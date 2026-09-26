@@ -595,13 +595,28 @@ function sessionArtifacts(
 // The workflow's reproduction step
 // ---------------------------------------------------------------------------
 
-/** The session that owns `captureId`, as the service records it. */
+/**
+ * The session that owns `captureId`, as the service records it.
+ *
+ * The session list carries rows, not records, so each listed session is read
+ * whole until one records the capture — capturing sessions first, since the
+ * owner of an open window is the one in `capturing`.
+ */
 async function sessionOwningCapture(service: ServiceHandle, captureId: string): Promise<string> {
-  const sessions = await service.listSessions();
-  const owner = sessions.find((candidate) =>
-    candidate.captures.some((capture) => capture.id === captureId),
+  const rows = await service.listSessions();
+  const ordered = [
+    ...rows.filter((row) => row.status === 'capturing'),
+    ...rows.filter((row) => row.status !== 'capturing'),
+  ];
+  for (const row of ordered) {
+    const record = await service.getSession(row.id);
+    if (record.captures.some((capture) => capture.id === captureId)) {
+      return record.id;
+    }
+  }
+  throw new Error(
+    `No listed session records capture ${captureId}: the service's session list and the capture it answered disagree.`,
   );
-  return required(owner, `the session owning capture ${captureId}`).id;
 }
 
 /**

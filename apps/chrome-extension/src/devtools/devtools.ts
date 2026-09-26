@@ -48,16 +48,20 @@
  * ## Contract gaps
  *
  * `../shared/messages` is the only wire contract on this port, and it declares
- * exactly two upstream frames (`devtools.hello`, `devtools.element`). Three
+ * exactly two upstream frames (`devtools.hello`, `devtools.element`). Two
  * needs of this page have no declared frame, so they are kept as controller
  * state (see {@link DevtoolsController.getState}) instead of widening the
  * union locally. Each site is marked `contract gap:`.
  *
- * - the DevTools theme name — the panel reads it itself through
- *   `../panel/theme.ts`;
  * - panel visibility (`onShown` / `onHidden`);
  * - the reason a selection could not be described — the declared shape
  *   carries `target: null` for every failure.
+ *
+ * The DevTools theme name needs no frame at all: the panel document follows
+ * the theme itself through `../panel/theme.ts` — DevTools'
+ * `setThemeChangeHandler` plus a re-read of `panels.themeName` whenever the
+ * panel is shown again — so the value read here is kept in state for
+ * diagnostics only.
  *
  * ## Worker suspension and DevTools teardown
  *
@@ -98,9 +102,12 @@ import type { SelectedTarget } from '@debuggen/protocol';
 
 import {
   EXTENSION_CHANNEL,
+  isBoundedSingleLine,
   isDevtoolsDownstreamMessage,
+  parseSelectedTargetDescriptor,
   PORT_DEVTOOLS,
   PORT_PROTOCOL_VERSION,
+  SELECTION_MAX_URL_LENGTH,
 } from '../shared/messages';
 import type {
   DevtoolsDownstreamMessage,
@@ -202,31 +209,14 @@ const MAX_BACKOFF_EXPONENT = 16;
  * ===========================================================================
  * Descriptor bounds
  *
- * Mirrors of the authoritative `selectedTargetSchema` bounds in
- * `packages/instrumentation/src/schema/target.ts`, which the service applies to
- * every `target.selected`. Enforcing the same ceilings here means a hostile
- * page that overwrote `__DEBUGGEN__` cannot inflate the frame, while nothing
- * the service would accept is ever refused on the way.
+ * The descriptor's own bounds — selector, tag name, text, component chain and
+ * URL — and the parser that enforces them live in `../shared/messages`
+ * (Section J), because the panel's "Use selected element" reads the same `$0`
+ * answer and must refuse exactly what this page refuses. Only the bound on a
+ * failure message, which only this page's expression produces, is declared
+ * here.
  * ===========================================================================
  */
-
-/** Longest `selector`, in UTF-16 code units. */
-export const SELECTION_MAX_SELECTOR_LENGTH = 1_024;
-
-/** Longest `tagName`. */
-export const SELECTION_MAX_TAG_NAME_LENGTH = 64;
-
-/** Longest `text`; a longer or multi-line value is dropped (the field is optional). */
-export const SELECTION_MAX_TEXT_LENGTH = 256;
-
-/** Most `componentChain` entries kept, nearest-first. */
-export const SELECTION_MAX_COMPONENT_CHAIN = 16;
-
-/** Longest component name; a longer entry is dropped from the chain. */
-export const SELECTION_MAX_COMPONENT_NAME_LENGTH = 128;
-
-/** Longest `url`. */
-export const SELECTION_MAX_URL_LENGTH = 2_048;
 
 /** Longest failure `message` kept from the page. */
 export const SELECTION_MAX_MESSAGE_LENGTH = 200;
@@ -349,54 +339,6 @@ function isMember<Member extends string>(
   return typeof value === 'string' && vocabulary.some((member) => member === value);
 }
 
-/** The C0 and C1 control ranges, which the service's single-line rule refuses. */
-const C0_CONTROL_MAX = 0x1f;
-const C1_CONTROL_MIN = 0x7f;
-const C1_CONTROL_MAX = 0x9f;
-
-/** Whether `value` contains a C0/C1 control character (a line break, a tab, NUL…). */
-function hasControlCharacter(value: string): boolean {
-  for (let index = 0; index < value.length; index += 1) {
-    const code = value.charCodeAt(index);
-    if (code <= C0_CONTROL_MAX || (code >= C1_CONTROL_MIN && code <= C1_CONTROL_MAX)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-/**
- * A string of at most `maxLength` code units with visible content and no
- * control character — the service's single-line rule, with its bound.
- */
-function isBoundedLine(value: unknown, maxLength: number): value is string {
-  return (
-    typeof value === 'string' &&
-    value.length <= maxLength &&
-    value.trim().length > 0 &&
-    !hasControlCharacter(value)
-  );
-}
-
-/** An absolute `http:`/`https:` URL with a host, as the service requires. */
-function isAbsoluteHttpUrl(value: string): boolean {
-  try {
-    const parsed = new URL(value);
-    return (parsed.protocol === 'http:' || parsed.protocol === 'https:') && parsed.hostname !== '';
-  } catch {
-    return false;
-  }
-}
-
-/** A descriptor `url`: bounded, single-line, untrimmed-equal and absolute http(s). */
-function isDescriptorUrl(value: unknown): value is string {
-  return (
-    isBoundedLine(value, SELECTION_MAX_URL_LENGTH) &&
-    value.trim() === value &&
-    isAbsoluteHttpUrl(value)
-  );
-}
-
 /** A failure outcome, with its message only when one was given. */
 function failure(reason: SelectionFailureReason, message?: string): SelectionResult {
   return message === undefined || message === ''
@@ -405,44 +347,15 @@ function failure(reason: SelectionFailureReason, message?: string): SelectionRes
 }
 
 /**
- * Validate a descriptor the page returned and rebuild it from its five known
- * fields, so no unrecognised key rides along.
- *
- * @returns The descriptor, or `undefined` when a required field is missing,
- * mistyped or out of bounds.
- */
-function parseDescriptor(raw: unknown): SelectedTarget | undefined {
-  if (!isRecord(raw)) {
-    return undefined;
-  }
-  const { selector, tagName, text, componentChain, url } = raw;
-  if (
-    !isBoundedLine(selector, SELECTION_MAX_SELECTOR_LENGTH) ||
-    !isBoundedLine(tagName, SELECTION_MAX_TAG_NAME_LENGTH) ||
-    !isDescriptorUrl(url) ||
-    !Array.isArray(componentChain)
-  ) {
-    return undefined;
-  }
-  // Nearest-first is the chain's contract, so entries are filtered in order
-  // and the cap keeps the nearest ones.
-  const chain = componentChain
-    .filter((entry): entry is string => isBoundedLine(entry, SELECTION_MAX_COMPONENT_NAME_LENGTH))
-    .slice(0, SELECTION_MAX_COMPONENT_CHAIN);
-  // `text` is optional: a value that is not a bounded single line is dropped
-  // rather than truncated, so nothing the agent did not write is relayed.
-  return isBoundedLine(text, SELECTION_MAX_TEXT_LENGTH)
-    ? { selector, tagName, text, componentChain: chain, url }
-    : { selector, tagName, componentChain: chain, url };
-}
-
-/**
  * Validate what {@link SELECTION_DESCRIPTOR_EXPRESSION} answered.
  *
  * The page is untrusted — any script can overwrite `window.__DEBUGGEN__` — so
- * the answer is checked structurally, bounded as the service would bound it,
- * and rebuilt from known keys only. The descriptor is otherwise relayed
- * verbatim: it is not redacted again (the agent applied the deny-list) and no
+ * the descriptor goes through `parseSelectedTargetDescriptor`, the bounded,
+ * HTTP-URL-aware parser in `../shared/messages` that the panel's "Use selected
+ * element" applies to the same answer: checked structurally, bounded as the
+ * service would bound it, and rebuilt from known keys only. The descriptor is
+ * otherwise relayed verbatim: nothing is redacted here (the worker forwards it
+ * to the service, which redacts before it stores or sends anything) and no
  * field is added.
  *
  * @param raw Whatever `inspectedWindow.eval` returned.
@@ -454,7 +367,7 @@ export function parseSelectionResult(raw: unknown): SelectionResult {
       return failure('invalid-descriptor');
     }
     if (raw.ok === true) {
-      const target = parseDescriptor(raw.target);
+      const target = parseSelectedTargetDescriptor(raw.target);
       return target === undefined ? failure('invalid-descriptor') : { ok: true, target };
     }
     if (raw.ok === false && isMember(EXPRESSION_FAILURE_REASONS, raw.reason)) {
@@ -488,8 +401,8 @@ export function parseInspectedLocation(raw: unknown): InspectedLocation {
   if (!isRecord(raw)) {
     return {};
   }
-  const url = isBoundedLine(raw.url, SELECTION_MAX_URL_LENGTH) ? raw.url : undefined;
-  const origin = isBoundedLine(raw.origin, SELECTION_MAX_URL_LENGTH) ? raw.origin : undefined;
+  const url = isBoundedSingleLine(raw.url, SELECTION_MAX_URL_LENGTH) ? raw.url : undefined;
+  const origin = isBoundedSingleLine(raw.origin, SELECTION_MAX_URL_LENGTH) ? raw.origin : undefined;
   return {
     ...(url === undefined ? {} : { url }),
     ...(origin === undefined ? {} : { origin }),
@@ -963,9 +876,11 @@ export function createDevtoolsController(deps: DevtoolsControllerDeps): Devtools
   }
 
   /**
-   * Re-read the theme. DevTools exposes no theme-change event this page
-   * relies on, so this runs at start and on every panel show, and records a
-   * change only when the value actually differs.
+   * Re-read the theme for this page's own state. The panel document does not
+   * depend on it: `../panel/theme.ts` follows the DevTools theme itself
+   * (`setThemeChangeHandler` plus a re-read on show). This runs at start and
+   * on every panel show, and records a change only when the value actually
+   * differs.
    */
   function refreshTheme(): void {
     const next = readThemeName();
@@ -973,9 +888,9 @@ export function createDevtoolsController(deps: DevtoolsControllerDeps): Devtools
       return;
     }
     themeName = next;
-    // contract gap: `../shared/messages` declares no theme frame on
-    // PORT_DEVTOOLS. The raw value is kept in state; `../panel/theme.ts`
-    // reads and maps `panels.themeName` itself.
+    // No PORT_DEVTOOLS theme frame is needed: `../panel/theme.ts` reads, maps
+    // and follows `panels.themeName` in the panel document itself, so the raw
+    // value is kept here, unmapped, for diagnostics only.
     log.debug('DevTools theme read.', { themeName: next ?? 'unknown' });
   }
 
@@ -1132,8 +1047,9 @@ export function createDevtoolsController(deps: DevtoolsControllerDeps): Devtools
           return;
         }
         announcements += 1;
-        // contract gap: `devtools.hello` carries no theme and no panel
-        // visibility, and no other declared frame does; both stay in state.
+        // contract gap: `devtools.hello` carries no panel visibility, and no
+        // other declared frame does; it stays in state. (The theme needs no
+        // frame: the panel follows it itself through `../panel/theme.ts`.)
         const pending = pendingElement;
         if (pending !== undefined && postFrame(elementFrame(pending))) {
           pendingElement = undefined;

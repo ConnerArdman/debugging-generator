@@ -3,13 +3,21 @@
  * one-file manifest read, framework-generic dev-script selection, the relaunch
  * command and its developer-facing hint, and the `detectDevServer` matrix.
  *
- * Five things are on trial here, each for a reason the plan states.
+ * Six things are on trial here, each for a reason the plan states.
  *
  * - **The probe is loopback-only, and the refusal comes first.** A dev-server
  *   URL reaches this service over HTTP, so a probe that would dial any host
  *   turns the service into an outbound request engine for whoever can reach
  *   it. AAP §0.5.6 keeps the service local; the suite therefore pins not only
  *   the refusal but that the injected `FetchLike` was called **zero** times.
+ * - **An answer is not an identity.** Any process can answer 404 or 500 on the
+ *   session's port. Detection counts it as this project's dev server only on
+ *   the framework's own response signature (`X-Powered-By: Next.js`, the
+ *   `next-router-state-tree` token in `Vary`) and reports anything else as
+ *   `occupied`, not launchable — even with a `server-agent` connected for the
+ *   project, because that agent's dev server may be listening on another
+ *   port. The signature is matched without a header value ever reaching the
+ *   result or a log record.
  * - **The manifest read is private.** Exactly one project file is read —
  *   `<projectRoot>/package.json`, through the no-follow reader — and nothing of
  *   it survives beyond the four `TargetManifest` fields; no error echoes file
@@ -61,11 +69,20 @@ import type { Mock } from 'vitest';
 
 import { PACKAGE_MANAGERS } from '@debuggen/code-analysis';
 import { READINESS_HINT_MAX_LENGTH } from '@debuggen/instrumentation';
-import { DEBUGGEN_ERROR_CODES, DebuggenError, createConsoleLogger, isErr } from '@debuggen/shared';
+import {
+  DEBUGGEN_ERROR_CODES,
+  DebuggenError,
+  createConsoleLogger,
+  isErr,
+  ok,
+} from '@debuggen/shared';
 import type { DebuggenErrorCode, LogRecord, Logger, Result } from '@debuggen/shared';
 
+import { isProductAuthoredText } from '../sessions/progress.js';
 import {
   DEFAULT_PROBE_TIMEOUT_MS,
+  DEV_SERVER_FRAMEWORKS,
+  DEV_SERVER_IDENTITY_EVIDENCE,
   DEV_SERVER_PRELOAD_REASONS,
   LAUNCH_DEV_SERVER_COMMAND_TITLE,
   MAX_MANIFEST_BYTES,
@@ -85,6 +102,7 @@ import {
 import type {
   DevScriptSelection,
   DevServerDetectDeps,
+  DevServerDetection,
   FetchLike,
   FetchLikeResponse,
   KnownPackageManagerId,
@@ -116,6 +134,27 @@ const INGEST_URL = 'http://127.0.0.1:43117/telemetry/ingest';
 
 /** A loopback dev-server URL; every probe of it is answered by a stub. */
 const DEV_URL = 'http://127.0.0.1:4100/';
+
+/**
+ * The response headers `next dev` sends on a page: both halves of the Next.js
+ * signature (`X-Powered-By` and the router tokens in `Vary`) beside a header
+ * that carries no identity.
+ */
+const NEXT_PAGE_HEADERS = Object.freeze({
+  'x-powered-by': 'Next.js',
+  vary: 'rsc, next-router-state-tree, next-router-prefetch, next-router-segment-prefetch, Accept-Encoding',
+  'content-type': 'text/html; charset=utf-8',
+});
+
+/**
+ * The headers of a generic process that is not a Next.js dev server — an
+ * unrelated HTTP server holding the session's port.
+ */
+const UNRELATED_SERVER_HEADERS = Object.freeze({
+  'x-powered-by': 'Express',
+  vary: 'Origin, Accept-Encoding',
+  'content-type': 'text/plain; charset=utf-8',
+});
 
 /**
  * The environment a preloaded dev server needs, in the order the relaunch
@@ -286,9 +325,19 @@ const THROWING_LOGGER: Logger = Object.freeze({
   child: failLogging,
 });
 
-/** A fetch stub that answers every request with `status`. */
+/** A fetch stub that answers every request with `status` and no headers at all. */
 function answering(status: number) {
   return vi.fn<FetchLike>(() => Promise.resolve({ status }));
+}
+
+/** A fetch stub that answers every request with `status` and real (undici) `headers`. */
+function answeringAs(status: number, headers: Readonly<Record<string, string>>) {
+  return vi.fn<FetchLike>(() => Promise.resolve({ status, headers: new Headers(headers) }));
+}
+
+/** A fetch stub that answers as `next dev` does: `status` with the Next.js signature. */
+function answeringAsNext(status = 200) {
+  return answeringAs(status, NEXT_PAGE_HEADERS);
 }
 
 /** The error undici produces for a refused connection: a `TypeError` whose `cause` is coded. */
@@ -561,6 +610,160 @@ describe('probeDevServer', () => {
     expectOk(await probeDevServer(DEV_URL, { fetchImpl }));
 
     expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  describe('the framework signature: evidence of identity, never a recorded value', () => {
+    it('recognises only the Next.js framework', () => {
+      expect(DEV_SERVER_FRAMEWORKS).toEqual(['next']);
+      expect(Object.isFrozen(DEV_SERVER_FRAMEWORKS)).toBe(true);
+    });
+
+    const signatures: readonly {
+      readonly label: string;
+      readonly headers: Readonly<Record<string, string>>;
+    }[] = [
+      { label: 'X-Powered-By: Next.js', headers: { 'x-powered-by': 'Next.js' } },
+      { label: 'X-Powered-By in another case', headers: { 'X-Powered-By': 'NEXT.JS' } },
+      {
+        label: 'X-Powered-By naming Next.js among others',
+        headers: { 'x-powered-by': 'Edge-Proxy, Next.js' },
+      },
+      {
+        label: 'the router token in Vary (X-Powered-By disabled)',
+        headers: { vary: 'rsc, next-router-state-tree, next-router-prefetch' },
+      },
+      {
+        label: 'the router token in another case, padded',
+        headers: { Vary: 'RSC ,  Next-Router-State-Tree , Accept-Encoding' },
+      },
+      { label: 'the router token alone', headers: { vary: 'next-router-state-tree' } },
+      { label: 'both halves', headers: NEXT_PAGE_HEADERS },
+    ];
+
+    it.each(signatures.flatMap((entry) => [200, 404, 500].map((status) => ({ ...entry, status }))))(
+      'HTTP $status with $label → framework "next"',
+      async ({ headers, status }) => {
+        const probe = expectOk(
+          await probeDevServer(DEV_URL, { fetchImpl: answeringAs(status, headers) }),
+        );
+
+        expect(probe).toMatchObject({ url: DEV_URL, reachable: true, status, framework: 'next' });
+      },
+    );
+
+    const unsigned: readonly {
+      readonly label: string;
+      readonly headers: Readonly<Record<string, string>>;
+    }[] = [
+      { label: 'no headers', headers: {} },
+      { label: 'an unrelated server', headers: UNRELATED_SERVER_HEADERS },
+      { label: 'X-Powered-By: next (no .js)', headers: { 'x-powered-by': 'next' } },
+      {
+        label: 'a Vary token that only contains the router token',
+        headers: { vary: 'x-next-router-state-tree, next-router-state-tree-v2' },
+      },
+      {
+        label: 'the router token in another header',
+        headers: { 'x-router': 'next-router-state-tree' },
+      },
+      { label: 'an empty Vary', headers: { vary: '' } },
+    ];
+
+    it.each(unsigned)('$label → no framework, still reachable', async ({ headers }) => {
+      const probe = expectOk(
+        await probeDevServer(DEV_URL, { fetchImpl: answeringAs(404, headers) }),
+      );
+
+      expect(probe).toMatchObject({ url: DEV_URL, reachable: true, status: 404 });
+      expect('framework' in probe).toBe(false);
+    });
+
+    it('reports no framework for a response without a headers object', async () => {
+      const probe = expectOk(await probeDevServer(DEV_URL, { fetchImpl: answering(200) }));
+
+      expect('framework' in probe).toBe(false);
+    });
+
+    const hostile: readonly {
+      readonly label: string;
+      readonly response: () => FetchLikeResponse;
+    }[] = [
+      {
+        label: 'a headers.get that throws',
+        response: () => ({
+          status: 200,
+          headers: {
+            get: (): string | null => {
+              throw new Error('header table unavailable');
+            },
+          },
+        }),
+      },
+      {
+        label: 'a headers getter that throws',
+        response: () => ({
+          status: 200,
+          get headers(): never {
+            throw new Error('headers unavailable');
+          },
+        }),
+      },
+      {
+        label: 'a headers.get that answers a non-string',
+        response: () =>
+          ({
+            status: 200,
+            headers: { get: () => ['Next.js'] },
+          }) as unknown as FetchLikeResponse,
+      },
+      {
+        label: 'a headers object whose get is not a function',
+        response: () =>
+          ({ status: 200, headers: { get: 'Next.js' } }) as unknown as FetchLikeResponse,
+      },
+      { label: 'null headers', response: () => ({ status: 200, headers: null }) },
+    ];
+
+    it.each(hostile)(
+      'tolerates $label: reachable, no framework, no crash',
+      async ({ response }) => {
+        const { logger, records } = recordingLogger();
+        const fetchImpl = vi.fn<FetchLike>(() => Promise.resolve(response()));
+
+        const probe = expectOk(await probeDevServer(DEV_URL, { fetchImpl, logger }));
+
+        expect(probe).toMatchObject({ url: DEV_URL, reachable: true, status: 200 });
+        expect('framework' in probe).toBe(false);
+        expect(JSON.stringify(records)).not.toContain('unavailable');
+      },
+    );
+
+    it('never stores, returns or logs a header value — only the framework name', async () => {
+      const plantedPoweredBy = plantedValue(71, 24);
+      const plantedVary = plantedValue(73, 24);
+      const plantedCookie = plantedValue(79, 24);
+      const { logger, records } = recordingLogger();
+
+      const probe = expectOk(
+        await probeDevServer(DEV_URL, {
+          logger,
+          fetchImpl: answeringAs(200, {
+            'x-powered-by': `Next.js ${plantedPoweredBy}`,
+            vary: `next-router-state-tree, ${plantedVary}`,
+            'set-cookie': `session=${plantedCookie}`,
+          }),
+        }),
+      );
+
+      expect(probe.framework).toBe('next');
+      const surfaces = JSON.stringify({ probe, records });
+      for (const planted of [plantedPoweredBy, plantedVary, plantedCookie]) {
+        expect(surfaces).not.toContain(planted);
+      }
+      expect(surfaces).not.toMatch(/next\.js|next-router-state-tree/i);
+      const answered = records.find((record) => record.message === 'Dev-server probe answered');
+      expect(answered?.fields).toMatchObject({ subsystem: 'dev-server', framework: 'next' });
+    });
   });
 
   describe('a transport failure is an answer, not an error', () => {
@@ -1637,6 +1840,77 @@ describe('buildRelaunchHint', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Relaunch text provenance (CWE-209): what this module composes is proven
+// ---------------------------------------------------------------------------
+
+describe('relaunch text provenance', () => {
+  it('registers every relaunch hint it composes, and nothing that merely resembles one', () => {
+    const devScript: DevScriptSelection = { name: 'dev', command: 'next dev' };
+
+    for (const packageManager of PACKAGE_MANAGERS) {
+      const input: RelaunchCommandInput = {
+        projectRoot: PROJECT_ROOT,
+        packageManager,
+        devScript,
+        preloadUrl: PRELOAD_URL,
+        ingestUrl: INGEST_URL,
+      };
+      const hint = buildRelaunchHint(input);
+
+      expect(isProductAuthoredText(hint), hint).toBe(true);
+      // Exact text only: an adapter's relaunch text quoting the same command,
+      // or the hint with anything appended, is not the product's.
+      expect(isProductAuthoredText(`Restart with: ${formatRelaunchCommand(input)}`)).toBe(false);
+      expect(isProductAuthoredText(`${hint} ?token=zz-private`)).toBe(false);
+    }
+  });
+
+  it('registers a detection’s relaunch hint and the gap reasons readiness quotes', async () => {
+    const { serverAgents } = presence(false);
+    const detections = [
+      await detectDevServer(
+        { projectRoot: PROJECT_ROOT, devServerUrl: DEV_URL },
+        portalDeps({ fetchImpl: answering(200), serverAgents }),
+      ),
+      await detectDevServer(
+        { projectRoot: PROJECT_ROOT, devServerUrl: DEV_URL },
+        portalDeps({ fetchImpl: refusing(), serverAgents }),
+      ),
+    ];
+
+    for (const detection of detections) {
+      expect(detection.preloadAttached).toBe(false);
+      expect(isProductAuthoredText(detection.relaunchHint)).toBe(true);
+
+      const unavailable = buildPreloadUnavailableSignals(detection);
+      expect(unavailable.length).toBeGreaterThan(0);
+      for (const entry of unavailable) {
+        expect(isProductAuthoredText(entry.reason), entry.reason).toBe(true);
+        expect(isProductAuthoredText(entry.hint)).toBe(true);
+      }
+    }
+  });
+
+  it('never proves a hint a caller supplied on a detection it built itself', () => {
+    const foreign = 'Restart with: cd /home/dev/acme-portal && SECRET=zz-private pnpm dev';
+    const unavailable = buildPreloadUnavailableSignals({
+      running: true,
+      preloadAttached: false,
+      preloadReason: 'no-server-agent-connection',
+      relaunchHint: foreign,
+    });
+
+    expect(unavailable.length).toBeGreaterThan(0);
+    for (const entry of unavailable) {
+      // The reason is this module's own; the hint is relayed, never registered.
+      expect(isProductAuthoredText(entry.reason)).toBe(true);
+      expect(entry.hint).toBe(foreign);
+      expect(isProductAuthoredText(entry.hint)).toBe(false);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // detectDevServer
 // ---------------------------------------------------------------------------
 
@@ -1644,7 +1918,7 @@ describe('detectDevServer', () => {
   describe('the four states', () => {
     it('running with a server-agent connected: preload attached, nothing to launch', async () => {
       const { serverAgents, hasServerAgentForProject } = presence(true);
-      const fetchImpl = answering(200);
+      const fetchImpl = answeringAsNext(200);
 
       const detection = await detectDevServer(
         { projectRoot: PROJECT_ROOT, devServerUrl: DEV_URL },
@@ -1655,14 +1929,17 @@ describe('detectDevServer', () => {
         projectRoot: PROJECT_ROOT,
         devServerUrl: DEV_URL,
         running: true,
+        // The signature identifies the server; the connection only attaches the preload.
+        identifiedBy: 'framework-signature',
         preloadAttached: true,
         preloadReason: 'server-agent-connected',
         canLaunch: false,
         packageManager: 'pnpm',
         packageManagerSource: 'manifest-field',
         devScript: { name: 'dev', command: 'next dev' },
-        probe: { url: DEV_URL, reachable: true, status: 200, durationMs: 12 },
+        probe: { url: DEV_URL, reachable: true, status: 200, framework: 'next', durationMs: 12 },
       });
+      expect('occupied' in detection).toBe(false);
       expect(detection.notes).toEqual([]);
       expect(hasServerAgentForProject).toHaveBeenCalledWith(PROJECT_ROOT);
       expect(fetchImpl).toHaveBeenCalledTimes(1);
@@ -1675,15 +1952,17 @@ describe('detectDevServer', () => {
 
       const detection = await detectDevServer(
         { projectRoot: PROJECT_ROOT, devServerUrl: DEV_URL },
-        portalDeps({ fetchImpl: answering(200), serverAgents }),
+        portalDeps({ fetchImpl: answeringAsNext(200), serverAgents }),
       );
 
       expect(detection).toMatchObject({
         running: true,
+        identifiedBy: 'framework-signature',
         preloadAttached: false,
         preloadReason: 'no-server-agent-connection',
         canLaunch: false,
       });
+      expect('occupied' in detection).toBe(false);
       expect(detection.relaunchCommand).toBe(expectedCommand(PROJECT_ROOT, 'pnpm run dev'));
       expect(detection.relaunchHint).toMatch(
         /^This project's dev server is running without the Debug Generator preload/,
@@ -1724,6 +2003,9 @@ describe('detectDevServer', () => {
         devScript: { name: 'dev', command: 'next dev' },
         probe: { url: DEV_URL, reachable: false, error: { code: 'ECONNREFUSED' } },
       });
+      // Nothing answered, so nothing holds the address and nothing was identified.
+      expect('occupied' in detection).toBe(false);
+      expect('identifiedBy' in detection).toBe(false);
       expect(detection.relaunchHint).toMatch(
         /^No dev server with the Debug Generator preload is running/,
       );
@@ -1813,10 +2095,10 @@ describe('detectDevServer', () => {
     it('reports every preload reason from the documented vocabulary', async () => {
       const reasons = new Set<string>();
       const scenarios: readonly DevServerDetectDeps[] = [
-        portalDeps({ fetchImpl: answering(200), serverAgents: presence(true).serverAgents }),
-        portalDeps({ fetchImpl: answering(200), serverAgents: presence(false).serverAgents }),
+        portalDeps({ fetchImpl: answeringAsNext(200), serverAgents: presence(true).serverAgents }),
+        portalDeps({ fetchImpl: answeringAsNext(200), serverAgents: presence(false).serverAgents }),
         portalDeps({ fetchImpl: refusing(), serverAgents: presence(false).serverAgents }),
-        portalDeps({ fetchImpl: answering(200) }),
+        portalDeps({ fetchImpl: answeringAsNext(200) }),
       ];
 
       for (const deps of scenarios) {
@@ -1835,15 +2117,17 @@ describe('detectDevServer', () => {
     it('reports "unknown" for a running server when no registry is injected, without throwing', async () => {
       const detection = await detectDevServer(
         { projectRoot: PROJECT_ROOT, devServerUrl: DEV_URL },
-        portalDeps({ fetchImpl: answering(200) }),
+        portalDeps({ fetchImpl: answeringAsNext(200) }),
       );
 
       expect(detection).toMatchObject({
         running: true,
+        identifiedBy: 'framework-signature',
         preloadAttached: false,
         preloadReason: 'unknown',
         canLaunch: false,
       });
+      expect('occupied' in detection).toBe(false);
       expect(detection.relaunchHint).toMatch(/could not be confirmed/);
       expect(detection.notes).toContainEqual(
         expect.stringMatching(/No server-agent registry was available/),
@@ -1878,11 +2162,403 @@ describe('detectDevServer', () => {
 
       const detection = await detectDevServer(
         { projectRoot: PROJECT_ROOT, devServerUrl: DEV_URL },
-        portalDeps({ fetchImpl: answering(200), serverAgents }),
+        portalDeps({ fetchImpl: answeringAsNext(200), serverAgents }),
       );
 
       expect(detection.preloadAttached).toBe(false);
       expect(detection.preloadReason).toBe('no-server-agent-connection');
+      expect(detection.identifiedBy).toBe('framework-signature');
+    });
+
+    it('reads hasServerAgentForProject only, even from a registry that can describe its connection', async () => {
+      const hasServerAgentForProject = vi.fn<(projectRoot: string) => boolean>(() => true);
+      // The client registry also answers serverAgentForProject; detection must not ask it.
+      const serverAgentForProject = vi.fn<(projectRoot: string) => unknown>(() =>
+        ok({ online: true, connectedAt: 1 }),
+      );
+      const registry = { hasServerAgentForProject, serverAgentForProject };
+
+      const detection = await detectDevServer(
+        { projectRoot: PROJECT_ROOT, devServerUrl: DEV_URL },
+        portalDeps({ fetchImpl: answeringAsNext(200), serverAgents: registry }),
+      );
+
+      expect(detection).toMatchObject({
+        running: true,
+        identifiedBy: 'framework-signature',
+        preloadAttached: true,
+      });
+      expect(hasServerAgentForProject).toHaveBeenCalledTimes(1);
+      expect(serverAgentForProject).toHaveBeenCalledTimes(0);
+    });
+  });
+
+  describe("server identity: an answer is this project's dev server only on evidence", () => {
+    /** The occupied hint's opening, independent of the relaunch command it quotes. */
+    const OCCUPIED_OPENING = /^Another process answers at this project's dev-server address/;
+
+    /** The fixed occupied note for an unsigned answer with `status` at {@link DEV_URL}. */
+    function unsignedNote(status: number): string {
+      return `Something answered at ${DEV_URL} with HTTP ${status}, but the response carries no Next.js signature, so it is not identifiable as this project's dev server and is treated as another process holding the address.`;
+    }
+
+    /** The sentence the occupied note adds when a server-agent is connected for the project. */
+    const AGENT_ELSEWHERE =
+      " A server-agent is connected for this project, but the process answering at that URL was not identified, so the agent's dev server may be listening at a different address; check that debuggen.devServerUrl names it.";
+
+    it.each([404, 500])(
+      'an unidentified HTTP %i is occupied: not running, not launchable, not "running without the preload"',
+      async (status) => {
+        const { serverAgents } = presence(false);
+
+        const detection = await detectDevServer(
+          { projectRoot: PROJECT_ROOT, devServerUrl: DEV_URL },
+          portalDeps({ fetchImpl: answeringAs(status, UNRELATED_SERVER_HEADERS), serverAgents }),
+        );
+
+        expect(detection).toMatchObject({
+          devServerUrl: DEV_URL,
+          running: false,
+          occupied: true,
+          preloadAttached: false,
+          preloadReason: 'not-running',
+          // The portal manifest has a dev script; the occupied address alone blocks the launch.
+          devScript: { name: 'dev', command: 'next dev' },
+          canLaunch: false,
+          probe: { url: DEV_URL, reachable: true, status },
+        });
+        expect('identifiedBy' in detection).toBe(false);
+        expect(detection.notes).toEqual([unsignedNote(status)]);
+
+        expect(detection.relaunchHint).toMatch(OCCUPIED_OPENING);
+        expect(detection.relaunchHint).not.toMatch(/running without the Debug Generator preload/);
+        expect(detection.relaunchHint).toContain(
+          `Stop the process holding that address, or set debuggen.devServerUrl to this project's dev-server address, then run "${LAUNCH_DEV_SERVER_COMMAND_TITLE}"`,
+        );
+        expect(detection.relaunchHint.endsWith(`: ${detection.relaunchCommand}`)).toBe(true);
+        expect(detection.relaunchHint.length).toBeLessThanOrEqual(READINESS_HINT_MAX_LENGTH);
+        expect(buildRelaunchHint(detection)).toBe(detection.relaunchHint);
+
+        const unavailable = buildPreloadUnavailableSignals(detection);
+        expect(unavailable.map((entry) => entry.signal)).toEqual([...PRELOAD_DEPENDENT_SIGNALS]);
+        for (const entry of unavailable) {
+          expect(entry.reason).toBe(
+            'another process holds the dev-server address for this project',
+          );
+          expect(entry.hint).toBe(detection.relaunchHint);
+        }
+      },
+    );
+
+    it('treats an answer without a headers object as unidentified too', async () => {
+      const detection = await detectDevServer(
+        { projectRoot: PROJECT_ROOT, devServerUrl: DEV_URL },
+        portalDeps({ fetchImpl: answering(200), serverAgents: presence(false).serverAgents }),
+      );
+
+      expect(detection).toMatchObject({ running: false, occupied: true, canLaunch: false });
+    });
+
+    it('reports an unsigned answer as occupied when no registry is injected, naming no connection', async () => {
+      const detection = await detectDevServer(
+        { projectRoot: PROJECT_ROOT, devServerUrl: DEV_URL },
+        portalDeps({ fetchImpl: answeringAs(404, UNRELATED_SERVER_HEADERS) }),
+      );
+
+      expect(detection).toMatchObject({
+        running: false,
+        occupied: true,
+        preloadReason: 'not-running',
+        canLaunch: false,
+      });
+      expect(detection.notes).toEqual([unsignedNote(404)]);
+    });
+
+    it('keeps both notes when an occupied address meets a registry that throws', async () => {
+      const detection = await detectDevServer(
+        { projectRoot: PROJECT_ROOT, devServerUrl: DEV_URL },
+        portalDeps({
+          fetchImpl: answeringAs(500, UNRELATED_SERVER_HEADERS),
+          serverAgents: {
+            hasServerAgentForProject: () => {
+              throw new Error('registry offline');
+            },
+          },
+        }),
+      );
+
+      expect(detection).toMatchObject({ running: false, occupied: true, canLaunch: false });
+      expect(detection.notes).toEqual([
+        expect.stringMatching(/server-agent registry could not be queried/),
+        unsignedNote(500),
+      ]);
+    });
+
+    it.each([404, 500])(
+      'identifies a Next.js dev server answering HTTP %i by its signature: running without the preload',
+      async (status) => {
+        const detection = await detectDevServer(
+          { projectRoot: PROJECT_ROOT, devServerUrl: DEV_URL },
+          portalDeps({
+            fetchImpl: answeringAsNext(status),
+            serverAgents: presence(false).serverAgents,
+          }),
+        );
+
+        expect(detection).toMatchObject({
+          running: true,
+          identifiedBy: 'framework-signature',
+          preloadReason: 'no-server-agent-connection',
+          canLaunch: false,
+          probe: { status, framework: 'next' },
+        });
+        expect('occupied' in detection).toBe(false);
+      },
+    );
+
+    it.each([404, 500])(
+      'never lets a connected server-agent vouch for an unsigned HTTP %i: occupied, not launchable, the note names the agent',
+      async (status) => {
+        // The agent is connected for the project, but its dev server may be on
+        // another port: presence says nothing about who holds this address.
+        const { serverAgents, hasServerAgentForProject } = presence(true);
+
+        const detection = await detectDevServer(
+          { projectRoot: PROJECT_ROOT, devServerUrl: DEV_URL },
+          portalDeps({ fetchImpl: answeringAs(status, UNRELATED_SERVER_HEADERS), serverAgents }),
+        );
+
+        expect(detection).toMatchObject({
+          devServerUrl: DEV_URL,
+          running: false,
+          occupied: true,
+          preloadAttached: false,
+          preloadReason: 'not-running',
+          devScript: { name: 'dev', command: 'next dev' },
+          canLaunch: false,
+          probe: { url: DEV_URL, reachable: true, status },
+        });
+        expect('identifiedBy' in detection).toBe(false);
+        expect('framework' in (detection.probe ?? {})).toBe(false);
+        expect(hasServerAgentForProject).toHaveBeenCalledTimes(1);
+        expect(detection.notes).toEqual([`${unsignedNote(status)}${AGENT_ELSEWHERE}`]);
+        expect(detection.relaunchHint).toMatch(OCCUPIED_OPENING);
+        expect(detection.relaunchHint).not.toMatch(/already runs with the Debug Generator preload/);
+        expect(buildPreloadUnavailableSignals(detection)[0]?.reason).toBe(
+          'another process holds the dev-server address for this project',
+        );
+      },
+    );
+
+    it('treats a headerless answer as occupied even with a server-agent connected', async () => {
+      const detection = await detectDevServer(
+        { projectRoot: PROJECT_ROOT, devServerUrl: DEV_URL },
+        portalDeps({ fetchImpl: answering(200), serverAgents: presence(true).serverAgents }),
+      );
+
+      expect(detection).toMatchObject({
+        running: false,
+        occupied: true,
+        preloadAttached: false,
+        canLaunch: false,
+      });
+      expect(detection.notes).toEqual([`${unsignedNote(200)}${AGENT_ELSEWHERE}`]);
+    });
+
+    it.each([200, 404, 500])(
+      'identifies a signed HTTP %i with a server-agent connected: running with the preload attached',
+      async (status) => {
+        const detection = await detectDevServer(
+          { projectRoot: PROJECT_ROOT, devServerUrl: DEV_URL },
+          portalDeps({
+            fetchImpl: answeringAsNext(status),
+            serverAgents: presence(true).serverAgents,
+          }),
+        );
+
+        expect(detection).toMatchObject({
+          running: true,
+          identifiedBy: 'framework-signature',
+          preloadAttached: true,
+          preloadReason: 'server-agent-connected',
+          canLaunch: false,
+          probe: { status, framework: 'next' },
+        });
+        expect('occupied' in detection).toBe(false);
+        expect(detection.notes).toEqual([]);
+      },
+    );
+
+    it('identifies the server by its signature alone when no registry is injected', async () => {
+      const detection = await detectDevServer(
+        { projectRoot: PROJECT_ROOT, devServerUrl: DEV_URL },
+        portalDeps({ fetchImpl: answeringAs(200, { vary: 'rsc, next-router-state-tree' }) }),
+      );
+
+      expect(detection).toMatchObject({
+        running: true,
+        identifiedBy: 'framework-signature',
+        preloadAttached: false,
+        preloadReason: 'unknown',
+      });
+      expect('occupied' in detection).toBe(false);
+    });
+
+    it('holds its invariants across every probe and registry combination', async () => {
+      const probes: readonly (() => FetchLike)[] = [
+        () => answering(200),
+        () => answeringAs(404, UNRELATED_SERVER_HEADERS),
+        () => answeringAsNext(500),
+        () => refusing(),
+      ];
+      const registries: readonly {
+        readonly make: () => ServerAgentPresence | undefined;
+        readonly connected: boolean;
+      }[] = [
+        { make: () => undefined, connected: false },
+        { make: () => presence(true).serverAgents, connected: true },
+        { make: () => presence(false).serverAgents, connected: false },
+        {
+          make: () => ({
+            hasServerAgentForProject: () => {
+              throw new Error('registry offline');
+            },
+          }),
+          connected: false,
+        },
+      ];
+
+      for (const probe of probes) {
+        for (const registry of registries) {
+          const detection = await detectDevServer(
+            { projectRoot: PROJECT_ROOT, devServerUrl: DEV_URL },
+            portalDeps({ fetchImpl: probe(), serverAgents: registry.make() }),
+          );
+          const answered = detection.probe?.reachable === true;
+          const signed = detection.probe?.framework !== undefined;
+
+          // Identity is the signature, whatever the registry says.
+          expect(detection.running).toBe(answered && signed);
+          expect('identifiedBy' in detection).toBe(detection.running);
+          if (detection.identifiedBy !== undefined) {
+            expect(DEV_SERVER_IDENTITY_EVIDENCE).toContain(detection.identifiedBy);
+          }
+          expect(detection.occupied === true).toBe(answered && !signed);
+          expect('occupied' in detection).toBe(detection.occupied === true);
+          expect(detection.preloadAttached).toBe(detection.running && registry.connected);
+          if (!detection.running) {
+            expect(detection.preloadReason).toBe('not-running');
+          }
+          if (detection.occupied === true) {
+            expect(detection.canLaunch).toBe(false);
+          }
+          expect(detection.relaunchHint.length).toBeLessThanOrEqual(READINESS_HINT_MAX_LENGTH);
+        }
+      }
+    });
+
+    it('lists the framework signature as the only identity evidence', () => {
+      expect(DEV_SERVER_IDENTITY_EVIDENCE).toEqual(['framework-signature']);
+      expect(Object.isFrozen(DEV_SERVER_IDENTITY_EVIDENCE)).toBe(true);
+    });
+
+    it('records no header value in the detection or any log record', async () => {
+      const plantedPoweredBy = plantedValue(83, 24);
+      const plantedCookie = plantedValue(89, 24);
+      const { logger, records } = recordingLogger();
+
+      for (const [headers, serverAgents] of [
+        [
+          { 'x-powered-by': `Next.js ${plantedPoweredBy}`, 'set-cookie': `sid=${plantedCookie}` },
+          presence(false).serverAgents,
+        ],
+        [
+          { 'x-powered-by': `Relay ${plantedPoweredBy}`, 'set-cookie': `sid=${plantedCookie}` },
+          presence(false).serverAgents,
+        ],
+        // The agent-aware occupied note is fixed text too.
+        [
+          { 'x-powered-by': `Relay ${plantedPoweredBy}`, 'set-cookie': `sid=${plantedCookie}` },
+          presence(true).serverAgents,
+        ],
+      ] as const) {
+        const detection = await detectDevServer(
+          { projectRoot: PROJECT_ROOT, devServerUrl: DEV_URL },
+          portalDeps({ fetchImpl: answeringAs(404, headers), serverAgents, logger }),
+        );
+
+        const surfaces = JSON.stringify({ detection, records });
+        expect(surfaces).not.toContain(plantedPoweredBy);
+        expect(surfaces).not.toContain(plantedCookie);
+        expect(surfaces).not.toMatch(/Relay/);
+      }
+
+      const finished = records.filter(
+        (record) => record.message === 'Dev-server detection finished',
+      );
+      expect(finished.map((record) => record.fields)).toEqual([
+        expect.objectContaining({
+          running: true,
+          identifiedBy: 'framework-signature',
+          occupied: false,
+        }),
+        expect.objectContaining({ running: false, identifiedBy: undefined, occupied: true }),
+        expect.objectContaining({
+          running: false,
+          identifiedBy: undefined,
+          occupied: true,
+          preloadAttached: false,
+        }),
+      ]);
+    });
+
+    it('keeps the occupied hint within the limit for a very long project root', async () => {
+      const projectRoot = `/home/dev/${'nested/'.repeat(200)}portal`;
+
+      const detection = await detectDevServer(
+        { projectRoot, devServerUrl: DEV_URL },
+        portalDeps({
+          fetchImpl: answeringAs(404, UNRELATED_SERVER_HEADERS),
+          serverAgents: presence(false).serverAgents,
+        }),
+      );
+
+      expect(detection.occupied).toBe(true);
+      expect(detection.relaunchHint).toMatch(OCCUPIED_OPENING);
+      expect(detection.relaunchHint).toContain(LAUNCH_DEV_SERVER_COMMAND_TITLE);
+      expect(detection.relaunchHint).not.toContain(projectRoot);
+      expect(detection.relaunchHint.length).toBeLessThanOrEqual(READINESS_HINT_MAX_LENGTH);
+    });
+
+    it('reads a hand-built detection with or without occupied, as existing callers build them', () => {
+      const facts = {
+        running: false,
+        preloadAttached: false,
+        preloadReason: 'not-running',
+        relaunchHint: 'Run the editor command.',
+      } as const;
+
+      expect(buildPreloadUnavailableSignals(facts)[0]?.reason).toBe(
+        'no dev server with the preload is running for this project',
+      );
+      expect(buildPreloadUnavailableSignals({ ...facts, occupied: true })[0]?.reason).toBe(
+        'another process holds the dev-server address for this project',
+      );
+
+      const detection: DevServerDetection = {
+        projectRoot: PROJECT_ROOT,
+        running: false,
+        occupied: true,
+        preloadAttached: false,
+        preloadReason: 'not-running',
+        packageManager: 'pnpm',
+        packageManagerSource: 'manifest-field',
+        relaunchCommand: expectedCommand(PROJECT_ROOT, 'pnpm run dev'),
+        relaunchHint: '',
+        canLaunch: false,
+        notes: [],
+      };
+      expect(buildRelaunchHint(detection)).toMatch(OCCUPIED_OPENING);
     });
   });
 
@@ -1939,7 +2615,7 @@ describe('detectDevServer', () => {
         input: { projectRoot: PROJECT_ROOT, devServerUrl: DEV_URL },
         deps: () =>
           portalDeps({
-            fetchImpl: answering(200),
+            fetchImpl: answeringAsNext(200),
             serverAgents: {
               hasServerAgentForProject: () => {
                 throw new Error('registry offline');
@@ -2056,40 +2732,49 @@ describe('detectDevServer', () => {
       expect(detection.notes).toEqual([expect.stringMatching(/detection failed unexpectedly/)]);
       expect(detection.relaunchCommand).toContain(`cd ${PROJECT_ROOT} && `);
       const warning = records.find((record) => record.level === 'warn');
-      expect(warning?.fields).toMatchObject({ subsystem: 'dev-server', errorName: 'Error' });
+      expect(warning?.fields).toMatchObject({ subsystem: 'dev-server', errorClass: 'Error' });
       expect(JSON.stringify(records)).not.toContain('registry wiring failed');
     });
   });
 
   describe('the result is plain, credential-free data', () => {
-    it('survives a JSON round trip unchanged and carries no token, Authorization or environment value', async () => {
-      const plantedToken = plantedValue(47);
-      const plantedIngest = `http://127.0.0.1:1/${plantedValue(53, 16)}`;
-      vi.stubEnv('DEBUGGEN_TOKEN', plantedToken);
-      vi.stubEnv('DEBUGGEN_INGEST_URL', plantedIngest);
-      vi.stubEnv('DEBUGGEN_PROJECT_ROOT', `/srv/${plantedValue(59, 16)}`);
-      const queryValue = plantedValue(61, 20);
-      const { logger, records } = recordingLogger();
+    it.each([
+      { label: 'an identified dev server', fetchImpl: () => answeringAsNext(200) },
+      {
+        label: 'an occupied address',
+        fetchImpl: () => answeringAs(404, UNRELATED_SERVER_HEADERS),
+      },
+    ])(
+      'for $label, survives a JSON round trip unchanged and carries no token, Authorization or environment value',
+      async ({ fetchImpl }) => {
+        const plantedToken = plantedValue(47);
+        const plantedIngest = `http://127.0.0.1:1/${plantedValue(53, 16)}`;
+        vi.stubEnv('DEBUGGEN_TOKEN', plantedToken);
+        vi.stubEnv('DEBUGGEN_INGEST_URL', plantedIngest);
+        vi.stubEnv('DEBUGGEN_PROJECT_ROOT', `/srv/${plantedValue(59, 16)}`);
+        const queryValue = plantedValue(61, 20);
+        const { logger, records } = recordingLogger();
 
-      const detection = await detectDevServer(
-        { projectRoot: PROJECT_ROOT, devServerUrl: `http://localhost:4100/?ref=${queryValue}` },
-        portalDeps({
-          fetchImpl: answering(200),
-          serverAgents: presence(false).serverAgents,
-          logger,
-        }),
-      );
+        const detection = await detectDevServer(
+          { projectRoot: PROJECT_ROOT, devServerUrl: `http://localhost:4100/?ref=${queryValue}` },
+          portalDeps({
+            fetchImpl: fetchImpl(),
+            serverAgents: presence(false).serverAgents,
+            logger,
+          }),
+        );
 
-      const serialised = JSON.stringify(detection);
-      expect(JSON.parse(serialised)).toStrictEqual(detection);
-      for (const planted of [plantedToken, plantedIngest, queryValue, plantedValue(59, 16)]) {
-        expect(serialised).not.toContain(planted);
-        expect(JSON.stringify(records)).not.toContain(planted);
-      }
-      expect(serialised).not.toMatch(/authorization|bearer/i);
-      expect(detection.devServerUrl).toBe('http://localhost:4100/');
-      expect(secretShapedRuns(serialised)).toEqual([]);
-    });
+        const serialised = JSON.stringify(detection);
+        expect(JSON.parse(serialised)).toStrictEqual(detection);
+        for (const planted of [plantedToken, plantedIngest, queryValue, plantedValue(59, 16)]) {
+          expect(serialised).not.toContain(planted);
+          expect(JSON.stringify(records)).not.toContain(planted);
+        }
+        expect(serialised).not.toMatch(/authorization|bearer/i);
+        expect(detection.devServerUrl).toBe('http://localhost:4100/');
+        expect(secretShapedRuns(serialised)).toEqual([]);
+      },
+    );
 
     it('logs one info line under the dev-server subsystem', async () => {
       const { logger, records } = recordingLogger();
@@ -2097,7 +2782,7 @@ describe('detectDevServer', () => {
       await detectDevServer(
         { projectRoot: PROJECT_ROOT, devServerUrl: DEV_URL },
         portalDeps({
-          fetchImpl: answering(200),
+          fetchImpl: answeringAsNext(200),
           serverAgents: presence(true).serverAgents,
           logger,
         }),
@@ -2109,6 +2794,8 @@ describe('detectDevServer', () => {
         subsystem: 'dev-server',
         projectRoot: PROJECT_ROOT,
         running: true,
+        identifiedBy: 'framework-signature',
+        occupied: false,
         preloadAttached: true,
         preloadReason: 'server-agent-connected',
       });

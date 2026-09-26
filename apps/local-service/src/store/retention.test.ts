@@ -67,7 +67,8 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
+import type { SQLInputValue, SQLOutputValue, StatementSync } from 'node:sqlite';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
@@ -77,7 +78,12 @@ import type {
   ModificationRecord,
   ModificationStatus,
 } from '@debuggen/instrumentation';
-import { createAnalysisResult, parseAnalysisResult, parseSessionRecord } from '@debuggen/protocol';
+import {
+  SESSION_STATUSES,
+  createAnalysisResult,
+  parseAnalysisResult,
+  parseSessionRecord,
+} from '@debuggen/protocol';
 import type { AnalysisResult, PanelSpec, SessionRecord, SessionStatus } from '@debuggen/protocol';
 import {
   isErr,
@@ -95,20 +101,35 @@ import { SECURE_DIR_MODE, sha256OfFileSync } from '@debuggen/shared/node';
 
 import { openStore } from './db.js';
 import type { Store } from './db.js';
-import { createModificationsRepo } from './modifications-repo.js';
+import {
+  SELECT_SESSION_BACKUP_REFERENCES_SQL,
+  createModificationsRepo,
+} from './modifications-repo.js';
 import type { ModificationsRepo } from './modifications-repo.js';
 import { createPanelsRepo } from './panels-repo.js';
 import type { PanelsRepo } from './panels-repo.js';
-import { DEFAULT_RETENTION_DAYS, ORPHAN_BACKUP_GRACE_DAYS, runRetention } from './retention.js';
+import {
+  BACKUP_PROBE_BATCH_SIZE,
+  DEFAULT_RETENTION_DAYS,
+  IN_FLIGHT_SESSION_STATUSES,
+  MAX_REPORTED_ITEMS,
+  ORPHAN_BACKUP_GRACE_DAYS,
+  RETENTION_CANDIDATE_PAGE_SIZE,
+  runRetention,
+} from './retention.js';
 import type {
   RetentionDeps,
   RetentionIssue,
   RetentionOptions,
   RetentionReport,
 } from './retention.js';
-import { createSessionsRepo } from './sessions-repo.js';
-import type { SessionsRepo } from './sessions-repo.js';
-import { createTelemetryRepo } from './telemetry-repo.js';
+import {
+  SELECT_RETENTION_CANDIDATES_AFTER_SQL,
+  SELECT_RETENTION_CANDIDATES_SQL,
+  createSessionsRepo,
+} from './sessions-repo.js';
+import type { ListRetentionCandidatesOptions, SessionsRepo } from './sessions-repo.js';
+import { DEFAULT_PURGE_BATCH_SIZE, createTelemetryRepo } from './telemetry-repo.js';
 import type { PersistableTelemetryEvent, TelemetryRepo } from './telemetry-repo.js';
 
 /* -------------------------------------------------------------------------------------------------
@@ -1170,6 +1191,304 @@ describe('the conflict exemption', () => {
 });
 
 /* -------------------------------------------------------------------------------------------------
+ * One decision and one cascade per session, and no purge of an active one
+ * ---------------------------------------------------------------------------------------------- */
+
+/** How many events one seeding `insertMany` call carries. */
+const TELEMETRY_SEED_CHUNK = 1_000;
+
+/** More telemetry than one batch of the telemetry repository's batched purge holds. */
+const LARGE_TELEMETRY = DEFAULT_PURGE_BATCH_SIZE + 25;
+
+/** What {@link seedTelemetry} may vary. */
+interface TelemetrySeed {
+  /** Leave the capture window open, as a capture still in progress does. */
+  readonly open?: boolean;
+}
+
+/**
+ * Adds one capture holding `count` telemetry events to a session, written at
+ * `at` in chunks, and proves none of it refreshed the session's age.
+ *
+ * @returns The capture's id.
+ */
+function seedTelemetry(
+  harness: Harness,
+  sessionId: SessionId,
+  at: number,
+  count: number,
+  seed: TelemetrySeed = {},
+): CaptureId {
+  return withClock(harness, at, () => {
+    const captureId = newCaptureId();
+    unwrap(harness.sessions.startCapture({ sessionId, planVersion: 1, captureId, startedAt: at }));
+    for (let written = 0; written < count; written += TELEMETRY_SEED_CHUNK) {
+      const size = Math.min(TELEMETRY_SEED_CHUNK, count - written);
+      const events = Array.from({ length: size }, () =>
+        makeEvent(harness, sessionId, captureId, at),
+      );
+      expect(unwrap(harness.telemetry.insertMany(events)).inserted).toBe(size);
+    }
+    if (seed.open !== true) {
+      unwrap(harness.sessions.stopCapture({ captureId, stoppedAt: at + 1_000 }));
+    }
+    expect(storedUpdatedAt(harness, sessionId)).toBe(at);
+    return captureId;
+  });
+}
+
+/** Asserts that no row of any cascading table still belongs to `sessionId`. */
+function expectNoRowsLeft(harness: Harness, sessionId: SessionId): void {
+  for (const table of SESSION_SCOPED_TABLES) {
+    expect(rowsFor(harness, table, sessionId), table).toBe(0);
+  }
+}
+
+/** The `ingest_seq` of a session's last-inserted event. */
+function lastIngestSeq(harness: Harness, sessionId: SessionId): number {
+  return readCount(
+    harness.store
+      .statement('SELECT MAX(ingest_seq) AS n FROM telemetry_events WHERE session_id = ?')
+      .get(sessionId),
+  );
+}
+
+/** The resting statuses: every status outside {@link IN_FLIGHT_SESSION_STATUSES}. */
+const RESTING_STATUSES: readonly SessionStatus[] = SESSION_STATUSES.filter(
+  (status) => !IN_FLIGHT_SESSION_STATUSES.includes(status),
+);
+
+describe('an atomic purge that never touches an active session', () => {
+  it('purges a session holding more than one purge batch of telemetry in a single cascade', async () => {
+    const { sessionId, contents } = await seedFullSession(h, AGED_AT);
+    seedTelemetry(h, sessionId, AGED_AT, LARGE_TELEMETRY);
+
+    const report = await sweep(h);
+
+    expect(report.sessionIdsDeleted).toEqual([sessionId]);
+    expect(report.telemetryEventsDeleted).toBe(contents.telemetryEvents + LARGE_TELEMETRY);
+    expect(report.backupDirsDeleted).toBe(1);
+    expect(report.errors).toEqual([]);
+    expectNoRowsLeft(h, sessionId);
+    expect(sessionExists(h, sessionId)).toBe(false);
+  });
+
+  it('rolls a large session back whole when its cascade fails past the first purge batch, and carries on', async () => {
+    const failing = await seedFullSession(h, AGED_AT);
+    seedTelemetry(h, failing.sessionId, AGED_AT, LARGE_TELEMETRY);
+    const sibling = await seedFullSession(h, AGED_AT + DAY_MS);
+    const rowsBefore = scopedCounts(h, failing.sessionId);
+    expect(rowsBefore.telemetry_events).toBeGreaterThan(DEFAULT_PURGE_BATCH_SIZE);
+
+    // The session's last-inserted event refuses to be deleted, so the cascade
+    // fails after more rows than one purge batch holds. The engine's message is
+    // the sentinel, so the report and the logs can be proven free of it.
+    h.store.db.exec(
+      `CREATE TEMP TRIGGER retention_cascade_failure BEFORE DELETE ON main.telemetry_events ` +
+        `WHEN old.ingest_seq = ${String(lastIngestSeq(h, failing.sessionId))} ` +
+        `BEGIN SELECT RAISE(ABORT, '${SENTINEL}'); END`,
+    );
+
+    const report = await sweep(h);
+
+    // Nothing of the failing session went — not one event of any batch.
+    expect(sessionExists(h, failing.sessionId)).toBe(true);
+    expect(scopedCounts(h, failing.sessionId)).toEqual(rowsBefore);
+    expect(present(failing.contents.modification.backupPath)).toBe(true);
+    expect(issuesAt(report, 'session', failing.sessionId)).toHaveLength(1);
+    expect(report.errors).toHaveLength(1);
+    // The sweep went on to the next candidate.
+    expect(report.sessionIdsDeleted).toEqual([sibling.sessionId]);
+    expect(report.telemetryEventsDeleted).toBe(sibling.contents.telemetryEvents);
+    expectNoRowsLeft(h, sibling.sessionId);
+    // No engine text reaches the report or a log record.
+    expect(JSON.stringify(report)).not.toContain(SENTINEL);
+    expect(JSON.stringify(h.logs)).not.toContain(SENTINEL);
+
+    h.store.db.exec('DROP TRIGGER retention_cascade_failure');
+    const retry = await sweep(h);
+
+    expect(retry.sessionIdsDeleted).toEqual([failing.sessionId]);
+    expect(retry.telemetryEventsDeleted).toBe(rowsBefore.telemetry_events);
+    expect(retry.errors).toEqual([]);
+    expectNoRowsLeft(h, failing.sessionId);
+    expect(present(failing.contents.modification.backupPath)).toBe(false);
+  });
+
+  it('keeps every event of a large session refreshed after it was listed', async () => {
+    const { sessionId, contents } = await seedFullSession(h, AGED_AT);
+    seedTelemetry(h, sessionId, AGED_AT, LARGE_TELEMETRY);
+    const rowsBefore = scopedCounts(h, sessionId);
+
+    // A client touches the session between the candidate listing and the
+    // decision, as a live service does when the developer resumes it.
+    let refreshed = false;
+    const modifications: ModificationsRepo = {
+      ...h.modifications,
+      listConflicts: (...args: Parameters<ModificationsRepo['listConflicts']>) => {
+        if (args[0] === sessionId && !refreshed) {
+          refreshed = true;
+          unwrap(h.sessions.setStatus(sessionId, 'ended'));
+        }
+        return h.modifications.listConflicts(...args);
+      },
+    };
+
+    const report = await sweep(h, {}, { modifications });
+
+    expect(refreshed).toBe(true);
+    expect(storedUpdatedAt(h, sessionId)).toBe(NOW);
+    expect(report.sessionsDeleted).toBe(0);
+    expect(report.sessionIdsDeleted).toEqual([]);
+    expect(report.telemetryEventsDeleted).toBe(0);
+    expect(report.errors).toEqual([]);
+    expect(sessionExists(h, sessionId)).toBe(true);
+    expect(scopedCounts(h, sessionId)).toEqual(rowsBefore);
+    expect(present(contents.modification.backupPath)).toBe(true);
+    expect(
+      h.logs.some(
+        (log) =>
+          log.message === 'aged session no longer eligible at deletion time' &&
+          log.fields['outcome'] === 'refreshed',
+      ),
+    ).toBe(true);
+  });
+
+  it('retains an aged session in any in-flight status and purges one at rest, dry run and real alike', async () => {
+    const active: SessionId[] = [];
+    for (const status of IN_FLIGHT_SESSION_STATUSES) {
+      active.push((await seedFullSession(h, AGED_AT, { status })).sessionId);
+    }
+    const resting: SessionId[] = [];
+    for (const status of RESTING_STATUSES) {
+      resting.push((await seedFullSession(h, AGED_AT, { status })).sessionId);
+    }
+    const activeCounts = active.map((sessionId) => scopedCounts(h, sessionId));
+
+    const dry = await sweep(h, { dryRun: true });
+    const report = await sweep(h);
+
+    expect(comparable(report)).toEqual(comparable(dry));
+    expect(report.sessionsRetainedActive).toEqual([...active].sort());
+    expect(report.sessionIdsDeleted).toEqual([...resting].sort());
+    expect(report.sessionsRetainedForConflicts).toEqual([]);
+    expect(report.errors).toEqual([]);
+    expect(active.map((sessionId) => scopedCounts(h, sessionId))).toEqual(activeCounts);
+    for (const sessionId of resting) {
+      expectNoRowsLeft(h, sessionId);
+    }
+    expect(
+      h.logs.filter(
+        (log) =>
+          log.message === 'retaining an aged session: it is still active' &&
+          log.fields['reason'] === 'in-flight',
+      ),
+    ).toHaveLength(active.length * 2);
+  });
+
+  it('retains an aged session holding an open capture window until that window closes', async () => {
+    const { sessionId, contents } = await seedFullSession(h, AGED_AT, { status: 'ready' });
+    const captureId = seedTelemetry(h, sessionId, AGED_AT, 10, { open: true });
+    const events = contents.telemetryEvents + 10;
+
+    const held = await sweep(h);
+
+    expect(held.sessionsRetainedActive).toEqual([sessionId]);
+    expect(held.sessionsDeleted).toBe(0);
+    expect(held.errors).toEqual([]);
+    expect(rowsFor(h, 'telemetry_events', sessionId)).toBe(events);
+
+    // Closing the window does not refresh the session, so it ages out at once.
+    withClock(h, AGED_AT, () =>
+      unwrap(h.sessions.stopCapture({ captureId, stoppedAt: AGED_AT + 2_000 })),
+    );
+    expect(storedUpdatedAt(h, sessionId)).toBe(AGED_AT);
+    const released = await sweep(h);
+
+    expect(released.sessionIdsDeleted).toEqual([sessionId]);
+    expect(released.sessionsRetainedActive).toEqual([]);
+    expect(released.telemetryEventsDeleted).toBe(events);
+    expectNoRowsLeft(h, sessionId);
+  });
+
+  it('asks the caller last, inside the deleting transaction, and reads a failing answer as in use', async () => {
+    const claimed = (await seedFullSession(h, AGED_AT)).sessionId;
+    const unanswered = (await seedFullSession(h, AGED_AT)).sessionId;
+    const free = (await seedFullSession(h, AGED_AT)).sessionId;
+    const conflicted = (await seedFullSession(h, AGED_AT, {}, { status: 'conflict' })).sessionId;
+    const inFlight = (await seedFullSession(h, AGED_AT, { status: 'analyzing' })).sessionId;
+    const recent = (await seedFullSession(h, RECENT_AT)).sessionId;
+
+    const asked: { readonly sessionId: SessionId; readonly inTransaction: boolean }[] = [];
+    const report = await sweep(
+      h,
+      {},
+      {
+        isSessionInUse: (sessionId) => {
+          asked.push({ sessionId, inTransaction: h.store.db.isTransaction });
+          if (sessionId === unanswered) {
+            throw new Error(SENTINEL);
+          }
+          return sessionId === claimed;
+        },
+      },
+    );
+
+    expect(report.sessionsRetainedActive).toEqual([claimed, inFlight, unanswered].sort());
+    expect(report.sessionsRetainedForConflicts).toEqual([conflicted]);
+    expect(report.sessionIdsDeleted).toEqual([free]);
+    expect(report.errors).toEqual([]);
+    // Only sessions every other rule let through were asked, each inside the
+    // transaction that deletes it.
+    expect(asked.map((entry) => entry.sessionId).sort()).toEqual(
+      [claimed, free, unanswered].sort(),
+    );
+    expect(asked.every((entry) => entry.inTransaction)).toBe(true);
+    for (const sessionId of [claimed, unanswered, inFlight, conflicted, recent]) {
+      expect(sessionExists(h, sessionId)).toBe(true);
+    }
+    expect(JSON.stringify(h.logs)).not.toContain(SENTINEL);
+  });
+
+  it('tells the listener of each deleted session after its transaction, never on a dry run, and survives a throwing listener', async () => {
+    const first = (await seedFullSession(h, AGED_AT)).sessionId;
+    const second = (await seedFullSession(h, AGED_AT)).sessionId;
+    const inFlight = (await seedFullSession(h, AGED_AT, { status: 'analyzing' })).sessionId;
+    const recent = (await seedFullSession(h, RECENT_AT)).sessionId;
+
+    const told: { readonly sessionId: SessionId; readonly inTransaction: boolean }[] = [];
+    const listen = (sessionId: SessionId): void => {
+      told.push({ sessionId, inTransaction: h.store.db.isTransaction });
+      if (sessionId === first) {
+        throw new Error(SENTINEL);
+      }
+    };
+
+    const dry = await sweep(h, { dryRun: true }, { onSessionDeleted: listen });
+    expect(dry.sessionIdsDeleted).toEqual([first, second].sort());
+    expect(told).toEqual([]);
+
+    const report = await sweep(h, {}, { onSessionDeleted: listen });
+
+    expect(report.sessionIdsDeleted).toEqual([first, second].sort());
+    expect(report.errors).toEqual([]);
+    expect(told.map((entry) => entry.sessionId).sort()).toEqual([first, second].sort());
+    // Told once the delete has committed, so the listener sees no open transaction.
+    expect(told.every((entry) => !entry.inTransaction)).toBe(true);
+    for (const sessionId of [first, second]) {
+      expectNoRowsLeft(h, sessionId);
+    }
+    for (const sessionId of [inFlight, recent]) {
+      expect(sessionExists(h, sessionId)).toBe(true);
+    }
+    expect(
+      h.logs.filter((log) => log.message === 'the listener for a purged session failed'),
+    ).toHaveLength(1);
+    expect(JSON.stringify(h.logs)).not.toContain(SENTINEL);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
  * Rule 3 — orphan backups
  * ---------------------------------------------------------------------------------------------- */
 
@@ -1736,6 +2055,354 @@ describe('windows and constants', () => {
     expect(purged.sessionIdsDeleted).toEqual([yesterday]);
     expect(purged.orphanBackupsDeleted).toBe(1);
     expect(present(orphan)).toBe(false);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * Bounded work
+ * ---------------------------------------------------------------------------------------------- */
+
+/** What {@link observeStore} records of the sweep's own use of the store. */
+interface ObservedStore {
+  /** A store that forwards everything to the real one. */
+  readonly store: Store;
+  /** Every SQL text the sweep prepared through it, in order. */
+  readonly prepared: string[];
+  /**
+   * How many transactions and checkpoints the sweep asked it for, and how many
+   * journal rows its backup-reference probes read.
+   */
+  readonly calls: { transactions: number; checkpoints: number; referenceRowsRead: number };
+}
+
+/**
+ * Wraps a store so the calls the sweep makes on it directly — its journal
+ * probes and the rows they read, its per-session transactions, its checkpoint
+ * — are recorded. The repositories keep the real store, so only the sweep's
+ * own access is seen.
+ */
+function observeStore(store: Store): ObservedStore {
+  const prepared: string[] = [];
+  const calls = { transactions: 0, checkpoints: 0, referenceRowsRead: 0 };
+  const forward = <T extends object>(target: T, key: PropertyKey): unknown => {
+    const value: unknown = Reflect.get(target, key);
+    return typeof value === 'function'
+      ? (value as (...args: unknown[]) => unknown).bind(target)
+      : value;
+  };
+  const countRows = (statement: StatementSync): StatementSync =>
+    new Proxy(statement, {
+      get(target, key): unknown {
+        if (key === 'iterate') {
+          return function* (...args: SQLInputValue[]): Generator<Record<string, SQLOutputValue>> {
+            for (const row of target.iterate(...args)) {
+              calls.referenceRowsRead += 1;
+              yield row;
+            }
+          };
+        }
+        return forward(target, key);
+      },
+    });
+  const observed = new Proxy(store, {
+    get(target, key): unknown {
+      if (key === 'statement') {
+        return (sql: string): StatementSync => {
+          prepared.push(sql);
+          const statement = target.statement(sql);
+          return sql === SELECT_SESSION_BACKUP_REFERENCES_SQL ? countRows(statement) : statement;
+        };
+      }
+      if (key === 'transaction') {
+        return <T>(fn: () => T): T => {
+          calls.transactions += 1;
+          return target.transaction(fn);
+        };
+      }
+      if (key === 'checkpoint') {
+        return (): void => {
+          calls.checkpoints += 1;
+          target.checkpoint();
+        };
+      }
+      return forward(target, key);
+    },
+  });
+  return { store: observed, prepared, calls };
+}
+
+/** How many journal probes the sweep ran through an observed store. */
+function probesOf(observed: ObservedStore): number {
+  return observed.prepared.filter((sql) => sql === SELECT_SESSION_BACKUP_REFERENCES_SQL).length;
+}
+
+/**
+ * Journals `count` reverted records for `sessionId` straight into the table —
+ * an unrelated live journal the probes must never read. Their backups are not
+ * written: only the rows matter here.
+ */
+function seedUnrelatedJournal(harness: Harness, sessionId: SessionId, count: number): void {
+  const insert = harness.store.statement(
+    `INSERT INTO modifications (id, session_id, plan_version, file, original_hash, backup_path,
+       instrumented_hash, applied_at, updated_at, status, diff)
+     VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, 'reverted', '')`,
+  );
+  const before = rowsFor(harness, 'modifications', sessionId);
+  harness.store.transaction(() => {
+    for (let index = 0; index < count; index += 1) {
+      const originalHash = hashOf(harness, `bulk:original:${String(index)}`);
+      insert.run(
+        `mod_bulk_${String(index).padStart(6, '0')}`,
+        sessionId,
+        `src/bulk/file-${String(index)}.ts`,
+        originalHash,
+        join(harness.backupsDir, sessionId, originalHash),
+        hashOf(harness, `bulk:instrumented:${String(index)}`),
+        RECENT_AT,
+        RECENT_AT,
+      );
+    }
+  });
+  expect(rowsFor(harness, 'modifications', sessionId)).toBe(before + count);
+}
+
+/** The details of SQLite's plan for `sql`, bound to `args`. */
+function planOf(harness: Harness, sql: string, ...args: SQLInputValue[]): string[] {
+  return harness.store.db
+    .prepare(`EXPLAIN QUERY PLAN ${sql}`)
+    .all(...args)
+    .map((row) => String(row['detail']));
+}
+
+describe('bounded work', () => {
+  it('reads every candidate page and every backup probe from an index, with no sort or scan', () => {
+    const plans = [
+      planOf(h, SELECT_RETENTION_CANDIDATES_SQL, NOW, RETENTION_CANDIDATE_PAGE_SIZE),
+      planOf(
+        h,
+        SELECT_RETENTION_CANDIDATES_AFTER_SQL,
+        NOW,
+        AGED_AT,
+        1,
+        RETENTION_CANDIDATE_PAGE_SIZE,
+      ),
+      planOf(h, SELECT_SESSION_BACKUP_REFERENCES_SQL, fixedSessionId('plan')),
+    ];
+
+    for (const plan of plans) {
+      expect(plan.length).toBeGreaterThan(0);
+      for (const detail of plan) {
+        expect(detail).toMatch(/^SEARCH \w+ USING (COVERING )?INDEX /);
+        expect(detail).not.toContain('TEMP B-TREE');
+      }
+    }
+    expect(plans[0]?.[0]).toContain('idx_sessions_updated_at');
+    expect(plans[1]?.[0]).toContain('idx_sessions_updated_at');
+  });
+
+  it('purges a backlog of several candidate pages page by page, ties included, with capped lists and exact counts', async () => {
+    // The two oldest are in flight, so they stay behind the cursor on page one.
+    const retainedAhead = [0, 1].map((offset) =>
+      seedSession(h, { updatedAt: ANCIENT_AT + offset, status: 'capturing' }),
+    );
+    // Six hundred sessions share one updated_at — more than a page — so a page
+    // boundary falls inside the tie group and the keyset's tie-break carries
+    // the cursor through it; the rest come in groups of seven.
+    const purgeable = new Set<SessionId>();
+    for (let index = 0; index < MAX_REPORTED_ITEMS + 1; index += 1) {
+      const updatedAt = index < 600 ? AGED_AT : AGED_AT + 1 + Math.floor(index / 7);
+      purgeable.add(seedSession(h, { updatedAt }));
+    }
+    const total = retainedAhead.length + purgeable.size;
+
+    const pages: ListRetentionCandidatesOptions[] = [];
+    const seen: SessionId[] = [];
+    const sessions: SessionsRepo = {
+      ...h.sessions,
+      listRetentionCandidates: (options: ListRetentionCandidatesOptions) => {
+        pages.push(options);
+        const page = h.sessions.listRetentionCandidates(options);
+        if (!isErr(page)) {
+          seen.push(...page.value.map((candidate) => candidate.id));
+        }
+        return page;
+      },
+    };
+    const report = await sweep(h, {}, { sessions });
+
+    // Every count is exact; the lists stop at the cap and `omitted` holds the rest.
+    expect(report.sessionsDeleted).toBe(purgeable.size);
+    expect(report.sessionIdsDeleted).toHaveLength(MAX_REPORTED_ITEMS);
+    expect(new Set(report.sessionIdsDeleted).size).toBe(MAX_REPORTED_ITEMS);
+    expect(report.sessionIdsDeleted.every((sessionId) => purgeable.has(sessionId))).toBe(true);
+    expect(report.sessionIdsDeleted).toEqual([...report.sessionIdsDeleted].sort());
+    expect(report.sessionsRetainedActive).toEqual([...retainedAhead].sort());
+    expect(report.omitted).toEqual({
+      sessionIdsDeleted: purgeable.size - MAX_REPORTED_ITEMS,
+      sessionsRetainedForConflicts: 0,
+      sessionsRetainedActive: 0,
+      errors: 0,
+    });
+    expect(report.errors).toEqual([]);
+    for (const sessionId of purgeable) {
+      expect(sessionExists(h, sessionId)).toBe(false);
+    }
+    for (const sessionId of retainedAhead) {
+      expect(sessionExists(h, sessionId)).toBe(true);
+    }
+
+    // Every candidate was read exactly once, across keyset pages under one
+    // stable cutoff: the first from the start, each later one strictly past
+    // the last candidate of the one before.
+    expect(seen).toHaveLength(total);
+    expect(new Set(seen).size).toBe(total);
+    expect(pages).toHaveLength(Math.ceil(total / RETENTION_CANDIDATE_PAGE_SIZE));
+    expect(pages[0]?.after).toBeUndefined();
+    expect(new Set(pages.map((page) => page.updatedBefore))).toEqual(new Set([report.cutoff]));
+    expect(pages.every((page) => page.limit === RETENTION_CANDIDATE_PAGE_SIZE)).toBe(true);
+    const cursors = pages.slice(1).map((page) => page.after);
+    // The first page boundary falls inside the six-hundred-session tie group.
+    expect(cursors[0]?.updatedAt).toBe(AGED_AT);
+    for (const [index, cursor] of cursors.entries()) {
+      expect(cursor).toBeDefined();
+      const previous = cursors[index - 1];
+      if (cursor !== undefined && previous !== undefined) {
+        const ascending =
+          cursor.updatedAt > previous.updatedAt ||
+          (cursor.updatedAt === previous.updatedAt && cursor.position > previous.position);
+        expect(ascending).toBe(true);
+      }
+    }
+  });
+
+  it('caps the issue list at the reported maximum and counts the rest', async () => {
+    const target = join(h.outside, 'link-target');
+    writeFileSync(target, SENTINEL);
+    const links = MAX_REPORTED_ITEMS + 2;
+    for (let index = 0; index < links; index += 1) {
+      symlinkSync(target, join(h.backupsDir, `link-${String(index).padStart(5, '0')}`));
+    }
+
+    const report = await sweep(h);
+
+    expect(report.errors).toHaveLength(MAX_REPORTED_ITEMS);
+    expect(report.omitted.errors).toBe(links - MAX_REPORTED_ITEMS);
+    expect(report.errors.every((issue) => issue.scope === 'backup')).toBe(true);
+    expect(readFileSync(target, 'utf8')).toBe(SENTINEL);
+    expect(readdirSync(h.backupsDir)).toHaveLength(links);
+  });
+
+  it('reads no journal row, opens no transaction and writes nothing when nothing has aged', async () => {
+    const live = await seedFullSession(h, RECENT_AT);
+    seedUnrelatedJournal(h, live.sessionId, 500);
+    writeLooseBackup(h, fixedSessionId('young'), 'orphan-in-grace', RECENT_AT);
+    writeIndexEntry(h, 'recent-cache.json', { projectRoot: PROJECT_B }, RECENT_AT);
+    const rowsBefore = tableTotals(h);
+    const treeBefore = snapshotTree(h);
+    const observed = observeStore(h.store);
+
+    const report = await sweep(h, {}, { store: observed.store });
+
+    expect(probesOf(observed)).toBe(0);
+    expect(observed.calls).toEqual({ transactions: 0, checkpoints: 0, referenceRowsRead: 0 });
+    expect(report).toMatchObject({
+      sessionsDeleted: 0,
+      telemetryEventsDeleted: 0,
+      backupDirsDeleted: 0,
+      orphanBackupsDeleted: 0,
+      indexCachesDeleted: 0,
+      bytesReclaimed: 0,
+      errors: [],
+    });
+    expect(report.durationMs).toBeGreaterThanOrEqual(0);
+    expect(report.durationMs).toBeLessThan(10_000);
+    expect(tableTotals(h)).toEqual(rowsBefore);
+    expect(snapshotTree(h)).toEqual(treeBefore);
+    expect(present(live.contents.modification.backupPath)).toBe(true);
+  });
+
+  it('judges old backup files in bounded batches against their own session only, never the unrelated journal', async () => {
+    const live = await seedFullSession(h, RECENT_AT, {}, { backupAt: ANCIENT_AT });
+    const liveDir = join(h.backupsDir, live.sessionId);
+    const strays = BACKUP_PROBE_BATCH_SIZE + 2;
+    for (let index = 0; index < strays; index += 1) {
+      writeLooseBackup(h, live.sessionId, `stray-${String(index).padStart(5, '0')}`, ANCIENT_AT);
+    }
+    const ghostDir = join(h.backupsDir, fixedSessionId('ghost'));
+    const ghosts = ['one', 'two', 'three'].map((name) =>
+      writeLooseBackup(h, fixedSessionId('ghost'), name, ANCIENT_AT),
+    );
+    // A large journal of another live session, which no probe may read.
+    const bulk = seedSession(h, { updatedAt: RECENT_AT });
+    seedUnrelatedJournal(h, bulk, 2_500);
+    const observed = observeStore(h.store);
+
+    const report = await sweep(h, {}, { store: observed.store });
+
+    // The live directory's old files — its referenced backup included — went
+    // in two batches, the ghost's in one; each probe read only its own
+    // session's records: one for the live session, none for the ghost.
+    const liveCandidates = strays + 1;
+    expect(probesOf(observed)).toBe(Math.ceil(liveCandidates / BACKUP_PROBE_BATCH_SIZE) + 1);
+    expect(observed.calls.referenceRowsRead).toBe(
+      Math.ceil(liveCandidates / BACKUP_PROBE_BATCH_SIZE),
+    );
+    expect(report.orphanBackupsDeleted).toBe(strays + ghosts.length);
+    expect(report.backupDirsDeleted).toBe(1);
+    expect(report.errors).toEqual([]);
+    expect(readdirSync(liveDir)).toEqual([basename(live.contents.modification.backupPath)]);
+    expect(present(live.contents.modification.backupPath)).toBe(true);
+    expect(present(ghostDir)).toBe(false);
+  });
+
+  it("protects a composed backup through its record's original digest, wherever the recorded path points", async () => {
+    // The backup store reads a record's composed backup, backups/<session>/<digest>,
+    // whenever the recorded path is not one it will open — here, a path outside
+    // the state root. The composed file is therefore still that record's backup.
+    const live = seedSession(h, { updatedAt: RECENT_AT });
+    const moved = await withClockAsync(h, RECENT_AT, async () => {
+      const composed = makeModification(h, { sessionId: live });
+      const record = { ...composed, backupPath: join(h.outside, 'moved-away') };
+      const stored = unwrap(await h.modifications.append(record));
+      unwrap(await h.modifications.updateStatus(stored.id, 'reverted'));
+      return composed.backupPath;
+    });
+    writeDatedFile(moved, 'original bytes of the composed backup\n', ANCIENT_AT);
+
+    const report = await sweep(h);
+
+    expect(present(moved)).toBe(true);
+    expect(report.orphanBackupsDeleted).toBe(0);
+    expect(report.backupDirsDeleted).toBe(0);
+    expect(report.errors).toEqual([]);
+  });
+
+  it("removes a purged session's backup directory whole, since no other session's record resolves into it", async () => {
+    const aged = await seedFullSession(h, AGED_AT);
+    const agedDir = join(h.backupsDir, aged.sessionId);
+    const live = seedSession(h, { updatedAt: RECENT_AT });
+    const foreign = join(agedDir, 'named-by-another-session');
+    writeDatedFile(foreign, 'bytes another session names\n', ANCIENT_AT);
+    const recordId = await withClockAsync(h, RECENT_AT, async () => {
+      const record = { ...makeModification(h, { sessionId: live }), backupPath: foreign };
+      const stored = unwrap(await h.modifications.append(record));
+      unwrap(await h.modifications.updateStatus(stored.id, 'reverted'));
+      return stored.id;
+    });
+    const observed = observeStore(h.store);
+
+    const report = await sweep(h, {}, { store: observed.store });
+
+    expect(report.sessionIdsDeleted).toEqual([aged.sessionId]);
+    expectNoRowsLeft(h, aged.sessionId);
+    expect(report.backupDirsDeleted).toBe(1);
+    expect(present(agedDir)).toBe(false);
+    expect(report.errors).toEqual([]);
+    // Removing the purged directory needed no journal read at all.
+    expect(probesOf(observed)).toBe(0);
+    // The other session's record is untouched; the backup store would resolve
+    // it to its own session's composed path, never to the removed file.
+    expect(unwrap(await h.modifications.get(recordId))?.sessionId).toBe(live);
   });
 });
 

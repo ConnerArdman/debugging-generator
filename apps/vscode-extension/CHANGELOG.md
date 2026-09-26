@@ -4,12 +4,14 @@ All notable changes to the **Debug Generator** extension are recorded here. The 
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the extension follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.0] - 2026-09-20
+## [0.1.0] - Unreleased
 
-First release of the editor side of Debug Generator. You ask a debugging question about the project
-open in your workspace here; the generated debugging panel appears in the **Debug Generator** panel
-in Chrome DevTools, and the runtime items it shows link back to the lines of source they came from,
-which open in this editor.
+The first version of the editor side of Debug Generator, in development and not yet released or
+published. You ask a debugging question about the project open in your workspace here; the
+generated debugging panel appears in the **Debug Generator** panel in Chrome DevTools. Each runtime
+item it shows whose source location can be resolved links back to that line, which opens in this
+editor; an item whose location cannot be established is shown as unresolved rather than linked to
+a guess.
 
 ### Added
 
@@ -61,9 +63,13 @@ which open in this editor.
   machine.
 - Click-to-source: a source location opens the file at its line and column, places the selection
   there, reveals it in the editor and highlights the line briefly so you can see where you landed.
-- URI handler `vscode://debuggen.debug-generator/open?file&line&col`, used when the editor is not
-  connected to the service as a client. It validates the parameters independently, rejects paths
-  that resolve outside an open workspace folder, and asks for confirmation before opening anything.
+- Click-to-source reports this editor's result back to the DevTools panel (`source.result`), so
+  the panel shows a location as opened only once the editor has opened it, and shows a failure
+  otherwise.
+- URI handler `vscode://debuggen.debug-generator/open?file&line&col`, which the DevTools panel opens
+  when the editor is not connected to the service as a client. It validates the parameters
+  independently, rejects paths that resolve outside an open workspace folder, and asks for
+  confirmation before opening anything.
 - Self-contained packaging: the VSIX embeds the local coordination service, its versioned prompt
   files and the telemetry Node preload, so installing the extension is the only install step on the
   editor side.

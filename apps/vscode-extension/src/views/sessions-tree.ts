@@ -30,10 +30,27 @@
  *   `Result` and never rejects, so failures are branched on, not caught. A
  *   failure keeps its code, message and hint for display and logs its code
  *   only (AAP §0.5.2).
+ * - **Rows, not records, and every page of them.** `GET /sessions` answers one
+ *   page of `SessionListItem` rows — the fields a row renders and a diff-free
+ *   cleanup summary, most recently updated first — with the listing's `total`
+ *   and the `nextOffset` of the following page. One load walks the listing in
+ *   bounded requests of {@link SESSION_LIST_MAX_LIMIT} rows, from offset `0`
+ *   along `nextOffset` until it is `null`, so every stored session is listed
+ *   and selecting any of them reopens it (AAP §0.7.3). A row that two pages
+ *   both carry — the listing shifts when a session is created or updated
+ *   between two requests — is kept once, as the earlier page served it. The
+ *   gathered rows and the last page's `total` are written to the store once,
+ *   when the walk ends, so the views render one coherent list rather than a
+ *   list that grows page by page.
+ * - **Bounded, and honest when bounded.** A load requests at most
+ *   {@link SESSION_LIST_PAGE_CAP} pages. When that cap stops the walk, or a page
+ *   after the first fails, the rows gathered so far are kept and the tree ends
+ *   with one informational row that says how many sessions it does not list
+ *   and why, so a shortened list is never presented as the whole one.
  * - **Every label is data.** Labels, descriptions and tooltips are derived from
- *   `SessionRecord` fields; nothing inspects what a question means, nothing is
- *   seeded or canned, and the question is only whitespace-collapsed and
- *   truncated for display (AAP §0.5.4).
+ *   list-row fields and the listing's `total`; nothing inspects what a
+ *   question means, nothing is seeded or canned, and the question is only
+ *   whitespace-collapsed and truncated for display (AAP §0.5.4).
  *
  * ## When the tree fetches — and the loop it must never enter
  *
@@ -51,18 +68,23 @@
  *    or the active session is missing from the list and has not been fetched
  *    for yet (`applySessionRecord` refreshes listed sessions but never adds one,
  *    so a newly created session appears only through this fetch).
- * 3. A failed fetch writes nothing to the store and fires nothing, so it cannot
- *    re-enter the render that started it.
+ * 3. A load whose first page fails writes nothing to the store and fires
+ *    nothing, so it cannot re-enter the render that started it. A load whose
+ *    later page fails writes the rows it gathered once and records the
+ *    failure, so the next render is governed by the retry rule of 2 — never
+ *    by the write itself.
  *
  * Traced: `getChildren → load → setSessionList → onDidChange →
  * onDidChangeTreeData → getChildren`, and the second render finds the list
  * loaded and the active session listed, so it fetches nothing.
  *
- * Fetches are single-flight: concurrent renders share one request. An explicit
- * {@link SessionsTreeProvider.refresh} issued while a request is in flight
- * queues exactly one follow-up request, because the in-flight answer may
- * predate the change the caller is refreshing for (a purge, say); any number of
- * refreshes during that window share the same follow-up.
+ * Loads are single-flight: concurrent renders share one walk of the listing,
+ * every page of it. An explicit {@link SessionsTreeProvider.refresh} issued
+ * while a walk is in flight queues exactly one follow-up walk, because the
+ * in-flight answer may predate the change the caller is refreshing for (a
+ * purge, say); any number of refreshes during that window share the same
+ * follow-up. Disposing the provider aborts the page request in flight through
+ * the provider's lifetime signal, stops the walk and writes nothing.
  *
  * ## States that are rendered, never thrown (AAP §0.5.5)
  *
@@ -71,7 +93,12 @@
  * service is a row whose click runs `debuggen.startService`, an invalid service
  * URL is a row that opens that setting, an empty store is a row inviting a
  * question, and an unexpected error is caught, logged by code and rendered as a
- * row. A list that loaded once stays visible beneath a later failure row.
+ * row. A list that loaded once stays visible beneath a later failure row. The
+ * "sessions not listed" row appears only when the page cap stopped a walk or a
+ * page after the first failed; it states which, and has no command of its own.
+ * After a failed page the failure row above it carries the recovery action and
+ * the view retries by itself under the rule of 2; after the cap there is
+ * nothing to retry, because the next load would stop at the same cap.
  *
  * ## Module conventions
  *
@@ -99,8 +126,9 @@
 
 import * as vscode from 'vscode';
 
-import type { SessionRecord, SessionStatus } from '@debuggen/protocol';
-import { DebuggenError, assertNever, isOk } from '@debuggen/shared';
+import { SESSION_LIST_MAX_LIMIT } from '@debuggen/protocol';
+import type { SessionListItem, SessionStatus } from '@debuggen/protocol';
+import { DebuggenError, assertNever, isErr } from '@debuggen/shared';
 import type { DebuggenErrorCode, Logger } from '@debuggen/shared';
 
 import type { ServiceClient } from '../service/client';
@@ -134,6 +162,21 @@ export const MAX_SESSION_LABEL_LENGTH = 80;
  */
 export const RETRY_INTERVAL_MS = 2_000;
 
+/**
+ * The most `GET /sessions` pages one load of the tree requests: 20 pages of
+ * {@link SESSION_LIST_MAX_LIMIT} (500) rows, so up to 10 000 sessions.
+ *
+ * A load follows `nextOffset` to the end of the listing, and the protocol's
+ * page validation guarantees each `nextOffset` advances, so a walk always
+ * ends; the cap bounds what one load may cost — requests, rows held, and the
+ * time the first render waits — against a store far larger than the product
+ * produces. At the default 30-day retention (`DEBUGGEN_RETENTION_DAYS`),
+ * 10 000 sessions is more than 300 a day, every day. A walk the cap stops keeps
+ * the 10 000 most recently updated rows, and the tree's "not listed" row states
+ * how many older sessions it leaves out and why.
+ */
+export const SESSION_LIST_PAGE_CAP = 20;
+
 // ---------------------------------------------------------------------------
 // Module constants (immutable)
 // ---------------------------------------------------------------------------
@@ -158,8 +201,9 @@ const OPEN_SETTINGS_COMMAND = 'workbench.action.openSettings';
 const SERVICE_URL_SETTING = 'debuggen.serviceUrl';
 
 /**
- * The bound on one `GET /sessions`. The route is a store read, so anything
- * slower is a hung service; without a bound the first render would never end.
+ * The bound on one `GET /sessions` page request. The route is an indexed store
+ * read, so anything slower is a hung service; without a bound the first render
+ * would never end. A page that times out fails like any other page.
  */
 const LIST_TIMEOUT_MS = 10_000;
 
@@ -194,21 +238,16 @@ const DAY_FORMAT: Intl.DateTimeFormatOptions = Object.freeze({
 // ---------------------------------------------------------------------------
 
 /**
- * The session fields the tree renders — the projection the pure helpers below
- * read. Any `SessionRecord` satisfies it; the `debuggen.reopenSession` quick
- * pick passes records from `ExtensionState.sessionList` straight through.
+ * The session fields the tree renders: the protocol's `GET /sessions` row,
+ * re-exported under the name this module has always exported it by.
+ *
+ * The protocol's type rather than a local projection, so the row the service
+ * sends, the row `ExtensionState.sessionList` keeps and the row the pure
+ * helpers below read are one definition. A whole `SessionRecord` becomes one
+ * through the protocol's `toSessionListItem`. The `debuggen.reopenSession`
+ * quick pick passes rows from `ExtensionState.sessionList` straight through.
  */
-export type SessionListItem = Pick<
-  SessionRecord,
-  | 'id'
-  | 'projectRoot'
-  | 'projectName'
-  | 'status'
-  | 'question'
-  | 'createdAt'
-  | 'updatedAt'
-  | 'cleanup'
->;
+export type { SessionListItem };
 
 /** Formatting options shared by the pure helpers. */
 export interface SessionFormatOptions {
@@ -233,7 +272,7 @@ export interface GroupSessionsOptions extends SessionFormatOptions {
 /** A project row: one `projectRoot`, holding its sessions grouped by day. */
 export interface ProjectNode {
   readonly kind: 'project';
-  /** The grouping key: the session records' absolute project root. */
+  /** The grouping key: the listed sessions' absolute project root. */
   readonly projectRoot: string;
   /** The label: the `projectName` of the project's most recently updated session. */
   readonly projectName: string;
@@ -242,8 +281,8 @@ export interface ProjectNode {
    * and accents ignored), so the row also shows its root.
    */
   readonly nameIsAmbiguous: boolean;
-  /** Every session of the project, most recently updated first. */
-  readonly sessions: readonly SessionRecord[];
+  /** Every listed session of the project, most recently updated first. */
+  readonly sessions: readonly SessionListItem[];
   /** The project's day rows, newest day first. */
   readonly days: readonly DateNode[];
   /** Whether the row starts expanded; VS Code keeps the developer's choice afterwards. */
@@ -260,7 +299,7 @@ export interface DateNode {
   /** Local midnight of that day in epoch milliseconds; `NaN` when `createdAt` was not finite. */
   readonly dayStart: number;
   /** The day's sessions: `updatedAt` descending, then `createdAt` descending, then `id`. */
-  readonly sessions: readonly SessionRecord[];
+  readonly sessions: readonly SessionListItem[];
   /** Whether the row starts expanded: true for each project's newest day. */
   readonly expanded: boolean;
 }
@@ -274,15 +313,23 @@ export interface SessionNode {
    * knowing the record's shape. The row's click passes the bare id.
    */
   readonly sessionId: string;
-  /** The stored record the row renders. */
-  readonly session: SessionRecord;
+  /** The list row the tree item renders. */
+  readonly session: SessionListItem;
 }
 
 /** Which non-data state a {@link MessageNode} renders. */
 export type MessageKey =
-  'service-unreachable' | 'invalid-service-url' | 'load-failed' | 'empty' | 'render-failed';
+  | 'service-unreachable'
+  | 'invalid-service-url'
+  | 'load-failed'
+  | 'empty'
+  | 'render-failed'
+  | 'sessions-not-listed';
 
-/** A single-row state in place of (or above) the data: offline, empty, failed. */
+/**
+ * A single-row state in place of (or around) the data: offline, empty, failed,
+ * or the stored sessions a shortened load leaves out.
+ */
 export interface MessageNode {
   readonly kind: 'message';
   /** The state this row renders; also its stable tree item id. */
@@ -303,6 +350,7 @@ export type SessionsTreeNode = ProjectNode | DateNode | SessionNode | MessageNod
 export type SessionsTreeState = Pick<
   ExtensionState,
   | 'sessionList'
+  | 'sessionListTotal'
   | 'setSessionList'
   | 'onDidChange'
   | 'activeSession'
@@ -422,18 +470,18 @@ export function summarizeSession(
  *   active session's project — or, with no active session, the project holding
  *   the most recently updated session. Everything else starts collapsed.
  *
- * A record listed twice under one id is kept once, in its newest version, so
+ * A row listed twice under one id is kept once, in its newest version, so
  * the tree never registers two items with one id.
  *
- * @param sessions The stored sessions, in any order.
+ * @param sessions The listed session rows, in any order.
  * @param options The active session's project and the collation locale.
  * @returns The project rows; empty when there are no sessions.
  */
 export function groupSessions(
-  sessions: readonly SessionRecord[],
+  sessions: readonly SessionListItem[],
   options: GroupSessionsOptions = {},
 ): readonly ProjectNode[] {
-  const byProject = new Map<string, SessionRecord[]>();
+  const byProject = new Map<string, SessionListItem[]>();
   for (const session of latestById(sessions)) {
     const listed = byProject.get(session.projectRoot);
     if (listed === undefined) {
@@ -490,10 +538,10 @@ export function groupSessions(
  * Splits one project's already-ordered sessions into day rows, newest day
  * first. Grouping preserves input order, so each day's sessions stay sorted.
  */
-function groupByDay(projectRoot: string, ordered: readonly SessionRecord[]): readonly DateNode[] {
+function groupByDay(projectRoot: string, ordered: readonly SessionListItem[]): readonly DateNode[] {
   const byDay = new Map<
     string,
-    { readonly dayStart: number; readonly sessions: SessionRecord[] }
+    { readonly dayStart: number; readonly sessions: SessionListItem[] }
   >();
   for (const session of ordered) {
     const day = localDayOf(session.createdAt);
@@ -543,8 +591,8 @@ function mostRecentlyUpdatedProject(
 }
 
 /** Each id once, in its newest version (`updatedAt`; on a tie, the later entry). */
-function latestById(sessions: readonly SessionRecord[]): readonly SessionRecord[] {
-  const byId = new Map<string, SessionRecord>();
+function latestById(sessions: readonly SessionListItem[]): readonly SessionListItem[] {
+  const byId = new Map<string, SessionListItem>();
   for (const session of sessions) {
     const held = byId.get(session.id);
     if (held === undefined || session.updatedAt >= held.updatedAt) {
@@ -555,7 +603,7 @@ function latestById(sessions: readonly SessionRecord[]): readonly SessionRecord[
 }
 
 /** `updatedAt` descending, then `createdAt` descending, then `id` ascending. */
-function compareSessions(a: SessionRecord, b: SessionRecord): number {
+function compareSessions(a: SessionListItem, b: SessionListItem): number {
   return (
     compareNumbersDescending(a.updatedAt, b.updatedAt) ||
     compareNumbersDescending(a.createdAt, b.createdAt) ||
@@ -621,9 +669,13 @@ function collapseText(text: string, maxCodePoints: number): string {
     .trimEnd()}…`;
 }
 
-/** A cleanup state in words, with the number of files it refused to overwrite. */
+/**
+ * A cleanup state in words, with the number of files it refused to overwrite.
+ * The row carries that number as `conflictCount`; the conflicts themselves,
+ * and their diffs, stay on the whole record.
+ */
 function describeCleanup(cleanup: SessionListItem['cleanup']): string {
-  const conflicts = cleanup.conflicts.length;
+  const conflicts = cleanup.conflictCount;
   if (conflicts === 0) {
     return cleanup.status;
   }
@@ -685,6 +737,18 @@ interface SessionsLoadError {
   readonly hint?: string | undefined;
 }
 
+/**
+ * Why the rows a load stored may stop short of the listing:
+ *
+ * - `page-cap` — {@link SESSION_LIST_PAGE_CAP} pages were read and the last one
+ *   still named a `nextOffset`;
+ * - `page-failed` — a page after the first failed, and the rows of the pages
+ *   before it were stored.
+ *
+ * A walk that reached a `null` `nextOffset` has no shortfall.
+ */
+type ListingShortfall = 'page-cap' | 'page-failed';
+
 /** Reachable, and nothing is stored yet. */
 const EMPTY_NODE: MessageNode = Object.freeze({
   kind: 'message',
@@ -743,6 +807,82 @@ function failureNode(failure: SessionsLoadError): MessageNode {
     icon: unreachable ? 'debug-disconnect' : 'warning',
     command: { command: START_SERVICE_COMMAND, title: 'Start Local Service' },
   };
+}
+
+/**
+ * The informational row for the stored sessions a shortened load leaves out,
+ * or `undefined` when its rows account for the whole `total`.
+ *
+ * A load walks `GET /sessions` page by page to the end of the listing, so this
+ * row is rendered only for a load with a {@link ListingShortfall}: the page cap
+ * stopped the walk, or a page after the first failed. Its tooltip names that
+ * cause, because the two call for different expectations — the cap is a fixed
+ * bound the next load meets again, while a failed page is retried and the
+ * failure row above this one says why it failed. The row never offers an
+ * action of its own.
+ *
+ * @param total The listing's `total`, as `ExtensionState.sessionListTotal` holds it.
+ * @param listed How many rows the load stored.
+ * @param shortfall Why the load stopped before the end of the listing.
+ * @returns The row, or `undefined` when nothing is left out.
+ */
+function notListedNode(
+  total: number,
+  listed: number,
+  shortfall: ListingShortfall,
+): MessageNode | undefined {
+  const omitted = total - listed;
+  if (!Number.isSafeInteger(omitted) || omitted <= 0) {
+    return undefined;
+  }
+  const stored = formatCount(total, 'stored session', 'stored sessions');
+  const rest = omitted === 1 ? 'the other one is' : `the other ${String(omitted)} are`;
+  return {
+    kind: 'message',
+    key: 'sessions-not-listed',
+    label: `${formatCount(omitted, 'more session', 'more sessions')} not listed`,
+    description: `${String(listed)} of ${String(total)} shown`,
+    tooltip: `The local service holds ${stored} for this workspace. ${shortfallReason(
+      shortfall,
+      listed,
+      rest,
+    )}`,
+    icon: 'info',
+  };
+}
+
+/**
+ * The sentence of the "not listed" tooltip that says why the load stopped
+ * short. Exhaustive over {@link ListingShortfall}.
+ *
+ * @param shortfall Why the load stopped.
+ * @param listed How many rows the load stored.
+ * @param rest The omitted sessions as a sentence subject, e.g. `the other 250 are`.
+ * @returns One sentence, ending with a full stop.
+ */
+function shortfallReason(shortfall: ListingShortfall, listed: number, rest: string): string {
+  switch (shortfall) {
+    case 'page-cap': {
+      const perLoad = SESSION_LIST_PAGE_CAP * SESSION_LIST_MAX_LIMIT;
+      return (
+        `This view lists at most ${String(perLoad)} sessions per load ` +
+        `(${String(SESSION_LIST_PAGE_CAP)} pages of ${String(SESSION_LIST_MAX_LIMIT)}), ` +
+        `the most recently updated first; ${rest} not listed here.`
+      );
+    }
+    case 'page-failed': {
+      const shown =
+        listed > 0
+          ? `only the ${String(listed)} most recently updated`
+          : 'none of the stored sessions';
+      return (
+        `A later page of the listing could not be loaded, so this view lists ${shown}; ` +
+        `${rest} not listed until the listing loads again.`
+      );
+    }
+    default:
+      return assertNever(shortfall, 'Unhandled Sessions tree listing shortfall');
+  }
 }
 
 /**
@@ -808,14 +948,21 @@ export class SessionsTreeProvider
   /** Cancels an in-flight request on dispose. */
   private readonly lifetime = new AbortController();
 
-  /** The request in flight, shared by every caller (single-flight). */
+  /** The walk of the listing in flight, shared by every caller (single-flight). */
   private pending: Promise<void> | undefined;
-  /** The one follow-up request an explicit refresh queued behind {@link pending}. */
+  /** The one follow-up walk an explicit refresh queued behind {@link pending}. */
   private queued: Promise<void> | undefined;
-  /** Whether a `GET /sessions` has succeeded at least once. */
+  /** Whether a load has stored rows at least once. */
   private loaded = false;
-  /** The last request's failure, cleared by the next success. */
+  /** The last load's failure, cleared by the next load that reaches the end of the listing. */
   private lastError: SessionsLoadError | undefined;
+  /**
+   * Why the stored rows stop short of the listing, as the load that stored
+   * them found; `undefined` when that load reached the end. Left as it is by a
+   * load whose first page fails, because such a load stores nothing and the
+   * rows it describes are still the ones rendered.
+   */
+  private shortfall: ListingShortfall | undefined;
   /** The service's reachability when {@link lastError} was recorded. */
   private failureSignature: string | undefined;
   /** When the last request started, in epoch milliseconds. */
@@ -871,10 +1018,10 @@ export class SessionsTreeProvider
   }
 
   /**
-   * Fetches `GET /sessions` into the store, then fires a whole-tree refresh.
+   * Walks `GET /sessions` into the store, then fires a whole-tree refresh.
    *
-   * Joins nothing stale: with a request already in flight it waits for one
-   * follow-up request issued after that one settles, shared by every refresh
+   * Joins nothing stale: with a walk already in flight it waits for one
+   * follow-up walk issued after that one settles, shared by every refresh
    * made meanwhile. A failure is recorded and rendered, never thrown.
    */
   async refresh(): Promise<void> {
@@ -942,9 +1089,11 @@ export class SessionsTreeProvider
   // -------------------------------------------------------------------------
 
   /**
-   * The root rows: a failure row when the last request failed, then the
-   * project rows the store holds — or the empty-state row when it holds none
-   * and nothing failed.
+   * The root rows: a failure row when the last load failed, then the project
+   * rows the store holds, then — when the load that stored them stopped short
+   * of the listing and its `total` exceeds the rows stored — the one
+   * "sessions not listed" row. The empty-state row replaces all of them only
+   * when the store holds no row, nothing is left out and nothing failed.
    */
   private async rootChildren(): Promise<SessionsTreeNode[]> {
     await this.synchronize();
@@ -956,20 +1105,26 @@ export class SessionsTreeProvider
     if (failure !== undefined) {
       rows.push(failureNode(failure));
     }
-    const projects = groupSessions(this.state.sessionList, {
+    const listed = this.state.sessionList;
+    const projects = groupSessions(listed, {
       activeProjectRoot: this.state.activeSession?.projectRoot,
       locale: this.locale,
     });
-    if (projects.length > 0) {
-      rows.push(...projects);
-    } else if (failure === undefined) {
+    rows.push(...projects);
+    const notListed =
+      this.shortfall === undefined
+        ? undefined
+        : notListedNode(this.state.sessionListTotal, listed.length, this.shortfall);
+    if (notListed !== undefined) {
+      rows.push(notListed);
+    } else if (projects.length === 0 && failure === undefined) {
       rows.push(EMPTY_NODE);
     }
     return rows;
   }
 
   /**
-   * Brings the store up to date before a root render: waits for a request
+   * Brings the store up to date before a root render: waits for a walk
    * already in flight, or starts one when {@link fetchWarranted}. A render
    * that waited does not fetch again — the answer it waited for is fresh.
    */
@@ -1012,7 +1167,7 @@ export class SessionsTreeProvider
     return `${this.state.connectionStatus}:${String(this.state.serviceReachable)}`;
   }
 
-  /** Joins the request in flight, or starts one. */
+  /** Joins the walk in flight, or starts one. */
   private load(): Promise<void> {
     if (this.pending === undefined) {
       const attempt: Promise<void> = this.fetchSessions().finally(() => {
@@ -1026,7 +1181,7 @@ export class SessionsTreeProvider
   }
 
   /**
-   * A request that starts after this call: the in-flight one's answer may
+   * A walk that starts after this call: the in-flight one's answer may
    * predate the caller's change, so one follow-up is queued behind it and
    * shared by every caller until it starts.
    */
@@ -1050,32 +1205,94 @@ export class SessionsTreeProvider
   }
 
   /**
-   * One `GET /sessions`. Success is written to the store (which notifies the
-   * views); failure is recorded for the failure row, logged by code, and
-   * written nowhere, so it notifies nothing.
+   * One load: walks `GET /sessions` from offset `0` along `nextOffset`, in
+   * pages of {@link SESSION_LIST_MAX_LIMIT} rows, until `nextOffset` is `null`
+   * or {@link SESSION_LIST_PAGE_CAP} pages have been read.
+   *
+   * - Rows are de-duplicated by id, the first occurrence kept: offset paging
+   *   over a listing ordered by `updatedAt` shifts when a session is created or
+   *   updated between two requests, and the shifted row then appears on both
+   *   pages.
+   * - The gathered rows and the last page's `total` are written to the store
+   *   once, after the walk (the store then notifies the views).
+   * - A first page that fails is recorded for the failure row, logged by code
+   *   and written nowhere, so it notifies nothing.
+   * - A later page that fails keeps and stores the rows already gathered, with
+   *   the last `total` a page reported, and is recorded like a first-page
+   *   failure, so the failure row renders above the rows and the retry rule
+   *   applies.
+   * - Disposal aborts the page request in flight through the lifetime signal;
+   *   the walk then stops and writes nothing.
    */
   private async fetchSessions(): Promise<void> {
     const activeAtStart = this.state.activeSession?.id;
     this.lastAttemptAt = this.now();
-    const listed = await this.client.listSessions({
-      timeoutMs: LIST_TIMEOUT_MS,
-      signal: this.lifetime.signal,
-    });
-    if (this.disposed) {
-      return;
+
+    const gathered: SessionListItem[] = [];
+    const seen = new Set<string>();
+    let total = 0;
+    let pages = 0;
+    let offset: number | null = 0;
+    let failure: SessionsLoadError | undefined;
+
+    while (offset !== null && pages < SESSION_LIST_PAGE_CAP) {
+      const answer = await this.client.listSessions(
+        { limit: SESSION_LIST_MAX_LIMIT, offset },
+        { timeoutMs: LIST_TIMEOUT_MS, signal: this.lifetime.signal },
+      );
+      if (this.disposed) {
+        return;
+      }
+      if (isErr(answer)) {
+        const { code, message, hint } = answer.error;
+        failure = { code, message, hint };
+        break;
+      }
+      pages += 1;
+      const page = answer.value;
+      total = page.total;
+      for (const session of page.sessions) {
+        if (!seen.has(session.id)) {
+          seen.add(session.id);
+          gathered.push(session);
+        }
+      }
+      offset = page.nextOffset;
     }
-    if (isOk(listed)) {
-      this.loaded = true;
+
+    let shortfall: ListingShortfall | undefined;
+    if (failure !== undefined) {
+      this.lastError = failure;
+      this.failureSignature = this.reachabilitySignature();
+      if (pages === 0) {
+        // The first page failed: nothing was gathered, so nothing is written
+        // and the rows of the last load that stored any stay as they are.
+        this.log.warn('Stored sessions could not be listed', { code: failure.code });
+        return;
+      }
+      this.log.warn('Stored sessions could not be listed past a page', { code: failure.code });
+      shortfall = 'page-failed';
+    } else {
       this.lastError = undefined;
       this.failureSignature = undefined;
-      this.syncedActiveSessionId = activeAtStart;
-      this.state.setSessionList(listed.value);
-      return;
+      // Still a `nextOffset` after the last page read: the cap ended the walk.
+      shortfall = offset === null ? undefined : 'page-cap';
     }
-    const { code, message, hint } = listed.error;
-    this.lastError = { code, message, hint };
-    this.failureSignature = this.reachabilitySignature();
-    this.log.warn('Stored sessions could not be listed', { code });
+
+    // Set before the write: the write notifies the views, and a render it
+    // triggers must find the shortfall that describes the rows it renders.
+    this.loaded = true;
+    this.syncedActiveSessionId = activeAtStart;
+    this.shortfall = shortfall;
+    this.state.setSessionList({ sessions: gathered, total });
+    // Counts only: how many pages were read, how many distinct rows they
+    // carried and the listing's size — never a row's content.
+    this.log.debug(
+      shortfall === 'page-cap'
+        ? 'Stored sessions listed up to the page cap'
+        : 'Stored sessions listed',
+      { pages, rows: gathered.length, total },
+    );
   }
 
   // -------------------------------------------------------------------------

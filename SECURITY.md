@@ -4,14 +4,14 @@ Debug Generator runs entirely on the developer's machine and has no hosted compo
 
 ## Reporting a vulnerability
 
-Report a suspected vulnerability privately through a GitHub private security advisory on this repository (**Security → Report a vulnerability**), not in a public issue, discussion or pull request. Name the affected commit, the component and the reproduction steps, but do not attach captured telemetry, session databases, tokens, API keys or customer data; describe them instead. We aim to acknowledge reports promptly. What to include, and what to do if private reporting is unavailable to you, is in [section 11 of `docs/SECURITY.md`](docs/SECURITY.md#11-reporting-a-vulnerability).
+Report a suspected vulnerability privately through a GitHub private security advisory on this repository, [github.com/ConnerArdman/debugging-generator](https://github.com/ConnerArdman/debugging-generator) (**Security → Report a vulnerability**), not in a public issue, discussion or pull request. Name the affected commit, the component and the reproduction steps, but do not attach captured telemetry, session databases, tokens, API keys or customer data; describe them instead. We aim to acknowledge reports promptly. If that form is unavailable to you, open an issue on the repository that mentions its owner, [@ConnerArdman](https://github.com/ConnerArdman), asks only for a private security contact and contains no detail of the vulnerability. What to include, and the full fallback — including what to do if you cannot open the repository page — is in [section 11 of `docs/SECURITY.md`](docs/SECURITY.md#11-reporting-a-vulnerability).
 
 ## Supported versions
 
-| Version                                           | Supported                                                                                                    |
-| ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| Development line (`master` and `blitzy` branches) | Yes — security fixes land here                                                                               |
-| Released versions                                 | None yet: the monorepo is at `0.1.0` and is not published to the Chrome Web Store or the VS Code Marketplace |
+| Version                                           | Supported                                                                                                                |
+| ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| Development line (`master` and `blitzy` branches) | Yes — security fixes land here                                                                                           |
+| Released versions                                 | None yet: `0.1.0` is unreleased (in development) and is not published to the Chrome Web Store or the VS Code Marketplace |
 
 ## Where the details live
 

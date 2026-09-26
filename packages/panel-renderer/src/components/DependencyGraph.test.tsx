@@ -95,13 +95,15 @@
  *     `layoutDependencyGraph` in a hoisted record, so `layering` can prove the
  *     layering is resolved once per payload and reused rather than computed a
  *     second time. Nothing about the geometry changes under the mock.
- *   - **Layout-free, except where sizing is the subject.** happy-dom has no
- *     layout, so the component's viewport measures as unmeasured and every
- *     positional case asserts the default rhythm. The `canvas sizing` cases
- *     alone give the one element the component measures — its scroll viewport
- *     — a `clientWidth`, and the window a `ResizeObserver` they can fire, and
- *     restore the window's own observer when they finish; nothing else about
- *     layout is stubbed.
+ *   - **Layout-free throughout, with no layout stubbed.** happy-dom has no
+ *     layout, and the component needs none: it measures nothing, so its
+ *     geometry is a pure function of the payload and every positional case
+ *     asserts the scale module's rhythm directly. No element size, observer or
+ *     font metric is stood in for anywhere in this file. The `deterministic
+ *     geometry` cases prove the point: the canvas declares the layout's own
+ *     logical size, the column gap widens only as far as a count label drawn
+ *     in it requires — by the same pure estimate the component uses — and one
+ *     payload draws identically across renders, mounts and orders of arrival.
  *   - **No timers, no fake clocks, no arbitrary waits.** Post-resolution
  *     assertions go through `await screen.findBy…`; `userEvent` drives pointer
  *     activation, and `fireEvent` the two low-level gestures (a wheel and a key
@@ -155,16 +157,21 @@ import type {
   PanelSelection,
   PanelSelectionState,
 } from '../host/PanelActions';
+import { DATA_TABLE_COLUMN_TRACKS } from '../primitives/DataTable';
+import type { DataTableColumnWidth } from '../primitives/DataTable';
 import { dependencyNodeColorVar } from '../utils/color';
-import { formatCount, formatDurationCompact, formatTierLabel } from '../utils/format';
-import { DEFAULT_LABEL_FONT_SIZE, estimateTextWidth } from '../utils/measure';
+import {
+  DEFAULT_LABEL_FONT_SIZE,
+  estimateTextWidth,
+  formatCount,
+  formatDurationCompact,
+  formatTierLabel,
+} from '../utils/format';
 import {
   DEFAULT_GRAPH_COLUMN_GAP,
   DEFAULT_GRAPH_NODE_HEIGHT,
   DEFAULT_GRAPH_NODE_WIDTH,
   DEFAULT_GRAPH_ROW_GAP,
-  MAX_GRAPH_COLUMN_GAP,
-  MIN_GRAPH_COLUMN_GAP,
   assignGraphLayers,
   layoutDependencyGraph,
   resolveGraphLayering,
@@ -1197,79 +1204,13 @@ function legendOf(container: HTMLElement): HTMLElement {
 
 /*
  * ---------------------------------------------------------------------------
- * A measured viewport
+ * Canvas geometry, read off the drawing
  *
- * The component measures one element — the scroll viewport around its canvas —
- * through `useChartCanvas`, which reads the element's `clientWidth` when its
- * ref attaches and again on every `ResizeObserver` callback. happy-dom reports
- * a zero width and its observer never calls back, so the sizing cases stand in
- * for exactly those two things and nothing else.
+ * Every reader below takes the numbers the component wrote into the SVG's own
+ * attributes. None asks the DOM for a laid-out size — happy-dom has no layout
+ * to report — and none needs to: the component declares its whole geometry.
  * ---------------------------------------------------------------------------
  */
-
-/** A stand-in for the layout of the graph's viewport, installed for one case. */
-interface MeasuredViewport {
-  /**
-   * Gives the rendered viewport an inner width and delivers the resize the
-   * component observes, inside `act` so the redraw has committed on return.
-   */
-  resize(width: number): void;
-
-  /** Puts the window's own `ResizeObserver` back. */
-  restore(): void;
-}
-
-/**
- * Installs a `ResizeObserver` the case can fire. Call it before rendering: the
- * component's measure looks the constructor up when its viewport attaches.
- *
- * @returns The controls, and the restore the case must call in `finally`.
- */
-function installMeasuredViewport(): MeasuredViewport {
-  const view = window as unknown as { ResizeObserver: unknown };
-  const original = view.ResizeObserver;
-  const callbacks = new Set<() => void>();
-
-  class ControlledObserver {
-    private readonly callback: () => void;
-
-    public constructor(callback: () => void) {
-      this.callback = callback;
-    }
-
-    public observe(): void {
-      callbacks.add(this.callback);
-    }
-
-    public unobserve(): void {
-      callbacks.delete(this.callback);
-    }
-
-    public disconnect(): void {
-      callbacks.delete(this.callback);
-    }
-  }
-
-  view.ResizeObserver = ControlledObserver;
-
-  return {
-    resize(width: number): void {
-      const element = canvas().closest('.dg-dependency-graph__viewport');
-      if (element === null) {
-        throw new Error('the canvas is not drawn inside its viewport');
-      }
-      Object.defineProperty(element, 'clientWidth', { configurable: true, get: () => width });
-      act(() => {
-        for (const callback of [...callbacks]) {
-          callback();
-        }
-      });
-    },
-    restore(): void {
-      view.ResizeObserver = original;
-    },
-  };
-}
 
 /** The canvas's declared size, and its `viewBox` as four numbers. */
 function canvasFrame(): { width: number; height: number; viewBox: number[] } {
@@ -1284,6 +1225,53 @@ function canvasFrame(): { width: number; height: number; viewBox: number[] } {
 /** The left edge of every participant shape, in document order. */
 function shapeLefts(): number[] {
   return nodeShapes().map((shape) => Number(shape.getAttribute('x')));
+}
+
+/** The repeated-relationship count labels of the canvas, in document order. */
+function edgeCountLabels(): Element[] {
+  return Array.from(canvas().querySelectorAll('text.dg-dependency-graph__edge-label'));
+}
+
+/** Every positional fact of one drawing, as {@link drawnGeometry} returns it. */
+interface DrawnGeometry {
+  /** The canvas's declared size and `viewBox`. */
+  readonly frame: ReturnType<typeof canvasFrame>;
+  /** Every participant shape's rectangle, in document order. */
+  readonly shapes: (string | null)[][];
+  /** The labels drawn in those shapes, in the same order. */
+  readonly labels: string[];
+  /** Every relationship curve's path data, sorted. */
+  readonly curves: string[];
+  /** Every count label as `text@x,y`, sorted. */
+  readonly counts: string[];
+}
+
+/**
+ * The whole drawing's geometry, read off its attributes.
+ *
+ * Shapes and their labels are compared in document order, which the component
+ * fixes by column and canonical order. Curves and count labels are drawn in
+ * the order the relationships arrived, so they are compared as sorted sets:
+ * the question is whether any of them moved, not which the payload listed
+ * first.
+ *
+ * @returns The snapshot.
+ */
+function drawnGeometry(): DrawnGeometry {
+  return {
+    frame: canvasFrame(),
+    shapes: shapeGeometry(),
+    labels: canvasLabels(),
+    curves: edgeCurves()
+      .map((curve) => curve.getAttribute('d') ?? '')
+      .toSorted(),
+    counts: edgeCountLabels()
+      .map(
+        (label) =>
+          `${label.textContent ?? ''}@${label.getAttribute('x') ?? ''},${label.getAttribute('y') ?? ''}`,
+      )
+      .toSorted(),
+  };
 }
 
 /**
@@ -1522,7 +1510,7 @@ describe('DependencyGraph states', () => {
 });
 
 describe('DependencyGraph rendering', () => {
-  it('floors every participants-grid track in ch, so a narrow panel scrolls the grid instead of squeezing it', async () => {
+  it('sizes every participants-grid column by a token-built width role, so a narrow panel scrolls the grid instead of squeezing it', async () => {
     const stub = resolvingProvider(chainGraph());
 
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
@@ -1531,7 +1519,8 @@ describe('DependencyGraph rendering', () => {
     const template = grid.style.getPropertyValue('--dgc-columns').trim();
 
     // Split at top-level spaces only, so the space after the comma inside
-    // `minmax(24ch, 2fr)` stays inside the track it belongs to.
+    // `minmax(var(--dg-column-min-name), var(--dg-column-share-wide))` stays
+    // inside the track it belongs to.
     const tracks: string[] = [];
     let depth = 0;
     let current = '';
@@ -1550,21 +1539,37 @@ describe('DependencyGraph rendering', () => {
       tracks.push(current);
     }
 
-    // Six columns, none of them the floorless `minmax(0, …)` that let the
-    // participant label collapse to a few characters per line in a narrow
-    // panel; the participant column keeps the widest floor and twice the share,
-    // and the relationships column, whose chips wrap their full target, a floor
-    // wide enough for one chip per line.
-    expect(tracks).toHaveLength(6);
-    for (const track of tracks) {
-      expect(track).toMatch(/^minmax\(\d+ch, \d+fr\)$/u);
-    }
-    expect(tracks[1]).toBe('minmax(24ch, 2fr)');
-    expect(tracks[4]).toBe('minmax(22ch, 2fr)');
+    // Six columns, each the design system's track for its content's role: the
+    // layer and total-time figures take the compact roles, the class chip a
+    // label, and the participant, its relationships and its source the
+    // identifier role — so the participant label and the relationship chips,
+    // which wrap their full text, keep a floor wide enough for an identifier.
+    const roles: readonly DataTableColumnWidth[] = [
+      'status',
+      'name',
+      'label',
+      'quantity',
+      'name',
+      'name',
+    ];
+    expect(tracks).toEqual(roles.map((role) => DATA_TABLE_COLUMN_TRACKS[role].track));
 
-    // The floors reach the grid's own minimum inline size, which is what turns
-    // a too-narrow panel into a horizontal scroll.
-    expect(grid.style.getPropertyValue('--dgc-min-inline')).toContain('24ch');
+    // None of them is the floorless `minmax(0, …)` that let the participant
+    // label collapse to a few characters per line in a narrow panel: every
+    // track opens on a column-floor token, and no track carries a number of its
+    // own (AAP 0.6.4).
+    for (const track of tracks) {
+      expect(track).toMatch(/^(?:minmax\()?var\(--dg-column-min-[a-z]+\)/u);
+      expect(track).not.toMatch(/\d/u);
+    }
+
+    // One floor per column reaches the grid's own minimum inline size, which
+    // is what turns a too-narrow panel into a horizontal scroll.
+    const minimumInline = grid.style.getPropertyValue('--dgc-min-inline').trim();
+    expect(minimumInline).toBe(
+      `calc(${roles.map((role) => DATA_TABLE_COLUMN_TRACKS[role].minimum).join(' + ')})`,
+    );
+    expect(minimumInline.match(/var\(--dg-column-min-[a-z]+\)/gu)).toHaveLength(tracks.length);
   });
 
   it('draws one shape and one row per participant, and one curve per relationship', async () => {
@@ -2545,15 +2550,25 @@ describe('DependencyGraph static layout', () => {
   });
 });
 
-describe('DependencyGraph canvas sizing', () => {
+describe('DependencyGraph deterministic geometry', () => {
   /** The chain's column count: it places one participant per column. */
   const COLUMNS = CANONICAL_LABELS.length;
 
   /** The inset the canvas keeps on every side: half the participant outline's 2-unit stroke. */
   const INSET = 1;
 
-  /** How often the relationship into the datastore ran in the count-label case. */
+  /**
+   * The space the component keeps clear between a count label's ink and the
+   * outline on either side of it, beyond the half stroke ({@link INSET}) each
+   * outline reaches into the gap.
+   */
+  const LABEL_CLEARANCE = 4;
+
+  /** A count whose label is far wider than the default gap can hold. */
   const LARGE_COUNT = 123_456_789;
+
+  /** A count of several digits whose label the default gap still holds. */
+  const MODEST_COUNT = 1_234;
 
   /** The left edge of every chain column at a given gap, in reading order. */
   function columnLefts(gap: number): number[] {
@@ -2565,27 +2580,67 @@ describe('DependencyGraph canvas sizing', () => {
     return COLUMNS * DEFAULT_GRAPH_NODE_WIDTH + (COLUMNS - 1) * gap + 2 * INSET;
   }
 
+  /** The count label the canvas draws for a relationship that ran `count` times. */
+  function countLabel(count: number): string {
+    return `×${formatCount(count)}`;
+  }
+
   /**
-   * Asserts the canvas is drawn one user unit to a CSS pixel — its `viewBox` is
-   * its own declared size — and is exactly as tall as its one row of boxes, so
-   * no text is rescaled and no band is left beneath the drawing.
+   * The column gap a count label drawn in it requires: the label's advance by
+   * the package's own pure estimate at the label type role's size, rounded up
+   * to a whole unit, with the clearance and the half outline on both sides —
+   * and never less than the scale module's default rhythm.
    */
-  function expectDrawnAtPixelSize(): void {
+  function gapHolding(label: string): number {
+    return Math.max(
+      DEFAULT_GRAPH_COLUMN_GAP,
+      Math.ceil(estimateTextWidth(label, DEFAULT_LABEL_FONT_SIZE)) + 2 * (LABEL_CLEARANCE + INSET),
+    );
+  }
+
+  /**
+   * The chain with its one column-to-column repeated relationship, the server
+   * work into the datastore, run `count` times.
+   *
+   * @param count How often that relationship ran.
+   * @param order How to rearrange the participants and the relationships.
+   */
+  function repeatedChain(
+    count: number,
+    order: <T>(values: readonly T[]) => readonly T[] = (values) => values,
+  ): DependencyGraphData {
+    return makeGraph({
+      nodes: order(CHAIN_PARTICIPANTS),
+      edges: order([
+        makeEdge(ROUTE.id, DATASTORE.id, { count, totalDurationMs: 640 }),
+        ...CHAIN_RELATIONSHIPS.filter((edge) => edge.from !== ROUTE.id),
+      ]),
+    });
+  }
+
+  /**
+   * Asserts the canvas declares the chain's logical size at `gap`: the
+   * `viewBox` is the layout's own extent with the outline inset, the `width`
+   * and `height` attributes are those same two numbers — so at rest one user
+   * unit is one CSS pixel — and the canvas is exactly as tall as its one row of
+   * boxes. Every box keeps the scale module's width.
+   */
+  function expectLogicalSize(gap: number): void {
     const frame = canvasFrame();
-    expect(frame.viewBox).toEqual([-INSET, -INSET, frame.width, frame.height]);
+    expect(frame.width).toBe(chainCanvasWidth(gap));
     expect(frame.height).toBe(DEFAULT_GRAPH_NODE_HEIGHT + 2 * INSET);
+    expect(frame.viewBox).toEqual([-INSET, -INSET, frame.width, frame.height]);
     expect(nodeShapes().map((shape) => shape.getAttribute('width'))).toEqual(
       CANONICAL_LABELS.map(() => String(DEFAULT_GRAPH_NODE_WIDTH)),
     );
   }
 
   /**
-   * Renders a payload and waits for the grid. Call it after
-   * {@link installMeasuredViewport}, so the viewport attaches to the stand-in.
+   * Renders a payload and waits for the grid.
    *
    * @param data The payload to draw.
    */
-  async function renderMeasured(data: DependencyGraphData): Promise<void> {
+  async function renderGraph(data: DependencyGraphData): Promise<void> {
     renderComponent(makeNode(), {
       provider: resolvingProvider(data).provider,
       actions: makeActions().actions,
@@ -2593,138 +2648,110 @@ describe('DependencyGraph canvas sizing', () => {
     await screen.findByRole('grid');
   }
 
-  it('spreads its columns across a measured viewport, one user unit to a pixel', async () => {
-    const viewport = installMeasuredViewport();
-    try {
-      resetScaleCalls();
-      await renderMeasured(chainGraph());
+  it("declares the layout's own logical size as its viewBox, width and height", async () => {
+    await renderGraph(chainGraph());
 
-      // Before any measurement the unmeasured rhythm, as every other case draws it.
-      expect(shapeLefts()).toEqual(columnLefts(DEFAULT_GRAPH_COLUMN_GAP));
+    // The chain's one repeated relationship, `×2`, needs far less room than the
+    // default rhythm gives, so the rhythm holds.
+    expect(edgeCountLabels().map((label) => label.textContent)).toEqual([countLabel(2)]);
+    expect(shapeLefts()).toEqual(columnLefts(DEFAULT_GRAPH_COLUMN_GAP));
+    expectLogicalSize(DEFAULT_GRAPH_COLUMN_GAP);
+    expectCurvesBetweenColumns();
 
-      const measured = 1000;
-      viewport.resize(measured);
+    // The size is the drawing's own, declared as plain numbers on the element:
+    // no percentage, no inline style and no aspect override for a container to
+    // resolve. The viewport around it is a plain scroll container.
+    const picture = canvas();
+    expect(picture.getAttribute('width')).toBe(String(chainCanvasWidth(DEFAULT_GRAPH_COLUMN_GAP)));
+    expect(picture.getAttribute('height')).toBe(String(DEFAULT_GRAPH_NODE_HEIGHT + 2 * INSET));
+    expect(picture.getAttribute('style')).toBeNull();
+    expect(picture.getAttribute('preserveAspectRatio')).toBeNull();
 
-      // The gap at which five boxes fill the viewport less the inset, floored
-      // to a whole unit so the canvas never overflows by a fraction.
-      const gap = Math.floor(
-        (measured - 2 * INSET - COLUMNS * DEFAULT_GRAPH_NODE_WIDTH) / (COLUMNS - 1),
-      );
-      expect(gap).toBeGreaterThan(MIN_GRAPH_COLUMN_GAP);
-      expect(gap).toBeLessThan(MAX_GRAPH_COLUMN_GAP);
-      expect(shapeLefts()).toEqual(columnLefts(gap));
-
-      // It fills the viewport and never overflows it: all that is left over is
-      // the floor's remainder, under one unit per gap.
-      const { width } = canvasFrame();
-      expect(width).toBe(chainCanvasWidth(gap));
-      expect(width).toBeLessThanOrEqual(measured);
-      expect(measured - width).toBeLessThan(COLUMNS - 1);
-      expectDrawnAtPixelSize();
-      expectCurvesBetweenColumns();
-
-      // The reading order is the payload's, whatever the width.
-      expect(canvasLabels()).toEqual(CANONICAL_LABELS);
-      expect(participantLabels()).toEqual(CANONICAL_LABELS);
-
-      // The resize rebuilt the geometry from the layering already resolved:
-      // still one layering for the payload, handed to both layouts.
-      expect(scaleCalls.resolved).toHaveLength(1);
-      expect(scaleCalls.supplied).toHaveLength(2);
-      const [resolved] = scaleCalls.resolved;
-      expect(scaleCalls.supplied.every((layering) => layering === resolved)).toBe(true);
-    } finally {
-      viewport.restore();
-    }
+    const viewport = picture.parentElement;
+    expect(viewport?.classList.contains('dg-dependency-graph__viewport')).toBe(true);
+    expect(viewport?.getAttribute('style')).toBeNull();
   });
 
-  it('draws a graph too wide for its viewport at the narrowest gap and full size, to scroll', async () => {
-    const viewport = installMeasuredViewport();
-    try {
-      await renderMeasured(chainGraph());
+  it('widens the column gap exactly as far as a long count label drawn in it requires', async () => {
+    await renderGraph(repeatedChain(LARGE_COUNT));
 
-      const measured = 400;
-      viewport.resize(measured);
-
-      // Tightened as far as it goes, and then drawn wider than its viewport at
-      // full size rather than scaled down to fit it: the viewport scrolls.
-      expect(shapeLefts()).toEqual(columnLefts(MIN_GRAPH_COLUMN_GAP));
-      const { width } = canvasFrame();
-      expect(width).toBe(chainCanvasWidth(MIN_GRAPH_COLUMN_GAP));
-      expect(width).toBeGreaterThan(measured);
-      expectDrawnAtPixelSize();
-      expectCurvesBetweenColumns();
-    } finally {
-      viewport.restore();
+    const [label] = edgeCountLabels();
+    if (label === undefined) {
+      throw new Error('the repeated relationship drew no count label');
     }
+    const text = label.textContent ?? '';
+    expect(text).toBe(countLabel(LARGE_COUNT));
+
+    // Wider than the default rhythm, by exactly what the label needs, and the
+    // same for every gap: the columns stay on one pitch.
+    const gap = gapHolding(text);
+    expect(gap).toBeGreaterThan(DEFAULT_GRAPH_COLUMN_GAP);
+    expect(shapeLefts()).toEqual(columnLefts(gap));
+    expectLogicalSize(gap);
+    expectCurvesBetweenColumns();
+
+    // The label is centred in the gap it labels, and its ink — estimated the
+    // way the component estimates it — clears both outlines, whose strokes
+    // reach one unit into the gap, by the clearance on each side.
+    const [, , , routeLeft, datastoreLeft] = shapeLefts();
+    if (routeLeft === undefined || datastoreLeft === undefined) {
+      throw new Error('the chain drew fewer than five columns');
+    }
+    const routeRight = routeLeft + DEFAULT_GRAPH_NODE_WIDTH;
+    const centre = Number(label.getAttribute('x'));
+    const advance = estimateTextWidth(text, DEFAULT_LABEL_FONT_SIZE);
+    expect(centre).toBeCloseTo(routeRight + gap / 2);
+    expect(centre - advance / 2).toBeGreaterThanOrEqual(routeRight + INSET + LABEL_CLEARANCE);
+    expect(centre + advance / 2).toBeLessThanOrEqual(datastoreLeft - INSET - LABEL_CLEARANCE);
+
+    // The reading order is the payload's, whatever the gap.
+    expect(canvasLabels()).toEqual(CANONICAL_LABELS);
+    expect(participantLabels()).toEqual(CANONICAL_LABELS);
   });
 
-  it('stops spreading at the widest gap on a viewport far wider than the graph', async () => {
-    const viewport = installMeasuredViewport();
-    try {
-      await renderMeasured(chainGraph());
+  it('keeps the default rhythm for a count label the default gap already holds', async () => {
+    await renderGraph(repeatedChain(MODEST_COUNT));
 
-      const measured = 3000;
-      viewport.resize(measured);
-
-      expect(shapeLefts()).toEqual(columnLefts(MAX_GRAPH_COLUMN_GAP));
-      const { width } = canvasFrame();
-      expect(width).toBe(chainCanvasWidth(MAX_GRAPH_COLUMN_GAP));
-      expect(width).toBeLessThan(measured);
-      expectDrawnAtPixelSize();
-      expectCurvesBetweenColumns();
-    } finally {
-      viewport.restore();
-    }
+    // Several digits and a group separator, and still narrower than the gap
+    // needs to be: nothing widens that the data does not require.
+    const text = countLabel(MODEST_COUNT);
+    expect(edgeCountLabels().map((label) => label.textContent)).toEqual([text]);
+    expect(gapHolding(text)).toBe(DEFAULT_GRAPH_COLUMN_GAP);
+    expect(shapeLefts()).toEqual(columnLefts(DEFAULT_GRAPH_COLUMN_GAP));
+    expectLogicalSize(DEFAULT_GRAPH_COLUMN_GAP);
   });
 
-  it('widens the narrowest gap to hold a relationship count drawn in it', async () => {
-    const viewport = installMeasuredViewport();
-    try {
-      await renderMeasured(
-        makeGraph({
-          nodes: CHAIN_PARTICIPANTS,
-          edges: [
-            makeEdge(ROUTE.id, DATASTORE.id, { count: LARGE_COUNT, totalDurationMs: 640 }),
-            ...CHAIN_RELATIONSHIPS.filter((edge) => edge.from !== ROUTE.id),
-          ],
-        }),
-      );
+  it('draws one payload identically across renders, mounts and orders of arrival', async () => {
+    const user = userEvent.setup();
 
-      // Unmeasured, the count changes nothing: the default rhythm still holds.
-      expect(shapeLefts()).toEqual(columnLefts(DEFAULT_GRAPH_COLUMN_GAP));
+    resetScaleCalls();
+    await renderGraph(repeatedChain(LARGE_COUNT));
+    const first = drawnGeometry();
+    expect(first.frame.width).toBe(chainCanvasWidth(gapHolding(countLabel(LARGE_COUNT))));
 
-      viewport.resize(400);
+    // A second render of the same mount: a hover changes state and redraws the
+    // canvas, and not one coordinate moves — nor is the layering resolved or
+    // the layout rebuilt for it.
+    await user.hover(shapeNamed(ROUTE_LABEL));
+    expect(shapeNamed(ROUTE_LABEL).classList.contains('dg-is-hovered')).toBe(true);
+    expect(drawnGeometry()).toEqual(first);
+    await user.unhover(shapeNamed(ROUTE_LABEL));
+    expect(drawnGeometry()).toEqual(first);
+    expect(scaleCalls.resolved).toHaveLength(1);
+    expect(scaleCalls.supplied).toHaveLength(1);
 
-      const label = canvas().querySelector('text.dg-dependency-graph__edge-label');
-      if (label === null) {
-        throw new Error('the repeated relationship drew no count label');
-      }
-      const text = label.textContent ?? '';
-      expect(text).toBe(`×${formatCount(LARGE_COUNT)}`);
+    // Fresh mounts of the same data in other orders — reversed, and rotated —
+    // are the same graph, so they draw the same picture to the last attribute.
+    const arrivals: readonly (<T>(values: readonly T[]) => readonly T[])[] = [
+      (values) => values,
+      (values) => values.toReversed(),
+      (values) => [...values.slice(2), ...values.slice(0, 2)],
+    ];
 
-      // Every gap is the same, and wider than the narrowest a curve alone needs.
-      const lefts = shapeLefts();
-      const [, , , routeLeft, datastoreLeft] = lefts;
-      if (routeLeft === undefined || datastoreLeft === undefined) {
-        throw new Error('the chain drew fewer than five columns');
-      }
-      const gap = datastoreLeft - routeLeft - DEFAULT_GRAPH_NODE_WIDTH;
-      expect(gap).toBeGreaterThan(MIN_GRAPH_COLUMN_GAP);
-      expect(lefts).toEqual(columnLefts(gap));
-
-      // The label is centred in the gap it labels, and its ink — measured the
-      // way the component measures without canvas metrics — clears both
-      // outlines, whose strokes reach one unit into the gap.
-      const routeRight = routeLeft + DEFAULT_GRAPH_NODE_WIDTH;
-      const centre = Number(label.getAttribute('x'));
-      const advance = estimateTextWidth(text, DEFAULT_LABEL_FONT_SIZE);
-      expect(centre).toBeCloseTo(routeRight + gap / 2);
-      expect(centre - advance / 2).toBeGreaterThanOrEqual(routeRight + INSET);
-      expect(centre + advance / 2).toBeLessThanOrEqual(datastoreLeft - INSET);
-      expectDrawnAtPixelSize();
-    } finally {
-      viewport.restore();
+    for (const order of arrivals) {
+      cleanup();
+      await renderGraph(repeatedChain(LARGE_COUNT, order));
+      expect(drawnGeometry()).toEqual(first);
     }
   });
 });

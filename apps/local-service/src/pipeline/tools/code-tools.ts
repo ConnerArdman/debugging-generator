@@ -103,6 +103,14 @@ export type {
   RouteQueryResult,
 } from '@debuggen/code-analysis';
 
+/**
+ * The upstream HTTP method vocabulary, re-exported unchanged. The investigate
+ * stage reaches the code graph only through this module, and it grounds a flow
+ * step written as `<method> <route path>` against this list rather than against
+ * a restated one.
+ */
+export { HTTP_METHOD_NAMES } from '@debuggen/code-analysis';
+
 /* -------------------------------------------------------------------------------------------------
  * Compile-time helpers
  * ---------------------------------------------------------------------------------------------- */
@@ -2350,11 +2358,27 @@ export function createCodeTools(options: CodeToolsOptions): CodeTools {
     return Object.freeze(snapshot);
   };
 
+  /**
+   * Call records the logger refused since the last one it accepted.
+   *
+   * The service hands this module loggers that `../../logging.ts`'s
+   * `guardLogger` has already made no-throw, but this module may import
+   * nothing beyond its two packages and the context builder (its self-scan
+   * suite pins that set), so it cannot apply the guard to a logger it is given.
+   * An injected logger that throws anyway meets the same best-effort policy the
+   * guard applies: the record is dropped, the query's result stands, and the
+   * drop is counted — then announced as `droppedRecords` on the next record the
+   * logger accepts, because the logger that failed is the only sink this
+   * module has.
+   */
+  let droppedRecords = 0;
+
   const log = (fields: LogFields): void => {
     try {
-      logger.debug('code tool call', fields);
+      logger.debug('code tool call', droppedRecords === 0 ? fields : { ...fields, droppedRecords });
+      droppedRecords = 0;
     } catch {
-      // A failing logger must never fail a query, and there is nowhere else to report it.
+      droppedRecords += 1;
     }
   };
 

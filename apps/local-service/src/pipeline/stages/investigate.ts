@@ -45,6 +45,14 @@
  *    provider or executor failure. Exhaustion is an `Err`: this stage has no
  *    sanctioned fallback, so it never assembles an investigation from the
  *    results itself.
+ * 6. **Ground.** A valid investigation is held to the evidence before it is
+ *    returned: a shortlisted file no executed query returned is removed, a
+ *    symbol no result placed in its file is stripped, and a flow is removed
+ *    when a step names nothing a result returned or when two consecutive steps
+ *    are joined by no relationship an executed query returned
+ *    (`groundInvestigation`). The schema proves the reply well-formed; only the
+ *    results prove it true. Grounding asks the model nothing, so it is neither
+ *    a repair nor a retry.
  *
  * ## Two loops that must not be confused
  *
@@ -112,6 +120,7 @@ import type {
 import {
   CODE_TOOL_LIMITS,
   CODE_TOOL_NAMES,
+  HTTP_METHOD_NAMES,
   createCodeTools,
   describeCodeTools,
   isCodeToolName,
@@ -127,6 +136,7 @@ import type {
   CodeTools,
   CodeToolsOptions,
 } from '../tools/code-tools.js';
+import { buildInvestigateReplySchema } from './reply-schemas.js';
 
 /* -------------------------------------------------------------------------------------------------
  * Stage identity
@@ -191,6 +201,12 @@ export type CodeFlow = string;
  * The validated output of Stage 2 (AAP §0.4.2): the scored shortlist of
  * relevant files, most relevant first, and the flows that connect them.
  *
+ * The same shape serves twice. As the model's final reply it is only
+ * well-formed; as the stage's result it is also **grounded**: every file on the
+ * shortlist was returned by an executed query, every symbol was placed in its
+ * file by a result, and every flow step names an evidenced node, route or file
+ * (`groundInvestigation`). The stage never returns an ungrounded one.
+ *
  * Each `relevantFiles` element **is** protocol's `RelevantFile` — the imported
  * type, validated by the imported `relevantFileSchema` — because the
  * orchestrator persists the list verbatim as `SessionRecord.relevantFiles` and
@@ -215,10 +231,15 @@ export interface CodeInvestigation {
  * A reply that asks for further queries: the only other shape an
  * investigation turn may answer with (AAP §0.4.2, "model proposes queries").
  *
- * The proposals are deliberately `unknown`: each is validated individually by
- * `parseCodeToolRequest` before anything runs, and a malformed one becomes a
- * `CodeToolRejection` fed back as evidence rather than a reason to reject the
- * whole reply.
+ * Each proposal is structurally a call of one catalogued tool by the time the
+ * reply reaches the stage: {@link investigateReplySchema} types it per tool
+ * (its name, its required arguments, each argument's type), so a structurally
+ * malformed proposal is a schema rejection repaired by the one repair loop.
+ * The element type stays `unknown` because the stage never trusts that
+ * structure: each proposal is still validated by `parseCodeToolRequest` before
+ * anything runs, and a value-level refusal (a blank name, an unsafe path, an
+ * empty selector) becomes a `CodeToolRejection` fed back as evidence rather
+ * than a reason to reject the whole reply.
  */
 export interface InvestigateQueryBatch {
   /** The proposed queries, in the order the model wants them run. */
@@ -542,21 +563,41 @@ export function isInvestigateReply(value: unknown): value is InvestigateReply {
 }
 
 /**
- * The authoring schema of one investigation turn (AAP §0.5.3): the final
- * {@link CodeInvestigation} or a query batch, and nothing else — classified by
- * shape afterwards, never by reading prose.
+ * The authoring schema of one investigation turn (AAP §0.4.2, §0.5.3): the
+ * final {@link CodeInvestigation} or a query batch, and nothing else —
+ * classified by shape afterwards, never by reading prose.
  *
- * One opaque schema over {@link isInvestigateReply} rather than a union of two,
- * because a union's rejection reads only "Invalid input" at the root, while this
- * one's reads `expected` followed by {@link INVESTIGATE_REPLY_LABEL}, which is
- * what a repair turn shows the model. The artifact half is the same
- * {@link isCodeInvestigation} guard {@link codeInvestigationSchema} is built on,
- * so the two schemas share one definition of the artifact.
+ * Built by the reply-schemas module (`./reply-schemas.ts`) from this module's
+ * own guard and bounds, because this is the schema a real provider renders for
+ * the model: the schema-constrained route and the forced tool route both need
+ * a JSON Schema document with an object root, which an opaque schema cannot
+ * produce. Two halves:
+ *
+ * - {@link isInvestigateReply} decides first. A reply it refuses — the wrong
+ *   key set, a bound broken, a hostile value — is one root issue reading
+ *   `expected` followed by {@link INVESTIGATE_REPLY_LABEL}, the line a repair
+ *   turn shows the model; no key or value of the reply is quoted. The artifact
+ *   half of that guard is the same {@link isCodeInvestigation} that
+ *   {@link codeInvestigationSchema} is built on, so the two schemas share one
+ *   definition of the artifact.
+ * - The structural schema then types each proposal of a batch as a call of one
+ *   catalogued tool, generated from the tool catalog. A proposal that names no
+ *   catalogued tool, lacks a required argument or carries an argument of the
+ *   wrong type is refused here, with per-path issues, by the one repair loop.
+ *   Value-level checks — blank or over-long strings, unsafe paths, clamped
+ *   integers, empty selectors, the excerpt argument rules — stay
+ *   `parseCodeToolRequest`'s, and its rejections remain evidence.
+ *
+ * A parse returns a structurally equal copy of the reply, with any argument key
+ * a tool does not declare dropped.
  */
-export const investigateReplySchema = opaqueSchema<InvestigateReply>(
-  INVESTIGATE_REPLY_LABEL,
-  isInvestigateReply,
-);
+export const investigateReplySchema = buildInvestigateReplySchema({
+  label: INVESTIGATE_REPLY_LABEL,
+  admits: isInvestigateReply,
+  maxQueries: MAX_PROPOSED_QUERIES,
+  maxFlows: MAX_FLOWS,
+  maxFlowChars: MAX_FLOW_CHARS,
+});
 
 /* -------------------------------------------------------------------------------------------------
  * Module contract
@@ -617,7 +658,7 @@ export interface InvestigateStageInput {
 
 /** The validated outcome of a run (AAP §0.4.2, Code-investigation row). */
 export interface InvestigateStageResult {
-  /** The validated Stage 2 artifact. */
+  /** The validated Stage 2 artifact, grounded in the executed queries' results. */
   readonly investigation: CodeInvestigation;
   /** The prompt version every turn used; the orchestrator records it on the session. */
   readonly promptVersion: string;
@@ -633,7 +674,10 @@ export interface InvestigateStageResult {
  */
 export interface InvestigateStage {
   /**
-   * Produces the validated code investigation for one pipeline run.
+   * Produces the validated code investigation for one pipeline run, grounded
+   * in what the run's executed queries returned: files, symbols and flows the
+   * results do not bear out are removed before the result is returned, and an
+   * investigation grounded down to an empty shortlist is still a success.
    *
    * Never throws. Every failure is an `Err` carrying a `DebuggenError`: the
    * context builder's (a cancelled build, a prompt that cannot load, a payload
@@ -770,11 +814,102 @@ interface EvidenceRoute {
   readonly file: string;
 }
 
-/** Everything the executed queries showed, collected structurally. */
+/**
+ * Everything the executed queries showed, collected structurally from the
+ * successful outcomes alone: what they named (nodes, routes, files, the
+ * declared names placed in each file) and how they related those names
+ * (`links`). Grounding reads the first to decide whether a step exists and the
+ * second to decide whether two consecutive steps are connected.
+ */
 interface Evidence {
   readonly nodes: EvidenceNode[];
   readonly routes: EvidenceRoute[];
   readonly files: Set<string>;
+  /**
+   * The declared names a result placed in each file: every node's `name`, the
+   * `symbol` of every located declaration a result carries (a source location,
+   * a symbol match), and the `symbol` a `handlersFor` handler reports for its
+   * location's file. What a shortlist entry's `symbol` is grounded against.
+   */
+  readonly symbols: Map<string, Set<string>>;
+  /**
+   * The unordered pairs of identifiers (node names, route paths, files) that a
+   * successful query result **related** to each other, keyed by
+   * {@link linkKey}. Unordered, because a path found by an undirected search
+   * may traverse an edge against its direction and a flow may be written either
+   * way round; what is asserted is a connection, never its direction. The
+   * sources, each taken only from what a result returned:
+   *
+   * - `pathBetween`: each two consecutive nodes of the returned path, in the
+   *   path's own traversal order;
+   * - `whoCalls`: each caller's name and the called `symbol` of the executed
+   *   request;
+   * - `componentsRendering`: each rendering parent's name and the rendered
+   *   `component` of the executed request;
+   * - `routeForUrl`: the resolved route path and its route node's name, and the
+   *   route path and its module file;
+   * - every recorded node: its file and its name (the containment the result
+   *   showed).
+   *
+   * `handlersFor` contributes no link: its handlers carry a method, a symbol
+   * and a location, and its request a URL, so neither names the route path a
+   * handler serves, and a link to it would be inferred rather than returned.
+   */
+  readonly links: Set<string>;
+}
+
+/** Records a declared name a result placed in `file`. */
+function addSymbol(evidence: Evidence, file: string, name: string | undefined): void {
+  if (name === undefined || name.length === 0) {
+    return;
+  }
+  const names = evidence.symbols.get(file) ?? new Set<string>();
+  names.add(name);
+  evidence.symbols.set(file, names);
+}
+
+/**
+ * Separates the two identifiers of a {@link Evidence.links} key. NUL is never
+ * part of an identifier that is keyed — {@link linkKey} refuses one holding
+ * it — so every key names exactly one pair and two different pairs can never
+ * collide.
+ */
+const LINK_KEY_SEPARATOR = '\u0000';
+
+/**
+ * The key of the unordered pair `{left, right}`: the two identifiers in code
+ * unit order, joined by {@link LINK_KEY_SEPARATOR}. `undefined` for an empty
+ * identifier or one containing the separator, which is then never linked.
+ */
+function linkKey(left: string, right: string): string | undefined {
+  if (
+    left.length === 0 ||
+    right.length === 0 ||
+    left.includes(LINK_KEY_SEPARATOR) ||
+    right.includes(LINK_KEY_SEPARATOR)
+  ) {
+    return undefined;
+  }
+  return left <= right
+    ? `${left}${LINK_KEY_SEPARATOR}${right}`
+    : `${right}${LINK_KEY_SEPARATOR}${left}`;
+}
+
+/** Records that a result related `left` and `right`; an absent or unkeyable identifier records nothing. */
+function addLink(evidence: Evidence, left: string | undefined, right: string | undefined): void {
+  if (left === undefined || right === undefined) {
+    return;
+  }
+  const key = linkKey(left, right);
+  if (key !== undefined) {
+    evidence.links.add(key);
+  }
+}
+
+/** Whether a result related `left` and `right`, in either order. */
+function isLinked(evidence: Evidence, left: string, right: string): boolean {
+  const key = linkKey(left, right);
+  return key !== undefined && evidence.links.has(key);
 }
 
 /** Reads one string field of an unknown value, or `undefined`. */
@@ -821,72 +956,177 @@ function addFile(evidence: Evidence, file: string | undefined): void {
   }
 }
 
-/** Records a code match (`{ kind, name, file }`) a result named. */
-function addNode(evidence: Evidence, match: unknown): void {
+/**
+ * Records a code match (`{ kind, name, file }`) a result named, together with
+ * the containment link between its file and its name.
+ *
+ * @returns The recorded node, or `undefined` when the match is malformed and
+ * contributed nothing — so a caller links only what was actually recorded.
+ */
+function addNode(evidence: Evidence, match: unknown): EvidenceNode | undefined {
   const kind = stringField(match, 'kind');
   const name = stringField(match, 'name');
   const file = stringField(match, 'file');
-  if (kind !== undefined && name !== undefined && file !== undefined && isSafeRelativePath(file)) {
-    evidence.nodes.push({ kind, name, file });
+  if (kind === undefined || name === undefined || file === undefined || !isSafeRelativePath(file)) {
+    return undefined;
+  }
+  const node: EvidenceNode = { kind, name, file };
+  evidence.nodes.push(node);
+  evidence.files.add(file);
+  addSymbol(evidence, file, name);
+  addLink(evidence, file, name);
+  return node;
+}
+
+/**
+ * Reads one tool's successful outcome for evidence: its `payload`, and the
+ * executed, parser-normalised `request` that produced it (the called symbol of
+ * a `whoCalls`, the rendered component of a `componentsRendering`). Both are
+ * read as `unknown`.
+ */
+type EvidenceReader = (payload: unknown, request: unknown, into: Evidence) => void;
+
+/**
+ * How each tool's outcome is read for evidence, total over the tool vocabulary
+ * by its type. Payloads and requests are read as `unknown` and checked field by
+ * field through own data properties only, so a malformed answer contributes
+ * nothing rather than failing the stage, and no getter ever runs. What each
+ * reader links is listed on {@link Evidence.links}.
+ */
+const EVIDENCE_READERS: Readonly<Record<CodeToolName, EvidenceReader>> = Object.freeze({
+  findByName: (payload, _request, into) => {
+    for (const match of listItems(payload)) {
+      addNode(into, match);
+    }
+  },
+  findSymbol: (payload, _request, into) => {
+    addNode(into, payload);
+  },
+  whoCalls: (payload, request, into) => {
+    const called = stringField(request, 'symbol');
+    for (const caller of listItems(payload)) {
+      const node = addNode(into, anyField(caller, 'caller'));
+      if (node !== undefined) {
+        addLink(into, node.name, called);
+      }
+    }
+  },
+  routeForUrl: (payload, _request, into) => {
+    const routePath = stringField(payload, 'routePath');
+    const file = stringField(payload, 'file');
+    if (routePath !== undefined && file !== undefined && isSafeRelativePath(file)) {
+      into.routes.push({ routePath, file });
+      into.files.add(file);
+      addLink(into, routePath, file);
+    }
+    const node = addNode(into, anyField(payload, 'node'));
+    if (node !== undefined) {
+      addLink(into, routePath, node.name);
+    }
+  },
+  handlersFor: (payload, _request, into) => {
+    for (const handler of listItems(payload)) {
+      const file = stringField(anyField(handler, 'location'), 'file');
+      addFile(into, file);
+      if (file !== undefined && into.files.has(file)) {
+        addSymbol(into, file, stringField(handler, 'symbol'));
+      }
+    }
+  },
+  componentsRendering: (payload, request, into) => {
+    const rendered = stringField(request, 'component');
+    for (const parent of listItems(payload)) {
+      const node = addNode(into, anyField(parent, 'component'));
+      if (node !== undefined) {
+        addLink(into, node.name, rendered);
+      }
+    }
+  },
+  pathBetween: (payload, _request, into) => {
+    // Index by index rather than through `listItems`, which compacts: a hole or
+    // a malformed node breaks the chain there, so the nodes either side of it —
+    // which the path never joined directly — are not linked.
+    const nodes = anyField(payload, 'nodes');
+    if (!Array.isArray(nodes)) {
+      return;
+    }
+    const list: readonly unknown[] = nodes;
+    let previous: EvidenceNode | undefined;
+    for (let index = 0; index < list.length; index += 1) {
+      const item = dataProperty(list, index);
+      const node = item === ABSENT ? undefined : addNode(into, item);
+      if (node !== undefined && previous !== undefined) {
+        addLink(into, previous.name, node.name);
+      }
+      previous = node;
+    }
+  },
+  excerpt: (payload, _request, into) => {
+    addFile(into, stringField(payload, 'file'));
+  },
+});
+
+/**
+ * How deep {@link addLocatedSymbols} descends into one result payload. A query
+ * result nests a declaration's location at most a few levels down (a route's
+ * `methodLocations.GET`, a path's `nodes[i].location`); the bound keeps the walk
+ * linear in the payload however it is shaped.
+ */
+const MAX_EVIDENCE_DEPTH = 8;
+
+/**
+ * Records every file a result payload returns, and every declared name it
+ * places in one: each object, at any depth, that carries a safe
+ * project-relative `file` contributes that file, and with it its `symbol` when
+ * it names one — a source location's enclosing declaration (`GET` in a route
+ * file), a symbol match. Own data properties only, so no getter runs; a
+ * `request` echo is skipped, so a name that was merely asked for is never
+ * evidence.
+ */
+function addLocatedSymbols(evidence: Evidence, value: unknown, depth: number): void {
+  if (depth > MAX_EVIDENCE_DEPTH) {
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of listItems(value)) {
+      addLocatedSymbols(evidence, item, depth + 1);
+    }
+    return;
+  }
+  if (!isPlainRecord(value)) {
+    return;
+  }
+  const file = stringField(value, 'file');
+  if (file !== undefined && isSafeRelativePath(file)) {
     evidence.files.add(file);
+    addSymbol(evidence, file, stringField(value, 'symbol'));
+  }
+  for (const key of Object.keys(value)) {
+    if (key !== 'request') {
+      const entry = anyField(value, key);
+      if (entry !== undefined) {
+        addLocatedSymbols(evidence, entry, depth + 1);
+      }
+    }
   }
 }
 
 /**
- * How each tool's payload is read for evidence, total over the tool vocabulary
- * by its type. Payloads are read as `unknown` and checked field by field, so a
- * malformed answer contributes nothing rather than failing the stage.
- */
-const EVIDENCE_READERS: Readonly<Record<CodeToolName, (payload: unknown, into: Evidence) => void>> =
-  Object.freeze({
-    findByName: (payload, into) => {
-      for (const match of listItems(payload)) {
-        addNode(into, match);
-      }
-    },
-    findSymbol: (payload, into) => {
-      addNode(into, payload);
-    },
-    whoCalls: (payload, into) => {
-      for (const caller of listItems(payload)) {
-        addNode(into, anyField(caller, 'caller'));
-      }
-    },
-    routeForUrl: (payload, into) => {
-      const routePath = stringField(payload, 'routePath');
-      const file = stringField(payload, 'file');
-      if (routePath !== undefined && file !== undefined && isSafeRelativePath(file)) {
-        into.routes.push({ routePath, file });
-        into.files.add(file);
-      }
-      addNode(into, anyField(payload, 'node'));
-    },
-    handlersFor: (payload, into) => {
-      for (const handler of listItems(payload)) {
-        addFile(into, stringField(anyField(handler, 'location'), 'file'));
-      }
-    },
-    componentsRendering: (payload, into) => {
-      for (const parent of listItems(payload)) {
-        addNode(into, anyField(parent, 'component'));
-      }
-    },
-    pathBetween: (payload, into) => {
-      for (const node of listItems(anyField(payload, 'nodes'))) {
-        addNode(into, node);
-      }
-    },
-    excerpt: (payload, into) => {
-      addFile(into, stringField(payload, 'file'));
-    },
-  });
-
-/**
  * Collects the evidence of every successful run: the graph nodes, routes and
- * files the results named. Rejections carry no evidence.
+ * files the results named, the declared names they placed in each file, and
+ * the pairs of identifiers they related ({@link Evidence.links}). Each reader
+ * is handed the outcome's own executed request — the parser-normalised request
+ * the executor echoes — never the proposal as the model wrote it. Rejections
+ * carry no evidence.
  */
 function collectEvidence(runs: readonly CodeToolRun[]): Evidence {
-  const evidence: Evidence = { nodes: [], routes: [], files: new Set<string>() };
+  const evidence: Evidence = {
+    nodes: [],
+    routes: [],
+    files: new Set<string>(),
+    symbols: new Map<string, Set<string>>(),
+    links: new Set<string>(),
+  };
   for (const run of runs) {
     const outcome: CodeToolOutcome = run.outcome;
     if (!outcome.ok) {
@@ -897,9 +1137,159 @@ function collectEvidence(runs: readonly CodeToolRun[]): Evidence {
       continue;
     }
     const payload: unknown = outcome.value.payload;
-    EVIDENCE_READERS[tool](payload, evidence);
+    const request: unknown = outcome.value.request;
+    EVIDENCE_READERS[tool](payload, request, evidence);
+    addLocatedSymbols(evidence, payload, 0);
   }
   return evidence;
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * Grounding: the investigation keeps only what the executed queries showed
+ * ---------------------------------------------------------------------------------------------- */
+
+/** Splits a flow into its steps at the arrow the prompt and the rules provider write, in either spelling. */
+const FLOW_STEP_SEPARATOR = /\s*(?:→|->)\s*/u;
+
+/** A flow step that names a route by method: `<HTTP method> <route path>`. */
+const METHOD_ROUTE_STEP = /^(\S+)\s+(\S.*)$/u;
+
+/** The methods a method-qualified route step may name: the upstream vocabulary, never restated. */
+const HTTP_METHODS: ReadonlySet<string> = new Set<string>(HTTP_METHOD_NAMES);
+
+/** An investigation held to the evidence, and what holding it there removed — counts only. */
+interface GroundedInvestigation {
+  /** The grounded investigation, frozen and detached from the model's reply. */
+  readonly investigation: CodeInvestigation;
+  /** Shortlist entries dropped because no executed query returned their file. */
+  readonly removedFileCount: number;
+  /** Kept entries whose symbol no executed query placed in their file; the symbol alone was dropped. */
+  readonly strippedSymbolCount: number;
+  /**
+   * Flows dropped because a step named nothing an executed query returned, or
+   * because two consecutive steps were joined by no relationship one returned.
+   */
+  readonly removedFlowCount: number;
+}
+
+/** A shortlist entry under its evidenced file spelling, without its symbol; reason and score kept. */
+function withoutSymbol(entry: RelevantFile, file: string): RelevantFile {
+  const copy: { -readonly [Key in keyof RelevantFile]: RelevantFile[Key] } = { ...entry, file };
+  delete copy.symbol;
+  return copy;
+}
+
+/**
+ * Holds a validated investigation to what the run's executed queries actually
+ * returned (AAP §0.4.2: "model proposes queries, deterministic code executes
+ * them"). The reply schema proves the investigation well-formed; only the
+ * evidence can prove it true, so nothing the model merely asserted reaches
+ * Stage 3, the stored session or the editor's relevant-files view.
+ *
+ * - **Files.** An entry is kept only when a successful query result named its
+ *   file (compared in normal POSIX form, which is also the spelling kept).
+ * - **Symbols.** A kept entry whose `symbol` no result placed in that same file
+ *   loses the symbol and keeps its grounded file, reason and score: the file is
+ *   still evidenced, the declaration is not.
+ * - **Flows.** A flow is a claim that its steps are connected, so both halves
+ *   of the claim must be evidenced:
+ *   1. every step between its arrows (`→` or `->`) is non-empty and is an
+ *      evidenced node or symbol name, an evidenced route path (a `routeForUrl`
+ *      result or an `api-route` node), an evidenced file, or
+ *      `<HTTP method> <evidenced route path>` — prose steps are not evidence;
+ *   2. every two consecutive steps are **linked**: a successful executed query
+ *      returned a relationship between them ({@link Evidence.links} lists the
+ *      sources). A method-qualified route step is compared as its route path.
+ *      Two names that separate lookups each found — two unrelated
+ *      `findByName` hits — are not linked, so the model cannot connect them by
+ *      writing an arrow between them.
+ *
+ *   A single-step flow asserts no connection and needs its step evidenced only.
+ *   A flow the rules-based provider writes — the node names of a `pathBetween`
+ *   result joined by arrows, in the path's order — is grounded by
+ *   construction, because each two consecutive names of it are a link.
+ *
+ * Pure and total. Grounding is not a repair: it never asks the model again,
+ * never retries and never substitutes anything, and an investigation grounded
+ * down to an empty shortlist is still a valid result (Stage 3 then plans from
+ * the runtime signals alone). What it removed is reported as counts only.
+ *
+ * @param investigation The investigation the reply schema accepted.
+ * @param evidence What the run's executed queries returned.
+ * @returns The grounded investigation and the counts of what was removed.
+ */
+function groundInvestigation(
+  investigation: CodeInvestigation,
+  evidence: Evidence,
+): GroundedInvestigation {
+  let removedFileCount = 0;
+  let strippedSymbolCount = 0;
+  const relevantFiles: RelevantFile[] = [];
+  for (const entry of investigation.relevantFiles) {
+    const file = normalizePosix(entry.file);
+    if (!evidence.files.has(file)) {
+      removedFileCount += 1;
+      continue;
+    }
+    if (entry.symbol !== undefined && evidence.symbols.get(file)?.has(entry.symbol) !== true) {
+      strippedSymbolCount += 1;
+      relevantFiles.push(withoutSymbol(entry, file));
+      continue;
+    }
+    relevantFiles.push({ ...entry, file });
+  }
+
+  const routePaths = new Set<string>([
+    ...evidence.routes.map((route) => route.routePath),
+    ...evidence.nodes.filter((node) => node.kind === 'api-route').map((node) => node.name),
+  ]);
+  const names = new Set<string>([...evidence.files, ...routePaths]);
+  for (const declared of evidence.symbols.values()) {
+    for (const name of declared) {
+      names.add(name);
+    }
+  }
+  // The evidenced identifier a step names — the step itself, or the route path
+  // of a `<HTTP method> <route path>` step — or `undefined` for a step that
+  // names nothing a result returned.
+  const stepIdentifier = (step: string): string | undefined => {
+    if (step.length === 0) {
+      return undefined;
+    }
+    if (names.has(step)) {
+      return step;
+    }
+    const [, method, routePath] = METHOD_ROUTE_STEP.exec(step) ?? [];
+    return method !== undefined &&
+      routePath !== undefined &&
+      HTTP_METHODS.has(method) &&
+      routePaths.has(routePath)
+      ? routePath
+      : undefined;
+  };
+  // Every step evidenced, and every two consecutive steps linked.
+  const isGroundedFlow = (flow: string): boolean => {
+    let previous: string | undefined;
+    for (const step of flow.trim().split(FLOW_STEP_SEPARATOR)) {
+      const identifier = stepIdentifier(step);
+      if (identifier === undefined) {
+        return false;
+      }
+      if (previous !== undefined && !isLinked(evidence, previous, identifier)) {
+        return false;
+      }
+      previous = identifier;
+    }
+    return true;
+  };
+  const flows = investigation.flows.filter(isGroundedFlow);
+
+  return {
+    investigation: detachInvestigation({ relevantFiles, flows }),
+    removedFileCount,
+    strippedSymbolCount,
+    removedFlowCount: investigation.flows.length - flows.length,
+  };
 }
 
 /** Up to {@link MAX_FINDING_ROWS_PER_STAGE} distinct names, in first-seen order. */
@@ -983,7 +1373,10 @@ const STARTED_LOG = 'Investigate stage started.';
 /** Debug record of one executed batch. Fields: stage, turn, counts, tool names, budget. */
 const BATCH_LOG = 'Investigate stage executed a query batch.';
 
-/** Info record of a validated investigation. Fields: version, counts, budget, timing. */
+/**
+ * Info record of a validated investigation. Fields: version, counts, budget,
+ * timing, and what grounding removed (file, symbol and flow counts).
+ */
 const COMPLETED_LOG = 'Investigate stage produced a validated code investigation.';
 
 /** Warn record of a failed run. Fields: stage, error code, rejection reason, counts. */
@@ -1467,8 +1860,12 @@ export function createInvestigateStage(deps: InvestigateStageDeps): InvestigateS
       const reply: unknown = answer.value.value;
 
       if (isCodeInvestigation(reply)) {
-        const investigation = detachInvestigation(reply);
+        // The reply is well-formed; grounding keeps only what the executed
+        // queries returned. What it removed is logged as counts, never as the
+        // paths, symbols or flow text themselves.
         const evidence = collectEvidence(state.runs);
+        const grounded = groundInvestigation(reply, evidence);
+        const investigation = grounded.investigation;
         log.info(COMPLETED_LOG, {
           stage: INVESTIGATE_STAGE,
           promptVersion,
@@ -1481,9 +1878,9 @@ export function createInvestigateStage(deps: InvestigateStageDeps): InvestigateS
           remainingQueries: state.remaining,
           relevantFileCount: investigation.relevantFiles.length,
           flowCount: investigation.flows.length,
-          unevidencedFileCount: investigation.relevantFiles.filter(
-            (entry) => !evidence.files.has(entry.file),
-          ).length,
+          removedFileCount: grounded.removedFileCount,
+          strippedSymbolCount: grounded.strippedSymbolCount,
+          removedFlowCount: grounded.removedFlowCount,
           durationMs: Math.max(0, context.now() - started),
         });
         emitProgress('findings', log, () =>

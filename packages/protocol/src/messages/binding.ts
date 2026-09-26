@@ -159,8 +159,27 @@ const MAX_ORIGIN_LENGTH = 512;
  * The upper bound is `Number.MAX_SAFE_INTEGER` because beyond it two distinct
  * ids can compare equal as doubles, and a registry keyed by tab id would then
  * route one tab's telemetry to another's panel.
+ *
+ * ## One schema for every spelling of "the tab" on the wire
+ *
+ * Exported because this is also the schema of the **acting tab**: the inspected
+ * tab a DevTools frame or request acts for. The Chrome service worker carries
+ * every inspected tab over one paired credential and one WebSocket, so the
+ * service can hold a DevTools principal to "only the session bound to that tab"
+ * (AAP §0.5.6) only when each frame and request says which tab it is for:
+ *
+ * - `../envelope.ts` declares the envelope's optional `tabId` with it, and
+ *   `createEnvelope` validates its `tabId` option against it;
+ * - `../http.ts` parses and formats the `x-debuggen-tab` request header
+ *   (`ACTING_TAB_HEADER`) with it, so a header value is held to exactly the
+ *   rules a payload's `tabId` is.
+ *
+ * Both import it from this module directly; the messages barrel does not
+ * forward it, because it is a field primitive rather than a message payload.
+ * Like every `tabId` here, the acting tab is an identifier the service checks
+ * against its own live binding table, never a capability.
  */
-const tabIdSchema = z
+export const tabIdSchema = z
   .number()
   .int()
   .min(0, {

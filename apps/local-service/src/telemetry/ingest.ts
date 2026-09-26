@@ -23,6 +23,17 @@
  *    refusal is a drop: the whole batch is counted under its `DropReason` and
  *    **nothing is parsed, hashed, persisted or broadcast** — which is what makes
  *    "an unrelated plan collects no backend telemetry" true end to end.
+ * 2½. **Account producer loss.** A relayed browser batch may say how many
+ *    events its page agent discarded since its previous loss report (the
+ *    agent's buffer is bounded at 5 000 events while the bridge is away, AAP
+ *    §0.5.5). Once the batch is attributed, that count is handed to the
+ *    store's optional loss ledger (`telemetry.recordProducerLoss`) against the
+ *    **attributed** session and capture, so the capture's summary can say its
+ *    evidence is incomplete rather than look whole. It is recorded here, before
+ *    the batch's own events are processed, because the loss happened whatever
+ *    becomes of them; a refused batch records nothing, since the capture its
+ *    loss belongs to is exactly what could not be established. A ledger failure
+ *    is logged and never fails the batch.
  * 3. **One request-key hasher per batch.** The session's secret is read from
  *    the store and `createRequestKeyHasher` is called once, so the
  *    non-extractable HMAC key is imported once per batch, not once per event.
@@ -31,7 +42,10 @@
  * 4. **Parse every element** with `parseTelemetryEventIngress`. A malformed
  *    element is counted as `invalid` and skipped; its siblings continue. The
  *    strict ingress schema refuses `sessionId`, `captureId` and `ingestSeq`, so
- *    nothing is added to an event before this step.
+ *    nothing is added to an event before this step. It is also what validates
+ *    a producer's optional `clockOffsetMs`: a whole number of milliseconds
+ *    within `±CLOCK_OFFSET_BOUND_MS`, so a fractional or out-of-bound offset
+ *    makes its element `invalid` rather than reaching the store.
  * 5. **Assign `request_key`** — from the **unredacted** URL, before step 6.
  *    Producer-supplied service-assigned keys are stripped from every event
  *    first; then a request-kind event carrying a method and a URL receives the
@@ -45,19 +59,40 @@
  *    `captureId` and applies the tier gate; a dropped event is counted under
  *    its reason and never stored.
  * 7½. **Locate** — the optional `sources` port places every attributed event
- *    that arrived without a `source` in the project's code (AAP §0.4.2, "Source
- *    resolution path": patch metadata, route map, code graph, or the fetch
- *    initiator mapped through the dev server's source map). It runs on
- *    redacted, attributed events and **before** persistence, so the stored
- *    document, the correlator and the live tail all carry the same location. A
- *    failure is counted and logged, never fatal: the event is stored without
- *    a location rather than not at all.
+ *    in the project's code (AAP §0.4.2, "Source resolution path": patch
+ *    metadata, route map, code graph, or the fetch initiator mapped through the
+ *    dev server's source map). A producer-stamped `source` is a **claim**, not
+ *    a location: the page agent shares the page's main world, so a page script
+ *    can stamp any event it posts. Every event goes to the port — a `patch`
+ *    claim with it, for corroboration against the modification journal; a
+ *    claim on any other route withheld, since only a patch records a position
+ *    a producer can carry — and the stored `source` is exactly the port's
+ *    answer for that event id; a claim the port does not return is removed and
+ *    counted in `sourcesRefused`. It runs on redacted, attributed events and
+ *    **before** persistence, so the stored document, the correlator and the
+ *    live tail all carry the same verified location. A failure is counted and
+ *    logged, never fatal: the event is stored without a location — its claim
+ *    removed too, since nothing verified it — rather than not at all. Without
+ *    a port no claim can be verified, so none is kept.
+ *    The step is bounded by the locate budget ({@link DEFAULT_LOCATE_BUDGET_MS}):
+ *    the locator is asked to answer with what it has when the budget fires and
+ *    is no longer awaited once {@link LOCATE_BUDGET_GRACE_MS} more has passed,
+ *    so a slow dev server or index can delay a batch by that much and never
+ *    stall live capture; events left unplaced are counted as
+ *    `sourcesUnplacedByBudget`, and a claim the budget left unverified is
+ *    removed like any other.
  * 8. **Persist** — one `telemetry.insertMany` call for the whole batch. The
  *    store assigns `ingestSeq` and returns the rows as it holds them; a store
- *    failure is a typed `Err` and nothing is retried or broadcast.
+ *    failure is a typed `Err` and nothing is retried or broadcast. The events
+ *    carrying a `clockOffsetMs` are counted as they are handed over
+ *    (`clockOffsetsReported`); the store projects each offset into
+ *    `telemetry_events.clock_offset_ms`.
  * 9. **Correlate** — `correlator.onEventsPersisted` with the rows the store
- *    **returned** (they carry `ingestSeq`, the final ordering tie-break). A
- *    failure is logged and counted, never fatal: the evidence is durable.
+ *    **returned** (they carry the attribution and `ingestSeq`). The correlator
+ *    marks the traces they touch stale, in time proportional to the batch and
+ *    with no store read, and each rebuilds once from the store on its next
+ *    read, however many batches landed in between. A failure is logged and
+ *    counted, never fatal: the evidence is durable.
  * 10. **Tail** — `liveTail.push` with the same returned rows. A failure is
  *     logged and counted, never fatal. The tail de-duplicates by event id, so
  *     rows the store skipped as idempotent replays are safe to send again.
@@ -99,11 +134,40 @@
  * failures are summarised by zod issue codes and top-level schema field names
  * taken from the upstream parse helper, never by the rejected value.
  *
+ * ## Rate of what this module says
+ *
+ * Producers choose how often they send, so no warning or error is written per
+ * batch unconditionally. Each is admitted by one {@link createLogThrottle} per
+ * pipeline, keyed by its class and scope — the session once the batch is
+ * attributed; before that the producer: the origin with the relayed tab, or
+ * with a digest of the server agent's credential project — and optionally its
+ * error code: one record per key per {@link LOG_THROTTLE_INTERVAL_MS}, at most
+ * {@link LOG_THROTTLE_MAX_RECORDS_PER_INTERVAL} across all keys, each written
+ * record carrying `suppressed` (and `suppressedUntracked`) counts of what was
+ * held back. Held-back occurrences that no later record carries are written as
+ * a trailing summary (`trailingSummary: true`) one interval later, so a flood
+ * that stops is still reported. The debug records of batches that stored
+ * nothing — empty, dropped whole, or entirely malformed — pass through a
+ * separate throttle of the same shape, keyed by their producer (and session,
+ * once attributed), so the first such batch of every producer in an interval
+ * is reported whole and only its repeats are summarised; the debug record of
+ * a batch that stored evidence is not throttled, being bounded by the
+ * evidence itself. Keys are never written.
+ *
  * ## Time base
  *
  * `startTime` (epoch milliseconds as a double) and `duration` (milliseconds)
  * pass through untouched for both tiers. The injected clock is read only to
- * measure this module's own elapsed time for the summary log line.
+ * measure this module's own elapsed time for the summary log line and to pace
+ * the log throttle.
+ *
+ * A producer's `clockOffsetMs` — its informational estimate of `server clock −
+ * producer clock` (AAP 0.2.3, `@debuggen/telemetry`'s `ClockOffsetEstimator`),
+ * stamped once when it created the event — passes through the same way: it is
+ * validated at step 4 and persisted at step 8, and it is never applied to
+ * `startTime` or `duration` and never re-derived here. The service's clock
+ * plays no part in it; the summary log line carries only how many events
+ * reported one and the largest magnitude among them.
  *
  * @example
  * ```ts
@@ -116,8 +180,13 @@
  *   logger,
  * });
  *
- * // ../server/ws.ts — a telemetry.event frame relayed for an inspected tab:
- * const fromTab = await ingest.ingestFromAgent({ tabId, events: payload.events });
+ * // ../server/routes/telemetry.ts — a telemetry.event frame relayed for an inspected tab:
+ * const fromTab = await ingest.ingestFromAgent({
+ *   tabId,
+ *   events: payload.events,
+ *   ...(payload.armedCaptureId === undefined ? {} : { armedCaptureId: payload.armedCaptureId }),
+ *   ...(payload.droppedCount === undefined ? {} : { droppedCount: payload.droppedCount }),
+ * });
  *
  * // ../server/routes/telemetry.ts — POST /telemetry/ingest with a server-agent credential:
  * const fromServer = await ingest.ingestFromServerAgent({
@@ -141,11 +210,14 @@ import type {
   DebuggenErrorCode,
   LogFields,
   Logger,
+  ProducerId,
   Result,
   SessionId,
   SourceLocation,
+  SourceResolvedBy,
   TraceId,
 } from '@debuggen/shared';
+import { sha256Hex } from '@debuggen/shared/node';
 import {
   KIND_ATTRIBUTE_KEYS,
   REQUEST_KINDS,
@@ -163,7 +235,7 @@ import type {
   XHR_ATTRIBUTE_KEYS,
 } from '@debuggen/telemetry';
 
-import { LOG_BINDING_KEYS, sessionLogger, subsystemLogger } from '../logging.js';
+import { LOG_BINDING_KEYS, guardLogger, sessionLogger, subsystemLogger } from '../logging.js';
 import type { InsertTelemetryResult, PersistableTelemetryEvent } from '../store/telemetry-repo.js';
 import {
   DROP_REASONS,
@@ -328,11 +400,56 @@ const INGRESS_FIELD_NAMES: ReadonlySet<string> = new Set<string>(
   Object.keys(telemetryEventIngressSchema.shape),
 );
 
+/**
+ * The only resolution route a producer may claim for its own event.
+ *
+ * AAP §0.4.2 ("Source resolution path") gives producers exactly one location
+ * to carry: the position `@debuggen/instrumentation` recorded when it patched
+ * a function, which both tiers' span helpers stamp `resolvedBy: 'patch'`. Every
+ * other route — route map, code graph, source map, React owner chain — is the
+ * service's own computation from the event's evidence, so a producer-stamped
+ * location on one of them is not a candidate worth vetting: it is removed
+ * before step 7½'s locator sees the event, and the locator computes its own.
+ * A `patch` claim is still only a claim; the locator corroborates it against
+ * the session's modification journal.
+ */
+const PRODUCER_CLAIMABLE_ROUTES: ReadonlySet<SourceResolvedBy> = new Set<SourceResolvedBy>([
+  'patch',
+]);
+
 /** The issue code recorded for an element whose properties could not even be read. */
 const UNREADABLE_ISSUE_CODE = 'unreadable';
 
 /** The most distinct issue codes or field names one log record lists. */
 const MAX_LOGGED_ISSUE_LABELS = 16;
+
+/**
+ * How long step 7½ may hold a batch by default, in milliseconds.
+ *
+ * Locating is enrichment; persistence and the live tail are the evidence. The
+ * source-map route waits on the dev server (up to `fetchSourceMap`'s five-second
+ * timeout per chunk), so without a bound one slow chunk would delay every event
+ * of the batch — and the DevTools tail with it. A second and a half covers an
+ * index already in memory and a warm dev server with room to spare; whatever is
+ * still unplaced then is stored without a location, counted in
+ * {@link IngestReport.sourcesUnplacedByBudget}.
+ */
+export const DEFAULT_LOCATE_BUDGET_MS = 1_500;
+
+/**
+ * The largest budget {@link TelemetryIngestDeps.locateBudgetMs} honours. A
+ * longer wait would hold the live tail past what a developer watching it reads
+ * as live, which is the stall the budget exists to prevent.
+ */
+export const MAX_LOCATE_BUDGET_MS = 10_000;
+
+/**
+ * How long past its budget a locator is still awaited before ingest stops
+ * waiting for it. The budget is a request — "answer with what you have" — and
+ * this is its enforcement: a locator that ignores the signal cannot hold a batch
+ * longer than the budget plus this grace.
+ */
+export const LOCATE_BUDGET_GRACE_MS = 100;
 
 /* -------------------------------------------------------------------------------------------------
  * Consumer-side ports
@@ -346,14 +463,35 @@ const MAX_LOGGED_ISSUE_LABELS = 16;
 type MaybePromise<T> = T | PromiseLike<T>;
 
 /**
- * The telemetry store, as far as ingest needs it: one bulk write.
+ * One producer-loss report, as ingest hands it to the store's ledger: how many
+ * events a producer said it discarded before delivery, accounted against the
+ * session and capture its batch was **attributed** to (never a capture the
+ * producer named). Identifiers and a count only.
+ *
+ * Declared structurally here so this module does not depend on the store's
+ * own declaration; `TelemetryRepo.recordProducerLoss` accepts this shape.
+ */
+export interface ProducerLossReportLike {
+  /** The session the reporting batch was attributed to. */
+  readonly sessionId: SessionId;
+  /** The capture window the reporting batch was attributed to. */
+  readonly captureId: CaptureId;
+  /** The producer id the transport announced, when it announced one. Diagnostic only. */
+  readonly producerId?: ProducerId | undefined;
+  /** Events the producer discarded since its previous loss report; a positive safe integer. */
+  readonly droppedEvents: number;
+}
+
+/**
+ * The telemetry store, as far as ingest needs it: one bulk write, and the
+ * optional producer-loss ledger.
  *
  * `insertMany` takes **already-redacted, attributed** events without an
  * `ingestSeq`, writes them in one transaction (`ON CONFLICT(id)` replays of an
  * identical event are skipped, not refused) and returns the batch as the store
  * holds it — every offered event, each carrying its store-assigned `ingestSeq`.
  *
- * @see ../store/telemetry-repo.js — `TelemetryRepo.insertMany`, the implementation.
+ * @see ../store/telemetry-repo.js — `TelemetryRepo`, the implementation.
  */
 export interface TelemetryRepoLike {
   /**
@@ -365,6 +503,22 @@ export interface TelemetryRepoLike {
   insertMany(
     events: readonly PersistableTelemetryEvent[],
   ): MaybePromise<Result<InsertTelemetryResult, DebuggenError>>;
+
+  /**
+   * Adds one producer-loss report to the capture's ledger, which the capture
+   * summary reads when the window closes (pipeline step 2½).
+   *
+   * Optional: a store without a ledger still ingests every batch, and the
+   * reported count still appears in {@link IngestReport.producerDropped}.
+   * Called only with a positive count, only for an attributed batch, and at
+   * most once per batch. `ok` carries the ledger's count for the capture after
+   * the report, which ingest only logs; an `Err` is logged and never fails the
+   * batch.
+   *
+   * @param report The attributed session and capture, and the count.
+   * @returns The capture's recorded loss, or the refusal.
+   */
+  recordProducerLoss?(report: ProducerLossReportLike): MaybePromise<Result<number, DebuggenError>>;
 }
 
 /**
@@ -429,25 +583,53 @@ export const DEFAULT_INGEST_PRIVACY: IngestPrivacyPrimitives = Object.freeze({
   redactEvent,
 });
 
+/** What ingest tells a locator about one call. */
+export interface IngestLocateOptions {
+  /**
+   * The batch's locate budget: aborted when
+   * {@link TelemetryIngestDeps.locateBudgetMs} has elapsed. It asks for the
+   * answer **as it stands** — a locator should stop starting new work and
+   * answer `ok` with the locations found so far — not for a cancellation, and
+   * an `Err` after it fired still counts as a locate failure. A locator that
+   * ignores it is stopped waiting for {@link LOCATE_BUDGET_GRACE_MS} later.
+   */
+  readonly signal?: AbortSignal | undefined;
+}
+
 /**
  * The source-location port of step 7½: `../source/resolve.ts` behind a
  * per-session adapter that `../main.ts` wires (the session's project root,
  * code index, modification journal and dev-server origin).
  *
- * Handed only redacted, attributed events that carry no `source`, all of one
- * batch at once so the resolver shares one source-map cache across them; it
- * answers the locations it found keyed by event id and leaves the rest out.
+ * Handed every redacted, attributed event of one batch at once, so the
+ * resolver shares one source-map cache across them. An event may arrive with a
+ * producer-stamped `patch` `source`; that is a **claim** for the resolver to
+ * corroborate against the session's modification journal, never a location to
+ * keep. A claim on any other route is removed before the port sees the event
+ * (no producer records one, AAP §0.4.2), so the port computes that location
+ * itself. The port answers the locations it vouches for, keyed by event id, and
+ * leaves the rest out: whatever it leaves out is stored without a `source`, the
+ * producer's claim removed.
  */
 export interface IngestSourceLocator {
+  /**
+   * Places the events it can.
+   *
+   * @param events The batch's redacted, attributed events that carry no `source`.
+   * @param attribution The session and capture the batch was attributed to.
+   * @param options The batch's locate budget; see {@link IngestLocateOptions}.
+   * @returns The locations found, keyed by event id, or the failure.
+   */
   locate(
     events: readonly AttributedEvent[],
     attribution: IngestAttribution,
+    options?: IngestLocateOptions,
   ): Promise<Result<ReadonlyMap<string, SourceLocation>, DebuggenError>>;
 }
 
 /** Everything {@link createTelemetryIngest} is given; all of it injected. */
 export interface TelemetryIngestDeps {
-  /** The telemetry store; only `insertMany` is called. */
+  /** The telemetry store; `insertMany` is called, and `recordProducerLoss` when it exists. */
   readonly telemetry: TelemetryRepoLike;
   /** The sessions store; only `getOrCreateRequestKeySecret` is called. */
   readonly sessions: SessionsRepoLike;
@@ -463,12 +645,23 @@ export interface TelemetryIngestDeps {
   /**
    * Places attributed events in the project's source before they are stored
    * (step 7½). Optional for the same reason as {@link correlator}: without it
-   * events are stored with whatever `source` their producer stamped.
+   * events are stored without a `source` — a producer-stamped one is removed,
+   * because nothing could verify it.
    */
   readonly sources?: IngestSourceLocator | undefined;
+  /**
+   * How long step 7½ may hold a batch, in milliseconds; defaults to
+   * {@link DEFAULT_LOCATE_BUDGET_MS}. Only a positive finite value no larger
+   * than {@link MAX_LOCATE_BUDGET_MS} is honoured; any other value is treated
+   * as absent.
+   */
+  readonly locateBudgetMs?: number | undefined;
   /** The service logger; defaults to `noopLogger`. Bound to `subsystem: "telemetry.ingest"`. */
   readonly logger?: Logger | undefined;
-  /** The clock this module's own elapsed time is read from; defaults to `nowEpochMs`. */
+  /**
+   * The clock this module's own elapsed time and its log throttle's intervals
+   * are read from; defaults to `nowEpochMs`.
+   */
   readonly now?: (() => number) | undefined;
   /**
    * A lower batch ceiling. Only a positive integer at most
@@ -496,7 +689,10 @@ export interface IngestFailureCounts {
   readonly redaction: number;
   /** Events the attributor could not decide on, and which were therefore not stored. */
   readonly attribution: number;
-  /** `1` when locating the batch's events failed; they were stored without a location. */
+  /**
+   * `1` when locating the batch's events failed; they were stored without a
+   * location, producer-stamped claims included (counted in `sourcesRefused`).
+   */
   readonly location: number;
   /** `1` when correlating the persisted rows failed; the rows stay persisted. */
   readonly correlation: number;
@@ -528,13 +724,39 @@ export interface IngestReport {
   readonly skipped: number;
   /** Request events that received a `request_key`. */
   readonly requestKeysComputed: number;
-  /** Events stored with a `source` step 7½ placed (a producer-stamped `source` is not counted). */
+  /**
+   * Events stored with a `source`: every one is the locator's answer (step 7½),
+   * including a producer claim the locator confirmed.
+   */
   readonly sourcesLocated: number;
+  /**
+   * Events step 7½ had not placed when the locate budget expired, and which
+   * were therefore stored without a location; `0` when the locator answered
+   * within its budget.
+   */
+  readonly sourcesUnplacedByBudget: number;
+  /**
+   * Events that arrived with a producer-stamped `source` and were stored with
+   * none, because step 7½'s locator returned no location for them — the claim
+   * refused on verification, or unverifiable because the locator is absent or
+   * failed. A claim the locator replaced with its own answer counts in
+   * {@link sourcesLocated} instead.
+   */
+  readonly sourcesRefused: number;
   /** Producer-supplied service-assigned attribute keys removed (a producer may never set them). */
   readonly serviceKeysStripped: number;
+  /**
+   * Events handed to the store carrying a producer-reported `clockOffsetMs`
+   * (step 8), idempotent replays included. The offsets themselves are stored,
+   * never applied; `0` when no event of the batch reported one.
+   */
+  readonly clockOffsetsReported: number;
   /** Failures that were counted rather than failing the batch. */
   readonly failures: IngestFailureCounts;
-  /** The trace ids the correlator rebuilt, in first-seen order; empty without a correlator. */
+  /**
+   * The trace ids the correlator marked stale for a rebuild on their next read,
+   * in first-seen order; empty without a correlator.
+   */
   readonly tracesTouched: readonly TraceId[];
   /** The session the batch was attributed to, once resolved. */
   readonly sessionId?: SessionId;
@@ -544,6 +766,13 @@ export interface IngestReport {
   readonly batchDropReason?: DropReason;
   /** The code of that refusal (for example `UNAUTHORIZED` for a project-scope mismatch). */
   readonly batchDropCode?: DebuggenErrorCode;
+  /**
+   * Events the producer reported discarding before this batch, accounted
+   * against {@link captureId} (pipeline step 2½). Present only when the batch
+   * was attributed and the count is above zero — whether or not the store has
+   * a loss ledger to record it in.
+   */
+  readonly producerDropped?: number;
 }
 
 /**
@@ -553,10 +782,20 @@ export interface IngestReport {
  * `tabId` must come from the **authenticated DevTools connection** the frame
  * arrived on — never from the page. `documentId`, `producerId` and `url` are
  * diagnostic context from the agent's `agent.ready`, not authorization facts.
+ * `armedCaptureId` and `droppedCount` are the payload's delivery context:
+ * the first is refusal-only (a batch naming another capture than the open one
+ * is dropped as `stale-capture`, see `./attribute.ts`), the second is the
+ * producer's loss report (pipeline step 2½).
  */
 export interface AgentIngestInput extends Omit<BrowserIngestContext, 'origin'> {
   /** The `events` of the `telemetry.event` payload, as received; validated here element by element. */
   readonly events: unknown;
+  /**
+   * The payload's `droppedCount`: events the page agent discarded since its
+   * previous loss report. Absent means none were reported; a value that is not
+   * a non-negative safe integer is ignored (and logged without its value).
+   */
+  readonly droppedCount?: number | undefined;
 }
 
 /**
@@ -589,8 +828,10 @@ export interface TelemetryIngest {
 
   /**
    * Ingests a `telemetry.event` frame relayed by the Chrome service worker.
-   * The caller is `../server/ws.ts`. Builds a `browser-agent` context and
-   * delegates to {@link ingest}.
+   * The caller is `../server/routes/telemetry.ts`, for frames `../server/ws.ts`
+   * hands it. Builds a `browser-agent` context (carrying `armedCaptureId` when
+   * given), delegates to {@link ingest}'s pipeline and accounts `droppedCount`
+   * against the attributed capture.
    *
    * @param input The tab identity and the frame's events.
    * @returns As {@link ingest}; a malformed `input` is a `PROTOCOL_INVALID_MESSAGE` `Err`.
@@ -635,13 +876,17 @@ interface RunState {
   skipped: number;
   requestKeysComputed: number;
   sourcesLocated: number;
+  sourcesUnplacedByBudget: number;
+  sourcesRefused: number;
   serviceKeysStripped: number;
+  clockOffsetsReported: number;
   readonly failures: MutableFailureCounts;
   tracesTouched: readonly TraceId[];
   sessionId?: SessionId;
   captureId?: CaptureId;
   batchDropReason?: DropReason;
   batchDropCode?: DebuggenErrorCode;
+  producerDropped?: number;
 }
 
 /** What the request-key step made of one parsed event. */
@@ -692,6 +937,7 @@ function newRunState(received: number): RunState {
     skipped: 0,
     requestKeysComputed: 0,
     serviceKeysStripped: 0,
+    clockOffsetsReported: 0,
     failures: {
       requestKey: 0,
       redaction: 0,
@@ -701,6 +947,8 @@ function newRunState(received: number): RunState {
       tail: 0,
     },
     sourcesLocated: 0,
+    sourcesUnplacedByBudget: 0,
+    sourcesRefused: 0,
     tracesTouched: [],
   };
 }
@@ -716,6 +964,44 @@ function droppedTotal(dropped: Readonly<Record<DropReason, number>>): number {
   return total;
 }
 
+/** What the events handed to the store said about their producers' clocks. */
+interface ClockOffsetTally {
+  /** How many of the events carried a `clockOffsetMs`. */
+  readonly reported: number;
+  /** The largest `|clockOffsetMs|` among them; `undefined` when none carried one. */
+  readonly maxAbsMs: number | undefined;
+}
+
+/**
+ * Counts the producer-reported clock offsets of the events step 8 is about to
+ * hand to the store. A read only: every offset stays exactly as its producer
+ * stamped it and the ingress schema validated it.
+ *
+ * @param events The redacted, attributed, located events of the batch.
+ * @returns The count and the largest magnitude.
+ */
+function tallyClockOffsets(events: readonly AttributedEvent[]): ClockOffsetTally {
+  let reported = 0;
+  let maxAbsMs: number | undefined;
+
+  for (const event of events) {
+    const offset = event.clockOffsetMs;
+
+    if (offset === undefined) {
+      continue;
+    }
+
+    reported += 1;
+    const magnitude = Math.abs(offset);
+
+    if (maxAbsMs === undefined || magnitude > maxAbsMs) {
+      maxAbsMs = magnitude;
+    }
+  }
+
+  return { reported, maxAbsMs };
+}
+
 /** Freezes a run state into the report returned to the caller. */
 function toReport(state: RunState): IngestReport {
   const report: IngestReport = {
@@ -728,16 +1014,116 @@ function toReport(state: RunState): IngestReport {
     skipped: state.skipped,
     requestKeysComputed: state.requestKeysComputed,
     sourcesLocated: state.sourcesLocated,
+    sourcesUnplacedByBudget: state.sourcesUnplacedByBudget,
+    sourcesRefused: state.sourcesRefused,
     serviceKeysStripped: state.serviceKeysStripped,
+    clockOffsetsReported: state.clockOffsetsReported,
     failures: Object.freeze({ ...state.failures }),
     tracesTouched: Object.freeze([...state.tracesTouched]),
     ...(state.sessionId === undefined ? {} : { sessionId: state.sessionId }),
     ...(state.captureId === undefined ? {} : { captureId: state.captureId }),
     ...(state.batchDropReason === undefined ? {} : { batchDropReason: state.batchDropReason }),
     ...(state.batchDropCode === undefined ? {} : { batchDropCode: state.batchDropCode }),
+    ...(state.producerDropped === undefined ? {} : { producerDropped: state.producerDropped }),
   };
 
   return Object.freeze(report);
+}
+
+/** What step 7½ made of one batch: the events to store and what happened to their locations. */
+interface SourcePlacement {
+  /** The batch in producer order, each event carrying only the location the locator answered. */
+  readonly events: readonly AttributedEvent[];
+  /** Events that received a location from the locator. */
+  readonly located: number;
+  /** Producer-stamped locations removed with nothing in their stead: the locator returned none. */
+  readonly refused: number;
+}
+
+/**
+ * `event` without its `source`: the shape stored for an unverified claim.
+ *
+ * @param event An attributed event carrying a producer-stamped `source`.
+ * @returns A shallow copy with the `source` key absent (not set to `undefined`).
+ */
+function withoutSource(event: AttributedEvent): AttributedEvent {
+  const copy: AttributedEvent = { ...event };
+  Reflect.deleteProperty(copy, 'source');
+  return copy;
+}
+
+/**
+ * `event` as step 7½'s locator is handed it: a claim on a route no producer may
+ * stamp ({@link PRODUCER_CLAIMABLE_ROUTES}) is removed first, so the locator
+ * computes that location from the event's own evidence instead of vetting a
+ * producer's assertion of it. A `patch` claim is kept for corroboration.
+ *
+ * @param event A redacted, attributed event, with or without a claim.
+ * @returns `event` itself, or a copy without its unclaimable `source`.
+ */
+function asLocatorCandidate(event: AttributedEvent): AttributedEvent {
+  const claim = event.source;
+  return claim === undefined || PRODUCER_CLAIMABLE_ROUTES.has(claim.resolvedBy)
+    ? event
+    : withoutSource(event);
+}
+
+/**
+ * Settles every event's `source` on the locator's answer alone.
+ *
+ * A producer-stamped `source` is a **claim**: the browser agent runs in the
+ * page's main world, where any page script can stamp an event through the
+ * public span helper or post a forged frame, and the dev-server preload is no
+ * more authoritative about a location than the service's own resolver. So an
+ * event keeps a location only when the locator returned one for its id — the
+ * resolver's vetted, re-stamped answer, which for a `patch` claim means the
+ * modification journal corroborated it — and any claim without such an answer
+ * is removed. With no answer at all (`found` is `undefined`: no locator, or one
+ * that failed) every claim is removed, because none could be verified.
+ *
+ * `events` are the batch as attribution left it, claims included, so a claim
+ * {@link asLocatorCandidate} withheld from the locator is still counted when
+ * the locator placed nothing in its stead.
+ *
+ * @param events The redacted, attributed batch, in producer order.
+ * @param found The locator's locations keyed by event id, or `undefined` when there is no answer.
+ * @returns The events to store with the located and refused counts.
+ * @throws Only when `found` itself throws on read; the caller treats that as a locator failure.
+ */
+function placeSources(
+  events: readonly AttributedEvent[],
+  found: ReadonlyMap<string, SourceLocation> | undefined,
+): SourcePlacement {
+  let located = 0;
+  let refused = 0;
+
+  const placed = events.map((event) => {
+    // Deliberately not `found?.get`: an `ok` answer that is not a map must
+    // throw here, so the caller counts it as a failure instead of trusting it.
+    const source = found === undefined ? undefined : found.get(event.id);
+
+    if (source !== undefined) {
+      located += 1;
+      return { ...event, source };
+    }
+
+    if (event.source === undefined) {
+      return event;
+    }
+
+    refused += 1;
+    return withoutSource(event);
+  });
+
+  return { events: placed, located, refused };
+}
+
+/**
+ * Whether `value` is a usable loss count: a non-negative safe integer, the
+ * range `telemetryEventPayloadSchema.droppedCount` admits.
+ */
+function isLossCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 }
 
 /**
@@ -849,6 +1235,95 @@ function effectiveMaxBatch(option: number | undefined): number {
     option <= MAX_INGEST_BATCH
     ? option
     : MAX_INGEST_BATCH;
+}
+
+/**
+ * The locate budget in force: the configured one when it is a positive finite
+ * number no larger than {@link MAX_LOCATE_BUDGET_MS}, otherwise
+ * {@link DEFAULT_LOCATE_BUDGET_MS}.
+ */
+function effectiveLocateBudget(option: number | undefined): number {
+  return option !== undefined &&
+    Number.isFinite(option) &&
+    option > 0 &&
+    option <= MAX_LOCATE_BUDGET_MS
+    ? option
+    : DEFAULT_LOCATE_BUDGET_MS;
+}
+
+/** How a locator's call ended, as {@link locateWithinBudget} observed it. */
+type LocateAnswer =
+  | {
+      /** The locator answered, within its budget or after it fired. */
+      readonly kind: 'answered';
+      readonly result: Result<ReadonlyMap<string, SourceLocation>, DebuggenError>;
+      /** Whether the budget had fired by the time it answered. */
+      readonly budgetExpired: boolean;
+    }
+  | {
+      /** The locator threw or rejected. */
+      readonly kind: 'threw';
+    }
+  | {
+      /** The locator had not answered by the budget plus its grace; ingest stopped waiting. */
+      readonly kind: 'overran';
+    };
+
+/**
+ * Calls a locator under a budget.
+ *
+ * An `AbortController` fires at `budgetMs` and is handed to the locator as its
+ * {@link IngestLocateOptions.signal}; a second timer, {@link LOCATE_BUDGET_GRACE_MS}
+ * later, ends the wait for a locator that ignored it. Both timers are `unref`'d,
+ * so neither keeps the process alive, and both are cleared however the call
+ * ends. A locator promise still pending when the wait ends is left to settle on
+ * its own: its outcome is observed (so a late rejection is never unhandled) and
+ * discarded.
+ *
+ * @param locator The injected locator.
+ * @param events The events to place.
+ * @param attribution The batch's attribution.
+ * @param budgetMs The budget in force.
+ * @returns How the call ended; never rejects.
+ */
+async function locateWithinBudget(
+  locator: IngestSourceLocator,
+  events: readonly AttributedEvent[],
+  attribution: IngestAttribution,
+  budgetMs: number,
+): Promise<LocateAnswer> {
+  const budget = new AbortController();
+  let budgetTimer: ReturnType<typeof setTimeout> | undefined;
+  let graceTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const overran = new Promise<LocateAnswer>((resolve) => {
+    budgetTimer = setTimeout(() => {
+      budget.abort();
+    }, budgetMs);
+    graceTimer = setTimeout(() => {
+      resolve({ kind: 'overran' });
+    }, budgetMs + LOCATE_BUDGET_GRACE_MS);
+    budgetTimer.unref();
+    graceTimer.unref();
+  });
+
+  const answered = Promise.resolve()
+    .then(() => locator.locate(events, attribution, { signal: budget.signal }))
+    .then(
+      (result): LocateAnswer => ({
+        kind: 'answered',
+        result,
+        budgetExpired: budget.signal.aborted,
+      }),
+      (): LocateAnswer => ({ kind: 'threw' }),
+    );
+
+  try {
+    return await Promise.race([answered, overran]);
+  } finally {
+    clearTimeout(budgetTimer);
+    clearTimeout(graceTimer);
+  }
 }
 
 /**
@@ -982,6 +1457,522 @@ async function assignRequestKey(
 }
 
 /* -------------------------------------------------------------------------------------------------
+ * The log throttle
+ *
+ * A batch or frame is cheap to send and a warning is not cheap to write: a
+ * page script can post malformed telemetry as fast as the bridge relays it,
+ * and one unconditional record per batch would turn that into unbounded log
+ * growth (CWE-400). Every warning and error this module writes — and those of
+ * `../server/routes/telemetry.ts`, which imports this throttle — is admitted
+ * by a {@link LogThrottle} first, which coalesces repeats into a count.
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * How long, by default, a {@link createLogThrottle} key waits between two
+ * written records, in milliseconds — the live tail's own reporting cadence.
+ */
+export const LOG_THROTTLE_INTERVAL_MS = 10_000;
+
+/**
+ * How many records, by default, a {@link createLogThrottle} writes per
+ * interval across all of its keys together, so that many distinct keys cannot
+ * defeat the per-key bound.
+ */
+export const LOG_THROTTLE_MAX_RECORDS_PER_INTERVAL = 32;
+
+/** How many keys, by default, a {@link createLogThrottle} tracks at once. */
+export const LOG_THROTTLE_MAX_KEYS = 256;
+
+/**
+ * How many consecutive trailing-summary wake-ups a {@link createLogThrottle}
+ * makes that find nothing due before it stops waking until the next hold-back
+ * — so a clock that does not advance cannot keep a timer cycling forever.
+ */
+const LOG_THROTTLE_MAX_IDLE_WAKEUPS = 3;
+
+/**
+ * Schedules one trailing-summary wake-up of a {@link createLogThrottle}. The
+ * default is an `unref`'d `setTimeout`, so a pending summary never keeps the
+ * process alive.
+ */
+export type LogThrottleScheduler = (callback: () => void, delayMs: number) => void;
+
+/**
+ * Held-back occurrences of one key that no later record carried, handed to
+ * {@link LogThrottleOptions.onSummary} once the key's interval has passed.
+ *
+ * @typeParam P What the caller handed {@link LogThrottle.admit} with the
+ * key's latest held-back occurrence.
+ */
+export interface LogThrottleSummary<P> {
+  /** The payload of the key's latest held-back occurrence. */
+  readonly payload: P;
+  /** How many occurrences of the key were held back and never written. */
+  readonly suppressed: number;
+  /** As {@link LogThrottleVerdict.suppressedUntracked}. */
+  readonly suppressedUntracked: number;
+}
+
+/** The default {@link LogThrottleScheduler}: an unref'd `setTimeout`. */
+function unrefTimeout(callback: () => void, delayMs: number): void {
+  const timer = setTimeout(callback, delayMs);
+  timer.unref();
+}
+
+/**
+ * What {@link createLogThrottle} is built from; every option has a default.
+ *
+ * @typeParam P The payload a caller hands {@link LogThrottle.admit} for its
+ * trailing summaries; `undefined` when it writes none.
+ */
+export interface LogThrottleOptions<P = undefined> {
+  /**
+   * Writes a trailing summary: called for a key whose held-back occurrences
+   * no later record carried, once its interval has passed, subject to the same
+   * ceiling across keys as written records. Without it nothing is scheduled
+   * and a count waits for the key's next written record. It must not throw; a
+   * throw is ignored.
+   */
+  readonly onSummary?: ((summary: LogThrottleSummary<P>) => void) | undefined;
+  /** Schedules the trailing-summary wake-ups; defaults to an unref'd `setTimeout`. */
+  readonly scheduler?: LogThrottleScheduler | undefined;
+  /**
+   * The least time between two written records of one key, in milliseconds;
+   * defaults to {@link LOG_THROTTLE_INTERVAL_MS}. A value that is not a
+   * positive finite number keeps the default.
+   */
+  readonly intervalMs?: number | undefined;
+  /**
+   * The most records written per interval across every key; defaults to
+   * {@link LOG_THROTTLE_MAX_RECORDS_PER_INTERVAL}. A value that is not a
+   * positive safe integer keeps the default.
+   */
+  readonly maxRecordsPerInterval?: number | undefined;
+  /**
+   * The most keys tracked; defaults to {@link LOG_THROTTLE_MAX_KEYS}. The least
+   * recently admitted key is forgotten first. A value that is not a positive
+   * safe integer keeps the default.
+   */
+  readonly maxKeys?: number | undefined;
+  /**
+   * The clock intervals are measured on, in epoch milliseconds; defaults to
+   * `nowEpochMs`. A reading that throws or is not finite is replaced by the
+   * last good one, and a reading earlier than a key's last record (the clock
+   * stepped back) ends that key's interval rather than extending it.
+   */
+  readonly now?: (() => number) | undefined;
+}
+
+/** The answer of {@link LogThrottle.admit} for one occurrence. */
+export interface LogThrottleVerdict {
+  /** Whether the caller should write its record now. */
+  readonly write: boolean;
+  /**
+   * When `write` is true: how many occurrences of this key were held back
+   * since its previous written record. Always `0` when `write` is false.
+   */
+  readonly suppressed: number;
+  /**
+   * When `write` is true: how many held-back occurrences belonged to keys the
+   * throttle stopped tracking (evicted by `maxKeys`) before they could be
+   * reported, reported once on the next written record of any key. Always
+   * `0` when `write` is false.
+   */
+  readonly suppressedUntracked: number;
+}
+
+/**
+ * A coalescing rate limit for log records, keyed by what the record is about.
+ *
+ * @typeParam P The payload kept for a trailing summary (see {@link LogThrottleOptions.onSummary}).
+ */
+export interface LogThrottle<P = undefined> {
+  /**
+   * Admits one occurrence of `key`.
+   *
+   * A key is written at most once per interval; occurrences in between are
+   * counted and carried by the key's next written record — or, when the
+   * throttle writes trailing summaries and no such record comes, by a summary
+   * once the interval has passed. Across all keys at most
+   * `maxRecordsPerInterval` records and summaries are written per interval; a
+   * key the global ceiling holds back keeps its count and is written once the
+   * ceiling allows. Keys are the caller's bookkeeping and are never written
+   * anywhere.
+   *
+   * @param key What the record is about — a message class and its scope.
+   * @param payload What a trailing summary of this occurrence would write; the
+   * latest held-back occurrence's payload is the one kept, and an absent
+   * (`undefined`) payload keeps the previous one.
+   * @returns Whether to write, and the counts the written record must carry.
+   * Never throws.
+   */
+  admit(key: string, payload?: P): LogThrottleVerdict;
+}
+
+/** The verdict for an occurrence that is held back. */
+const HELD_BACK: LogThrottleVerdict = Object.freeze({
+  write: false,
+  suppressed: 0,
+  suppressedUntracked: 0,
+});
+
+/**
+ * Creates a {@link LogThrottle}.
+ *
+ * Its state is bounded: at most `maxKeys` keys, each a timestamp, a count and
+ * the latest held-back payload, plus one window counter, one count of evicted
+ * occurrences and at most one pending wake-up.
+ *
+ * Without `onSummary` nothing is scheduled: a count is carried by the key's
+ * next written record, so a key that never recurs keeps its count until it is
+ * evicted, when the count moves to `suppressedUntracked` of the next record of
+ * any key. With `onSummary`, the first hold-back schedules a wake-up one
+ * interval on — by then the key, and the window, are due — which hands every
+ * due key's count to `onSummary` (within the ceiling across keys) and wakes
+ * again while counts are left. A flood that stops is therefore still reported,
+ * one interval after it began being held back.
+ *
+ * @param options The interval, the global ceiling, the key bound, the clock
+ * and the trailing summaries.
+ * @returns The throttle. Neither creating it nor admitting to it throws.
+ *
+ * @example
+ * ```ts
+ * const throttle = createLogThrottle({ now: clock });
+ * const verdict = throttle.admit(`malformed\u0000${sessionId}`);
+ * if (verdict.write) {
+ *   logger.warn('malformed telemetry events skipped', {
+ *     invalid,
+ *     ...suppressionFields(verdict),
+ *   });
+ * }
+ * ```
+ */
+export function createLogThrottle<P = undefined>(
+  options: LogThrottleOptions<P> = {},
+): LogThrottle<P> {
+  const intervalMs =
+    typeof options.intervalMs === 'number' &&
+    Number.isFinite(options.intervalMs) &&
+    options.intervalMs > 0
+      ? options.intervalMs
+      : LOG_THROTTLE_INTERVAL_MS;
+  const maxRecords = positiveSafeIntegerOr(
+    options.maxRecordsPerInterval,
+    LOG_THROTTLE_MAX_RECORDS_PER_INTERVAL,
+  );
+  const maxKeys = positiveSafeIntegerOr(options.maxKeys, LOG_THROTTLE_MAX_KEYS);
+  const clock = options.now ?? nowEpochMs;
+  const onSummary = options.onSummary;
+  const scheduler = options.scheduler ?? unrefTimeout;
+
+  /**
+   * One key: when its last record was written, what was held back since, and
+   * the payload of the latest held-back occurrence (for its trailing summary).
+   */
+  interface KeyState {
+    writtenAt: number | undefined;
+    pending: number;
+    payload: { readonly value: P } | undefined;
+  }
+
+  /** Insertion-ordered, so the first entry is the least recently admitted key. */
+  const keys = new Map<string, KeyState>();
+  let windowStartedAt: number | undefined;
+  let writtenInWindow = 0;
+  let untracked = 0;
+  let lastReading = 0;
+  /** Whether a trailing-summary wake-up is pending. */
+  let wakeupPending = false;
+  /** Consecutive wake-ups that found nothing due; see {@link LOG_THROTTLE_MAX_IDLE_WAKEUPS}. */
+  let idleWakeups = 0;
+
+  function readClock(): number {
+    try {
+      const reading = clock();
+      if (Number.isFinite(reading)) {
+        lastReading = reading;
+      }
+    } catch {
+      // Fall through to the last good reading.
+    }
+    return lastReading;
+  }
+
+  /** Whether an interval that began at `since` is over at `at`, or the clock stepped back. */
+  function intervalOver(since: number, at: number): boolean {
+    return at < since || at - since >= intervalMs;
+  }
+
+  /** The key's state, created on first use and moved to most recently admitted. */
+  function stateOf(key: string): KeyState {
+    const held = keys.get(key);
+    if (held !== undefined) {
+      keys.delete(key);
+      keys.set(key, held);
+      return held;
+    }
+
+    const fresh: KeyState = { writtenAt: undefined, pending: 0, payload: undefined };
+    keys.set(key, fresh);
+
+    while (keys.size > maxKeys) {
+      const oldest = keys.entries().next();
+      if (oldest.done === true) {
+        break;
+      }
+      const [oldestKey, oldestState] = oldest.value;
+      keys.delete(oldestKey);
+      untracked += oldestState.pending;
+    }
+
+    return fresh;
+  }
+
+  /** Opens a fresh ceiling window when the current one is over at `at`. */
+  function rollWindow(at: number): void {
+    if (windowStartedAt === undefined || intervalOver(windowStartedAt, at)) {
+      windowStartedAt = at;
+      writtenInWindow = 0;
+    }
+  }
+
+  /**
+   * Counts one held-back occurrence, keeps its payload (an absent one keeps
+   * the previous) and schedules its summary.
+   */
+  function holdBack(state: KeyState, payload: P | undefined): void {
+    state.pending += 1;
+    if (payload !== undefined) {
+      state.payload = { value: payload };
+    }
+    idleWakeups = 0;
+    scheduleWakeup();
+  }
+
+  /**
+   * Schedules one wake-up an interval on, when summaries are written and none
+   * is pending. By then every key held back so far is due and the window has
+   * rolled, so the wake-up can write them.
+   */
+  function scheduleWakeup(): void {
+    if (onSummary === undefined || wakeupPending) {
+      return;
+    }
+    wakeupPending = true;
+    try {
+      scheduler(wakeup, intervalMs);
+    } catch {
+      // No timer: the counts wait for the keys' next written records instead.
+      wakeupPending = false;
+    }
+  }
+
+  /**
+   * Writes the trailing summary of every due key with a count and a payload,
+   * oldest first, within the ceiling across keys; wakes again while counts are
+   * left, and stops after {@link LOG_THROTTLE_MAX_IDLE_WAKEUPS} wake-ups in a
+   * row that could write nothing.
+   */
+  function wakeup(): void {
+    wakeupPending = false;
+    if (onSummary === undefined) {
+      return;
+    }
+    try {
+      const at = readClock();
+      rollWindow(at);
+      let written = 0;
+      let left = false;
+      for (const state of keys.values()) {
+        const held = state.payload;
+        if (state.pending === 0 || held === undefined) {
+          continue;
+        }
+        if (
+          (state.writtenAt !== undefined && !intervalOver(state.writtenAt, at)) ||
+          writtenInWindow >= maxRecords
+        ) {
+          left = true;
+          continue;
+        }
+        writtenInWindow += 1;
+        written += 1;
+        const summary: LogThrottleSummary<P> = Object.freeze({
+          payload: held.value,
+          suppressed: state.pending,
+          suppressedUntracked: untracked,
+        });
+        state.pending = 0;
+        state.payload = undefined;
+        state.writtenAt = at;
+        untracked = 0;
+        try {
+          onSummary(summary);
+        } catch {
+          // Advisory only: the count is spent whether or not the sink took it.
+        }
+      }
+      idleWakeups = written > 0 ? 0 : idleWakeups + 1;
+      if (left && idleWakeups < LOG_THROTTLE_MAX_IDLE_WAKEUPS) {
+        scheduleWakeup();
+      }
+    } catch {
+      // Unreachable; a fault here ends the wake-ups rather than repeating it.
+    }
+  }
+
+  function admit(key: string, payload?: P): LogThrottleVerdict {
+    try {
+      const at = readClock();
+      const state = stateOf(key);
+
+      if (state.writtenAt !== undefined && !intervalOver(state.writtenAt, at)) {
+        holdBack(state, payload);
+        return HELD_BACK;
+      }
+
+      rollWindow(at);
+
+      if (writtenInWindow >= maxRecords) {
+        holdBack(state, payload);
+        return HELD_BACK;
+      }
+
+      writtenInWindow += 1;
+      const verdict: LogThrottleVerdict = Object.freeze({
+        write: true,
+        suppressed: state.pending,
+        suppressedUntracked: untracked,
+      });
+      state.pending = 0;
+      state.payload = undefined;
+      state.writtenAt = at;
+      untracked = 0;
+      return verdict;
+    } catch {
+      // Unreachable with a string key; a fault here holds the record back
+      // rather than letting the throttle itself become the flood.
+      return HELD_BACK;
+    }
+  }
+
+  return Object.freeze({ admit });
+}
+
+/**
+ * The fields a written record adds for a verdict: `suppressed` and
+ * `suppressedUntracked`, each only when non-zero, so a record that coalesced
+ * nothing is unchanged.
+ *
+ * @param verdict The verdict {@link LogThrottle.admit} answered with `write: true`.
+ * @returns The counts to spread into the record's fields.
+ */
+export function suppressionFields(verdict: LogThrottleVerdict): LogFields {
+  return {
+    ...(verdict.suppressed > 0 ? { suppressed: verdict.suppressed } : {}),
+    ...(verdict.suppressedUntracked > 0
+      ? { suppressedUntracked: verdict.suppressedUntracked }
+      : {}),
+  };
+}
+
+/**
+ * The fields a trailing summary adds to the record it re-writes: `suppressed`
+ * — every occurrence it reports, none of which was written — `trailingSummary`,
+ * which marks the record as a report of held-back occurrences rather than a new
+ * one, and `suppressedUntracked` when non-zero. The rest of the record's fields
+ * are those of the latest held-back occurrence.
+ *
+ * @param summary A summary {@link LogThrottleOptions.onSummary} was handed.
+ * @returns The counts to spread into the re-written record's fields.
+ */
+export function summaryFields(summary: LogThrottleSummary<unknown>): LogFields {
+  return {
+    suppressed: summary.suppressed,
+    trailingSummary: true,
+    ...(summary.suppressedUntracked > 0
+      ? { suppressedUntracked: summary.suppressedUntracked }
+      : {}),
+  };
+}
+
+/** `value` when it is a positive safe integer, otherwise `fallback`. */
+function positiveSafeIntegerOr(value: number | undefined, fallback: number): number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : fallback;
+}
+
+/**
+ * The classes of warning and error this module writes, each a throttle key
+ * prefix. A key adds the record's scope (and its error code where it carries
+ * one), so a flood of one class in one scope cannot hide another.
+ */
+const WARNING_CLASS = Object.freeze({
+  batchRefused: 'batch-refused',
+  attributionFailed: 'attribution-failed',
+  secretUnavailable: 'secret-unavailable',
+  malformedEvents: 'malformed-events',
+  serviceKeysStripped: 'service-keys-stripped',
+  eventsDegraded: 'events-degraded',
+  locateBudget: 'locate-budget',
+  locateFailed: 'locate-failed',
+  correlationFailed: 'correlation-failed',
+  tailRefused: 'tail-refused',
+  persistFailed: 'persist-failed',
+  unexpected: 'unexpected',
+});
+
+/**
+ * The classes of debug record the debug throttle admits: those of a batch
+ * that stored nothing, which a producer can repeat as often as it sends.
+ */
+const DEBUG_CLASS = Object.freeze({
+  emptyBatch: 'empty-batch',
+  droppedBatch: 'dropped-batch',
+  storedNothing: 'stored-nothing',
+});
+
+/** How much of a project digest a throttle key keeps: 64 bits, ample to tell a machine's projects apart. */
+const SCOPE_DIGEST_CHARS = 16;
+
+/** One throttle key from its parts; the separator cannot occur in an id or a code. */
+function throttleKey(...parts: readonly string[]): string {
+  return parts.join('\u0000');
+}
+
+/**
+ * The producer scope of a record: the origin and the relayed tab for a page
+ * agent; the origin and a digest of the credential's project (the transport's
+ * scope, never the body's claim) for a server agent. So one producer's flood
+ * is summarised under its own keys and never holds back another producer's
+ * records. Never a project path, and never written: it only keys the throttle.
+ */
+function unattributedScope(context: unknown, origin: IngestOrigin | undefined): string {
+  try {
+    if (origin === 'server-agent') {
+      const scoped = readProperty(context, 'scopedProjectRoot');
+      return typeof scoped === 'string'
+        ? `${origin}:${sha256Hex(scoped).slice(0, SCOPE_DIGEST_CHARS)}`
+        : origin;
+    }
+    if (origin !== 'browser-agent') {
+      return origin ?? 'unknown-origin';
+    }
+    const tabId = readProperty(context, 'tabId');
+    return typeof tabId === 'number' && Number.isSafeInteger(tabId)
+      ? `${origin}:${String(tabId)}`
+      : origin;
+  } catch {
+    return origin ?? 'unknown-origin';
+  }
+}
+
+/** The scope of a record written once the batch is attributed: its session. */
+function sessionScope(sessionId: SessionId): string {
+  return `session:${sessionId}`;
+}
+
+/* -------------------------------------------------------------------------------------------------
  * The pipeline
  * ---------------------------------------------------------------------------------------------- */
 
@@ -1011,29 +2002,89 @@ export function createTelemetryIngest(deps: TelemetryIngestDeps): TelemetryInges
   const privacy = deps.privacy ?? DEFAULT_INGEST_PRIVACY;
   const clock = deps.now ?? nowEpochMs;
   const maxBatch = effectiveMaxBatch(deps.maxBatch);
-  const root = deps.logger ?? noopLogger;
+  const locateBudgetMs = effectiveLocateBudget(deps.locateBudgetMs);
+  // Logging is advisory: the pipeline's decisions stand without it. The root is
+  // guarded before any child is derived, so neither `child()` nor any level
+  // method of it or of a logger derived from it can throw — a failed write is
+  // dropped and counted by the shared best-effort policy of `../logging.ts`.
+  const root = guardLogger(deps.logger ?? noopLogger);
+  const log = subsystemLogger(root, INGEST_SUBSYSTEM);
+
+  /** Writes one record through a logger derived from the guarded root; it never throws. */
+  function emit(target: Logger, level: IngestLogLevel, message: string, fields: LogFields): void {
+    target[level](message, fields);
+  }
+
+  /** A record a throttle may hold back, kept whole so its trailing summary can re-write it. */
+  interface HeldRecord {
+    readonly target: Logger;
+    readonly level: IngestLogLevel;
+    readonly message: string;
+    readonly fields: LogFields;
+  }
+
+  /** Re-writes a held-back record as its trailing summary. */
+  const writeSummary = (summary: LogThrottleSummary<HeldRecord>): void => {
+    const { target, level, message, fields } = summary.payload;
+    emit(target, level, message, { ...fields, ...summaryFields(summary) });
+  };
+
+  /** Admits every warning and error of this pipeline; see "The log throttle". */
+  const throttle = createLogThrottle<HeldRecord>({ now: clock, onSummary: writeSummary });
 
   /**
-   * Derives a logger without letting a faulty logger fail the batch: logging
-   * is advisory, the pipeline's decisions stand without it.
+   * Admits the debug records of batches that stored nothing — ignored, dropped
+   * whole, or entirely malformed — which a producer can repeat as often as it
+   * sends. A separate throttle, so they never take a warning's place under the
+   * ceiling. The debug record of a batch that stored evidence is not throttled:
+   * it is bounded by the evidence itself.
    */
-  function derive(build: () => Logger): Logger {
-    try {
-      return build();
-    } catch {
-      return noopLogger;
+  const debugThrottle = createLogThrottle<HeldRecord>({ now: clock, onSummary: writeSummary });
+
+  /**
+   * Writes a record through `through`: at most one per `key` per interval,
+   * carrying how many occurrences were held back since the previous one, and a
+   * trailing summary of the held-back ones when no later record carries them.
+   */
+  function emitThrough(
+    through: LogThrottle<HeldRecord>,
+    target: Logger,
+    level: IngestLogLevel,
+    key: string,
+    message: string,
+    fields: LogFields,
+  ): void {
+    const verdict = through.admit(key, { target, level, message, fields });
+
+    if (verdict.write) {
+      emit(target, level, message, { ...fields, ...suppressionFields(verdict) });
     }
   }
 
-  const log = derive(() => subsystemLogger(root, INGEST_SUBSYSTEM));
+  /** Writes a warning or an error through the warning throttle. */
+  function emitThrottled(
+    target: Logger,
+    level: 'warn' | 'error',
+    key: string,
+    message: string,
+    fields: LogFields,
+  ): void {
+    emitThrough(throttle, target, level, key, message, fields);
+  }
 
-  /** Writes one record; a logger that throws is ignored. */
-  function emit(target: Logger, level: IngestLogLevel, message: string, fields: LogFields): void {
-    try {
-      target[level](message, fields);
-    } catch {
-      // Advisory only.
-    }
+  /** Writes the debug record of a batch that stored nothing through the debug throttle. */
+  function emitDebugThrottled(
+    target: Logger,
+    key: string,
+    message: string,
+    fields: LogFields,
+  ): void {
+    emitThrough(debugThrottle, target, 'debug', key, message, fields);
+  }
+
+  /** The throttle scope of a run: its session once attributed. */
+  function runScope(state: RunState): string {
+    return state.sessionId === undefined ? 'unattributed' : sessionScope(state.sessionId);
   }
 
   /** The clock's reading, or `undefined` when it throws or is not finite. */
@@ -1082,6 +2133,78 @@ export function createTelemetryIngest(deps: TelemetryIngestDeps): TelemetryInges
     } catch {
       return err(dependencyError('resolveBatch', 'INTERNAL'));
     }
+  }
+
+  /**
+   * Step 2½: the producer's loss report, accounted against the capture the
+   * batch was just attributed to — never against one the producer named.
+   *
+   * `reportedLoss` is the transport's `droppedCount` as received: absent or
+   * `0` is no report, anything but a non-negative safe integer is ignored with
+   * a warning that omits the value. A positive count is set on the report and
+   * handed to the store's ledger when the store has one. Nothing here fails the
+   * batch: a refused, failing or throwing ledger is logged with its code only.
+   */
+  async function recordLoss(
+    attribution: IngestAttribution,
+    reportedLoss: unknown,
+    state: RunState,
+    scoped: Logger,
+    originFields: LogFields,
+  ): Promise<void> {
+    if (reportedLoss === undefined) {
+      return;
+    }
+
+    if (!isLossCount(reportedLoss)) {
+      emit(scoped, 'warn', 'a malformed producer loss report was ignored', originFields);
+      return;
+    }
+
+    if (reportedLoss === 0) {
+      return;
+    }
+
+    state.producerDropped = reportedLoss;
+
+    const store = deps.telemetry;
+    let code: DebuggenErrorCode;
+
+    try {
+      if (typeof store.recordProducerLoss !== 'function') {
+        emit(scoped, 'info', 'a producer reported discarded events; no loss ledger is wired', {
+          ...originFields,
+          droppedEvents: reportedLoss,
+        });
+        return;
+      }
+
+      const recorded = await store.recordProducerLoss({
+        sessionId: attribution.sessionId,
+        captureId: attribution.captureId,
+        ...(attribution.producerId === undefined ? {} : { producerId: attribution.producerId }),
+        droppedEvents: reportedLoss,
+      });
+
+      if (recorded.ok) {
+        emit(scoped, 'info', 'a producer reported discarded events; recorded against the capture', {
+          ...originFields,
+          droppedEvents: reportedLoss,
+          ...(isLossCount(recorded.value) ? { captureDroppedEvents: recorded.value } : {}),
+        });
+        return;
+      }
+
+      code = asDebuggenError(recorded.error, 'recordProducerLoss', 'STORE_ERROR').code;
+    } catch {
+      code = 'STORE_ERROR';
+    }
+
+    emit(scoped, 'warn', 'a producer loss report could not be recorded; the batch continues', {
+      ...originFields,
+      code,
+      droppedEvents: reportedLoss,
+    });
   }
 
   /**
@@ -1188,7 +2311,20 @@ export function createTelemetryIngest(deps: TelemetryIngestDeps): TelemetryInges
     }
   }
 
-  /** Step 7½: source locations for the events that carry none; failure is counted, never fatal. */
+  /**
+   * Step 7½: every stored `source` is the locator's answer, within the locate
+   * budget; a failure is counted and a budget that expired is counted, neither
+   * is fatal, and either way the batch continues to persistence.
+   *
+   * The whole batch is handed over — a `patch` claim included, because it is
+   * corroborated against the session's modification journal rather than
+   * recomputed, while a claim on any other route is withheld (see
+   * {@link asLocatorCandidate}) — and each event keeps exactly the location the
+   * locator returned for its id. A producer-stamped `source` the locator did
+   * not return, or that could not be checked at all (no port, an `Err`, a
+   * throw, an unreadable answer, a budget that ran out first), is removed and
+   * counted in `sourcesRefused`.
+   */
   async function locate(
     events: readonly AttributedEvent[],
     attribution: IngestAttribution,
@@ -1196,43 +2332,83 @@ export function createTelemetryIngest(deps: TelemetryIngestDeps): TelemetryInges
     scoped: Logger,
   ): Promise<readonly AttributedEvent[]> {
     const sources = deps.sources;
-    const pending = events.filter((event) => event.source === undefined);
 
-    if (sources === undefined || pending.length === 0) {
+    if (events.length === 0) {
       return events;
     }
 
-    let code: DebuggenErrorCode;
+    let code: DebuggenErrorCode | undefined;
+    let placement: SourcePlacement | undefined;
+    let budgetExpired = false;
 
-    try {
-      const located = await sources.locate(pending, attribution);
+    if (sources !== undefined) {
+      const answer = await locateWithinBudget(
+        sources,
+        events.map(asLocatorCandidate),
+        attribution,
+        locateBudgetMs,
+      );
 
-      if (located.ok) {
-        const found = located.value;
-        return events.map((event) => {
-          const source = event.source === undefined ? found.get(event.id) : undefined;
-          if (source === undefined) {
-            return event;
+      if (answer.kind === 'overran') {
+        budgetExpired = true;
+      } else if (answer.kind === 'threw') {
+        code = 'INTERNAL';
+      } else {
+        budgetExpired = answer.budgetExpired;
+        try {
+          const located = answer.result;
+
+          if (located.ok) {
+            // Read inside the guard: an answer that is not a readable map is a
+            // locator failure like any other, not a reason to trust the claims.
+            placement = placeSources(events, located.value);
+          } else {
+            code = asDebuggenError(located.error, 'locate', 'INTERNAL').code;
           }
-          state.sourcesLocated += 1;
-          return { ...event, source };
-        });
+        } catch {
+          code = 'INTERNAL';
+        }
       }
-
-      code = asDebuggenError(located.error, 'locate', 'INTERNAL').code;
-    } catch {
-      code = 'INTERNAL';
     }
 
-    state.failures.location = 1;
-    emit(scoped, 'warn', 'telemetry events could not be located; they are stored without one', {
-      code,
-      pending: pending.length,
-    });
-    return events;
+    const settled = placement ?? placeSources(events, undefined);
+    state.sourcesLocated += settled.located;
+    state.sourcesRefused += settled.refused;
+
+    if (budgetExpired) {
+      const unplaced = events.length - settled.located;
+      state.sourcesUnplacedByBudget = unplaced;
+
+      if (unplaced > 0) {
+        emitThrottled(
+          scoped,
+          'warn',
+          throttleKey(WARNING_CLASS.locateBudget, runScope(state)),
+          'telemetry events were not located within the budget; they are stored without one',
+          { pending: events.length, unplaced, budgetMs: locateBudgetMs },
+        );
+      }
+    }
+
+    if (code !== undefined) {
+      state.failures.location = 1;
+      emitThrottled(
+        scoped,
+        'warn',
+        throttleKey(WARNING_CLASS.locateFailed, runScope(state), code),
+        'telemetry events could not be located; they are stored without one',
+        { code, pending: events.length, sourcesRefused: settled.refused },
+      );
+    }
+
+    return settled.events;
   }
 
-  /** Step 9: correlation of the returned rows; failure is counted, never fatal. */
+  /**
+   * Step 9: hands the returned rows to the correlator, which marks the traces
+   * they touch stale for a coalesced rebuild on the next read; failure is
+   * counted, never fatal.
+   */
   async function correlate(
     rows: readonly TelemetryEvent[],
     state: RunState,
@@ -1263,10 +2439,13 @@ export function createTelemetryIngest(deps: TelemetryIngestDeps): TelemetryInges
     }
 
     state.failures.correlation = 1;
-    emit(scoped, 'warn', 'telemetry correlation failed; the batch stays persisted', {
-      code,
-      persisted: rows.length,
-    });
+    emitThrottled(
+      scoped,
+      'warn',
+      throttleKey(WARNING_CLASS.correlationFailed, runScope(state), code),
+      'telemetry correlation failed; the batch stays persisted',
+      { code, persisted: rows.length },
+    );
   }
 
   /** Step 10: the live tail of the returned rows; failure is counted, never fatal. */
@@ -1297,16 +2476,25 @@ export function createTelemetryIngest(deps: TelemetryIngestDeps): TelemetryInges
     }
 
     state.failures.tail = 1;
-    emit(scoped, 'warn', 'telemetry live tail refused the batch; the batch stays persisted', {
-      code,
-      persisted: rows.length,
-    });
+    emitThrottled(
+      scoped,
+      'warn',
+      throttleKey(WARNING_CLASS.tailRefused, sessionScope(sessionId), code),
+      'telemetry live tail refused the batch; the batch stays persisted',
+      { code, persisted: rows.length },
+    );
   }
 
-  /** The pipeline of the module notes, steps 1 to 11, in order. */
+  /**
+   * The pipeline of the module notes, steps 1 to 11, in order.
+   *
+   * @param reportedLoss The transport's `droppedCount`, as received; only the
+   * browser transport carries one (step 2½).
+   */
   async function run(
     context: IngestContext,
     events: unknown,
+    reportedLoss: unknown,
   ): Promise<Result<IngestReport, DebuggenError>> {
     const startedAt = readClock();
     const origin = originOf(context);
@@ -1319,11 +2507,17 @@ export function createTelemetryIngest(deps: TelemetryIngestDeps): TelemetryInges
     const bounded = boundBatch(events);
 
     if (isErr(bounded)) {
-      emit(log, 'warn', 'telemetry batch refused before ingest', {
-        ...originFields,
-        code: bounded.error.code,
-        ...(bounded.error.details ?? {}),
-      });
+      emitThrottled(
+        log,
+        'warn',
+        throttleKey(
+          WARNING_CLASS.batchRefused,
+          unattributedScope(context, origin),
+          bounded.error.code,
+        ),
+        'telemetry batch refused before ingest',
+        { ...originFields, code: bounded.error.code, ...(bounded.error.details ?? {}) },
+      );
       return bounded;
     }
 
@@ -1331,7 +2525,12 @@ export function createTelemetryIngest(deps: TelemetryIngestDeps): TelemetryInges
     const state = newRunState(received);
 
     if (received === 0) {
-      emit(log, 'debug', 'empty telemetry batch ignored', originFields);
+      emitDebugThrottled(
+        log,
+        throttleKey(DEBUG_CLASS.emptyBatch, unattributedScope(context, origin)),
+        'empty telemetry batch ignored',
+        originFields,
+      );
       return ok(toReport(state));
     }
 
@@ -1344,23 +2543,29 @@ export function createTelemetryIngest(deps: TelemetryIngestDeps): TelemetryInges
       const error = asDebuggenError(resolved.error, 'resolveBatch', 'INTERNAL');
 
       if (reason === undefined) {
-        emit(log, 'warn', 'telemetry batch attribution failed', {
-          ...originFields,
-          code: error.code,
-          received,
-        });
+        emitThrottled(
+          log,
+          'warn',
+          throttleKey(
+            WARNING_CLASS.attributionFailed,
+            unattributedScope(context, origin),
+            error.code,
+          ),
+          'telemetry batch attribution failed',
+          { ...originFields, code: error.code, received },
+        );
         return err(error);
       }
 
       state.dropped[reason] = received;
       state.batchDropReason = reason;
       state.batchDropCode = error.code;
-      emit(log, 'debug', 'telemetry batch dropped by attribution', {
-        ...originFields,
-        reason,
-        code: error.code,
-        received,
-      });
+      emitDebugThrottled(
+        log,
+        throttleKey(DEBUG_CLASS.droppedBatch, unattributedScope(context, origin), reason),
+        'telemetry batch dropped by attribution',
+        { ...originFields, reason, code: error.code, received },
+      );
       return ok(toReport(state));
     }
 
@@ -1368,17 +2573,22 @@ export function createTelemetryIngest(deps: TelemetryIngestDeps): TelemetryInges
     const sessionId = attribution.sessionId;
     state.sessionId = sessionId;
     state.captureId = attribution.captureId;
-    const scoped = derive(() => sessionLogger(log, sessionId, attribution.captureId));
+    const scoped = sessionLogger(log, sessionId, attribution.captureId);
+
+    // 2½. The producer's loss report, against the capture just resolved.
+    await recordLoss(attribution, reportedLoss, state, scoped, originFields);
 
     // 3. One request-key hasher per batch, from the session's secret.
     const hasher = await batchHasher(sessionId);
 
     if (isErr(hasher)) {
-      emit(scoped, 'warn', 'telemetry batch refused: the request-key secret is unavailable', {
-        ...originFields,
-        code: hasher.error.code,
-        received,
-      });
+      emitThrottled(
+        scoped,
+        'warn',
+        throttleKey(WARNING_CLASS.secretUnavailable, runScope(state), hasher.error.code),
+        'telemetry batch refused: the request-key secret is unavailable',
+        { ...originFields, code: hasher.error.code, received },
+      );
       return hasher;
     }
 
@@ -1437,47 +2647,69 @@ export function createTelemetryIngest(deps: TelemetryIngestDeps): TelemetryInges
     }
 
     if (state.invalid > 0) {
-      emit(scoped, 'warn', 'malformed telemetry events skipped', {
-        ...originFields,
-        invalid: state.invalid,
-        received,
-        issueCodes: [...issueCodes],
-        fields: [...issueFields],
-      });
+      emitThrottled(
+        scoped,
+        'warn',
+        throttleKey(WARNING_CLASS.malformedEvents, runScope(state)),
+        'malformed telemetry events skipped',
+        {
+          ...originFields,
+          invalid: state.invalid,
+          received,
+          issueCodes: [...issueCodes],
+          fields: [...issueFields],
+        },
+      );
     }
 
     if (state.serviceKeysStripped > 0) {
-      emit(scoped, 'warn', 'producer-supplied service-assigned attributes discarded', {
-        ...originFields,
-        count: state.serviceKeysStripped,
-      });
+      emitThrottled(
+        scoped,
+        'warn',
+        throttleKey(WARNING_CLASS.serviceKeysStripped, runScope(state)),
+        'producer-supplied service-assigned attributes discarded',
+        { ...originFields, count: state.serviceKeysStripped },
+      );
     }
 
     const perEventFailures =
       state.failures.requestKey + state.failures.redaction + state.failures.attribution;
 
     if (perEventFailures > 0) {
-      emit(scoped, 'warn', 'telemetry events degraded or not stored during ingest', {
-        ...originFields,
-        requestKey: state.failures.requestKey,
-        redaction: state.failures.redaction,
-        attribution: state.failures.attribution,
-      });
+      emitThrottled(
+        scoped,
+        'warn',
+        throttleKey(WARNING_CLASS.eventsDegraded, runScope(state)),
+        'telemetry events degraded or not stored during ingest',
+        {
+          ...originFields,
+          requestKey: state.failures.requestKey,
+          redaction: state.failures.redaction,
+          attribution: state.failures.attribution,
+        },
+      );
     }
 
-    // 7½. Locate — before persistence, so the stored row, the correlator and the tail agree.
+    // 7½. Locate — before persistence, so the stored row, the correlator and the tail agree
+    //     on a location the locator vouched for; an unverified producer claim is removed here.
     const placed = await locate(collected, attribution, state, scoped);
 
-    // 8. Persist — one write; the store assigns `ingestSeq`.
+    // 8. Persist — one write; the store assigns `ingestSeq` and projects each
+    //    producer's `clockOffsetMs`, which is counted here and never applied.
+    const clockOffsets = tallyClockOffsets(placed);
+    state.clockOffsetsReported = clockOffsets.reported;
+
     if (placed.length > 0) {
       const stored = await persist(placed);
 
       if (isErr(stored)) {
-        emit(scoped, 'warn', 'telemetry batch could not be persisted', {
-          ...originFields,
-          code: stored.error.code,
-          attributed: placed.length,
-        });
+        emitThrottled(
+          scoped,
+          'warn',
+          throttleKey(WARNING_CLASS.persistFailed, runScope(state), stored.error.code),
+          'telemetry batch could not be persisted',
+          { ...originFields, code: stored.error.code, attributed: placed.length },
+        );
         return stored;
       }
 
@@ -1493,9 +2725,10 @@ export function createTelemetryIngest(deps: TelemetryIngestDeps): TelemetryInges
       }
     }
 
-    // 11. Report.
+    // 11. Report. A batch that stored nothing is reported through the debug
+    //     throttle, since a producer can repeat it without bound.
     const finishedAt = readClock();
-    emit(scoped, 'debug', 'telemetry batch ingested', {
+    const summary: LogFields = {
       ...originFields,
       received,
       parsed: state.parsed,
@@ -1506,32 +2739,65 @@ export function createTelemetryIngest(deps: TelemetryIngestDeps): TelemetryInges
       skipped: state.skipped,
       requestKeysComputed: state.requestKeysComputed,
       sourcesLocated: state.sourcesLocated,
+      sourcesUnplacedByBudget: state.sourcesUnplacedByBudget,
+      sourcesRefused: state.sourcesRefused,
       tracesTouched: state.tracesTouched.length,
+      ...(state.producerDropped === undefined ? {} : { producerDropped: state.producerDropped }),
+      clockOffsetsReported: state.clockOffsetsReported,
+      ...(clockOffsets.maxAbsMs === undefined
+        ? {}
+        : { maxAbsClockOffsetMs: clockOffsets.maxAbsMs }),
       ...(startedAt === undefined || finishedAt === undefined
         ? {}
         : { elapsedMs: roundMs(Math.max(0, finishedAt - startedAt)) }),
-    });
+    };
+    if (state.persisted > 0) {
+      emit(scoped, 'debug', 'telemetry batch ingested', summary);
+    } else {
+      emitDebugThrottled(
+        scoped,
+        throttleKey(DEBUG_CLASS.storedNothing, runScope(state), unattributedScope(context, origin)),
+        'telemetry batch ingested',
+        summary,
+      );
+    }
 
     return ok(toReport(state));
   }
 
-  async function ingest(
+  /** {@link run} behind the never-rejects guarantee, with the transport's loss report. */
+  async function execute(
     context: IngestContext,
     events: unknown,
+    reportedLoss: unknown,
   ): Promise<Result<IngestReport, DebuggenError>> {
     try {
-      return await run(context, events);
+      return await run(context, events, reportedLoss);
     } catch {
       // Every step above guards its own dependency; reaching this is a defect,
       // reported as a typed error rather than a rejected promise.
-      emit(log, 'error', 'telemetry ingest failed unexpectedly', { code: 'INTERNAL' });
+      emitThrottled(
+        log,
+        'error',
+        throttleKey(WARNING_CLASS.unexpected, unattributedScope(context, originOf(context))),
+        'telemetry ingest failed unexpectedly',
+        { code: 'INTERNAL' },
+      );
       return err(dependencyError('ingest', 'INTERNAL'));
     }
+  }
+
+  function ingest(
+    context: IngestContext,
+    events: unknown,
+  ): Promise<Result<IngestReport, DebuggenError>> {
+    return execute(context, events, undefined);
   }
 
   function ingestFromAgent(input: AgentIngestInput): Promise<Result<IngestReport, DebuggenError>> {
     let context: BrowserIngestContext;
     let events: unknown;
+    let reportedLoss: unknown;
 
     try {
       context = {
@@ -1540,13 +2806,15 @@ export function createTelemetryIngest(deps: TelemetryIngestDeps): TelemetryInges
         ...(input.documentId === undefined ? {} : { documentId: input.documentId }),
         ...(input.producerId === undefined ? {} : { producerId: input.producerId }),
         ...(input.url === undefined ? {} : { url: input.url }),
+        ...(input.armedCaptureId === undefined ? {} : { armedCaptureId: input.armedCaptureId }),
       };
       events = input.events;
+      reportedLoss = input.droppedCount;
     } catch {
       return Promise.resolve(err(invalidBatchError('unreadable-input')));
     }
 
-    return ingest(context, events);
+    return execute(context, events, reportedLoss);
   }
 
   function ingestFromServerAgent(
@@ -1567,7 +2835,9 @@ export function createTelemetryIngest(deps: TelemetryIngestDeps): TelemetryInges
       return Promise.resolve(err(invalidBatchError('unreadable-input')));
     }
 
-    return ingest(context, events);
+    // The ingest body names no capture and reports no loss (see ./attribute.ts,
+    // "The residual server-tier case").
+    return execute(context, events, undefined);
   }
 
   return Object.freeze({ ingest, ingestFromAgent, ingestFromServerAgent });
@@ -1580,6 +2850,12 @@ export function createTelemetryIngest(deps: TelemetryIngestDeps): TelemetryInges
  * already present as the identical event); `rejected` is every other element —
  * malformed, dropped by attribution, or not safe to store — and is omitted
  * when zero, as the response schema prescribes.
+ *
+ * The route answers `202` whatever the counts, because the service did decide
+ * about every event, so the body — not the status — is the acknowledgement:
+ * the Node preload's exporter (`packages/telemetry/src/node/exporter.ts`)
+ * counts `accepted` as posted and `rejected` as dropped by the service, and a
+ * batch answered with `accepted: 0` as refused rather than posted.
  *
  * @param report The report of one ingest call.
  * @returns The body the route answers with.

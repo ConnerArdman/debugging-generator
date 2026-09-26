@@ -58,7 +58,7 @@
  */
 
 import { captureStartConflictResponseSchema } from '@debuggen/protocol';
-import type { SessionRecord } from '@debuggen/protocol';
+import type { SessionListItem } from '@debuggen/protocol';
 import { DebuggenError, isErr } from '@debuggen/shared';
 
 import type { ActiveSessionRef, CommandContext, CommandId } from './index';
@@ -147,13 +147,17 @@ function questionExcerpt(question: string): string {
  * How the conflict headline names the owning session: always its id, followed
  * by its question excerpt when the host's session list already holds that
  * session. The list is read, never refreshed — a session the host does not know
- * is named by its id alone.
+ * (or that the listed page left out) is named by its id alone.
  *
  * @param ownerId The owning session's id.
- * @param sessions The host's cached session list.
+ * @param sessions The host's cached session list rows; only `id` and
+ *   `question` are read.
  * @returns The parenthesised label's content.
  */
-function ownerLabel(ownerId: string, sessions: readonly SessionRecord[]): string {
+function ownerLabel(
+  ownerId: string,
+  sessions: readonly Pick<SessionListItem, 'id' | 'question'>[],
+): string {
   const listed = sessions.find((session) => session.id === ownerId);
   if (listed === undefined) {
     return ownerId;

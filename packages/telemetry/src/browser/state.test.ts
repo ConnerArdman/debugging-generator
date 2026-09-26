@@ -24,10 +24,10 @@
  * - every key written is the catalogued spelling `../aggregate/timeline.ts`
  *   reads back (`../schema/attributes.ts`'s `STATE_ATTRIBUTE_KEYS`).
  *
- * `emitMany` is spied on rather than the page's `postMessage`, for the same
- * reason `./react.test.tsx` does it: the assertions are about the drafts this
- * module builds, and the transport's own queueing, batching and bridge
- * handshake are that module's contract and its own tests' business.
+ * `emitMany` is spied on rather than the page channel, for the same reason
+ * `./react.test.tsx` does it: the assertions are about the drafts this module
+ * builds, and the transport's own queueing, batching and bridge handshake are
+ * that module's contract and its own tests' business.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';

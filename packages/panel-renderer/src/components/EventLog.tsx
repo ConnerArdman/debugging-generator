@@ -1119,22 +1119,30 @@ function selectedEventLogRowKey(
  * nothing from a render, so the column list has one identity for the life of
  * the module and a row's cells depend on the row alone.
  *
- * Every track is relational or a `ch` measure that resolves identically in
- * every row: the header row and each data row are separate grid containers, so
- * an intrinsic track would size itself from one row's own content and stop
- * sitting under its own header (see `../primitives/DataTable`). No track is a
- * literal length (AAP 0.6.4).
+ * Every column declares its width ROLE, never a size (`DataTableColumnWidth`
+ * in `../primitives/DataTable`, AAP 0.6.4): `DataTable` resolves each role to
+ * a track built from the design system's column floor and share tokens, the
+ * same track every other table gives content of that kind. The roles follow
+ * the content:
  *
- * Every track also has a non-zero floor. The three bounded columns are fixed
- * `ch` measures sized for their widest value and header: a sequence number up
- * to six digits, an offset up to five integer digits in seconds, the longest
- * kind label ("Performance entry"). The two free-text columns are
- * `minmax(<floor>, <share>)`: the floor keeps a readable excerpt of a name
- * beside its source chip, and at least one attribute pair, and the share hands
- * spare width to the attributes two parts to one. `DataTable` sums the floors
- * into the grid's own minimum width, so a surface narrower than their sum
- * scrolls the log horizontally instead of squeezing a column to its padding
- * and letting its content paint over the next one.
+ * - the sequence number is `ordinal`, the fixed role of a position number, so
+ *   the figures down the column never drift as the panel widens;
+ * - the offset is `quantity`, a formatted measurement with its unit;
+ * - the kind chip is `label`, whose floor holds the longest kind label
+ *   ("Performance entry");
+ * - the record's name, beside its status and source chips, is `name`;
+ * - the attribute strip is `text`, the free-text role with the widest share,
+ *   so the attributes take the largest part of any spare width, where a wider
+ *   cell shows more pairs whole.
+ *
+ * Every role track is a fixed floor or a floor and a ratio, which resolves
+ * identically in every row: the header row and each data row are separate
+ * grid containers, so an intrinsic track would size itself from one row's own
+ * content and stop sitting under its own header. And every role has a
+ * non-zero floor, which `DataTable` sums into the grid's own minimum width, so
+ * a surface narrower than their sum scrolls the log horizontally instead of
+ * squeezing a column to its padding and letting its content paint over the
+ * next one.
  * ---------------------------------------------------------------------------
  */
 
@@ -1258,26 +1266,26 @@ function renderAttributesCell(row: EventLogRow): ReactNode {
  * response carried (AAP 0.4.2).
  */
 const EVENT_LOG_COLUMNS: readonly DataTableColumn<EventLogRow>[] = Object.freeze([
-  { key: 'seq', header: COLUMN_HEADER_SEQ, align: 'end', width: '8ch', cell: renderSeqCell },
+  { key: 'seq', header: COLUMN_HEADER_SEQ, align: 'end', width: 'ordinal', cell: renderSeqCell },
   {
     key: 'startTime',
     header: COLUMN_HEADER_OFFSET,
     align: 'end',
-    width: '11ch',
+    width: 'quantity',
     cell: renderOffsetCell,
   },
-  { key: 'kind', header: COLUMN_HEADER_KIND, width: '18ch', cell: renderKindCell },
+  { key: 'kind', header: COLUMN_HEADER_KIND, width: 'label', cell: renderKindCell },
   {
     key: 'name',
     header: COLUMN_HEADER_NAME,
-    width: 'minmax(28ch, 1fr)',
+    width: 'name',
     rowHeader: true,
     cell: renderNameCell,
   },
   {
     key: 'attributes',
     header: COLUMN_HEADER_ATTRIBUTES,
-    width: 'minmax(28ch, 2fr)',
+    width: 'text',
     cell: renderAttributesCell,
   },
 ]);

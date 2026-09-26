@@ -30,26 +30,45 @@
  * | Message | Effect |
  * | --- | --- |
  * | `session.bind` | Only a `devtools` principal binds. The payload's `origin` must be the origin of its `url`. Without `sessionId` the tab binds to the most recently updated non-ended session whose dev-server origin equals the tab's origin; with `sessionId` it binds to that session only if its dev-server origin matches — a mismatch is a refusal, never a silent bind. |
- * | `tab.navigated` | Same origin keeps the binding, records the new URL and re-arms the agent the new document started dormant; a different origin drops the binding. A navigation of an unbound tab is a no-op. |
+ * | `tab.navigated` | Same origin keeps the binding, records the new URL and re-arms the agent the new document started dormant — reporting `Page reloaded during capture` when a capture is open; a different origin drops the binding. A navigation of an unbound tab is a no-op. |
  * | `session.unbind` | Drops the binding. Idempotent: an unbound tab is a no-op. It never ends the session, cancels a capture or disarms instrumentation. |
  *
  * **Cardinality** (AAP §0.2.3): one tab binds to at most one session and one
  * session accepts one tab at a time. A second bind replaces the first and is
- * announced: every displaced binding is told with `session.bound` carrying the
- * displaced session, tab and URL and `reason: 'replaced'`, before the new
- * binding is announced — the order the Chrome service worker's tab registry
- * relies on (it drops a record only when a drop names that record's tab *and*
- * session). A redundant re-bind of the same pair by the same credential — a
- * service-worker reconnect re-announcing its bindings — displaces nothing and
- * announces no replacement.
+ * announced: once the bind's writes stand, every displaced binding is told with
+ * `session.bound` carrying the displaced session, tab and URL and
+ * `reason: 'replaced'`, before the new binding is announced — the order the
+ * Chrome service worker's tab registry relies on (it drops a record only when
+ * a drop names that record's tab *and* session). A redundant re-bind of the
+ * same pair by the same credential — a service-worker reconnect re-announcing
+ * its bindings — displaces nothing and announces no replacement.
  *
  * **Two stores, one truth.** The durable `bindings` row
  * (`../../store/sessions-repo.ts`) survives a restart; the live
  * {@link ClientRegistry} view finds the socket. Every mutation writes the store
  * first and the registry second, then mirrors the tab onto the session record
  * through {@link SessionManager.setBoundTab} — the manager is the only writer of
- * the record and the only broadcaster of `session.updated`. A failure between
- * the two writes restores the store to what it held, so the two never disagree.
+ * the record and the only broadcaster of `session.updated`.
+ *
+ * **Nothing is announced before every write stands.** A bind writes the row,
+ * the live binding and then the record mirrors (each other session that lost
+ * its tab cleared, the bound session shown its tab); should the registry or any
+ * mirror refuse, every write already made is compensated in reverse — each
+ * mirrored record gets its previous bound tab back, the new live binding is
+ * released and every live binding it displaced is re-established under the
+ * credential that made it, and the new row is removed with the rows it
+ * displaced written back — and the original refusal is returned with no
+ * `replaced` or `bound` announcement sent. A re-bind of the same tab to the
+ * same session — a new URL, or a new DevTools connection — replaces a binding
+ * the store never reports displaced (nor does the registry, which updates the
+ * same credential's binding in place), so the tab's row and live binding are
+ * read before the first write and a refusal puts both back, URL and bound-at
+ * stamp included. Compensation failures are logged by ids and codes; a
+ * displaced binding whose credential no registered connection holds keeps its
+ * durable row, as after a restart. A same-origin navigation
+ * is held to the same rule: when the registry or the record refuses the new
+ * URL, the row and the registry get the previous URL back and the navigation
+ * is neither announced nor re-armed.
  *
  * **Announcements** go to the session's DevTools and VS Code clients (the two
  * receivers AAP §0.4.2 names) through `broadcastToKinds`. The registry keeps a
@@ -69,6 +88,15 @@
  * newly bound tab or a reloaded document continues the capture (AAP §0.5.5,
  * "Page reloaded during capture").
  *
+ * **The reload is reported, once.** A same-origin navigation kept while the
+ * session has an open capture is also told to the developer: exactly one
+ * `Page reloaded during capture` progress row of the capture stage, emitted
+ * through the injected progress port (`../../sessions/progress.ts`, which
+ * persists it for replay and sends it to the session's editor and panel), its
+ * detail saying whether the agent resumed. A navigation without an open
+ * capture, a refused navigation and a bind report nothing; the INFO log line
+ * stays.
+ *
  * **Explicit unbind versus a dropped socket.** A socket that closes is marked
  * offline by `../ws.ts` and `../clients.ts` and keeps its bindings, because the
  * MV3 service worker suspends after about 30 s of idleness and reconnects with
@@ -81,7 +109,12 @@
  * Such a row is left until the panel re-binds (the reconnecting service worker
  * re-announces its tabs, and `upsertBinding` replaces the row) or the session
  * ends. Navigation and unbind act only on live bindings, authorized against the
- * credential that made them with `requireBoundSession`.
+ * credential that made them with `requireBoundSession`, with the tab the
+ * frame's payload names as the acting tab: a frame about tab A changes only
+ * tab A's binding, even though every tab of one paired extension presents the
+ * same credential. `../ws.ts` delivers a binding frame here only when that tab
+ * is the sender's own — a connection whose hello announced a tab may bind,
+ * navigate and unbind that tab alone.
  *
  * ## Protocol discipline and privacy
  *
@@ -97,6 +130,16 @@
  * origins, never by string prefix, and none is hardcoded: they come from the
  * session's stored `devServerUrl` and the payload.
  *
+ * **No raw inspected URL outlives the frame** (AAP §0.5.2). The raw document
+ * URL is read once, to compute the origin every decision compares; what the
+ * `bindings` row, the registry, the record's `boundTab` and every
+ * `session.bound` carry is {@link redactBoundUrl}'s form — query values `?` per
+ * key, path pattern-scrubbed. A selected-element descriptor is redacted the
+ * same way — its URL, and every URL embedded in its text, selector, tag name
+ * and component names — by {@link redactSelectedTarget}, which
+ * `../../main.ts` applies to `target.selected` and `./sessions.ts` to the
+ * target a `session.create` carries, before either reaches the record.
+ *
  * Operations are serialized through one queue, so the replacement, the record
  * mirror, the announcements and the replay of one frame are never interleaved
  * with another binding frame's.
@@ -109,6 +152,7 @@
  *   manager: sessionManager,
  *   reopener,
  *   arming: instrumentationService,
+ *   progress: sessionProgress,
  *   logger,
  * });
  * // inside ws.ts's exhaustive switch over the parsed message type:
@@ -119,9 +163,12 @@
  * @module
  */
 
+import { parseSelectedTarget, selectedTargetSchema } from '@debuggen/instrumentation';
 import {
   MESSAGE_PAYLOAD_SCHEMAS,
   MESSAGE_TYPES,
+  SESSION_STATUSES,
+  boundTabSchema,
   bindingReasonSchema,
   clientKindSchema,
   createEnvelope,
@@ -129,6 +176,8 @@ import {
   parseSessionBoundPayload,
   parseSessionUnbindPayload,
   parseTabNavigatedPayload,
+  progressStageSchema,
+  progressStatusSchema,
   sessionBoundPayloadSchema,
 } from '@debuggen/protocol';
 import type {
@@ -136,9 +185,11 @@ import type {
   ClientKind,
   MessagePayload,
   MessageType,
+  SelectedTarget,
   SessionBindPayload,
   SessionBoundPayload,
   SessionRecord,
+  SessionStatus,
   SessionUnbindPayload,
   TabNavigatedPayload,
 } from '@debuggen/protocol';
@@ -152,12 +203,14 @@ import {
   ok,
 } from '@debuggen/shared';
 import type { DebuggenErrorCode, LogFields, Logger, Result, SessionId } from '@debuggen/shared';
+import { REDACTION_MARKER, redactTextUrls, redactUrl, scrub, truncate } from '@debuggen/telemetry';
 
 import type { InstrumentationService } from '../../instrumentation/service.js';
 import { LOG_BINDING_KEYS, subsystemLogger } from '../../logging.js';
 import type { SessionManager } from '../../sessions/manager.js';
+import type { SessionProgress } from '../../sessions/progress.js';
 import type { SessionReopener } from '../../sessions/reopen.js';
-import { MAX_SESSION_LIST_LIMIT } from '../../store/sessions-repo.js';
+import { isTerminalSessionStatus } from '../../sessions/state-machine.js';
 import type {
   BindingUpsert,
   SessionsRepo,
@@ -165,7 +218,12 @@ import type {
 } from '../../store/sessions-repo.js';
 import { requireBoundSession, requireRole } from '../auth.js';
 import type { Principal } from '../auth.js';
-import type { ClientRegistry, TabBindingView } from '../clients.js';
+import type {
+  BindTabOutcome,
+  ClientRegistry,
+  RegisteredClient,
+  TabBindingView,
+} from '../clients.js';
 
 /* -------------------------------------------------------------------------------------------------
  * Section A — protocol vocabulary, resolved rather than restated
@@ -257,11 +315,53 @@ const BINDING_ROLE = KINDS.devtools;
 /** Who hears a binding announcement: the session's DevTools panel and its VS Code views (AAP §0.4.2). */
 const ANNOUNCEMENT_KINDS: readonly ClientKind[] = Object.freeze([KINDS.devtools, KINDS.vscode]);
 
+/** Protocol's progress-stage vocabulary, keyed by member. */
+const PROGRESS_STAGE = progressStageSchema.enum;
+
+/** Protocol's progress-status vocabulary, keyed by member. */
+const PROGRESS_STATUS = progressStatusSchema.enum;
+
+/** The stage a reload notice is filed under: the capture the reload interrupted. */
+const RELOAD_NOTICE_STAGE = PROGRESS_STAGE.capture;
+
+/**
+ * A reload notice is a finding within the capture's group — a `done` row, as
+ * every finding row is — and never the capture stage's own close.
+ */
+const RELOAD_NOTICE_STATUS = PROGRESS_STATUS.done;
+
 /** Who receives the reopen replay after a bind: only the panel that just bound; the editor already holds it. */
 const REPLAY_KINDS: readonly ClientKind[] = Object.freeze([KINDS.devtools]);
 
+/**
+ * The statuses a tab can be bound to a session in: protocol's vocabulary minus
+ * the state machine's terminal statuses, derived so neither rule is restated.
+ */
+const ACTIVE_SESSION_STATUSES: readonly SessionStatus[] = Object.freeze(
+  SESSION_STATUSES.filter((status) => !isTerminalSessionStatus(status)),
+);
+
 /** The two URL schemes a document a session can bind to is served over. */
 const HTTP_PROTOCOLS: ReadonlySet<string> = new Set(['http:', 'https:']);
+
+/**
+ * The WHATWG serialization of an opaque origin (`about:`, `chrome:`, `data:`,
+ * `file:` …), which is what `URL.prototype.origin` answers for such a document.
+ */
+const OPAQUE_ORIGIN = 'null';
+
+/**
+ * Protocol's rule for a document URL on a session record, in a `session.bound`
+ * announcement and in the registry's view alike: an absolute URL within the
+ * shared 2048-character bound. Read off the record schema rather than restated.
+ */
+const DOCUMENT_URL_SCHEMA = boundTabSchema.shape.url;
+
+/** The upstream field rules of a selected-element descriptor, one schema per field. */
+const TARGET_FIELD_SCHEMAS = selectedTargetSchema.shape;
+
+/** The upstream rule for one component name of a descriptor's chain. */
+const TARGET_COMPONENT_NAME_SCHEMA = TARGET_FIELD_SCHEMAS.componentChain.element;
 
 /* -------------------------------------------------------------------------------------------------
  * Section B — constant refusal wording (never echoes a value)
@@ -292,6 +392,13 @@ const SESSION_ENDED_HINT = 'Start a new session from the Debug Generator view in
 const ANNOUNCEMENT_INVALID_MESSAGE =
   'The binding announcement could not be built from the binding state.';
 
+/** The event-log entry AAP §0.5.5 names for a same-origin reload while a capture is open. */
+const RELOAD_DURING_CAPTURE_MESSAGE = 'Page reloaded during capture';
+const RELOAD_RESUMED_DETAIL =
+  'The page agent was re-armed in the reloaded page; the same capture continues.';
+const RELOAD_NOT_RESUMED_DETAIL =
+  'The page agent could not be re-armed in the reloaded page, so its events are missing from this capture';
+
 const UNEXPECTED_FAILURE_MESSAGE = 'The binding operation failed unexpectedly.';
 const UNEXPECTED_FAILURE_HINT =
   'Reopen the Debug Generator panel; the service log names the failing step.';
@@ -317,22 +424,43 @@ export type AgentArmingPort = Pick<InstrumentationService, 'armCapture'>;
  * each field is narrowed to the members this module calls.
  */
 export interface BindingRoutesDeps {
-  /** The live bindings and the fan-out; the client registry in production. */
+  /**
+   * The live bindings and the fan-out; the client registry in production.
+   * `get` and `list` find the connection whose credential made a displaced
+   * binding, so a refused bind can re-establish it under that credential.
+   */
   readonly clients: Pick<
     ClientRegistry,
-    'bindTab' | 'updateTabUrl' | 'unbindTab' | 'bindingForTab' | 'broadcastToKinds'
+    'bindTab' | 'updateTabUrl' | 'unbindTab' | 'bindingForTab' | 'broadcastToKinds' | 'get' | 'list'
   >;
-  /** The durable `bindings` rows, session records and open captures. */
+  /**
+   * The durable `bindings` rows, session records, the indexed origin lookup
+   * and open captures. `getBindingByTab` reads a tab's row before a bind
+   * replaces it, so a refused re-bind of the same tab and session can write
+   * that row back.
+   */
   readonly sessions: Pick<
     SessionsRepo,
-    'get' | 'list' | 'upsertBinding' | 'deleteBinding' | 'getActiveCapture'
+    | 'get'
+    | 'findLatestByDevServer'
+    | 'getBindingByTab'
+    | 'upsertBinding'
+    | 'deleteBinding'
+    | 'getActiveCapture'
   >;
   /** The one writer of the session record, which mirrors the bound tab and broadcasts `session.updated`. */
   readonly manager: Pick<SessionManager, 'setBoundTab'>;
-  /** Replays stored state to a panel that just bound, and answers whether a session is read-only. */
+  /** Replays stored state to a panel that just bound. */
   readonly reopener: Pick<SessionReopener, 'reopen'>;
   /** Re-sends `agent.config` for an open capture. */
   readonly arming: AgentArmingPort;
+  /**
+   * Where a same-origin reload during an open capture is reported: one `done`
+   * row of the capture stage, persisted and sent to the session's editor and
+   * panel (AAP §0.5.5, "Page reloaded during capture"). The session progress
+   * emitter in production; omitted, the reload is logged only.
+   */
+  readonly progress?: Pick<SessionProgress, 'emit'> | undefined;
   /** The service logger; bound to `subsystem: "binding"`. Defaults to silence. */
   readonly logger?: Logger | undefined;
   /** The clock bindings and frames are stamped with, in epoch milliseconds. Defaults to `nowEpochMs`. */
@@ -378,6 +506,7 @@ export interface BindingAnnouncement {
 export interface SessionBindOutcome {
   readonly sessionId: SessionId;
   readonly tabId: number;
+  /** The bound document's URL as recorded and announced: redacted by {@link redactBoundUrl}. */
   readonly url: string;
   /** Whether the session was named by the panel or matched by origin. */
   readonly matchedBy: SessionMatch;
@@ -488,6 +617,147 @@ export function isSessionOrigin(devServerUrl: string, documentUrl: string): bool
   return sessionOrigin !== undefined && sessionOrigin === serializedOriginOf(documentUrl);
 }
 
+/** Whether a value satisfies protocol's document-URL rule (absolute, at most 2048 characters). */
+function isRecordableUrl(value: string): boolean {
+  return DOCUMENT_URL_SCHEMA.safeParse(value).success;
+}
+
+/**
+ * The shortest honest stand-in for a document URL whose redacted form cannot
+ * be recorded: `${origin}/` for an HTTP(S) document, the tuple origin of
+ * another special scheme (`ws:`, `ftp:`), or the bare scheme of an
+ * opaque-origin document (`about:`, `chrome:`, `file:`). `undefined` only for
+ * a value that is not an absolute URL at all.
+ */
+function documentUrlFallback(raw: string, origin: string | undefined): string | undefined {
+  if (origin !== undefined) {
+    return `${origin}/`;
+  }
+  const parsed = URL.parse(raw);
+  if (parsed === null) {
+    return undefined;
+  }
+  const candidate = parsed.origin === OPAQUE_ORIGIN ? parsed.protocol : `${parsed.origin}/`;
+  return isRecordableUrl(candidate) ? candidate : undefined;
+}
+
+/**
+ * The form of an inspected document's URL that may be persisted, mirrored onto
+ * the session record, held by the registry and announced (AAP §0.5.2: query
+ * values become `?` per key for display *and* storage; the path is kept and
+ * pattern-scrubbed; userinfo and a non-empty fragment are masked).
+ *
+ * Redaction is `@debuggen/telemetry`'s `redactUrl`, the same function ingest
+ * applies to captured request URLs, so a bound URL and a captured one read
+ * alike. The result must still be recordable and still belong to the origin
+ * the caller compared: were the redacted text longer than protocol's bound, or
+ * were it to parse to another origin or scheme, `${origin}/` (or its
+ * opaque-origin analogue) is returned instead — never the raw URL.
+ *
+ * The raw URL is used only by the caller, ephemerally, for the origin
+ * comparison every binding decision rests on; this is the value that outlives
+ * the frame.
+ *
+ * @param raw The document URL exactly as the panel or the service worker sent it.
+ * @param origin The caller's {@link serializedOriginOf} of `raw` — the origin it
+ * compared — or `undefined` for a document without an HTTP(S) origin.
+ * @returns The redacted URL; for a value that is not an absolute URL at all,
+ * the redacted text, which the caller's schema validation then refuses.
+ *
+ * @example
+ * ```ts
+ * redactBoundUrl('http://127.0.0.1:3000/reports?token=abc&sort=price', 'http://127.0.0.1:3000');
+ * // → 'http://127.0.0.1:3000/reports?token=?&sort=?'
+ * ```
+ */
+export function redactBoundUrl(raw: string, origin: string | undefined): string {
+  const redacted = redactUrl(raw);
+  const keepsOrigin =
+    serializedOriginOf(redacted) === origin &&
+    (origin !== undefined || URL.parse(redacted)?.protocol === URL.parse(raw)?.protocol);
+  if (keepsOrigin && isRecordableUrl(redacted)) {
+    return redacted;
+  }
+  return documentUrlFallback(raw, origin) ?? redacted;
+}
+
+/** Anything a descriptor field can be checked against: the upstream field schema. */
+interface FieldRule {
+  safeParse(value: unknown): { readonly success: boolean };
+}
+
+/**
+ * One label of a selected-element descriptor, redacted and still satisfying
+ * its upstream field rule.
+ *
+ * Two passes, in the order `@debuggen/telemetry` requires: `scrub` replaces
+ * every secret-shaped run by pattern, then `redactTextUrls` masks the query
+ * values and fragment of every URL the label embeds — an absolute link text
+ * (`http://127.0.0.1:3000/reset?code=…`), an origin-relative reference in a
+ * sentence (`Visit /reset?code=…`) or an attribute selector
+ * (`a[href="/p?id=…"]`) — keeping keys, paths and the surrounding text. Should
+ * the masks have lengthened the label past the rule's bound, it is truncated
+ * back to the length the valid original had; truncation only ever shortens
+ * the redacted text. `undefined` when neither form satisfies the rule.
+ */
+function redactedLabel(value: string, rule: FieldRule): string | undefined {
+  const redacted = redactTextUrls(scrub(value));
+  if (rule.safeParse(redacted).success) {
+    return redacted;
+  }
+  const bounded = truncate(redacted, value.length);
+  return rule.safeParse(bounded).success ? bounded : undefined;
+}
+
+/**
+ * The form of a selected-element descriptor that may be stored on a session
+ * record, broadcast and handed to Stage 1 (AAP §0.5.2): its `url` through
+ * {@link redactBoundUrl}, and its `text`, `selector`, `tagName` and every
+ * component name through `@debuggen/telemetry`'s `scrub` and then its
+ * `redactTextUrls`, so neither a bearer token, a JWT or a key the page
+ * rendered into a label nor the query value of a URL a label embeds — a link
+ * whose text is its own address, `Visit /reset?coupon=…`, an attribute
+ * selector `a[href="/p?id=…"]` — reaches the store: each such value becomes
+ * `?` per key, exactly as in the descriptor's own `url`.
+ *
+ * The result re-validates with `parseSelectedTarget`. A field whose redacted
+ * form no longer satisfies its rule degrades rather than failing the frame:
+ * `text` (optional) is omitted, a component name is dropped from the chain,
+ * `selector` and `tagName` become the redaction marker, and `url` falls back to
+ * `${origin}/`. Should even that not validate — possible only for an input that
+ * was not a valid descriptor to begin with — the most conservative descriptor
+ * is returned, still redacted, and the record's own validation refuses it
+ * downstream. No field of the input is ever returned unredacted.
+ *
+ * @param target A descriptor as `target.selected` or `session.create` carried it.
+ * @returns The redacted descriptor.
+ */
+export function redactSelectedTarget(target: SelectedTarget): SelectedTarget {
+  const origin = serializedOriginOf(target.url);
+  const redactedUrl = redactBoundUrl(target.url, origin);
+  const url =
+    TARGET_FIELD_SCHEMAS.url.safeParse(redactedUrl).success || origin === undefined
+      ? redactedUrl
+      : `${origin}/`;
+  const text =
+    target.text === undefined ? undefined : redactedLabel(target.text, TARGET_FIELD_SCHEMAS.text);
+  const redacted: SelectedTarget = {
+    selector: redactedLabel(target.selector, TARGET_FIELD_SCHEMAS.selector) ?? REDACTION_MARKER,
+    tagName: redactedLabel(target.tagName, TARGET_FIELD_SCHEMAS.tagName) ?? REDACTION_MARKER,
+    ...(text === undefined ? {} : { text }),
+    componentChain: target.componentChain.flatMap((name) => {
+      const label = redactedLabel(name, TARGET_COMPONENT_NAME_SCHEMA);
+      return label === undefined ? [] : [label];
+    }),
+    url,
+  };
+  const validated = parseSelectedTarget(redacted);
+  if (validated.ok) {
+    return validated.value;
+  }
+  return { selector: REDACTION_MARKER, tagName: REDACTION_MARKER, componentChain: [], url };
+}
+
 /** A typed refusal whose message and hint are constants. */
 function refusal(
   code: DebuggenErrorCode,
@@ -567,6 +837,58 @@ function mergeDisplaced(
 interface ResolvedSession {
   readonly record: SessionRecord;
   readonly matchedBy: SessionMatch;
+}
+
+/** One session-record mirror a bind wrote, and the bound tab the record showed before it. */
+interface MirrorWrite {
+  readonly sessionId: SessionId;
+  readonly previous: BoundTab | undefined;
+}
+
+/**
+ * What a tab was bound to when a bind began, in both stores.
+ *
+ * A re-bind of the same tab to the same session — a new URL, or a new
+ * DevTools connection — replaces this binding unreported: `upsertBinding`
+ * reports only another session's or another tab's row as displaced, and the
+ * registry, when the same credential re-binds, updates its binding in place
+ * and reports nothing either. Only this snapshot lets a refused re-bind put
+ * the tab's row and live binding back.
+ */
+interface PriorBinding {
+  /** The tab's durable row, or `undefined` when it had none. */
+  readonly row: StoredTabBinding | undefined;
+  /** The tab's live binding, or `undefined` when it had none. */
+  readonly live: TabBindingView | undefined;
+}
+
+/** Everything a bind wrote before a later step refused, for {@link BindingRoutes.handleSessionBind}'s compensation. */
+interface BindUndo {
+  /** The durable row the bind wrote, with the rows it displaced. */
+  readonly stored: BindingUpsert;
+  /** The live binding the bind made, with the bindings it displaced; absent when the registry refused. */
+  readonly live: BindTabOutcome | undefined;
+  /** The record mirrors that succeeded, in write order. */
+  readonly mirrored: readonly MirrorWrite[];
+  /** The tab's bindings before the bind, for the one a same-pair re-bind replaces unreported. */
+  readonly prior: PriorBinding;
+  /** The tab the bind was for. */
+  readonly tabId: number;
+  /** The binding credential, the only one that may release the new live binding. */
+  readonly principal: Principal;
+}
+
+/** Whether two bindings pair the same tab with the same session. */
+function samePair(
+  left: { readonly tabId: number; readonly sessionId: string },
+  right: { readonly tabId: number; readonly sessionId: string },
+): boolean {
+  return left.tabId === right.tabId && left.sessionId === right.sessionId;
+}
+
+/** The tab and session a durable row pairs, in the shape {@link samePair} compares. */
+function pairOfRow(row: StoredTabBinding): { readonly tabId: number; readonly sessionId: string } {
+  return { tabId: row.tab.tabId, sessionId: row.sessionId };
 }
 
 /**
@@ -724,9 +1046,58 @@ export function createBindingRoutes(deps: BindingRoutesDeps): BindingRoutes {
     return { status: 'rearmed', captureId: capture.id };
   }
 
+  /**
+   * Reports a same-origin reload of the bound tab while the session has an
+   * open capture — the re-arm named a capture — as exactly one progress row:
+   * the `Page reloaded during capture` entry of the capture stage, whose
+   * detail says whether the agent resumed (with the error code when it did
+   * not) and carries no URL. Best effort: a row that cannot be emitted is
+   * logged and never fails the navigation, which has already been announced.
+   *
+   * @returns Whether the row was emitted.
+   */
+  function reportReloadDuringCapture(sessionId: SessionId, rearm: AgentRearmOutcome): boolean {
+    if (deps.progress === undefined || rearm.captureId === undefined) {
+      return false;
+    }
+    const detail =
+      rearm.status === 'rearmed'
+        ? RELOAD_RESUMED_DETAIL
+        : rearm.errorCode === undefined
+          ? `${RELOAD_NOT_RESUMED_DETAIL}.`
+          : `${RELOAD_NOT_RESUMED_DETAIL} (${rearm.errorCode}).`;
+    const fields = sessionFields(sessionId, { [LOG_BINDING_KEYS.captureId]: rearm.captureId });
+    try {
+      const emitted = deps.progress.emit(sessionId, {
+        stage: RELOAD_NOTICE_STAGE,
+        status: RELOAD_NOTICE_STATUS,
+        message: RELOAD_DURING_CAPTURE_MESSAGE,
+        detail,
+      });
+      if (isErr(emitted)) {
+        log.warn('The reload-during-capture notice was not emitted', {
+          ...fields,
+          ...errorFields(emitted.error),
+        });
+        return false;
+      }
+      return true;
+    } catch (thrown) {
+      log.warn('Emitting the reload-during-capture notice threw', {
+        ...fields,
+        errorName: thrownName(thrown),
+      });
+      return false;
+    }
+  }
+
   /* ---- store restoration ---- */
 
-  /** Writes a displaced durable row back, logging (not propagating) a failure. */
+  /**
+   * Writes a previous durable row back — one a bind displaced or replaced, or
+   * the pre-navigation row of a refused navigation — with its own URL and
+   * bound-at stamp, logging (not propagating) a failure.
+   */
   function restoreRow(row: StoredTabBinding): void {
     const restored = sessions.upsertBinding({
       tabId: row.tab.tabId,
@@ -736,14 +1107,22 @@ export function createBindingRoutes(deps: BindingRoutesDeps): BindingRoutes {
     });
     if (isErr(restored)) {
       log.error(
-        'A displaced binding row could not be restored',
+        'A previous binding row could not be restored',
         sessionFields(row.sessionId, { tabId: row.tab.tabId, ...errorFields(restored.error) }),
       );
     }
   }
 
-  /** Undoes one `upsertBinding`: removes the new row and writes back what it displaced. */
-  function rollbackUpsert(upsert: BindingUpsert): void {
+  /**
+   * Undoes one `upsertBinding`: removes the new row, then writes back every
+   * row it replaced — the rows it reported displaced and, when the bind
+   * re-bound the same tab to the same session, the tab's own previous row,
+   * which the upsert replaced without reporting it.
+   *
+   * @param upsert What the bind's `upsertBinding` answered.
+   * @param priorRow The tab's row before the bind, from {@link PriorBinding}.
+   */
+  function rollbackUpsert(upsert: BindingUpsert, priorRow: StoredTabBinding | undefined): void {
     const removed = sessions.deleteBinding(upsert.binding.tab.tabId);
     if (isErr(removed)) {
       log.error(
@@ -755,30 +1134,182 @@ export function createBindingRoutes(deps: BindingRoutesDeps): BindingRoutes {
       );
       return;
     }
-    for (const row of [upsert.displacedTab, upsert.displacedSession]) {
-      if (row !== undefined) {
-        restoreRow(row);
+    const reported = [upsert.displacedTab, upsert.displacedSession].filter(
+      (row): row is StoredTabBinding => row !== undefined,
+    );
+    for (const row of reported) {
+      restoreRow(row);
+    }
+    if (
+      priorRow !== undefined &&
+      !reported.some((row) => samePair(pairOfRow(row), pairOfRow(priorRow)))
+    ) {
+      restoreRow(priorRow);
+    }
+  }
+
+  /* ---- bind: record mirror and compensation ---- */
+
+  /**
+   * Mirrors a bind onto the session records through the manager: first the
+   * record of every other session that lost its tab is cleared, then the bound
+   * session's record is given the tab (skipped when it already shows it).
+   * Each write that succeeds is appended to `written` with the bound tab the
+   * record showed before it, so a later failure can put every record back.
+   *
+   * @returns `ok` once every write succeeded; the first refusal otherwise,
+   * with `written` holding exactly the writes that were made.
+   */
+  async function mirrorBind(
+    record: SessionRecord,
+    released: readonly DisplacedBinding[],
+    bound: BoundTab,
+    written: MirrorWrite[],
+  ): Promise<Result<void, DebuggenError>> {
+    const orphaned = new Set(
+      released.map((previous) => previous.sessionId).filter((id) => id !== record.id),
+    );
+    for (const orphan of orphaned) {
+      const loaded = sessions.get(orphan);
+      if (isErr(loaded)) {
+        return loaded;
+      }
+      const previous = loaded.value?.boundTab;
+      if (previous === undefined) {
+        // No record, or one that shows no tab: nothing to clear or to restore.
+        continue;
+      }
+      const cleared = await mirrorBoundTab(orphan, undefined);
+      if (isErr(cleared)) {
+        return cleared;
+      }
+      written.push({ sessionId: orphan, previous });
+    }
+    if (!recordShowsTab(record, bound.tabId, bound.url)) {
+      const shown = await mirrorBoundTab(record.id, bound);
+      if (isErr(shown)) {
+        return shown;
+      }
+      written.push({ sessionId: record.id, previous: record.boundTab });
+    }
+    return ok(undefined);
+  }
+
+  /**
+   * The registered DevTools connection holding the credential that made a
+   * binding: the binding's recorded recipient when it still qualifies,
+   * otherwise any connection of that credential; `undefined` when none is
+   * registered. Only a connection's own principal can re-make its binding.
+   */
+  function holderOf(binding: TabBindingView): RegisteredClient | undefined {
+    const holds = (client: RegisteredClient | undefined): client is RegisteredClient =>
+      client !== undefined &&
+      client.kind === BINDING_ROLE &&
+      client.principal.tokenHash === binding.boundBy;
+    const recipient =
+      binding.recipientId === undefined ? undefined : clients.get(binding.recipientId);
+    return holds(recipient) ? recipient : clients.list({ kind: BINDING_ROLE }).find(holds);
+  }
+
+  /**
+   * Re-establishes a live binding a refused bind displaced or changed in
+   * place, under the credential that made it and with its original URL and
+   * `boundAt`. When no registered connection holds that credential any more,
+   * the binding stays with its durable row alone — exactly the state a restart
+   * leaves, which the reconnecting service worker's re-bind repairs.
+   */
+  function restoreLiveBinding(binding: TabBindingView): void {
+    const fields = sessionFields(binding.sessionId, { tabId: binding.tabId });
+    const holder = holderOf(binding);
+    if (holder === undefined) {
+      log.warn(
+        'A previous live binding was not re-established: no connection holds its credential; its binding row is restored',
+        fields,
+      );
+      return;
+    }
+    const rebound = clients.bindTab({
+      tabId: binding.tabId,
+      sessionId: binding.sessionId,
+      url: binding.url,
+      principal: holder.principal,
+      clientId: holder.id,
+      boundAt: binding.boundAt,
+    });
+    if (isErr(rebound)) {
+      log.error('A previous live binding could not be re-established', {
+        ...fields,
+        ...errorFields(rebound.error),
+      });
+    }
+  }
+
+  /**
+   * Undoes a bind that failed after its durable row was written, in the
+   * reverse of the order it was made: each mirrored record gets its previous
+   * bound tab back; the new live binding is released and every live binding it
+   * displaced is re-established, as is the tab's previous binding when the
+   * registry changed it in place (the same credential re-binding the same tab
+   * and session) rather than reporting it displaced; and the durable row is
+   * removed with every row it replaced written back, the tab's own previous
+   * row of the same session included. Nothing was announced, so nothing is
+   * retracted. Every compensation failure is logged by ids and codes and
+   * none is propagated — the caller answers with the original refusal.
+   */
+  async function compensateBind(undo: BindUndo): Promise<void> {
+    for (const write of [...undo.mirrored].reverse()) {
+      const fields = sessionFields(write.sessionId, { bound: write.previous !== undefined });
+      try {
+        const restored = await manager.setBoundTab(write.sessionId, write.previous);
+        if (isErr(restored)) {
+          log.error('A session record could not be restored after a refused bind', {
+            ...fields,
+            ...errorFields(restored.error),
+          });
+        }
+      } catch (thrown) {
+        log.error('Restoring a session record after a refused bind threw', {
+          ...fields,
+          errorName: thrownName(thrown),
+        });
       }
     }
+    if (undo.live !== undefined) {
+      const undone = clients.unbindTab(undo.tabId, { principal: undo.principal });
+      if (isErr(undone)) {
+        log.error(
+          'The live binding of a refused bind could not be released',
+          sessionFields(undo.live.binding.sessionId, {
+            tabId: undo.tabId,
+            ...errorFields(undone.error),
+          }),
+        );
+      }
+      for (const change of undo.live.displaced) {
+        restoreLiveBinding(change.binding);
+      }
+      const priorLive = undo.prior.live;
+      if (
+        priorLive !== undefined &&
+        !undo.live.displaced.some((change) => samePair(change.binding, priorLive))
+      ) {
+        restoreLiveBinding(priorLive);
+      }
+    }
+    rollbackUpsert(undo.stored, undo.prior.row);
   }
 
   /* ---- session resolution ---- */
 
   /**
-   * Whether a session has ended, answered by the reopener's pure read
-   * (`readOnly` is exactly "terminal" there) so the terminal-status rule stays
-   * the state machine's.
+   * The named session, provided its dev server serves the tab's origin and it
+   * has not ended. Whether it has ended is the state machine's terminal-status
+   * rule applied to the record just read — no history is reopened to ask.
    */
-  async function isReadOnly(sessionId: SessionId): Promise<Result<boolean, DebuggenError>> {
-    const read = await reopener.reopen(sessionId, { replay: false });
-    return isErr(read) ? read : ok(read.value.readOnly);
-  }
-
-  /** The named session, provided its dev server serves the tab's origin and it has not ended. */
-  async function resolveNamed(
+  function resolveNamed(
     sessionId: SessionId,
     origin: string,
-  ): Promise<Result<ResolvedSession, DebuggenError>> {
+  ): Result<ResolvedSession, DebuggenError> {
     const loaded = sessions.get(sessionId);
     if (isErr(loaded)) {
       return loaded;
@@ -797,11 +1328,7 @@ export function createBindingRoutes(deps: BindingRoutesDeps): BindingRoutes {
         reason: 'origin-mismatch',
       });
     }
-    const readOnly = await isReadOnly(record.id);
-    if (isErr(readOnly)) {
-      return readOnly;
-    }
-    if (readOnly.value) {
+    if (isTerminalSessionStatus(record.status)) {
       return refusal('SESSION_INVALID_STATE', SESSION_ENDED_MESSAGE, SESSION_ENDED_HINT, {
         reason: 'session-ended',
       });
@@ -811,47 +1338,53 @@ export function createBindingRoutes(deps: BindingRoutesDeps): BindingRoutes {
 
   /**
    * The most recently updated session that has not ended and whose dev server
-   * serves `origin`. Sessions are walked newest first, a page at a time; a
-   * session whose record cannot be read is skipped rather than allowed to hide
-   * every older one.
+   * serves `origin`.
+   *
+   * The store answers from its projections alone —
+   * {@link SessionsRepo.findLatestByDevServer} reads only the `id`,
+   * `dev_server_url` and `updated_at` columns of the active sessions
+   * `idx_sessions_status` narrows the read to, newest first, and stops at the
+   * first whose URL
+   * canonicalises to `origin` through {@link serializedOriginOf} — so the
+   * record of the winner is the only one read and parsed, and an ended
+   * session's history is never touched. A winner whose record cannot be read is
+   * skipped, and the lookup continues past it, rather than allowed to hide
+   * every older match.
    */
-  async function resolveByOrigin(origin: string): Promise<Result<ResolvedSession, DebuggenError>> {
-    let offset = 0;
+  function resolveByOrigin(origin: string): Result<ResolvedSession, DebuggenError> {
+    const unreadable = new Set<SessionId>();
     for (;;) {
-      const page = sessions.list({ limit: MAX_SESSION_LIST_LIMIT, offset });
-      if (isErr(page)) {
-        return page;
+      const found = sessions.findLatestByDevServer({
+        statuses: ACTIVE_SESSION_STATUSES,
+        matches: (devServerUrl, candidate) =>
+          !unreadable.has(candidate) && serializedOriginOf(devServerUrl) === origin,
+      });
+      if (isErr(found)) {
+        return found;
       }
-      const { items, total } = page.value;
-      for (const item of items) {
-        const loaded = sessions.get(item.id);
-        if (isErr(loaded)) {
-          log.warn(
-            'A session record could not be read while matching a tab origin; skipped',
-            sessionFields(item.id, errorFields(loaded.error)),
-          );
-          continue;
-        }
-        const record = loaded.value;
-        if (record === undefined || serializedOriginOf(record.devServerUrl) !== origin) {
-          continue;
-        }
-        const readOnly = await isReadOnly(record.id);
-        if (isErr(readOnly)) {
-          log.warn(
-            'A session matching a tab origin could not be read; skipped',
-            sessionFields(record.id, errorFields(readOnly.error)),
-          );
-          continue;
-        }
-        if (!readOnly.value) {
-          return ok({ record, matchedBy: 'origin' });
-        }
-      }
-      offset += items.length;
-      if (items.length === 0 || offset >= total) {
+      const candidate = found.value;
+      if (candidate === undefined) {
         break;
       }
+      const loaded = sessions.get(candidate);
+      const record = loaded.ok ? loaded.value : undefined;
+      if (
+        record !== undefined &&
+        !isTerminalSessionStatus(record.status) &&
+        serializedOriginOf(record.devServerUrl) === origin
+      ) {
+        return ok({ record, matchedBy: 'origin' });
+      }
+      // Unreadable, gone, or no longer what its projections said: excluded, so
+      // the next lookup answers with the next-newest match.
+      log.warn(
+        'A session matching a tab origin could not be read; skipped',
+        sessionFields(
+          candidate,
+          loaded.ok ? { present: record !== undefined } : errorFields(loaded.error),
+        ),
+      );
+      unreadable.add(candidate);
     }
     log.info('A bind matched no active session by origin');
     return refusal('SESSION_NOT_FOUND', NO_SESSION_FOR_ORIGIN_MESSAGE, NO_SESSION_FOR_ORIGIN_HINT, {
@@ -882,15 +1415,32 @@ export function createBindingRoutes(deps: BindingRoutesDeps): BindingRoutes {
 
     const resolved =
       request.sessionId === undefined
-        ? await resolveByOrigin(origin)
-        : await resolveNamed(request.sessionId, origin);
+        ? resolveByOrigin(origin)
+        : resolveNamed(request.sessionId, origin);
     if (isErr(resolved)) {
       return resolved;
     }
     const { record, matchedBy } = resolved.value;
     const sessionId = record.id;
-    const { tabId, url } = request;
+    const { tabId } = request;
+    // The raw URL decided the origin above and goes no further: every store,
+    // the registry and every announcement hold the redacted form.
+    const url = redactBoundUrl(request.url, origin);
     const boundAt = clock();
+
+    // 0. What the tab is bound to now, in both stores. A re-bind of the same
+    //    tab to the same session replaces that binding unreported (see
+    //    PriorBinding), so a refusal below needs this snapshot to put it back.
+    //    A row that cannot be read would refuse the upsert anyway.
+    const priorRow = sessions.getBindingByTab(tabId);
+    if (isErr(priorRow)) {
+      log.error(
+        "The tab's current binding row could not be read; the bind was refused",
+        sessionFields(sessionId, { tabId, ...errorFields(priorRow.error) }),
+      );
+      return priorRow;
+    }
+    const prior: PriorBinding = { row: priorRow.value, live: clients.bindingForTab(tabId) };
 
     // 1. The durable row: what a restart rebuilds from.
     const stored = sessions.upsertBinding({ tabId, sessionId, url, boundAt });
@@ -902,7 +1452,8 @@ export function createBindingRoutes(deps: BindingRoutesDeps): BindingRoutes {
       return stored;
     }
 
-    // 2. The live view: what a push finds the socket through.
+    // 2. The live view: what a push finds the socket through. A refusal here
+    //    left the registry untouched, so only the row is rolled back.
     const live = clients.bindTab({
       tabId,
       sessionId,
@@ -912,7 +1463,7 @@ export function createBindingRoutes(deps: BindingRoutesDeps): BindingRoutes {
       boundAt,
     });
     if (isErr(live)) {
-      rollbackUpsert(stored.value);
+      rollbackUpsert(stored.value, prior.row);
       log.warn(
         'The live binding was refused; the persisted row was rolled back',
         sessionFields(sessionId, { tabId, ...errorFields(live.error) }),
@@ -920,48 +1471,56 @@ export function createBindingRoutes(deps: BindingRoutesDeps): BindingRoutes {
       return live;
     }
 
-    // 3. Tell every displaced binding it was replaced, then clear the record of
-    //    each other session that lost its tab.
-    const displaced: BindingAnnouncement[] = [];
+    // 3. Mirror the change onto the session records: clear each other session
+    //    that lost its tab, then show the tab on the bound one. Should any
+    //    write refuse (or throw), every write of steps 1–3 is compensated in
+    //    reverse and the refusal returned; nothing has been announced yet.
     const released = mergeDisplaced(live.value.displaced, stored.value, { sessionId, tabId });
+    const mirrored: MirrorWrite[] = [];
+    const undo: BindUndo = {
+      stored: stored.value,
+      live: live.value,
+      mirrored,
+      prior,
+      tabId,
+      principal,
+    };
+    let written: Result<void, DebuggenError>;
+    try {
+      written = await mirrorBind(record, released, { tabId, url }, mirrored);
+    } catch (thrown) {
+      await compensateBind(undo);
+      throw thrown;
+    }
+    if (isErr(written)) {
+      await compensateBind(undo);
+      log.warn(
+        'A session record refused the binding; every write of the bind was undone',
+        sessionFields(sessionId, {
+          tabId,
+          displaced: released.length,
+          mirrored: mirrored.length,
+          ...errorFields(written.error),
+        }),
+      );
+      return written;
+    }
+
+    // 4. Every write stands: tell each displaced binding it was replaced …
+    const displaced: BindingAnnouncement[] = [];
     for (const previous of released) {
-      const announced = announce({
+      const replaced = announce({
         sessionId: previous.sessionId,
         tabId: previous.tabId,
         url: previous.url,
         reason: REASON_REPLACED,
       });
-      if (announced.ok) {
-        displaced.push(announced.value);
-      }
-    }
-    const orphanedSessions = new Set(
-      released.map((previous) => previous.sessionId).filter((id) => id !== sessionId),
-    );
-    for (const orphaned of orphanedSessions) {
-      await mirrorBoundTab(orphaned, undefined);
-    }
-
-    // 4. Mirror the new tab onto the session record. Should the manager refuse,
-    //    the new binding is undone in both stores so they keep agreeing.
-    if (!recordShowsTab(record, tabId, url)) {
-      const mirrored = await mirrorBoundTab(sessionId, { tabId, url });
-      if (isErr(mirrored)) {
-        const undone = clients.unbindTab(tabId, { principal });
-        const removed = sessions.deleteBinding(tabId);
-        log.warn(
-          'The session record refused the bound tab; the new binding was undone',
-          sessionFields(sessionId, {
-            tabId,
-            liveUndone: undone.ok,
-            storeUndone: removed.ok,
-          }),
-        );
-        return mirrored;
+      if (replaced.ok) {
+        displaced.push(replaced.value);
       }
     }
 
-    // 5. Announce the establishment to the panel and the session's editors.
+    // 5. … then announce the establishment to the panel and the session's editors.
     const announced = announce({
       sessionId,
       tabId,
@@ -1075,6 +1634,13 @@ export function createBindingRoutes(deps: BindingRoutesDeps): BindingRoutes {
   /**
    * The live binding of a tab, authorized for the principal: `undefined` when
    * the tab is not bound, `TAB_NOT_BOUND` when another credential bound it.
+   *
+   * A binding frame is about the one tab its payload names, so that tab is the
+   * acting tab `requireBoundSession` checks the binding against. Two rules
+   * upstream keep that tab the sender's own: protocol refuses a frame whose
+   * envelope names a different tab, and `../ws.ts` refuses a payload tab other
+   * than the one a single-tab connection announced in its hello before this
+   * handler runs.
    */
   function authorizedBinding(
     tabId: number,
@@ -1084,7 +1650,7 @@ export function createBindingRoutes(deps: BindingRoutesDeps): BindingRoutes {
     if (binding === undefined) {
       return ok(undefined);
     }
-    const access = requireBoundSession(principal, binding.sessionId, binding);
+    const access = requireBoundSession(principal, binding.sessionId, binding, tabId);
     return isErr(access) ? access : ok(binding);
   }
 
@@ -1094,6 +1660,14 @@ export function createBindingRoutes(deps: BindingRoutesDeps): BindingRoutes {
    * Keeps a binding across a same-origin navigation: records the new URL in
    * the durable row, the live view and the session record, announces it and
    * re-arms the agent the new document started dormant.
+   *
+   * The announcement and the re-arm follow only once all three writes stand.
+   * Should the live view or the session record refuse the new URL (or the
+   * record write throw), the writes already made are reverted — the live view
+   * and the row get the previous URL back — and the refusal is returned, so no
+   * surface is told of a URL the record does not hold.
+   *
+   * @param url The new document's URL, already redacted by {@link redactBoundUrl}.
    */
   async function keepBinding(
     binding: TabBindingView,
@@ -1128,7 +1702,32 @@ export function createBindingRoutes(deps: BindingRoutesDeps): BindingRoutes {
       return updated;
     }
     if (!recordShowsTab(record, tabId, url)) {
-      await mirrorBoundTab(sessionId, { tabId, url });
+      /** Puts the live view, then the row, back on the URL the record still holds. */
+      const revertNavigation = (): void => {
+        const reverted = clients.updateTabUrl({ tabId, url: binding.url, principal });
+        if (isErr(reverted)) {
+          log.error(
+            'The live binding could not be returned to its previous URL',
+            sessionFields(sessionId, { tabId, ...errorFields(reverted.error) }),
+          );
+        }
+        restoreRow({ sessionId, tab: { tabId, url: binding.url }, boundAt: binding.boundAt });
+      };
+      let mirrored: Result<void, DebuggenError>;
+      try {
+        mirrored = await mirrorBoundTab(sessionId, { tabId, url });
+      } catch (thrown) {
+        revertNavigation();
+        throw thrown;
+      }
+      if (isErr(mirrored)) {
+        revertNavigation();
+        log.warn(
+          'The session record refused the navigated URL; the binding keeps its previous URL and nothing was announced',
+          sessionFields(sessionId, { tabId, ...errorFields(mirrored.error) }),
+        );
+        return mirrored;
+      }
     }
     const announced = announce({
       sessionId,
@@ -1140,9 +1739,10 @@ export function createBindingRoutes(deps: BindingRoutesDeps): BindingRoutes {
       return announced;
     }
     const rearm = rearmAgent(record);
+    const reloadNotice = reportReloadDuringCapture(sessionId, rearm);
     log.info(
       'Bound tab navigated within its origin',
-      sessionFields(sessionId, { tabId, rearm: rearm.status }),
+      sessionFields(sessionId, { tabId, rearm: rearm.status, reloadNotice }),
     );
     return ok({ kind: 'kept', announced: announced.value, rearm });
   }
@@ -1175,8 +1775,11 @@ export function createBindingRoutes(deps: BindingRoutesDeps): BindingRoutes {
       return loaded;
     }
     const record = loaded.value;
+    // The origin is decided on the raw URL; only its redacted form is recorded
+    // or announced, whichever way the navigation goes.
+    const documentUrl = redactBoundUrl(url, serializedOriginOf(url));
     if (record !== undefined && isSessionOrigin(record.devServerUrl, url)) {
-      return keepBinding(binding, record, url, principal);
+      return keepBinding(binding, record, documentUrl, principal);
     }
     // Another origin — or a session that no longer exists, which no document can
     // belong to: the binding ends. The announcement carries the new document for
@@ -1184,7 +1787,7 @@ export function createBindingRoutes(deps: BindingRoutesDeps): BindingRoutes {
     const dropped =
       record === undefined
         ? await dropBinding(binding, principal, REASON_UNBOUND, binding.url, false)
-        : await dropBinding(binding, principal, REASON_ORIGIN_CHANGED, url, true);
+        : await dropBinding(binding, principal, REASON_ORIGIN_CHANGED, documentUrl, true);
     if (isErr(dropped)) {
       return dropped;
     }

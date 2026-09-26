@@ -538,8 +538,8 @@ const KEY_RENDERED_FIBER_COUNT = 'renderedFiberCount';
  * One component instance in a {@link snapshotComponentTree} result.
  *
  * Deliberately four fields and a child list, and **never** props, state, a
- * DOM node or a fiber: the snapshot crosses `window.postMessage` as JSON
- * inside an event's attributes, so anything that could not be serialised — or
+ * DOM node or a fiber: the snapshot crosses the page channel as JSON inside
+ * an event's attributes, so anything that could not be serialised — or
  * should not be — has no place in it. `name` is the field
  * `../aggregate/renders.ts`'s tree parser accepts as a component's name
  * alongside its own `component` spelling, so a snapshot emitted from the page

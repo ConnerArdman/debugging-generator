@@ -31,13 +31,27 @@
  *   principal on the socket.
  * - **Non-delivery is an answer, not a failure.** With no editor connected the
  *   handler's outcome is `delivered: false` / `no-editor-client`; the service
- *   answers the sender with `TRANSPORT_DISCONNECTED` — the cue for the
- *   extension's `vscode://debuggen.debug-generator/open` fallback — and the
+ *   answers the sender with `source.result` `no-editor`, `ref` = the sender's
+ *   own frame id — the cue for the extension's
+ *   `vscode://debuggen.debug-generator/open` fallback — and no `error`, and the
  *   sender's connection stays open. Nothing is queued for an editor that
  *   connects later.
- * - **Privacy.** No error payload and no captured log record carries an
- *   absolute outside path, a symbolic link's target, file content or a
- *   credential.
+ * - **Delivery is not opening.** A forwarded location is answered to its sender
+ *   only once the editor has answered the forwarded frame: the editor's
+ *   `opened` or `failed` (with its code) reaches the sender as `source.result`
+ *   under the sender's own `ref`, and nothing is claimed before that. Only an
+ *   editor whose workspace covers the session may answer — an editor of another
+ *   project and a DevTools connection are refused — and an answer for a frame
+ *   the service never forwarded is accepted and relayed to nobody. A frame
+ *   whose id is too long for a `source.result` `ref` is refused before it is
+ *   forwarded, so no location is opened that its sender could not hear about.
+ * - **Privacy.** No error payload, no relayed result and no captured log record
+ *   carries an absolute outside path, a symbolic link's target, file content or
+ *   a credential. A refusal by the handler — whose sentence may name the
+ *   requested project-relative file — is answered as a `failed` `source.result`
+ *   to the sender alone, never as a session-less `error` frame; only refusals
+ *   made before the handler runs (payload validation, role, binding), whose
+ *   sentences quote nothing from the request, are `error` replies.
  *
  * Every path this suite plants lives inside the `fs.mkdtemp` containers of the
  * harness's project copies; the committed corpus under `test/fixtures/**` is
@@ -48,8 +62,9 @@
  * assertion proves is a statement about `source.open` alone.
  *
  * No error code and no message type is typed out as a string: codes are read
- * from `DEBUGGEN_ERROR_CODES`, and the one message type this suite sends is
- * read from the registry of the protocol module that owns it.
+ * from `DEBUGGEN_ERROR_CODES`, and the two message types this suite exchanges
+ * are read from the registry of the protocol module that owns them, by the
+ * payload schema each one maps to.
  */
 
 import { randomBytes } from 'node:crypto';
@@ -65,6 +80,9 @@ import {
   isMessageOfType,
   parseMessage,
   parseSourceOpenPayload,
+  parseSourceResultPayload,
+  sourceOpenPayloadSchema,
+  sourceResultPayloadSchema,
 } from '@debuggen/protocol';
 import type {
   ErrorPayload,
@@ -72,6 +90,7 @@ import type {
   ProtocolMessage,
   SessionRecord,
   SourceOpenPayload,
+  SourceResultPayload,
 } from '@debuggen/protocol';
 import {
   DEBUGGEN_ERROR_CODES,
@@ -90,10 +109,12 @@ import { SOURCE_OPEN_REJECTIONS } from '../../src/source/open.js';
 import type { SourceOpenRejection, SourceOpenUndelivered } from '../../src/source/open.js';
 import {
   DEFAULT_FIXTURE_PROJECT,
+  HARNESS_TIMEOUTS,
   assertTreeUnchanged,
   fixturePath,
   isUnauthorizedClose,
   startHarness,
+  waitFor,
 } from './harness.js';
 import type {
   CapturedLogRecord,
@@ -122,28 +143,50 @@ const REJECTION = Object.freeze(
   Object.fromEntries(SOURCE_OPEN_REJECTIONS.map((rejection) => [rejection, rejection])),
 ) as { readonly [R in SourceOpenRejection]: R };
 
+/** The source-navigation registry: wire name → payload schema. */
+type SourceRegistry = typeof SOURCE_MESSAGE_PAYLOADS;
+
+/** The registry key whose payload schema is `S` — a single literal for each distinct schema. */
+type SourceMessageTypeOf<S> = {
+  [K in keyof SourceRegistry]: SourceRegistry[K] extends S ? K : never;
+}[keyof SourceRegistry] &
+  MessageType;
+
 /**
- * The one protocol message type a single-message domain registry declares.
+ * The wire name under which `SOURCE_MESSAGE_PAYLOADS` — the registry
+ * `packages/protocol/src/messages/source.ts` contributes to the envelope union,
+ * the one place each wire name is written — registers `schema`.
  *
- * `SOURCE_MESSAGE_PAYLOADS` is the registry `packages/protocol/src/messages/source.ts`
- * contributes to the envelope union — the one place the wire name is written.
+ * Looked up by schema identity, so no wire name is restated here, and proved to
+ * be exactly one key that is also a member of `MESSAGE_TYPES`.
  */
-function soleMessageType<R extends object>(registry: R): keyof R & MessageType {
-  const declared = Object.keys(registry).filter((key): key is keyof R & MessageType =>
-    MESSAGE_TYPES.some((type) => type === key),
-  );
+function sourceMessageTypeOf<S extends SourceRegistry[keyof SourceRegistry]>(
+  schema: S,
+): SourceMessageTypeOf<S> {
+  const declared = Object.entries(SOURCE_MESSAGE_PAYLOADS)
+    .filter(([, candidate]) => candidate === schema)
+    .map(([key]) => key)
+    .filter((key): key is SourceMessageTypeOf<S> => MESSAGE_TYPES.some((type) => type === key));
   const [only, ...others] = declared;
   if (only === undefined || others.length > 0) {
-    throw new Error('A single-message registry must declare exactly one protocol message type.');
+    throw new Error('The source registry must declare the schema under exactly one message type.');
   }
   return only;
 }
 
-/** The message under test, read from its owning registry. */
-const SOURCE_OPEN = soleMessageType(SOURCE_MESSAGE_PAYLOADS);
+/** The request under test, read from its owning registry. */
+const SOURCE_OPEN = sourceMessageTypeOf(sourceOpenPayloadSchema);
+
+/** The answer to it, read from the same registry. */
+const SOURCE_RESULT = sourceMessageTypeOf(sourceResultPayloadSchema);
 
 /** A received `source.open` envelope. */
 type SourceOpenMessage = HarnessMessage<typeof SOURCE_OPEN>;
+
+/** What an editor may answer a forwarded location with: its payload without the correlation. */
+type EditorAnswer =
+  | { readonly status: 'opened' }
+  | Pick<Extract<SourceResultPayload, { readonly status: 'failed' }>, 'status' | 'error'>;
 
 /**
  * The handler's outcome when the location passed every check but no editor was
@@ -154,16 +197,6 @@ const NO_EDITOR_CLIENT: SourceOpenUndelivered['reason'] = 'no-editor-client';
 
 /** The `subsystem` binding every record of `src/source/open.ts` carries. */
 const SOURCE_SUBSYSTEM = 'source';
-
-/** The codes a containment or payload refusal is answered with; non-delivery is none of them. */
-const REFUSAL_CODES: readonly DebuggenErrorCode[] = Object.freeze([
-  CODE.PROTOCOL_INVALID_MESSAGE,
-  CODE.PATH_OUTSIDE_PROJECT,
-  CODE.FS_UNSAFE_PATH,
-  CODE.PROJECT_NOT_FOUND,
-  CODE.UNAUTHORIZED,
-  CODE.TAB_NOT_BOUND,
-]);
 
 /* -------------------------------------------------------------------------------------------------
  * The fixture layout
@@ -255,6 +288,9 @@ const watched: HarnessWsClient[] = [];
 
 /** Every `error` payload any request of this suite was answered with — the privacy sweep's input. */
 const errorReplies: ErrorPayload[] = [];
+
+/** Every `source.result` any sender of this suite received — also swept for privacy. */
+const resultReplies: SourceResultPayload[] = [];
 
 /** Every credential handed to a connection of this suite, by label — none may ever be echoed. */
 const credentials: { readonly label: string; readonly value: string }[] = [];
@@ -587,6 +623,12 @@ interface Observation {
   readonly frameId: string;
   /** The `error` replies the sender received for the frame. */
   readonly errors: readonly ErrorPayload[];
+  /**
+   * The `source.result` answers the sender had received for the frame by the
+   * time its frame was provably handled: the `no-editor` answer arrives within
+   * that window, an editor's answer only after the editor has spoken.
+   */
+  readonly results: readonly SourceResultPayload[];
   /** Every `source.open` any watched connection received while the request was handled. */
   readonly forwarded: readonly Forwarded[];
   /** The log records the service wrote while the request was handled. */
@@ -596,6 +638,26 @@ interface Observation {
 /** Whether a frame is a `source.open`. */
 function isSourceOpen(message: ProtocolMessage): message is SourceOpenMessage {
   return isMessageOfType(message, SOURCE_OPEN);
+}
+
+/** The `source.result` payloads a connection received whose `ref` names `frameId`. */
+function resultsFor(client: HarnessWsClient, frameId: string): SourceResultPayload[] {
+  return client.received.flatMap((message) =>
+    isMessageOfType(message, SOURCE_RESULT) && message.payload.ref === frameId
+      ? [message.payload]
+      : [],
+  );
+}
+
+/** Every `source.result` any watched connection received since its mark. */
+function resultsSince(
+  marks: readonly { readonly client: HarnessWsClient; readonly mark: number }[],
+): SourceResultPayload[] {
+  return marks.flatMap(({ client, mark }) =>
+    client.received
+      .slice(mark)
+      .flatMap((message) => (isMessageOfType(message, SOURCE_RESULT) ? [message.payload] : [])),
+  );
 }
 
 /** Inbox positions of every live watched connection, taken before a request. */
@@ -651,8 +713,61 @@ async function observe(sender: HarnessWsClient, write: () => string): Promise<Ob
 
   const forwarded = await collectForwarded(marks, sender);
   const errors = sender.errorsFor(frameId);
+  const results = resultsFor(sender, frameId);
   errorReplies.push(...errors);
-  return { frameId, errors, forwarded, records: target.logger.records.slice(logMark) };
+  resultReplies.push(...results);
+  return { frameId, errors, results, forwarded, records: target.logger.records.slice(logMark) };
+}
+
+/**
+ * Has `editor` answer the `source.open` it received with `answer`, under the
+ * forwarded frame's own id as `ref`, and proves the service handled the answer
+ * without refusing it.
+ *
+ * @returns The id of the answer frame.
+ */
+async function answerAsEditor(
+  editor: HarnessWsClient,
+  forwarded: SourceOpenMessage,
+  answer: EditorAnswer,
+): Promise<string> {
+  const receipt = editor.send(SOURCE_RESULT, {
+    ...answer,
+    sessionId: forwarded.payload.sessionId,
+    ref: forwarded.id,
+  });
+  if (isErr(receipt.result) || receipt.result.value !== 'sent') {
+    throw new Error(`The ${SOURCE_RESULT} frame was not written: ${editor.describe()}`);
+  }
+  expect(await editor.flush(), 'the editor closed before its answer was handled').toBe(true);
+  expect(editor.errorsFor(receipt.id), 'the service refused the editor answer').toEqual([]);
+  return receipt.id;
+}
+
+/**
+ * Waits for the one `source.result` the sender receives for its frame, and
+ * proves it is a well-formed answer naming the sender's own frame and session.
+ */
+async function relayedResult(
+  sender: HarnessWsClient,
+  frameId: string,
+  sessionId: string,
+): Promise<SourceResultPayload> {
+  const message = await waitFor(
+    sender,
+    SOURCE_RESULT,
+    (candidate) => candidate.payload.ref === frameId,
+    HARNESS_TIMEOUTS.message,
+  );
+  const payload = parseSourceResultPayload(message.payload);
+  if (isErr(payload)) {
+    throw new Error(`The relayed ${SOURCE_RESULT} does not validate: ${payload.error.message}`);
+  }
+  expect(payload.value.sessionId).toBe(sessionId);
+  expect(message.sessionId).toBe(sessionId);
+  expect(resultsFor(sender, frameId), 'a request is answered exactly once').toHaveLength(1);
+  resultReplies.push(payload.value);
+  return payload.value;
 }
 
 /** A writer sending `payload` through the protocol client's typed `send`. */
@@ -703,6 +818,7 @@ function recipientsOf(observation: Observation): string[] {
 function expectErrorReply(observation: Observation, code: DebuggenErrorCode): ErrorPayload {
   expect(observation.errors.map((reply) => reply.code)).toEqual([code]);
   expect(recipientsOf(observation), 'no connection may receive a refused location').toEqual([]);
+  expect(observation.results, 'a refused request is answered by its error alone').toEqual([]);
   const [reply] = observation.errors;
   if (reply === undefined) {
     throw new Error('An error reply was asserted and is missing.');
@@ -712,14 +828,44 @@ function expectErrorReply(observation: Observation, code: DebuggenErrorCode): Er
 }
 
 /**
- * Asserts the request was forwarded exactly once, to `recipient` only, and that
- * the sender received no `error` reply.
+ * Asserts the handler's refusal was answered with exactly one `failed`
+ * `source.result` carrying `code` and naming the frame — never with an `error`
+ * reply, which is session-less and so relayed by a Chrome service worker to
+ * every panel it serves, while the refusal's sentence may quote the requested
+ * file — and that nothing was forwarded to anyone.
+ */
+function expectRefusedResult(
+  observation: Observation,
+  code: DebuggenErrorCode,
+): Extract<SourceResultPayload, { status: 'failed' }>['error'] {
+  expect(
+    observation.errors,
+    'a handler refusal never travels as a session-less error frame',
+  ).toEqual([]);
+  expect(recipientsOf(observation), 'no connection may receive a refused location').toEqual([]);
+  const [result, ...extra] = observation.results;
+  expect(extra, 'a refused request is answered once').toEqual([]);
+  if (result?.status !== 'failed') {
+    throw new Error(
+      `A failed source.result was asserted; got ${result === undefined ? 'none' : result.status}.`,
+    );
+  }
+  expect(result.ref).toBe(observation.frameId);
+  expect(result.error.code).toBe(code);
+  return result.error;
+}
+
+/**
+ * Asserts the request was forwarded exactly once, to `recipient` only, that the
+ * sender received no `error` reply, and that nothing was claimed to the sender
+ * yet: delivery to an editor is not an answer until the editor gives one.
  */
 function expectForwardedOnlyTo(
   observation: Observation,
   recipient: HarnessWsClient,
 ): SourceOpenMessage {
   expect(observation.errors).toEqual([]);
+  expect(observation.results, 'nothing is answered before the editor answers').toEqual([]);
   expect(recipientsOf(observation)).toEqual([describeRecipient(recipient)]);
   const [only] = observation.forwarded;
   if (only === undefined) {
@@ -788,6 +934,7 @@ function expectHandlerNotReached(observation: Observation): void {
 function expectNoLeak(sandbox: Sandbox, observation: Observation): void {
   const haystacks = [
     ...observation.errors.map((reply) => JSON.stringify(reply)),
+    ...observation.results.map((result) => JSON.stringify(result)),
     ...observation.records.map((record) => record.line),
   ];
   expect(leaksIn(sandbox, haystacks)).toEqual([]);
@@ -884,6 +1031,14 @@ describe('forwarding a contained location to the editor', () => {
       expect(message.payload.location.confidence).toBe(location.confidence);
       expect(handlerRecords(observation).map((record) => record.fields['delivered'])).toEqual([1]);
       expectNoLeak(sandbox, observation);
+
+      // Only the editor's own answer is relayed, under the sender's ref, not the forward's.
+      await answerAsEditor(editorA, message, { status: 'opened' });
+      expect(await relayedResult(devtoolsA.client, observation.frameId, sessionA.id)).toEqual({
+        sessionId: sessionA.id,
+        ref: observation.frameId,
+        status: 'opened',
+      });
     },
   );
 
@@ -900,6 +1055,10 @@ describe('forwarding a contained location to the editor', () => {
     expectFaithfulForward(message, sessionA.id, location, observation.frameId);
     // The location is forwarded as sent: the link's own name, never its canonical target.
     expect(message.payload.location.file).toBe(ALIAS_LINK);
+
+    await answerAsEditor(editorA, message, { status: 'opened' });
+    const relayed = await relayedResult(devtoolsA.client, observation.frameId, sessionA.id);
+    expect(relayed.status).toBe('opened');
   });
 
   it('refuses a missing file distinctly from a containment refusal', async () => {
@@ -912,9 +1071,10 @@ describe('forwarding a contained location to the editor', () => {
         location: locationFor(MISSING_FILE, 2),
       }),
     );
-    const missingReply = expectErrorReply(missing, CODE.PROJECT_NOT_FOUND);
+    const missingReply = expectRefusedResult(missing, CODE.PROJECT_NOT_FOUND);
     expectHandlerRefusal(missing, REJECTION['file-missing'], 'not-found');
-    // The reply may name the project-relative file, never the absolute root.
+    // The answer — read only by the request that asked — may name the
+    // project-relative file, never the absolute root.
     expect(missingReply.message).toContain(MISSING_FILE);
     expect(missingReply.message).not.toContain(sandbox.root);
 
@@ -925,7 +1085,7 @@ describe('forwarding a contained location to the editor', () => {
         location: locationFor(DIRECTORY_ENTRY, 3),
       }),
     );
-    expectErrorReply(directory, CODE.PROJECT_NOT_FOUND);
+    expectRefusedResult(directory, CODE.PROJECT_NOT_FOUND);
     expectHandlerRefusal(directory, REJECTION['file-missing'], 'not-a-file');
 
     const escaping = await observe(
@@ -935,7 +1095,7 @@ describe('forwarding a contained location to the editor', () => {
         location: locationFor(ESCAPE_LINK, 4),
       }),
     );
-    const escapingReply = expectErrorReply(escaping, CODE.FS_UNSAFE_PATH);
+    const escapingReply = expectRefusedResult(escaping, CODE.FS_UNSAFE_PATH);
     expectHandlerRefusal(escaping, REJECTION['unsafe-path'], 'symlink-escapes-project-root');
 
     expect(missingReply.code).not.toBe(escapingReply.code);
@@ -943,6 +1103,117 @@ describe('forwarding a contained location to the editor', () => {
       expectNoLeak(sandbox, observation);
     }
     await expectTargetsUntouched(sandbox);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * The editor's answer, relayed to the sender
+ * ---------------------------------------------------------------------------------------------- */
+
+describe('the editor answer, correlated to the sender request', () => {
+  /** Forwards one contained location from tab A to editor A, and returns what was forwarded. */
+  async function forwardFromTabA(variant: number): Promise<{
+    readonly observation: Observation;
+    readonly forwarded: SourceOpenMessage;
+  }> {
+    const { devtoolsA, editorA, sessionA } = state();
+    const observation = await observe(
+      devtoolsA.client,
+      typedFrame(devtoolsA.client, {
+        sessionId: sessionA.id,
+        location: locationFor(SERVICE_FILE, variant),
+      }),
+    );
+    return { observation, forwarded: expectForwardedOnlyTo(observation, editorA) };
+  }
+
+  it('relays an editor failure to the sender with its code, under the sender ref', async () => {
+    const { devtoolsA, editorA, sessionA, sandbox } = state();
+    const { observation, forwarded } = await forwardFromTabA(5);
+    const failure: EditorAnswer = {
+      status: 'failed',
+      error: {
+        code: CODE.PROJECT_NOT_FOUND,
+        message: 'VS Code could not open the file at that location.',
+        hint: 'Reopen the project folder in VS Code, then click the link again.',
+      },
+    };
+
+    await answerAsEditor(editorA, forwarded, failure);
+
+    expect(await relayedResult(devtoolsA.client, observation.frameId, sessionA.id)).toEqual({
+      ...failure,
+      sessionId: sessionA.id,
+      ref: observation.frameId,
+    });
+    // A relayed failure is an answer, not a refusal of the sender's frame.
+    expect(devtoolsA.client.errorsFor(observation.frameId)).toEqual([]);
+    expectNoLeak(sandbox, observation);
+  });
+
+  it('lets no editor of another project settle it, and relays the rightful answer', async () => {
+    const { devtoolsA, editorA, editorB, sessionA } = state();
+    const { observation, forwarded } = await forwardFromTabA(6);
+    const marks = markInboxes();
+
+    // Editor B's workspace does not cover session A's project: its answer is refused.
+    const intruding = editorB.send(SOURCE_RESULT, {
+      sessionId: sessionA.id,
+      ref: forwarded.id,
+      status: 'opened',
+    });
+    expect(await editorB.flush()).toBe(true);
+    expect(editorB.errorsFor(intruding.id).map((reply) => reply.code)).toEqual([CODE.UNAUTHORIZED]);
+    errorReplies.push(...editorB.errorsFor(intruding.id));
+    expect(await devtoolsA.client.flush()).toBe(true);
+    expect(resultsFor(devtoolsA.client, observation.frameId)).toEqual([]);
+
+    // The editor the location was forwarded to still settles it.
+    await answerAsEditor(editorA, forwarded, { status: 'opened' });
+    expect((await relayedResult(devtoolsA.client, observation.frameId, sessionA.id)).status).toBe(
+      'opened',
+    );
+    expect(resultsSince(marks).map((result) => result.ref)).toEqual([observation.frameId]);
+  });
+
+  it('refuses a source.result sent by a DevTools connection', async () => {
+    const { devtoolsA, editorA, sessionA } = state();
+    const { observation, forwarded } = await forwardFromTabA(7);
+
+    const spoofed = devtoolsA.client.send(SOURCE_RESULT, {
+      sessionId: sessionA.id,
+      ref: forwarded.id,
+      status: 'opened',
+    });
+    expect(await devtoolsA.client.flush()).toBe(true);
+    expect(devtoolsA.client.errorsFor(spoofed.id).map((reply) => reply.code)).toEqual([
+      CODE.UNAUTHORIZED,
+    ]);
+    errorReplies.push(...devtoolsA.client.errorsFor(spoofed.id));
+    // The panel cannot answer its own request: nothing was settled by it.
+    expect(resultsFor(devtoolsA.client, observation.frameId)).toEqual([]);
+
+    await answerAsEditor(editorA, forwarded, { status: 'opened' });
+    expect((await relayedResult(devtoolsA.client, observation.frameId, sessionA.id)).status).toBe(
+      'opened',
+    );
+  });
+
+  it('accepts an answer to a frame it never forwarded, and relays it to nobody', async () => {
+    const { editorA, sessionA } = state();
+    const marks = markInboxes();
+
+    const stray = editorA.send(SOURCE_RESULT, {
+      sessionId: sessionA.id,
+      ref: newMessageId(),
+      status: 'opened',
+    });
+    expect(await editorA.flush()).toBe(true);
+
+    // A late or unknown answer is normal: no error for the editor, no result for anyone.
+    expect(editorA.errorsFor(stray.id)).toEqual([]);
+    await collectForwarded(marks, editorA);
+    expect(resultsSince(marks)).toEqual([]);
   });
 });
 
@@ -1083,7 +1354,7 @@ describe('containment against the stored project root', () => {
         expectErrorReply(observation, CODE.PROTOCOL_INVALID_MESSAGE);
         expectHandlerNotReached(observation);
       } else {
-        expectErrorReply(observation, CODE.FS_UNSAFE_PATH);
+        expectRefusedResult(observation, CODE.FS_UNSAFE_PATH);
         expectHandlerRefusal(observation, REJECTION['unsafe-path'], row.reason ?? '');
       }
       expectNoLeak(sandbox, observation);
@@ -1159,7 +1430,7 @@ describe('authorization and the stored project root', () => {
       devtoolsA.client,
       typedFrame(devtoolsA.client, { sessionId: sessionA.id, location }),
     );
-    expectErrorReply(againstA, CODE.PROJECT_NOT_FOUND);
+    expectRefusedResult(againstA, CODE.PROJECT_NOT_FOUND);
     expectHandlerRefusal(againstA, REJECTION['file-missing'], 'not-found');
 
     // Named for the second session, the very same location resolves in its root and
@@ -1170,6 +1441,9 @@ describe('authorization and the stored project root', () => {
     );
     const message = expectForwardedOnlyTo(againstB, editorB);
     expectFaithfulForward(message, sessionB.id, location, againstB.frameId);
+    // An editor that asked is answered like a panel: by its own frame's ref.
+    await answerAsEditor(editorB, message, { status: 'opened' });
+    expect((await relayedResult(editorB, againstB.frameId, sessionB.id)).status).toBe('opened');
 
     expectNoLeak(sandbox, againstA);
     expectNoLeak(sandbox, againstB);
@@ -1203,7 +1477,11 @@ describe('authorization and the stored project root', () => {
       typedFrame(editorB, { sessionId: sessionA.id, location: locationFor(SERVICE_FILE, 4) }),
     );
 
-    expectErrorReply(crossed, CODE.UNAUTHORIZED);
+    // The editor may not receive a frame about a session its workspace does not
+    // cover, so the handler's refusal cannot be a `source.result`: it falls back
+    // to an `error` reply whose sentence quotes nothing from the request.
+    const reply = expectErrorReply(crossed, CODE.UNAUTHORIZED);
+    expect(reply.message).not.toContain(SERVICE_FILE);
     expectHandlerRefusal(crossed, REJECTION['not-authorized'], 'project-out-of-scope');
     expectNoLeak(sandbox, crossed);
   });
@@ -1284,9 +1562,13 @@ describe(`with no editor connected (the ${NO_EDITOR_CLIENT} outcome)`, () => {
     );
 
     // The sender learns that nobody received the location — its cue for the
-    // vscode:// URI fallback — as a transport answer, never as a refusal.
-    const reply = expectErrorReply(observation, CODE.TRANSPORT_DISCONNECTED);
-    expect(REFUSAL_CODES).not.toContain(reply.code);
+    // vscode:// URI fallback — as a source.result answer naming its own frame,
+    // before its frame is provably handled, and never as an error.
+    expect(observation.errors).toEqual([]);
+    expect(observation.results).toEqual([
+      { sessionId: sessionA.id, ref: observation.frameId, status: 'no-editor' },
+    ]);
+    expect(recipientsOf(observation), 'nobody was there to receive it').toEqual([]);
 
     // The handler itself succeeded: every check passed and the forward reached
     // no editor (`delivered: false`), with no rejection recorded.
@@ -1318,6 +1600,56 @@ describe(`with no editor connected (the ${NO_EDITOR_CLIENT} outcome)`, () => {
     );
     const message = expectForwardedOnlyTo(observation, lateEditor);
     expectFaithfulForward(message, sessionA.id, location, observation.frameId);
+    await answerAsEditor(lateEditor, message, { status: 'opened' });
+    expect((await relayedResult(devtoolsA.client, observation.frameId, sessionA.id)).status).toBe(
+      'opened',
+    );
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * A request its answer could not name
+ * ---------------------------------------------------------------------------------------------- */
+
+describe('a source.open whose frame id no source.result can reference', () => {
+  it('is refused before anything is forwarded, so no location opens unanswered', async () => {
+    const { harness: target, projectA, devtoolsA, sessionA } = state();
+    // The live editor of the project (connected by the previous block), so a
+    // forward would have somewhere to go.
+    const editor = await target.editor(projectA.root);
+    watch(editor);
+    const marks = markInboxes();
+    const receivedBefore = devtoolsA.client.received.length;
+    const editorReceivedBefore = editor.received.length;
+
+    // A valid envelope id (the envelope allows up to 128 characters) that is
+    // longer than the 64 characters a `source.result` `ref` may carry.
+    const longId = `msg_${'x'.repeat(96)}`;
+    const location = locationFor(SERVICE_FILE, 5);
+    devtoolsA.client.sendRaw(
+      JSON.stringify({
+        id: longId,
+        type: SOURCE_OPEN,
+        sessionId: sessionA.id,
+        ts: Date.now(),
+        payload: { sessionId: sessionA.id, location },
+      }),
+    );
+    expect(await devtoolsA.client.flush()).toBe(true);
+
+    const answers = devtoolsA.client.received.slice(receivedBefore);
+    const refusals = answers.filter((message) => isMessageOfType(message, 'error'));
+    expect(refusals.map((message) => message.payload)).toEqual([
+      expect.objectContaining({ code: 'PROTOCOL_INVALID_MESSAGE' }),
+    ]);
+    expect(
+      answers.filter((message) => isMessageOfType(message, 'source.result')),
+      'nothing claims an outcome for a request that was never forwarded',
+    ).toEqual([]);
+    const forwarded = await collectForwarded(marks, devtoolsA.client);
+    expect(forwarded.map(({ recipient }) => describeRecipient(recipient))).toEqual([]);
+    expect(editor.received.slice(editorReceivedBefore).filter(isSourceOpen)).toEqual([]);
+    expect(devtoolsA.client.authenticated).toBe(true);
   });
 });
 
@@ -1329,9 +1661,11 @@ describe('privacy and the developer tree', () => {
   it('never echoes an outside path, a link target, file content or a credential', () => {
     const { harness: target, sandbox } = state();
     expect(errorReplies.length).toBeGreaterThan(CONTAINMENT_ROWS.length);
+    expect(resultReplies.length).toBeGreaterThan(SOURCE_RESOLVED_BY.length);
 
     const haystacks = [
       ...errorReplies.map((reply) => JSON.stringify(reply)),
+      ...resultReplies.map((result) => JSON.stringify(result)),
       ...target.logger.records.map((record) => record.line),
     ];
     expect(leaksIn(sandbox, haystacks)).toEqual([]);

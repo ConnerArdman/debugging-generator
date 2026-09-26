@@ -1,7 +1,8 @@
 /**
  * `debuggen.showModifications` — reveals the Debug Generator view's file
- * modifications section and re-reads the active session's modification journal
- * from the service (AAP §0.4.2, §0.5.1, §0.7.3).
+ * modifications section, records the first page of the active session's
+ * modification journal in the store and reports how many records the journal
+ * holds (AAP §0.4.2, §0.5.1, §0.7.3).
  *
  * ## Why the command exists
  *
@@ -23,26 +24,44 @@
  *    section is on screen while the answer is in flight.
  * 3. **One HTTP operation** — `modifications.list`
  *    (`GET /sessions/:id/modifications`) through `ServiceClient`, which owns
- *    the route, the credential and the response schema.
- * 4. **One notice** — the failure with the service's hint, that no file was
- *    patched, or how many records the journal holds.
+ *    the route, the credential and the response schema — sent to the session's
+ *    owning endpoint (`ExtensionState.activeSessionEndpoint`), which is where
+ *    the journal lives even after `debuggen.serviceUrl` has changed. It asks
+ *    for the service's default window: one page, which the service bounds to
+ *    `MODIFICATIONS_PAGE_DEFAULT_LIMIT` records and
+ *    `MODIFICATIONS_PAGE_DIFF_BUDGET` (6 MiB) of UTF-8 diff text, however large
+ *    the journal's diffs are.
+ * 4. **Into the store** — the page's records are projected through
+ *    `ExtensionState.applyModificationJournal`, so the section just revealed
+ *    lists them with their status, diff and backup path even while no
+ *    `session.updated` can reach this window (the socket is closed).
+ * 5. **One notice** — the failure with the service's hint, that no file was
+ *    patched, or how many records the journal holds: its `total`, never the
+ *    page's length.
+ *
+ * ## Why one page
+ *
+ * The records normally reach the view without this command: `ModificationsList`
+ * and `DiffView` render the journal from the whole records that reach the host
+ * through `session.updated` (`applySessionRecord`) and `instrumentation.ready`
+ * (`applyInstrumentationReady`). This read is the fallback for a window no
+ * broadcast reaches, and the journal's size is the page's `total`, so the
+ * command never walks further pages: one bounded page is all it transfers.
  *
  * ## What it deliberately does not do
  *
- * - **It does not write the store.** `src/state.ts` declares no mutator that
- *   accepts a modification list. The journal reaches the view through
- *   `session.updated` (`applySessionRecord`) and `instrumentation.ready`
- *   (`applyInstrumentationReady`), whose merge rules keep it append-only and in
- *   applied order. Re-shaping the HTTP answer into either payload would forge
- *   a broadcast — `instrumentation.ready` also replaces the runtime-hook list
- *   and clears an instrumentation failure — and a private copy here would give
- *   the view a second source of truth. The fetched journal is therefore
- *   reported, never stored.
+ * - **It keeps no copy and forges no frame.** The journal is written into the
+ *   store through the one mutator declared for exactly this answer, whose
+ *   merge rules keep it append-only, in applied order, and never let an answer
+ *   move a record's status back. It is not re-shaped into a `session.updated`
+ *   or `instrumentation.ready` payload — the latter also replaces the
+ *   runtime-hook list and clears an instrumentation failure — and nothing is
+ *   held here, so the view has a single source of truth.
  * - **It renders nothing.** File names, status badges, diffs and the preserved
  *   original's backup path are `ModificationsList`'s and `DiffView`'s to show.
  * - **It logs no content.** A diff carries the developer's own source and a
- *   record names their files and the backup directory, so the only log line is
- *   a count.
+ *   record names their files and the backup directory; the command reads
+ *   neither, and its only log line carries the journal's total.
  * - **It never presents a failure as an empty journal.** A failed request is
  *   reported as a failure, and the view keeps the list the last broadcast
  *   provided.
@@ -52,7 +71,6 @@
  * session, so no caller can point it at a session the developer is not viewing.
  */
 
-import type { ModificationRecord } from '@debuggen/protocol';
 import { isErr } from '@debuggen/shared';
 
 import type { FocusSection } from '../views/session-view-provider';
@@ -96,33 +114,39 @@ const NO_MODIFICATIONS_NOTICE: CommandNotice = Object.freeze({
     'Debug Generator patches a source file only to time a named function; every other signal comes from runtime hooks.',
 });
 
+/** Where a non-empty journal's records are shown, and what each row carries. */
+const JOURNAL_LISTED_DETAIL =
+  'Each one is listed under File modifications with its status and the exact diff that was applied.';
+
 // ---------------------------------------------------------------------------
 // Notice
 // ---------------------------------------------------------------------------
 
 /**
- * The one notice that reports a successfully fetched journal: that it is
- * empty, or how many records it holds. A follow-up can layer a second record
- * onto a file an earlier plan version already instrumented, so the count is of
- * modifications, not of distinct files. No file name, status or diff is read.
+ * The one notice that reports a successfully loaded journal page: that the
+ * journal is empty, or how many records it holds as the page's `total` reports
+ * it — the whole journal's length, never the number of records this one page
+ * carries. A follow-up can layer a second record onto a file an earlier plan
+ * version already instrumented, so the number is of modifications, not of
+ * distinct files.
  *
- * @param records The journal as `GET /sessions/:id/modifications` returned it.
+ * @example
+ * ```ts
+ * describeJournal(3).message; // '3 file modifications are recorded for this session.'
+ * ```
+ *
+ * @param total The journal's `total`, as the page reported it.
  * @returns The informational notice to show.
  */
-function describeJournal(records: readonly ModificationRecord[]): CommandNotice {
-  const count = records.length;
-  if (count === 0) {
+function describeJournal(total: number): CommandNotice {
+  if (total === 0) {
     return NO_MODIFICATIONS_NOTICE;
   }
-  return {
-    level: 'info',
-    message:
-      count === 1
-        ? '1 file modification is recorded for this session.'
-        : `${String(count)} file modifications are recorded for this session.`,
-    detail:
-      'Each one is listed under File modifications with its status and the exact diff that was applied.',
-  };
+  const message =
+    total === 1
+      ? '1 file modification is recorded for this session.'
+      : `${String(total)} file modifications are recorded for this session.`;
+  return { level: 'info', message, detail: JOURNAL_LISTED_DETAIL };
 }
 
 // ---------------------------------------------------------------------------
@@ -131,9 +155,10 @@ function describeJournal(records: readonly ModificationRecord[]): CommandNotice 
 
 /**
  * Runs `debuggen.showModifications`: reveals the modifications section, fetches
- * the active session's journal once and reports the outcome in exactly one
- * notice. Expected failures are rendered and the promise still resolves; only a
- * genuinely unexpected throw reaches the barrel's wrapper.
+ * the active session's journal once from its owning service, records it in the
+ * store and reports the outcome in exactly one notice. Expected failures are
+ * rendered and the promise still resolves; only a genuinely unexpected throw
+ * reaches the barrel's wrapper.
  *
  * @param ctx The command context `registerCommands` resolved.
  * @param args Whatever the invoker passed; ignored (see the module notes).
@@ -155,15 +180,24 @@ export async function showModifications(
   await ctx.ui.executeCommand(REVEAL_SESSION_VIEW);
   ctx.sessionView.postFocus(MODIFICATIONS_SECTION);
 
-  const records = await ctx.client.getModifications(active.sessionId);
-  if (isErr(records)) {
-    await ctx.ui.notifyFailure(records.error, { prefix: LOAD_FAILURE_PREFIX });
+  // The journal lives in the service that owns the session, which is not
+  // necessarily the one `debuggen.serviceUrl` names now.
+  const page = await ctx.client.getModifications(active.sessionId, undefined, {
+    endpoint: ctx.state.activeSessionEndpoint,
+  });
+  if (isErr(page)) {
+    await ctx.ui.notifyFailure(page.error, { prefix: LOAD_FAILURE_PREFIX });
     return;
   }
 
+  // Into the store, so the section the view just revealed lists it even when
+  // no `session.updated` can reach this window.
+  const projected = ctx.state.applyModificationJournal(active.sessionId, page.value.modifications);
   ctx.logger.debug('Modifications refreshed', {
     command: COMMAND_ID,
-    count: records.value.length,
+    count: page.value.total,
+    listed: page.value.modifications.length,
+    projected,
   });
-  await ctx.ui.notify(describeJournal(records.value));
+  await ctx.ui.notify(describeJournal(page.value.total));
 }

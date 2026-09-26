@@ -14,6 +14,14 @@
  * carries an absolute path, a symbolic-link target, file contents or a
  * credential.
  *
+ * The correlation of the editor's `source.result` with the forward it answers
+ * is driven on an injected fake clock: the first `opened` settles, every
+ * addressed editor failing settles the first failure, the deadline settles
+ * `failed`, a late or unknown answer is accepted and ignored, an answer from the
+ * wrong session, the wrong workspace or the wrong client kind is refused,
+ * `close()` settles what is pending, an editor answering inside the send itself
+ * finds its entry, and the pending table stays bounded.
+ *
  * The symbolic-link cases run twice: against a real temporary directory with
  * real `realpath` and `lstat`, and against an injected table-based resolver,
  * which is how the edge cases a real filesystem cannot stage on demand (a
@@ -55,6 +63,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
   CLIENT_KINDS,
+  SOURCE_OPEN_EDITOR_TIMEOUT_MS,
   createEnvelope,
   encodeMessage,
   isMessageOfType,
@@ -68,6 +77,7 @@ import type {
   ProtocolMessage,
   SessionRecord,
   SourceOpenPayload,
+  SourceResultPayload,
 } from '@debuggen/protocol';
 import {
   DEBUGGEN_ERROR_CODES,
@@ -86,6 +96,7 @@ import type {
 } from '@debuggen/shared';
 
 import {
+  DEFAULT_MAX_PENDING_EDITOR_RESULTS,
   SOURCE_OPEN_REJECTIONS,
   assertLocationWithinProject,
   createSourceOpenHandler,
@@ -94,10 +105,14 @@ import {
 } from './open.js';
 import type {
   SourceOpenBinding,
+  SourceOpenDelivered,
   SourceOpenDeps,
+  SourceOpenEditorResult,
+  SourceOpenHandler,
   SourceOpenOutcome,
   SourceOpenPrincipal,
   SourceOpenRealPath,
+  SourceOpenTimers,
 } from './open.js';
 
 /* -------------------------------------------------------------------------------------------------
@@ -285,6 +300,9 @@ interface HarnessOptions {
   readonly logger?: Logger;
   readonly sessionsGet?: SourceOpenDeps['sessions']['get'];
   readonly send?: SourceOpenDeps['clients']['sendToSessionClients'];
+  readonly timers?: SourceOpenTimers;
+  readonly editorResultTimeoutMs?: number;
+  readonly maxPendingEditorResults?: number;
 }
 
 /** The handler wired to recording fakes. */
@@ -292,6 +310,7 @@ interface Harness {
   readonly sent: SentMessage[];
   readonly entries: LogEntry[];
   readonly lookups: string[];
+  readonly handler: SourceOpenHandler;
   readonly handle: (
     input: unknown,
     principal: SourceOpenPrincipal,
@@ -338,9 +357,107 @@ function harness(options: HarnessOptions): Harness {
     now: () => FIXED_NOW,
     ...(options.realpath === undefined ? {} : { realpath: options.realpath }),
     ...(options.verifyExists === undefined ? {} : { verifyExists: options.verifyExists }),
+    ...(options.timers === undefined ? {} : { timers: options.timers }),
+    ...(options.editorResultTimeoutMs === undefined
+      ? {}
+      : { editorResultTimeoutMs: options.editorResultTimeoutMs }),
+    ...(options.maxPendingEditorResults === undefined
+      ? {}
+      : { maxPendingEditorResults: options.maxPendingEditorResults }),
   });
 
-  return { sent, entries, lookups, handle: (input, principal) => handler.handle(input, principal) };
+  return {
+    sent,
+    entries,
+    lookups,
+    handler,
+    handle: (input, principal) => handler.handle(input, principal),
+  };
+}
+
+/** A deterministic clock behind the {@link SourceOpenTimers} seam. */
+interface FakeClock extends SourceOpenTimers {
+  /** Moves the clock forward, running every callback that falls due, in order. */
+  advance(ms: number): void;
+  /** How many callbacks are scheduled and not yet run or cleared. */
+  readonly active: number;
+  /** How many handles had `unref()` called on them. */
+  readonly unrefs: number;
+}
+
+function fakeClock(): FakeClock {
+  let now = 0;
+  let unrefs = 0;
+  const scheduled = new Map<object, { readonly at: number; readonly callback: () => void }>();
+  return {
+    setTimeout(callback: () => void, delayMs: number): unknown {
+      const handle = {
+        unref: (): void => {
+          unrefs += 1;
+        },
+      };
+      scheduled.set(handle, { at: now + delayMs, callback });
+      return handle;
+    },
+    clearTimeout(handle: unknown): void {
+      if (typeof handle === 'object' && handle !== null) {
+        scheduled.delete(handle);
+      }
+    },
+    advance(ms: number): void {
+      now += ms;
+      const due = [...scheduled.entries()]
+        .filter(([, timer]) => timer.at <= now)
+        .sort(([, a], [, b]) => a.at - b.at);
+      for (const [handle, timer] of due) {
+        scheduled.delete(handle);
+        timer.callback();
+      }
+    },
+    get active(): number {
+      return scheduled.size;
+    },
+    get unrefs(): number {
+      return unrefs;
+    },
+  };
+}
+
+/** Records whether, and with what, a promise has settled. */
+function track<T>(promise: Promise<T>): {
+  readonly settled: boolean;
+  readonly value: T | undefined;
+} {
+  const state: { settled: boolean; value: T | undefined } = { settled: false, value: undefined };
+  void promise.then((value) => {
+    state.settled = true;
+    state.value = value;
+  });
+  return state;
+}
+
+/** Lets every queued promise callback run. */
+function flushPromises(): Promise<void> {
+  return new Promise((resolve) => {
+    setImmediate(resolve);
+  });
+}
+
+/** A delivered outcome, failing the test for anything else. */
+function deliveredOf(outcome: SourceOpenOutcome): SourceOpenDelivered {
+  if (!outcome.delivered) {
+    throw new Error('expected a delivered forward, received no-editor-client');
+  }
+  return outcome;
+}
+
+/** A delivered outcome without the per-request correlation fields, for equality checks. */
+function withoutCorrelation(outcome: SourceOpenOutcome): Record<string, unknown> {
+  if (!outcome.delivered) {
+    return { ...outcome };
+  }
+  const { delivered, clients, location, file } = outcome;
+  return { delivered, clients, location, file };
 }
 
 /** The refusal carried by a result, failing the test when there is none. */
@@ -450,6 +567,12 @@ const ALLOWED_LOG_FIELDS: ReadonlySet<string> = new Set([
   'column',
   'resolvedBy',
   'delivered',
+  'ref',
+  'status',
+  'settled',
+  'pending',
+  'option',
+  'fallback',
 ]);
 
 /* -------------------------------------------------------------------------------------------------
@@ -884,7 +1007,7 @@ describe('createSourceOpenHandler → SourceOpenHandler.handle', () => {
 
       const outcome = valueOf(await h.handle(input, editor));
 
-      expect(outcome).toEqual({
+      expect(withoutCorrelation(outcome)).toEqual({
         delivered: true,
         clients: 1,
         location: input.location,
@@ -897,6 +1020,10 @@ describe('createSourceOpenHandler → SourceOpenHandler.handle', () => {
       }
       expect(sent.sessionId).toBe(SESSION_ID);
       expect(sent.clientKind).toBe(EDITOR_KIND);
+      // The outcome names the forwarded frame an editor's answer will carry as `ref`.
+      const delivered = deliveredOf(outcome);
+      expect(delivered.forwardedId).toBe(sent.message.id);
+      expect(delivered.editorResult).toBeInstanceOf(Promise);
 
       // The frame is one the receiving editor's own parser accepts.
       const reparsed = valueOf(parseMessage(JSON.parse(JSON.stringify(sent.message))));
@@ -1005,7 +1132,12 @@ describe('createSourceOpenHandler → SourceOpenHandler.handle', () => {
 
         const outcome = valueOf(await h.handle({ sessionId: SESSION_ID, location }, editor));
 
-        expect(outcome).toEqual({ delivered: true, clients: 1, location, file: LEGIT_FILE });
+        expect(withoutCorrelation(outcome)).toEqual({
+          delivered: true,
+          clients: 1,
+          location,
+          file: LEGIT_FILE,
+        });
         const message = h.sent[0]?.message;
         expect(message?.type === 'source.open' && message.payload.location.file).toBe(
           'src/alias.ts',
@@ -1018,10 +1150,12 @@ describe('createSourceOpenHandler → SourceOpenHandler.handle', () => {
       const h = harness({ session: sessionRecordFor(project) });
       const input: SourceOpenPayload = { sessionId: SESSION_ID, location: locationOf(LEGIT_FILE) };
 
-      const first = await h.handle(input, editor);
-      const second = await h.handle(input, editor);
+      const first = valueOf(await h.handle(input, editor));
+      const second = valueOf(await h.handle(input, editor));
 
-      expect(second).toEqual(first);
+      // Equal but for the correlation of each forward, which is its own.
+      expect(withoutCorrelation(second)).toEqual(withoutCorrelation(first));
+      expect(deliveredOf(second).forwardedId).not.toBe(deliveredOf(first).forwardedId);
       expect(h.sent).toHaveLength(2);
 
       const refusing = harness({ session: sessionRecordFor(project) });
@@ -1227,7 +1361,9 @@ describe('createSourceOpenHandler → SourceOpenHandler.handle', () => {
 
       const unchecked = harness({ session, realpath: tableRealpath({}), verifyExists: false });
       expect(
-        valueOf(await unchecked.handle({ sessionId: SESSION_ID, location }, principal)),
+        withoutCorrelation(
+          valueOf(await unchecked.handle({ sessionId: SESSION_ID, location }, principal)),
+        ),
       ).toEqual({ delivered: true, clients: 1, location, file: 'src/a.ts' });
 
       const checked = harness({ session, realpath: tableRealpath({}) });
@@ -1733,6 +1869,574 @@ describe('createSourceOpenHandler → SourceOpenHandler.handle', () => {
       expect(h.entries.length).toBeGreaterThanOrEqual(3);
       expect(JSON.stringify(h.entries)).not.toContain(`../outside/${FOREIGN_NAME}`);
       expectPrivateLogs(h.entries);
+    });
+  });
+
+  describe('editor result correlation — acceptEditorResult, the deadline and close()', () => {
+    const location = locationOf(LEGIT_FILE);
+
+    /** An editor connection of the project, with a registry id for de-duplication. */
+    const editorConnection = (connectionId: string): SourceOpenPrincipal => ({
+      ...editor,
+      connectionId,
+    });
+
+    /** Forwards one request and returns the delivered outcome. */
+    const forward = async (h: Harness): Promise<SourceOpenDelivered> =>
+      deliveredOf(valueOf(await h.handle({ sessionId: SESSION_ID, location }, editor)));
+
+    /** An editor's `source.result` envelope for `ref`. */
+    const answerFrame = (
+      ref: string,
+      result: SourceOpenEditorResult,
+      sessionId: string = SESSION_ID,
+    ): ProtocolMessage => {
+      const payload: SourceResultPayload = { ...result, sessionId, ref };
+      return createEnvelope('source.result', payload);
+    };
+
+    const failedWith = (code: DebuggenErrorCode, message: string): SourceOpenEditorResult => ({
+      status: 'failed',
+      error: { code, message, hint: 'Reopen the file in VS Code.' },
+    });
+
+    it('settles opened on the first opened answer, and ignores every later answer', async () => {
+      const clock = fakeClock();
+      const h = harness({ session: sessionRecordFor(project), deliverTo: 2, timers: clock });
+      const { forwardedId, editorResult } = await forward(h);
+      const state = track(editorResult);
+
+      const first = valueOf(
+        await h.handler.acceptEditorResult(
+          answerFrame(forwardedId, failedWith(CODES.fileMissing, 'The file is gone.')),
+          editorConnection('conn-a'),
+        ),
+      );
+      await flushPromises();
+      expect(first).toEqual({ settled: false });
+      expect(state.settled).toBe(false);
+
+      const second = valueOf(
+        await h.handler.acceptEditorResult(
+          answerFrame(forwardedId, { status: 'opened' }),
+          editorConnection('conn-b'),
+        ),
+      );
+      expect(second).toEqual({ settled: true });
+      expect(await editorResult).toEqual({ status: 'opened' });
+      expect(clock.active).toBe(0);
+
+      // A late answer after settlement is normal: accepted, and it changes nothing.
+      const late = valueOf(
+        await h.handler.acceptEditorResult(
+          answerFrame(forwardedId, failedWith(CODES.internal, 'Late.')),
+          editorConnection('conn-a'),
+        ),
+      );
+      expect(late).toEqual({ settled: false });
+      expect(await editorResult).toEqual({ status: 'opened' });
+      expectPrivateLogs(h.entries);
+    });
+
+    it('settles with the first failure once every addressed editor failed, counting each connection once', async () => {
+      const clock = fakeClock();
+      const h = harness({ session: sessionRecordFor(project), deliverTo: 2, timers: clock });
+      const { forwardedId, editorResult } = await forward(h);
+      const state = track(editorResult);
+      const firstFailure = failedWith(CODES.fileMissing, 'The file is gone.');
+
+      expect(
+        valueOf(
+          await h.handler.acceptEditorResult(
+            answerFrame(forwardedId, firstFailure),
+            editorConnection('conn-a'),
+          ),
+        ),
+      ).toEqual({ settled: false });
+      // The same connection failing twice is one editor, not two.
+      expect(
+        valueOf(
+          await h.handler.acceptEditorResult(
+            answerFrame(forwardedId, failedWith(CODES.internal, 'Again.')),
+            editorConnection('conn-a'),
+          ),
+        ),
+      ).toEqual({ settled: false });
+      await flushPromises();
+      expect(state.settled).toBe(false);
+
+      expect(
+        valueOf(
+          await h.handler.acceptEditorResult(
+            answerFrame(forwardedId, failedWith(CODES.unsafePath, 'Refused.')),
+            editorConnection('conn-b'),
+          ),
+        ),
+      ).toEqual({ settled: true });
+      expect(await editorResult).toEqual(firstFailure);
+      expect(clock.active).toBe(0);
+    });
+
+    it('settles failed TRANSPORT_DISCONNECTED when no editor answers before the deadline', async () => {
+      const clock = fakeClock();
+      const h = harness({
+        session: sessionRecordFor(project),
+        timers: clock,
+        editorResultTimeoutMs: 500,
+      });
+      const { forwardedId, editorResult } = await forward(h);
+      const state = track(editorResult);
+      expect(clock.active).toBe(1);
+      expect(clock.unrefs).toBe(1);
+
+      clock.advance(499);
+      await flushPromises();
+      expect(state.settled).toBe(false);
+
+      clock.advance(1);
+      const result = await editorResult;
+      const responsiveHint: unknown = expect.stringContaining(
+        'VS Code window for the project is responsive',
+      );
+      expect(result).toEqual({
+        status: 'failed',
+        error: {
+          code: CODES.transport,
+          message: 'VS Code did not confirm that it opened the source location in time.',
+          hint: responsiveHint,
+        },
+      });
+      expect(clock.active).toBe(0);
+
+      // The editor answering after the deadline is not an error.
+      expect(
+        valueOf(
+          await h.handler.acceptEditorResult(
+            answerFrame(forwardedId, { status: 'opened' }),
+            editor,
+          ),
+        ),
+      ).toEqual({ settled: false });
+      expectPrivateLogs(h.entries);
+    });
+
+    it('waits SOURCE_OPEN_EDITOR_TIMEOUT_MS by default', async () => {
+      const clock = fakeClock();
+      const h = harness({ session: sessionRecordFor(project), timers: clock });
+      const { editorResult } = await forward(h);
+      const state = track(editorResult);
+
+      clock.advance(SOURCE_OPEN_EDITOR_TIMEOUT_MS - 1);
+      await flushPromises();
+      expect(state.settled).toBe(false);
+
+      clock.advance(1);
+      expect((await editorResult).status).toBe('failed');
+    });
+
+    it('runs on the global timers when none are injected', async () => {
+      const h = harness({ session: sessionRecordFor(project), editorResultTimeoutMs: 5 });
+      const { editorResult } = await forward(h);
+
+      const result = await editorResult;
+
+      expect(result.status === 'failed' && result.error.code).toBe(CODES.transport);
+    });
+
+    it('replaces an unusable option with its default, and says so', async () => {
+      for (const unusable of [0, -1, 1.5, Number.NaN, 2 ** 31]) {
+        const clock = fakeClock();
+        const h = harness({
+          session: sessionRecordFor(project),
+          timers: clock,
+          editorResultTimeoutMs: unusable,
+          maxPendingEditorResults: unusable,
+        });
+        expect(
+          h.entries
+            .filter((entry) => entry.level === 'warn')
+            .map((entry) => entry.fields['option']),
+        ).toEqual(
+          unusable === 2 ** 31
+            ? ['editorResultTimeoutMs']
+            : ['editorResultTimeoutMs', 'maxPendingEditorResults'],
+        );
+
+        const { editorResult } = await forward(h);
+        const state = track(editorResult);
+        clock.advance(SOURCE_OPEN_EDITOR_TIMEOUT_MS - 1);
+        await flushPromises();
+        expect(state.settled).toBe(false);
+        clock.advance(1);
+        expect((await editorResult).status).toBe('failed');
+        expectPrivateLogs(h.entries);
+      }
+    });
+
+    it('answers a ref that is not pending with ok({ settled: false }) and a debug record', async () => {
+      const h = harness({ session: sessionRecordFor(project), timers: fakeClock() });
+
+      const outcome = valueOf(
+        await h.handler.acceptEditorResult(
+          answerFrame('msg_never_forwarded', { status: 'opened' }),
+          editor,
+        ),
+      );
+
+      expect(outcome).toEqual({ settled: false });
+      const entry = h.entries.find((candidate) => candidate.message.startsWith('Ignored'));
+      expect(entry?.level).toBe('debug');
+      expect(entry?.fields).toMatchObject({ ref: 'msg_never_forwarded', status: 'opened' });
+      expectPrivateLogs(h.entries);
+    });
+
+    it('refuses an answer naming another session than the forward it answers', async () => {
+      const h = harness({ session: sessionRecordFor(project), timers: fakeClock() });
+      const { forwardedId, editorResult } = await forward(h);
+
+      const error = refusalOf(
+        await h.handler.acceptEditorResult(
+          answerFrame(forwardedId, { status: 'opened' }, 'ses_some_other_session'),
+          editor,
+        ),
+      );
+
+      expect(error.code).toBe(CODES.unauthorized);
+      expect(sourceOpenRejectionOf(error)).toBe('not-authorized');
+      expect(error.details?.['reason']).toBe('session-mismatch');
+      // The refused answer settled nothing: the rightful one still does.
+      expect(
+        valueOf(
+          await h.handler.acceptEditorResult(
+            answerFrame(forwardedId, { status: 'opened' }),
+            editor,
+          ),
+        ),
+      ).toEqual({ settled: true });
+      expect(await editorResult).toEqual({ status: 'opened' });
+    });
+
+    it('refuses an editor whose announced workspace does not cover the session project', async () => {
+      const h = harness({ session: sessionRecordFor(project), timers: fakeClock() });
+      const { forwardedId, editorResult } = await forward(h);
+      const state = track(editorResult);
+
+      for (const principal of [
+        { client: 'vscode', projectRoots: [outside] },
+        { client: 'vscode', projectRoots: [sibling] },
+        { client: 'vscode' },
+      ] satisfies SourceOpenPrincipal[]) {
+        const error = refusalOf(
+          await h.handler.acceptEditorResult(
+            answerFrame(forwardedId, { status: 'opened' }),
+            principal,
+          ),
+        );
+        expect(error.code).toBe(CODES.unauthorized);
+        expect(error.details?.['reason']).toBe('project-out-of-scope');
+        expectPrivate(error, forbidden());
+      }
+      await flushPromises();
+      expect(state.settled).toBe(false);
+      expectPrivateLogs(h.entries);
+    });
+
+    it('refuses an answer from anything but an editor connection', async () => {
+      const h = harness({ session: sessionRecordFor(project), timers: fakeClock() });
+      const { forwardedId, editorResult } = await forward(h);
+      const state = track(editorResult);
+
+      for (const principal of [
+        { client: 'devtools', tabId: 7, sessionId: SESSION_ID },
+        { client: 'agent' },
+        { client: 'server-agent', projectRoots: [project] },
+        hostile<SourceOpenPrincipal>(undefined),
+        hostile<SourceOpenPrincipal>({ client: 'root' }),
+      ] satisfies SourceOpenPrincipal[]) {
+        const error = refusalOf(
+          await h.handler.acceptEditorResult(
+            answerFrame(forwardedId, { status: 'opened' }),
+            principal,
+          ),
+        );
+        expect(error.code).toBe(CODES.unauthorized);
+        expect(sourceOpenRejectionOf(error)).toBe('not-authorized');
+        expect(error.details?.['reason']).toBe('role-not-permitted');
+      }
+      await flushPromises();
+      expect(state.settled).toBe(false);
+    });
+
+    it('refuses no-editor from an editor: that status is the service’s own answer', async () => {
+      const h = harness({ session: sessionRecordFor(project), timers: fakeClock() });
+      const { forwardedId, editorResult } = await forward(h);
+      const state = track(editorResult);
+
+      const error = refusalOf(
+        await h.handler.acceptEditorResult(
+          createEnvelope('source.result', {
+            sessionId: SESSION_ID,
+            ref: forwardedId,
+            status: 'no-editor',
+          }),
+          editor,
+        ),
+      );
+
+      expect(error.code).toBe(CODES.invalidMessage);
+      expect(sourceOpenRejectionOf(error)).toBe('invalid-payload');
+      expect(error.details?.['reason']).toBe('status-not-permitted');
+      await flushPromises();
+      expect(state.settled).toBe(false);
+    });
+
+    it('refuses a malformed answer without echoing any of it', async () => {
+      const h = harness({ session: sessionRecordFor(project), timers: fakeClock() });
+      const { forwardedId } = await forward(h);
+      const marker = 'ANSWER-MARKER-5d1e';
+
+      for (const input of [
+        'not json at all',
+        `{"id":"${marker}"`,
+        { sessionId: SESSION_ID, ref: forwardedId, status: 'opened', extra: marker },
+        { sessionId: SESSION_ID, ref: forwardedId, status: 'failed' },
+        { sessionId: SESSION_ID, ref: forwardedId, status: `${marker}-status` },
+        { sessionId: SESSION_ID, status: 'opened' },
+        createEnvelope('source.open', { sessionId: SESSION_ID, location }),
+        undefined,
+        42,
+      ]) {
+        const error = refusalOf(await h.handler.acceptEditorResult(input, editor));
+        expect(error.code).toBe(CODES.invalidMessage);
+        expect(sourceOpenRejectionOf(error)).toBe('invalid-payload');
+        expectPrivate(error, [marker]);
+      }
+      expect(JSON.stringify(h.entries)).not.toContain(marker);
+      expectPrivateLogs(h.entries);
+    });
+
+    it('accepts a parsed envelope, a raw frame and a bare payload', async () => {
+      const h = harness({ session: sessionRecordFor(project), timers: fakeClock() });
+      const forms: ((ref: string) => unknown)[] = [
+        (ref) => answerFrame(ref, { status: 'opened' }),
+        (ref) => encodeMessage(answerFrame(ref, { status: 'opened' })),
+        (ref) => ({ sessionId: SESSION_ID, ref, status: 'opened' }),
+      ];
+
+      for (const form of forms) {
+        const { forwardedId, editorResult } = await forward(h);
+        expect(valueOf(await h.handler.acceptEditorResult(form(forwardedId), editor))).toEqual({
+          settled: true,
+        });
+        expect(await editorResult).toEqual({ status: 'opened' });
+      }
+    });
+
+    it('logs an editor answer by status, code and ids only — never its message or hint', async () => {
+      const h = harness({ session: sessionRecordFor(project), timers: fakeClock() });
+      const { forwardedId, editorResult } = await forward(h);
+      const secret = `${outside}/${FOREIGN_NAME} ${OUTSIDE_CONTENT_MARKER}`;
+
+      valueOf(
+        await h.handler.acceptEditorResult(
+          answerFrame(forwardedId, {
+            status: 'failed',
+            error: { code: CODES.fileMissing, message: secret, hint: secret },
+          }),
+          editor,
+        ),
+      );
+
+      // The failure travels to the sender unchanged; it is only kept out of the log.
+      const result = await editorResult;
+      expect(result.status === 'failed' && result.error.message).toBe(secret);
+      const settledEntry = h.entries.find((entry) => entry.message.startsWith('Settled'));
+      expect(settledEntry?.fields).toMatchObject({
+        ref: forwardedId,
+        status: 'failed',
+        code: CODES.fileMissing,
+        settled: true,
+      });
+      const forwardedEntry = h.entries.find((entry) => entry.message.startsWith('Forwarded'));
+      expect(forwardedEntry?.fields['ref']).toBe(forwardedId);
+      expectPrivateLogs(h.entries);
+    });
+
+    it('close() settles every pending forward failed, clears its deadline, and settles later forwards at once', async () => {
+      const clock = fakeClock();
+      const h = harness({ session: sessionRecordFor(project), timers: clock });
+      const first = await forward(h);
+      const second = await forward(h);
+      expect(clock.active).toBe(2);
+
+      h.handler.close();
+
+      const anyHint: unknown = expect.any(String);
+      const shutdown = {
+        status: 'failed',
+        error: {
+          code: CODES.transport,
+          message: 'The Debug Generator service is shutting down.',
+          hint: anyHint,
+        },
+      };
+      expect(await first.editorResult).toEqual(shutdown);
+      expect(await second.editorResult).toEqual(shutdown);
+      expect(clock.active).toBe(0);
+      expect(() => {
+        h.handler.close();
+      }).not.toThrow();
+
+      // A forward after close is still sent, and answered failed at once.
+      const late = await forward(h);
+      expect(h.sent).toHaveLength(3);
+      expect(await late.editorResult).toEqual(shutdown);
+      expect(clock.active).toBe(0);
+      // Nothing is pending any more, so an answer settles nothing.
+      expect(
+        valueOf(
+          await h.handler.acceptEditorResult(
+            answerFrame(first.forwardedId, { status: 'opened' }),
+            editor,
+          ),
+        ),
+      ).toEqual({ settled: false });
+    });
+
+    it('registers the pending entry before sending, so an editor answering inside the send settles it', async () => {
+      for (const reply of [
+        { status: 'opened' },
+        failedWith(CODES.fileMissing, 'The file is gone.'),
+      ] satisfies SourceOpenEditorResult[]) {
+        const clock = fakeClock();
+        const answers: Result<unknown, DebuggenError>[] = [];
+        // The send is built before the handler exists, so it reaches it through a holder.
+        const wired: { handler?: SourceOpenHandler } = {};
+        const h = harness({
+          session: sessionRecordFor(project),
+          timers: clock,
+          // The editor answers synchronously, from inside the registry's send.
+          send: (_sessionId, _kind, message) => {
+            void wired.handler
+              ?.acceptEditorResult(answerFrame(message.id, reply), editor)
+              .then((answer) => answers.push(answer));
+            return 1;
+          },
+        });
+        wired.handler = h.handler;
+
+        const { editorResult } = await forward(h);
+
+        expect(await editorResult).toEqual(reply);
+        await flushPromises();
+        // An opened answer settles on arrival; a failure once the send reports one editor.
+        expect(answers.map((answer) => valueOf(answer))).toEqual([
+          { settled: reply.status === 'opened' },
+        ]);
+        expect(clock.active).toBe(0);
+      }
+    });
+
+    it('drops the pending entry of a forward that reached nobody or could not be sent', async () => {
+      const clock = fakeClock();
+      const offered: ProtocolMessage[] = [];
+      const senders: SourceOpenDeps['clients']['sendToSessionClients'][] = [
+        (_sessionId, _kind, message) => {
+          offered.push(message);
+          return 0;
+        },
+        (_sessionId, _kind, message) => {
+          offered.push(message);
+          throw new Error('socket closed');
+        },
+        (_sessionId, _kind, message) => {
+          offered.push(message);
+          return -1;
+        },
+      ];
+
+      for (const send of senders) {
+        const h = harness({ session: sessionRecordFor(project), timers: clock, send });
+        await h.handle({ sessionId: SESSION_ID, location }, editor);
+        const message = offered.at(-1);
+        if (message === undefined) {
+          throw new Error('expected the frame to have been offered');
+        }
+        expect(clock.active).toBe(0);
+        expect(
+          valueOf(
+            await h.handler.acceptEditorResult(
+              answerFrame(message.id, { status: 'opened' }),
+              editor,
+            ),
+          ),
+        ).toEqual({ settled: false });
+      }
+    });
+
+    it('bounds the pending table: past the bound the oldest forward settles failed', async () => {
+      expect(DEFAULT_MAX_PENDING_EDITOR_RESULTS).toBe(256);
+      const clock = fakeClock();
+      const h = harness({
+        session: sessionRecordFor(project),
+        timers: clock,
+        maxPendingEditorResults: 2,
+      });
+
+      const oldest = await forward(h);
+      const middle = await forward(h);
+      const newest = await forward(h);
+
+      const evicted = await oldest.editorResult;
+      expect(evicted.status === 'failed' && evicted.error.code).toBe('RATE_LIMITED');
+      expect(clock.active).toBe(2);
+      const warning = h.entries.find((entry) => entry.message.startsWith('Gave up'));
+      expect(warning?.level).toBe('warn');
+      expect(warning?.fields['ref']).toBe(oldest.forwardedId);
+
+      // The two newer forwards are still pending and still answerable.
+      for (const pendingForward of [middle, newest]) {
+        expect(
+          valueOf(
+            await h.handler.acceptEditorResult(
+              answerFrame(pendingForward.forwardedId, { status: 'opened' }),
+              editor,
+            ),
+          ),
+        ).toEqual({ settled: true });
+        expect(await pendingForward.editorResult).toEqual({ status: 'opened' });
+      }
+      expect(clock.active).toBe(0);
+      expectPrivateLogs(h.entries);
+    });
+
+    it('never throws from acceptEditorResult, whatever it is handed', async () => {
+      const throwing = hostile<SourceOpenTimers>({
+        setTimeout: () => {
+          throw new Error('no timers here');
+        },
+        clearTimeout: () => {
+          throw new Error('no timers here');
+        },
+      });
+      const h = harness({ session: sessionRecordFor(project), timers: throwing });
+
+      // A deadline that cannot be armed settles the forward rather than stranding it.
+      const { editorResult } = await forward(h);
+      const result = await editorResult;
+      expect(result.status === 'failed' && result.error.code).toBe(CODES.internal);
+
+      for (const principal of [
+        hostile<SourceOpenPrincipal>(null),
+        hostile<SourceOpenPrincipal>({ client: 'vscode', projectRoots: 'not-an-array' }),
+        hostile<SourceOpenPrincipal>({ client: 'vscode', connectionId: 42 }),
+      ]) {
+        const answered = await h.handler.acceptEditorResult(
+          { sessionId: SESSION_ID, ref: 'msg_x', status: 'opened' },
+          principal,
+        );
+        expect(typeof answered.ok).toBe('boolean');
+      }
     });
   });
 

@@ -32,7 +32,9 @@
  *    preload degrades the capture, it does not fail it.
  * 3. Opens the capture window through `SessionManager.startCapture`, whose
  *    one-capture-per-project conflict is returned unchanged so the route can
- *    answer `409 { owningSessionId }`.
+ *    answer `409 { owningSessionId }`, and begins the telemetry store's
+ *    producer-loss accounting for it — only a window this process began
+ *    accounting for can later report its loss total as the whole loss.
  * 4. Arms both producers through `InstrumentationService.armCapture`, which
  *    sends `agent.config` and `server-agent.config` carrying the configuration
  *    the installer derived with the upstream `deriveAgentHookConfig` /
@@ -46,20 +48,39 @@
  * 1. Resolves the capture window and disarms both producers through
  *    `InstrumentationService.disarmCapture` (the dormant page configuration and
  *    the capture-less preload configuration: disabled, not idled).
- * 2. Produces the {@link CaptureSummary}: the stored one when the capture row
+ * 2. **The stop barrier.** The window stays open — ingest keeps attributing to
+ *    it — while the capture's ingest watermark is polled until it stands still
+ *    for a quiet period, bounded by {@link CAPTURE_DRAIN_DEFAULTS}: the batches
+ *    the producers flush on disarm, and any already in flight, then belong to
+ *    the capture that recorded them rather than arriving after it closed.
+ * 3. Produces the {@link CaptureSummary}: the stored one when the capture row
  *    already holds it, otherwise `computeCaptureSummary` from
  *    `@debuggen/telemetry` over the capture's persisted, already-redacted
- *    events. No metric, aggregate, correlation or redaction is computed here.
- * 3. **The empty-capture rule of AAP §0.5.5**, as the pure
+ *    events — read page by page, yielding between pages, and bounded by
+ *    {@link MAX_SUMMARY_EVENTS} and {@link MAX_SUMMARY_BYTES}, whichever comes
+ *    first, so the one synchronous aggregate over them stays short and the
+ *    events it holds stay small. No metric, aggregate, correlation or redaction
+ *    is computed here. A computed summary carries its `coverage`: stored versus
+ *    summarised events, the events the producers reported discarding, and how
+ *    the barrier ended — `'unverified'` rather than `'quiescent'` when a
+ *    producer that sent the capture events could not be confirmed disarmed, so
+ *    its final flush may still be missing.
+ * 4. **The empty-capture rule of AAP §0.5.5**, as the pure
  *    {@link classifyCaptureEmptiness}: zero events, or zero browser interactions
- *    for a question whose validated understanding needs interactions. An empty
- *    capture is a legitimate outcome, not a crash.
- * 4. Closes the window through `SessionManager.stopCapture` with
+ *    for a question whose validated, classified understanding needs
+ *    interactions — whether or not the interaction hook was armed. A capped summary is judged by the
+ *    store's exact per-kind counts. An empty capture is a legitimate outcome,
+ *    not a crash.
+ * 5. Closes the window through `SessionManager.stopCapture` with
  *    `next: "ready"` for an empty capture and `next: "analyzing"` otherwise —
  *    the decision the manager's contract assigns to this stage. The manager
  *    persists the summary, broadcasts `capture.stopped` and applies the
  *    transition; this stage writes no status of its own and never runs,
- *    skips or fabricates an analysis.
+ *    skips or fabricates an analysis. Once the window is closed, the loss
+ *    ledger's entry for it is released.
+ * 6. Tells both user interfaces, as `finding` rows of counts only, when the
+ *    evidence is incomplete and when an interaction question's capture is
+ *    empty because its interaction hook was off.
  *
  * ## Boundaries
  *
@@ -77,12 +98,16 @@
  *   and no captured value is echoed into an error.
  * - **Progress is advisory.** The `capture` group's header and closing row go
  *   through `../../sessions/progress.ts`'s stage methods; a row that cannot be
- *   sent is logged and never fails the stage. The only sentence this module
- *   defines is AAP §0.5.5's empty-capture sentence ({@link CAPTURE_EMPTY_MESSAGE}).
+ *   sent is logged and never fails the stage. The sentences this module
+ *   defines are AAP §0.5.5's empty-capture sentence ({@link CAPTURE_EMPTY_MESSAGE}),
+ *   the hook-off explanation ({@link INTERACTION_HOOK_OFF_MESSAGE}) and the
+ *   incomplete-evidence row, which states counts only.
  * - Every expected failure is a `Result` `Err`; neither method rejects.
  *
  * @module
  */
+
+import { setImmediate as yieldToEventLoop } from 'node:timers/promises';
 
 import {
   DISABLED_SERVER_AGENT_SIGNALS,
@@ -110,8 +135,15 @@ import type {
 } from '@debuggen/protocol';
 import { DebuggenError, err, ok } from '@debuggen/shared';
 import type { DebuggenErrorCode, LogFields, Logger, Result } from '@debuggen/shared';
-import { computeCaptureSummary } from '@debuggen/telemetry';
-import type { CaptureSummary, TelemetryEvent } from '@debuggen/telemetry';
+import { TELEMETRY_KINDS, allowedTiersFor, computeCaptureSummary } from '@debuggen/telemetry';
+import type {
+  CaptureCoverage,
+  CaptureDrainOutcome,
+  CaptureSummary,
+  TelemetryEvent,
+  TelemetryKind,
+  TelemetryTier,
+} from '@debuggen/telemetry';
 
 import { buildDegradationNotice } from '../../instrumentation/service.js';
 import type {
@@ -121,18 +153,24 @@ import type {
   ServerAgentDelivery,
 } from '../../instrumentation/service.js';
 import type {
+  ReadinessRemediation,
   ReadinessRemediationKind,
   ReadinessVerdict,
 } from '../../instrumentation/readiness.js';
 import { LOG_BINDING_KEYS, sessionLogger, subsystemLogger } from '../../logging.js';
 import type { CaptureStopNext, SessionManager } from '../../sessions/manager.js';
-import { CAPTURE_SIGNAL_LABELS, INSTRUMENTATION_ROW_ORDER } from '../../sessions/progress.js';
-import type { SessionProgress } from '../../sessions/progress.js';
+import {
+  CAPTURE_SIGNAL_LABELS,
+  FAILURE_COPY_BY_CODE,
+  INSTRUMENTATION_ROW_ORDER,
+  authorProductText,
+  isProductAuthoredText,
+} from '../../sessions/progress.js';
+import type { PublicFailureCopy, SessionProgress } from '../../sessions/progress.js';
 import { STAGE_STATUS, transition } from '../../sessions/state-machine.js';
 import type { SessionFailure } from '../../sessions/state-machine.js';
 import type { SessionsRepo } from '../../store/sessions-repo.js';
-import { TELEMETRY_QUERY_MAX_LIMIT } from '../../store/telemetry-repo.js';
-import type { TelemetryRepo } from '../../store/telemetry-repo.js';
+import type { CaptureIngestWatermark, TelemetryRepo } from '../../store/telemetry-repo.js';
 import type { PipelineStageContext } from '../context-builder.js';
 
 /* -------------------------------------------------------------------------------------------------
@@ -171,15 +209,30 @@ export const CAPTURE_EMPTY_MESSAGE =
   'No telemetry was captured. Interact with the page while capture is running, then Capture again.';
 
 /**
+ * The `session.progress` finding row that precedes {@link CAPTURE_EMPTY_MESSAGE}
+ * when an interaction question's capture is empty because the page agent's
+ * interaction hook was off (AAP §0.5.5): the developer learns why no
+ * interaction could be recorded instead of only being asked to interact again.
+ * No name, route or question text — the hook and the signal are product
+ * vocabulary.
+ */
+export const INTERACTION_HOOK_OFF_MESSAGE =
+  'The browser interaction hook was off for this capture, so the interaction this question needs could not be recorded.';
+
+/**
  * Why a capture counts as empty — the two conditions AAP §0.5.5 names, as a
  * closed vocabulary:
  *
  * - `'no-events'` — the capture window recorded no event at all, on any tier.
- * - `'no-interaction'` — events arrived, but the validated understanding needs
- *   the interaction signal and the page recorded no user interaction while the
- *   interaction hook was armed. Without an interaction there is no trace root
- *   to hang the browser and server evidence off, so an analysis would answer a
- *   question nobody reproduced.
+ * - `'no-interaction'` — events arrived, but the validated understanding
+ *   classifies the problem and needs the interaction signal
+ *   ({@link understandingNeedsInteraction}), and the capture recorded no user
+ *   interaction.
+ *   Without an interaction there is no trace root to hang the browser and
+ *   server evidence off, so an analysis would answer a question nobody
+ *   reproduced. This holds whether or not the page's interaction hook was
+ *   armed: with the hook off, unrelated server or performance events are still
+ *   no reproduction of the interaction the question is about.
  */
 export const CAPTURE_EMPTINESS_REASONS = Object.freeze(['no-events', 'no-interaction'] as const);
 
@@ -194,6 +247,14 @@ export type CaptureEmptinessReason = (typeof CAPTURE_EMPTINESS_REASONS)[number];
  */
 const INTERACTION_SIGNAL = 'interactions' as const satisfies CaptureSignal;
 
+/**
+ * The category an understanding answers with when it could not classify the
+ * problem: the most general member of the closed category vocabulary
+ * (`PROBLEM_CATEGORIES`), typed against it so a rename upstream is a compile
+ * error.
+ */
+const UNCLASSIFIED_CATEGORY = 'other' as const satisfies ProblemUnderstanding['category'];
+
 /** The session status the capture stage runs under, from the state machine's own table. */
 const CAPTURING_STATUS = STAGE_STATUS[CAPTURE_STAGE];
 
@@ -202,6 +263,68 @@ const NEXT_WITH_EVIDENCE: CaptureStopNext = STAGE_STATUS.analyze;
 
 /** Where an empty capture sends its session: back to `ready`, so "Capture again" re-arms the same plan. */
 const NEXT_WHEN_EMPTY: CaptureStopNext = 'ready';
+
+/**
+ * The most stored events one capture summary is computed from: **10 000**
+ * (AAP §0.5.5).
+ *
+ * `computeCaptureSummary` needs every event it summarises in memory at once
+ * and runs synchronously over all of them, so a noisy capture read in full
+ * could exhaust the service's heap and hold the one event loop — ingest, both
+ * user interfaces' requests — for as long as the aggregate took. The stage
+ * therefore reads the capture page by page in canonical order, yields to the
+ * event loop between pages, and stops at whichever ceiling comes first, this
+ * one or {@link MAX_SUMMARY_BYTES}: the summary then covers the capture's
+ * earliest events, the emptiness rule reads the store's exact per-kind counts
+ * instead of the summary's, and the summary's coverage reports how many stored
+ * events it left out — `summary.truncated` keeps its own meaning, the top-N
+ * clipping of its sections.
+ *
+ * The value is measured, not chosen: `computeCaptureSummary` costs about
+ * 12 ms per 1 000 events on the development host (Node 24.21.0), almost
+ * independently of attribute size. Over events of a realistic cross-tier mix
+ * (about 520 stored characters each) 10 000 events took 116–136 ms, where the
+ * previous ceiling of 50 000 took 570–640 ms — more than half a second of a
+ * frozen service at every stop of a noisy capture.
+ */
+export const MAX_SUMMARY_EVENTS = 10_000;
+
+/**
+ * The most stored event data one capture summary is computed from: **16 MiB**
+ * of stored JSON, counted in characters of the events' stored documents
+ * (AAP §0.5.5).
+ *
+ * The event ceiling alone does not bound memory: attributes are open JSON and
+ * one dev-server ingest request may carry 32 MiB, so 10 000 rich events could
+ * still hold hundreds of megabytes. The events a summary holds occupy about
+ * their stored size in heap (measured at 1.05×), so this ceiling is what bounds
+ * the read's memory. Measured on the development host:
+ *
+ * | Events offered | Stored each | Summarised | Held heap | Heap after the aggregate | `computeCaptureSummary` |
+ * | --- | --- | --- | --- | --- | --- |
+ * | 12 000, realistic mix | ~0.5 KB | 10 000 (event ceiling) | ~7 MiB | ~35 MiB | 116–172 ms |
+ * | 50 000, 2 KB attributes | ~2.6 KB | 6 750 (this ceiling) | 18 MiB | ~80 MiB | 81–97 ms |
+ * | 12 000, 10 KB attributes | ~10.8 KB | 1 750 (this ceiling) | 19 MiB | ~37 MiB | 23–48 ms |
+ *
+ * Under the previous, count-only ceiling the second row held 132 MiB and took
+ * 552–628 ms, and the third held 126 MiB.
+ */
+export const MAX_SUMMARY_BYTES = 16 * 1024 * 1024;
+
+/**
+ * How many rows one page of the summary walk reads: **250**.
+ *
+ * Both ceilings are checked between pages, so a walk overshoots the one that
+ * stops it by at most one page. At 250 rows that is 2.5 % of
+ * {@link MAX_SUMMARY_EVENTS}, and about 2.6 MiB — 16 % of
+ * {@link MAX_SUMMARY_BYTES} — for events with 10 KB of attributes; the one row
+ * a page cannot bound is a single stored event larger than that, which only
+ * the ingest request ceiling limits. A page is also one synchronous slice of
+ * the store read and the event validation between two yields: measured at
+ * 1.4–9 ms for 250 rows on the development host, against 19–52 ms for a
+ * page at the store's 5 000-row ceiling.
+ */
+export const SUMMARY_PAGE_SIZE = 250;
 
 /** The `subsystem` binding of this stage's log records, shared by every pipeline module. */
 const PIPELINE_SUBSYSTEM = 'pipeline';
@@ -241,7 +364,8 @@ const BLOCKED_GATE_FALLBACK_CODE: DebuggenErrorCode = 'INSTRUMENTATION_UNAVAILAB
  * The message of a blocked gate whose verdict lists no blocking entry to quote —
  * the verdict's "no planned signal is deliverable" case with nothing more
  * specific attached. Every other blocked gate is described by the readiness
- * module's own reasons.
+ * module's own proven reasons, and by fixed code copy where an entry's reason
+ * is not product-authored (see `blockedGateError`).
  */
 const NOTHING_DELIVERABLE_MESSAGE = 'None of the planned signals can be collected yet.';
 
@@ -261,10 +385,18 @@ export interface CaptureEvidenceCounts {
   readonly interactionCount: number;
   /**
    * Whether this capture had to record an interaction to be worth analysing:
-   * the understanding needs the interaction signal **and** the interaction hook
-   * was armed (or its arming is unknown).
+   * the understanding needs the interaction signal. Independent of what was
+   * armed (AAP §0.5.5).
    */
   readonly interactionRequired: boolean;
+  /**
+   * Whether the page agent's interaction hook was armed for the capture —
+   * present only when the arming is known. A diagnostic that never changes the
+   * classification: it lets a caller explain an interaction question's empty
+   * capture by saying the hook was off, rather than only asking the developer
+   * to interact again.
+   */
+  readonly interactionHookArmed?: boolean;
 }
 
 /** A capture that holds evidence worth analysing. */
@@ -293,11 +425,16 @@ export type CaptureEmptiness = CaptureWithEvidence | EmptyCapture;
 /** Optional facts {@link classifyCaptureEmptiness} can take into account. */
 export interface ClassifyCaptureEmptinessOptions {
   /**
-   * The page-agent hooks the capture was armed with. When supplied and its
-   * `interactions` hook was off — a plan that armed nothing in the page — the
-   * interaction condition does not apply: asking the developer to "interact,
-   * then Capture again" could never produce an interaction that nothing was
-   * listening for. Absent, the hook is assumed armed.
+   * The page-agent hooks the capture was armed with, when they are known.
+   * Supplied, the classification reports whether the `interactions` hook was on
+   * ({@link CaptureEvidenceCounts.interactionHookArmed}); absent, that
+   * diagnostic is left out.
+   *
+   * The hooks never exempt a capture from the interaction condition. An
+   * interaction question whose capture recorded no interaction is empty
+   * whether the hook was off or on — events from other signals are not a
+   * reproduction of the interaction — so the session returns to `ready`
+   * instead of an analysis answering a question nobody reproduced (AAP §0.5.5).
    */
   readonly agentHooks?: AgentHookConfig | undefined;
 }
@@ -327,8 +464,8 @@ function isList<T>(value: readonly T[] | undefined): value is readonly T[] {
 
 /**
  * Whether a validated understanding says the question can only be answered
- * from a user interaction: its closed `signalsNeeded` vocabulary names the
- * interaction signal.
+ * from a user interaction: it classifies the problem, and its closed
+ * `signalsNeeded` vocabulary names the interaction signal.
  *
  * The decision is read from `signalsNeeded` rather than from the `category`
  * alone because a category does not settle it: a `'rendering'` question about
@@ -337,14 +474,24 @@ function isList<T>(value: readonly T[] | undefined): value is readonly T[] {
  * records as the interaction signal. The question text is never consulted
  * (AAP §0.5.4).
  *
+ * An unclassified understanding (`'other'`) never makes an interaction
+ * question. Its signals are not the ones a class of problem is settled by; they
+ * are what the context's shape makes worth capturing — the rules-based provider
+ * adds the interaction signal for any selected element and for any project
+ * with event handlers. Demanding an interaction then would call empty every
+ * capture of a problem that shows without input, such as a page that
+ * re-renders or re-requests while the developer does nothing (AAP §0.5.5 asks
+ * for an interaction only for an interaction question).
+ *
  * @param understanding The session's validated Stage 1 understanding, when it
  * has one.
- * @returns `true` when the interaction signal is among the signals needed.
+ * @returns `true` when the problem is classified and the interaction signal is
+ * among the signals needed.
  */
 export function understandingNeedsInteraction(
   understanding: ProblemUnderstanding | undefined,
 ): boolean {
-  if (understanding === undefined) {
+  if (understanding === undefined || understanding.category === UNCLASSIFIED_CATEGORY) {
     return false;
   }
   return listOf<CaptureSignal>(understanding.signalsNeeded).includes(INTERACTION_SIGNAL);
@@ -360,11 +507,18 @@ export function understandingNeedsInteraction(
  * (`telemetryKindsForSignal`), read from the summary's zero-filled per-kind
  * counts, so no kind name is restated here. A malformed count reads as zero.
  *
+ * The interaction condition depends on the question alone. What was armed is
+ * reported (`interactionHookArmed`) but never exempts a capture: an interaction
+ * question's capture with no interaction is empty even when the plan left the
+ * interaction hook off.
+ *
  * This function **reports**; it does not act. The caller decides what an empty
  * capture means for the session — this stage passes `next: "ready"` to the
  * session manager, and the orchestrator skips analysis.
  *
- * @param summary The capture's summary.
+ * @param summary The capture's event count and zero-filled per-kind counts: a
+ * `CaptureSummary`, or the store's exact counts when the summary was capped at
+ * {@link MAX_SUMMARY_EVENTS} or {@link MAX_SUMMARY_BYTES}.
  * @param understanding The session's validated understanding, when it has one;
  * absent, only the zero-events condition applies.
  * @param options Optional arming facts; see
@@ -380,7 +534,7 @@ export function understandingNeedsInteraction(
  * ```
  */
 export function classifyCaptureEmptiness(
-  summary: CaptureSummary,
+  summary: Pick<CaptureSummary, 'eventCount' | 'kindCounts'>,
   understanding: ProblemUnderstanding | undefined,
   options?: ClassifyCaptureEmptinessOptions,
 ): CaptureEmptiness {
@@ -389,9 +543,14 @@ export function classifyCaptureEmptiness(
   for (const kind of telemetryKindsForSignal(INTERACTION_SIGNAL)) {
     interactionCount += countOf(summary.kindCounts[kind]);
   }
-  const hookArmed = options?.agentHooks === undefined || options.agentHooks.interactions;
-  const interactionRequired = hookArmed && understandingNeedsInteraction(understanding);
-  const counts: CaptureEvidenceCounts = { eventCount, interactionCount, interactionRequired };
+  const interactionRequired = understandingNeedsInteraction(understanding);
+  const hooks = options?.agentHooks;
+  const counts: CaptureEvidenceCounts = {
+    eventCount,
+    interactionCount,
+    interactionRequired,
+    ...(hooks !== undefined ? { interactionHookArmed: hooks.interactions === true } : {}),
+  };
 
   if (eventCount === 0) {
     return Object.freeze({
@@ -410,6 +569,385 @@ export function classifyCaptureEmptiness(
     });
   }
   return Object.freeze({ ...counts, empty: false });
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * The stop barrier (AAP §0.5.5) — timing
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * The stop barrier's default timing, in milliseconds (AAP §0.5.5).
+ *
+ * When a capture stops, both producers are disarmed and each flushes what it
+ * still holds: the page agent's transport drains its queue on the dormant
+ * configuration (its own flush timer runs every 250 ms), and the dev-server
+ * preload flushes its span processor before tearing its instrumentation down
+ * (its exporter sends a partial batch at the latest 1 000 ms after its first
+ * span and gives one ingest request 5 000 ms). Those batches are still on
+ * their way when the stop request arrives, so the stage keeps the capture
+ * window open — ingest keeps attributing to it — and polls the window's ingest
+ * watermark until it stands still:
+ *
+ * - `pollIntervalMs` — **100**: how often the watermark is read (an in-memory
+ *   lookup of the arrivals ingest committed, never a statement, so a poll costs
+ *   the same however much the capture holds).
+ * - `quietPeriodMs` — **600**: how long the watermark must stand still when
+ *   both producers were told to disarm — more than two page-agent flush
+ *   intervals, and the flush-on-disarm batches go out immediately.
+ * - `unreachableQuietPeriodMs` — **1 500**: the quiet period when a producer
+ *   could not be told to disarm (the preload unreachable, the dormant page
+ *   configuration unsent, or the disarm itself failed). Such a producer keeps
+ *   flushing on its own timer, so the barrier outlasts one whole preload flush
+ *   interval with margin.
+ * - `maxDrainMs` — **5 000**: the hard ceiling, the preload's own ingest
+ *   request timeout. A watermark still moving then ends the barrier as
+ *   `'deadline'`, and the summary's coverage says the window may be missing
+ *   its last events.
+ */
+export const CAPTURE_DRAIN_DEFAULTS = Object.freeze({
+  pollIntervalMs: 100,
+  quietPeriodMs: 600,
+  unreachableQuietPeriodMs: 1_500,
+  maxDrainMs: 5_000,
+} as const);
+
+/**
+ * The stop barrier's sleeper, monotonic clock and durations (AAP §0.5.5). Every
+ * member is injectable through {@link CaptureStageDeps.drain} so a suite can
+ * drive each barrier outcome without real time passing.
+ *
+ * The clock is deliberately **not** the stage's `now`: that is the service's
+ * wall clock, stamped on records (and an integration harness advances it per
+ * read rather than with time), while the barrier measures elapsed real time
+ * and needs a source that never jumps.
+ */
+export interface CaptureDrainTiming {
+  /**
+   * Resolves after `ms` milliseconds, or as soon as `signal` aborts. A rejection
+   * is tolerated and treated as an early wake-up. Defaults to a timer that
+   * resolves on abort.
+   */
+  readonly sleep: (ms: number, signal: AbortSignal | undefined) => Promise<void>;
+  /** A monotonic millisecond clock. Defaults to `performance.now()`. */
+  readonly monotonicNow: () => number;
+  /** How often the watermark is read; see {@link CAPTURE_DRAIN_DEFAULTS}. Positive. */
+  readonly pollIntervalMs: number;
+  /** How long the watermark must stand still when every producer was told to disarm. */
+  readonly quietPeriodMs: number;
+  /** How long it must stand still when a producer could not be told. */
+  readonly unreachableQuietPeriodMs: number;
+  /** The hard ceiling of the whole barrier. */
+  readonly maxDrainMs: number;
+}
+
+/**
+ * Which ceiling ended a summary walk before the capture's end:
+ * {@link MAX_SUMMARY_EVENTS} (`'events'`) or {@link MAX_SUMMARY_BYTES}
+ * (`'bytes'`).
+ */
+type SummaryCeiling = 'events' | 'bytes';
+
+/** What a bounded read of one capture's stored events produced: the summary and its counts. */
+interface SummarizedCapture {
+  /** The upstream summary over the events read. */
+  readonly summary: CaptureSummary;
+  /**
+   * How many stored rows the walk read, readable or not: every row the capture
+   * holds when the walk reached its end, a lower bound when a ceiling stopped it.
+   */
+  readonly rowsRead: number;
+  /** How many events the summary was computed from. */
+  readonly summarizedEvents: number;
+  /** How many rows read no longer validate and were left out. */
+  readonly skipped: number;
+  /** The stored size of the rows read, in characters of their JSON documents. */
+  readonly storedChars: number;
+  /**
+   * The ceiling that stopped the walk on a full page, when one did — the
+   * capture may then hold more rows than were read — or `undefined` when the
+   * walk reached the capture's end.
+   */
+  readonly ceiling: SummaryCeiling | undefined;
+}
+
+/**
+ * The counts a computed summary is judged and reported by — the capture's
+ * size, its per-kind counts and producers, and whether the summary covers only
+ * part of it — reconciled with the store's exact counts when a ceiling stopped
+ * the walk.
+ */
+interface CaptureEvidence {
+  /** The per-kind counts the emptiness rule reads. */
+  readonly counts: Pick<CaptureSummary, 'eventCount' | 'kindCounts'>;
+  /**
+   * How many events the store holds for the capture — exact, except when a
+   * capped capture's exact counts could not be read, where it is the rows read.
+   */
+  readonly storedEvents: number;
+  /** Which producers delivered events to the capture. */
+  readonly contributing: ContributingProducers;
+  /**
+   * The ceiling that left stored events out of the summary, or `undefined`
+   * when it covers every row — including a walk stopped at a ceiling exactly
+   * where the capture ended.
+   */
+  readonly ceiling: SummaryCeiling | undefined;
+}
+
+/** What one run of the stop barrier observed: counts and a vocabulary member only. */
+interface CaptureDrainReport {
+  /** How the barrier ended; becomes the summary's `coverage.drain`. */
+  readonly outcome: CaptureDrainOutcome;
+  /** How many times the watermark was read. */
+  readonly polls: number;
+  /** How many of those reads saw the watermark move. */
+  readonly changes: number;
+  /** How long the barrier ran on the monotonic clock, `0` when it could not be read. */
+  readonly waitedMs: number;
+  /** The quiet period the barrier waited for. */
+  readonly quietPeriodMs: number;
+  /** The last watermark read, when any read succeeded. */
+  readonly watermark?: CaptureIngestWatermark;
+}
+
+/**
+ * The default sleeper: a timer that resolves after `ms`, or at once when the
+ * signal aborts. It never rejects, so the barrier's only way out of a wait is
+ * the next watermark read or the abort check that follows it.
+ */
+function sleepUnlessAborted(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  return new Promise<void>((resolve) => {
+    if (signal?.aborted === true) {
+      resolve();
+      return;
+    }
+    const wake = (): void => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', wake);
+      resolve();
+    };
+    const timer = setTimeout(wake, ms);
+    signal?.addEventListener('abort', wake, { once: true });
+  });
+}
+
+/** An injected duration when it is a finite number within bounds, otherwise the default. */
+function durationOr(value: number | undefined, fallback: number, minimum: number): number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= minimum ? value : fallback;
+}
+
+/**
+ * The barrier timing a stage runs with: each injected member that is usable,
+ * the default for the rest. A poll interval must be positive (a zero interval
+ * would spin); the other durations may be zero.
+ */
+function resolveDrainTiming(injected: Partial<CaptureDrainTiming> | undefined): CaptureDrainTiming {
+  return Object.freeze({
+    sleep: injected?.sleep ?? sleepUnlessAborted,
+    monotonicNow: injected?.monotonicNow ?? ((): number => performance.now()),
+    pollIntervalMs: durationOr(injected?.pollIntervalMs, CAPTURE_DRAIN_DEFAULTS.pollIntervalMs, 1),
+    quietPeriodMs: durationOr(injected?.quietPeriodMs, CAPTURE_DRAIN_DEFAULTS.quietPeriodMs, 0),
+    unreachableQuietPeriodMs: durationOr(
+      injected?.unreachableQuietPeriodMs,
+      CAPTURE_DRAIN_DEFAULTS.unreachableQuietPeriodMs,
+      0,
+    ),
+    maxDrainMs: durationOr(injected?.maxDrainMs, CAPTURE_DRAIN_DEFAULTS.maxDrainMs, 0),
+  });
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * Coverage (AAP §0.5.5) — pure
+ * ---------------------------------------------------------------------------------------------- */
+
+/** What {@link coverageNotice} is told beyond the coverage itself. */
+interface CoverageFacts {
+  /** The coverage attached to the summary. */
+  readonly coverage: CaptureCoverage;
+  /**
+   * The ceiling that left stored events out of the summary, when one did —
+   * which is what tells a capped summary from one missing unreadable rows.
+   */
+  readonly ceiling: SummaryCeiling | undefined;
+  /**
+   * Whether the producer-loss total is the whole loss: it could be read, and
+   * the ledger has tracked the capture since its window opened in this
+   * process. Otherwise `coverage.producerDroppedEvents` is a lower bound.
+   */
+  readonly lossAccounted: boolean;
+}
+
+/** A count as display text, digits grouped the same way on every host. */
+function formatCount(count: number): string {
+  return count.toLocaleString('en-US');
+}
+
+/** Bytes per mebibyte, for display. */
+const BYTES_PER_MIB = 1024 * 1024;
+
+/** The ceiling that stopped a summary, as the words the finding row names it by. */
+function ceilingText(ceiling: SummaryCeiling): string {
+  return ceiling === 'events'
+    ? `${formatCount(MAX_SUMMARY_EVENTS)} events`
+    : `${formatCount(Math.round(MAX_SUMMARY_BYTES / BYTES_PER_MIB))} MiB of stored event data`;
+}
+
+/**
+ * The `session.progress` finding row that tells both user interfaces a
+ * capture's evidence is incomplete, in counts only: the summary was capped or
+ * left unreadable rows out, a producer discarded events before delivery, or
+ * the stop barrier could not confirm that every in-flight event arrived.
+ *
+ * @returns The row's message, or `undefined` for a complete coverage.
+ */
+function coverageNotice(facts: CoverageFacts): string | undefined {
+  const { coverage, ceiling } = facts;
+  if (coverage.complete) {
+    return undefined;
+  }
+  const sentences: string[] = [];
+  const missing = coverage.storedEvents - coverage.summarizedEvents;
+  if (ceiling !== undefined) {
+    sentences.push(
+      missing > 0
+        ? `The summary covers the first ${formatCount(coverage.summarizedEvents)} of ${formatCount(coverage.storedEvents)} captured events; one summary covers at most ${ceilingText(ceiling)}.`
+        : `The summary covers the first ${formatCount(coverage.summarizedEvents)} captured events; the capture may hold more, and one summary covers at most ${ceilingText(ceiling)}.`,
+    );
+  } else if (missing > 0) {
+    sentences.push(
+      `The summary covers ${formatCount(coverage.summarizedEvents)} of ${formatCount(coverage.storedEvents)} captured events; ${formatCount(missing)} stored ${missing === 1 ? 'event' : 'events'} could not be read back.`,
+    );
+  }
+  const dropped = coverage.producerDroppedEvents;
+  if (dropped > 0) {
+    sentences.push(
+      `${facts.lossAccounted ? '' : 'At least '}${formatCount(dropped)} ${dropped === 1 ? 'event was' : 'events were'} discarded by a producer before delivery.`,
+    );
+  } else if (!facts.lossAccounted) {
+    sentences.push('Whether any producer discarded events before delivery could not be confirmed.');
+  }
+  if (coverage.drain === 'deadline') {
+    sentences.push(
+      'Events were still arriving when the capture stopped, so its last events may be missing.',
+    );
+  } else if (coverage.drain === 'unverified') {
+    sentences.push(
+      'Whether every event in flight when the capture stopped arrived could not be confirmed.',
+    );
+  }
+  return `Capture evidence is incomplete. ${sentences.join(' ')}`;
+}
+
+/**
+ * Whether a disarm left a producer that may still be sending on its own timer:
+ * the disarm could not be sent at all, the dormant page configuration was not
+ * sent, or the preload could not be reached.
+ */
+function producerMayStillSend(disarmed: DisarmCaptureOutcome | undefined): boolean {
+  return (
+    disarmed === undefined || !disarmed.agentDisarmed || disarmed.serverAgent === 'unreachable'
+  );
+}
+
+/** The tier the page agent reports every event in (AAP §0.2.3). */
+const PAGE_AGENT_TIERS: readonly TelemetryTier[] = Object.freeze(['browser'] as const);
+
+/** The tiers the dev-server preload reports its events in: request handling and database spans (AAP §0.2.3). */
+const SERVER_AGENT_TIERS: readonly TelemetryTier[] = Object.freeze(['server', 'db'] as const);
+
+/**
+ * Which of the two producers delivered events to a capture, as far as the
+ * capture's counts show: the page agent through browser-tier events, the
+ * dev-server preload through server- and db-tier events.
+ */
+interface ContributingProducers {
+  /** Whether the capture holds, or may hold, events of {@link PAGE_AGENT_TIERS}. */
+  readonly pageAgent: boolean;
+  /** Whether the capture holds, or may hold, events of {@link SERVER_AGENT_TIERS}. */
+  readonly serverAgent: boolean;
+}
+
+/** The two producers, as the vocabulary a log record names an unconfirmed one by. */
+type ProducerName = 'page-agent' | 'server-agent';
+
+/** The summed count of the tiers named, from a zero-filled per-tier table. */
+function tierTotal(
+  tierCounts: Readonly<Record<TelemetryTier, number>>,
+  tiers: readonly TelemetryTier[],
+): number {
+  let total = 0;
+  for (const tier of tiers) {
+    total += countOf(tierCounts[tier]);
+  }
+  return total;
+}
+
+/**
+ * The producers a fully summarised capture holds events of, read off the
+ * summary's exact per-tier counts.
+ */
+function contributorsFromTiers(
+  tierCounts: Readonly<Record<TelemetryTier, number>>,
+): ContributingProducers {
+  return {
+    pageAgent: tierTotal(tierCounts, PAGE_AGENT_TIERS) > 0,
+    serverAgent: tierTotal(tierCounts, SERVER_AGENT_TIERS) > 0,
+  };
+}
+
+/**
+ * The producers a capped capture may hold events of, read off the store's
+ * exact per-kind counts of the whole window. A kind the telemetry schema allows
+ * in several tiers (`function`, `log`) counts towards every producer that may
+ * have sent it: an over-approximation can only report a flush as unconfirmed,
+ * never confirm one, and a capped capture is already reported incomplete.
+ */
+function contributorsFromKinds(
+  kindCounts: Readonly<Record<TelemetryKind, number>>,
+): ContributingProducers {
+  let pageAgent = false;
+  let serverAgent = false;
+  for (const kind of TELEMETRY_KINDS) {
+    if (countOf(kindCounts[kind]) === 0) {
+      continue;
+    }
+    const tiers = allowedTiersFor(kind);
+    pageAgent ||= tiers.some((tier) => PAGE_AGENT_TIERS.includes(tier));
+    serverAgent ||= tiers.some((tier) => SERVER_AGENT_TIERS.includes(tier));
+  }
+  return { pageAgent, serverAgent };
+}
+
+/**
+ * The producers that delivered events to this capture but whose final flush
+ * the stop cannot confirm (AAP §0.5.5), in a fixed order:
+ *
+ * - the **page agent** when the capture holds browser-tier events and the
+ *   dormant page configuration was not sent (`agentDisarmed: false`), or the
+ *   disarm could not be sent at all;
+ * - the **dev-server preload** when the capture holds server- or db-tier
+ *   events and the preload could not be reached (`serverAgent:
+ *   'unreachable'`), or the disarm could not be sent at all.
+ *
+ * A producer that sent the capture nothing is never listed: an unreachable
+ * preload of a page-only capture has no flush this capture could be missing,
+ * and listing it would mark ordinary captures incomplete.
+ */
+function unconfirmedContributors(
+  disarmed: DisarmCaptureOutcome | undefined,
+  contributing: ContributingProducers,
+): readonly ProducerName[] {
+  const unconfirmed: ProducerName[] = [];
+  if (contributing.pageAgent && (disarmed === undefined || !disarmed.agentDisarmed)) {
+    unconfirmed.push('page-agent');
+  }
+  if (
+    contributing.serverAgent &&
+    (disarmed === undefined || disarmed.serverAgent === 'unreachable')
+  ) {
+    unconfirmed.push('server-agent');
+  }
+  return unconfirmed;
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -492,12 +1030,34 @@ export interface CaptureStageDeps {
   readonly instrumentation: CaptureInstrumentationPort;
   /** The capture rows: which window is open and what a stopped one recorded. */
   readonly sessions: Pick<SessionsRepo, 'getCapture' | 'getActiveCapture'>;
-  /** The capture's persisted, already-redacted events, read only to summarise them. */
-  readonly telemetry: Pick<TelemetryRepo, 'listByCapture'>;
+  /**
+   * The capture's persisted, already-redacted events, read only: paged —
+   * with each page's stored size — to summarise them, counted per kind when the
+   * summary is capped, and watched through the ingest watermark by the stop
+   * barrier. Beside the events, the in-process producer-loss ledger: begun when
+   * the window opens, read for the total the summary's coverage reports, and
+   * released once the window is closed.
+   */
+  readonly telemetry: Pick<
+    TelemetryRepo,
+    | 'pageCaptureForSummary'
+    | 'countByKind'
+    | 'captureWatermark'
+    | 'beginProducerLossAccounting'
+    | 'producerLoss'
+    | 'releaseProducerLoss'
+  >;
   /** The only writer of session status: reads the record, opens and closes capture windows. */
   readonly sessionManager: Pick<SessionManager, 'get' | 'startCapture' | 'stopCapture'>;
-  /** The `session.progress` emitter (`../../sessions/progress.ts`). */
-  readonly progress: Pick<SessionProgress, 'stageStarted' | 'stageCompleted' | 'stageFailed'>;
+  /**
+   * The `session.progress` emitter (`../../sessions/progress.ts`): the group
+   * rows, and the `finding` rows that say a capture's evidence is incomplete or
+   * that its interaction hook was off.
+   */
+  readonly progress: Pick<
+    SessionProgress,
+    'stageStarted' | 'stageCompleted' | 'stageFailed' | 'finding'
+  >;
   /**
    * The adapter registry, asked only whether the adapter a stored action names
    * is still registered, so that the arming state recomputed after a restart
@@ -512,6 +1072,12 @@ export interface CaptureStageDeps {
   readonly logger?: Logger | undefined;
   /** The clock durations are measured with. Absent, the stage context's clock is used. */
   readonly now?: (() => number) | undefined;
+  /**
+   * The stop barrier's sleeper, monotonic clock and durations, member by
+   * member; absent members take {@link CAPTURE_DRAIN_DEFAULTS}, real timers and
+   * `performance.now()`. Never derived from {@link now}.
+   */
+  readonly drain?: Partial<CaptureDrainTiming> | undefined;
   /**
    * Whether this stage emits its own group rows — the `running` header when a
    * capture is armed, the closing `done` row when it completes (carrying
@@ -618,7 +1184,11 @@ export interface CaptureCompleteResult {
   readonly captureId: string;
   /** The plan version installed while it ran. */
   readonly planVersion: number;
-  /** The capture's summary — the payload of `capture.stopped`. */
+  /**
+   * The capture's summary — the payload of `capture.stopped`. A summary
+   * computed by this call carries its `coverage`; a stored one carries what it
+   * was stored with.
+   */
   readonly summary: CaptureSummary;
   /** Whether it was read back from the capture row or computed from the stored events now. */
   readonly summarySource: CaptureSummarySource;
@@ -660,7 +1230,8 @@ export interface CaptureStage {
   ): Promise<Result<CaptureArmResult, DebuggenError>>;
 
   /**
-   * Disarms both producers, summarises the capture, classifies it and closes
+   * Disarms both producers, waits — bounded — for the batches they flush to
+   * land, summarises the capture with its coverage, classifies it and closes
    * the window — to `analyzing` with evidence, to `ready` when empty.
    *
    * @param context The stage context of the capturing session.
@@ -833,19 +1404,50 @@ function enabledLabelsFor(signals: readonly CaptureSignal[]): readonly string[] 
   return INSTRUMENTATION_ROW_ORDER.filter((label) => labels.has(label));
 }
 
+/** The gate's sentences, and whether any blocking entry's reason could not be proven. */
+interface BlockedSentences {
+  /** One "Could not enable ‹signal›: ‹reason›." per proven entry, collapsed. */
+  readonly sentences: readonly string[];
+  /** Whether an entry was left out because its reason is not product-authored. */
+  readonly unproven: boolean;
+}
+
+/**
+ * Whether a blocking entry's wording may be quoted in the refusal: its reason
+ * is text the product registered (`isProductAuthoredText` — readiness's gate
+ * wording, detection's preload-gap reason, readiness's fixed sentence for a
+ * failed probe), and its label is either product vocabulary
+ * (`CAPTURE_SIGNAL_LABELS`) or quoted inside that proven reason, as a failed
+ * probe's adapter id is. An adapter's own reason — which may quote a path, a
+ * statement or a URL (CWE-209) — is never proven.
+ */
+function isProvenEntry(entry: UnavailableSignal, label: string): boolean {
+  return (
+    isProductAuthoredText(entry.reason) &&
+    (isCaptureSignal(entry.signal) || entry.reason.includes(label))
+  );
+}
+
 /**
  * The first clause of AAP §0.5.5's sentence for each signal the gate withheld —
- * "Could not enable ‹signal›: ‹reason›." — with the readiness module's reason
- * verbatim (its reasons are worded to read after that colon). The "Continuing
- * with" clause is omitted because a blocked gate does not continue. Identical
- * sentences collapse onto the first.
+ * "Could not enable ‹signal›: ‹reason›." — with the reason verbatim when it is
+ * proven product text (readiness's reasons are worded to read after that
+ * colon). An entry whose reason is not proven contributes no sentence; the
+ * caller puts the code's fixed copy in its place. The "Continuing with" clause
+ * is omitted because a blocked gate does not continue. Identical sentences
+ * collapse onto the first.
  */
-function blockedSentences(entries: readonly UnavailableSignal[]): readonly string[] {
+function blockedSentences(entries: readonly UnavailableSignal[]): BlockedSentences {
   const sentences: string[] = [];
   const seen = new Set<string>();
+  let unproven = false;
   for (const entry of entries) {
     const label = labelForSignal(entry.signal);
     if (label.length === 0) {
+      continue;
+    }
+    if (!isProvenEntry(entry, label)) {
+      unproven = true;
       continue;
     }
     const reason = toDisplayLine(entry.reason).replace(TRAILING_PUNCTUATION_PATTERN, '');
@@ -856,38 +1458,91 @@ function blockedSentences(entries: readonly UnavailableSignal[]): readonly strin
       sentences.push(sentence);
     }
   }
-  return sentences;
+  return { sentences, unproven };
+}
+
+/** The recovery steps of the blocking entries, and whether any could not be proven. */
+interface BlockedHints {
+  /** Each proven hint once, as one line of display text, in entry order. */
+  readonly hints: readonly string[];
+  /** Whether a non-empty hint was left out because it is not product-authored. */
+  readonly unproven: boolean;
 }
 
 /**
- * The typed refusal of an unsatisfied readiness gate: the readiness module's
- * own reasons and hints, the code of the first remedy, and — for the surfaces —
- * the verdict's blocking entries and remediations verbatim.
+ * The blocking entries' hints that are proven product text — readiness's gate
+ * hints, detection's relaunch hint — deduplicated. When no entry states a hint
+ * and the first remedy is a relaunch, its hint stands in, on the same proof.
+ */
+function blockedHints(
+  entries: readonly UnavailableSignal[],
+  first: ReadinessRemediation | undefined,
+): BlockedHints {
+  const hints: string[] = [];
+  let unproven = false;
+  const take = (text: string): void => {
+    const line = toDisplayLine(text);
+    if (line.length === 0) {
+      return;
+    }
+    if (!isProductAuthoredText(text)) {
+      unproven = true;
+    } else if (!hints.includes(line)) {
+      hints.push(line);
+    }
+  };
+  for (const entry of entries) {
+    take(entry.hint);
+  }
+  if (hints.length === 0 && !unproven && first?.kind === 'relaunch-dev-server') {
+    take(first.hint);
+  }
+  return { hints, unproven };
+}
+
+/** The fixed public copy of a failure code, `INTERNAL`'s for a code outside the vocabulary. */
+function fixedCopyOf(code: DebuggenErrorCode): PublicFailureCopy {
+  return Object.hasOwn(FAILURE_COPY_BY_CODE, code)
+    ? FAILURE_COPY_BY_CODE[code]
+    : FAILURE_COPY_BY_CODE.INTERNAL;
+}
+
+/**
+ * The typed refusal of an unsatisfied readiness gate: the code of the first
+ * remedy, a message and hint composed only of product-authored text, and — for
+ * the local log alone — the verdict's blocking entries and remediations
+ * verbatim in `details`.
+ *
+ * The refusal is shown verbatim by both user interfaces (an HTTP 409/503 body,
+ * a failed row), so its text is proven before it is used (CWE-209): a blocking
+ * entry's reason or hint is quoted only when `isProductAuthoredText` accepts
+ * it, and every unproven fragment is replaced by the code's fixed copy from
+ * `FAILURE_COPY_BY_CODE` — its summary for an unproven reason, its hint for an
+ * unproven hint. What the refusal then says is wholly the product's, so it is
+ * registered with `authorProductText` and a surface may show it as is.
  */
 function blockedGateError(sessionId: string, verdict: ReadinessVerdict): DebuggenError {
   const blocking = listOf(verdict.blocking);
   const remediations = listOf(verdict.remediations);
   const degraded = listOf(verdict.degraded);
-  const sentences = blockedSentences(blocking);
-  const hints = [
-    ...new Set(
-      blocking.map((entry) => toDisplayLine(entry.hint)).filter((hint) => hint.length > 0),
-    ),
-  ];
   const first = remediations[0];
-  if (hints.length === 0 && first?.kind === 'relaunch-dev-server') {
-    const relaunchHint = toDisplayLine(first.hint);
-    if (relaunchHint.length > 0) {
-      hints.push(relaunchHint);
-    }
-  }
-  const message =
+  const code = first === undefined ? BLOCKED_GATE_FALLBACK_CODE : BLOCKED_GATE_CODES[first.kind];
+  const copy = fixedCopyOf(code);
+  const worded = blockedSentences(blocking);
+  const hinted = blockedHints(blocking, first);
+  const sentences = worded.unproven ? [...worded.sentences, copy.summary] : worded.sentences;
+  const hints =
+    hinted.unproven && !hinted.hints.includes(copy.hint)
+      ? [...hinted.hints, copy.hint]
+      : hinted.hints;
+  const message = authorProductText(
     sentences.length === 0
       ? NOTHING_DELIVERABLE_MESSAGE
-      : clip(sentences.join(' '), MAX_ERROR_MESSAGE_LENGTH);
-  const hint =
-    hints.length === 0 ? NOTHING_DELIVERABLE_HINT : clip(hints.join(' '), MAX_ERROR_HINT_LENGTH);
-  const code = first === undefined ? BLOCKED_GATE_FALLBACK_CODE : BLOCKED_GATE_CODES[first.kind];
+      : clip(sentences.join(' '), MAX_ERROR_MESSAGE_LENGTH),
+  );
+  const hint = authorProductText(
+    hints.length === 0 ? NOTHING_DELIVERABLE_HINT : clip(hints.join(' '), MAX_ERROR_HINT_LENGTH),
+  );
 
   return new DebuggenError(code, message, {
     hint,
@@ -930,10 +1585,19 @@ function nonZeroCounts(counts: Readonly<Record<string, number>>): LogFields {
   return fields;
 }
 
-/** The enumerated `details.reason` of an error, when it carries one. */
+/** An enumerated reason: a short kebab-case identifier, the only `details.reason` shape logged. */
+const REASON_PATTERN = /^[a-z][a-z0-9-]{0,63}$/u;
+
+/**
+ * The enumerated `details.reason` of an error, when it carries one. Upstream
+ * modules put a closed-vocabulary identifier there, but a collaborator's error
+ * can carry a wrapped exception's text under the same key; anything outside
+ * {@link REASON_PATTERN} is therefore left out of the log record rather than
+ * trusted (CWE-532), and never matches a reason this stage branches on.
+ */
 function reasonOf(error: DebuggenError): string | undefined {
   const reason = error.details?.['reason'];
-  return typeof reason === 'string' ? reason : undefined;
+  return typeof reason === 'string' && REASON_PATTERN.test(reason) ? reason : undefined;
 }
 
 /** The names of the hooks a configuration turns on — vocabulary names only. */
@@ -1004,6 +1668,7 @@ async function attemptAsync<T>(
  */
 export function createCaptureStage(deps: CaptureStageDeps): CaptureStage {
   const reportBoundaries = deps.reportStageBoundaries ?? true;
+  const drainTiming = resolveDrainTiming(deps.drain);
 
   /** The call's logger: bound to the pipeline subsystem, this stage, the session and the capture. */
   const loggerFor = (context: CaptureStageContext, captureId: string | undefined): Logger => {
@@ -1043,7 +1708,7 @@ export function createCaptureStage(deps: CaptureStageDeps): CaptureStage {
    */
   const sendRow = (
     log: Logger,
-    row: 'started' | 'completed' | 'failed',
+    row: 'started' | 'completed' | 'failed' | 'finding',
     send: () => Result<unknown, DebuggenError>,
   ): void => {
     const sent = attempt(send, 'INTERNAL');
@@ -1161,31 +1826,43 @@ export function createCaptureStage(deps: CaptureStageDeps): CaptureStage {
   };
 
   /**
-   * Reads every persisted event of one capture, page by page, and summarises
-   * them with the upstream `computeCaptureSummary`. The events are the
-   * already-redacted rows ingest stored; nothing is re-redacted, correlated or
-   * aggregated here.
+   * Reads one capture's persisted events page by page, {@link SUMMARY_PAGE_SIZE}
+   * rows at a time in canonical order, and summarises them with the upstream
+   * `computeCaptureSummary`. The events are the already-redacted rows ingest
+   * stored; nothing is re-redacted, correlated or aggregated here.
+   *
+   * Bounded twice: the walk stops once {@link MAX_SUMMARY_EVENTS} rows or
+   * {@link MAX_SUMMARY_BYTES} of stored documents have been read — unreadable
+   * rows count towards both, so a capture of poisoned rows is bounded too —
+   * checking both between pages, so it overshoots the ceiling that stops it by
+   * at most one page. It yields to the event loop between pages, so ingest and
+   * every other request keep being served while a large capture is read, and
+   * the one synchronous aggregate at the end runs over at most one bounded
+   * summary's events.
+   *
+   * @returns The summary with its counts. `rowsRead` is the capture's full size
+   * only when no ceiling stopped the walk; `evidenceCountsOf` reconciles a
+   * capped walk with the store's exact counts.
    */
-  const summarizeFromStore = (
+  const summarizeFromStore = async (
     log: Logger,
     sessionId: string,
     captureId: string,
     signal: AbortSignal | undefined,
-  ): Result<CaptureSummary, DebuggenError> => {
+  ): Promise<Result<SummarizedCapture, DebuggenError>> => {
     const events: TelemetryEvent[] = [];
     let offset = 0;
+    let rowsRead = 0;
     let skipped = 0;
-    let more = true;
-    while (more) {
+    let storedChars = 0;
+    let ceiling: SummaryCeiling | undefined;
+    for (;;) {
       if (isAborted(signal)) {
         return err(cancelledError(sessionId, captureId));
       }
+      const limit = Math.min(SUMMARY_PAGE_SIZE, MAX_SUMMARY_EVENTS - rowsRead);
       const page = attempt(
-        () =>
-          deps.telemetry.listByCapture(sessionId, captureId, {
-            limit: TELEMETRY_QUERY_MAX_LIMIT,
-            offset,
-          }),
+        () => deps.telemetry.pageCaptureForSummary(sessionId, captureId, { limit, offset }),
         'STORE_ERROR',
       );
       if (!page.ok) {
@@ -1195,20 +1872,156 @@ export function createCaptureStage(deps: CaptureStageDeps): CaptureStage {
         events.push(row);
       }
       const pageSkipped = countOf(page.value.skipped);
+      const read = Math.max(countOf(page.value.rowsRead), page.value.rows.length + pageSkipped);
       skipped += pageSkipped;
-      const read = page.value.rows.length + pageSkipped;
+      rowsRead += read;
+      storedChars += countOf(page.value.storedChars);
       const next = page.value.nextOffset;
-      more = next !== undefined && read > 0 && next > offset;
-      if (next !== undefined && more) {
-        offset = next;
+      if (next === undefined || read === 0 || next <= offset) {
+        break;
       }
+      if (rowsRead >= MAX_SUMMARY_EVENTS) {
+        ceiling = 'events';
+        break;
+      }
+      if (storedChars >= MAX_SUMMARY_BYTES) {
+        ceiling = 'bytes';
+        break;
+      }
+      offset = next;
+      await yieldToEventLoop();
     }
     if (skipped > 0) {
       log.warn('Stored events that no longer validate were left out of the capture summary.', {
         skipped,
       });
     }
-    return ok(computeCaptureSummary(events, { captureId, sessionId }));
+    return ok(
+      Object.freeze({
+        summary: computeCaptureSummary(events, { captureId, sessionId }),
+        rowsRead,
+        summarizedEvents: events.length,
+        skipped,
+        storedChars,
+        ceiling,
+      }),
+    );
+  };
+
+  /**
+   * The counts the empty-capture rule reads. A walk a ceiling stopped saw only
+   * the capture's earliest events, so its per-kind counts would under-report
+   * the rest; the store's exact per-kind count of the whole capture is used
+   * instead, and its total is the capture's size. A total no larger than the
+   * rows read means the capture ended exactly where the walk stopped: the
+   * summary covers it in full after all. Should the exact count fail, the
+   * summary's own counts — the evidence the analysis will reason from — are
+   * used, the rows read stand in for the capture's size, and the fallback is
+   * logged.
+   *
+   * The same counts say which producers delivered events to the capture: the
+   * summary's per-tier counts of a capture summarised in full, the exact
+   * per-kind counts of a capped one. A capped capture whose exact counts
+   * cannot be read may hold events of either producer beyond the cap, so both
+   * are reported as contributing — it is reported incomplete regardless.
+   *
+   * @returns The counts, the capture's size, its producers and the ceiling
+   * that left events out of the summary.
+   */
+  const evidenceCountsOf = (
+    log: Logger,
+    sessionId: string,
+    captureId: string,
+    summarized: SummarizedCapture,
+  ): CaptureEvidence => {
+    const inFull: CaptureEvidence = {
+      counts: summarized.summary,
+      storedEvents: summarized.rowsRead,
+      contributing: contributorsFromTiers(summarized.summary.tierCounts),
+      ceiling: undefined,
+    };
+    const { ceiling } = summarized;
+    if (ceiling === undefined) {
+      return inFull;
+    }
+    const exact = attempt(() => deps.telemetry.countByKind(sessionId, captureId), 'STORE_ERROR');
+    if (!exact.ok) {
+      log.warn(
+        'The exact event counts of a capped capture could not be read; the summary counts are used.',
+        {
+          code: exact.error.code,
+          ceiling,
+          rowsRead: summarized.rowsRead,
+        },
+      );
+      return {
+        counts: summarized.summary,
+        storedEvents: summarized.rowsRead,
+        contributing: { pageAgent: true, serverAgent: true },
+        ceiling,
+      };
+    }
+    let eventCount = 0;
+    for (const count of Object.values(exact.value)) {
+      eventCount += countOf(count);
+    }
+    if (eventCount <= summarized.rowsRead) {
+      return inFull;
+    }
+    log.warn('The capture holds more than one summary covers; the summary was capped.', {
+      ceiling,
+      storedEvents: eventCount,
+      summarizedEvents: summarized.summarizedEvents,
+      storedChars: summarized.storedChars,
+      maxSummaryEvents: MAX_SUMMARY_EVENTS,
+      maxSummaryBytes: MAX_SUMMARY_BYTES,
+    });
+    return {
+      counts: { eventCount, kindCounts: exact.value },
+      storedEvents: eventCount,
+      contributing: contributorsFromKinds(exact.value),
+      ceiling,
+    };
+  };
+
+  /**
+   * How the stop barrier ended once the capture's producers are known (AAP
+   * §0.5.5). A barrier that went quiet only proves that nothing arrived for the
+   * quiet period; a producer that sent this capture events and could not be
+   * told to disarm — its dormant configuration unsent, its preload unreachable,
+   * or the disarm itself failed — may still hold a final flush the window never
+   * saw. Such a capture's barrier is reported `'unverified'`, so its coverage is
+   * not complete and both user interfaces are told. Every other ending is
+   * returned unchanged, and a producer that contributed nothing never changes
+   * the ending.
+   *
+   * @returns The drain outcome the summary's coverage records.
+   */
+  const confirmDrain = (
+    log: Logger,
+    drain: CaptureDrainOutcome,
+    disarmed: DisarmCaptureOutcome | undefined,
+    contributing: ContributingProducers,
+  ): CaptureDrainOutcome => {
+    if (drain !== 'quiescent') {
+      return drain;
+    }
+    const unconfirmed = unconfirmedContributors(disarmed, contributing);
+    if (unconfirmed.length === 0) {
+      return drain;
+    }
+    log.warn(
+      'A producer that sent this capture events could not be confirmed to have flushed; the capture window is reported unverified.',
+      {
+        drain: 'unverified',
+        reason: 'producer-flush-unconfirmed',
+        producers: unconfirmed,
+        ...(disarmed === undefined
+          ? { disarm: 'failed' }
+          : { agentDisarmed: disarmed.agentDisarmed, serverAgent: disarmed.serverAgent }),
+      },
+    );
+    return 'unverified';
   };
 
   /**
@@ -1237,6 +2050,255 @@ export function createCaptureStage(deps: CaptureStageDeps): CaptureStage {
   };
 
   /**
+   * The coverage a computed summary carries (AAP §0.5.5): how many events the
+   * store holds for the window and how many the summary covers, how many the
+   * producers reported discarding (the telemetry store's per-capture ledger,
+   * fed by ingest), and how the stop barrier ended. `complete` only when
+   * nothing is known to be missing — a loss total that cannot be read, or one
+   * the in-memory ledger cannot vouch for (the service restarted since the
+   * window opened, or the ledger forgot the capture), is not known to be zero,
+   * and a summary a ceiling capped is not whole even when the capture's exact
+   * size could not be read.
+   */
+  const coverageOf = (
+    log: Logger,
+    sessionId: string,
+    captureId: string,
+    evidence: CaptureEvidence,
+    summarized: SummarizedCapture,
+    drain: CaptureDrainOutcome,
+  ): CoverageFacts => {
+    const loss = attempt(() => deps.telemetry.producerLoss(sessionId, captureId), 'STORE_ERROR');
+    if (!loss.ok) {
+      log.warn('The producer-loss total could not be read; the capture is not reported complete.', {
+        code: loss.error.code,
+      });
+    }
+    const producerDroppedEvents = loss.ok ? countOf(loss.value.droppedEvents) : 0;
+    const lossAccounted = loss.ok && loss.value.accounted === true;
+    if (loss.ok && !lossAccounted) {
+      log.warn(
+        'The producer-loss ledger has not tracked this capture since its window opened; the loss total is a lower bound and the capture is not reported complete.',
+        {
+          reason: 'producer-loss-unaccounted',
+          producerDroppedEvents,
+        },
+      );
+    }
+    const { storedEvents, ceiling } = evidence;
+    const summarizedEvents = summarized.summarizedEvents;
+    const coverage: CaptureCoverage = Object.freeze({
+      storedEvents,
+      summarizedEvents,
+      producerDroppedEvents,
+      drain,
+      complete:
+        lossAccounted &&
+        ceiling === undefined &&
+        summarizedEvents >= storedEvents &&
+        producerDroppedEvents === 0 &&
+        drain !== 'deadline' &&
+        drain !== 'unverified',
+    });
+    return { coverage, ceiling, lossAccounted };
+  };
+
+  /**
+   * Starts the producer-loss ledger's accounting for a window this stage just
+   * opened, so the capture's coverage can later vouch for its loss total. A
+   * ledger that refuses is logged and does not stop the capture: its coverage
+   * then reads as unaccounted and is never reported complete.
+   */
+  const beginLossAccounting = (log: Logger, sessionId: string, captureId: string): void => {
+    const begun = attempt(
+      () => deps.telemetry.beginProducerLossAccounting(sessionId, captureId),
+      'STORE_ERROR',
+    );
+    if (!begun.ok) {
+      log.warn(
+        'The producer-loss ledger could not begin accounting for the capture; its coverage will not be reported complete.',
+        { code: begun.error.code },
+      );
+    }
+  };
+
+  /**
+   * Releases the ledger's entry and the ingest arrivals the stop barrier
+   * watched for a window this stage has closed, once the loss total is
+   * persisted in the summary's coverage. A release that fails is logged only:
+   * both bounded structures forget the entry in time regardless.
+   */
+  const releaseLossAccounting = (log: Logger, sessionId: string, captureId: string): void => {
+    const released = attempt(
+      () => deps.telemetry.releaseProducerLoss(sessionId, captureId),
+      'STORE_ERROR',
+    );
+    if (!released.ok) {
+      log.warn('The producer-loss ledger entry of a closed capture could not be released.', {
+        code: released.error.code,
+      });
+    }
+  };
+
+  /** One monotonic reading for the stop barrier; a clock that throws or answers a non-finite value yields `undefined`. */
+  const readMonotonic = (): number | undefined => {
+    try {
+      const value = drainTiming.monotonicNow();
+      return Number.isFinite(value) ? value : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+
+  /**
+   * The stop barrier (AAP §0.5.5): after the producers were disarmed and
+   * **before** the window is closed, waits — bounded — for the batches they
+   * flush on disarm, and any already in flight, to be stored under this
+   * capture.
+   *
+   * The window stays open throughout, so ingest keeps attributing late batches
+   * to the capture that recorded them instead of discarding them once the
+   * window has closed. The capture's ingest watermark is read every
+   * `pollIntervalMs`; the barrier ends:
+   *
+   * - `'quiescent'` once the watermark has stood still for the quiet period
+   *   ({@link CaptureDrainTiming.unreachableQuietPeriodMs} when a producer
+   *   could not be told to disarm, {@link CaptureDrainTiming.quietPeriodMs}
+   *   otherwise);
+   * - `'deadline'` when the watermark is still moving at `maxDrainMs` (or, as a
+   *   guard against a clock that does not advance, after twice the polls that
+   *   ceiling allows);
+   * - `'unverified'` when the watermark or the monotonic clock could not be
+   *   read.
+   *
+   * A `'quiescent'` ending is provisional: once the summary shows which
+   * producers sent the capture events, `confirmDrain` reports it
+   * `'unverified'` when one of them could not be confirmed disarmed.
+   *
+   * Each ending is logged with counts only; none of them fails the capture.
+   *
+   * @returns The report, or the cancellation when `signal` aborted.
+   */
+  const awaitIngestQuiescence = async (
+    log: Logger,
+    sessionId: string,
+    captureId: string,
+    disarmed: DisarmCaptureOutcome | undefined,
+    signal: AbortSignal | undefined,
+  ): Promise<Result<CaptureDrainReport, DebuggenError>> => {
+    const quietPeriodMs = producerMayStillSend(disarmed)
+      ? drainTiming.unreachableQuietPeriodMs
+      : drainTiming.quietPeriodMs;
+    const maxPolls = 2 * Math.ceil(drainTiming.maxDrainMs / drainTiming.pollIntervalMs) + 2;
+    let polls = 0;
+    let changes = 0;
+
+    const readWatermark = (): Result<CaptureIngestWatermark, DebuggenError> => {
+      polls += 1;
+      return attempt(() => deps.telemetry.captureWatermark(sessionId, captureId), 'STORE_ERROR');
+    };
+
+    const finish = (
+      outcome: CaptureDrainOutcome,
+      startedAt: number | undefined,
+      watermark: CaptureIngestWatermark | undefined,
+      code?: DebuggenErrorCode,
+    ): Result<CaptureDrainReport, DebuggenError> => {
+      const endedAt = readMonotonic();
+      const waitedMs =
+        startedAt === undefined || endedAt === undefined ? 0 : Math.max(0, endedAt - startedAt);
+      const report: CaptureDrainReport = Object.freeze({
+        outcome,
+        polls,
+        changes,
+        waitedMs,
+        quietPeriodMs,
+        ...(watermark !== undefined ? { watermark } : {}),
+      });
+      const fields: LogFields = {
+        drain: outcome,
+        polls,
+        changes,
+        waitedMs,
+        quietPeriodMs,
+        // Arrivals, not stored events: the watermark counts the rows ingest
+        // committed while tracking the capture, a change detector only.
+        ...(watermark !== undefined ? { arrivals: watermark.eventCount } : {}),
+        ...(code !== undefined ? { code } : {}),
+      };
+      if (outcome === 'quiescent') {
+        log.debug('The capture window went quiet before it closed.', fields);
+      } else {
+        log.warn(
+          'The capture window closes without confirming that every in-flight event arrived.',
+          fields,
+        );
+      }
+      return ok(report);
+    };
+
+    const startedAt = readMonotonic();
+    if (startedAt === undefined) {
+      return finish('unverified', undefined, undefined);
+    }
+    const first = readWatermark();
+    if (!first.ok) {
+      return finish('unverified', startedAt, undefined, first.error.code);
+    }
+    let watermark = first.value;
+    let lastChangeAt = startedAt;
+
+    for (;;) {
+      if (isAborted(signal)) {
+        return err(cancelledError(sessionId, captureId));
+      }
+      const now = readMonotonic();
+      if (now === undefined) {
+        return finish('unverified', startedAt, watermark);
+      }
+      const quietFor = now - lastChangeAt;
+      const elapsed = now - startedAt;
+      if (quietFor >= quietPeriodMs) {
+        return finish('quiescent', startedAt, watermark);
+      }
+      if (elapsed >= drainTiming.maxDrainMs || polls >= maxPolls) {
+        return finish('deadline', startedAt, watermark);
+      }
+      const waitMs = Math.max(
+        1,
+        Math.min(
+          drainTiming.pollIntervalMs,
+          quietPeriodMs - quietFor,
+          drainTiming.maxDrainMs - elapsed,
+        ),
+      );
+      try {
+        await drainTiming.sleep(waitMs, signal);
+      } catch (thrown) {
+        // A sleeper that rejects is an early wake-up: the poll bound still ends the barrier.
+        log.debug('The stop barrier woke early.', {
+          code: DebuggenError.from(thrown, 'INTERNAL').code,
+        });
+      }
+      if (isAborted(signal)) {
+        return err(cancelledError(sessionId, captureId));
+      }
+      const next = readWatermark();
+      if (!next.ok) {
+        return finish('unverified', startedAt, watermark, next.error.code);
+      }
+      if (
+        next.value.eventCount !== watermark.eventCount ||
+        next.value.lastIngestSeq !== watermark.lastIngestSeq
+      ) {
+        watermark = next.value;
+        changes += 1;
+        lastChangeAt = readMonotonic() ?? now;
+      }
+    }
+  };
+
+  /**
    * Closes a capture window this stage opened but could not arm, so the session
    * returns to `ready` instead of sitting in `capturing` with nothing
    * collecting. The window is closed through the session manager with the
@@ -1251,17 +2313,26 @@ export function createCaptureStage(deps: CaptureStageDeps): CaptureStage {
     projectRoot: string,
   ): Promise<boolean> => {
     disarm(log, session.id, captureId, projectRoot);
-    const summary = summarizeFromStore(log, session.id, captureId, undefined);
-    if (!summary.ok) {
+    const summarized = await summarizeFromStore(log, session.id, captureId, undefined);
+    if (!summarized.ok) {
       log.error('The capture window of a failed arm could not be summarised; it stays open.', {
-        code: summary.error.code,
+        code: summarized.error.code,
       });
       return false;
     }
+    // Nothing was armed, so there is no flush to wait for: the barrier is not applicable.
+    const { coverage } = coverageOf(
+      log,
+      session.id,
+      captureId,
+      evidenceCountsOf(log, session.id, captureId, summarized.value),
+      summarized.value,
+      'not-applicable',
+    );
     const stopped = await attemptAsync(
       () =>
         deps.sessionManager.stopCapture(session.id, {
-          summary: summary.value,
+          summary: Object.freeze({ ...summarized.value.summary, coverage }),
           next: NEXT_WHEN_EMPTY,
         }),
       'INTERNAL',
@@ -1272,6 +2343,7 @@ export function createCaptureStage(deps: CaptureStageDeps): CaptureStage {
       });
       return false;
     }
+    releaseLossAccounting(log, session.id, captureId);
     return true;
   };
 
@@ -1370,6 +2442,9 @@ export function createCaptureStage(deps: CaptureStageDeps): CaptureStage {
     }
     const { captureId } = opened.value;
     log = loggerFor(context, captureId);
+    // The loss ledger accounts for the window from the moment it exists, so
+    // every loss report ingest attributes to it is counted (AAP §0.5.5).
+    beginLossAccounting(log, sessionId, captureId);
 
     // 4. Both producers, armed by the instrumentation layer with the
     //    configuration its installer derived; nothing is reshaped here.
@@ -1502,35 +2577,68 @@ export function createCaptureStage(deps: CaptureStageDeps): CaptureStage {
 
     // 2. Both producers back to dormant while the window is still live.
     const disarmed = capturing ? disarm(log, sessionId, captureId, context.projectRoot) : undefined;
+    const holdsSummary = record.summary !== undefined && record.summary.captureId === captureId;
 
-    // 3. The summary: the stored one when the row already holds it, otherwise
-    //    the upstream aggregate over the capture's persisted events.
+    // 3. The stop barrier: the window stays open — so ingest keeps attributing
+    //    to it — until the batches the producers flush on disarm have landed,
+    //    bounded. Only a live window being summarised now has anything to wait
+    //    for; a window closed earlier is `not-applicable`.
+    let drain: CaptureDrainOutcome = 'not-applicable';
+    if (capturing && !holdsSummary) {
+      const drained = await awaitIngestQuiescence(
+        log,
+        sessionId,
+        captureId,
+        disarmed,
+        context.signal,
+      );
+      if (!drained.ok) {
+        return fail(drained.error);
+      }
+      drain = drained.value.outcome;
+    }
+
+    // 4. The summary: the stored one when the row already holds it, otherwise
+    //    the upstream aggregate over the capture's persisted events, bounded.
+    //    A computed summary carries its coverage: what it left out, what the
+    //    producers reported discarding and how the barrier ended — persisted with
+    //    it and broadcast in `capture.stopped`. A quiet barrier is reported
+    //    unverified when a producer that sent this capture events could not be
+    //    confirmed disarmed: its final flush may never have arrived.
     let summary: CaptureSummary;
     let summarySource: CaptureSummarySource;
-    if (record.summary !== undefined && record.summary.captureId === captureId) {
+    let evidence: Pick<CaptureSummary, 'eventCount' | 'kindCounts'>;
+    let coverageFacts: CoverageFacts | undefined;
+    if (record.summary !== undefined && holdsSummary) {
       summary = record.summary;
       summarySource = 'stored';
+      evidence = summary;
     } else {
-      const computed = summarizeFromStore(log, sessionId, captureId, context.signal);
+      const computed = await summarizeFromStore(log, sessionId, captureId, context.signal);
       if (!computed.ok) {
         return fail(computed.error);
       }
-      summary = computed.value;
+      const measured = evidenceCountsOf(log, sessionId, captureId, computed.value);
+      drain = confirmDrain(log, drain, disarmed, measured.contributing);
+      coverageFacts = coverageOf(log, sessionId, captureId, measured, computed.value, drain);
+      summary = Object.freeze({ ...computed.value.summary, coverage: coverageFacts.coverage });
       summarySource = 'computed';
+      evidence = measured.counts;
     }
+    const coverage = summary.coverage;
 
-    // 4. The empty-capture rule of AAP §0.5.5, judged against what was armed.
+    // 5. The empty-capture rule of AAP §0.5.5, judged by the question alone;
+    //    what was armed is only reported, as the interaction-hook diagnostic.
     const armedWith = resolveArmedConfiguration(log, session, record.planVersion);
     const emptiness = classifyCaptureEmptiness(
-      summary,
+      evidence,
       input.understanding ?? session.understanding,
-      {
-        agentHooks: armedWith.agentHooks,
-      },
+      // The dormant stand-in of an unknown arming would misreport the hook as off.
+      armedWith.source === 'none' ? {} : { agentHooks: armedWith.agentHooks },
     );
     const next = emptiness.empty ? NEXT_WHEN_EMPTY : NEXT_WITH_EVIDENCE;
 
-    // 5. The window, closed by the only writer of session status, which persists
+    // 6. The window, closed by the only writer of session status, which persists
     //    the summary and broadcasts `capture.stopped`.
     let capture: CaptureRecord = record;
     let stoppedNow = false;
@@ -1547,9 +2655,30 @@ export function createCaptureStage(deps: CaptureStageDeps): CaptureStage {
       }
       capture = stopped.value;
       stoppedNow = true;
+      // The loss total now lives in the persisted coverage; the ledger's entry
+      // and the window's arrivals are no longer needed.
+      releaseLossAccounting(log, sessionId, captureId);
     }
 
-    // 6. The capture group's closing row: the stage title, or the empty-capture sentence.
+    // 7. What the developer needs to read before the closing row, in counts
+    //    only: that the evidence is incomplete, and why an interaction
+    //    question's capture is empty when its hook was off.
+    const incomplete = coverageFacts === undefined ? undefined : coverageNotice(coverageFacts);
+    if (stoppedNow && incomplete !== undefined) {
+      sendRow(log, 'finding', () => deps.progress.finding(sessionId, CAPTURE_STAGE, incomplete));
+    }
+    if (
+      stoppedNow &&
+      emptiness.empty &&
+      emptiness.reason === 'no-interaction' &&
+      emptiness.interactionHookArmed === false
+    ) {
+      sendRow(log, 'finding', () =>
+        deps.progress.finding(sessionId, CAPTURE_STAGE, INTERACTION_HOOK_OFF_MESSAGE),
+      );
+    }
+
+    // 8. The capture group's closing row: the stage title, or the empty-capture sentence.
     if (stoppedNow && reportBoundaries) {
       sendRow(log, 'completed', () =>
         deps.progress.stageCompleted(
@@ -1566,11 +2695,23 @@ export function createCaptureStage(deps: CaptureStageDeps): CaptureStage {
         planVersion: record.planVersion,
         eventCount: emptiness.eventCount,
         interactionCount: emptiness.interactionCount,
+        ...(emptiness.interactionHookArmed !== undefined
+          ? { interactionHookArmed: emptiness.interactionHookArmed }
+          : {}),
         traceCount: countOf(summary.traceCount),
         empty: emptiness.empty,
         ...(emptiness.empty ? { reason: emptiness.reason } : {}),
         next,
         summarySource,
+        drain,
+        ...(coverage !== undefined
+          ? {
+              coverageComplete: coverage.complete,
+              storedEvents: coverage.storedEvents,
+              summarizedEvents: coverage.summarizedEvents,
+              producerDroppedEvents: coverage.producerDroppedEvents,
+            }
+          : {}),
         stoppedNow,
         armedSource: armedWith.source,
         kinds: nonZeroCounts(summary.kindCounts),

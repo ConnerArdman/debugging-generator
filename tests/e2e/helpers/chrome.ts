@@ -77,7 +77,7 @@
  */
 
 import { readdirSync, readFileSync, statSync } from 'node:fs';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { lstat, mkdtemp, readFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -161,6 +161,26 @@ const EVAL_LOG_LIMIT = 100;
 /** How many panel-side errors a failure message quotes. */
 const ERRORS_QUOTED = 5;
 
+/**
+ * How many teardown failures one rejection of a `close()` quotes; any further
+ * failures are counted, not quoted.
+ */
+const TEARDOWN_FAILURES_QUOTED = 8;
+
+/** The longest single teardown failure quoted, in characters (one line, scrubbed). */
+const TEARDOWN_FAILURE_MAX_LENGTH = 500;
+
+/** The longest teardown rejection message, in characters. */
+const TEARDOWN_MESSAGE_MAX_LENGTH = 2_000;
+
+/**
+ * How many problems a context retains from its life for
+ * {@link ExtensionContextHandle.close} to report (the oldest are kept, later
+ * ones are counted), so a context that leaks a wake-up page on every worker
+ * re-acquisition cannot grow without bound.
+ */
+const DEFERRED_PROBLEMS_LIMIT = TEARDOWN_FAILURES_QUOTED;
+
 /** The mutable interval list `expect.poll` wants, derived from the service helper's bounds. */
 const POLL_INTERVALS: number[] = [...POLL_INTERVALS_MS];
 
@@ -202,8 +222,12 @@ const STUB_CONTROL_GLOBAL = '__debuggenE2eDevtoolsStub';
  */
 const WAKE_PORT_NAME = 'debuggen.e2e-wake';
 
-/** `chrome.devtools.panels.themeName` per theme: DevTools reports `default` for light. */
-const DEVTOOLS_THEME_NAMES = Object.freeze({ dark: 'dark', light: 'default' } as const);
+/**
+ * `chrome.devtools.panels.themeName` per theme, as the panel maps it
+ * (`src/panel/theme.ts`): `'dark'` (like DevTools' `'default'`) selects the
+ * dark token set, and `'light'` is the one name that selects the light set.
+ */
+const DEVTOOLS_THEME_NAMES = Object.freeze({ dark: 'dark', light: 'light' } as const);
 
 /**
  * The panel's visible strings, each copied from the module-private constant
@@ -486,6 +510,152 @@ async function pollUntilReady(
   } catch (error) {
     throw new Error(failure(lastSeen), { cause: error });
   }
+}
+
+// ---------------------------------------------------------------------------
+// Bounded teardown — every close attempted, every failure reported
+// ---------------------------------------------------------------------------
+//
+// A close that fails is a leak: a Chromium process, a profile directory or a
+// tab outliving the test that owned it. So no close here is ever silenced.
+// Each step runs even when an earlier one failed, each failure is recorded as
+// one scrubbed, bounded line, and the caller receives one rejection naming
+// them (`tests/e2e/helpers/fixtures.ts` runs every close through its
+// `runSteps`/`throwIfProblems`, which turn that rejection into a failed
+// worker or test). The action labels are composed here from non-secret values
+// (a tab id, the profile path, a page's role) and are kept verbatim; only the
+// error text, which this module does not control, is scrubbed.
+
+/** No one-time values to scrub: the context-level teardown never handles a pairing code. */
+const NO_SECRETS: ReadonlySet<string> = new Set();
+
+/** One teardown failure as a single scrubbed line of at most {@link TEARDOWN_FAILURE_MAX_LENGTH} characters. */
+function teardownFailure(action: string, error: unknown, secrets: ReadonlySet<string>): string {
+  const detail = scrub(describeError(error), secrets).replace(/\s+/g, ' ').trim();
+  return truncate(`${action}: ${detail}`, TEARDOWN_FAILURE_MAX_LENGTH);
+}
+
+/**
+ * Run one teardown step, recording its failure in `failures` instead of
+ * throwing, so the next step is still attempted.
+ */
+async function attemptTeardown(
+  failures: string[],
+  action: string,
+  step: () => Promise<unknown>,
+  secrets: ReadonlySet<string> = NO_SECRETS,
+): Promise<void> {
+  try {
+    await step();
+  } catch (error) {
+    failures.push(teardownFailure(action, error, secrets));
+  }
+}
+
+/**
+ * Close `page` and confirm it reports closed. A rejected `close()` and a page
+ * still open afterwards (a leaked tab) are each recorded; nothing throws.
+ * Playwright's `page.close()` already resolves for a page whose context or
+ * browser went away first, so a recorded rejection is a real failure.
+ *
+ * @param label The page's role in the failure line, for example `panel page`.
+ */
+async function closePageInto(
+  failures: string[],
+  label: string,
+  page: Page,
+  secrets: ReadonlySet<string> = NO_SECRETS,
+): Promise<void> {
+  await attemptTeardown(failures, `closing the ${label}`, () => page.close(), secrets);
+  if (!page.isClosed()) {
+    failures.push(`the ${label} still reports open after close() — the tab leaked`);
+  }
+}
+
+/**
+ * One bounded rejection message: `summary`, how many steps failed, the first
+ * {@link TEARDOWN_FAILURES_QUOTED} failures and a count of the rest, cut to
+ * {@link TEARDOWN_MESSAGE_MAX_LENGTH} characters. The failures come first so a
+ * caller that truncates the message again still sees them.
+ *
+ * @example
+ * teardownMessage('Closing the panel of tab 7 was incomplete', ['closing the panel page: Error: …'])
+ * // → 'Closing the panel of tab 7 was incomplete: 1 teardown failure(s) — closing the panel page: Error: …'
+ */
+function teardownMessage(summary: string, failures: readonly string[]): string {
+  const quoted = failures.slice(0, TEARDOWN_FAILURES_QUOTED);
+  const unquoted = failures.length - quoted.length;
+  const rest = unquoted > 0 ? `; and ${String(unquoted)} more` : '';
+  return truncate(
+    `${summary}: ${String(failures.length)} teardown failure(s) — ${quoted.join('; ')}${rest}`,
+    TEARDOWN_MESSAGE_MAX_LENGTH,
+  );
+}
+
+/** `' ' + teardownMessage(summary, failures)`, or `''` when nothing failed — a suffix for another message. */
+function teardownSuffix(summary: string, failures: readonly string[]): string {
+  return failures.length === 0 ? '' : ` ${teardownMessage(summary, failures)}`;
+}
+
+/**
+ * The error to rethrow for a failed operation whose cleanup has run: `error`
+ * itself when the cleanup was clean; otherwise a new error whose message is
+ * `error`'s description first and the bounded cleanup failures after it, with
+ * `error` kept as its `cause`. The failure being reported always leads — the
+ * cleanup is what the operation's failure left behind.
+ */
+function withCleanupFailures(
+  error: unknown,
+  summary: string,
+  failures: readonly string[],
+): unknown {
+  if (failures.length === 0) {
+    return error;
+  }
+  return new Error(`${describeError(error)}${teardownSuffix(summary, failures)}`, {
+    cause: error,
+  });
+}
+
+/**
+ * Close the pages an operation opened before it failed, then return the error
+ * to rethrow ({@link withCleanupFailures}): the operation's own error when
+ * every page closed, a wrapped one naming the close failures otherwise.
+ */
+async function errorAfterClosingPages(
+  error: unknown,
+  pages: readonly (readonly [label: string, page: Page | undefined])[],
+  secrets: ReadonlySet<string>,
+): Promise<unknown> {
+  const failures: string[] = [];
+  for (const [label, page] of pages) {
+    if (page !== undefined) {
+      await closePageInto(failures, label, page, secrets);
+    }
+  }
+  return withCleanupFailures(error, 'Closing the pages it opened also failed', failures);
+}
+
+/**
+ * Confirm `directory` is gone after a removal. `rm({ force: true })` resolves
+ * without proving anything about what is left (a crash reporter that wrote
+ * into the profile after the browser exited, a path it could not see), so
+ * absence is established rather than inferred.
+ *
+ * @throws {Error} When the directory still exists, or its absence cannot be established.
+ */
+async function assertRemoved(directory: string): Promise<void> {
+  try {
+    await lstat(directory);
+  } catch (error) {
+    if (isRecord(error) && error.code === 'ENOENT') {
+      return;
+    }
+    throw new Error(`the removal of ${directory} could not be confirmed: ${describeError(error)}`, {
+      cause: error,
+    });
+  }
+  throw new Error(`${directory} still exists after it was removed`);
 }
 
 // ---------------------------------------------------------------------------
@@ -831,17 +1001,51 @@ export interface ExtensionContextHandle {
    */
   getServiceWorker(): Promise<Worker>;
   /**
-   * Close every panel opened through {@link openPanelPage}, then the context,
-   * then remove the temporary profile. Idempotent: a second call returns the
-   * first call's outcome.
+   * Close every panel opened through {@link openPanelPage} (newest first),
+   * then the context, then remove the temporary profile and confirm its
+   * directory is gone. Every step is attempted even when an earlier one
+   * failed.
+   *
+   * Rejects — after all of them ran — with one bounded error naming each
+   * failure: a panel that did not close cleanly, the context, a profile that
+   * could not be removed or still exists, and any worker wake-up page that
+   * could not be closed during the context's life (see
+   * {@link getServiceWorker}). Idempotent: a second call returns the first
+   * call's outcome, rejection included.
    */
   close(): Promise<void>;
 }
 
-/** Per-context state that {@link openPanelPage} and {@link resetExtensionState} share. */
+/** Per-context state that {@link openPanelPage}, {@link resetExtensionState} and the handle share. */
 interface ExtensionInternals {
   /** Every open panel handle, in opening order. */
   readonly openPanels: Set<PanelHandle>;
+  /**
+   * Teardown failures observed while the context was in use that no caller
+   * was awaiting — a worker wake-up page that would not close is a leaked
+   * tab — reported by {@link ExtensionContextHandle.close}. The first
+   * {@link DEFERRED_PROBLEMS_LIMIT} are kept; {@link deferredDropped} counts
+   * the rest.
+   */
+  readonly deferredProblems: string[];
+  /** How many deferred problems arrived after {@link deferredProblems} was full. */
+  deferredDropped: number;
+  /**
+   * The worker wake-ups still in flight. Each settles to a value (never
+   * rejects); {@link ExtensionContextHandle.close} awaits them once the
+   * context is closed, so a wake-up page's close outcome is known before it
+   * reports.
+   */
+  readonly pendingWakes: Set<Promise<unknown>>;
+}
+
+/** Record a teardown problem for {@link ExtensionContextHandle.close} to report, within the bound. */
+function recordDeferredProblem(internals: ExtensionInternals, problem: string): void {
+  if (internals.deferredProblems.length < DEFERRED_PROBLEMS_LIMIT) {
+    internals.deferredProblems.push(problem);
+  } else {
+    internals.deferredDropped += 1;
+  }
 }
 
 /** The internals of each handle this module created. */
@@ -867,11 +1071,19 @@ function extensionInternals(handle: ExtensionContextHandle): ExtensionInternals 
  * connects a port with an unknown name — every `runtime.onConnect` dispatch
  * starts the worker, and `background/ports.ts` refuses and disconnects the
  * unknown name.
+ *
+ * The wake-up page is always closed. A close that fails (or leaves the page
+ * open) is a leaked tab: it is recorded in `internals` for
+ * {@link ExtensionContextHandle.close} to report, because the caller treats
+ * the wake itself as best-effort and must not fail worker acquisition over it.
+ *
+ * @throws {Error} When the page cannot be opened, navigated or evaluated in.
  */
 async function wakeWorker(
   context: BrowserContext,
   extensionId: string,
   extensionPath: string,
+  internals: ExtensionInternals,
 ): Promise<void> {
   const page = await context.newPage();
   try {
@@ -885,7 +1097,11 @@ async function wakeWorker(
       host.chrome?.runtime?.connect?.({ name: portName });
     }, WAKE_PORT_NAME);
   } finally {
-    await page.close().catch(() => undefined);
+    const failures: string[] = [];
+    await closePageInto(failures, 'worker wake-up page', page);
+    for (const failure of failures) {
+      recordDeferredProblem(internals, failure);
+    }
   }
 }
 
@@ -903,6 +1119,10 @@ async function wakeWorker(
  * @throws {Error} "the Chrome extension is not built — …" before launching when
  * `dist/manifest.json` is missing; an actionable message when no worker
  * registers or its id is malformed (the context and profile are disposed).
+ * When disposing after a failure — removing the profile after a failed
+ * launch, closing the context and removing the profile after a missing or
+ * malformed worker — itself fails, the error names those failures after the
+ * original message, and the original error stays its `cause`.
  */
 export async function launchExtensionContext(
   options: LaunchExtensionContextOptions = {},
@@ -914,11 +1134,14 @@ export async function launchExtensionContext(
       ? await mkdtemp(path.join(os.tmpdir(), 'debuggen-e2e-profile-'))
       : path.resolve(suppliedProfile);
   const ownsUserDataDir = suppliedProfile === undefined;
+  /** Remove the profile this call created, and confirm it is gone; a caller's profile is never touched. */
   const removeProfile = async (): Promise<void> => {
     if (ownsUserDataDir) {
       await rm(userDataDir, { recursive: true, force: true });
+      await assertRemoved(userDataDir);
     }
   };
+  const profileRemoval = `removing the profile ${userDataDir}`;
 
   const { args: extraArgs, ...launchOptions } = options.launchOptions ?? {};
   let context: BrowserContext;
@@ -935,14 +1158,24 @@ export async function launchExtensionContext(
       ...(options.viewport === undefined ? {} : { viewport: options.viewport }),
     });
   } catch (error) {
-    await removeProfile();
-    throw error;
+    // The launch failure leads; a profile left behind is appended, never swapped in for it.
+    const failures: string[] = [];
+    await attemptTeardown(failures, profileRemoval, removeProfile);
+    throw withCleanupFailures(error, 'Removing its profile also failed', failures);
   }
 
-  const disposeContext = async (): Promise<void> => {
-    await context.close().catch(() => undefined);
-    await removeProfile().catch(() => undefined);
+  /**
+   * Dispose of a context that never became a handle: close it, then remove the
+   * owned profile — each attempted whatever the other did — and return what
+   * failed, for the error that caused the disposal to carry.
+   */
+  const disposeContext = async (): Promise<string[]> => {
+    const failures: string[] = [];
+    await attemptTeardown(failures, 'closing the context', () => context.close());
+    await attemptTeardown(failures, profileRemoval, removeProfile);
+    return failures;
   };
+  const disposalSummary = 'Disposing the context also failed';
 
   let worker = context.serviceWorkers().find((candidate) => isExtensionUrl(candidate.url()));
   let serviceWorkerDiscovery: ServiceWorkerDiscovery = 'already-running';
@@ -954,9 +1187,9 @@ export async function launchExtensionContext(
         predicate: (candidate) => isExtensionUrl(candidate.url()),
       });
     } catch (error) {
-      await disposeContext();
+      const disposal = await disposeContext();
       throw new Error(
-        `The extension's MV3 service worker did not register within ${String(WORKER_READY_TIMEOUT_MS)} ms (extension path ${extensionPath}). A manifest that loads but whose worker fails to evaluate shows up as this timeout; rebuild with \`pnpm build\` and check the worker bundle. ${describeError(error)}`,
+        `The extension's MV3 service worker did not register within ${String(WORKER_READY_TIMEOUT_MS)} ms (extension path ${extensionPath}). A manifest that loads but whose worker fails to evaluate shows up as this timeout; rebuild with \`pnpm build\` and check the worker bundle. ${describeError(error)}${teardownSuffix(disposalSummary, disposal)}`,
         { cause: error },
       );
     }
@@ -964,14 +1197,20 @@ export async function launchExtensionContext(
 
   const extensionId = hostOf(worker.url());
   if (!EXTENSION_ID_PATTERN.test(extensionId)) {
-    await disposeContext();
+    const disposal = await disposeContext();
     throw new Error(
-      `The extension id could not be read from the worker URL ${worker.url()}: "${extensionId}" is not a 32-character id from a–p.`,
+      `The extension id could not be read from the worker URL ${worker.url()}: "${extensionId}" is not a 32-character id from a–p.${teardownSuffix(disposalSummary, disposal)}`,
     );
   }
 
   let current: Worker = worker;
   const isOurs = (candidate: Worker): boolean => hostOf(candidate.url()) === extensionId;
+  const internals: ExtensionInternals = {
+    openPanels: new Set(),
+    deferredProblems: [],
+    deferredDropped: 0,
+    pendingWakes: new Set(),
+  };
 
   const getServiceWorker = async (): Promise<Worker> => {
     const live = context.serviceWorkers().find(isOurs);
@@ -989,7 +1228,22 @@ export async function launchExtensionContext(
         (worker): { readonly worker: Worker } => ({ worker }),
         (error: unknown): { readonly error: unknown } => ({ error }),
       );
-    const wake = wakeWorker(context, extensionId, extensionPath).catch(() => undefined);
+    // The registration event is authoritative, so a wake that fails (a
+    // navigation timeout, say) does not fail the acquisition: its description
+    // is kept for the timeout message below. A wake-up page that would not
+    // close is a leaked tab, which wakeWorker records for close() to report.
+    let wakeFailure: string | undefined;
+    const wake = wakeWorker(context, extensionId, extensionPath, internals).then(
+      () => undefined,
+      (error: unknown) => {
+        wakeFailure = truncate(
+          describeError(error).replace(/\s+/g, ' ').trim(),
+          TEARDOWN_FAILURE_MAX_LENGTH,
+        );
+      },
+    );
+    internals.pendingWakes.add(wake);
+    void wake.then(() => internals.pendingWakes.delete(wake));
     await Promise.race([wake, registration]);
     const outcome = await registration;
     if ('worker' in outcome) {
@@ -1002,12 +1256,11 @@ export async function launchExtensionContext(
       return lateArrival;
     }
     throw new Error(
-      `The extension's service worker (${extensionId}) is not running and did not restart within ${String(WORKER_READY_TIMEOUT_MS)} ms after a wake-up connection. ${describeError(outcome.error)}`,
+      `The extension's service worker (${extensionId}) is not running and did not restart within ${String(WORKER_READY_TIMEOUT_MS)} ms after a wake-up connection. ${describeError(outcome.error)}${wakeFailure === undefined ? '' : ` (the wake-up page itself failed: ${wakeFailure})`}`,
       { cause: outcome.error },
     );
   };
 
-  const internals: ExtensionInternals = { openPanels: new Set() };
   let closing: Promise<void> | undefined;
 
   const handle: ExtensionContextHandle = {
@@ -1025,18 +1278,25 @@ export async function launchExtensionContext(
         LIVE_EXTENSIONS.delete(handle);
         const failures: string[] = [];
         for (const panel of [...internals.openPanels].reverse()) {
-          await panel.close().catch((error: unknown) => {
-            failures.push(`closing a panel: ${describeError(error)}`);
-          });
+          await attemptTeardown(failures, `closing the panel of tab ${String(panel.tabId)}`, () =>
+            panel.close(),
+          );
         }
-        await context.close().catch((error: unknown) => {
-          failures.push(`closing the context: ${describeError(error)}`);
-        });
-        await removeProfile().catch((error: unknown) => {
-          failures.push(`removing the profile ${userDataDir}: ${describeError(error)}`);
-        });
+        await attemptTeardown(failures, 'closing the context', () => context.close());
+        // A wake-up still in flight settles promptly once its context is gone;
+        // wait for it so a wake-up page that failed to close is reported here.
+        await Promise.allSettled([...internals.pendingWakes]);
+        failures.push(...internals.deferredProblems);
+        if (internals.deferredDropped > 0) {
+          failures.push(
+            `${String(internals.deferredDropped)} further problem(s) recorded while the context was in use were not retained`,
+          );
+        }
+        await attemptTeardown(failures, profileRemoval, removeProfile);
         if (failures.length > 0) {
-          throw new Error(`Closing the extension context was incomplete: ${failures.join('; ')}`);
+          throw new Error(
+            teardownMessage('Closing the extension context was incomplete', failures),
+          );
         }
       })();
       return closing;
@@ -1227,8 +1487,8 @@ export interface DevtoolsStubArgs {
   readonly documentPaths: readonly string[];
   /** `chrome.devtools.inspectedWindow.tabId`. */
   readonly inspectedTabId: number;
-  /** `chrome.devtools.panels.themeName`: `'default'` (light) or `'dark'`. */
-  readonly themeName: 'default' | 'dark';
+  /** `chrome.devtools.panels.themeName`: `'dark'` or `'light'` (see {@link DEVTOOLS_THEME_NAMES}). */
+  readonly themeName: 'dark' | 'light';
   /** The `page.exposeBinding` name `inspectedWindow.eval` forwards to. */
   readonly evalBinding: string;
   /** The window property the test-only {@link DevtoolsStubControl} is published under. */
@@ -1274,7 +1534,9 @@ export interface DevtoolsStubControl {
  *   expression string in the inspected application page. Success calls
  *   `callback(result, undefined)`, because `App.tsx` treats any defined
  *   `exceptionInfo` as a failure;
- * - `panels.themeName` (`src/panel/theme.ts`, `devtools.ts`);
+ * - `panels.themeName` (`src/panel/theme.ts`, `devtools.ts`); the optional
+ *   `panels.setThemeChangeHandler` is left out, which `theme.ts`
+ *   feature-detects, re-reading `themeName` when the panel is shown instead;
  * - `panels.create(title, iconPath, pagePath, callback)` as a recording no-op
  *   whose callback receives a panel object with `onShown`/`onHidden`;
  * - `panels.elements.onSelectionChanged` with working
@@ -1713,7 +1975,17 @@ export interface PanelHandle {
   reload(): Promise<void>;
   /** Whether {@link close} has been called. */
   isClosed(): boolean;
-  /** Close the panel page, then the DevTools page (unbinding the tab). Idempotent. */
+  /**
+   * Attach the console log when the running test failed (see
+   * {@link PanelCloseOptions.attachOnFailure}), close the panel page, then the
+   * DevTools page (unbinding the tab), and confirm both report closed. Every
+   * step is attempted even when an earlier one failed.
+   *
+   * Rejects — after all of them ran — with one bounded, scrubbed error naming
+   * each failure: the attachment, a `close()` that rejected, a page still open
+   * afterwards. Idempotent: a second call returns the first call's outcome,
+   * rejection included.
+   */
   close(options?: PanelCloseOptions): Promise<void>;
 }
 
@@ -1757,21 +2029,36 @@ function forwardConsole(state: PanelState, page: Page, caller: EvalCaller): void
   });
 }
 
-/** Open a page of the context with the eval binding and the stub installed ahead of navigation. */
+/** The role of each document's page in a teardown failure line. */
+const PAGE_LABELS = Object.freeze({
+  devtools: 'DevTools page',
+  panel: 'panel page',
+} as const satisfies Record<EvalCaller, string>);
+
+/**
+ * Open a page of the context with the eval binding and the stub installed
+ * ahead of navigation. A page whose preparation fails is closed before the
+ * error propagates — the caller never received it, so nothing else could —
+ * and a failure to close it is appended to that error.
+ */
 async function prepareStubbedPage(
   state: PanelState,
   caller: EvalCaller,
   stubArgs: DevtoolsStubArgs,
 ): Promise<Page> {
   const page = await state.extension.context.newPage();
-  forwardConsole(state, page, caller);
-  await page.exposeBinding(
-    EVAL_BINDING,
-    (_source: unknown, expression: unknown, evalOptions: unknown) =>
-      answerInspectedEval(state, caller, expression, evalOptions),
-  );
-  await page.addInitScript(installDevtoolsStub, stubArgs);
-  return page;
+  try {
+    forwardConsole(state, page, caller);
+    await page.exposeBinding(
+      EVAL_BINDING,
+      (_source: unknown, expression: unknown, evalOptions: unknown) =>
+        answerInspectedEval(state, caller, expression, evalOptions),
+    );
+    await page.addInitScript(installDevtoolsStub, stubArgs);
+    return page;
+  } catch (error) {
+    throw await errorAfterClosingPages(error, [[PAGE_LABELS[caller], page]], state.secrets);
+  }
 }
 
 /** What the stub in one document has observed. */
@@ -1898,7 +2185,9 @@ async function waitForPanelInteractive(
  * @throws {Error} For an invalid tab id, a tab on an unexpected origin, an
  * `inspectedPage` that is another tab, or a document that never becomes
  * interactive — with the panel's recent console errors. Pages opened before
- * the failure are closed.
+ * the failure are closed; when one of them does not close cleanly, the error
+ * names that failure after the original description and keeps the original
+ * error as its `cause`.
  */
 export async function openPanelPage(
   handle: ExtensionContextHandle,
@@ -1982,9 +2271,15 @@ export async function openPanelPage(
   try {
     await openBoth();
   } catch (error) {
-    await page?.close().catch(() => undefined);
-    await devtoolsPage?.close().catch(() => undefined);
-    throw error;
+    // Both pages are attempted; the opening failure leads the rethrown error.
+    throw await errorAfterClosingPages(
+      error,
+      [
+        [PAGE_LABELS.panel, page],
+        [PAGE_LABELS.devtools, devtoolsPage],
+      ],
+      state.secrets,
+    );
   }
   if (page === undefined || locators === undefined) {
     throw new Error('openPanelPage: the panel page was not opened.');
@@ -2061,11 +2356,24 @@ export async function openPanelPage(
     close(closeOptions) {
       closing ??= (async () => {
         internals.openPanels.delete(panel);
+        const failures: string[] = [];
         if ((closeOptions?.attachOnFailure ?? true) && currentTestFailed()) {
-          await panel.attachConsoleLog().catch(() => undefined);
+          await attemptTeardown(
+            failures,
+            "attaching the panel's console log",
+            () => panel.attachConsoleLog(),
+            state.secrets,
+          );
         }
-        await panelPage.close().catch(() => undefined);
-        await devtools?.close().catch(() => undefined);
+        await closePageInto(failures, PAGE_LABELS.panel, panelPage, state.secrets);
+        if (devtools !== undefined) {
+          await closePageInto(failures, PAGE_LABELS.devtools, devtools, state.secrets);
+        }
+        if (failures.length > 0) {
+          throw new Error(
+            teardownMessage(`Closing the panel of tab ${String(tabId)} was incomplete`, failures),
+          );
+        }
       })();
       return closing;
     },
@@ -2576,6 +2884,15 @@ async function drivePanelPicker(
  * Wait until the descriptor the product produced is observable downstream:
  * recorded on the session at the service (via `session.updated` on the editor
  * client), or — without an editor client — rendered by the panel's target area.
+ *
+ * A selection of the very descriptor the session already records changes
+ * nothing, so the service worker answers it as already recorded and sends no
+ * `target.selected` (`sendSelectedTarget` in
+ * apps/chrome-extension/src/background/service-worker.ts) — and no
+ * `session.updated` follows. That is the case when an element picked before the
+ * question (sent with `session.create`) is picked again once the session is
+ * ready. The session's newest record is therefore checked first: when it
+ * already holds this descriptor, it is the recorded target.
  */
 async function observeSelection(
   options: SelectTargetOptions,
@@ -2586,14 +2903,21 @@ async function observeSelection(
 ): Promise<SelectedTarget> {
   const { editorClient, sessionId, panel } = options;
   if (editorClient !== undefined) {
+    const ofSession = ({ session }: MessagePayload<'session.updated'>): boolean =>
+      sessionId === undefined || session.id === sessionId;
+    const records = ({ session }: MessagePayload<'session.updated'>): boolean =>
+      session.target !== undefined &&
+      sameTarget(session.target, descriptor) &&
+      (options.requireOwnerChain !== true || session.target.componentChain.length > 0);
+    const newest =
+      sessionId === undefined ? undefined : editorClient.lastOf('session.updated', ofSession);
+    if (newest !== undefined && records(newest.payload)) {
+      return validateTarget(newest.payload.session.target, "The session record's target");
+    }
     try {
       const message = await editorClient.waitFor(
         'session.updated',
-        ({ session }) =>
-          (sessionId === undefined || session.id === sessionId) &&
-          session.target !== undefined &&
-          sameTarget(session.target, descriptor) &&
-          (options.requireOwnerChain !== true || session.target.componentChain.length > 0),
+        (payload) => ofSession(payload) && records(payload),
         { sinceIndex, timeoutMs },
       );
       return validateTarget(message.payload.session.target, "The session record's target");

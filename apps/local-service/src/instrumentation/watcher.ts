@@ -46,6 +46,24 @@
  * - **One handle per directory**, reference-counted across every watched file in
  *   it (and across sessions of this watcher), closed as soon as its last file is
  *   released.
+ * - **A lost or refused watch is recovered, and the outage is announced.** When
+ *   an established handle reports an error, or the platform refuses the initial
+ *   watch, the directory's files enter one per-directory recovery: an
+ *   `unref()`ed timer retries the watch after
+ *   {@link DEFAULT_WATCH_RETRY_INITIAL_MS}, doubling to
+ *   {@link DEFAULT_WATCH_RETRY_MAX_MS} and retrying at that ceiling for as long
+ *   as a file still waits. Every refused retry asks for one evaluation of each
+ *   waiting file, so an edit made while unwatched is still judged (polling at
+ *   the retry cadence). A poll never postpones a check already due or running —
+ *   unlike an event, it does not restart the debounce — so a retry cadence
+ *   shorter than the debounce still lets every evaluation run. A successful
+ *   retry evaluates each re-attached file once, for the edit made in the gap.
+ *   Each session is told once per outage — "Conflict
+ *   detection paused for ‹file›…" — and once more when its files are watched
+ *   again. The recovery ends when its last file is re-attached (by a retry or by
+ *   a {@link InstrumentationWatcher.refresh}), released, or its session stopped.
+ *   Cleanup's own hash check stays the backstop: a file never re-attached is
+ *   still compared with its `instrumentedHash` before it is restored.
  * - **Chain heads only.** A follow-up plan version layers a new record over an
  *   earlier one for the same file; only the newest record's `instrumentedHash`
  *   describes the bytes on disk, so one entry per file is kept — the head from
@@ -53,8 +71,16 @@
  * - **Containment and no symbolic links.** Every `record.file` is resolved
  *   inside the session's project root with `resolveWithinProject`, and every
  *   directory between the root and the watched directory must be a real
- *   directory (checked with `lstat`, never followed). A refusal is recorded as
- *   a {@link WatchIssue}, never thrown.
+ *   directory (checked with `lstat`, never followed). The chain is checked when
+ *   the watch set is rebuilt, again — synchronously, in the same turn as the
+ *   `fs.watch` call — before every recovery retry re-attaches a directory, and
+ *   before every evaluation hashes a file or reads it for a diff, because a
+ *   directory can be replaced by a link while its watch is down. A file behind
+ *   a link is neither watched nor read and is not polled; its recovery keeps
+ *   retrying, and the file is watched again once the link is gone. A refusal
+ *   is recorded as a {@link WatchIssue} — once per link found — never thrown.
+ *   `fs.watch` has no no-follow form, so the platform's own window between the
+ *   last `lstat` and the watch syscall is the one that remains.
  * - **Per-file debounce** coalesces an editor's write burst into one
  *   evaluation; timers are `unref()`ed and cleared on every stop, so nothing
  *   keeps the process or a test worker alive.
@@ -75,7 +101,9 @@
  * ```
  *
  * While suspended nothing is queued and nothing is evaluated; an evaluation
- * already in flight is abandoned before it can mutate anything.
+ * already in flight is abandoned before it can mutate anything. A watch
+ * recovery keeps re-attaching while suspended — attaching judges nothing — and
+ * the evaluations it asks for wait for the resume like any other.
  *
  * ## Privacy
  *
@@ -95,7 +123,7 @@
  * @module
  */
 
-import { promises as fsPromises, watch as nodeWatch } from 'node:fs';
+import { lstatSync, promises as fsPromises, statSync, watch as nodeWatch } from 'node:fs';
 
 import {
   buildConflictReport,
@@ -121,11 +149,11 @@ import {
   ok,
   resolveWithinProject,
 } from '@debuggen/shared';
-import type { DebuggenErrorCode, Logger, Result } from '@debuggen/shared';
+import type { DebuggenErrorCode, LogFields, Logger, Result } from '@debuggen/shared';
 import { sha256OfFile } from '@debuggen/shared/node';
 
 import type { ServiceConfig } from '../config.js';
-import { LOG_BINDING_KEYS, subsystemLogger } from '../logging.js';
+import { LOG_BINDING_KEYS, describeException, guardLogger, subsystemLogger } from '../logging.js';
 import type { SessionProgress } from '../sessions/progress.js';
 import type { ModificationsRepo } from '../store/modifications-repo.js';
 
@@ -145,22 +173,54 @@ import type { ModificationsRepo } from '../store/modifications-repo.js';
 export const DEFAULT_CONFLICT_DEBOUNCE_MS = 200;
 
 /**
- * The progress stage a conflict row is filed under: the stage that owns
- * modifications, which is where both user interfaces list them.
+ * How long, in milliseconds, a directory whose watch was lost or refused waits
+ * before its first re-attach attempt. Each refused attempt doubles the wait, up
+ * to {@link DEFAULT_WATCH_RETRY_MAX_MS}. Overridable per watcher through
+ * {@link InstrumentationWatcherDeps.watchRetryInitialMs}.
+ */
+export const DEFAULT_WATCH_RETRY_INITIAL_MS = 250;
+
+/**
+ * The ceiling, in milliseconds, of the re-attach backoff: while a file still
+ * waits for its directory, the watch is retried (and the file evaluated) at
+ * least this often and never more often. Overridable per watcher through
+ * {@link InstrumentationWatcherDeps.watchRetryMaxMs}.
+ */
+export const DEFAULT_WATCH_RETRY_MAX_MS = 30_000;
+
+/**
+ * The longest delay a Node timer holds; a larger one fires after 1 ms, which
+ * would turn a generous retry interval into a hot loop.
+ */
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+/**
+ * How many files a watch notice names before summarising the rest as
+ * "N more files", so a directory holding many instrumented files still reads
+ * as one short sentence.
+ */
+const MAX_FILES_NAMED_PER_NOTICE = 3;
+
+/**
+ * The progress stage a conflict row — and a watch paused or resumed row — is
+ * filed under: the stage that owns modifications, which is where both user
+ * interfaces list them.
  */
 const CONFLICT_PROGRESS_STAGE: ProgressStage = 'instrument';
 
 /**
- * The progress status of a conflict row: `running`, **not** `failed`. The
- * session has not failed — the developer simply has a file the product will
- * leave alone — and a `failed` row would be rendered as a failing stage.
+ * The progress status of a conflict row and of a watch notice: `running`,
+ * **not** `failed`. The session has not failed — the developer simply has a
+ * file the product will leave alone, or a file checked by retrying rather than
+ * by an event — and a `failed` row would be rendered as a failing stage.
  */
 const CONFLICT_PROGRESS_STATUS: ProgressStatus = 'running';
 
 /**
  * The bound `session.progress` applies to a row's `message`. A conflict
- * sentence reaches it only with a pathological backup path; clipping keeps the
- * row deliverable instead of letting the schema refuse it.
+ * sentence reaches it only with a pathological backup path, a watch notice only
+ * with pathological file names; clipping keeps the row deliverable instead of
+ * letting the schema refuse it.
  */
 const PROGRESS_MESSAGE_LIMIT = 2_000;
 
@@ -329,9 +389,10 @@ export interface InstrumentationWatcherDeps {
   /** The modification journal: `ModificationsRepo` in production. */
   readonly modifications: WatcherModifications;
   /**
-   * Where the conflict row goes. `SessionProgress` persists each row before
-   * broadcasting it, which is what makes the notice survive a session reopen.
-   * Absent in contexts that only need the journal transition.
+   * Where the conflict row, and the rows announcing that conflict detection
+   * paused or resumed for a directory, go. `SessionProgress` persists each row
+   * before broadcasting it, which is what makes the notice survive a session
+   * reopen. Absent in contexts that only need the journal transition.
    */
   readonly progress?: Pick<SessionProgress, 'emit'> | undefined;
   /** Receives the structured conflict; see {@link ModificationConflictListener}. */
@@ -348,6 +409,20 @@ export interface InstrumentationWatcherDeps {
    * non-negative number is replaced by the default.
    */
   readonly debounceMs?: number | undefined;
+  /**
+   * The wait before the first re-attach attempt of a lost or refused directory
+   * watch, in milliseconds; defaults to {@link DEFAULT_WATCH_RETRY_INITIAL_MS}.
+   * A value that is not a finite, positive number is replaced by the default;
+   * one beyond what a timer can hold is clamped to it.
+   */
+  readonly watchRetryInitialMs?: number | undefined;
+  /**
+   * The ceiling of the re-attach backoff, in milliseconds; defaults to
+   * {@link DEFAULT_WATCH_RETRY_MAX_MS}. Validated like
+   * {@link watchRetryInitialMs}; a ceiling below the initial wait is raised to
+   * it.
+   */
+  readonly watchRetryMaxMs?: number | undefined;
   /** The directory-watch primitive; defaults to `fs.watch`. */
   readonly watch?: WatchLike | undefined;
   /**
@@ -385,10 +460,24 @@ export interface WatchedFile {
  * - `outside-project` — the record's path escapes the project root.
  * - `unsafe-path` — a symbolic link (or a non-directory) stands between the
  *   project root and the file's directory, so nothing is watched through it.
+ *   Found when the watch set is rebuilt, or at runtime — before a recovery
+ *   retry re-attaches the directory or an evaluation reads the file — when a
+ *   directory was replaced by a link; then the file is neither watched nor read
+ *   until the link is gone, and the issue is recorded once per link found.
  * - `directory-missing` — the file's directory is gone; the file is evaluated
  *   once, which reports it missing.
- * - `watch-failed` — the platform refused the directory watch (`ENOSPC`, …).
- * - `watch-lost` — an established watch reported an error and was closed.
+ * - `watch-failed` — the platform refused the directory watch (`ENOSPC`, …):
+ *   the file enters its directory's recovery, which retries the watch with
+ *   bounded backoff and evaluates the file on every refused retry. Also
+ *   recorded, without a recovery, when a directory on the way to the file could
+ *   not be inspected; the next {@link InstrumentationWatcher.refresh} tries
+ *   again.
+ * - `watch-lost` — an established watch reported an error and was closed: the
+ *   file is evaluated once and enters the same recovery.
+ *
+ *   Either way the session is told that conflict detection paused for the
+ *   file, and told again once it resumed. The issue stays listed until the next
+ *   rebuild, as the record of the gap.
  * - `journal-unreadable` — the journal could not answer for this file.
  * - `file-unreadable` — the file exists but could not be read, so no decision
  *   was made about it.
@@ -434,7 +523,9 @@ export interface InstrumentationWatcher {
    * suspended, so an edit made before the watch began is still caught.
    *
    * A file that cannot be watched is recorded as a {@link WatchIssue} and never
-   * aborts the call; only a journal that cannot be read at all is an `Err`.
+   * aborts the call; a refused directory watch is retried in the background
+   * (see `watch-failed`). Only a journal that cannot be read at all is an
+   * `Err`.
    *
    * @returns The files now under watch.
    */
@@ -474,9 +565,11 @@ export interface InstrumentationWatcher {
 
   /**
    * Stops watching one session: closes its directory handles (when no other
-   * session shares them), clears its timers, drops its entries and waits,
-   * bounded, for evaluations already in flight. No transition happens for the
-   * session after it resolves. Idempotent; safe for an unknown session.
+   * session shares them), clears its timers, withdraws its files from every
+   * watch recovery (cancelling a recovery left with no file), drops its
+   * entries and waits, bounded, for evaluations already in flight. No
+   * transition happens for the session after it resolves. Idempotent; safe for
+   * an unknown session.
    *
    * Call it **before** cleanup restores the session's files: a restore is a
    * write this module would otherwise have to judge. (Should one race it
@@ -493,7 +586,8 @@ export interface InstrumentationWatcher {
 
   /**
    * The files currently under watch, for one session or for all of them.
-   * A file whose directory watch could not be established is not listed.
+   * A file whose directory watch could not be established, or was lost, is not
+   * listed until its directory's recovery (or a refresh) re-attaches it.
    */
   watchedFiles(sessionId?: string): readonly WatchedFile[];
 
@@ -576,6 +670,102 @@ const OBSERVATION_WORDING: Readonly<Record<ConflictObservation, string>> = Objec
 });
 
 /**
+ * Why a directory's watch is down, which chooses the reason clause of the
+ * paused notice:
+ *
+ * - `lost` — an established watch reported an error and was closed.
+ * - `refused` — the platform refused to open the watch in the first place.
+ */
+export type WatchOutageCause = 'lost' | 'refused';
+
+/**
+ * Renders the notice that conflict detection paused for files of one
+ * directory, sent to the session once per outage:
+ *
+ * ```text
+ * Conflict detection paused for ‹file›: the watch on its folder stopped.
+ * Debug Generator keeps retrying and still checks the file before restoring it.
+ * ```
+ *
+ * The second sentence is literal: every refused retry evaluates the file, and
+ * cleanup compares it with its `instrumentedHash` before restoring anything.
+ * Exported, like {@link buildConflictMessage}, so the suites reference the one
+ * definition. It names project-relative files only — at most
+ * {@link MAX_FILES_NAMED_PER_NOTICE}, the rest counted — never an absolute
+ * path, content or an errno.
+ *
+ * @example
+ * ```ts
+ * buildWatchPausedMessage(['src/a.ts', 'src/b.ts'], 'refused');
+ * // 'Conflict detection paused for src/a.ts and src/b.ts: the platform refused
+ * //  a watch on their folder. Debug Generator keeps retrying and still checks
+ * //  the files before restoring them.'
+ * ```
+ *
+ * @param files The project-relative files whose watch is down.
+ * @param cause Why the watch is down.
+ * @returns The sentence, verbatim.
+ */
+export function buildWatchPausedMessage(files: readonly string[], cause: WatchOutageCause): string {
+  const named = nameFiles(files);
+  const plural = named.count > 1;
+  const folder = plural ? 'their folder' : 'its folder';
+  const reason =
+    cause === 'lost'
+      ? `the watch on ${folder} stopped`
+      : `the platform refused a watch on ${folder}`;
+  const checked = plural ? 'the files before restoring them' : 'the file before restoring it';
+
+  return `Conflict detection paused for ${named.text}: ${reason}. Debug Generator keeps retrying and still checks ${checked}.`;
+}
+
+/**
+ * Renders the notice that conflict detection resumed for files whose watch was
+ * re-established — by a retry or by a refresh — sent once per outage to each
+ * session that was told it paused:
+ *
+ * ```text
+ * Conflict detection resumed for ‹file›.
+ * ```
+ *
+ * @param files The project-relative files watched again.
+ * @returns The sentence, verbatim.
+ */
+export function buildWatchResumedMessage(files: readonly string[]): string {
+  return `Conflict detection resumed for ${nameFiles(files).text}.`;
+}
+
+/**
+ * Names files compactly — `a`, `a and b`, `a, b and c`, `a, b, c and 2 more
+ * files` — and counts the distinct, non-blank ones.
+ */
+function nameFiles(files: readonly string[]): { readonly text: string; readonly count: number } {
+  const distinct = [...new Set(files.filter((file) => file.length > 0))];
+
+  if (distinct.length === 0) {
+    return { text: 'an instrumented file', count: 1 };
+  }
+
+  const shown = distinct.slice(0, MAX_FILES_NAMED_PER_NOTICE);
+  const hidden = distinct.length - shown.length;
+
+  if (hidden > 0) {
+    return {
+      text: `${shown.join(', ')} and ${String(hidden)} more ${hidden === 1 ? 'file' : 'files'}`,
+      count: distinct.length,
+    };
+  }
+
+  const leading = shown.slice(0, -1);
+  const last = shown.at(-1) ?? '';
+
+  return {
+    text: leading.length === 0 ? last : `${leading.join(', ')} and ${last}`,
+    count: distinct.length,
+  };
+}
+
+/**
  * Clips `text` to `limit` characters with a trailing ellipsis, never splitting
  * a surrogate pair.
  */
@@ -631,6 +821,18 @@ interface WatchEntry {
   readonly basename: string;
   /** The directory watch this entry is subscribed to, when one is established. */
   directoryWatch: DirectoryWatch | undefined;
+  /**
+   * The recovery this entry waits in while its directory watch is down; set
+   * only while `directoryWatch` is `undefined`, cleared on re-attach or release.
+   */
+  recovery: DirectoryRecovery | undefined;
+  /**
+   * The in-project segment at which the last runtime chain check found a
+   * symbolic link, while one stands there: the entry is then neither attached
+   * nor read. Cleared by the first check that finds the chain safe again, so an
+   * `unsafe-path` issue is recorded once per link found.
+   */
+  unsafeSegment: string | undefined;
   /** The pending debounce timer. */
   timer: ReturnType<typeof setTimeout> | undefined;
   /** An evaluation is running. */
@@ -647,6 +849,33 @@ interface DirectoryWatch {
   handle: WatchHandleLike | undefined;
   readonly entries: Set<WatchEntry>;
   closed: boolean;
+}
+
+/**
+ * One directory whose watch is down, and the entries waiting for it — across
+ * every session of this watcher, as the handle itself is shared. Lives from the
+ * outage until its last entry is re-attached, released or stopped.
+ */
+interface DirectoryRecovery {
+  readonly directory: string;
+  /** Active, unwatched entries waiting for this directory. */
+  readonly orphans: Set<WatchEntry>;
+  /**
+   * Per session told that conflict detection paused: the files the notice
+   * named, so a file is announced once per outage and a session is told it
+   * resumed only after it was told it paused.
+   */
+  readonly announced: Map<SessionState, Set<string>>;
+  /** Per session: the entries re-attached so far, named once the session has no orphan left. */
+  readonly restored: Map<SessionState, WatchEntry[]>;
+  /** The pending re-attach attempt. */
+  timer: ReturnType<typeof setTimeout> | undefined;
+  /** The wait before the next attempt; doubles on each refusal, up to the ceiling. */
+  nextDelayMs: number;
+  /** Attempts made so far. */
+  attempts: number;
+  /** Set when the recovery ends; an ended recovery never acts again. */
+  ended: boolean;
 }
 
 /** What the file on disk looked like when an evaluation began. */
@@ -672,17 +901,27 @@ interface ConflictFinding {
   readonly backupVerified: boolean;
 }
 
-/** The errno of a thrown filesystem error, or `'UNKNOWN'`. */
+/**
+ * The errno of a thrown filesystem error, or `'UNKNOWN'`.
+ *
+ * Read through `describeException`, so only a closed-vocabulary code — an
+ * errno / `ERR_*` code, or a `DebuggenError` code — is ever returned: an
+ * arbitrary `code` property on a foreign value never reaches a log field, a
+ * `WatchIssue` or a conflict notice.
+ */
 function errnoOf(thrown: unknown): string {
-  if (typeof thrown === 'object' && thrown !== null && 'code' in thrown) {
-    const code = (thrown as { readonly code: unknown }).code;
+  return describeException(thrown).errorCode ?? 'UNKNOWN';
+}
 
-    if (typeof code === 'string' && code.length > 0) {
-      return code;
-    }
+/** Appends `value` to the list `map` holds for `key`, creating the list on first use. */
+function appendTo<K, V>(map: Map<K, V[]>, key: K, value: V): void {
+  const list = map.get(key);
+
+  if (list === undefined) {
+    map.set(key, [value]);
+  } else {
+    list.push(value);
   }
-
-  return 'UNKNOWN';
 }
 
 /** A frozen public view of one entry. */
@@ -745,6 +984,100 @@ async function inspectDirectoryChain(
   file: string,
   directory: string,
 ): Promise<DirectoryChainState> {
+  const walk = directoryChainOf(projectRoot, file, directory);
+
+  try {
+    const rootStats = await fsPromises.stat(walk.rootDirectory);
+
+    if (!rootStats.isDirectory()) {
+      return { kind: 'missing' };
+    }
+  } catch (thrown) {
+    return chainFailureOf(thrown);
+  }
+
+  for (const step of walk.steps) {
+    if (step.absolute === undefined) {
+      return { kind: 'unsafe', segment: step.prefix };
+    }
+
+    try {
+      const judged = judgeChainSegment(await fsPromises.lstat(step.absolute), step.prefix);
+
+      if (judged !== undefined) {
+        return judged;
+      }
+    } catch (thrown) {
+      return chainFailureOf(thrown);
+    }
+  }
+
+  return { kind: 'ok' };
+}
+
+/**
+ * {@link inspectDirectoryChain}, synchronously, with the same rules and the
+ * same answers.
+ *
+ * Used where the answer gates a synchronous operation that follows the path —
+ * a recovery retry's `fs.watch`, an evaluation's first read — so that no turn
+ * of the event loop separates the last `lstat` from the operation it guards:
+ * a directory swapped for a link while its watch was down is found in the same
+ * turn that would otherwise have followed it. The walk is a handful of
+ * `lstat`s, bounded by the file's depth below the project root.
+ */
+function inspectDirectoryChainSync(
+  projectRoot: string,
+  file: string,
+  directory: string,
+): DirectoryChainState {
+  const walk = directoryChainOf(projectRoot, file, directory);
+
+  try {
+    if (!statSync(walk.rootDirectory).isDirectory()) {
+      return { kind: 'missing' };
+    }
+  } catch (thrown) {
+    return chainFailureOf(thrown);
+  }
+
+  for (const step of walk.steps) {
+    if (step.absolute === undefined) {
+      return { kind: 'unsafe', segment: step.prefix };
+    }
+
+    try {
+      const judged = judgeChainSegment(lstatSync(step.absolute), step.prefix);
+
+      if (judged !== undefined) {
+        return judged;
+      }
+    } catch (thrown) {
+      return chainFailureOf(thrown);
+    }
+  }
+
+  return { kind: 'ok' };
+}
+
+/** The directories a chain inspection walks, from the root down to the file's directory. */
+interface DirectoryChainWalk {
+  /** The project root, as reached from the file's directory (it may be a link the developer chose). */
+  readonly rootDirectory: string;
+  /**
+   * Each directory below the root, as its project-relative prefix and its
+   * contained absolute path — `undefined` when the prefix does not resolve
+   * inside the root, which the walk reports as unsafe.
+   */
+  readonly steps: readonly { readonly prefix: string; readonly absolute: string | undefined }[];
+}
+
+/** The pure part of a chain inspection: what to look at, in order. */
+function directoryChainOf(
+  projectRoot: string,
+  file: string,
+  directory: string,
+): DirectoryChainWalk {
   const segments = file.split('/').filter((segment) => segment.length > 0);
   segments.pop();
 
@@ -754,18 +1087,7 @@ async function inspectDirectoryChain(
     rootDirectory = dirnamePosix(rootDirectory);
   }
 
-  try {
-    const rootStats = await fsPromises.stat(rootDirectory);
-
-    if (!rootStats.isDirectory()) {
-      return { kind: 'missing' };
-    }
-  } catch (thrown) {
-    const errno = errnoOf(thrown);
-
-    return MISSING_ERRNO_CODES.has(errno) ? { kind: 'missing' } : { kind: 'unreadable', errno };
-  }
-
+  const steps: { readonly prefix: string; readonly absolute: string | undefined }[] = [];
   let prefix = '';
 
   for (const segment of segments) {
@@ -773,28 +1095,33 @@ async function inspectDirectoryChain(
 
     const resolved = resolveWithinProject(projectRoot, prefix);
 
-    if (isErr(resolved)) {
-      return { kind: 'unsafe', segment: prefix };
-    }
-
-    try {
-      const stats = await fsPromises.lstat(resolved.value);
-
-      if (stats.isSymbolicLink()) {
-        return { kind: 'unsafe', segment: prefix };
-      }
-
-      if (!stats.isDirectory()) {
-        return { kind: 'missing' };
-      }
-    } catch (thrown) {
-      const errno = errnoOf(thrown);
-
-      return MISSING_ERRNO_CODES.has(errno) ? { kind: 'missing' } : { kind: 'unreadable', errno };
-    }
+    steps.push({ prefix, absolute: isErr(resolved) ? undefined : resolved.value });
   }
 
-  return { kind: 'ok' };
+  return { rootDirectory, steps };
+}
+
+/**
+ * One directory of the chain, judged from its `lstat`: a link is unsafe, a
+ * non-directory makes the file's directory missing, and a real directory lets
+ * the walk go on (`undefined`).
+ */
+function judgeChainSegment(
+  stats: { isSymbolicLink(): boolean; isDirectory(): boolean },
+  prefix: string,
+): DirectoryChainState | undefined {
+  if (stats.isSymbolicLink()) {
+    return { kind: 'unsafe', segment: prefix };
+  }
+
+  return stats.isDirectory() ? undefined : { kind: 'missing' };
+}
+
+/** A chain inspection's failed `stat`: a missing directory, or an unreadable one with its errno. */
+function chainFailureOf(thrown: unknown): DirectoryChainState {
+  const errno = errnoOf(thrown);
+
+  return MISSING_ERRNO_CODES.has(errno) ? { kind: 'missing' } : { kind: 'unreadable', errno };
 }
 
 /** The production {@link WatchLike}: `fs.watch` over one directory. */
@@ -841,6 +1168,18 @@ function resolveDebounce(value: number | undefined): number {
     : DEFAULT_CONFLICT_DEBOUNCE_MS;
 }
 
+/**
+ * A re-attach interval actually used: the injected value when it is a finite,
+ * positive number, else `fallback`, and never beyond what a timer can hold. A
+ * zero is refused like a negative: it would retry a refusing platform in a hot
+ * loop.
+ */
+function resolveRetryInterval(value: number | undefined, fallback: number): number {
+  const usable = value !== undefined && Number.isFinite(value) && value > 0 ? value : fallback;
+
+  return Math.min(usable, MAX_TIMER_DELAY_MS);
+}
+
 // ---------------------------------------------------------------------------
 // Section F — the factory
 // ---------------------------------------------------------------------------
@@ -849,12 +1188,13 @@ function resolveDebounce(value: number | undefined): number {
  * Creates the live conflict detector.
  *
  * The returned watcher holds all of its state — sessions, directory handles,
- * timers, reported transitions — in this closure, so two watchers in one
- * process never interfere and a suite can run several in parallel.
+ * watch recoveries, timers, reported transitions — in this closure, so two
+ * watchers in one process never interfere and a suite can run several in
+ * parallel.
  *
  * @param deps The journal, the progress emitter, the conflict listener, the
- * state root, and optionally a logger, a clock, a debounce, a watch primitive
- * and a backup-store factory.
+ * state root, and optionally a logger, a clock, a debounce, the re-attach
+ * backoff, a watch primitive and a backup-store factory.
  * @returns The watcher. Nothing is watched until
  * {@link InstrumentationWatcher.watchSession} is called.
  *
@@ -882,11 +1222,22 @@ export function createInstrumentationWatcher(
   deps: InstrumentationWatcherDeps,
 ): InstrumentationWatcher {
   const { modifications } = deps;
-  const log = subsystemLogger(deps.logger ?? noopLogger, LOG_SUBSYSTEM).child({
+  // Guarded once, at construction: this module logs on its failure paths — a
+  // lost watch, a refused row, a misread clock — where an injected logger that
+  // throws must not cost the developer the conflict report being assembled.
+  const log = subsystemLogger(guardLogger(deps.logger ?? noopLogger), LOG_SUBSYSTEM).child({
     component: LOG_COMPONENT,
   });
   const clock = deps.now ?? nowEpochMs;
   const debounceMs = resolveDebounce(deps.debounceMs);
+  const retryInitialMs = resolveRetryInterval(
+    deps.watchRetryInitialMs,
+    DEFAULT_WATCH_RETRY_INITIAL_MS,
+  );
+  const retryMaxMs = Math.max(
+    retryInitialMs,
+    resolveRetryInterval(deps.watchRetryMaxMs, DEFAULT_WATCH_RETRY_MAX_MS),
+  );
   const watchDirectory = deps.watch ?? defaultWatch;
   // No logger is handed to the backup store or to detectConflict: both log
   // digests and backup paths, and every record reachable from this module is
@@ -898,19 +1249,41 @@ export function createInstrumentationWatcher(
 
   const sessions = new Map<string, SessionState>();
   const directories = new Map<string, DirectoryWatch>();
+  /** One recovery per directory whose watch is down, keyed like `directories`. */
+  const recoveries = new Map<string, DirectoryRecovery>();
   const reported = new Set<string>();
+  /** Whether {@link stamp} has already recorded falling back to the wall clock. */
+  let clockFallbackRecorded = false;
 
-  /** The clock, replaced by the wall clock when it throws or answers nonsense. */
+  /**
+   * The clock, replaced by the wall clock when it throws or answers nonsense:
+   * an injected clock is a test seam, and its failure must not cost the
+   * developer a conflict report.
+   *
+   * The fallback is a deliberate best-effort decision, recorded at `debug`
+   * with an enumerated reason and, for a throw, the closed exception fields —
+   * once per watcher, so a clock broken for good yields one line rather than
+   * one per stamped issue.
+   */
   function stamp(): number {
-    try {
-      const value = clock();
+    let value: number;
 
-      if (Number.isFinite(value) && value > 0) {
-        return value;
-      }
-    } catch {
-      // Fall through: an injected clock is a test seam, and its failure must
-      // not cost the developer a conflict report.
+    try {
+      value = clock();
+    } catch (thrown) {
+      return wallClock({ reason: 'clock-threw', ...describeException(thrown) });
+    }
+
+    return Number.isFinite(value) && value > 0
+      ? value
+      : wallClock({ reason: 'clock-reading-unusable' });
+  }
+
+  /** The wall-clock fallback of {@link stamp}, recording its first use. */
+  function wallClock(fields: LogFields): number {
+    if (!clockFallbackRecorded) {
+      clockFallbackRecorded = true;
+      log.debug('the injected clock could not be read; the wall clock is used instead', fields);
     }
 
     return nowEpochMs();
@@ -1037,8 +1410,14 @@ export function createInstrumentationWatcher(
 
   /**
    * An established watch failed (the directory vanished, the platform revoked
-   * it). The handle is closed, every file in it is recorded as no longer
-   * watched and evaluated once — which reports it if it is gone.
+   * it). The handle is closed; every file in it is recorded as a `watch-lost`
+   * issue, evaluated once — which reports it if it is gone — and handed to the
+   * directory's recovery, which retries the watch with bounded backoff, keeps
+   * evaluating the files while the platform refuses, and tells each session
+   * that conflict detection paused (and, later, that it resumed).
+   *
+   * @param directoryWatch The handle that reported the error.
+   * @param error The handle's error; only its errno is kept.
    */
   function onDirectoryError(directoryWatch: DirectoryWatch, error: Error): void {
     if (directoryWatch.closed) {
@@ -1048,6 +1427,7 @@ export function createInstrumentationWatcher(
     closeDirectory(directoryWatch);
 
     const orphaned = [...directoryWatch.entries];
+    const errno = errnoOf(error);
     directoryWatch.entries.clear();
 
     for (const entry of orphaned) {
@@ -1060,17 +1440,21 @@ export function createInstrumentationWatcher(
           file: entry.record.file,
           recordId: entry.record.id,
           message:
-            "The watch on this file's directory stopped; the file is checked once more and is watched again after the next refresh.",
-          errno: errnoOf(error),
+            "The watch on this file's directory stopped. It is re-established with backoff; until then the file is checked on every retry, and cleanup checks it before restoring anything.",
+          errno,
         }),
       );
       schedule(entry);
     }
+
+    enterRecovery(directoryWatch.directory, orphaned, 'lost');
   }
 
   /**
    * Subscribes an entry to its directory's handle, opening the handle when it
-   * is the first entry in that directory.
+   * is the first entry in that directory. An entry that was waiting in its
+   * directory's recovery leaves it — whoever re-attached it, a retry or a
+   * rebuild — which cancels the recovery once nothing else waits.
    *
    * @returns `undefined` on success, or the errno the platform refused with.
    */
@@ -1080,6 +1464,7 @@ export function createInstrumentationWatcher(
     if (existing !== undefined && !existing.closed) {
       existing.entries.add(entry);
       entry.directoryWatch = existing;
+      leaveRecovery(entry, 'restored');
 
       return undefined;
     }
@@ -1107,6 +1492,7 @@ export function createInstrumentationWatcher(
     directories.set(entry.directory, created);
     created.entries.add(entry);
     entry.directoryWatch = created;
+    leaveRecovery(entry, 'restored');
 
     return undefined;
   }
@@ -1135,12 +1521,16 @@ export function createInstrumentationWatcher(
     }
   }
 
-  /** Releases an entry for good: no timer, no watch, no further action. */
+  /**
+   * Releases an entry for good: no timer, no watch, no place in a recovery, no
+   * further action.
+   */
   function release(entry: WatchEntry): void {
     entry.active = false;
     entry.dirty = false;
     clearTimer(entry);
     detach(entry);
+    leaveRecovery(entry, 'released');
 
     if (entry.session.entries.get(entry.absolutePath) === entry) {
       entry.session.entries.delete(entry.absolutePath);
@@ -1151,6 +1541,394 @@ export function createInstrumentationWatcher(
   function releaseAll(session: SessionState): void {
     for (const entry of [...session.entries.values()]) {
       release(entry);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Watch recovery
+  // -------------------------------------------------------------------------
+
+  /**
+   * Hands unwatched entries of one directory to its recovery, creating and
+   * arming the recovery when none is running, and tells each session which of
+   * its files lost conflict detection. An entry already waiting is not
+   * announced again, so a rebuild whose attach is refused once more during an
+   * outage adds no row.
+   *
+   * Only entries that are active, unwatched, of a live session and in
+   * `directory` are taken; anything else is ignored.
+   *
+   * @param directory The directory whose watch is down.
+   * @param entries The entries left without a watch.
+   * @param cause Why the watch is down, for the paused notice.
+   */
+  function enterRecovery(
+    directory: string,
+    entries: readonly WatchEntry[],
+    cause: WatchOutageCause,
+  ): void {
+    const eligible = entries.filter(
+      (entry) =>
+        entry.active &&
+        !entry.session.stopped &&
+        entry.directoryWatch === undefined &&
+        entry.directory === directory,
+    );
+
+    if (eligible.length === 0) {
+      return;
+    }
+
+    let recovery = recoveries.get(directory);
+
+    if (recovery === undefined || recovery.ended) {
+      recovery = {
+        directory,
+        orphans: new Set(),
+        announced: new Map(),
+        restored: new Map(),
+        timer: undefined,
+        nextDelayMs: retryInitialMs,
+        attempts: 0,
+        ended: false,
+      };
+      recoveries.set(directory, recovery);
+    }
+
+    const newlyWaiting = new Map<SessionState, WatchEntry[]>();
+
+    for (const entry of eligible) {
+      if (entry.recovery === recovery) {
+        continue;
+      }
+
+      entry.recovery = recovery;
+      recovery.orphans.add(entry);
+      appendTo(newlyWaiting, entry.session, entry);
+    }
+
+    for (const [session, waiting] of newlyWaiting) {
+      announcePaused(recovery, session, waiting, cause);
+    }
+
+    if (recovery.timer === undefined && recovery.orphans.size > 0) {
+      armRecovery(recovery);
+    }
+  }
+
+  /**
+   * Arms a recovery's next attempt on an `unref()`ed timer, replacing any
+   * attempt already armed, so a recovery never holds two timers.
+   */
+  function armRecovery(recovery: DirectoryRecovery): void {
+    if (recovery.timer !== undefined) {
+      clearTimeout(recovery.timer);
+    }
+
+    const timer = setTimeout(() => {
+      recovery.timer = undefined;
+      attemptRecovery(recovery);
+    }, recovery.nextDelayMs);
+
+    timer.unref();
+    recovery.timer = timer;
+  }
+
+  /**
+   * One re-attach attempt. Every waiting entry is attached through
+   * {@link attach}, which opens the directory's handle for the first and shares
+   * it with the rest (or shares one another rebuild already opened). Each
+   * re-attached entry is evaluated once, so an edit made in the gap is judged;
+   * the last one out ends the recovery and sends the resumed notices.
+   *
+   * Before each attach, the directory chain is checked again, in the same turn
+   * as the watch call ({@link chainIsSafe}): the directory may have been
+   * replaced by a link while its watch was down, and a retry must never follow
+   * it. An entry behind a link stays waiting — neither attached nor polled —
+   * and counts as a refusal for the backoff.
+   *
+   * On a refusal, every entry still waiting is polled once ({@link poll}) — the
+   * fallback that keeps edits judged while nothing is watched — and the next
+   * attempt is armed after twice the last wait, capped at the ceiling. The
+   * attempts go on at the ceiling for as long as an entry waits; suspension
+   * does not stop them, while the evaluations obey it through
+   * {@link schedule}.
+   */
+  function attemptRecovery(recovery: DirectoryRecovery): void {
+    if (recovery.ended) {
+      return;
+    }
+
+    recovery.attempts += 1;
+
+    const reattached: WatchEntry[] = [];
+    let refused: string | undefined;
+    let withheld = 0;
+
+    for (const entry of [...recovery.orphans]) {
+      // Re-checked per entry: a notice sent for the previous one may have
+      // reached code that released or re-attached this one.
+      if (entry.recovery !== recovery) {
+        recovery.orphans.delete(entry);
+        continue;
+      }
+
+      if (!entry.active || entry.session.stopped || entry.directoryWatch !== undefined) {
+        leaveRecovery(entry, 'released');
+        continue;
+      }
+
+      if (!chainIsSafe(entry)) {
+        withheld += 1;
+        continue;
+      }
+
+      refused = attach(entry);
+
+      if (refused !== undefined) {
+        break;
+      }
+
+      reattached.push(entry);
+    }
+
+    for (const entry of reattached) {
+      schedule(entry);
+    }
+
+    if (!recovery.ended && recovery.orphans.size === 0) {
+      endRecovery(recovery);
+    }
+
+    if (recovery.ended) {
+      return;
+    }
+
+    if (refused === undefined && withheld === 0) {
+      // Entries that joined while this attempt ran get the next one.
+      armRecovery(recovery);
+
+      return;
+    }
+
+    const retryInMs = Math.min(recovery.nextDelayMs * 2, retryMaxMs);
+
+    for (const [session, waiting] of orphansBySession(recovery)) {
+      log.debug('a directory watch is still refused; its files are checked now and retried', {
+        [LOG_BINDING_KEYS.sessionId]: session.sessionId,
+        files: waiting.map((entry) => entry.record.file),
+        attempt: recovery.attempts,
+        retryInMs,
+        errno: refused,
+        ...(withheld === 0 ? {} : { withheld }),
+      });
+
+      for (const entry of waiting) {
+        poll(entry);
+      }
+    }
+
+    recovery.nextDelayMs = retryInMs;
+    armRecovery(recovery);
+  }
+
+  /**
+   * Checks, synchronously, that no symbolic link stands between the project
+   * root and an entry's directory ({@link inspectDirectoryChainSync}), so the
+   * watch call or read it guards follows in the same turn as the last `lstat`.
+   *
+   * A link found at a segment not reported yet records one `unsafe-path` issue;
+   * the entry keeps the segment until a check finds the chain safe again. A
+   * missing or unreadable chain passes: the operation it guards fails on its
+   * own, as it would have without the check, and reports that.
+   *
+   * @returns Whether the entry's directory may be watched and its file read now.
+   */
+  function chainIsSafe(entry: WatchEntry): boolean {
+    const chain = inspectDirectoryChainSync(
+      entry.session.projectRoot,
+      entry.record.file,
+      entry.directory,
+    );
+
+    if (chain.kind !== 'unsafe') {
+      entry.unsafeSegment = undefined;
+
+      return true;
+    }
+
+    if (entry.unsafeSegment !== chain.segment) {
+      entry.unsafeSegment = chain.segment;
+      pushRuntimeIssue(
+        entry.session,
+        makeIssue(entry.session, {
+          kind: 'unsafe-path',
+          code: 'FS_UNSAFE_PATH',
+          file: entry.record.file,
+          recordId: entry.record.id,
+          message: `A symbolic link now stands at '${chain.segment}' inside the project, so the file is neither watched nor read through it. Watching resumes once the link is gone; cleanup checks the file before restoring anything.`,
+        }),
+      );
+    }
+
+    return false;
+  }
+
+  /**
+   * Takes an entry out of its recovery: `restored` when it was re-attached,
+   * `released` when it no longer needs watching (released, stopped). A session
+   * left with no waiting entry is settled; a recovery left with none ends.
+   */
+  function leaveRecovery(entry: WatchEntry, outcome: 'restored' | 'released'): void {
+    const { recovery, session } = entry;
+
+    if (recovery === undefined) {
+      return;
+    }
+
+    entry.recovery = undefined;
+    recovery.orphans.delete(entry);
+
+    if (outcome === 'restored') {
+      appendTo(recovery.restored, session, entry);
+    }
+
+    if (![...recovery.orphans].some((orphan) => orphan.session === session)) {
+      settleSession(recovery, session);
+    }
+
+    if (recovery.orphans.size === 0) {
+      endRecovery(recovery);
+    }
+  }
+
+  /**
+   * Closes one session's part in a recovery: when it was told conflict
+   * detection paused and some of its files are watched again, it is told that
+   * detection resumed for them. A stopped session is told nothing.
+   */
+  function settleSession(recovery: DirectoryRecovery, session: SessionState): void {
+    const restored = (recovery.restored.get(session) ?? []).filter((entry) => entry.active);
+    const wasAnnounced = recovery.announced.has(session);
+
+    recovery.restored.delete(session);
+    recovery.announced.delete(session);
+
+    if (restored.length === 0 || session.stopped) {
+      return;
+    }
+
+    const files = restored.map((entry) => entry.record.file);
+
+    log.info('a directory watch is re-established; conflict detection resumed', {
+      [LOG_BINDING_KEYS.sessionId]: session.sessionId,
+      files,
+      attempts: recovery.attempts,
+    });
+
+    if (wasAnnounced) {
+      emitWatchNotice(session, buildWatchResumedMessage(files), 'resumed');
+    }
+  }
+
+  /** Ends a recovery: its timer is cleared and nothing of it acts again. */
+  function endRecovery(recovery: DirectoryRecovery): void {
+    if (recovery.ended) {
+      return;
+    }
+
+    recovery.ended = true;
+
+    if (recovery.timer !== undefined) {
+      clearTimeout(recovery.timer);
+      recovery.timer = undefined;
+    }
+
+    if (recoveries.get(recovery.directory) === recovery) {
+      recoveries.delete(recovery.directory);
+    }
+
+    for (const orphan of recovery.orphans) {
+      orphan.recovery = undefined;
+    }
+
+    recovery.orphans.clear();
+    recovery.announced.clear();
+    recovery.restored.clear();
+  }
+
+  /** A recovery's waiting entries, grouped by session in arrival order. */
+  function orphansBySession(recovery: DirectoryRecovery): Map<SessionState, WatchEntry[]> {
+    const grouped = new Map<SessionState, WatchEntry[]>();
+
+    for (const entry of recovery.orphans) {
+      appendTo(grouped, entry.session, entry);
+    }
+
+    return grouped;
+  }
+
+  /**
+   * Tells one session that conflict detection paused for those of `entries`
+   * whose files its notice has not named yet in this outage.
+   */
+  function announcePaused(
+    recovery: DirectoryRecovery,
+    session: SessionState,
+    entries: readonly WatchEntry[],
+    cause: WatchOutageCause,
+  ): void {
+    const named = recovery.announced.get(session) ?? new Set<string>();
+    const files = entries.map((entry) => entry.record.file).filter((file) => !named.has(file));
+
+    if (files.length === 0) {
+      return;
+    }
+
+    for (const file of files) {
+      named.add(file);
+    }
+
+    recovery.announced.set(session, named);
+    emitWatchNotice(session, buildWatchPausedMessage(files, cause), 'paused');
+  }
+
+  /**
+   * Emits one watch notice row through the progress emitter, which persists it
+   * before broadcasting. Skipped without an emitter; a refusal or a throw is
+   * logged and contained, as for the conflict row.
+   */
+  function emitWatchNotice(
+    session: SessionState,
+    message: string,
+    notice: 'paused' | 'resumed',
+  ): void {
+    const { progress } = deps;
+
+    if (progress === undefined) {
+      return;
+    }
+
+    try {
+      const sent = progress.emit(session.sessionId, {
+        stage: CONFLICT_PROGRESS_STAGE,
+        status: CONFLICT_PROGRESS_STATUS,
+        message: clip(message, PROGRESS_MESSAGE_LIMIT),
+      });
+
+      if (isErr(sent)) {
+        log.warn('the watch notice progress row was refused', {
+          [LOG_BINDING_KEYS.sessionId]: session.sessionId,
+          notice,
+          code: sent.error.code,
+        });
+      }
+    } catch (thrown) {
+      log.warn('the watch notice progress row could not be emitted', {
+        [LOG_BINDING_KEYS.sessionId]: session.sessionId,
+        notice,
+        code: DebuggenError.from(thrown).code,
+      });
     }
   }
 
@@ -1185,6 +1963,22 @@ export function createInstrumentationWatcher(
 
     timer.unref();
     entry.timer = timer;
+  }
+
+  /**
+   * Asks for one evaluation of an entry waiting in a recovery — the polling
+   * fallback. Unlike {@link schedule}, a poll never restarts a debounce that is
+   * already counting and never queues behind a running evaluation: the check
+   * already due or in flight answers it. Polls arriving faster than the
+   * debounce therefore cannot postpone the check forever. An entry behind a
+   * link ({@link chainIsSafe}) is not polled.
+   */
+  function poll(entry: WatchEntry): void {
+    if (entry.timer !== undefined || entry.evaluating || entry.unsafeSegment !== undefined) {
+      return;
+    }
+
+    schedule(entry);
   }
 
   /**
@@ -1237,10 +2031,11 @@ export function createInstrumentationWatcher(
    * Decides whether one watched file diverged from its chain head and, when it
    * did, records the conflict and announces it.
    *
-   * The sequence: observe the bytes → compare with the cached head (equal: stop,
+   * The sequence: check the directory chain (a link on the way: stop, recorded
+   * once) → observe the bytes → compare with the cached head (equal: stop,
    * silently) → confirm the head against the journal (a newer head the file
-   * matches: adopt it and stop) → obtain the verdict and report from
-   * `detectConflict` → re-read the record immediately before the one permitted
+   * matches: adopt it and stop) → check the chain again → obtain the verdict and
+   * report from `detectConflict` → re-read the record immediately before the one permitted
    * mutation → `applied → conflict` → notify once. Every `await` is followed by
    * a liveness check, so a suspend or a stop that lands mid-evaluation stops it
    * before it can mutate anything.
@@ -1250,6 +2045,13 @@ export function createInstrumentationWatcher(
     const epoch = session.epoch;
     const live = (): boolean =>
       entry.active && !session.stopped && session.suspendDepth === 0 && session.epoch === epoch;
+
+    // A directory on the way may have been replaced by a link since the watch
+    // set was built: nothing is hashed through one. Checked in this turn, just
+    // before the read begins.
+    if (!chainIsSafe(entry)) {
+      return;
+    }
 
     let head = entry.record;
     const observation = await observeFile(entry.absolutePath);
@@ -1339,6 +2141,13 @@ export function createInstrumentationWatcher(
 
         return;
       }
+    }
+
+    // The verdict reads the file again, for the diff: the chain is re-checked
+    // in this turn, just before that read, so no content behind a link reaches
+    // a report.
+    if (!chainIsSafe(entry)) {
+      return;
     }
 
     const finding = await describeConflict(session, head, observation);
@@ -1711,7 +2520,9 @@ export function createInstrumentationWatcher(
    * file whose chain head is `applied`. An existing entry is kept (and its head
    * replaced when it moved); an entry whose file is no longer applied is
    * released; a new file is watched. Unless the session is suspended, every new
-   * or re-headed entry is evaluated once.
+   * or re-headed entry — and every entry re-attached out of a watch recovery —
+   * is evaluated once. An entry whose directory watch the platform refuses
+   * enters that directory's recovery.
    */
   async function rebuild(
     session: SessionState,
@@ -1850,6 +2661,7 @@ export function createInstrumentationWatcher(
     // Everything below is synchronous: the reconciliation cannot interleave
     // with an event, a suspend or a stop.
     const toEvaluate: WatchEntry[] = [];
+    const refusedByDirectory = new Map<string, WatchEntry[]>();
 
     for (const entry of [...session.entries.values()]) {
       const wanted = desired.get(entry.absolutePath);
@@ -1867,6 +2679,8 @@ export function createInstrumentationWatcher(
       }
 
       entry.record = wanted.head;
+      // This rebuild's own chain check found no link on the way to the file.
+      entry.unsafeSegment = undefined;
     }
 
     for (const [absolutePath, wanted] of desired) {
@@ -1880,6 +2694,8 @@ export function createInstrumentationWatcher(
           directory: wanted.directory,
           basename: wanted.basename,
           directoryWatch: undefined,
+          recovery: undefined,
+          unsafeSegment: undefined,
           timer: undefined,
           evaluating: false,
           dirty: false,
@@ -1912,24 +2728,41 @@ export function createInstrumentationWatcher(
         continue;
       }
 
+      // An entry waiting in a recovery that this rebuild re-attaches leaves it
+      // (cancelling the recovery once nothing else waits) and is evaluated
+      // once, for an edit made while it was unwatched.
+      const wasWaiting = entry.recovery !== undefined;
       const refused = attach(entry);
 
-      if (refused !== undefined) {
-        issues.push(
-          makeIssue(session, {
-            kind: 'watch-failed',
-            code: 'INSTRUMENTATION_UNAVAILABLE',
-            file: wanted.head.file,
-            recordId: wanted.head.id,
-            message:
-              "The platform refused a watch on the file's directory; edits to it are detected at the next refresh or at cleanup.",
-            errno: refused,
-          }),
-        );
+      if (refused === undefined) {
+        if (wasWaiting && !toEvaluate.includes(entry)) {
+          toEvaluate.push(entry);
+        }
+
+        continue;
       }
+
+      issues.push(
+        makeIssue(session, {
+          kind: 'watch-failed',
+          code: 'INSTRUMENTATION_UNAVAILABLE',
+          file: wanted.head.file,
+          recordId: wanted.head.id,
+          message:
+            "The platform refused a watch on the file's directory. It is retried with backoff; until then the file is checked on every retry, and cleanup checks it before restoring anything.",
+          errno: refused,
+        }),
+      );
+      appendTo(refusedByDirectory, entry.directory, entry);
     }
 
     session.issues = issues;
+
+    // One recovery per refused directory, entered once with all of its files,
+    // so the session is told in one row per directory.
+    for (const [directory, refusedEntries] of refusedByDirectory) {
+      enterRecovery(directory, refusedEntries, 'refused');
+    }
 
     for (const entry of toEvaluate) {
       schedule(entry);
@@ -1987,6 +2820,12 @@ export function createInstrumentationWatcher(
 
   async function stopAll(): Promise<void> {
     await Promise.all([...sessions.values()].map((session) => stopState(session)));
+
+    // Stopping every session already emptied every recovery; any one left is
+    // cancelled here so no retry timer outlives the watcher.
+    for (const recovery of [...recoveries.values()]) {
+      endRecovery(recovery);
+    }
 
     for (const directoryWatch of [...directories.values()]) {
       closeDirectory(directoryWatch);

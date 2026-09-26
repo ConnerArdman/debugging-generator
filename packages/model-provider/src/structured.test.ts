@@ -20,10 +20,11 @@
  *    fragile spy.
  * 2. **The asymmetry is asserted from both sides.** A schema failure earns a
  *    repair whose turn carries the failing field paths; a normaliser throw
- *    earns an immediate rejection, one error-level log record carrying the
- *    input, and *no second call*. A provider failure earns neither — it
- *    short-circuits without spending a repair, because a call that produced no
- *    output has nothing to correct.
+ *    earns an immediate rejection, one error-level log record carrying closed
+ *    fields only — provenance, counts and the thrown error's code, never the
+ *    input or the thrown message — and *no second call*. A provider failure
+ *    earns neither — it short-circuits without spending a repair, because a
+ *    call that produced no output has nothing to correct.
  * 3. **The re-parse of the raw output is load-bearing.** One case scripts an
  *    attempt whose *pre-parsed* value violates a numeric bound and requires it
  *    to be rejected, because the real provider's schema helpers strip the
@@ -31,9 +32,12 @@
  *    §0.2.4). That case is what stops the re-parse from being "optimised away".
  * 4. **Nothing rejected is ever echoed.** A distinctive sentinel is planted in
  *    every position a rejected payload could travel from — a failing value, an
- *    undecoded response — and required to be absent from the repair turn, the
- *    rejection's message and details, and the log fields. This text is sent
- *    back to a provider and persisted with a session, so the property matters.
+ *    undecoded response, a schema-valid answer a normaliser then threw on, the
+ *    thrown message itself — and required to be absent from the repair turn,
+ *    the rejection's message and details, and every log record at every level.
+ *    This text is sent back to a provider, persisted with a session and written
+ *    to the service log, which no redaction checkpoint guards (CWE-532), so the
+ *    property matters.
  *
  * ## Harness constraints this file works under
  *
@@ -71,6 +75,7 @@ import {
   MAX_ISSUE_LINE_LENGTH,
   NON_JSON_ISSUE_MESSAGE,
   REPAIR_ASSISTANT_NOTICE,
+  UNVALIDATABLE_ISSUE_MESSAGE,
   buildRepairRequest,
   formatZodIssues,
   generateStructuredWithRepair,
@@ -1004,7 +1009,7 @@ describe('normalisation', () => {
     expect(String(error.cause)).toContain(thrown.message);
   });
 
-  it('logs the normaliser failure once, at error level, with the input that provoked it', async () => {
+  it('logs the normaliser failure once, at error level, with closed fields and the closed code only', async () => {
     const provider = createFakeProvider([decoded(VALID_OUTPUT)]);
 
     const result = await generateStructuredWithRepair(provider, reportSchema, makeRequest(), {
@@ -1022,18 +1027,185 @@ describe('normalisation', () => {
     expect(logRecords).toHaveLength(1);
     const record = onlyRecordAt('error');
     expect(record.message).toContain('normaliser threw');
-    // The one value this loop ever logs: whoever fixes the defect needs the
-    // input that provoked it.
-    expect(record.fields.input).toEqual(VALID_OUTPUT);
-    expect(record.fields.reason).toBe('normalize');
-    expect(record.fields.attempts).toBe(1);
-    expect(record.fields.repairs).toBe(0);
-    expect(record.fields.stage).toBe(DEFAULT_STAGE);
-    expect(record.fields.promptVersion).toBe(DEFAULT_PROMPT_VERSION);
-    expect(record.fields.sessionId).toBe(DEFAULT_SESSION_ID);
-    expect(record.fields.schemaName).toBe('report');
-    expect(String(record.fields.error)).toContain('could not derive');
+    // The whole key set is pinned rather than probed field by field, so an open
+    // field — the parsed answer, the thrown message, a details value — cannot
+    // be added unnoticed. Provenance and counts locate the answer; the closed
+    // code classifies the defect. A native `Error` carries no code of its own,
+    // so the record says `INTERNAL`, and it carries no failure class.
+    expect(record.fields).toEqual({
+      reason: 'normalize',
+      attempts: 1,
+      repairs: 0,
+      stage: DEFAULT_STAGE,
+      promptVersion: DEFAULT_PROMPT_VERSION,
+      sessionId: DEFAULT_SESSION_ID,
+      schemaName: 'report',
+      code: 'INTERNAL',
+    });
+    expect('input' in record.fields).toBe(false);
+    expect('error' in record.fields).toBe(false);
+    expect(logText()).not.toContain('could not derive');
   });
+
+  it('logs a thrown DebuggenError by its own code and failure class, never by its message, hint or details', async () => {
+    const thrown = new DebuggenError(
+      'PANEL_INVALID',
+      'the normalised document broke a whole-document rule',
+      {
+        hint: 'a hint the log never repeats',
+        details: {
+          failureClass: 'internal-schema',
+          issueCount: 2,
+          note: 'a detail value the log never repeats',
+        },
+      },
+    );
+    const provider = createFakeProvider([decoded(VALID_OUTPUT)]);
+
+    const result = await generateStructuredWithRepair(provider, reportSchema, makeRequest(), {
+      normalize: (): NormalizedReport => {
+        throw thrown;
+      },
+      schemaName: 'report',
+      logger: captureLogger,
+    });
+
+    const error = expectErr(result);
+    expect(onlyRecordAt('error').fields).toEqual({
+      reason: 'normalize',
+      attempts: 1,
+      repairs: 0,
+      stage: DEFAULT_STAGE,
+      promptVersion: DEFAULT_PROMPT_VERSION,
+      sessionId: DEFAULT_SESSION_ID,
+      schemaName: 'report',
+      code: 'PANEL_INVALID',
+      failureClass: 'internal-schema',
+    });
+    const logged = logText();
+    expect(logged).not.toContain('whole-document rule');
+    expect(logged).not.toContain('never repeats');
+    // The rejection is this module's own `INTERNAL`; the thrown error travels
+    // on as its cause by identity, which is where a caller's classifier reads
+    // the failure class back from.
+    expect(error.code).toBe('INTERNAL');
+    expect(error.cause).toBe(thrown);
+  });
+
+  it('drops a failure class it cannot read, or one too long to be a class token, and still rejects', async () => {
+    const unreadable: Record<string, unknown> = {};
+    Object.defineProperty(unreadable, 'failureClass', {
+      enumerable: true,
+      get: (): never => {
+        throw new Error('a details getter that refuses to be read');
+      },
+    });
+    const throws = [
+      new DebuggenError('INTERNAL', 'the normaliser failed', { details: unreadable }),
+      new DebuggenError('INTERNAL', 'the normaliser failed', {
+        details: { failureClass: `a${'-b'.repeat(40)}` },
+      }),
+    ];
+
+    for (const thrown of throws) {
+      logRecords.length = 0;
+      const provider = createFakeProvider([decoded(VALID_OUTPUT)]);
+
+      const result = await generateStructuredWithRepair(provider, reportSchema, makeRequest(), {
+        normalize: (): NormalizedReport => {
+          throw thrown;
+        },
+        logger: captureLogger,
+      });
+
+      // A typed rejection, never an exception out of the loop, with the thrown
+      // error still attached; the record keeps its closed code and names no class.
+      const error = expectErr(result);
+      expect(detailsOf(error).reason).toBe('normalize');
+      expect(error.cause).toBe(thrown);
+      const fields = onlyRecordAt('error').fields;
+      expect(fields.code).toBe('INTERNAL');
+      expect('failureClass' in fields).toBe(false);
+    }
+  });
+
+  /**
+   * The shapes a normaliser failure arrives in, each quoting the private
+   * sentinel wherever it can: the message, and — for a `DebuggenError` — the
+   * hint, a details value and a `failureClass` that is prose rather than a
+   * class token, which the loop must drop rather than log.
+   */
+  const privateThrows: readonly {
+    readonly kind: string;
+    readonly make: () => Error;
+    readonly code: string;
+  }[] = [
+    {
+      kind: 'a native Error',
+      make: () => new Error(`derivation failed near ${SENTINEL}`),
+      code: 'INTERNAL',
+    },
+    {
+      kind: 'a DebuggenError',
+      make: () =>
+        new DebuggenError('PANEL_INVALID', `the normalised document quoted ${SENTINEL}`, {
+          hint: `compare against ${SENTINEL}`,
+          details: {
+            failureClass: `not a class token ${SENTINEL}`,
+            quoted: SENTINEL,
+            issues: [{ path: 'label', code: SENTINEL }],
+          },
+        }),
+      code: 'PANEL_INVALID',
+    },
+  ];
+
+  it.each(privateThrows)(
+    'keeps a private sentinel in the parsed answer and in $kind out of every log record',
+    async ({ make, code }) => {
+      const thrown = make();
+      const provider = createFakeProvider([decoded({ count: 3, label: SENTINEL })]);
+      const handed: string[] = [];
+
+      const result = await generateStructuredWithRepair(provider, reportSchema, makeRequest(), {
+        normalize: (input): NormalizedReport => {
+          handed.push(input.label);
+          throw thrown;
+        },
+        schemaName: 'report',
+        logger: captureLogger,
+      });
+
+      const error = expectErr(result);
+      // Not vacuous: the normaliser really was handed the schema-valid private
+      // answer, exactly once, after exactly one provider call.
+      expect(handed).toEqual([SENTINEL]);
+      expect(provider.calls).toHaveLength(1);
+
+      // Every record at every level — the capture logger's threshold is
+      // `trace` — serialised whole: message, name and fields.
+      expect(logRecords.length).toBeGreaterThan(0);
+      for (const record of logRecords) {
+        expect(JSON.stringify(record)).not.toContain(SENTINEL);
+      }
+      const fields = onlyRecordAt('error').fields;
+      expect(fields.code).toBe(code);
+      expect('failureClass' in fields).toBe(false);
+
+      // The rejection is closed too, and still classifies the defect.
+      expect(error.code).toBe('INTERNAL');
+      expect(detailsOf(error).reason).toBe('normalize');
+      expect(rejectionText(error)).not.toContain(SENTINEL);
+
+      // The thrown value is preserved on the cause chain — by identity for a
+      // `DebuggenError`, one level down for the `DebuggenError` that `tryCatch`
+      // wraps a native error in — so the defect stays diagnosable in-process
+      // without ever being written to a log.
+      const wrapped = error.cause;
+      expect(DebuggenError.is(wrapped)).toBe(true);
+      expect([wrapped, DebuggenError.is(wrapped) ? wrapped.cause : undefined]).toContain(thrown);
+    },
+  );
 
   it('accepts a normaliser that returns a falsy value', async () => {
     // `tryCatch` classifies by *throwing*, never by the value returned, so a
@@ -1172,6 +1344,140 @@ describe('an answer that never decoded as JSON', () => {
 
     expectOk(result);
     expect(lastTurnContent(callAt(provider, 1))).not.toContain(SENTINEL);
+    expect(logText()).not.toContain(SENTINEL);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Output the schema could not even read
+ * ---------------------------------------------------------------------------
+ */
+
+describe('an answer whose validation throws', () => {
+  /** The one line a throwing parse is reported with, as a rejection's details carry it. */
+  const UNVALIDATABLE_LINE = `${ISSUE_ROOT_MARKER}: ${UNVALIDATABLE_ISSUE_MESSAGE}`;
+
+  /** A decoded answer whose `count` getter throws an error carrying the sentinel. */
+  function throwingGetterOutput(): unknown {
+    return Object.defineProperty({ label: 'first' }, 'count', {
+      enumerable: true,
+      get: () => {
+        throw new Error(`the read of ${SENTINEL} failed`);
+      },
+    });
+  }
+
+  /** A schema whose `safeParse` throws `thrown` for every input, before any issue is recorded. */
+  function throwingSchema(thrown: () => unknown): ZodType<ReportInput> {
+    return z.preprocess((value: unknown) => {
+      // The branch keeps the preprocess callback's return reachable for the
+      // compiler; every input takes the throwing one.
+      if (value !== SENTINEL) {
+        throw thrown();
+      }
+      return value;
+    }, reportSchema);
+  }
+
+  it('turns a parse that throws into an invalid attempt, repaired rather than thrown', async () => {
+    const provider = createFakeProvider([decoded(throwingGetterOutput()), decoded(VALID_OUTPUT)]);
+    // The premise: the real schema, handed this output, throws.
+    expect(() => reportSchema.safeParse(throwingGetterOutput())).toThrow(SENTINEL);
+
+    const result = await generateStructuredWithRepair(provider, reportSchema, makeRequest(), {
+      logger: captureLogger,
+    });
+
+    expectOk(result);
+    expect(result.value.value).toEqual(VALID_OUTPUT);
+    expect(provider.calls).toHaveLength(2);
+    expect(result.value.repairs).toBe(1);
+    const repair = lastTurnContent(callAt(provider, 1));
+    expect(repair).toContain(UNVALIDATABLE_LINE);
+    expect(repair).not.toContain(SENTINEL);
+    expect(logText()).not.toContain(SENTINEL);
+  });
+
+  it('spends the repair budget on a schema that always throws, then rejects with reason "schema"', async () => {
+    const script = Array.from({ length: DEFAULT_MAX_REPAIRS + 1 }, () => decoded(VALID_OUTPUT));
+    const provider = createFakeProvider(script);
+    const schema = throwingSchema(() => new Error(`validation touched ${SENTINEL}`));
+
+    const pending = generateStructuredWithRepair(provider, schema, makeRequest(), {
+      logger: captureLogger,
+      schemaName: 'report',
+    });
+    await expect(pending).resolves.toBeDefined();
+    const error = expectErr(await pending);
+
+    // Counted as invalid: one attempt plus every repair, never a further call.
+    expect(provider.calls).toHaveLength(DEFAULT_MAX_REPAIRS + 1);
+    expect(error.code).toBe('MODEL_OUTPUT_INVALID');
+    const details = detailsOf(error);
+    expect(details.reason).toBe('schema');
+    expect(details.attempts).toBe(DEFAULT_MAX_REPAIRS + 1);
+    expect(details.repairs).toBe(DEFAULT_MAX_REPAIRS);
+    expect(details.issues).toEqual([UNVALIDATABLE_LINE]);
+    expect(details.issueCount).toBe(1);
+
+    // No copy of the thrown message anywhere it could travel.
+    for (let index = 1; index < provider.calls.length; index += 1) {
+      const repair = lastTurnContent(callAt(provider, index));
+      expect(repair).toContain(UNVALIDATABLE_LINE);
+      expect(repair).not.toContain(SENTINEL);
+    }
+    expect(rejectionText(error)).not.toContain(SENTINEL);
+    expect(error.message).not.toContain(SENTINEL);
+    expect(logText()).not.toContain(SENTINEL);
+
+    // One content-free warn record per throwing attempt, plus the budget-spent record.
+    const threw = logRecords.filter(
+      (record) =>
+        record.message ===
+        'The authoring schema threw while validating an attempt; treating the attempt as invalid',
+    );
+    expect(threw).toHaveLength(DEFAULT_MAX_REPAIRS + 1);
+    for (const record of threw) {
+      expect(record.level).toBe('warn');
+      expect(record.fields['issuePaths']).toEqual([ISSUE_ROOT_MARKER]);
+      expect(record.fields['reason']).toBe('schema');
+    }
+  });
+
+  it('never reads the thrown value, even one whose own reads throw', async () => {
+    const provider = createFakeProvider([decoded(VALID_OUTPUT)]);
+    let reads = 0;
+    const hostileThrown = new Proxy(
+      {},
+      {
+        get: () => {
+          reads += 1;
+          throw new Error(SENTINEL);
+        },
+        getPrototypeOf: () => {
+          reads += 1;
+          throw new Error(SENTINEL);
+        },
+        has: () => {
+          reads += 1;
+          throw new Error(SENTINEL);
+        },
+      },
+    );
+
+    const result = await generateStructuredWithRepair(
+      provider,
+      throwingSchema(() => hostileThrown),
+      makeRequest(),
+      { maxRepairs: 0, logger: captureLogger },
+    );
+
+    const error = expectErr(result);
+    expect(detailsOf(error).reason).toBe('schema');
+    expect(detailsOf(error).issues).toEqual([UNVALIDATABLE_LINE]);
+    expect(reads).toBe(0);
+    expect(rejectionText(error)).not.toContain(SENTINEL);
     expect(logText()).not.toContain(SENTINEL);
   });
 });

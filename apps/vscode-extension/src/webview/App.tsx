@@ -6,9 +6,25 @@
  * action leaves as exactly one `WebviewToHostMessage` through `postToHost`. No component below
  * `App` owns server state, posts to the host or touches `./vscode-api` — they receive plain data
  * and report intent through callbacks. `main.tsx` owns `createRoot` and the `ready` handshake.
+ *
+ * ## Pending actions
+ *
+ * A control stays disabled from the moment its request is handed to the host until the host has
+ * answered THAT request — never merely until the host next speaks. Every request leaves with a
+ * `requestId` minted here, in the event path ({@link createRequestId}), and the host answers it with
+ * exactly one `actionResult` echoing that id; `./pending-actions` settles a pending request on that
+ * frame alone, when both its `action` and its `requestId` match. Snapshots, notices and pairing
+ * frames are presentational: they update what the view shows and settle nothing, so the
+ * session-less snapshot `debuggen.startSession` pushes before `POST /sessions` resolves, a session
+ * reopened from the Sessions tree, End session's `ended` snapshot, the "pick the element" notice or
+ * an unrelated error can no longer re-enable a control mid-request or discard a draft. `openFile`
+ * waits on nothing: it carries no id and never touches the pending state. A request the host never
+ * answers is failed by the reducer's 150 s safety timeout, which outlasts every host-side bound.
+ * `QuestionForm` and `FollowUp` keep the typed text until their submission's own result arrives,
+ * clearing it only when the host accepted it and keeping it, with a retry hint, when it failed.
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import type { ReactElement, Ref, RefObject } from 'react';
 
 import {
@@ -42,8 +58,6 @@ import type {
   SessionCleanupState,
   StageFailure,
   WebviewState,
-  WebviewToHostMessage,
-  WebviewToHostMessageType,
 } from '../webview-messages';
 
 import { AnalysisSummary } from './components/AnalysisSummary';
@@ -56,6 +70,15 @@ import { QuestionForm } from './components/QuestionForm';
 import { RelevantFiles } from './components/RelevantFiles';
 import { StatusBar } from './components/StatusBar';
 import { TargetBadge } from './components/TargetBadge';
+import {
+  INITIAL_PENDING_ACTIONS_STATE,
+  isPending,
+  isWebviewRequestDraft,
+  nextDeadline,
+  pendingActionsReducer,
+  withRequestId,
+} from './pending-actions';
+import type { WebviewToHostDraft } from './pending-actions';
 import { useWebviewTheme } from './theme';
 import { isVsCodeApiAvailable, postToHost, subscribeToHost } from './vscode-api';
 
@@ -223,6 +246,13 @@ const UNDELIVERED_HINT =
 
 /** How many host notices are kept; the oldest is dropped first so the view never grows unbounded. */
 const MAX_NOTICES = 5;
+
+/**
+ * Random bytes in one request id: 16 (128 bits), written as 32 lowercase hex characters — well
+ * inside the contract's `MAX_WEBVIEW_REQUEST_ID_LENGTH` and `[A-Za-z0-9_-]` alphabet, and wide
+ * enough that two requests of one view never share an id.
+ */
+const REQUEST_ID_BYTES = 16;
 
 /** The class of every focus or reveal target wrapper; declared in `./styles.css`. */
 const ANCHOR_CLASS = 'dgv-view__anchor';
@@ -446,6 +476,28 @@ function reveal(element: HTMLElement): void {
   if (typeof element.scrollIntoView === 'function') {
     element.scrollIntoView({ block: 'nearest' });
   }
+}
+
+/**
+ * Mints the id of one request: {@link REQUEST_ID_BYTES} bytes from the platform's CSPRNG, as
+ * lowercase hex. Called from the send path only — an event handler — and never from the reducer,
+ * which must stay free of randomness for StrictMode's replay. The id is a correlation handle, not
+ * a secret: it only lets the host's `actionResult` name the request it answers.
+ *
+ * @returns 32 characters from `[0-9a-f]`.
+ *
+ * @example
+ * ```ts
+ * createRequestId(); // e.g. '5f0c2a9e7b1d4c3a8e6f2b0d9a7c1e4f'
+ * ```
+ */
+function createRequestId(): string {
+  const bytes = globalThis.crypto.getRandomValues(new Uint8Array(REQUEST_ID_BYTES));
+  let id = '';
+  for (const byte of bytes) {
+    id += byte.toString(16).padStart(2, '0');
+  }
+  return id;
 }
 
 // ---------------------------------------------------------------------------
@@ -678,8 +730,12 @@ export function App(): ReactElement {
   const [pairing, setPairing] = useState<PairingState | undefined>(undefined);
   const [noticeLog, setNoticeLog] = useState<NoticeLog>(EMPTY_NOTICE_LOG);
   const [focusRequest, setFocusRequest] = useState<FocusRequest | undefined>(undefined);
-  // The last action handed to the host, until the host next speaks (state, notice or pairing).
-  const [awaiting, setAwaiting] = useState<WebviewToHostMessageType | undefined>(undefined);
+  // Every request handed to the host and not yet answered by its own `actionResult`, plus the
+  // outcome of the last question and follow-up (see `./pending-actions`).
+  const [pendingActions, dispatchPending] = useReducer(
+    pendingActionsReducer,
+    INITIAL_PENDING_ACTIONS_STATE,
+  );
   // Counts dismissals, so focus can be returned after the dismissed notice's button unmounts.
   const [dismissals, setDismissals] = useState(0);
   // Counts pairing codes issued while the view is open, each of which is scrolled into view.
@@ -701,7 +757,9 @@ export function App(): ReactElement {
   const noticesRef = useRef<HTMLDivElement>(null);
 
   // One subscription for the life of the view. `vscode-api` replays the buffered opening
-  // snapshot to it and keeps exactly one `message` listener under StrictMode.
+  // snapshot to it and keeps exactly one `message` listener under StrictMode. Only `actionResult`
+  // reaches the pending-request reducer: snapshots, notices and pairing frames name no request,
+  // so they update what the view shows and settle nothing.
   useEffect(
     () =>
       subscribeToHost((message: HostToWebviewMessage) => {
@@ -718,13 +776,11 @@ export function App(): ReactElement {
             }
             firstSnapshotHandled.current = true;
             displayedPairingCode.current = code;
-            setAwaiting(undefined);
             setState(message.state);
             setPairing(message.state.pairing);
             return;
           }
           case 'notice':
-            setAwaiting(undefined);
             setNoticeLog((log) => addNotice(log, message.level, message.message, message.hint));
             return;
           case 'pairing': {
@@ -733,7 +789,6 @@ export function App(): ReactElement {
               setPairingReveals((count) => count + 1);
             }
             displayedPairingCode.current = code;
-            setAwaiting(undefined);
             setPairing(message.pairing);
             return;
           }
@@ -746,6 +801,16 @@ export function App(): ReactElement {
             }));
             return;
           }
+          case 'actionResult':
+            // The one frame that settles a request, and only the pending one of `action` whose id
+            // it echoes: a superseded, timed-out or already answered request's result is ignored.
+            dispatchPending({
+              kind: 'result',
+              requestId: message.requestId,
+              action: message.action,
+              status: message.status,
+            });
+            return;
           default:
             assertNever(message, 'Unhandled host message');
         }
@@ -753,14 +818,48 @@ export function App(): ReactElement {
     [],
   );
 
-  /** Posts one message; a message the host could not receive becomes a visible notice. */
-  const send = useCallback((message: WebviewToHostMessage): void => {
-    if (postToHost(message)) {
-      setAwaiting(message.type);
+  /**
+   * Posts one message. A request draft is given a fresh id ({@link createRequestId}) and, once
+   * delivered, becomes pending until its own `actionResult` arrives; the clock and the randomness
+   * are read here, in the event path, so the reducer stays pure. `openFile` waits on nothing and is
+   * posted as composed. A message the host channel refused becomes a visible notice, and a refused
+   * question or follow-up is reported to its form as failed so the typed text is kept.
+   */
+  const send = useCallback((draft: WebviewToHostDraft): void => {
+    if (!isWebviewRequestDraft(draft)) {
+      if (!postToHost(draft)) {
+        setNoticeLog((log) => addNotice(log, 'error', UNDELIVERED_MESSAGE, UNDELIVERED_HINT));
+      }
       return;
     }
+    const requestId = createRequestId();
+    const message = withRequestId(draft, requestId);
+    if (postToHost(message)) {
+      dispatchPending({ kind: 'begin', type: message.type, requestId, now: Date.now() });
+      return;
+    }
+    dispatchPending({ kind: 'undelivered', type: message.type });
     setNoticeLog((log) => addNotice(log, 'error', UNDELIVERED_MESSAGE, UNDELIVERED_HINT));
   }, []);
+
+  // One timer for the earliest pending deadline, re-armed whenever that deadline changes and
+  // cleared on unmount. When it fires, the timer's own elapsed time is the authority: `now` is at
+  // least the deadline it was armed for, so the entry it waited on is always settled.
+  const pendingDeadline = nextDeadline(pendingActions);
+  useEffect(() => {
+    if (pendingDeadline === undefined) {
+      return undefined;
+    }
+    const timer = setTimeout(
+      () => {
+        dispatchPending({ kind: 'expire', now: Math.max(Date.now(), pendingDeadline) });
+      },
+      Math.max(0, pendingDeadline - Date.now()),
+    );
+    return () => {
+      clearTimeout(timer);
+    };
+  }, [pendingDeadline]);
 
   const dismissNotice = useCallback((id: string): void => {
     setNoticeLog((log) => removeNotice(log, id));
@@ -924,6 +1023,8 @@ export function App(): ReactElement {
     return items;
   }, [serviceWarning, unbound, noticeLog, pairChrome, dismissNotice]);
 
+  const launchingDevServer = isPending(pendingActions, 'launchDevServer');
+  const pairingChrome = isPending(pendingActions, 'pairChrome');
   const noSessionActions = useMemo(
     () => (
       <Stack direction="horizontal" gap={2} wrap>
@@ -931,7 +1032,7 @@ export function App(): ReactElement {
           variant="secondary"
           size="sm"
           onClick={launchDevServer}
-          disabled={serviceUnavailable || awaiting === 'launchDevServer'}
+          disabled={serviceUnavailable || launchingDevServer}
         >
           {LAUNCH_DEV_SERVER_LABEL}
         </Button>
@@ -939,13 +1040,13 @@ export function App(): ReactElement {
           variant="ghost"
           size="sm"
           onClick={pairChrome}
-          disabled={serviceUnavailable || awaiting === 'pairChrome'}
+          disabled={serviceUnavailable || pairingChrome}
         >
           {PAIR_CHROME_LABEL}
         </Button>
       </Stack>
     ),
-    [launchDevServer, pairChrome, awaiting, serviceUnavailable],
+    [launchDevServer, pairChrome, launchingDevServer, pairingChrome, serviceUnavailable],
   );
 
   if (!hostAvailable) {
@@ -985,11 +1086,18 @@ export function App(): ReactElement {
   const { connection, capture } = state;
   const capturing = capture.active || phase.capturing;
   const followUpPending =
-    awaiting === 'askFollowUp' ||
+    isPending(pendingActions, 'askFollowUp') ||
     (session !== undefined &&
       phase.pipelineRunning &&
       state.analysis !== undefined &&
       session.followUps.length > 0);
+  // The armed capture belongs to a follow-up on the new-capture path (AAP 0.4.2), so the prompt
+  // says "again". The follow-up stage stamps `needsNewCapture: true` once the delta is installed
+  // and `false` on the existing-evidence path; `undefined` means it has not been stamped yet. Once
+  // a follow-up exists the session re-arms only through that path (`generated → planning`).
+  const latestFollowUp = session?.followUps.at(-1);
+  const followUpCapture =
+    phase.armed && latestFollowUp !== undefined && latestFollowUp.needsNewCapture !== false;
 
   return (
     <PanelShell theme={theme}>
@@ -1021,7 +1129,8 @@ export function App(): ReactElement {
                   onSubmit={askQuestion}
                   disabled={!phase.acceptsQuestion}
                   unavailable={serviceUnavailable}
-                  pending={awaiting === 'askQuestion'}
+                  pending={isPending(pendingActions, 'askQuestion')}
+                  submission={pendingActions.outcomes.askQuestion}
                 />
               </Section>
             </div>
@@ -1030,7 +1139,7 @@ export function App(): ReactElement {
               <TargetBadge
                 target={state.target}
                 onRequestTarget={requestTarget}
-                pending={awaiting === 'requestTarget'}
+                pending={isPending(pendingActions, 'requestTarget')}
               />
             </Section>
 
@@ -1046,7 +1155,7 @@ export function App(): ReactElement {
                   <StageFailureNotice
                     failure={state.failure}
                     onRetry={retryFailedStage}
-                    retrying={awaiting === 'retryStage'}
+                    retrying={isPending(pendingActions, 'retryStage')}
                   />
                 ) : null}
 
@@ -1054,6 +1163,7 @@ export function App(): ReactElement {
                   <ProgressSteps
                     entries={state.progress}
                     captureArmed={phase.armed && !capturing}
+                    followUpCapture={followUpCapture}
                     pending={phase.pipelineRunning}
                   />
                 </Section>
@@ -1090,7 +1200,11 @@ export function App(): ReactElement {
                     onStart={startCapture}
                     onStop={stopCapture}
                     armed={phase.armed}
-                    pending={awaiting === 'startCapture' || awaiting === 'stopCapture'}
+                    followUpCapture={followUpCapture}
+                    pending={
+                      isPending(pendingActions, 'startCapture') ||
+                      isPending(pendingActions, 'stopCapture')
+                    }
                   />
                 </Section>
 
@@ -1122,6 +1236,7 @@ export function App(): ReactElement {
                   <Section title={FOLLOW_UP_SECTION_TITLE} variant="card">
                     <FollowUp
                       onSubmit={askFollowUp}
+                      submission={pendingActions.outcomes.askFollowUp}
                       enabled={phase.acceptsFollowUp}
                       pending={followUpPending}
                     />
@@ -1132,7 +1247,7 @@ export function App(): ReactElement {
                   <SessionEnd
                     cleanup={state.cleanup}
                     ended={phase.ended}
-                    ending={awaiting === 'endSession'}
+                    ending={isPending(pendingActions, 'endSession')}
                     onEnd={endSession}
                   />
                 </Section>
@@ -1147,7 +1262,7 @@ export function App(): ReactElement {
                     expiresAt={pairing.expiresAt}
                     onPair={pairChrome}
                     onDismiss={dismissPairing}
-                    pending={awaiting === 'pairChrome'}
+                    pending={pairingChrome}
                   />
                 </Section>
               </div>

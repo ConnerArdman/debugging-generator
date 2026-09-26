@@ -16,10 +16,20 @@
  *    A probe that could not run (setting unset or unusable) is not a stop: the
  *    service's own detection is authoritative, so the command proceeds.
  * 3. **One HTTP operation** — `devServer.launch` (`POST /dev-server/launch`,
- *    AAP §0.4.2) with `{ projectRoot }` alone. `command` is deliberately
+ *    AAP §0.4.2) with `{ projectRoot, sessionId?, devServerUrl? }`.
+ *    `devServerUrl` is the configured address whenever the probe could read
+ *    it: the service's detection probes it before spawning anything, so a dev
+ *    server already answering there is reused when the service launched it and
+ *    refused with the exact relaunch command otherwise — never duplicated on
+ *    another port. `command` is deliberately
  *    omitted: the service's `dev-server/detect.ts` reads the target's package
  *    manager and dev script, so this command never prompts for, assembles or
- *    displays a command line.
+ *    displays a command line. `sessionId` is the editor's active session when
+ *    it belongs to this project and has not ended: the launched dev server is
+ *    then tied to that session and stopped, with its credential revoked, when
+ *    the session ends (AAP §0.7.1 Group 2). Without an active session the
+ *    launch starts the developer's own dev server, which keeps serving after
+ *    any session ends until it is stopped.
  * 4. **Render the result** — one notice either way. A failure goes through
  *    `ctx.ui.notifyFailure` untouched, because the service carries the exact
  *    relaunch command for a dev server running without the preload in its
@@ -46,7 +56,7 @@
 
 import * as vscode from 'vscode';
 
-import type { DevServerLaunchResponse } from '@debuggen/protocol';
+import type { DevServerLaunchRequest, DevServerLaunchResponse } from '@debuggen/protocol';
 import { DebuggenError, isErr, isOk } from '@debuggen/shared';
 import type { Result } from '@debuggen/shared';
 
@@ -103,6 +113,19 @@ const LAUNCH_WITH_TRACING_SENTENCE = `Choose "${LAUNCH_WITH_TRACING_ACTION}" to 
 const LAUNCHED_DETAIL_SENTENCE =
   'Server, route-handler and database spans will be captured from it during the next capture.';
 
+/**
+ * The lifetime of a dev server launched for the active session. Conditional on
+ * purpose: the response does not say whether the service started a child for
+ * the session or reused one the developer launched earlier, which keeps
+ * running.
+ */
+const SESSION_LIFETIME_SENTENCE =
+  'A dev server started for the current debugging session stops when that session ends; one that was already running keeps running.';
+
+/** The lifetime of a dev server launched with no active session. */
+const DEVELOPER_LIFETIME_SENTENCE =
+  'It keeps running after debugging sessions end, until you stop it or the Debug Generator service stops.';
+
 // ---------------------------------------------------------------------------
 // Command
 // ---------------------------------------------------------------------------
@@ -154,13 +177,15 @@ export async function launchDevServer(
     }
   }
 
-  const launched = await requestLaunch(ctx, project.projectRoot);
+  const sessionId = owningSessionIdFor(ctx, project.projectRoot);
+  const configuredUrl = isOk(probe) ? probe.value.url : undefined;
+  const launched = await requestLaunch(ctx, project.projectRoot, sessionId, configuredUrl);
   if (isErr(launched)) {
     await ctx.ui.notifyFailure(launched.error, { prefix: LAUNCH_FAILURE_PREFIX });
     return;
   }
 
-  await reportLaunched(ctx, launched.value, unusableSettingOf(probe));
+  await reportLaunched(ctx, launched.value, unusableSettingOf(probe), sessionId !== undefined);
 }
 
 // ---------------------------------------------------------------------------
@@ -193,21 +218,50 @@ async function confirmLaunchOverRunningServer(
 }
 
 /**
- * The one HTTP operation of this command: `devServer.launch` with the project
- * root alone, shown as a status-bar progress indicator while the service
- * detects, spawns and waits for the dev server.
+ * The session a launch for `projectRoot` is tied to: the editor's active
+ * session, when it is of this very project and has not ended. Anything else —
+ * no active session, one of another workspace folder, an ended one — launches
+ * the developer's own dev server, which no session end stops.
  *
  * @param ctx The command context.
  * @param projectRoot The normalised project root the guard resolved.
+ * @returns The session id to send, or `undefined`.
+ */
+function owningSessionIdFor(ctx: CommandContext, projectRoot: string): string | undefined {
+  const session = ctx.state.activeSession;
+  if (session === undefined || session.status === 'ended' || session.projectRoot !== projectRoot) {
+    return undefined;
+  }
+  return session.id;
+}
+
+/**
+ * The one HTTP operation of this command: `devServer.launch` with the project
+ * root and, when there is one, the session the dev server belongs to and the
+ * configured address — shown as a status-bar progress indicator while the
+ * service detects, spawns and waits for the dev server.
+ *
+ * @param ctx The command context.
+ * @param projectRoot The normalised project root the guard resolved.
+ * @param sessionId The active session of this project, when there is one.
+ * @param devServerUrl The configured `debuggen.devServerUrl`, as the probe
+ *   normalised it, when the probe could read it.
  * @returns The service's answer, as the client reports it.
  */
 async function requestLaunch(
   ctx: CommandContext,
   projectRoot: string,
+  sessionId: string | undefined,
+  devServerUrl: string | undefined,
 ): Promise<Result<DevServerLaunchResponse, DebuggenError>> {
+  const request: DevServerLaunchRequest = {
+    projectRoot,
+    ...(sessionId === undefined ? {} : { sessionId }),
+    ...(devServerUrl === undefined ? {} : { devServerUrl }),
+  };
   return await vscode.window.withProgress(
     { location: vscode.ProgressLocation.Window, title: LAUNCH_PROGRESS_TITLE },
-    () => ctx.client.launchDevServer({ projectRoot }, { timeoutMs: LAUNCH_REQUEST_TIMEOUT_MS }),
+    () => ctx.client.launchDevServer(request, { timeoutMs: LAUNCH_REQUEST_TIMEOUT_MS }),
   );
 }
 
@@ -221,20 +275,23 @@ async function requestLaunch(
  * @param ctx The command context.
  * @param launched The service's validated launch response.
  * @param unusableSetting The probe's refusal of an unusable setting, if any.
+ * @param forSession Whether the launch was tied to the active session.
  */
 async function reportLaunched(
   ctx: CommandContext,
   launched: DevServerLaunchResponse,
   unusableSetting: DebuggenError | undefined,
+  forSession: boolean,
 ): Promise<void> {
   const normalized = ctx.discovery.normalizeDevServerUrl(launched.devServerUrl);
   const openableUrl = isOk(normalized) ? normalized.value : undefined;
   const shownUrl = openableUrl ?? launched.devServerUrl;
 
+  const lifetime = forSession ? SESSION_LIFETIME_SENTENCE : DEVELOPER_LIFETIME_SENTENCE;
   const detail =
     unusableSetting === undefined
-      ? LAUNCHED_DETAIL_SENTENCE
-      : `${LAUNCHED_DETAIL_SENTENCE} debuggen.devServerUrl was not probed: ${unusableSetting.message}`;
+      ? `${LAUNCHED_DETAIL_SENTENCE} ${lifetime}`
+      : `${LAUNCHED_DETAIL_SENTENCE} ${lifetime} debuggen.devServerUrl was not probed: ${unusableSetting.message}`;
 
   const notice: CommandNotice = {
     level: 'info',

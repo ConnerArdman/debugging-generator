@@ -10,10 +10,14 @@
  *   (AAP §0.5.5).
  * - **`satisfied` is load-bearing.** It feeds the state machine's
  *   `instrumenting → ready` guard, so every blocking condition of AAP §0.7.1
- *   Group 2 — no binding, no page agent, a React hook installed after React,
- *   nothing deliverable — is asserted to block, and every degradation of
+ *   Group 2 — no binding, no page agent for the current document, a page agent
+ *   installed late (for every browser signal, not only React's), nothing
+ *   deliverable — is asserted to block, and every degradation of
  *   AAP §0.5.5 — a missing preload, a page without React, an adapter-reported
- *   gap, a failing adapter probe — is asserted not to.
+ *   gap — is asserted not to.
+ * - **An unverified probe establishes nothing.** An adapter whose readiness
+ *   probe fails has its signals withheld: they are deliverable only when
+ *   another adapter confirms them, so a failure is never counted as readiness.
  * - **The relaunch command is the detection's, verbatim.** A remediation that
  *   restated or recomposed the command would drift from what the editor and the
  *   launcher show.
@@ -69,15 +73,20 @@ import {
   type AgentReadyPayload,
   type BoundTab,
   type SessionProgressPayload,
+  type SessionRecord,
 } from '@debuggen/protocol';
 import {
   DEBUGGEN_ERROR_CODES,
   DebuggenError,
+  createConsoleLogger,
   isErr,
   isOk,
   noopLogger,
   ok,
   err,
+  type LogFields,
+  type Logger,
+  type LogRecord,
   type Result,
 } from '@debuggen/shared';
 
@@ -89,13 +98,20 @@ import {
   type detectDevServer,
 } from '../dev-server/detect.js';
 import type { LaunchedDevServer } from '../dev-server/launcher.js';
+import { LOG_ERROR_FIELD_KEY } from '../logging.js';
+import { createCaptureStage } from '../pipeline/stages/capture.js';
 import {
   CAPTURE_SIGNAL_LABELS,
+  FAILURE_COPY_BY_CODE,
   READY_TO_CAPTURE_MESSAGE,
+  isProductAuthoredText,
   type SessionProgress,
 } from '../sessions/progress.js';
+import { fingerprintDocumentId } from './document-fingerprint.js';
 import {
+  DEFAULT_NAVIGATION_SETTLE_MS,
   DEFAULT_RELOAD_WAIT_MS,
+  MAX_NAVIGATION_SETTLE_MS,
   MAX_RELOAD_WAIT_MS,
   RELOAD_REQUEST_MESSAGE,
   collectObservedReadiness,
@@ -169,6 +185,12 @@ interface FakeAgentsInput {
   readonly latestSequence?: readonly (AgentReadyPayload | undefined)[];
   readonly next?: WaitScript;
   readonly receivedAt?: number;
+  /**
+   * What `latestNavigationAt` answers — the binding's latest committed
+   * navigation of the tab; `'throw'` makes the method throw. Omitted, the
+   * registry has no such method.
+   */
+  readonly navigatedAt?: number | 'throw';
   readonly throwOnLatest?: boolean;
   readonly rejectWait?: boolean;
 }
@@ -260,6 +282,17 @@ function fakeAgents(input: FakeAgentsInput = {}): FakeAgents {
     ...(input.receivedAt === undefined
       ? {}
       : { latestAgentReadyAt: (): number | undefined => input.receivedAt }),
+    ...(input.navigatedAt === undefined
+      ? {}
+      : {
+          latestNavigationAt: (): number | undefined => {
+            if (input.navigatedAt === 'throw') {
+              throw new Error('navigation journal unavailable');
+            }
+
+            return input.navigatedAt;
+          },
+        }),
   };
 
   return {
@@ -823,6 +856,31 @@ describe('collectReadinessEvidence — page agent facts', () => {
     if (isErr(result)) throw result.error;
     expect(result.value.observed.browserAgent).toBeUndefined();
     expect(result.value.notes.join(' ')).toMatch(/could not be read/);
+  });
+
+  it('keeps a report for another page than the binding without waiting, noting that readiness confirms it', async () => {
+    const agents = fakeAgents({ latest: agentReady(), next: 'never' });
+    const navigated = await collectReadinessEvidence(collectDeps({ agents: agents.registry }), {
+      sessionId: SESSION_ID,
+      projectRoot: PROJECT_ROOT,
+      boundTab: { tabId: TAB_ID, url: `${APP_ORIGIN}/gadgets` },
+    });
+    const onPage = await collectReadinessEvidence(collectDeps({ agents: agents.registry }), {
+      sessionId: SESSION_ID,
+      projectRoot: PROJECT_ROOT,
+      boundTab: BOUND_TAB,
+    });
+
+    if (isErr(navigated)) throw navigated.error;
+    if (isErr(onPage)) throw onPage.error;
+    // The read is synchronous: the report is kept as observed and nothing is awaited.
+    expect(agents.waitCalls).toEqual([]);
+    expect(navigated.value.observed.browserAgent?.documentId).toBe('doc_first');
+    expect(navigated.value.notes).toContain(
+      'The latest page-agent report predates the page the binding records now; readiness confirms the current document before capture.',
+    );
+    expect(onPage.value.observed.browserAgent?.documentId).toBe('doc_first');
+    expect(onPage.value.notes.join(' ')).not.toMatch(/confirms the current document/u);
   });
 });
 
@@ -1471,7 +1529,7 @@ describe('evaluateReadiness — blocking page conditions', () => {
     expect(readyToCapture).toHaveBeenCalledTimes(1);
   });
 
-  it('blocks React signals when the hook arrived after React, naming the document to replace', async () => {
+  it('blocks every browser signal when the hook arrived after React, naming the document to replace', async () => {
     const { progress, emit } = fakeProgress();
     const agents = fakeAgents({ latest: agentReady({ installedBeforeReact: false }) });
     const verdict = await evaluate(
@@ -1480,9 +1538,12 @@ describe('evaluateReadiness — blocking page conditions', () => {
     );
 
     expect(verdict.satisfied).toBe(false);
-    expect(signalsOf(verdict.blocking)).toEqual(['react', 'componentTree']);
+    expect(signalsOf(verdict.blocking)).toEqual(['interactions', 'react', 'componentTree']);
     expect(verdict.blocking[0]?.hint).toBe(RELOAD_REQUEST_MESSAGE);
-    expect(verdict.deliverableSignals).toEqual(['interactions']);
+    expect(
+      verdict.blocking.every((gap) => /React hook was installed after/u.test(gap.reason)),
+    ).toBe(true);
+    expect(verdict.deliverableSignals).toEqual([]);
     expect(verdict.remediations).toEqual([
       { kind: 'reload-page', tabId: TAB_ID, documentId: 'doc_first' },
     ]);
@@ -1953,29 +2014,734 @@ describe('RELOAD_REQUEST_MESSAGE — the one-click reload request', () => {
   });
 });
 
-describe('evaluateReadiness — page degradations', () => {
-  it('does not block non-React browser signals on a late hook', async () => {
+// ---------------------------------------------------------------------------
+// Page-supplied document ids in logs (CWE-532, AAP §0.5.2)
+// ---------------------------------------------------------------------------
+
+describe('evaluateReadiness — page-supplied document ids never reach a log', () => {
+  /** The text a forged `agent.ready` smuggles in; no fingerprint can contain it. */
+  const PRIVATE_SENTINEL = 'PRIVATE-SENTINEL';
+  const forged = (label: string): string => `/${label}/${PRIVATE_SENTINEL}?token=${label}`;
+  const reactPlan = (): InstrumentationPlan =>
+    plan([action('react-render-tracking', PAGE_ADAPTER_ID)]);
+
+  /** A logger that keeps every record, at every level, for the case to read. */
+  function recordingLogger(): {
+    readonly logger: ReturnType<typeof createConsoleLogger>;
+    readonly records: LogRecord[];
+  } {
+    const records: LogRecord[] = [];
+    const logger = createConsoleLogger({
+      level: 'trace',
+      sink: (record) => {
+        records.push(record);
+      },
+    });
+
+    return { logger, records };
+  }
+
+  /** The one record carrying `message`; the case fails unless there is exactly one. */
+  function recordOf(records: readonly LogRecord[], message: string): LogRecord {
+    const matching = records.filter((record) => record.message === message);
+    const [only] = matching;
+
+    expect(matching, `exactly one "${message}" record`).toHaveLength(1);
+    if (only === undefined) {
+      throw new Error(`no "${message}" record was written`);
+    }
+
+    return only;
+  }
+
+  /** No record names a raw `documentId` field or carries any of the forged text. */
+  function expectNoPageText(records: readonly LogRecord[]): void {
+    const serialized = JSON.stringify(records);
+
+    expect(records.length).toBeGreaterThan(0);
+    expect(serialized).not.toContain(PRIVATE_SENTINEL);
+    expect(serialized).not.toContain('token=');
+    for (const record of records) {
+      expect(Object.keys(record.fields)).not.toContain('documentId');
+    }
+  }
+
+  it('fingerprints the late-hook document it asks to reload and the new document it re-evaluates on', async () => {
+    const late = forged('late');
+    const reloaded = forged('reloaded');
+    const { logger, records } = recordingLogger();
+    const { progress } = fakeProgress();
+    const agents = fakeAgents({
+      latest: agentReady({ documentId: late, installedBeforeReact: false }),
+      next: agentReady({ documentId: reloaded, installedBeforeReact: true }),
+    });
+
+    const verdict = await evaluate(
+      { adapters: registryOf(pageAdapter()), agents: agents.registry, progress, logger },
+      { plan: reactPlan(), boundTab: BOUND_TAB },
+    );
+
+    // Matching still runs on the raw ids: the wait names the late document and
+    // the verdict describes the reloaded one.
+    expect(agents.waitCalls[0]?.options.afterDocumentId).toBe(late);
+    expect(verdict.satisfied).toBe(true);
+    expect(verdict.observed.browserAgent?.documentId).toBe(reloaded);
+
+    const asked = recordOf(records, 'Asked the developer to reload the bound tab');
+    expect(asked.level).toBe('info');
+    expect(asked.fields).toMatchObject({
+      tabId: TAB_ID,
+      document: fingerprintDocumentId(late),
+      documentIdCanonical: false,
+    });
+
+    const reevaluated = recordOf(
+      records,
+      'The bound tab reported a new document; evaluating readiness again',
+    );
+    expect(reevaluated.level).toBe('info');
+    expect(reevaluated.fields).toMatchObject({
+      tabId: TAB_ID,
+      document: fingerprintDocumentId(reloaded),
+      documentIdCanonical: false,
+    });
+    expect(reevaluated.fields['document']).not.toBe(asked.fields['document']);
+    expectNoPageText(records);
+  });
+
+  it('fingerprints the document whose reload was already requested', async () => {
+    const late = forged('repeat');
+    const { logger, records } = recordingLogger();
+    const { progress, emit } = fakeProgress();
+    const ledger = new Set<string>();
+    const run = (): Promise<ReadinessVerdict> =>
+      evaluate(
+        {
+          adapters: registryOf(pageAdapter()),
+          agents: fakeAgents({
+            latest: agentReady({ documentId: late, installedBeforeReact: false }),
+          }).registry,
+          progress,
+          reloadPrompts: ledger,
+          reloadWaitMs: 0,
+          logger,
+        },
+        { plan: reactPlan(), boundTab: BOUND_TAB },
+      );
+
+    await run();
+    const repeated = await run();
+
+    expect(emit).toHaveBeenCalledTimes(1);
+    expect(remediationOf(repeated, 'reload-page')?.documentId).toBe(late);
+
+    const already = recordOf(records, 'The reload was already requested for this document');
+    expect(already.level).toBe('debug');
+    expect(already.fields).toMatchObject({
+      tabId: TAB_ID,
+      document: fingerprintDocumentId(late),
+      documentIdCanonical: false,
+    });
+    expectNoPageText(records);
+  });
+
+  it('fingerprints a report it ignores for another origin, and names no document it does not know', async () => {
+    const elsewhere = forged('elsewhere');
+    const { logger, records } = recordingLogger();
+    const { progress } = fakeProgress();
+
+    const verdict = await evaluate(
+      {
+        adapters: registryOf(pageAdapter()),
+        agents: fakeAgents({
+          latest: agentReady({ documentId: elsewhere, url: 'http://127.0.0.1:4999/elsewhere' }),
+        }).registry,
+        progress,
+        reloadWaitMs: 0,
+        logger,
+      },
+      { plan: reactPlan(), boundTab: BOUND_TAB },
+    );
+
+    expect(verdict.observed.browserAgent).toBeUndefined();
+
+    const ignored = recordOf(records, 'Ignoring an agent.ready for a different tab or origin');
+    expect(ignored.level).toBe('debug');
+    expect(ignored.fields).toMatchObject({
+      tabId: TAB_ID,
+      reportedTabId: TAB_ID,
+      document: fingerprintDocumentId(elsewhere),
+      documentIdCanonical: false,
+    });
+
+    // No page agent reported for the bound document, so the reload names none.
+    const asked = recordOf(records, 'Asked the developer to reload the bound tab');
+    expect(Object.keys(asked.fields)).not.toContain('document');
+    expect(Object.keys(asked.fields)).not.toContain('documentIdCanonical');
+    expectNoPageText(records);
+  });
+
+  it('marks an id of the agent’s own shape canonical, and still logs only its fingerprint', async () => {
+    const canonical = 'doc_0123456789abcdef';
+    const { logger, records } = recordingLogger();
+    const { progress } = fakeProgress();
+
+    await evaluate(
+      {
+        adapters: registryOf(pageAdapter()),
+        agents: fakeAgents({
+          latest: agentReady({ documentId: canonical, installedBeforeReact: false }),
+        }).registry,
+        progress,
+        reloadWaitMs: 0,
+        logger,
+      },
+      { plan: reactPlan(), boundTab: BOUND_TAB },
+    );
+
+    const asked = recordOf(records, 'Asked the developer to reload the bound tab');
+    expect(asked.fields).toMatchObject({
+      document: fingerprintDocumentId(canonical),
+      documentIdCanonical: true,
+    });
+    expect(JSON.stringify(records)).not.toContain(canonical);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// evaluateReadiness — the current document after a navigation
+// ---------------------------------------------------------------------------
+
+describe('evaluateReadiness — the current document after a navigation', () => {
+  /**
+   * The binding after a committed same-origin navigation from `/widgets` to
+   * `/gadgets`: the binding route mirrored the new URL, while the registry
+   * still holds the `/widgets` document's report until a new one arrives.
+   */
+  const NAVIGATED_TAB: BoundTab = { tabId: TAB_ID, url: `${APP_ORIGIN}/gadgets?view=grid#list` };
+  const SETTLE_MS = 300;
+
+  const reactPlan = (): InstrumentationPlan =>
+    plan([action('react-render-tracking', PAGE_ADAPTER_ID)]);
+
+  /** The report of the document the navigation left, at the binding's old path. */
+  const leftBehind = (overrides: Partial<AgentReadyPayload> = {}): AgentReadyPayload =>
+    agentReady(overrides);
+
+  /** The report of the document that replaced it, at the binding's new path. */
+  const replacement = (overrides: Partial<AgentReadyPayload> = {}): AgentReadyPayload =>
+    agentReady({
+      documentId: 'doc_second',
+      producerId: 'prd_second',
+      url: `${APP_ORIGIN}/gadgets`,
+      ...overrides,
+    });
+
+  it.each([
+    [
+      'another query and fragment on the same path',
+      { tabId: TAB_ID, url: `${APP_ORIGIN}/widgets?sort=asc#grid` },
+      leftBehind(),
+    ],
+    ['a binding URL that cannot be read', { tabId: TAB_ID, url: 'not a url' }, leftBehind()],
+    [
+      'a report whose URL is not http(s)',
+      NAVIGATED_TAB,
+      leftBehind({ url: 'file:///srv/app/index.html' }),
+    ],
+  ])('trusts the report on sight for %s, and never waits', async (_label, boundTab, report) => {
+    const agents = fakeAgents({ latest: report, next: 'never' });
+    const verdict = await evaluate(
+      { adapters: registryOf(pageAdapter()), agents: agents.registry },
+      { plan: reactPlan(), boundTab },
+    );
+
+    expect(agents.waitCalls).toEqual([]);
+    expect(verdict.satisfied).toBe(true);
+    expect(verdict.observed.browserAgent?.documentId).toBe('doc_first');
+  });
+
+  it('judges the replacement reported within the settle window: a late hook there blocks, naming it', async () => {
+    const { progress, emit } = fakeProgress();
+    const adapter = pageAdapter();
+    const agents = fakeAgents({ latest: leftBehind(), next: 'deferred', receivedAt: NOW - 250 });
+    const pending = evaluate(
+      {
+        adapters: registryOf(adapter),
+        agents: agents.registry,
+        progress,
+        navigationSettleMs: SETTLE_MS,
+        reloadWaitMs: 0,
+      },
+      { plan: reactPlan(), boundTab: NAVIGATED_TAB },
+    );
+
+    await agents.waitStarted;
+    expect(agents.waitCalls).toEqual([
+      { tabId: TAB_ID, options: { timeoutMs: SETTLE_MS, afterDocumentId: 'doc_first' } },
+    ]);
+    // Nothing is judged on the left-behind document's facts.
+    expect(adapter.calls).toHaveLength(0);
+
+    agents.settleWait(replacement({ installedBeforeReact: false }));
+    const verdict = await pending;
+
+    expect(verdict.observed.browserAgent).toEqual({
+      producerId: 'prd_second',
+      documentId: 'doc_second',
+      url: `${APP_ORIGIN}/gadgets`,
+      installedBeforeReact: false,
+      reactDetected: true,
+      observedAt: NOW - 250,
+    });
+    expect(adapter.calls).toHaveLength(1);
+    expect(adapter.calls[0]?.readiness.browserAgent?.documentId).toBe('doc_second');
+    expect(verdict.satisfied).toBe(false);
+    expect(remediationOf(verdict, 'reload-page')).toEqual({
+      kind: 'reload-page',
+      tabId: TAB_ID,
+      documentId: 'doc_second',
+    });
+    expect(emit).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(verdict)).not.toContain('doc_first');
+  });
+
+  it('passes on a healthy replacement without a reload prompt, though the document it replaced was hook-late', async () => {
+    const { progress, emit, readyToCapture } = fakeProgress();
+    const agents = fakeAgents({
+      latest: leftBehind({ installedBeforeReact: false }),
+      next: replacement(),
+    });
+    const verdict = await evaluate(
+      { adapters: registryOf(pageAdapter()), agents: agents.registry, progress },
+      { plan: reactPlan(), boundTab: NAVIGATED_TAB },
+    );
+
+    expect(agents.waitCalls).toHaveLength(1);
+    expect(agents.waitCalls[0]?.options).toEqual({
+      timeoutMs: DEFAULT_NAVIGATION_SETTLE_MS,
+      afterDocumentId: 'doc_first',
+    });
+    expect(verdict.satisfied).toBe(true);
+    expect(verdict.observed.browserAgent?.documentId).toBe('doc_second');
+    expect(verdict.observed.browserAgent?.observedAt).toBe(NOW);
+    expect(verdict.remediations).toEqual([]);
+    expect(verdict.reloadRequested).toBe(false);
+    expect(emit).not.toHaveBeenCalled();
+    expect(readyToCapture).toHaveBeenCalledTimes(1);
+  });
+
+  it('stamps the replacement with the clock when the registry no longer holds that document', async () => {
+    const registry: BrowserAgentRegistry = {
+      latestAgentReady: () => leftBehind(),
+      latestAgentReadyAt: () => NOW - 9_000,
+      waitForAgentReady: () => Promise.resolve(replacement()),
+    };
+    const verdict = await evaluate(
+      { adapters: registryOf(pageAdapter()), agents: registry, navigationSettleMs: SETTLE_MS },
+      { plan: reactPlan(), boundTab: NAVIGATED_TAB },
+    );
+
+    expect(verdict.observed.browserAgent?.documentId).toBe('doc_second');
+    expect(verdict.observed.browserAgent?.observedAt).toBe(NOW);
+  });
+
+  it('awaits the replacement of a same-page report received before the latest navigation — a reload — and judges it', async () => {
+    const agents = fakeAgents({
+      latest: leftBehind(),
+      next: replacement({ url: `${APP_ORIGIN}/widgets`, installedBeforeReact: false }),
+      receivedAt: NOW - 5_000,
+      navigatedAt: NOW - 1_000,
+    });
+    const verdict = await evaluate(
+      {
+        adapters: registryOf(pageAdapter()),
+        agents: agents.registry,
+        navigationSettleMs: SETTLE_MS,
+        reloadWaitMs: 0,
+      },
+      { plan: reactPlan(), boundTab: BOUND_TAB },
+    );
+
+    // The binding's URL did not change; the recorded navigation alone is why
+    // the report is not trusted on sight.
+    expect(agents.waitCalls).toEqual([
+      { tabId: TAB_ID, options: { timeoutMs: SETTLE_MS, afterDocumentId: 'doc_first' } },
+    ]);
+    expect(verdict.observed.browserAgent?.documentId).toBe('doc_second');
+    expect(verdict.satisfied).toBe(false);
+    expect(remediationOf(verdict, 'reload-page')).toEqual({
+      kind: 'reload-page',
+      tabId: TAB_ID,
+      documentId: 'doc_second',
+    });
+  });
+
+  it('trusts a same-page report received after the latest navigation, without waiting', async () => {
+    const agents = fakeAgents({
+      latest: leftBehind(),
+      next: 'never',
+      receivedAt: NOW - 500,
+      navigatedAt: NOW - 1_000,
+    });
+    const verdict = await evaluate(
+      { adapters: registryOf(pageAdapter()), agents: agents.registry },
+      { plan: reactPlan(), boundTab: BOUND_TAB },
+    );
+
+    expect(agents.waitCalls).toEqual([]);
+    expect(verdict.satisfied).toBe(true);
+    expect(verdict.observed.browserAgent?.documentId).toBe('doc_first');
+  });
+
+  it.each([
+    [
+      'a navigation time that is not an epoch time',
+      { navigatedAt: Number.NaN, receivedAt: NOW - 5_000 },
+    ],
+    [
+      'a registry that throws on the navigation time',
+      { navigatedAt: 'throw' as const, receivedAt: NOW - 5_000 },
+    ],
+    ['a registry that cannot say when the report arrived', { navigatedAt: NOW - 1 }],
+  ])('trusts a same-page report on sight with %s', async (_label, timing) => {
+    const agents = fakeAgents({ latest: leftBehind(), next: 'never', ...timing });
+    const verdict = await evaluate(
+      { adapters: registryOf(pageAdapter()), agents: agents.registry },
+      { plan: reactPlan(), boundTab: BOUND_TAB },
+    );
+
+    expect(agents.waitCalls).toEqual([]);
+    expect(verdict.satisfied).toBe(true);
+  });
+
+  it('notes, when collecting, a same-page report received before the latest navigation', async () => {
+    const agents = fakeAgents({
+      latest: leftBehind(),
+      next: 'never',
+      receivedAt: NOW - 5_000,
+      navigatedAt: NOW - 1_000,
+    });
+    const collected = await collectReadinessEvidence(collectDeps({ agents: agents.registry }), {
+      sessionId: SESSION_ID,
+      projectRoot: PROJECT_ROOT,
+      boundTab: BOUND_TAB,
+    });
+
+    if (isErr(collected)) throw collected.error;
+    expect(agents.waitCalls).toEqual([]);
+    expect(collected.value.observed.browserAgent?.documentId).toBe('doc_first');
+    expect(collected.value.notes.join(' ')).toMatch(/confirms the current document/u);
+  });
+
+  it('keeps the original report when no replacement reports within the window: a same-document navigation', async () => {
+    useFakeTimeouts();
+    const agents = fakeAgents({ latest: leftBehind(), next: 'timeout' });
+    let settled = false;
+    const pending = evaluate(
+      {
+        adapters: registryOf(pageAdapter()),
+        agents: agents.registry,
+        navigationSettleMs: SETTLE_MS,
+      },
+      { plan: reactPlan(), boundTab: NAVIGATED_TAB },
+    ).then((verdict) => {
+      settled = true;
+      return verdict;
+    });
+
+    await agents.waitStarted;
+    await vi.advanceTimersByTimeAsync(SETTLE_MS - 1);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    const verdict = await pending;
+
+    expect(settled).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(agents.waitCalls).toHaveLength(1);
+    expect(verdict.satisfied).toBe(true);
+    expect(verdict.observed.browserAgent?.documentId).toBe('doc_first');
+    expect(verdict.remediations).toEqual([]);
+    expect(verdict.reloadRequested).toBe(false);
+  });
+
+  it('stays bounded when the port never answers, releasing its backstop, and keeps the report', async () => {
+    useFakeTimeouts();
+    const agents = fakeAgents({ latest: leftBehind(), next: 'never' });
+    let settled = false;
+    const pending = evaluate(
+      {
+        adapters: registryOf(pageAdapter()),
+        agents: agents.registry,
+        navigationSettleMs: SETTLE_MS,
+      },
+      { plan: reactPlan(), boundTab: NAVIGATED_TAB },
+    ).then((verdict) => {
+      settled = true;
+      return verdict;
+    });
+
+    await agents.waitStarted;
+    // The port's own deadline passes and it still says nothing.
+    await vi.advanceTimersByTimeAsync(SETTLE_MS);
+    expect(settled).toBe(false);
+    // The backstop is a bounded grace beyond that deadline, well under a second.
+    await vi.advanceTimersByTimeAsync(1_000);
+    const verdict = await pending;
+
+    expect(settled).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(verdict.satisfied).toBe(true);
+    expect(verdict.observed.browserAgent?.documentId).toBe('doc_first');
+  });
+
+  it('contains a settle wait that rejects, keeping the report', async () => {
+    const verdict = await evaluate(
+      {
+        adapters: registryOf(pageAdapter()),
+        agents: fakeAgents({ latest: leftBehind(), rejectWait: true }).registry,
+        navigationSettleMs: SETTLE_MS,
+      },
+      { plan: reactPlan(), boundTab: NAVIGATED_TAB },
+    );
+
+    expect(verdict.satisfied).toBe(true);
+    expect(verdict.observed.browserAgent?.documentId).toBe('doc_first');
+  });
+
+  it('does not wait once the request is aborted, keeping the report', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const agents = fakeAgents({ latest: leftBehind(), next: 'never' });
+    const verdict = await evaluate(
+      { adapters: registryOf(pageAdapter()), agents: agents.registry },
+      { plan: reactPlan(), boundTab: NAVIGATED_TAB, signal: controller.signal },
+    );
+
+    expect(agents.waitCalls).toEqual([]);
+    expect(verdict.satisfied).toBe(true);
+    expect(verdict.observed.browserAgent?.documentId).toBe('doc_first');
+  });
+
+  it('stops waiting as soon as the request is aborted mid-settle, releasing its timer', async () => {
+    useFakeTimeouts();
+    const controller = new AbortController();
+    const agents = fakeAgents({ latest: leftBehind(), next: 'deferred' });
+    const pending = evaluate(
+      {
+        adapters: registryOf(pageAdapter()),
+        agents: agents.registry,
+        navigationSettleMs: SETTLE_MS,
+      },
+      { plan: reactPlan(), boundTab: NAVIGATED_TAB, signal: controller.signal },
+    );
+
+    await agents.waitStarted;
+    expect(agents.waitCalls[0]?.options.signal).toBe(controller.signal);
+    controller.abort();
+    const verdict = await pending;
+
+    expect(vi.getTimerCount()).toBe(0);
+    expect(verdict.observed.browserAgent?.documentId).toBe('doc_first');
+  });
+
+  it('reads a replacement from another origin as no report for the current document', async () => {
+    const agents = fakeAgents({
+      latest: leftBehind(),
+      next: replacement({ url: 'http://127.0.0.1:4999/elsewhere' }),
+    });
+    const verdict = await evaluate(
+      { adapters: registryOf(pageAdapter()), agents: agents.registry, reloadWaitMs: 0 },
+      { plan: reactPlan(), boundTab: NAVIGATED_TAB },
+    );
+
+    expect(verdict.satisfied).toBe(false);
+    expect('browserAgent' in verdict.observed).toBe(false);
+    expect(verdict.remediations).toEqual([{ kind: 'reload-page', tabId: TAB_ID }]);
+  });
+
+  it.each([
+    ['absent', undefined, DEFAULT_NAVIGATION_SETTLE_MS],
+    ['negative', -1, DEFAULT_NAVIGATION_SETTLE_MS],
+    ['not a number', Number.NaN, DEFAULT_NAVIGATION_SETTLE_MS],
+    ['infinite', Number.POSITIVE_INFINITY, DEFAULT_NAVIGATION_SETTLE_MS],
+    ['fractional', 250.9, 250],
+    ['above the ceiling', MAX_NAVIGATION_SETTLE_MS * 5, MAX_NAVIGATION_SETTLE_MS],
+  ])('clamps a navigationSettleMs that is %s', async (_label, navigationSettleMs, expected) => {
+    const agents = fakeAgents({ latest: leftBehind() });
+    const verdict = await evaluate(
+      { adapters: registryOf(pageAdapter()), agents: agents.registry, navigationSettleMs },
+      { plan: reactPlan(), boundTab: NAVIGATED_TAB },
+    );
+
+    expect(agents.waitCalls.map((call) => call.options.timeoutMs)).toEqual([expected]);
+    expect(verdict.satisfied).toBe(true);
+  });
+
+  it('does not wait at all with navigationSettleMs 0, keeping the report', async () => {
+    const agents = fakeAgents({ latest: leftBehind(), next: 'never' });
+    const verdict = await evaluate(
+      { adapters: registryOf(pageAdapter()), agents: agents.registry, navigationSettleMs: 0 },
+      { plan: reactPlan(), boundTab: NAVIGATED_TAB },
+    );
+
+    expect(agents.waitCalls).toEqual([]);
+    expect(verdict.satisfied).toBe(true);
+    expect(verdict.observed.browserAgent?.documentId).toBe('doc_first');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// evaluateReadiness — the late-install gate for browser signals without React
+// ---------------------------------------------------------------------------
+
+describe('evaluateReadiness — a late-installed page agent blocks every browser signal', () => {
+  /** A browser plan with no React, state or tree signal in it. */
+  const pagePlan = (): InstrumentationPlan =>
+    plan([
+      action('interaction-tracking', PAGE_ADAPTER_ID),
+      action('fetch-tracking', PAGE_ADAPTER_ID),
+      action('perf-tracking', PAGE_ADAPTER_ID),
+    ]);
+
+  const HOOK_LATE_REASON = 'the React hook was installed after the page had already loaded React';
+  const AGENT_LATE_REASON =
+    'the page agent was installed after the page had already started loading';
+
+  it('blocks an interaction, fetch and perf plan on a late document, naming it, and asks once', async () => {
+    const { progress, emit, readyToCapture } = fakeProgress();
+    const ledger = new Set<string>();
+    const run = (): Promise<ReadinessVerdict> =>
+      evaluate(
+        {
+          adapters: registryOf(pageAdapter()),
+          agents: fakeAgents({ latest: agentReady({ installedBeforeReact: false }) }).registry,
+          progress,
+          reloadPrompts: ledger,
+          reloadWaitMs: 0,
+        },
+        { plan: pagePlan(), boundTab: BOUND_TAB },
+      );
+
+    const first = await run();
+    const second = await run();
+
+    expect(first.plannedSignals).toEqual(expect.arrayContaining(['interactions', 'fetch', 'perf']));
+    expect(
+      first.plannedSignals.some((signal) => ['react', 'state', 'componentTree'].includes(signal)),
+    ).toBe(false);
+    for (const verdict of [first, second]) {
+      expect(verdict.satisfied).toBe(false);
+      expect(signalsOf(verdict.blocking)).toEqual(verdict.plannedSignals);
+      expect(verdict.deliverableSignals).toEqual([]);
+      expect(verdict.degraded).toEqual([]);
+      for (const gap of verdict.blocking) {
+        expect(gap).toEqual({
+          signal: gap.signal,
+          reason: HOOK_LATE_REASON,
+          hint: RELOAD_REQUEST_MESSAGE,
+        });
+      }
+      expect(verdict.remediations).toEqual([
+        { kind: 'reload-page', tabId: TAB_ID, documentId: 'doc_first' },
+      ]);
+    }
+    // One reload row for the document, whatever the number of evaluations.
+    expect(emit).toHaveBeenCalledTimes(1);
+    expect(emit.mock.calls[0]?.[1]).toEqual({
+      stage: 'instrument',
+      status: 'running',
+      message: RELOAD_REQUEST_MESSAGE,
+      detail: HOOK_LATE_REASON,
+    });
+    expect([first.reloadRequested, second.reloadRequested]).toEqual([true, false]);
+    expect(readyToCapture).not.toHaveBeenCalled();
+  });
+
+  it('passes that plan after exactly one re-evaluation on the reloaded document reporting the agent in time', async () => {
+    const { progress, emit, readyToCapture } = fakeProgress();
+    const adapter = pageAdapter();
+    const agents = fakeAgents({
+      latest: agentReady({ installedBeforeReact: false }),
+      next: 'deferred',
+    });
+    const pending = evaluate(
+      { adapters: registryOf(adapter), agents: agents.registry, progress, reloadWaitMs: 1_000 },
+      { plan: pagePlan(), boundTab: BOUND_TAB },
+    );
+
+    await agents.waitStarted;
+    expect(emit).toHaveBeenCalledTimes(1);
+    expect(agents.waitCalls).toHaveLength(1);
+    expect(agents.waitCalls[0]?.options).toMatchObject({
+      timeoutMs: 1_000,
+      afterDocumentId: 'doc_first',
+    });
+
+    agents.settleWait(
+      agentReady({
+        documentId: 'doc_second',
+        producerId: 'prd_second',
+        installedBeforeReact: true,
+      }),
+    );
+    const verdict = await pending;
+
+    expect(verdict.satisfied).toBe(true);
+    expect(verdict.deliverableSignals).toEqual(verdict.plannedSignals);
+    expect(verdict.blocking).toEqual([]);
+    expect(verdict.remediations).toEqual([]);
+    expect(verdict.observed.browserAgent?.documentId).toBe('doc_second');
+    expect(verdict.reloadRequested).toBe(true);
+    expect(adapter.calls).toHaveLength(2);
+    expect(emit).toHaveBeenCalledTimes(1);
+    expect(readyToCapture).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses the page agent’s wording on a late document where no React was found', async () => {
     const { progress, emit } = fakeProgress();
     const verdict = await evaluate(
       {
         adapters: registryOf(pageAdapter()),
-        agents: fakeAgents({ latest: agentReady({ installedBeforeReact: false }) }).registry,
+        agents: fakeAgents({
+          latest: agentReady({ installedBeforeReact: false, reactDetected: false }),
+        }).registry,
         progress,
+        reloadWaitMs: 0,
       },
-      {
-        plan: plan([
-          action('fetch-tracking', PAGE_ADAPTER_ID),
-          action('interaction-tracking', PAGE_ADAPTER_ID),
-        ]),
-        boundTab: BOUND_TAB,
-      },
+      { plan: pagePlan(), boundTab: BOUND_TAB },
     );
 
-    expect(verdict.satisfied).toBe(true);
-    expect(verdict.deliverableSignals).toEqual(['interactions', 'fetch']);
-    expect(emit).not.toHaveBeenCalled();
+    expect(verdict.satisfied).toBe(false);
+    expect(signalsOf(verdict.blocking)).toEqual(verdict.plannedSignals);
+    for (const gap of verdict.blocking) {
+      expect(gap.reason).toBe(AGENT_LATE_REASON);
+      expect(gap.hint).toBe(RELOAD_REQUEST_MESSAGE);
+    }
+    expect(emit.mock.calls[0]?.[1].detail).toBe(AGENT_LATE_REASON);
+    expect(remediationOf(verdict, 'reload-page')?.documentId).toBe('doc_first');
   });
 
+  it('judges the late install before a missing React, so fiber signals block rather than degrade', async () => {
+    const verdict = await evaluate(
+      {
+        adapters: registryOf(pageAdapter()),
+        agents: fakeAgents({
+          latest: agentReady({ installedBeforeReact: false, reactDetected: false }),
+        }).registry,
+        reloadWaitMs: 0,
+      },
+      { plan: plan([action('react-render-tracking', PAGE_ADAPTER_ID)]), boundTab: BOUND_TAB },
+    );
+
+    expect(verdict.satisfied).toBe(false);
+    expect(signalsOf(verdict.blocking)).toEqual(['interactions', 'react', 'componentTree']);
+    expect(verdict.blocking.every((gap) => gap.reason === AGENT_LATE_REASON)).toBe(true);
+    expect(verdict.degraded).toEqual([]);
+  });
+});
+
+describe('evaluateReadiness — page degradations', () => {
   it('degrades, but does not block, React signals on a page without React', async () => {
     const verdict = await evaluate(
       {
@@ -2335,7 +3101,7 @@ describe('evaluateReadiness — degradation-only conditions', () => {
     expect(verdict.deliverableSignals).toEqual(verdict.plannedSignals);
   });
 
-  it('captures an adapter whose readiness() rejects as a degraded gap with a reason, and resolves Ok', async () => {
+  it('degrades, but still delivers, the signals of a rejected probe that another adapter confirms, and resolves Ok', async () => {
     const flaky = fakeAdapter('flaky-probe', [{ type: 'perf-tracking', mode: 'runtime' }], () =>
       Promise.reject(new Error('')),
     );
@@ -2363,19 +3129,25 @@ describe('evaluateReadiness — degradation-only conditions', () => {
     if (isErr(outcome.value)) throw outcome.value.error;
     const verdict = outcome.value.value;
 
-    expect(verdict.satisfied).toBe(true);
-    expect(verdict.blocking).toEqual([]);
-    expect(verdict.degraded.length).toBeGreaterThan(0);
-    for (const gap of verdict.degraded) {
-      expect(gap.reason.trim().length).toBeGreaterThan(0);
-      expect(gap.hint.trim().length).toBeGreaterThan(0);
-    }
+    const flakyReport = verdict.perAdapter[1]?.readiness;
+    const flakySignals = (flakyReport?.signals ?? []).map((row) => row.signal);
     expect(verdict.perAdapter.map((report) => report.adapterId)).toEqual([
       PAGE_ADAPTER_ID,
       'flaky-probe',
     ]);
-    const flakyReport = verdict.perAdapter[1]?.readiness;
-    expect(flakyReport?.signals.every((row) => row.status === 'degraded')).toBe(true);
+    // The failed probe establishes nothing: every row it contributes is withheld…
+    expect(flakySignals).toContain('perf');
+    expect(flakyReport?.signals.every((row) => row.status === 'unavailable')).toBe(true);
+    expect(flakyReport?.ready).toBe(false);
+    // …and each of those signals is delivered only because the page adapter vouches for it.
+    expect(verdict.deliverableSignals).toEqual(verdict.plannedSignals);
+    expect(verdict.satisfied).toBe(true);
+    expect(verdict.blocking).toEqual([]);
+    expect(signalsOf(verdict.degraded)).toEqual(flakySignals);
+    for (const gap of verdict.degraded) {
+      expect(gap.reason.trim().length).toBeGreaterThan(0);
+      expect(gap.hint.trim().length).toBeGreaterThan(0);
+    }
   });
 });
 
@@ -2383,35 +3155,87 @@ describe('evaluateReadiness — degradation-only conditions', () => {
 // evaluateReadiness — adapters
 // ---------------------------------------------------------------------------
 
-describe('evaluateReadiness — adapter failures never propagate', () => {
-  it('turns a rejected probe into degraded rows carrying the error’s reason and hint', async () => {
+/**
+ * The generic next step `./readiness.ts` gives a probe that failed, written
+ * out independently of the module's own constant.
+ */
+const ADAPTER_FAILED_HINT =
+  'Capture proceeds with the signals that are available; check the service log, then evaluate readiness again.';
+
+describe('evaluateReadiness — adapter failures fail closed and never propagate', () => {
+  /**
+   * Every session-level gate healthy: a bound tab whose current document's page
+   * agent reported with the hook in place before React, and a preload connected
+   * for the project — so whatever withholds a signal below is the probe alone.
+   */
+  const healthyGates = (): Pick<EvaluateReadinessRequest, 'context' | 'boundTab'> => ({
+    context: context({
+      browserAgent: toObservedBrowserAgent(agentReady(), NOW),
+      serverAgent: { connected: true, projectRoot: PROJECT_ROOT, lastHeartbeatAt: NOW },
+    }),
+    boundTab: BOUND_TAB,
+  });
+
+  /** Evaluates through `settle`, so a throw of any kind fails the case as data. */
+  async function evaluateSettled(
+    deps: Pick<EvaluateReadinessDeps, 'adapters'> & Partial<EvaluateReadinessDeps>,
+    request: Pick<EvaluateReadinessRequest, 'plan'>,
+  ): Promise<ReadinessVerdict> {
+    const outcome = await settle(() =>
+      evaluateReadiness(
+        { agents: fakeAgents({ latest: agentReady() }).registry, now: clock, ...deps },
+        { ...healthyGates(), ...request },
+      ),
+    );
+
+    expect(outcome.threw).toBe(false);
+    if (outcome.threw) throw new Error('evaluation rethrew');
+    expect(isOk(outcome.value)).toBe(true);
+    if (isErr(outcome.value)) throw outcome.value.error;
+    return outcome.value.value;
+  }
+
+  it('withholds every signal of a rejected probe that is their only claimant, with the fixed reason and hint, never the DebuggenError’s', async () => {
+    const { progress, emit, readyToCapture } = fakeProgress();
     const failing = fakeAdapter(
       PAGE_ADAPTER_ID,
       [{ type: 'fetch-tracking', mode: 'runtime' }],
       () =>
         Promise.reject(
           new DebuggenError('INSTRUMENTATION_UNAVAILABLE', 'probe exploded\nsecond line', {
-            hint: 'try the other thing',
+            hint: 'try the other\nthing',
           }),
         ),
     );
-    const verdict = await evaluate(
-      { adapters: registryOf(failing), agents: fakeAgents({ latest: agentReady() }).registry },
-      { plan: plan([action('fetch-tracking', PAGE_ADAPTER_ID)]), boundTab: BOUND_TAB },
+    const verdict = await evaluateSettled(
+      { adapters: registryOf(failing), progress },
+      { plan: plan([action('fetch-tracking', PAGE_ADAPTER_ID)]) },
     );
 
-    expect(verdict.satisfied).toBe(true);
-    expect(verdict.degraded).toEqual([
-      { signal: 'interactions', reason: 'probe exploded second line', hint: 'try the other thing' },
-      { signal: 'fetch', reason: 'probe exploded second line', hint: 'try the other thing' },
+    const reason = `the ${PAGE_ADAPTER_ID} adapter could not report readiness`;
+    expect(verdict.plannedSignals).toEqual(['interactions', 'fetch']);
+    expect(verdict.deliverableSignals).toEqual([]);
+    expect(verdict.satisfied).toBe(false);
+    // Rule 4: with nothing deliverable, every gap holds the session back.
+    expect(verdict.degraded).toEqual([]);
+    expect(verdict.blocking).toEqual([
+      { signal: 'interactions', reason, hint: ADAPTER_FAILED_HINT },
+      { signal: 'fetch', reason, hint: ADAPTER_FAILED_HINT },
     ]);
+    expect(isProductAuthoredText(reason)).toBe(true);
+    expect(isProductAuthoredText(ADAPTER_FAILED_HINT)).toBe(true);
     const report = verdict.perAdapter[0]?.readiness;
     expect(report?.adapter).toBe(PAGE_ADAPTER_ID);
-    expect(report?.ready).toBe(true);
-    expect(report?.signals.every((row) => row.status === 'degraded')).toBe(true);
+    expect(report?.ready).toBe(false);
+    expect(report?.signals.every((row) => row.status === 'unavailable')).toBe(true);
+    // Every page gate held, so no reload or binding is asked for, and nothing announces ready.
+    expect(verdict.remediations).toEqual([]);
+    expect(verdict.reloadRequested).toBe(false);
+    expect(emit).not.toHaveBeenCalled();
+    expect(readyToCapture).not.toHaveBeenCalled();
   });
 
-  it('contains a probe that throws synchronously, with a fallback hint', async () => {
+  it('withholds the signals of a probe that throws synchronously, with a fallback hint', async () => {
     const failing = fakeAdapter(
       PAGE_ADAPTER_ID,
       [{ type: 'perf-tracking', mode: 'runtime' }],
@@ -2419,30 +3243,172 @@ describe('evaluateReadiness — adapter failures never propagate', () => {
         throw new Error('sync failure');
       },
     );
+    const verdict = await evaluateSettled(
+      { adapters: registryOf(failing) },
+      { plan: plan([action('perf-tracking', PAGE_ADAPTER_ID)]) },
+    );
+
+    expect(verdict.satisfied).toBe(false);
+    expect(verdict.deliverableSignals).toEqual([]);
+    expect(signalsOf(verdict.blocking)).toEqual(verdict.plannedSignals);
+    expect(verdict.blocking[0]?.reason).toBe(
+      `the ${PAGE_ADAPTER_ID} adapter could not report readiness`,
+    );
+    expect(verdict.blocking[0]?.hint.length).toBeGreaterThan(0);
+    expect(verdict.degraded).toEqual([]);
+  });
+
+  it('never shows a thrown probe’s own message or foreign hint as a readiness reason or hint', async () => {
+    const sentinel = 'sentinel-51f0';
+    const privateText = `SELECT * FROM users WHERE email = '${sentinel}@example.test' -- /home/dev/project/.env?token=${sentinel}`;
+    // A foreign error whose `hint` property is not the product's, and the
+    // product's own error wrapping a message it did not write.
+    const thrown: readonly Error[] = [
+      Object.assign(new Error(privateText), { hint: `run cat /etc/${sentinel}` }),
+      new DebuggenError('INSTRUMENTATION_UNAVAILABLE', privateText),
+    ];
+
+    for (const error of thrown) {
+      const { progress, emit } = fakeProgress();
+      const failing = fakeAdapter(
+        PAGE_ADAPTER_ID,
+        [{ type: 'perf-tracking', mode: 'runtime' }],
+        () => Promise.reject(error),
+      );
+      const verdict = await evaluate(
+        {
+          adapters: registryOf(failing),
+          agents: fakeAgents({ latest: agentReady() }).registry,
+          progress,
+        },
+        { plan: plan([action('perf-tracking', PAGE_ADAPTER_ID)]), boundTab: BOUND_TAB },
+      );
+      const rows = verdict.perAdapter.flatMap((report) =>
+        report.readiness.signals.flatMap((row) => [row.reason ?? '', row.hint ?? '']),
+      );
+      const emitted = emit.mock.calls.flatMap(([, row]) => [row.message, row.detail ?? '']);
+
+      // The only claimant failed, so its signals are withheld (fail closed).
+      expect(verdict.blocking.length).toBeGreaterThan(0);
+      for (const text of [...verdictStrings(verdict), ...rows, ...emitted]) {
+        expect(text).not.toContain(sentinel);
+      }
+    }
+  });
+
+  it('replaces a thrown DebuggenError’s private hint with the fixed hint, keeping the error for the local log', async () => {
+    const sentinel = 'sentinel-9a4c';
+    const thrown = new DebuggenError('INSTRUMENTATION_UNAVAILABLE', 'the probe failed', {
+      hint: `Re-run SELECT * FROM accounts WHERE token = '${sentinel}' in /home/dev/project/.env?key=${sentinel}`,
+    });
+    const records: { readonly level: string; readonly fields: LogFields | undefined }[] = [];
+    const record =
+      (level: string) =>
+      (_message: string, fields?: LogFields): void => {
+        records.push({ level, fields });
+      };
+    const logger: Logger = {
+      level: 'trace',
+      trace: record('trace'),
+      debug: record('debug'),
+      info: record('info'),
+      warn: record('warn'),
+      error: record('error'),
+      fatal: record('fatal'),
+      child: () => logger,
+    };
+    const failing = fakeAdapter(PAGE_ADAPTER_ID, [{ type: 'perf-tracking', mode: 'runtime' }], () =>
+      Promise.reject(thrown),
+    );
+
     const verdict = await evaluate(
-      { adapters: registryOf(failing), agents: fakeAgents({ latest: agentReady() }).registry },
+      {
+        adapters: registryOf(failing),
+        agents: fakeAgents({ latest: agentReady() }).registry,
+        logger,
+      },
       { plan: plan([action('perf-tracking', PAGE_ADAPTER_ID)]), boundTab: BOUND_TAB },
     );
 
-    expect(verdict.satisfied).toBe(true);
-    expect(verdict.degraded[0]?.reason).toBe('sync failure');
-    expect(verdict.degraded[0]?.hint.length).toBeGreaterThan(0);
+    expect(verdict.blocking.length).toBeGreaterThan(0);
+    for (const gap of verdict.blocking) {
+      expect(gap.hint).toBe(ADAPTER_FAILED_HINT);
+      expect(isProductAuthoredText(gap.reason)).toBe(true);
+      expect(isProductAuthoredText(gap.hint)).toBe(true);
+    }
+    for (const text of verdictStrings(verdict)) {
+      expect(text).not.toContain(sentinel);
+    }
+
+    // The error itself travels only under the logger's error key: once at
+    // `warn`, once at `debug` for the serializer's redacted diagnostic.
+    const carrying = records.filter((entry) => entry.fields?.[LOG_ERROR_FIELD_KEY] === thrown);
+    expect(carrying.map((entry) => entry.level)).toEqual(['warn', 'debug']);
+    for (const entry of carrying) {
+      const { [LOG_ERROR_FIELD_KEY]: caught, ...closed } = entry.fields ?? {};
+      expect(caught).toBe(thrown);
+      expect(closed['adapterId']).toBe(PAGE_ADAPTER_ID);
+      expect(JSON.stringify(closed)).not.toContain(sentinel);
+    }
   });
 
-  it('degrades the signals of an adapter that answers an invalid report', async () => {
+  it('withholds the signals of an adapter that answers an invalid report', async () => {
     const invalid = fakeAdapter(
       PAGE_ADAPTER_ID,
       [{ type: 'fetch-tracking', mode: 'runtime' }],
       () => ({ ready: 'yes' }) as unknown as Readiness,
     );
-    const verdict = await evaluate(
-      { adapters: registryOf(invalid), agents: fakeAgents({ latest: agentReady() }).registry },
-      { plan: plan([action('fetch-tracking', PAGE_ADAPTER_ID)]), boundTab: BOUND_TAB },
+    const verdict = await evaluateSettled(
+      { adapters: registryOf(invalid) },
+      { plan: plan([action('fetch-tracking', PAGE_ADAPTER_ID)]) },
     );
 
+    expect(verdict.satisfied).toBe(false);
+    expect(verdict.deliverableSignals).toEqual([]);
+    expect(signalsOf(verdict.blocking)).toEqual(['interactions', 'fetch']);
+    expect(verdict.blocking[0]?.reason).toMatch(/does not match the readiness schema/);
+    expect(verdict.perAdapter[0]?.readiness.signals.map((row) => row.status)).toEqual([
+      'unavailable',
+      'unavailable',
+    ]);
+  });
+
+  it('delivers a signal a failed probe covers only where a second adapter reports it ready', async () => {
+    const failing = fakeAdapter('flaky-probe', [{ type: 'fetch-tracking', mode: 'runtime' }], () =>
+      Promise.reject(new Error('probe timed out')),
+    );
+    // Confirms `fetch` alone; `interactions` has no witness but the failed probe.
+    const confirmer = fakeAdapter(
+      'fetch-confirmer',
+      [{ type: 'fetch-tracking', mode: 'runtime' }],
+      () =>
+        buildReadiness({
+          adapter: 'fetch-confirmer',
+          signals: [{ signal: 'fetch', status: 'available' }],
+          now: clock,
+        }),
+    );
+    const verdict = await evaluateSettled(
+      { adapters: registryOf(failing, confirmer) },
+      { plan: plan([action('fetch-tracking', 'flaky-probe')]) },
+    );
+
+    expect(verdict.perAdapter.map((report) => report.adapterId)).toEqual([
+      'flaky-probe',
+      'fetch-confirmer',
+    ]);
+    expect(verdict.plannedSignals).toEqual(['interactions', 'fetch']);
+    expect(verdict.deliverableSignals).toEqual(['fetch']);
     expect(verdict.satisfied).toBe(true);
+    expect(verdict.blocking).toEqual([]);
+    // Both still carry the failure, so the developer is told why each may be
+    // thin or missing — in the fixed product wording, never the thrown message.
     expect(signalsOf(verdict.degraded)).toEqual(['interactions', 'fetch']);
-    expect(verdict.degraded[0]?.reason).toMatch(/does not match the readiness schema/);
+    expect(
+      verdict.degraded.every(
+        (gap) => gap.reason === 'the flaky-probe adapter could not report readiness',
+      ),
+    ).toBe(true);
   });
 });
 
@@ -2667,8 +3633,22 @@ describe('evaluateReadiness — structural guarantees', () => {
       },
     );
 
-    expect(verdict.blocking.length).toBeGreaterThan(0);
-    expect(verdict.degraded.length).toBeGreaterThan(0);
+    // A late page blocks every browser signal and no preload is connected, so
+    // nothing is deliverable and Rule 4 holds every gap — page and server — in
+    // `blocking`; the failed probe's withheld rows travel in its report.
+    expect(verdict.deliverableSignals).toEqual([]);
+    expect(verdict.degraded).toEqual([]);
+    expect(signalsOf(verdict.blocking)).toEqual(expect.arrayContaining(['react', 'http']));
+    const flakyRows =
+      verdict.perAdapter.find((report) => report.adapterId === 'flaky-probe')?.readiness.signals ??
+      [];
+    expect(flakyRows.length).toBeGreaterThan(0);
+    for (const row of flakyRows) {
+      expect(row).toMatchObject({
+        status: 'unavailable',
+        reason: 'the flaky-probe adapter could not report readiness',
+      });
+    }
     expect(verdict.remediations.map((entry) => entry.kind)).toEqual([
       'reload-page',
       'relaunch-dev-server',
@@ -2777,10 +3757,283 @@ describe('evaluateReadiness — edge cases', () => {
     expect(verdict.evaluatedAt).toBeGreaterThan(0);
   });
 
+  it('records falling back from a throwing clock once, at debug, with closed fields only', async () => {
+    const debug = vi.fn<Logger['debug']>();
+    const logger: Logger = {
+      ...noopLogger,
+      level: 'trace',
+      debug,
+      child: () => logger,
+    };
+    const before = Date.now();
+    const verdict = await evaluate(
+      {
+        adapters: registryOf(pageAdapter()),
+        agents: fakeAgents({ latest: agentReady() }).registry,
+        logger,
+        now: () => {
+          throw new Error('clock-sentinel-83c1');
+        },
+      },
+      { plan: plan([action('fetch-tracking', PAGE_ADAPTER_ID)]), boundTab: BOUND_TAB },
+    );
+
+    expect(verdict.evaluatedAt).toBeGreaterThanOrEqual(before);
+    const fallbacks = debug.mock.calls.filter(([, fields]) => fields?.['reason'] === 'clock-threw');
+    expect(fallbacks).toHaveLength(1);
+    expect(fallbacks[0]?.[1]).toMatchObject({ reason: 'clock-threw', errorClass: 'Error' });
+    expect(JSON.stringify(fallbacks)).not.toContain('clock-sentinel-83c1');
+  });
+
   it('exposes bounded reload-wait constants', () => {
     expect(DEFAULT_RELOAD_WAIT_MS).toBeGreaterThan(0);
     expect(MAX_RELOAD_WAIT_MS).toBeGreaterThanOrEqual(DEFAULT_RELOAD_WAIT_MS);
     expect(RELOAD_REQUEST_MESSAGE).not.toMatch(/[\n\r]/);
+  });
+
+  it('exposes bounded navigation-settle constants, far shorter than the reload wait', () => {
+    expect(DEFAULT_NAVIGATION_SETTLE_MS).toBe(1_500);
+    expect(MAX_NAVIGATION_SETTLE_MS).toBe(10_000);
+    expect(MAX_NAVIGATION_SETTLE_MS).toBeGreaterThanOrEqual(DEFAULT_NAVIGATION_SETTLE_MS);
+    expect(MAX_NAVIGATION_SETTLE_MS).toBeLessThan(DEFAULT_RELOAD_WAIT_MS);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The capture gate's refusal of a verdict (../pipeline/stages/capture.ts):
+// only product-authored reasons and hints reach a client (CWE-209)
+// ---------------------------------------------------------------------------
+
+/** A session record the capture stage may arm: `ready`, holding `planned`. */
+function readySession(planned: InstrumentationPlan): SessionRecord {
+  return {
+    id: SESSION_ID,
+    projectRoot: PROJECT_ROOT,
+    projectName: 'sample-project',
+    devServerUrl: `${APP_ORIGIN}/`,
+    createdAt: NOW,
+    updatedAt: NOW,
+    status: 'ready',
+    question: 'Why does the sample panel take so long to save?',
+    followUps: [],
+    relevantFiles: [],
+    plans: [planned],
+    modifications: [],
+    captures: [],
+    panelIds: [],
+    analyses: [],
+    cleanup: { status: 'pending', conflicts: [] },
+    promptVersions: {},
+    provider: { id: 'deterministic' },
+  };
+}
+
+/**
+ * Arms the real capture stage with `verdict` as the install's verdict and
+ * returns its refusal. Every collaborator past the gate throws, so the refusal
+ * is proven to be the gate's own, raised before any capture window opens.
+ */
+async function captureGateRefusal(
+  verdict: ReadinessVerdict,
+  planned: InstrumentationPlan,
+): Promise<DebuggenError> {
+  const beyondTheGate = (member: string) => (): never => {
+    throw new Error(`the capture gate must refuse before ${member}`);
+  };
+  const session = readySession(planned);
+  const stage = createCaptureStage({
+    instrumentation: {
+      armCapture: beyondTheGate('armCapture'),
+      disarmCapture: beyondTheGate('disarmCapture'),
+      arming: () => undefined,
+    },
+    sessions: {
+      getCapture: beyondTheGate('getCapture'),
+      getActiveCapture: beyondTheGate('getActiveCapture'),
+    },
+    telemetry: {
+      pageCaptureForSummary: beyondTheGate('pageCaptureForSummary'),
+      countByKind: beyondTheGate('countByKind'),
+      captureWatermark: beyondTheGate('captureWatermark'),
+      beginProducerLossAccounting: beyondTheGate('beginProducerLossAccounting'),
+      producerLoss: beyondTheGate('producerLoss'),
+      releaseProducerLoss: beyondTheGate('releaseProducerLoss'),
+    },
+    sessionManager: {
+      get: () => ok(session),
+      startCapture: beyondTheGate('startCapture'),
+      stopCapture: beyondTheGate('stopCapture'),
+    },
+    progress: {
+      stageStarted: beyondTheGate('stageStarted'),
+      stageCompleted: beyondTheGate('stageCompleted'),
+      stageFailed: beyondTheGate('stageFailed'),
+      finding: beyondTheGate('finding'),
+    },
+    registry: { get: () => undefined },
+    logger: noopLogger,
+  });
+
+  const armed = await stage.arm(
+    { sessionId: SESSION_ID, session, projectRoot: PROJECT_ROOT, logger: noopLogger, now: clock },
+    { readiness: verdict },
+  );
+
+  if (!isErr(armed)) {
+    throw new Error('the capture gate admitted an unsatisfied verdict');
+  }
+
+  return armed.error;
+}
+
+/** The gate's sentences for `entries`, composed as the stage composes them, collapsed alike. */
+function gateSentences(
+  entries: readonly { readonly signal: CaptureSignal; readonly reason: string }[],
+): string[] {
+  return [
+    ...new Set(
+      entries.map(
+        (entry) => `Could not enable ${CAPTURE_SIGNAL_LABELS[entry.signal]}: ${entry.reason}.`,
+      ),
+    ),
+  ];
+}
+
+describe('the capture gate refusal — only product-authored wording reaches a client', () => {
+  const sentinel = 'sentinel-c3f1';
+  const privateReason = `the driver said SELECT * FROM users WHERE email = '${sentinel}@example.test'`;
+  const privateHint = `open /home/dev/project/.env?token=${sentinel} and retry`;
+  const PRIVATE_ADAPTER_ID = 'private-probe';
+
+  /** An adapter that reports every signal of its action unavailable, in its own private words. */
+  function privateAdapter(): ReturnType<typeof fakeAdapter> {
+    return fakeAdapter(PRIVATE_ADAPTER_ID, [{ type: 'fetch-tracking', mode: 'runtime' }], () =>
+      buildReadiness({
+        adapter: PRIVATE_ADAPTER_ID,
+        signals: (['interactions', 'fetch'] as const).map((signal): ReadinessSignal => ({
+          signal,
+          status: 'unavailable',
+          reason: privateReason,
+          hint: privateHint,
+        })),
+        now: clock,
+      }),
+    );
+  }
+
+  it('refuses with the code’s fixed copy when every blocking reason and hint is an adapter’s', async () => {
+    const planned = plan([action('fetch-tracking', PRIVATE_ADAPTER_ID)]);
+    const verdict = await evaluate(
+      {
+        adapters: registryOf(privateAdapter()),
+        agents: fakeAgents({ latest: agentReady() }).registry,
+      },
+      { plan: planned, boundTab: BOUND_TAB },
+    );
+
+    // Readiness relays the adapter's words verbatim for the progress view, and
+    // never registers them as the product's.
+    expect(verdict.satisfied).toBe(false);
+    expect(signalsOf(verdict.blocking)).toEqual(['interactions', 'fetch']);
+    for (const entry of verdict.blocking) {
+      expect(entry.reason).toBe(privateReason);
+      expect(isProductAuthoredText(entry.reason)).toBe(false);
+      expect(isProductAuthoredText(entry.hint)).toBe(false);
+    }
+
+    const refusal = await captureGateRefusal(verdict, planned);
+
+    expect(refusal.code).toBe('INSTRUMENTATION_UNAVAILABLE');
+    expect(refusal.message).toBe(FAILURE_COPY_BY_CODE.INSTRUMENTATION_UNAVAILABLE.summary);
+    expect(refusal.hint).toBe(FAILURE_COPY_BY_CODE.INSTRUMENTATION_UNAVAILABLE.hint);
+    expect(JSON.stringify(refusal.toPayload())).not.toContain(sentinel);
+    expect(isProductAuthoredText(refusal.message)).toBe(true);
+    expect(isProductAuthoredText(refusal.hint)).toBe(true);
+  });
+
+  it('keeps the proven sentences and puts fixed copy only where an entry was unproven', async () => {
+    const planned = plan([action('fetch-tracking', PAGE_ADAPTER_ID)]);
+    const unbound = await evaluate(
+      { adapters: registryOf(pageAdapter()), agents: fakeAgents().registry },
+      { plan: planned },
+    );
+    expect(signalsOf(unbound.blocking)).toEqual(['interactions', 'fetch']);
+    const verdict: ReadinessVerdict = {
+      ...unbound,
+      blocking: [...unbound.blocking, { signal: 'pg', reason: privateReason, hint: privateHint }],
+    };
+
+    const refusal = await captureGateRefusal(verdict, planned);
+    const copy = FAILURE_COPY_BY_CODE.TAB_NOT_BOUND;
+    const gateReason = unbound.blocking[0]?.reason ?? '';
+    const gateHint = unbound.blocking[0]?.hint ?? '';
+
+    expect(refusal.code).toBe('TAB_NOT_BOUND');
+    expect(refusal.message).toBe(
+      [
+        ...gateSentences([
+          { signal: 'interactions', reason: gateReason },
+          { signal: 'fetch', reason: gateReason },
+        ]),
+        copy.summary,
+      ].join(' '),
+    );
+    expect(refusal.hint).toBe(`${gateHint} ${copy.hint}`);
+    expect(JSON.stringify(refusal.toPayload())).not.toContain(sentinel);
+    expect(isProductAuthoredText(refusal.message)).toBe(true);
+    expect(isProductAuthoredText(refusal.hint)).toBe(true);
+  });
+
+  it('quotes readiness’s own gate wording verbatim, and registers the composed refusal', async () => {
+    const planned = plan([action('fetch-tracking', PAGE_ADAPTER_ID)]);
+    const verdict = await evaluate(
+      { adapters: registryOf(pageAdapter()), agents: fakeAgents().registry },
+      { plan: planned },
+    );
+    const gateReason = verdict.blocking[0]?.reason ?? '';
+
+    expect(isProductAuthoredText(gateReason)).toBe(true);
+
+    const refusal = await captureGateRefusal(verdict, planned);
+
+    expect(refusal.code).toBe('TAB_NOT_BOUND');
+    expect(refusal.message).toBe(
+      gateSentences([
+        { signal: 'interactions', reason: gateReason },
+        { signal: 'fetch', reason: gateReason },
+      ]).join(' '),
+    );
+    expect(refusal.hint).toBe(verdict.blocking[0]?.hint);
+    expect(isProductAuthoredText(refusal.message)).toBe(true);
+    expect(isProductAuthoredText(refusal.hint)).toBe(true);
+  });
+
+  it('quotes detection’s preload reason and relaunch command verbatim, and registers the composed refusal', async () => {
+    const planned = plan([action('server-span', SERVER_ADAPTER_ID)]);
+    const verdict = await evaluate(
+      { adapters: registryOf(serverAdapter()), agents: fakeAgents().registry },
+      { plan: planned },
+    );
+    const generic = { projectRoot: PROJECT_ROOT, packageManager: 'pnpm' } as const;
+    const preloadReason = verdict.blocking[0]?.reason ?? '';
+
+    expect(signalsOf(verdict.blocking)).toEqual(['http', 'routeHandlers', 'functions']);
+    expect(isProductAuthoredText(preloadReason)).toBe(true);
+
+    const refusal = await captureGateRefusal(verdict, planned);
+
+    expect(refusal.code).toBe('SERVER_AGENT_NOT_READY');
+    expect(refusal.message).toBe(
+      gateSentences([
+        { signal: 'http', reason: preloadReason },
+        { signal: 'routeHandlers', reason: preloadReason },
+        { signal: 'functions', reason: preloadReason },
+      ]).join(' '),
+    );
+    expect(refusal.hint).toBe(buildRelaunchHint(generic));
+    expect(refusal.hint).toContain(formatRelaunchCommand(generic));
+    expect(isProductAuthoredText(refusal.message)).toBe(true);
+    expect(isProductAuthoredText(refusal.hint)).toBe(true);
   });
 });
 

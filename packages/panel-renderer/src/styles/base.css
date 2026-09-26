@@ -51,17 +51,20 @@
  * ## Structural values that are not design decisions
  *
  * Purely relational forms encode no design decision and are permitted:
- * percentages such as `100%`, grid and flex ratios such as `1fr`,
- * `minmax(0, 1fr)` and `flex: 1 1 auto`, `inset(50%)`, unitless SVG geometry
- * (for example `stroke-dasharray`), and the CSS border-width keywords `thin`
- * and `medium` — which is how a hairline rule is expressed here, never as a
- * length. A duration is not among them: a transition or animation takes its
- * timing from the motion tokens, and a visible size is not either: a glyph box
- * takes `--dg-icon-size`, which is font-relative in the token table itself.
- * The one length literal in this file is the `1em` clip box of
- * `.dg-visually-hidden`, which paints nothing and so encodes no visual
- * dimension; `src/tokens/tokens.test.ts` names that exemption exactly and
- * fails on any other length literal.
+ * percentages such as `100%`, flex ratios such as `flex: 1 1 auto`,
+ * `inset(50%)` and unitless SVG geometry (for example `stroke-dasharray`).
+ * A duration is not among them: a transition or animation takes its timing
+ * from the motion tokens. A visible size is not either: a glyph box takes
+ * `--dg-icon-size`, which is font-relative in the token table itself. Nor is
+ * an edge's weight: a hairline is `--dg-border-width-hairline` and an emphasis
+ * edge `--dg-border-width-marker`, so no `thin`, `medium` or `thick` keyword
+ * appears in a border or outline declaration. Nor is a share of a grid's spare
+ * width, which is a `--dg-column-share-*` token, or the unit of a measured
+ * number, which is `--dg-pixel-unit`. The one length literal in this file is
+ * the `1em` clip box of `.dg-visually-hidden`, which paints nothing and so
+ * encodes no visual dimension; `src/tokens/tokens.test.ts` names that
+ * exemption exactly and fails on any other length literal and on any
+ * border-width keyword.
  *
  * ## Type roles
  *
@@ -281,11 +284,11 @@ body {
   color: var(--dg-text-muted);
 }
 
-/* A hairline expressed with the border-width keyword, since a length is not
- * available to this layer. */
+/* A divider drawn in the hairline edge weight, the token every rule and
+ * divider in the design system shares. */
 :where(hr) {
   border: 0;
-  border-top: thin solid var(--dg-border-subtle);
+  border-top: var(--dg-border-width-hairline) solid var(--dg-border-subtle);
 }
 
 /* ==========================================================================

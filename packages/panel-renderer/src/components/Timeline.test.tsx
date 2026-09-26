@@ -30,9 +30,17 @@
  *     span whose parent is not loaded is marked "Parent not loaded" — never
  *     "Re-attached" — until a later page brings the parent.
  *   - **Partial results say so.** A `spans` page states how much of the result it
- *     holds and offers to load more; a `trace` walk stopped at its row bound
- *     states N of M and offers to show more; a `trace` the correlator truncated
- *     says that, with the refine route, instead of implying completeness.
+ *     holds and offers to load more; a `trace` the correlator truncated says
+ *     that, with the refine route, instead of implying completeness.
+ *   - **The drawn-row budget is absolute.** A walk longer than
+ *     `MAX_DRAWN_ROWS` is drawn one window at a time: the canvas never holds
+ *     more bars than the budget however often "Next spans" is pressed, every
+ *     walked span is drawn in exactly one window, the footer states which rows
+ *     are drawn and how many precede and follow them, no connector is drawn to
+ *     a parent outside the window, focus passes to the other paging control at
+ *     either end, a span result's further pages lengthen the walk without
+ *     growing the window, a span selected elsewhere in the panel pages the
+ *     window to it once, and a changed query starts again at its first row.
  *   - **Paging follows the service.** Each further page is requested at the
  *     `nextOffset` the previous response named, at the same page size, and
  *     appended with each record once; the loaded rows stay on screen while a
@@ -74,15 +82,14 @@
  *   - **Generic fixture vocabulary only** (AAP 0.5.4): span names, a file path and
  *     a symbol belonging to no application, demonstration or otherwise — in the
  *     fixtures and in the comments alike.
- *   - **Layout is not stubbed, with one declared exception.** No
- *     `getBoundingClientRect` override and no `ResizeObserver` polyfill: with no
- *     layout the viewport reports no width, so the canvas lays out at its
- *     unmeasured fallback width and its labels are measured by the deterministic
- *     estimate of `../utils/measure` — a pure function of the data, which is what
- *     every case asserts against. The exception is the measured-mode cases in
- *     "Timeline canvas geometry", which report a width for the timeline's
- *     viewport element only, through a `clientWidth` getter restored after each
- *     case: the pixel-canvas contract cannot be observed any other way here.
+ *   - **Layout is not stubbed.** No `getBoundingClientRect` override, no
+ *     `ResizeObserver` polyfill and no size getter anywhere: the component reads
+ *     no layout, so none is needed. The canvas is a fixed logical coordinate
+ *     space — a `viewBox` `CHART_VIEWBOX_WIDTH` units wide, `width="100%"`,
+ *     `preserveAspectRatio="xMinYMin meet"` — and its labels are fitted with
+ *     the deterministic advance estimate of `../utils/format`, so the drawing
+ *     is a pure function of the data, which is what every case asserts against
+ *     under happy-dom's zero layout.
  *   - **Queries by role and accessible name.** The canvas, the grid, its rows, the
  *     chips, the tooltips and the footer control are all reached that way; a class
  *     is read only off an element already obtained semantically, since no
@@ -130,19 +137,28 @@ import type {
   PanelSelectionState,
 } from '../host/PanelActions';
 import { kindColorVar, tierColorVar } from '../utils/color';
-import { ELLIPSIS, createEstimateMeasure, splitGraphemes } from '../utils/measure';
 import {
+  DEFAULT_LABEL_FONT_SIZE,
+  ELLIPSIS,
   KIND_LABELS,
   NOT_AVAILABLE_LABEL,
   TIER_LABELS,
+  createEstimateMeasure,
   formatCount,
   formatDuration,
   formatDurationCompact,
   formatKindLabel,
   formatOffset,
   formatTierLabel,
+  splitGraphemes,
 } from '../utils/format';
-import { alignHairline, layoutHeight, rowY } from '../utils/scale';
+import {
+  CHART_VIEWBOX_WIDTH,
+  MAX_DRAWN_ROWS,
+  alignHairline,
+  layoutHeight,
+  rowY,
+} from '../utils/scale';
 import { FlameChart } from './FlameChart';
 import { Timeline } from './Timeline';
 
@@ -2222,34 +2238,79 @@ describe('Timeline empty pages', () => {
   );
 });
 
-/** The trace walk's default row bound, restated so the counts below are stated. */
-const TRACE_ROW_BOUND = 2000;
+/**
+ * The most bars one window draws, restated so the counts below are stated —
+ * and checked against the scale module's own budget in the first case that
+ * relies on it, so a change to either is noticed.
+ */
+const DRAWN_ROW_BUDGET = 2000;
 
-/** Children under the wide trace's root: past the bound, by less than one step. */
-const WIDE_CHILD_COUNT = 2500;
+/**
+ * The time a case that draws full windows is allowed, in milliseconds.
+ *
+ * Each full window is two thousand bars with their labels and titles, which
+ * the layout-free DOM builds in about a second; a case that pages through
+ * several windows exceeds the runner's five-second default on a shared,
+ * loaded machine without anything being wrong. Generous, not unbounded: a
+ * window that never settles still fails the case.
+ */
+const WINDOW_CASE_TIMEOUT_MS = 30_000;
 
-/** The control that raises a trace walk's row bound. */
-const SHOW_MORE_SPANS_NAME = 'Show more spans';
+/**
+ * Children under the long trace's root: with the root, 4,501 rows — two full
+ * windows and a third of 501, so paging reaches a last window that is not full.
+ */
+const LONG_CHILD_COUNT = 4500;
+
+/** The rows the long trace's walk holds: its root and every child. */
+const LONG_TRACE_ROWS = LONG_CHILD_COUNT + 1;
+
+/** The control that moves the drawn window back by one window. */
+const PREVIOUS_SPANS_NAME = 'Previous spans';
+
+/** The control that moves the drawn window on by one window. */
+const NEXT_SPANS_NAME = 'Next spans';
 
 /** The refine route the footer gives for a trace the correlator bounded. */
 const REFINE_TRUNCATED_TRACE = 'Narrow the query or capture a shorter interaction to see the rest.';
 
+/** The span id of the long trace's root, which every child names as its parent. */
+const LONG_ROOT_SPAN_ID = spanIdFor(5000);
+
+/** The event id of the long trace's root. */
+const LONG_ROOT_ID = 'event-example-wide-root';
+
+/** The operation name of the long trace's root. */
+const LONG_ROOT_NAME = 'example.batch';
+
+/** The event id of the long trace's child at `index`. */
+function longChildId(index: number): string {
+  return `event-example-wide-${String(index).padStart(4, '0')}`;
+}
+
+/** The operation name of the long trace's child at `index`. */
+function longChildName(index: number): string {
+  return `example.step.${String(index).padStart(4, '0')}`;
+}
+
 /**
- * A trace wider than the walk's row bound: one root and
- * {@link WIDE_CHILD_COUNT} back-to-back 1 ms operations under it.
+ * A trace longer than one drawn window: one root and `childCount`
+ * back-to-back 1 ms operations under it, so the walk is the root followed by
+ * every child in order and a child's walk position is its index plus one.
  *
+ * @param childCount How many children the root has.
  * @returns The correlated trace.
  */
-function wideTrace(): TraceTree {
-  const rootSpanId = spanIdFor(5000);
-  const children = Array.from({ length: WIDE_CHILD_COUNT }, (_unused, index) =>
+function wideTrace(childCount: number = LONG_CHILD_COUNT): TraceTree {
+  const rootSpanId = LONG_ROOT_SPAN_ID;
+  const children = Array.from({ length: childCount }, (_unused, index) =>
     makeTraceNode(
       makeEvent({
-        id: `event-example-wide-${String(index).padStart(4, '0')}`,
+        id: longChildId(index),
         spanId: spanIdFor(6000 + index),
         parentSpanId: rootSpanId,
         kind: 'function',
-        name: `example.step.${String(index).padStart(4, '0')}`,
+        name: longChildName(index),
         tier: 'server',
         startTime: BASE_START_MS + index,
         duration: 1,
@@ -2264,13 +2325,13 @@ function wideTrace(): TraceTree {
   return makeTree([
     makeTraceNode(
       makeEvent({
-        id: 'event-example-wide-root',
+        id: LONG_ROOT_ID,
         spanId: rootSpanId,
         kind: 'route.handler',
-        name: 'example.batch',
+        name: LONG_ROOT_NAME,
         tier: 'server',
         startTime: BASE_START_MS,
-        duration: WIDE_CHILD_COUNT,
+        duration: childCount,
         producerId: SERVER_PRODUCER_ID,
         seq: 0,
         ingestSeq: 1,
@@ -2363,13 +2424,67 @@ describe('Timeline partial results', () => {
     ).toBeDefined();
 
     // A trace is not a paged source, and nothing more of this one is in memory,
-    // so there is neither a page nor a larger bound to ask for.
+    // so there is neither a page to ask for nor another window to move to.
     expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
-    expect(screen.queryByRole('button', { name: SHOW_MORE_SPANS_NAME })).toBeNull();
+    expect(screen.queryByRole('button', { name: PREVIOUS_SPANS_NAME })).toBeNull();
+    expect(screen.queryByRole('button', { name: NEXT_SPANS_NAME })).toBeNull();
   });
+});
 
-  it('states a walk’s row bound as N of M and shows more spans on request', async () => {
+/**
+ * The footer's statement of a partial window, spelled out as the reader reads
+ * it: the 1-based range drawn, the walk it was cut from, and how many rows lie
+ * before and after it undrawn.
+ *
+ * @param first The first drawn row, 1-based.
+ * @param last The last drawn row, 1-based.
+ * @param total How many rows the walk holds.
+ * @param before How many rows precede the window.
+ * @param after How many rows follow it.
+ */
+function windowFooter(
+  first: number,
+  last: number,
+  total: number,
+  before: number,
+  after: number,
+): string {
+  const undrawn = [
+    ...(before > 0 ? [`${formatCount(before)} before them`] : []),
+    ...(after > 0 ? [`${formatCount(after)} after them`] : []),
+  ];
+
+  return `Spans ${formatCount(first)}–${formatCount(last)} of ${formatCount(
+    total,
+  )} are drawn; ${undrawn.join(' and ')} ${before + after === 1 ? 'is' : 'are'} not.`;
+}
+
+/** A flat span record of a long result: a root of its own, 1 ms after the one before it. */
+function longResultSpan(index: number): TelemetryEvent {
+  return makeEvent({
+    id: `event-example-flat-${String(index).padStart(4, '0')}`,
+    spanId: spanIdFor(9000 + index),
+    kind: 'function',
+    name: `example.flat.${String(index).padStart(4, '0')}`,
+    tier: 'server',
+    startTime: BASE_START_MS + index,
+    duration: 1,
+    producerId: SERVER_PRODUCER_ID,
+    seq: index,
+    ingestSeq: index + 1,
+  });
+}
+
+/*
+ * Every case below draws at least one full window of two thousand bars, so the
+ * group runs under {@link WINDOW_CASE_TIMEOUT_MS} rather than the default.
+ */
+describe('Timeline drawn-row window', { timeout: WINDOW_CASE_TIMEOUT_MS }, () => {
+  it('draws a trace longer than one window a window at a time, says which rows are drawn, and pages without asking for more', async () => {
+    // The budget this suite restates is the scale module's own.
+    expect(MAX_DRAWN_ROWS).toBe(DRAWN_ROW_BUDGET);
     const tree = wideTrace();
+    expect(tree.nodeCount).toBe(LONG_TRACE_ROWS);
     const stub = resolvingTrace(tree);
     const user = userEvent.setup();
 
@@ -2377,33 +2492,311 @@ describe('Timeline partial results', () => {
 
     const canvas = await findCanvas();
 
-    // The walk stopped at its bound: the footer and the picture state the
-    // subset of the whole, and the summary marks it as partial.
-    const firstFooter = `${formatCount(TRACE_ROW_BOUND)} of ${formatCount(tree.nodeCount)} spans shown.`;
-    const footer = screen.getByText(firstFooter);
+    // The first window: which rows it draws and how many follow it undrawn,
+    // in the footer and in the picture's own text alternative.
+    const footer = screen.getByText(
+      windowFooter(1, DRAWN_ROW_BUDGET, LONG_TRACE_ROWS, 0, LONG_TRACE_ROWS - DRAWN_ROW_BUDGET),
+    );
     expect(footer.getAttribute('aria-live')).toBe('polite');
     expect(canvas.getAttribute('aria-label')).toContain(
-      `${formatCount(TRACE_ROW_BOUND)} of ${formatCount(tree.nodeCount)} spans`,
+      `${formatCount(DRAWN_ROW_BUDGET)} of ${formatCount(LONG_TRACE_ROWS)} spans (spans ${formatCount(
+        1,
+      )}–${formatCount(DRAWN_ROW_BUDGET)})`,
     );
-    expect(barsOf(canvas)).toHaveLength(TRACE_ROW_BOUND);
+    expect(barsOf(canvas)).toHaveLength(DRAWN_ROW_BUDGET);
+    expect(barTitled(canvas, LONG_ROOT_NAME)).toBeDefined();
+    // The root is drawn in this window, so every child drawn with it is joined to it.
+    expect(edgesOf(canvas)).toHaveLength(DRAWN_ROW_BUDGET - 1);
     expect(within(summaryStrip()).getByText('Partial result')).toBeDefined();
+    // The table is the same window, and its name says so rather than "every span".
+    expect(
+      screen.getByRole('grid', {
+        name: (name) =>
+          name.includes(
+            `spans ${formatCount(1)}–${formatCount(DRAWN_ROW_BUDGET)} of the ${formatCount(
+              LONG_TRACE_ROWS,
+            )} captured spans`,
+          ),
+      }),
+    ).toBeDefined();
+    expect(screen.queryByRole('button', { name: PREVIOUS_SPANS_NAME })).toBeNull();
     expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
 
-    // The trace is in memory whole, so showing more asks the provider nothing.
-    await user.click(screen.getByRole('button', { name: SHOW_MORE_SPANS_NAME }));
+    // The walk is in memory whole, so moving the window asks the provider nothing.
+    await user.click(screen.getByRole('button', { name: NEXT_SPANS_NAME }));
+    await screen.findByText(
+      windowFooter(
+        DRAWN_ROW_BUDGET + 1,
+        DRAWN_ROW_BUDGET * 2,
+        LONG_TRACE_ROWS,
+        DRAWN_ROW_BUDGET,
+        LONG_TRACE_ROWS - DRAWN_ROW_BUDGET * 2,
+      ),
+    );
     expect(stub.resolve).toHaveBeenCalledTimes(1);
 
-    // The step was capped at the trace's own count, so everything is shown:
-    // the bare count, no partial mark, no control — and focus, whose control
-    // is gone, lands on the table's tab stop rather than on the document.
-    const allCanvas = await findCanvas();
-    expect(barsOf(allCanvas)).toHaveLength(tree.nodeCount);
-    expect(screen.getByText(`${formatCount(tree.nodeCount)} spans shown.`)).toBeDefined();
-    expect(within(summaryStrip()).queryByText('Partial result')).toBeNull();
-    expect(screen.queryByRole('button', { name: SHOW_MORE_SPANS_NAME })).toBeNull();
-    const focused = document.activeElement;
-    expect(focused?.closest('.dg-timeline__equivalent')).not.toBeNull();
-    expect(focused?.getAttribute('tabindex')).toBe('0');
+    // The second window starts at walk row 2,000 — the child at index 1,999 —
+    // and holds no more bars than the first. Its rows' parent, the root, is not
+    // drawn here, so no connector is invented to another row, and each row's
+    // description says where its parent is.
+    const second = await findCanvas();
+    const secondBars = barsOf(second);
+    expect(secondBars).toHaveLength(DRAWN_ROW_BUDGET);
+    expect(
+      secondBars[0]?.querySelector('title')?.textContent?.startsWith(longChildName(1999)),
+    ).toBe(true);
+    expect(() => barTitled(second, LONG_ROOT_NAME)).toThrow();
+    expect(edgesOf(second)).toHaveLength(0);
+    expect(barTitled(second, longChildName(1999)).querySelector('title')?.textContent).toContain(
+      `Its parent span ${LONG_ROOT_SPAN_ID} is span ${formatCount(
+        1,
+      )} of this view, outside the spans drawn now, so no connector is drawn to it.`,
+    );
+    // Every window is drawn on the whole walk's axis.
+    expect(second.getAttribute('aria-label')).toContain(`over ${formatDuration(LONG_CHILD_COUNT)}`);
+    expect(canvas.getAttribute('aria-label')).toContain(`over ${formatDuration(LONG_CHILD_COUNT)}`);
+
+    expect(stub.resolve).toHaveBeenCalledTimes(1);
+  });
+
+  it('hands focus to the other paging control when the window reaches either end of the walk', async () => {
+    // One full window and a short one: 2,101 rows.
+    const childCount = DRAWN_ROW_BUDGET + 100;
+    const rows = childCount + 1;
+    const stub = resolvingTrace(wideTrace(childCount));
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+    await findCanvas();
+    expect(screen.queryByRole('button', { name: PREVIOUS_SPANS_NAME })).toBeNull();
+
+    // The last window is short, and the control that reached it goes away:
+    // focus moves to the control that pages back, not to the document.
+    await user.click(screen.getByRole('button', { name: NEXT_SPANS_NAME }));
+    await screen.findByText(windowFooter(DRAWN_ROW_BUDGET + 1, rows, rows, DRAWN_ROW_BUDGET, 0));
+    expect(barsOf(await findCanvas())).toHaveLength(rows - DRAWN_ROW_BUDGET);
+    expect(screen.queryByRole('button', { name: NEXT_SPANS_NAME })).toBeNull();
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: PREVIOUS_SPANS_NAME }));
+
+    // Back at the first window, focus moves the other way.
+    await user.click(screen.getByRole('button', { name: PREVIOUS_SPANS_NAME }));
+    await screen.findByText(windowFooter(1, DRAWN_ROW_BUDGET, rows, 0, rows - DRAWN_ROW_BUDGET));
+    expect(barsOf(await findCanvas())).toHaveLength(DRAWN_ROW_BUDGET);
+    expect(screen.queryByRole('button', { name: PREVIOUS_SPANS_NAME })).toBeNull();
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: NEXT_SPANS_NAME }));
+    expect(stub.resolve).toHaveBeenCalledTimes(1);
+  });
+
+  it('never draws more than the budget however often Next is pressed, and every walked span is drawn in exactly one window', async () => {
+    const tree = wideTrace();
+    const stub = resolvingTrace(tree);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+    await findCanvas();
+
+    const drawnEvents = new Map<string, number>();
+    let windows = 0;
+    const record = (canvas: HTMLElement): void => {
+      const bars = barsOf(canvas);
+      expect(bars.length).toBeGreaterThan(0);
+      expect(bars.length).toBeLessThanOrEqual(DRAWN_ROW_BUDGET);
+      windows += 1;
+      for (const bar of bars) {
+        const title = bar.querySelector('title')?.textContent ?? '';
+        drawnEvents.set(title, (drawnEvents.get(title) ?? 0) + 1);
+      }
+    };
+
+    record(await findCanvas());
+    // Next is pressed for as long as it is offered; it is withdrawn at the last
+    // window, so no press can move the window past the walk's end.
+    for (;;) {
+      const next = screen.queryByRole('button', { name: NEXT_SPANS_NAME });
+      if (next === null) {
+        break;
+      }
+      const before = screen.getByText(/^Spans /).textContent;
+      await user.click(next);
+      await waitFor(() => {
+        expect(screen.getByText(/^Spans /).textContent).not.toBe(before);
+      });
+      record(await findCanvas());
+      // While the control remains — a middle window — it keeps focus.
+      const remaining = screen.queryByRole('button', { name: NEXT_SPANS_NAME });
+      if (remaining !== null) {
+        expect(document.activeElement).toBe(remaining);
+      }
+    }
+
+    // Three windows for 4,501 rows, and every row of the walk drawn once: the
+    // window moved over the walk, it never grew and never skipped a row.
+    expect(windows).toBe(Math.ceil(LONG_TRACE_ROWS / DRAWN_ROW_BUDGET));
+    expect(drawnEvents.size).toBe(LONG_TRACE_ROWS);
+    expect([...drawnEvents.values()].every((count) => count === 1)).toBe(true);
+    expect(stub.resolve).toHaveBeenCalledTimes(1);
+  });
+  it('starts again from the first window when the node’s query changes', async () => {
+    const stub = resolvingTrace(wideTrace());
+    const { actions } = makeActions();
+    const user = userEvent.setup();
+
+    const withHost = (node: TimelineNode): ReactElement => (
+      <DataProviderContext.Provider value={stub.provider}>
+        <PanelSessionContext.Provider value={SESSION_ID}>
+          <PanelActionsContext.Provider value={actions}>
+            <Timeline node={node} />
+          </PanelActionsContext.Provider>
+        </PanelSessionContext.Provider>
+      </DataProviderContext.Provider>
+    );
+
+    const view = render(withHost(makeNode()));
+    await findCanvas();
+    await user.click(screen.getByRole('button', { name: NEXT_SPANS_NAME }));
+    await screen.findByText(
+      windowFooter(
+        DRAWN_ROW_BUDGET + 1,
+        DRAWN_ROW_BUDGET * 2,
+        LONG_TRACE_ROWS,
+        DRAWN_ROW_BUDGET,
+        LONG_TRACE_ROWS - DRAWN_ROW_BUDGET * 2,
+      ),
+    );
+
+    // Same node, a different query: its walk is drawn from its first row, not
+    // from the window the previous query was paged to.
+    view.rerender(
+      withHost(
+        makeNode({ query: { source: 'trace', filter: { traceId: TRACE_ID, tier: 'server' } } }),
+      ),
+    );
+
+    await screen.findByText(
+      windowFooter(1, DRAWN_ROW_BUDGET, LONG_TRACE_ROWS, 0, LONG_TRACE_ROWS - DRAWN_ROW_BUDGET),
+    );
+    expect(barTitled(await findCanvas(), LONG_ROOT_NAME)).toBeDefined();
+    expect(screen.queryByRole('button', { name: PREVIOUS_SPANS_NAME })).toBeNull();
+    expect(stub.resolve).toHaveBeenCalledTimes(2);
+  });
+
+  it('pages the window to a span selected elsewhere in the panel, once, and marks nothing it does not draw', async () => {
+    const stub = resolvingTrace(wideTrace());
+    const spies = makeActions();
+    const user = userEvent.setup();
+    // The child at index 4,200 is walk row 4,201: in the third window.
+    const late: PanelSelectionState = { selection: { eventId: longChildId(4200) } };
+
+    const { rerender } = render(
+      hostedTree(<Timeline node={makeNode()} />, stub.provider, spies.actions, late),
+    );
+
+    // The window holding the selected span is drawn, and the span is marked
+    // on the canvas and in the table.
+    await screen.findByText(
+      windowFooter(
+        DRAWN_ROW_BUDGET * 2 + 1,
+        LONG_TRACE_ROWS,
+        LONG_TRACE_ROWS,
+        DRAWN_ROW_BUDGET * 2,
+        0,
+      ),
+    );
+    expect(selectedBars()).toHaveLength(1);
+    expect(
+      barTitled(timelineCanvas(), longChildName(4200)).classList.contains('dg-is-selected'),
+    ).toBe(true);
+
+    // Paging away is the reader's choice and is kept: the window is not pulled
+    // back to the selection, and the selection it no longer draws is marked
+    // nowhere — no stale mark on a bar or a row of another window.
+    await user.click(screen.getByRole('button', { name: PREVIOUS_SPANS_NAME }));
+    await screen.findByText(
+      windowFooter(
+        DRAWN_ROW_BUDGET + 1,
+        DRAWN_ROW_BUDGET * 2,
+        LONG_TRACE_ROWS,
+        DRAWN_ROW_BUDGET,
+        LONG_TRACE_ROWS - DRAWN_ROW_BUDGET * 2,
+      ),
+    );
+    expect(selectedBars()).toHaveLength(0);
+    expect(dataRows().some((row) => row.getAttribute('aria-selected') === 'true')).toBe(false);
+
+    // A new selection, by trace and span, in the first window: the window
+    // follows it there.
+    rerender(
+      hostedTree(<Timeline node={makeNode()} />, stub.provider, spies.actions, {
+        selection: {
+          eventId: 'event-example-elsewhere',
+          traceId: TRACE_ID,
+          spanId: spanIdFor(6000 + 10),
+        },
+      }),
+    );
+    await screen.findByText(
+      windowFooter(1, DRAWN_ROW_BUDGET, LONG_TRACE_ROWS, 0, LONG_TRACE_ROWS - DRAWN_ROW_BUDGET),
+    );
+    expect(
+      barTitled(timelineCanvas(), longChildName(10)).classList.contains('dg-is-selected'),
+    ).toBe(true);
+    expect(selectedBars()).toHaveLength(1);
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+  });
+
+  it('bounds a span result the same way: a further page lengthens the walk and never grows the drawn window', async () => {
+    const pageSize = 1500;
+    const firstPage = Array.from({ length: pageSize }, (_unused, index) => longResultSpan(index));
+    const secondPage = Array.from({ length: pageSize }, (_unused, index) =>
+      longResultSpan(pageSize + index),
+    );
+    const total = pageSize * 2;
+    const stub = pagingProvider([
+      { source: 'spans', data: firstPage, total, nextOffset: pageSize },
+      { source: 'spans', data: secondPage, total },
+    ]);
+    const user = userEvent.setup();
+
+    renderComponent(
+      makeNode({ query: { source: 'spans', filter: { traceId: TRACE_ID }, limit: pageSize } }),
+      { provider: stub.provider, actions: makeActions().actions },
+    );
+
+    // One page fits one window: every loaded row is drawn and nothing is paged.
+    await screen.findByText(`Showing ${formatCount(pageSize)} of ${formatCount(total)} spans.`);
+    expect(barsOf(await findCanvas())).toHaveLength(pageSize);
+    expect(screen.queryByRole('button', { name: NEXT_SPANS_NAME })).toBeNull();
+
+    // The second page makes the loaded walk longer than one window: the
+    // canvas still draws the budget, and the footer states the total, what is
+    // loaded and which of the loaded rows are drawn.
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+    await screen.findByText(
+      `Showing ${formatCount(total)} of ${formatCount(total)} spans. ${windowFooter(
+        1,
+        DRAWN_ROW_BUDGET,
+        total,
+        0,
+        total - DRAWN_ROW_BUDGET,
+      )}`,
+    );
+    expect(barsOf(await findCanvas())).toHaveLength(DRAWN_ROW_BUDGET);
+    expect(within(summaryStrip()).getByText('Partial result')).toBeDefined();
+
+    // The rest of the loaded rows are one window on, and the provider is not
+    // asked again for rows it has already sent.
+    await user.click(screen.getByRole('button', { name: NEXT_SPANS_NAME }));
+    await screen.findByText(
+      `Showing ${formatCount(total)} of ${formatCount(total)} spans. ${windowFooter(
+        DRAWN_ROW_BUDGET + 1,
+        total,
+        total,
+        DRAWN_ROW_BUDGET,
+        0,
+      )}`,
+    );
+    expect(barsOf(await findCanvas())).toHaveLength(total - DRAWN_ROW_BUDGET);
+    expect(stub.resolve).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -4296,32 +4689,11 @@ function numericAttribute(element: Element, name: string): number {
 }
 
 /**
- * Reports `width` as the inner width of the timeline's viewport element — and of
- * no other element — for the rest of the case. The only layout stub in this
- * suite (see the harness note); `vi.restoreAllMocks` in `afterEach` removes it.
- *
- * @param width The viewport width, in CSS pixels.
+ * The measure the component fits its labels with, in every environment: the
+ * deterministic advance estimate at the label role's size. Reading a drawn
+ * label's width through it is reading exactly the width the component placed.
  */
-function stubViewportWidth(width: number): void {
-  const native = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'clientWidth');
-  vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockImplementation(function (
-    this: HTMLElement,
-  ) {
-    if (this.classList.contains('dg-timeline__viewport')) {
-      return width;
-    }
-    const value: unknown = native?.get?.call(this);
-    return typeof value === 'number' ? value : 0;
-  });
-}
-
-/**
- * The measure the component fits its labels with in this environment: the
- * deterministic estimate at the label size, since no font can be resolved
- * without a stylesheet or canvas metrics. Reading a drawn label's width through
- * it is reading exactly the width the component placed.
- */
-const LABEL_MEASURE = createEstimateMeasure();
+const LABEL_MEASURE = createEstimateMeasure(DEFAULT_LABEL_FONT_SIZE);
 
 /** A drawn bar label, with the horizontal run it covers. */
 interface DrawnLabel {
@@ -4551,114 +4923,78 @@ describe('Timeline canvas geometry', () => {
     );
   });
 
-  it('spans the lane bands across the whole canvas, which scales to its container without layout', async () => {
+  it('lays the canvas out in a fixed logical viewBox that CSS sizes to its container, reading no layout', async () => {
     const stub = resolvingTrace(nestedTree());
 
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
 
     const canvas = await findCanvas();
 
-    // No layout, so no measured width: the fallback coordinate space, scaled
-    // uniformly to the container.
+    // The fixed logical coordinate space: a viewBox the scale module's chart
+    // width wide and the drawing's own height tall, declared 100% wide so CSS
+    // sizes it, and scaled uniformly from its top-left corner.
     const [minX, minY, viewWidth, viewHeight] = viewBoxOf(canvas);
     expect([minX, minY]).toEqual([0, 0]);
+    expect(viewWidth).toBe(CHART_VIEWBOX_WIDTH);
+    expect(viewHeight).toBeGreaterThan(0);
     expect(canvas.getAttribute('width')).toBe('100%');
     expect(canvas.getAttribute('preserveAspectRatio')).toBe('xMinYMin meet');
     expect(numericAttribute(canvas, 'height')).toBe(viewHeight);
+    // Nothing measured is written back: neither the canvas nor its scroll
+    // container carries an inline size.
+    expect(canvas.getAttribute('style')).toBeNull();
+    expect(canvas.parentElement?.getAttribute('style') ?? null).toBeNull();
 
     const bands = laneBandsOf(canvas);
     expect(bands).toHaveLength(CHAIN_LANE_TIERS.length);
     for (const band of bands) {
       expect(numericAttribute(band, 'x')).toBe(0);
-      expect(numericAttribute(band, 'width')).toBe(viewWidth);
+      expect(numericAttribute(band, 'width')).toBe(CHART_VIEWBOX_WIDTH);
     }
+
+    // The root spans the whole window, so its bar spans the whole plot: from
+    // the lane-label column to the logical width less a trailing gutter
+    // narrower than that column.
+    const root = barTitled(canvas, NESTED_ROOT.name);
+    const rootStart = numericAttribute(root, 'x');
+    const rootEnd = rootStart + numericAttribute(root, 'width');
+    expect(rootStart).toBeGreaterThan(0);
+    expect(rootEnd).toBeLessThanOrEqual(CHART_VIEWBOX_WIDTH);
+    expect(CHART_VIEWBOX_WIDTH - rootEnd).toBeLessThan(rootStart);
   });
 
-  it('lays the canvas out in CSS pixels at the width its viewport measures', async () => {
-    const measuredWidth = 1400;
-    stubViewportWidth(measuredWidth);
-
-    const stub = resolvingTrace(nestedTree());
+  it('keeps every label clear of the lane labels, the canvas edge, foreign bars and other labels', async () => {
+    const tree = nestedTree();
+    const stub = resolvingTrace(tree);
 
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
 
     const canvas = await findCanvas();
 
-    // One user unit per CSS pixel: the declared size IS the viewBox, and there
-    // is no aspect ratio left to reconcile.
-    await waitFor(() => {
-      expect(canvas.getAttribute('width')).toBe(String(measuredWidth));
-    });
-    const [, , viewWidth, viewHeight] = viewBoxOf(canvas);
-    expect(viewWidth).toBe(measuredWidth);
-    expect(numericAttribute(canvas, 'height')).toBe(viewHeight);
-    expect(canvas.getAttribute('preserveAspectRatio')).toBeNull();
+    // The root starts at the window's start, so its bar starts at the end of
+    // the lane-label column.
+    const laneColumn = numericAttribute(barTitled(canvas, NESTED_ROOT.name), 'x');
+    const rows = expectLabelsClear(canvas, laneColumn);
+    expect(rows).toHaveLength(tree.nodeCount);
 
-    for (const band of laneBandsOf(canvas)) {
-      expect(numericAttribute(band, 'width')).toBe(measuredWidth);
+    // Most spans are labelled, and every label drawn whole is the whole
+    // "name · duration" text; a shortened one ends its name in an ellipsis and
+    // is a prefix of that name.
+    const labelled = rows.filter((row) => row.label !== undefined);
+    expect(labelled.length).toBeGreaterThanOrEqual(tree.nodeCount - 1);
+    for (const event of flattenFixture(tree.roots).map((node) => node.event)) {
+      const label = drawnRowNamed(rows, event.name).label;
+      if (label === undefined) {
+        continue;
+      }
+      const whole = `${event.name} · ${formatDurationCompact(event.duration)}`;
+      if (label.text !== whole) {
+        const [namePart = ''] = label.text.split(' · ');
+        expect(namePart.endsWith(ELLIPSIS) || namePart === event.name).toBe(true);
+        expect(event.name.startsWith(namePart.replace(ELLIPSIS, ''))).toBe(true);
+      }
     }
-
-    // The root spans the whole window, so its bar spans the whole plot: from
-    // the lane-label column to the canvas edge less a trailing gutter narrower
-    // than that column. It ends past the entire fallback width, so the plot is
-    // laid out in measured pixels rather than scaled up from the fallback.
-    const root = barTitled(canvas, NESTED_ROOT.name);
-    const rootStart = numericAttribute(root, 'x');
-    const rootEnd = rootStart + numericAttribute(root, 'width');
-    expect(rootStart).toBeGreaterThan(0);
-    expect(rootEnd).toBeGreaterThan(1000);
-    expect(rootEnd).toBeLessThanOrEqual(measuredWidth);
-    expect(measuredWidth - rootEnd).toBeLessThan(rootStart);
   });
-
-  it.each([
-    { viewport: undefined, mode: 'unmeasured' },
-    { viewport: 360, mode: 'a 360 px viewport' },
-    { viewport: 768, mode: 'a 768 px viewport' },
-    { viewport: 1400, mode: 'a 1400 px viewport' },
-  ])(
-    'keeps every label clear of the lane labels, the canvas edge, foreign bars and other labels ($mode)',
-    async ({ viewport }) => {
-      if (viewport !== undefined) {
-        stubViewportWidth(viewport);
-      }
-      const tree = nestedTree();
-      const stub = resolvingTrace(tree);
-
-      renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
-
-      const canvas = await findCanvas();
-      if (viewport !== undefined) {
-        await waitFor(() => {
-          expect(canvas.getAttribute('width')).toBe(String(viewport));
-        });
-      }
-
-      // The root starts at the window's start, so its bar starts at the end of
-      // the lane-label column.
-      const laneColumn = numericAttribute(barTitled(canvas, NESTED_ROOT.name), 'x');
-      const rows = expectLabelsClear(canvas, laneColumn);
-      expect(rows).toHaveLength(tree.nodeCount);
-
-      // Most spans are labelled at every width, and every label drawn whole is
-      // the whole "name · duration" text; a shortened one ends its name in an
-      // ellipsis and is a prefix of that name.
-      const labelled = rows.filter((row) => row.label !== undefined);
-      expect(labelled.length).toBeGreaterThanOrEqual(tree.nodeCount - 1);
-      for (const event of flattenFixture(tree.roots).map((node) => node.event)) {
-        const label = drawnRowNamed(rows, event.name).label;
-        if (label === undefined) {
-          continue;
-        }
-        const whole = `${event.name} · ${formatDurationCompact(event.duration)}`;
-        if (label.text !== whole) {
-          const [namePart = ''] = label.text.split(' · ');
-          expect(namePart.endsWith(ELLIPSIS) || namePart === event.name).toBe(true);
-          expect(event.name.startsWith(namePart.replace(ELLIPSIS, ''))).toBe(true);
-        }
-      }
-    },
-  );
 
   it('draws no label over a foreign bar: a late span with no room beside it goes unlabelled', async () => {
     const stub = resolvingTrace(nestedTree());
@@ -4696,51 +5032,110 @@ describe('Timeline canvas geometry', () => {
     expect(render.label?.end).toBeLessThanOrEqual(render.x);
   });
 
-  it('shortens a label by measured width: the duration kept when the name has room beside it, the name alone when it has not', async () => {
-    stubViewportWidth(360);
-    const narrow = resolvingTrace(nestedTree());
-
-    renderComponent(makeNode(), { provider: narrow.provider, actions: makeActions().actions });
-
-    const narrowCanvas = await findCanvas();
-    await waitFor(() => {
-      expect(narrowCanvas.getAttribute('width')).toBe('360');
+  it('shortens a label to its room in logical units: the duration kept when the name has room beside it, the name alone when it has not', async () => {
+    // One browser lane over an 1100 ms window, so one millisecond is 0.8 user
+    // units of the fixed canvas. The request fills most of the window under a
+    // name longer than its bar; the commit that ends the window shares its row
+    // and starts 72 units after the request ends.
+    const rootSpanId = spanIdFor(0x60);
+    const root = makeEvent({
+      id: 'event-example-0601',
+      spanId: rootSpanId,
+      kind: 'interaction',
+      name: 'example.click',
+      tier: 'browser',
+      startTime: BASE_START_MS,
+      duration: 1100,
+      producerId: BROWSER_PRODUCER_ID,
+      seq: 0,
+      ingestSeq: 1,
     });
-
-    // At 360 px the route handler's label fits nowhere whole; the widest room
-    // is inside its bar, where its name is cut to an ellipsis and its duration
-    // kept, and the text fits the bar.
-    const route = drawnRowNamed(drawnRowsOf(narrowCanvas), NESTED_ROUTE.name);
-    const suffix = ` · ${formatDurationCompact(NESTED_ROUTE.duration)}`;
-    expect(route.label?.inside).toBe(true);
-    expect(route.label?.text.endsWith(`${ELLIPSIS}${suffix}`)).toBe(true);
-    const cut = (route.label?.text ?? '').slice(0, -`${ELLIPSIS}${suffix}`.length);
-    expect(cut.length).toBeGreaterThan(0);
-    expect(NESTED_ROUTE.name.startsWith(cut)).toBe(true);
-    expect(route.label?.end ?? Number.POSITIVE_INFINITY).toBeLessThanOrEqual(route.end);
-
-    cleanup();
-    vi.restoreAllMocks();
-    stubViewportWidth(1400);
-    const wide = resolvingTrace(nestedTree());
-
-    renderComponent(makeNode(), { provider: wide.provider, actions: makeActions().actions });
-
-    const wideCanvas = await findCanvas();
-    await waitFor(() => {
-      expect(wideCanvas.getAttribute('width')).toBe('1400');
+    const request = makeEvent({
+      id: 'event-example-0602',
+      spanId: spanIdFor(0x61),
+      parentSpanId: rootSpanId,
+      kind: 'fetch',
+      name: `example.request.${'segment.'.repeat(16)}end`,
+      tier: 'browser',
+      startTime: BASE_START_MS + 8,
+      duration: 998,
+      producerId: BROWSER_PRODUCER_ID,
+      seq: 1,
+      ingestSeq: 2,
     });
+    const commit = makeEvent({
+      id: 'event-example-0603',
+      spanId: spanIdFor(0x62),
+      parentSpanId: rootSpanId,
+      kind: 'commit',
+      name: 'commit',
+      tier: 'browser',
+      startTime: BASE_START_MS + 1096,
+      duration: 4,
+      producerId: BROWSER_PRODUCER_ID,
+      seq: 2,
+      ingestSeq: 3,
+    });
+    const tree = makeTree([
+      makeTraceNode(root, {
+        depth: 0,
+        children: [makeTraceNode(request, { depth: 1 }), makeTraceNode(commit, { depth: 1 })],
+      }),
+    ]);
+    const stub = resolvingTrace(tree);
 
-    // At 1400 px the room between the request and the commit holds the
-    // commit's name but not its duration as well, so the name is drawn alone,
-    // before the bar and clear of the request.
-    const rows = drawnRowsOf(wideCanvas);
-    const commit = drawnRowNamed(rows, NESTED_COMMIT.name);
-    const request = drawnRowNamed(rows, NESTED_REQUEST.name);
-    expect(commit.label?.text).toBe(NESTED_COMMIT.name);
-    expect(commit.label?.inside).toBe(false);
-    expect(commit.label?.end ?? Number.POSITIVE_INFINITY).toBeLessThanOrEqual(commit.x);
-    expect(commit.label?.start ?? 0).toBeGreaterThan(request.end);
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const canvas = await findCanvas();
+    const rows = expectLabelsClear(canvas, numericAttribute(barTitled(canvas, root.name), 'x'));
+    const requestRow = drawnRowNamed(rows, request.name);
+    const commitRow = drawnRowNamed(rows, commit.name);
+    expect(commitRow.y).toBe(requestRow.y);
+
+    // The request's label fits nowhere whole. Its widest room is inside its
+    // bar, and that room holds the duration beside a cut of the name, so the
+    // duration is kept: the longest prefix whose estimate, with the ellipsis
+    // and the duration after it, fits the room — one grapheme more would not.
+    const requestLabel = requestRow.label;
+    if (requestLabel === undefined) {
+      throw new Error('the request was left unlabelled');
+    }
+    const requestSuffix = ` · ${formatDurationCompact(request.duration)}`;
+    const inset = requestLabel.start - requestRow.x;
+    const insideRoom = requestRow.end - inset - requestLabel.start;
+    expect(requestLabel.inside).toBe(true);
+    expect(inset).toBeGreaterThan(0);
+    expect(LABEL_MEASURE(`${request.name}${requestSuffix}`)).toBeGreaterThan(insideRoom);
+    expect(requestLabel.text.endsWith(`${ELLIPSIS}${requestSuffix}`)).toBe(true);
+    const kept = requestLabel.text.slice(0, -`${ELLIPSIS}${requestSuffix}`.length);
+    expect(kept.length).toBeGreaterThan(0);
+    expect(request.name.startsWith(kept)).toBe(true);
+    expect(LABEL_MEASURE(requestLabel.text)).toBeLessThanOrEqual(insideRoom);
+    expect(
+      LABEL_MEASURE(`${kept}${request.name.charAt(kept.length)}${ELLIPSIS}${requestSuffix}`),
+    ).toBeGreaterThan(insideRoom);
+
+    // The commit has no room after it (it ends the plot) and none inside (it
+    // is narrower than the insets). The room before it, between the request
+    // and its own bar, holds its name but not a four-grapheme cut of it with
+    // the duration beside it, so the name is drawn alone, whole, end-anchored
+    // before its bar and clear of the request.
+    const commitLabel = commitRow.label;
+    if (commitLabel === undefined) {
+      throw new Error('the commit was left unlabelled');
+    }
+    const commitSuffix = ` · ${formatDurationCompact(commit.duration)}`;
+    const gap = commitRow.x - commitLabel.end;
+    const beforeRoom = commitLabel.end - (requestRow.end + gap);
+    expect(commitLabel.text).toBe(commit.name);
+    expect(commitLabel.inside).toBe(false);
+    expect(gap).toBeGreaterThan(0);
+    expect(commitLabel.start).toBeGreaterThan(requestRow.end);
+    expect(LABEL_MEASURE(commit.name)).toBeLessThanOrEqual(beforeRoom);
+    expect(LABEL_MEASURE(`${commit.name}${commitSuffix}`)).toBeGreaterThan(beforeRoom);
+    expect(LABEL_MEASURE(`${commit.name.slice(0, 4)}${ELLIPSIS}${commitSuffix}`)).toBeGreaterThan(
+      beforeRoom,
+    );
   });
 
   it('cuts a hostile emoji name at a grapheme boundary, inside its bar, and keeps the whole name elsewhere', async () => {

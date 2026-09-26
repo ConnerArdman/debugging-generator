@@ -21,8 +21,15 @@
  *   that write is never reported, while a real edit afterwards still is.
  * - **Degradation is data.** A path escaping the project, a symbolic link on
  *   the way to it, a refused or lost watch, a vanished directory and a lost
- *   `updateStatus` race are recorded or absorbed — never thrown, never retried,
- *   never announced twice.
+ *   `updateStatus` race are recorded or absorbed — never thrown, never
+ *   announced twice. A lost `updateStatus` race is never retried.
+ * - **A lost or refused watch comes back, and says so.** The directory is
+ *   retried with exponential backoff up to a ceiling, every waiting file is
+ *   evaluated on each refused retry, and an edit made while unwatched is still
+ *   reported; each session is told once that conflict detection paused and
+ *   once that it resumed; a stop or a refresh that re-attaches first cancels
+ *   the retries. These cases drive a scripted watch port under fake
+ *   `setTimeout`/`clearTimeout`, so every retry lands when the test says.
  * - **The module writes nothing.** Its one permitted mutation is a single
  *   journal transition; the headline assertion snapshots every byte of the
  *   sandbox project and `$DEBUGGEN_HOME` around a full scenario, and a scan of
@@ -93,7 +100,11 @@ import {
 } from '../store/modifications-repo.js';
 import {
   DEFAULT_CONFLICT_DEBOUNCE_MS,
+  DEFAULT_WATCH_RETRY_INITIAL_MS,
+  DEFAULT_WATCH_RETRY_MAX_MS,
   buildConflictMessage,
+  buildWatchPausedMessage,
+  buildWatchResumedMessage,
   createInstrumentationWatcher,
   type InstrumentationWatcher,
   type InstrumentationWatcherDeps,
@@ -601,6 +612,180 @@ function createWatchProbe(): WatchProbe {
   return { watch, opened, handles, openCount: () => open };
 }
 
+/** One handle the scripted watch port opened. */
+interface ScriptedHandle {
+  readonly directory: string;
+  /** Whether the watcher closed it. */
+  isClosed(): boolean;
+  /** Delivers one event on the handle, as `fs.watch` would. */
+  emit(filename: string | null): void;
+  /** Fails the handle, as `fs.watch` does when its directory is revoked. */
+  fail(errno: string): void;
+}
+
+interface ScriptedWatch {
+  /** A synthetic `WatchLike`: no filesystem watch, events and errors only by hand. */
+  readonly watch: WatchLike;
+  /** Every call the watcher made, in order, and how it was answered. */
+  readonly calls: { readonly directory: string; readonly outcome: 'opened' | 'refused' }[];
+  /** The handles opened, in order. */
+  readonly handles: ScriptedHandle[];
+  /** Refuses every later call with `errno`, or opens again after `undefined`. */
+  refuseWith(errno: string | undefined): void;
+  /** Handles opened and not yet closed. */
+  openCount(): number;
+}
+
+function createScriptedWatch(): ScriptedWatch {
+  const calls: ScriptedWatch['calls'] = [];
+  const handles: ScriptedHandle[] = [];
+  let refusal: string | undefined;
+
+  const watch: WatchLike = (directory, _options, listener) => {
+    if (refusal !== undefined) {
+      calls.push({ directory, outcome: 'refused' });
+
+      throw Object.assign(new Error('the platform refused the watch'), { code: refusal });
+    }
+
+    calls.push({ directory, outcome: 'opened' });
+
+    const errorListeners: ((error: Error) => void)[] = [];
+    let closed = false;
+
+    handles.push({
+      directory,
+      isClosed: () => closed,
+      emit(filename) {
+        if (!closed) {
+          listener('change', filename);
+        }
+      },
+      fail(errno) {
+        const error = Object.assign(new Error('the watched directory was revoked'), {
+          code: errno,
+        });
+
+        for (const errorListener of [...errorListeners]) {
+          errorListener(error);
+        }
+      },
+    });
+
+    const handle: WatchHandleLike = {
+      close() {
+        closed = true;
+      },
+      on(_event, errorListener) {
+        errorListeners.push(errorListener);
+
+        return handle;
+      },
+    };
+
+    return handle;
+  };
+
+  return {
+    watch,
+    calls,
+    handles,
+    refuseWith(errno) {
+      refusal = errno;
+    },
+    openCount: () => handles.filter((handle) => !handle.isClosed()).length,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Harness: fake timeouts, for the recovery cases
+// ---------------------------------------------------------------------------
+
+/**
+ * The real `setTimeout`, captured before any test fakes it, so
+ * {@link eventually} waits on real time while the watcher's own timers stay
+ * under the test's hand.
+ */
+const realSetTimeout: typeof setTimeout = globalThis.setTimeout;
+
+/**
+ * Fakes `setTimeout` and `clearTimeout` only — the watcher's debounce and
+ * retry timers — while filesystem I/O, streams, `setImmediate` and `Date` stay
+ * real, so an evaluation still reads and hashes the file.
+ */
+function useFakeTimeouts(): void {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+}
+
+/**
+ * Retries `assertion` on real time until it passes, then throws its last
+ * failure after `WAIT.timeout`. Unlike `vi.waitFor`, it never advances fake
+ * timers, so a retry schedule moves only when a test advances it.
+ */
+async function eventually(assertion: () => void): Promise<void> {
+  const deadline = Date.now() + WAIT.timeout;
+
+  while (Date.now() < deadline) {
+    try {
+      assertion();
+
+      return;
+    } catch {
+      await new Promise<void>((resolve) => {
+        realSetTimeout(resolve, WAIT.interval);
+      });
+    }
+  }
+
+  assertion();
+}
+
+/**
+ * Advances the fake timeouts `stepMs` at a time, yielding briefly to real time
+ * after each step so an evaluation a timeout started can finish its I/O, until
+ * `done` holds or `limitMs` of fake time has passed. The caller asserts
+ * afterwards, so a condition that never holds fails there, with its values.
+ */
+async function advanceUntil(stepMs: number, limitMs: number, done: () => boolean): Promise<void> {
+  for (let elapsed = 0; elapsed < limitMs && !done(); elapsed += stepMs) {
+    vi.advanceTimersByTime(stepMs);
+    await new Promise<void>((resolve) => {
+      realSetTimeout(resolve, 2);
+    });
+  }
+}
+
+/** Waits `ms` of real time while the fake timeouts stand still. */
+function realPause(ms: number = QUIET_MS): Promise<void> {
+  return new Promise((resolve) => {
+    realSetTimeout(resolve, ms);
+  });
+}
+
+/**
+ * Replaces `directory` with a symbolic link to `target`, keeping the real
+ * directory aside, and plants `content` under the watched file's name there.
+ *
+ * @returns Restores the real directory in place of the link.
+ */
+async function swapDirectoryForLink(
+  directory: string,
+  target: string,
+  fileName: string,
+  content: string,
+): Promise<() => Promise<void>> {
+  const aside = `${directory}-aside`;
+
+  await rename(directory, aside);
+  await writeFile(join(target, fileName), content);
+  await symlink(target, directory);
+
+  return async () => {
+    await unlink(directory);
+    await rename(aside, directory);
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Harness: one watcher over one sandbox
 // ---------------------------------------------------------------------------
@@ -632,6 +817,10 @@ interface HarnessOptions {
   readonly debounceMs?: number;
   /** Replace the directory-watch primitive (the platform-refusal case). */
   readonly watch?: WatchLike;
+  /** Override the re-attach backoff's initial wait (the recovery cases). */
+  readonly watchRetryInitialMs?: number;
+  /** Override the re-attach backoff's ceiling (the recovery cases). */
+  readonly watchRetryMaxMs?: number;
 }
 
 /** Cleanups registered by the current test, run in reverse by `afterEach`. */
@@ -642,6 +831,9 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+  // A recovery case fakes the timeouts; the cleanups below run on real ones.
+  vi.useRealTimers();
+
   for (const cleanup of cleanups.reverse()) {
     await cleanup();
   }
@@ -672,6 +864,8 @@ async function createHarness(options: HarnessOptions = {}): Promise<Harness> {
     logger: createRecordingLogger(logs),
     now: clock,
     debounceMs: options.debounceMs ?? DEBOUNCE_MS,
+    watchRetryInitialMs: options.watchRetryInitialMs,
+    watchRetryMaxMs: options.watchRetryMaxMs,
     ...(options.watch !== undefined
       ? { watch: options.watch }
       : options.productionWatch === true
@@ -843,6 +1037,34 @@ async function waitForConflicts(harness: Harness, count: number): Promise<void> 
   await vi.waitFor(() => {
     expect(harness.listener.calls).toHaveLength(count);
   }, WAIT);
+}
+
+/**
+ * {@link startWatching} under fake timeouts: starts the session, fires the
+ * initial debounce by hand and waits, on real time, for every listed file's
+ * first no-op evaluation.
+ */
+async function startWatchingUnderFakeTimeouts(
+  harness: Harness,
+  files: readonly string[],
+): Promise<void> {
+  const started = await harness.watcher.watchSession({
+    sessionId: SESSION_ID,
+    projectRoot: harness.sandbox.projectRoot,
+  });
+
+  expect(started.ok).toBe(true);
+  vi.advanceTimersByTime(DEBOUNCE_MS);
+  await eventually(() => {
+    for (const file of files) {
+      expect(unchangedEvaluations(harness, file)).toBeGreaterThanOrEqual(1);
+    }
+  });
+}
+
+/** The messages of every progress row the session received, in order. */
+function rowMessages(harness: Harness): string[] {
+  return harness.progress.emitted.map((row) => row.message);
 }
 
 /** Writes `content` beside `absolute` and renames it over the target: an editor's atomic save. */
@@ -1615,9 +1837,45 @@ describe('degradation is reported as data, never thrown', () => {
       ['watch-failed', 'INSTRUMENTATION_UNAVAILABLE', 'ENOSPC'],
     ]);
     expect(issues.map((issue) => issue.recordId)).toContain(ledger.id);
+    expect(rowMessages(harness)).toEqual([
+      buildWatchPausedMessage([LEDGER_FILE, TALLY_FILE], 'refused'),
+    ]);
   });
 
-  it('closes a watch that reports an error (watch-lost), records it and re-checks the files once', async () => {
+  it('stamps with the wall clock when the injected clock throws, recording that decision once at debug', async () => {
+    const refusingWatch: WatchLike = () => {
+      throw Object.assign(new Error('the platform watch budget is exhausted'), { code: 'ENOSPC' });
+    };
+    const harness = await createHarness({ watch: refusingWatch });
+    await instrumentLedgerAndTally(harness);
+    const logs: CapturedLog[] = [];
+    const watcher = createInstrumentationWatcher({
+      modifications: harness.journal,
+      config: { debuggenHome: harness.sandbox.debuggenHome },
+      logger: createRecordingLogger(logs),
+      now: () => {
+        throw new Error('clock-sentinel-2b9d');
+      },
+      watch: refusingWatch,
+    });
+    cleanups.push(() => watcher.dispose());
+    const before = Date.now();
+
+    await watcher.watchSession({ sessionId: SESSION_ID, projectRoot: harness.sandbox.projectRoot });
+
+    const issues = watcher.watchIssues(SESSION_ID);
+    expect(issues).toHaveLength(2);
+    for (const issue of issues) {
+      expect(issue.detectedAt).toBeGreaterThanOrEqual(before);
+    }
+    const fallbacks = logs.filter((entry) => entry.fields['reason'] === 'clock-threw');
+    expect(fallbacks).toHaveLength(1);
+    expect(fallbacks[0]?.level).toBe('debug');
+    expect(fallbacks[0]?.fields['errorClass']).toBe('Error');
+    expect(JSON.stringify(logs.map((entry) => entry.fields))).not.toContain('clock-sentinel-2b9d');
+  });
+
+  it('closes a watch that reports an error (watch-lost), re-checks the files, and re-establishes the production watch', async () => {
     const harness = await createHarness();
     const { ledger } = await instrumentLedgerAndTally(harness);
     await startWatching(harness, [LEDGER_FILE, TALLY_FILE]);
@@ -1639,6 +1897,22 @@ describe('degradation is reported as data, never thrown', () => {
 
     await waitForUnchangedEvaluations(harness, LEDGER_FILE, before + 1);
     expect(harness.journal.updateCalls).toEqual([]);
+
+    // The real fs.watch is opened again after the default initial backoff…
+    await vi.waitFor(() => {
+      expect(harness.probe.openCount()).toBe(1);
+      expect(harness.watcher.watchedFiles(SESSION_ID)).toHaveLength(2);
+    }, WAIT);
+    expect(harness.probe.opened).toHaveLength(2);
+    expect(rowMessages(harness)).toEqual([
+      buildWatchPausedMessage([LEDGER_FILE, TALLY_FILE], 'lost'),
+      buildWatchResumedMessage([LEDGER_FILE, TALLY_FILE]),
+    ]);
+
+    // …and it is live: a real edit through it is reported.
+    await appendFile(harness.pathOf(LEDGER_FILE), `${DEVELOPER_LINE}\n`);
+    await waitForConflicts(harness, 1);
+    expect(conflictTransitions(harness).map((call) => call.id)).toEqual([ledger.id]);
   });
 
   it('checks a file whose directory is gone once, and reports it missing (directory-missing)', async () => {
@@ -1679,6 +1953,656 @@ describe('degradation is reported as data, never thrown', () => {
     expect(started.ok ? undefined : started.error.code).toBe('STORE_ERROR');
     expect(harness.probe.opened).toEqual([]);
     expect(harness.watcher.watchedFiles(SESSION_ID)).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Recovery: a lost or refused directory watch is retried, and the outage told
+// ---------------------------------------------------------------------------
+
+describe('a lost or refused watch is recovered, and the outage announced', () => {
+  it('words the notices for one file, and names at most three files before counting the rest', () => {
+    expect(buildWatchPausedMessage([LEDGER_FILE], 'lost')).toBe(
+      `Conflict detection paused for ${LEDGER_FILE}: the watch on its folder stopped. Debug Generator keeps retrying and still checks the file before restoring it.`,
+    );
+    expect(buildWatchResumedMessage([LEDGER_FILE])).toBe(
+      `Conflict detection resumed for ${LEDGER_FILE}.`,
+    );
+    expect(buildWatchResumedMessage(['a.ts', 'b.ts', 'c.ts'])).toBe(
+      'Conflict detection resumed for a.ts, b.ts and c.ts.',
+    );
+    expect(buildWatchResumedMessage(['a.ts', 'b.ts', 'c.ts', 'd.ts'])).toBe(
+      'Conflict detection resumed for a.ts, b.ts, c.ts and 1 more file.',
+    );
+    expect(
+      buildWatchPausedMessage(['a.ts', 'b.ts', 'c.ts', 'd.ts', 'e.ts', 'a.ts'], 'refused'),
+    ).toBe(
+      'Conflict detection paused for a.ts, b.ts, c.ts and 2 more files: the platform refused a watch on their folder. Debug Generator keeps retrying and still checks the files before restoring them.',
+    );
+    expect(buildWatchResumedMessage([])).toBe(
+      'Conflict detection resumed for an instrumented file.',
+    );
+  });
+
+  it('records watch-lost, announces the pause, re-attaches after the initial backoff and announces the resumption', async () => {
+    useFakeTimeouts();
+    const scripted = createScriptedWatch();
+    const harness = await createHarness({ watch: scripted.watch });
+    const { ledger, tally } = await instrumentLedgerAndTally(harness);
+    await startWatchingUnderFakeTimeouts(harness, [LEDGER_FILE, TALLY_FILE]);
+    const directory = dirname(harness.pathOf(LEDGER_FILE));
+    expect(scripted.calls).toEqual([{ directory, outcome: 'opened' }]);
+
+    scripted.handles[0]!.fail('EPERM');
+
+    expect(scripted.handles[0]!.isClosed()).toBe(true);
+    expect(harness.watcher.watchedFiles(SESSION_ID)).toEqual([]);
+    expect(
+      harness.watcher
+        .watchIssues(SESSION_ID)
+        .map((issue) => [issue.kind, issue.code, issue.recordId, issue.errno]),
+    ).toEqual([
+      ['watch-lost', 'INSTRUMENTATION_UNAVAILABLE', ledger.id, 'EPERM'],
+      ['watch-lost', 'INSTRUMENTATION_UNAVAILABLE', tally.id, 'EPERM'],
+    ]);
+
+    for (const issue of harness.watcher.watchIssues(SESSION_ID)) {
+      expect(issue.message).toContain('re-established with backoff');
+      expect(issue.message).not.toContain('next refresh');
+    }
+
+    const paused = buildWatchPausedMessage([LEDGER_FILE, TALLY_FILE], 'lost');
+    expect(paused).toBe(
+      `Conflict detection paused for ${LEDGER_FILE} and ${TALLY_FILE}: the watch on their folder stopped. Debug Generator keeps retrying and still checks the files before restoring them.`,
+    );
+    expect(harness.progress.emitted).toEqual([
+      { sessionId: SESSION_ID, stage: 'instrument', status: 'running', message: paused },
+    ]);
+
+    // Not one attempt before the initial backoff has elapsed…
+    vi.advanceTimersByTime(DEFAULT_WATCH_RETRY_INITIAL_MS - 1);
+    expect(scripted.calls).toHaveLength(1);
+
+    // …and the watch is back the moment it has.
+    vi.advanceTimersByTime(1);
+    expect(scripted.calls).toEqual([
+      { directory, outcome: 'opened' },
+      { directory, outcome: 'opened' },
+    ]);
+    expect(scripted.openCount()).toBe(1);
+    expect(
+      harness.watcher
+        .watchedFiles(SESSION_ID)
+        .map((watched) => watched.recordId)
+        .sort(),
+    ).toEqual([ledger.id, tally.id].sort());
+
+    const resumed = buildWatchResumedMessage([LEDGER_FILE, TALLY_FILE]);
+    expect(resumed).toBe(`Conflict detection resumed for ${LEDGER_FILE} and ${TALLY_FILE}.`);
+    expect(harness.progress.emitted).toEqual([
+      { sessionId: SESSION_ID, stage: 'instrument', status: 'running', message: paused },
+      { sessionId: SESSION_ID, stage: 'instrument', status: 'running', message: resumed },
+    ]);
+    expect(harness.progress.refused).toEqual([]);
+    expect(
+      harness.logs.filter((record) => record.level === 'info' && record.fields['attempts'] === 1),
+    ).toHaveLength(1);
+
+    // The recovery is over: no further attempt, however long the wait.
+    vi.advanceTimersByTime(DEFAULT_WATCH_RETRY_MAX_MS * 2);
+    expect(scripted.calls).toHaveLength(2);
+
+    // Rows and logs name project-relative files, never the sandbox.
+    expect(JSON.stringify(harness.progress.emitted)).not.toContain(harness.sandbox.root);
+    expect(JSON.stringify(harness.logs)).not.toContain(harness.sandbox.root);
+  });
+
+  it('reports an edit made while the directory was unwatched once the watch is re-attached', async () => {
+    useFakeTimeouts();
+    const retryMs = 1_000;
+    const scripted = createScriptedWatch();
+    const harness = await createHarness({ watch: scripted.watch, watchRetryInitialMs: retryMs });
+    const { ledger } = await instrumentLedgerAndTally(harness);
+    await startWatchingUnderFakeTimeouts(harness, [LEDGER_FILE, TALLY_FILE]);
+    const ledgerBefore = unchangedEvaluations(harness, LEDGER_FILE);
+    const tallyBefore = unchangedEvaluations(harness, TALLY_FILE);
+
+    scripted.handles[0]!.fail('EIO');
+
+    // The one check the loss itself asks for finds both files intact.
+    vi.advanceTimersByTime(DEBOUNCE_MS);
+    await eventually(() => {
+      expect(unchangedEvaluations(harness, LEDGER_FILE)).toBe(ledgerBefore + 1);
+      expect(unchangedEvaluations(harness, TALLY_FILE)).toBe(tallyBefore + 1);
+    });
+
+    // Nothing watches the directory now: the edit raises no event, and the
+    // only thing pending is the retry.
+    await appendFile(harness.pathOf(LEDGER_FILE), `${DEVELOPER_LINE}\n`);
+    expect(vi.getTimerCount()).toBe(1);
+    expect(harness.listener.calls).toEqual([]);
+
+    vi.advanceTimersByTime(retryMs - DEBOUNCE_MS - 1);
+    expect(scripted.calls).toHaveLength(1);
+    vi.advanceTimersByTime(1);
+    expect(scripted.calls.map((call) => call.outcome)).toEqual(['opened', 'opened']);
+
+    // The re-attached files are each evaluated once, which finds the edit.
+    vi.advanceTimersByTime(DEBOUNCE_MS);
+    await eventually(() => {
+      expect(harness.listener.calls).toHaveLength(1);
+    });
+
+    const { notice } = onlyConflict(harness);
+    expect(conflictTransitions(harness).map((call) => call.id)).toEqual([ledger.id]);
+    expect(harness.journal.current(ledger.id)?.status).toBe('conflict');
+    expect(rowMessages(harness)).toEqual([
+      buildWatchPausedMessage([LEDGER_FILE, TALLY_FILE], 'lost'),
+      buildWatchResumedMessage([LEDGER_FILE, TALLY_FILE]),
+      notice.message,
+    ]);
+    expect(harness.watcher.watchedFiles(SESSION_ID).map((watched) => watched.file)).toEqual([
+      TALLY_FILE,
+    ]);
+  });
+
+  it('backs off exponentially to the ceiling while refused, checks every waiting file on each retry, and still reports a conflict', async () => {
+    useFakeTimeouts();
+    const scripted = createScriptedWatch();
+    const harness = await createHarness({ watch: scripted.watch });
+    const { ledger } = await instrumentLedgerAndTally(harness);
+    await startWatchingUnderFakeTimeouts(harness, [LEDGER_FILE, TALLY_FILE]);
+    const ledgerBefore = unchangedEvaluations(harness, LEDGER_FILE);
+    const tallyBefore = unchangedEvaluations(harness, TALLY_FILE);
+
+    scripted.refuseWith('ENOSPC');
+    scripted.handles[0]!.fail('EPERM');
+
+    // Let the loss's own check finish, so each retry below starts from idle files.
+    vi.advanceTimersByTime(DEBOUNCE_MS);
+    await eventually(() => {
+      expect(unchangedEvaluations(harness, LEDGER_FILE)).toBe(ledgerBefore + 1);
+      expect(unchangedEvaluations(harness, TALLY_FILE)).toBe(tallyBefore + 1);
+    });
+
+    const expectedWaits = [250, 500, 1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000, 30_000];
+    expect(expectedWaits[0]).toBe(DEFAULT_WATCH_RETRY_INITIAL_MS);
+    expect(expectedWaits.at(-1)).toBe(DEFAULT_WATCH_RETRY_MAX_MS);
+
+    // Time since the last attempt (or the loss) when each wait begins to count.
+    let elapsed = DEBOUNCE_MS;
+
+    for (const [index, wait] of expectedWaits.entries()) {
+      vi.advanceTimersByTime(wait - elapsed - 1);
+      expect(scripted.calls).toHaveLength(1 + index);
+
+      vi.advanceTimersByTime(1);
+      expect(scripted.calls).toHaveLength(2 + index);
+      expect(scripted.calls.at(-1)?.outcome).toBe('refused');
+
+      // The polling fallback: the next retry plus one evaluation per waiting file.
+      expect(vi.getTimerCount()).toBe(3);
+      const ledgerChecked = unchangedEvaluations(harness, LEDGER_FILE);
+      const tallyChecked = unchangedEvaluations(harness, TALLY_FILE);
+      vi.advanceTimersByTime(DEBOUNCE_MS);
+      await eventually(() => {
+        expect(unchangedEvaluations(harness, LEDGER_FILE)).toBe(ledgerChecked + 1);
+        expect(unchangedEvaluations(harness, TALLY_FILE)).toBe(tallyChecked + 1);
+      });
+      elapsed = DEBOUNCE_MS;
+    }
+
+    // An edit made while the platform still refuses is found by the next retry's check.
+    await appendFile(harness.pathOf(LEDGER_FILE), `${DEVELOPER_LINE}\n`);
+    vi.advanceTimersByTime(DEFAULT_WATCH_RETRY_MAX_MS - elapsed);
+    expect(scripted.calls).toHaveLength(expectedWaits.length + 2);
+    vi.advanceTimersByTime(DEBOUNCE_MS);
+    await eventually(() => {
+      expect(harness.listener.calls).toHaveLength(1);
+    });
+    expect(conflictTransitions(harness).map((call) => call.id)).toEqual([ledger.id]);
+
+    // The conflicting file no longer waits; the other one is retried at the ceiling.
+    vi.advanceTimersByTime(DEFAULT_WATCH_RETRY_MAX_MS - DEBOUNCE_MS - 1);
+    expect(scripted.calls).toHaveLength(expectedWaits.length + 2);
+    vi.advanceTimersByTime(1);
+    expect(scripted.calls).toHaveLength(expectedWaits.length + 3);
+    expect(scripted.calls.slice(1).every((call) => call.outcome === 'refused')).toBe(true);
+    expect(harness.watcher.watchedFiles(SESSION_ID)).toEqual([]);
+
+    // Told once that detection paused, and never that it resumed.
+    expect(rowMessages(harness)).toEqual([
+      buildWatchPausedMessage([LEDGER_FILE, TALLY_FILE], 'lost'),
+      onlyConflict(harness).notice.message,
+    ]);
+
+    // Every refused retry is logged at debug with the next wait and the errno only.
+    const retries = harness.logs.filter(
+      (record) => record.level === 'debug' && record.fields['retryInMs'] !== undefined,
+    );
+    // Ten refused retries in the loop, then the conflict-finding one and the last.
+    expect(retries.map((record) => record.fields['retryInMs'])).toEqual([
+      ...expectedWaits.slice(1),
+      DEFAULT_WATCH_RETRY_MAX_MS,
+      DEFAULT_WATCH_RETRY_MAX_MS,
+      DEFAULT_WATCH_RETRY_MAX_MS,
+    ]);
+    expect(retries.every((record) => record.fields['errno'] === 'ENOSPC')).toBe(true);
+    expect(JSON.stringify(harness.logs)).not.toContain(harness.sandbox.root);
+  });
+
+  it('stopSession during a recovery cancels it: no further watch call and no pending timer', async () => {
+    useFakeTimeouts();
+    const scripted = createScriptedWatch();
+    const harness = await createHarness({ watch: scripted.watch });
+    await instrumentLedgerAndTally(harness);
+    await startWatchingUnderFakeTimeouts(harness, [LEDGER_FILE, TALLY_FILE]);
+
+    scripted.refuseWith('ENOSPC');
+    scripted.handles[0]!.fail('EPERM');
+    vi.advanceTimersByTime(DEFAULT_WATCH_RETRY_INITIAL_MS);
+    expect(scripted.calls.map((call) => call.outcome)).toEqual(['opened', 'refused']);
+    expect(vi.getTimerCount()).toBeGreaterThan(0);
+
+    await harness.watcher.stopSession(SESSION_ID);
+
+    expect(vi.getTimerCount()).toBe(0);
+    vi.advanceTimersByTime(DEFAULT_WATCH_RETRY_MAX_MS * 4);
+    expect(scripted.calls).toHaveLength(2);
+    expect(harness.watcher.watchedFiles(SESSION_ID)).toEqual([]);
+    expect(harness.watcher.watchIssues(SESSION_ID)).toEqual([]);
+    expect(rowMessages(harness)).toEqual([
+      buildWatchPausedMessage([LEDGER_FILE, TALLY_FILE], 'lost'),
+    ]);
+  });
+
+  it('a refresh that re-attaches first cancels the recovery without a second handle', async () => {
+    useFakeTimeouts();
+    const scripted = createScriptedWatch();
+    const harness = await createHarness({ watch: scripted.watch });
+    const { ledger, tally } = await instrumentLedgerAndTally(harness);
+    await startWatchingUnderFakeTimeouts(harness, [LEDGER_FILE, TALLY_FILE]);
+
+    scripted.handles[0]!.fail('EPERM');
+    vi.advanceTimersByTime(DEBOUNCE_MS);
+    await eventually(() => {
+      expect(unchangedEvaluations(harness, LEDGER_FILE)).toBe(2);
+      expect(unchangedEvaluations(harness, TALLY_FILE)).toBe(2);
+    });
+
+    const refreshed = await harness.watcher.refresh(SESSION_ID);
+
+    expect(refreshed.ok && refreshed.value.map((watched) => watched.recordId).sort()).toEqual(
+      [ledger.id, tally.id].sort(),
+    );
+    expect(scripted.calls.map((call) => call.outcome)).toEqual(['opened', 'opened']);
+    expect(scripted.openCount()).toBe(1);
+    expect(harness.watcher.watchIssues(SESSION_ID)).toEqual([]);
+    expect(rowMessages(harness)).toEqual([
+      buildWatchPausedMessage([LEDGER_FILE, TALLY_FILE], 'lost'),
+      buildWatchResumedMessage([LEDGER_FILE, TALLY_FILE]),
+    ]);
+
+    // The re-attached files are evaluated once more, for an edit made in the gap.
+    vi.advanceTimersByTime(DEBOUNCE_MS);
+    await eventually(() => {
+      expect(unchangedEvaluations(harness, LEDGER_FILE)).toBe(3);
+      expect(unchangedEvaluations(harness, TALLY_FILE)).toBe(3);
+    });
+
+    // The retry was cancelled: nothing opens a second handle, ever.
+    expect(vi.getTimerCount()).toBe(0);
+    vi.advanceTimersByTime(DEFAULT_WATCH_RETRY_MAX_MS * 2);
+    expect(scripted.calls).toHaveLength(2);
+    expect(scripted.openCount()).toBe(1);
+    expect(rowMessages(harness)).toHaveLength(2);
+  });
+
+  it('an initial watch refusal in watchSession enters the same recovery', async () => {
+    useFakeTimeouts();
+    const scripted = createScriptedWatch();
+    scripted.refuseWith('ENOSPC');
+    const harness = await createHarness({ watch: scripted.watch });
+    const { ledger, tally } = await instrumentLedgerAndTally(harness);
+
+    const started = await harness.watcher.watchSession({
+      sessionId: SESSION_ID,
+      projectRoot: harness.sandbox.projectRoot,
+    });
+
+    expect(started.ok && started.value).toEqual([]);
+    const issues = harness.watcher.watchIssues(SESSION_ID);
+    expect(issues.map((issue) => [issue.kind, issue.recordId, issue.errno])).toEqual([
+      ['watch-failed', ledger.id, 'ENOSPC'],
+      ['watch-failed', tally.id, 'ENOSPC'],
+    ]);
+
+    for (const issue of issues) {
+      expect(issue.message).toContain('retried with backoff');
+      expect(issue.message).not.toContain('next refresh');
+    }
+
+    const paused = buildWatchPausedMessage([LEDGER_FILE, TALLY_FILE], 'refused');
+    expect(paused).toBe(
+      `Conflict detection paused for ${LEDGER_FILE} and ${TALLY_FILE}: the platform refused a watch on their folder. Debug Generator keeps retrying and still checks the files before restoring them.`,
+    );
+    expect(rowMessages(harness)).toEqual([paused]);
+    expect(scripted.calls.map((call) => call.outcome)).toEqual(['refused', 'refused']);
+
+    // The initial evaluations still run, unwatched as the files are.
+    vi.advanceTimersByTime(DEBOUNCE_MS);
+    await eventually(() => {
+      expect(unchangedEvaluations(harness, LEDGER_FILE)).toBe(1);
+      expect(unchangedEvaluations(harness, TALLY_FILE)).toBe(1);
+    });
+
+    scripted.refuseWith(undefined);
+    vi.advanceTimersByTime(DEFAULT_WATCH_RETRY_INITIAL_MS - DEBOUNCE_MS - 1);
+    expect(scripted.calls).toHaveLength(2);
+    vi.advanceTimersByTime(1);
+
+    expect(scripted.calls.map((call) => call.outcome)).toEqual(['refused', 'refused', 'opened']);
+    expect(scripted.openCount()).toBe(1);
+    expect(
+      harness.watcher
+        .watchedFiles(SESSION_ID)
+        .map((watched) => watched.recordId)
+        .sort(),
+    ).toEqual([ledger.id, tally.id].sort());
+    expect(rowMessages(harness)).toEqual([
+      paused,
+      buildWatchResumedMessage([LEDGER_FILE, TALLY_FILE]),
+    ]);
+
+    // The re-attached files are checked once; then an event on the new handle is judged.
+    vi.advanceTimersByTime(DEBOUNCE_MS);
+    await eventually(() => {
+      expect(unchangedEvaluations(harness, LEDGER_FILE)).toBe(2);
+      expect(unchangedEvaluations(harness, TALLY_FILE)).toBe(2);
+    });
+    await appendFile(harness.pathOf(TALLY_FILE), `${DEVELOPER_LINE}\n`);
+    scripted.handles[0]!.emit(basename(TALLY_FILE));
+    vi.advanceTimersByTime(DEBOUNCE_MS);
+    await eventually(() => {
+      expect(harness.listener.calls).toHaveLength(1);
+    });
+    expect(conflictTransitions(harness).map((call) => call.id)).toEqual([tally.id]);
+  });
+
+  it.each([0, -1, Number.NaN, Number.POSITIVE_INFINITY])(
+    'replaces an unusable initial retry wait (%s) with the default and doubles from it',
+    async (unusable) => {
+      useFakeTimeouts();
+      const scripted = createScriptedWatch();
+      scripted.refuseWith('EMFILE');
+      const harness = await createHarness({
+        watch: scripted.watch,
+        watchRetryInitialMs: unusable,
+        watchRetryMaxMs: unusable,
+      });
+      await instrumentLedgerAndTally(harness);
+      await harness.watcher.watchSession({
+        sessionId: SESSION_ID,
+        projectRoot: harness.sandbox.projectRoot,
+      });
+      expect(scripted.calls).toHaveLength(2);
+
+      let calls = 2;
+
+      for (const wait of [250, 500, 1_000]) {
+        vi.advanceTimersByTime(wait - 1);
+        expect(scripted.calls).toHaveLength(calls);
+        vi.advanceTimersByTime(1);
+        calls += 1;
+        expect(scripted.calls).toHaveLength(calls);
+      }
+    },
+  );
+
+  it('raises a ceiling below the initial wait to the initial wait', async () => {
+    useFakeTimeouts();
+    const scripted = createScriptedWatch();
+    scripted.refuseWith('EMFILE');
+    const harness = await createHarness({
+      watch: scripted.watch,
+      watchRetryInitialMs: 1_000,
+      watchRetryMaxMs: 400,
+    });
+    await instrumentLedgerAndTally(harness);
+    await harness.watcher.watchSession({
+      sessionId: SESSION_ID,
+      projectRoot: harness.sandbox.projectRoot,
+    });
+
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      vi.advanceTimersByTime(999);
+      expect(scripted.calls).toHaveLength(1 + attempt);
+      vi.advanceTimersByTime(1);
+      expect(scripted.calls).toHaveLength(2 + attempt);
+    }
+  });
+
+  it.each(['throws', 'refuses'] as const)(
+    'contains a progress emitter that %s: the notices are logged and the watch still comes back',
+    async (failure) => {
+      useFakeTimeouts();
+      const scripted = createScriptedWatch();
+      const harness = await createHarness({
+        watch: scripted.watch,
+        progress: {
+          emit() {
+            if (failure === 'throws') {
+              throw new Error('progress channel down');
+            }
+
+            return err(new DebuggenError('PROTOCOL_INVALID_MESSAGE', 'Progress row refused.'));
+          },
+        },
+      });
+      await instrumentLedgerAndTally(harness);
+      await startWatchingUnderFakeTimeouts(harness, [LEDGER_FILE, TALLY_FILE]);
+
+      expect(() => {
+        scripted.handles[0]!.fail('EPERM');
+      }).not.toThrow();
+      vi.advanceTimersByTime(DEFAULT_WATCH_RETRY_INITIAL_MS);
+
+      expect(scripted.openCount()).toBe(1);
+      expect(harness.watcher.watchedFiles(SESSION_ID)).toHaveLength(2);
+      expect(
+        harness.logs
+          .filter((record) => record.level === 'warn' && record.fields['notice'] !== undefined)
+          .map((record) => record.fields['notice']),
+      ).toEqual(['paused', 'resumed']);
+    },
+  );
+
+  it('keeps polling a refused directory whose retry cadence is shorter than the debounce, and still finds an edit', async () => {
+    useFakeTimeouts();
+    const debounceMs = 200;
+    const retryMs = 10;
+    const scripted = createScriptedWatch();
+    const harness = await createHarness({
+      watch: scripted.watch,
+      debounceMs,
+      watchRetryInitialMs: retryMs,
+      watchRetryMaxMs: retryMs,
+    });
+    const { ledger } = await instrumentLedgerAndTally(harness);
+
+    const started = await harness.watcher.watchSession({
+      sessionId: SESSION_ID,
+      projectRoot: harness.sandbox.projectRoot,
+    });
+    expect(started.ok).toBe(true);
+    vi.advanceTimersByTime(debounceMs);
+    await eventually(() => {
+      expect(unchangedEvaluations(harness, LEDGER_FILE)).toBe(1);
+      expect(unchangedEvaluations(harness, TALLY_FILE)).toBe(1);
+    });
+
+    scripted.refuseWith('ENOSPC');
+    scripted.handles[0]!.fail('EPERM');
+
+    // A retry every 10 ms asks for a check each time; none may restart the
+    // 200 ms debounce already counting, so the checks keep running.
+    const polled = (): boolean =>
+      unchangedEvaluations(harness, LEDGER_FILE) >= 4 &&
+      unchangedEvaluations(harness, TALLY_FILE) >= 4;
+    await advanceUntil(retryMs, 5_000, polled);
+    expect(unchangedEvaluations(harness, LEDGER_FILE)).toBeGreaterThanOrEqual(4);
+    expect(unchangedEvaluations(harness, TALLY_FILE)).toBeGreaterThanOrEqual(4);
+    expect(scripted.calls.length).toBeGreaterThan(20);
+    expect(scripted.calls.slice(1).every((call) => call.outcome === 'refused')).toBe(true);
+
+    // An edit made while the platform still refuses is found by a poll.
+    await appendFile(harness.pathOf(LEDGER_FILE), `${DEVELOPER_LINE}\n`);
+    await advanceUntil(retryMs, 5_000, () => harness.listener.calls.length > 0);
+    expect(harness.listener.calls).toHaveLength(1);
+    expect(conflictTransitions(harness).map((call) => call.id)).toEqual([ledger.id]);
+    expect(harness.watcher.watchedFiles(SESSION_ID)).toEqual([]);
+  });
+
+  it('never re-attaches or reads through a directory swapped for a link while its watch was down', async () => {
+    useFakeTimeouts();
+    const scripted = createScriptedWatch();
+    const harness = await createHarness({ watch: scripted.watch });
+    const { ledger, tally } = await instrumentLedgerAndTally(harness);
+    await startWatchingUnderFakeTimeouts(harness, [LEDGER_FILE, TALLY_FILE]);
+    const directory = dirname(harness.pathOf(LEDGER_FILE));
+    const ledgerBefore = unchangedEvaluations(harness, LEDGER_FILE);
+    const tallyBefore = unchangedEvaluations(harness, TALLY_FILE);
+
+    scripted.handles[0]!.fail('EPERM');
+
+    // The loss's own check runs while the chain is still real.
+    vi.advanceTimersByTime(DEBOUNCE_MS);
+    await eventually(() => {
+      expect(unchangedEvaluations(harness, LEDGER_FILE)).toBe(ledgerBefore + 1);
+      expect(unchangedEvaluations(harness, TALLY_FILE)).toBe(tallyBefore + 1);
+    });
+
+    // Before the retry, the directory is replaced by a link to one outside the
+    // project, holding a file of the watched name whose content must never be read.
+    const restore = await swapDirectoryForLink(
+      directory,
+      harness.sandbox.outside,
+      basename(LEDGER_FILE),
+      `export const planted = '${PLANTED_SECRET}';\n`,
+    );
+
+    vi.advanceTimersByTime(DEFAULT_WATCH_RETRY_INITIAL_MS);
+
+    // No watch through the link, and one issue per file naming the segment.
+    expect(scripted.calls).toEqual([{ directory, outcome: 'opened' }]);
+    const unsafe = harness.watcher
+      .watchIssues(SESSION_ID)
+      .filter((issue) => issue.kind === 'unsafe-path');
+    expect(unsafe.map((issue) => [issue.recordId, issue.code])).toEqual([
+      [ledger.id, 'FS_UNSAFE_PATH'],
+      [tally.id, 'FS_UNSAFE_PATH'],
+    ]);
+    expect(unsafe[0]?.message).toContain("'src/ledger'");
+    expect(unsafe[0]?.message).not.toContain(harness.sandbox.root);
+
+    // Neither polled nor read, and still retried with backoff — without a second issue.
+    expect(vi.getTimerCount()).toBe(1);
+    vi.advanceTimersByTime(2 * DEFAULT_WATCH_RETRY_INITIAL_MS);
+    expect(scripted.calls).toHaveLength(1);
+    vi.advanceTimersByTime(DEBOUNCE_MS);
+    await realPause();
+    expect(unchangedEvaluations(harness, LEDGER_FILE)).toBe(ledgerBefore + 1);
+    expect(unchangedEvaluations(harness, TALLY_FILE)).toBe(tallyBefore + 1);
+    expect(
+      harness.watcher.watchIssues(SESSION_ID).filter((issue) => issue.kind === 'unsafe-path'),
+    ).toHaveLength(2);
+    expect(harness.listener.calls).toEqual([]);
+    expect(harness.journal.updateCalls).toEqual([]);
+    expect(rowMessages(harness)).toEqual([
+      buildWatchPausedMessage([LEDGER_FILE, TALLY_FILE], 'lost'),
+    ]);
+    expect(JSON.stringify(harness.logs)).not.toContain(PLANTED_SECRET);
+    expect(JSON.stringify(harness.progress.emitted)).not.toContain(PLANTED_SECRET);
+
+    // Once the real directory is back, the next retry watches it again.
+    await restore();
+    vi.advanceTimersByTime(4 * DEFAULT_WATCH_RETRY_INITIAL_MS);
+    expect(scripted.calls).toEqual([
+      { directory, outcome: 'opened' },
+      { directory, outcome: 'opened' },
+    ]);
+    expect(rowMessages(harness)).toEqual([
+      buildWatchPausedMessage([LEDGER_FILE, TALLY_FILE], 'lost'),
+      buildWatchResumedMessage([LEDGER_FILE, TALLY_FILE]),
+    ]);
+    vi.advanceTimersByTime(DEBOUNCE_MS);
+    await eventually(() => {
+      expect(unchangedEvaluations(harness, LEDGER_FILE)).toBe(ledgerBefore + 2);
+      expect(unchangedEvaluations(harness, TALLY_FILE)).toBe(tallyBefore + 2);
+    });
+    expect(harness.listener.calls).toEqual([]);
+  });
+
+  it('reads nothing through a directory swapped for a link under a live watch, and records it once', async () => {
+    useFakeTimeouts();
+    const scripted = createScriptedWatch();
+    const harness = await createHarness({ watch: scripted.watch });
+    const { ledger } = await instrumentLedgerAndTally(harness);
+    await startWatchingUnderFakeTimeouts(harness, [LEDGER_FILE, TALLY_FILE]);
+    const directory = dirname(harness.pathOf(LEDGER_FILE));
+    const before = unchangedEvaluations(harness, LEDGER_FILE);
+
+    // The planted file holds the instrumented bytes, so a read through the
+    // link would show up as one more intact evaluation.
+    await swapDirectoryForLink(
+      directory,
+      harness.sandbox.outside,
+      basename(LEDGER_FILE),
+      instrumentedOf(LEDGER_ORIGINAL),
+    );
+
+    for (let round = 0; round < 2; round += 1) {
+      scripted.handles[0]!.emit(basename(LEDGER_FILE));
+      vi.advanceTimersByTime(DEBOUNCE_MS);
+      await realPause();
+    }
+
+    expect(unchangedEvaluations(harness, LEDGER_FILE)).toBe(before);
+    expect(harness.listener.calls).toEqual([]);
+    expect(harness.journal.updateCalls).toEqual([]);
+    expect(
+      harness.watcher.watchIssues(SESSION_ID).map((issue) => [issue.kind, issue.recordId]),
+    ).toEqual([['unsafe-path', ledger.id]]);
+  });
+
+  it('re-checks the chain before the diff read: a swap landing mid-evaluation reports nothing read through the link', async () => {
+    const harness = await createHarness();
+    const { ledger } = await instrumentLedgerAndTally(harness);
+    await startWatching(harness, [LEDGER_FILE, TALLY_FILE]);
+    const directory = dirname(harness.pathOf(LEDGER_FILE));
+    const held = harness.journal.holdLatestReads();
+
+    // An edit starts an evaluation, which observes it and then waits on the journal…
+    await appendFile(harness.pathOf(LEDGER_FILE), `${DEVELOPER_LINE}\n`);
+    await held.reached;
+
+    // …while the directory is replaced by a link to planted content.
+    await swapDirectoryForLink(
+      directory,
+      harness.sandbox.outside,
+      basename(LEDGER_FILE),
+      `export const planted = '${PLANTED_SECRET}';\n`,
+    );
+    held.release();
+    await quiet();
+
+    expect(harness.listener.calls).toEqual([]);
+    expect(harness.journal.updateCalls).toEqual([]);
+    expect(
+      harness.watcher.watchIssues(SESSION_ID).map((issue) => [issue.kind, issue.recordId]),
+    ).toEqual([['unsafe-path', ledger.id]]);
+    expect(JSON.stringify(harness.logs)).not.toContain(PLANTED_SECRET);
+    expect(JSON.stringify(harness.progress.emitted)).not.toContain(PLANTED_SECRET);
   });
 });
 
@@ -2066,8 +2990,20 @@ describe('non-mutation', () => {
     const { code } = scanSource(WATCHER_SOURCE);
     const fsMembers = new Set([...code.matchAll(/\bfsPromises\.(\w+)/g)].map((match) => match[1]));
     expect([...fsMembers].sort()).toEqual(['lstat', 'stat']);
+    // The synchronous chain check behind the recovery retry and the evaluation
+    // reads only: `lstatSync` and `statSync`, never a synchronous write.
+    // The module's own `…Sync` helpers are not platform calls.
+    const ownFunctions = new Set(
+      [...code.matchAll(/\bfunction (\w+)\s*\(/g)].map((match) => match[1]),
+    );
+    const syncCalls = new Set(
+      [...code.matchAll(/\b(\w+Sync)\s*\(/g)]
+        .map((match) => match[1])
+        .filter((name) => !ownFunctions.has(name)),
+    );
+    expect([...syncCalls].sort()).toEqual(['lstatSync', 'statSync']);
     expect(WATCHER_SOURCE).toMatch(
-      /^import \{ promises as fsPromises, watch as nodeWatch \} from 'node:fs';$/m,
+      /^import \{ lstatSync, promises as fsPromises, statSync, watch as nodeWatch \} from 'node:fs';$/m,
     );
   });
 

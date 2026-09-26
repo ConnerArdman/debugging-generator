@@ -17,9 +17,12 @@
  * 3. **internal schema** — `validatePanelSpec`, inside that same callback. The
  *    callback *throws* on a normaliser or internal-schema failure, and that
  *    inversion is load-bearing: `structured.ts` treats a throwing normaliser as
- *    a product bug, logs it with the input and rejects it after exactly one
- *    provider call, without re-prompting (AAP 0.5.3). Only an authoring-schema
- *    failure ever earns a repair;
+ *    a product bug, logs it by provenance, counts and the thrown error's closed
+ *    code and class — never the parsed panel, whose title, summary and labels
+ *    are model prose that can echo developer source, and never the thrown
+ *    message (CWE-532) — and rejects it after exactly one provider call,
+ *    without re-prompting (AAP 0.5.3). Only an authoring-schema failure ever
+ *    earns a repair;
  * 4. **semantic validation** — `./validate.js`'s `validateGenerated`, against
  *    the capture the panel claims to describe.
  *
@@ -1071,6 +1074,12 @@ export function createPanelGenerator(deps: PanelGeneratorDeps): PanelGenerator {
    * with at most `DEFAULT_MAX_REPAIRS` repairs, then the validator's
    * normalise-then-validate callback, whose throw is the no-retry signal. A
    * throw out of the loop itself is returned as the failure it is.
+   *
+   * The session's service logger is handed to the loop as its sink. That is
+   * safe because the loop's records are closed — identifiers, counts, issue
+   * paths and closed codes — and never carry the panel answer or a thrown
+   * message, which is prose the model wrote and no redaction checkpoint has
+   * examined (CWE-532).
    */
   const callModel = async (
     request: ModelRequest,

@@ -8,11 +8,13 @@
  * Understanding problem          ← the `understand` stage's `running` row
  * Investigating code             ← the `investigate` stage's `running` row
  * ✓ Found ‹component›            ← a `done` row per component the code graph found
- * ✓ Traced ‹handler›             ← a `done` row per event handler actually traced
+ * ✓ Traced event handler         ← one `done` row when an event handler was traced;
+ *                                  its detail lists the traced symbols and a file
  * ✓ Found ‹route path›           ← a `done` row per API route actually resolved
  * ✓ Found database dependency    ← one `done` row when a database call site exists
  *
- * Preparing instrumentation      ← the `instrument` stage's `running` row
+ * Preparing instrumentation      ← the `instrument` stage's `running` row, settled
+ *                                  to `done` when readiness is satisfied
  * ✓ Browser performance          ← one `done` row per signal actually armed
  * ✓ React renders
  * ✓ Network tracing
@@ -24,10 +26,12 @@
  * ```
  *
  * A **group header** is a stage's `running` row, whose `message` is the stage
- * title from {@link PROGRESS_STAGE_TITLES}; a **✓ row** is a `done` row and a
- * **✗ row** a `failed` one. Both user interfaces group whatever the service sent
- * by stage and draw it in arrival order, so neither of them restates a title, a
- * label or a step list.
+ * title from {@link PROGRESS_STAGE_TITLES}; the `done` row a stage closes with
+ * carries that same title unless its caller states another, so a client keying
+ * rows on `(stage, message)` settles the header rather than adding a line. A
+ * **✓ row** is any other `done` row and a **✗ row** a `failed` one. Both user
+ * interfaces group whatever the service sent by stage and draw it in arrival
+ * order, so neither of them restates a title, a label or a step list.
  *
  * ## The rows are rendered from findings, never from canned text
  *
@@ -37,12 +41,15 @@
  * the names the code graph resolved, the hooks the installer armed, the signals
  * an adapter reported unavailable — and a class of finding with no input
  * produces **no row at all**: no placeholder, no "checking…" line, no default
- * name. Deleting one finding from the input deletes exactly its row. The source
- * holds only templates such as `` `Found ${name}` ``; the concrete text exists
- * only at run time. Nothing here reads, receives or branches on the developer's
- * question — it is not an input of any function in this module — and no name of
- * any particular application appears in it; `scripts/check-no-hardcoding.mjs`
- * scans this file for both.
+ * name. Deleting a component or a route from the input deletes exactly its row.
+ * The event-handler and database classes are one row each whose detail lists
+ * their findings: deleting one of those findings deletes it from that detail,
+ * and deleting the last deletes the row. The source holds only templates such
+ * as `` `Found ${name}` `` and the product's fixed Step-8 labels; the concrete
+ * findings exist only at run time. Nothing here reads, receives or branches on
+ * the developer's question — it is not an input of any function in this
+ * module — and no name of any particular application appears in it;
+ * `scripts/check-no-hardcoding.mjs` scans this file for both.
  *
  * The stage titles and signal labels below are the product's own vocabulary
  * (its pipeline stages and its capture signals), not a description of any
@@ -53,13 +60,16 @@
  * - The **builders** are exported, pure, synchronous and I/O-free — no store,
  *   no transport, no clock, no logger — so the from-findings guarantee is
  *   asserted directly against them by
- *   `apps/local-service/test/integration/session-lifecycle.test.ts` (this folder
- *   ships no colocated progress suite by design).
+ *   `apps/local-service/test/integration/session-lifecycle.test.ts`; the
+ *   colocated `./progress.test.ts` covers the public failure copy and the
+ *   emitter's failure handling.
  * - The **emitter**, {@link createSessionProgress}, turns a row into a validated
  *   `session.progress` payload, persists it through the session store's
  *   `session_progress` table and broadcasts it to the session's editor and
  *   DevTools clients. Persisting first is what lets `./reopen.ts` replay a
- *   session with every row a client ever saw.
+ *   session with every row that was persisted. A row whose persistence failed
+ *   is still broadcast — live delivery is best effort and never withheld — but
+ *   it exists only in the frames already sent and cannot be replayed.
  *
  * ## What this module never does
  *
@@ -71,8 +81,26 @@
  *   `apps/local-service/src/server/**`, which this module does not import.
  * - **It never puts a secret into a row or a log record.** Its inputs are names,
  *   project-relative paths, the product's labels and adapters' developer-facing
- *   reasons and hints. Log records carry only stages, statuses, counts and error
- *   codes — never a message, a detail or a rejected payload (AAP §0.5.2).
+ *   reasons and hints. Log records carry only stages, statuses, counts, error
+ *   codes and diagnostic references — never a message, a detail or a rejected
+ *   payload (AAP §0.5.2).
+ * - **It never shows a failure's own words.** A `failed` row is projected from
+ *   the failure's stage and closed error code alone: its message is
+ *   {@link publicFailureCopy}'s fixed text, its detail the failure's hint only
+ *   when that hint is proven product text ({@link isProductAuthoredText}) and
+ *   the code's own hint otherwise, followed by the code and a diagnostic
+ *   reference minted for that failure. The failure's message — which
+ *   `DebuggenError.from` may have taken verbatim from any exception — and an
+ *   unproven hint go only to the local service log, as the error field of the
+ *   `debug` record {@link STAGE_FAILURE_DIAGNOSTIC_MESSAGE} carrying the same
+ *   reference, where the service's error serializer emits them redacted
+ *   (CWE-209). The `warn` record {@link STAGE_FAILURE_LOG_MESSAGE}, which the
+ *   service's default log level keeps, carries the reference, the code and a
+ *   proven hint only.
+ * - **It never lets its own diagnostics cost a client a row.** The logger it is
+ *   given is wrapped by `../logging.ts`'s `guardLogger`, so no log call on the
+ *   emit path — or the creation of its subsystem child — can throw between
+ *   persisting a row and broadcasting it.
  *
  * @module
  */
@@ -102,10 +130,24 @@ import {
   type ServerAgentSignals,
   type UnavailableSignal,
 } from '@debuggen/instrumentation';
-import { DebuggenError, err, noopLogger, nowEpochMs, ok } from '@debuggen/shared';
-import type { Logger, Result, SessionId } from '@debuggen/shared';
+import {
+  DEBUGGEN_ERROR_CODES,
+  DebuggenError,
+  err,
+  newMessageId,
+  noopLogger,
+  nowEpochMs,
+  ok,
+} from '@debuggen/shared';
+import type { DebuggenErrorCode, Logger, Result, SessionId } from '@debuggen/shared';
 
-import { LOG_BINDING_KEYS, subsystemLogger } from '../logging.js';
+import {
+  LOG_BINDING_KEYS,
+  LOG_ERROR_FIELD_KEY,
+  describeException,
+  guardLogger,
+  subsystemLogger,
+} from '../logging.js';
 import type { SessionsRepo } from '../store/sessions-repo.js';
 import type { SessionFailure } from './state-machine.js';
 
@@ -184,13 +226,377 @@ export const INSTRUMENTATION_ROW_ORDER: readonly CaptureSignalLabel[] = Object.f
 
 /**
  * The closing `done` row of the instrumentation stage, emitted once readiness
- * is satisfied.
+ * is satisfied — immediately after the stage's own title row is settled to
+ * `done`, so the "Preparing instrumentation" header is never left spinning
+ * beside a session that is ready (see {@link SessionProgress.readyToCapture}).
  *
  * The VS Code view's "Reproduce the issue now." (AAP §0.7.3) is **not** a
  * progress row: it is the webview's own rendering of the armed state it reads
  * from the session record, and no stage emits it.
  */
 export const READY_TO_CAPTURE_MESSAGE = 'Ready to capture';
+
+/**
+ * The public text of one failure code: a sentence naming what failed and the
+ * developer's next step.
+ */
+export interface PublicFailureCopy {
+  /** One complete sentence naming what failed, in the product's words. */
+  readonly summary: string;
+  /** The developer's next step when the failure carried none of its own. */
+  readonly hint: string;
+}
+
+/**
+ * The only failure text a stage's `failed` row — and `instrumentation.failed`
+ * — may carry, keyed by the closed error-code vocabulary.
+ *
+ * A failure reaches this module as a `DebuggenError`, and
+ * `DebuggenError.from` keeps the message of whatever it wrapped: a driver
+ * error quoting a statement, a filesystem error quoting an absolute path, a
+ * provider error quoting its response. Both user interfaces display and
+ * persist a failure row, so its text must never be that message (CWE-209).
+ * It is this fixed copy instead, chosen by the failure's code — which is from
+ * `DEBUGGEN_ERROR_CODES` and therefore safe by construction — while the
+ * failure's own words are kept for the local, redacted service log under a
+ * diagnostic reference the row shows.
+ *
+ * Exhaustive over the vocabulary (`satisfies`), so a code added to
+ * `DEBUGGEN_ERROR_CODES` is a compile error here until it has copy. The model
+ * provider row is AAP §0.5.5's own wording, and the empty-capture row is its
+ * recovery sentence; the rest are written in the same plain, generic voice and
+ * name no project, framework or application.
+ */
+export const FAILURE_COPY_BY_CODE = Object.freeze({
+  CONFIG_INVALID: {
+    summary: 'The Debug Generator service configuration is invalid.',
+    hint: 'Check the DEBUGGEN_* settings in the environment, then restart the service.',
+  },
+  FORBIDDEN_ORIGIN: {
+    summary: 'A request from a web page was refused.',
+    hint: 'Use the Debug Generator view in VS Code or the Debug Generator DevTools panel.',
+  },
+  PAIRING_EXPIRED: {
+    summary: 'The pairing code expired.',
+    hint: 'Pair Chrome again from VS Code to get a new code.',
+  },
+  PAIRING_INVALID: {
+    summary: 'The pairing code was not accepted.',
+    hint: 'Pair Chrome again from VS Code to get a new code.',
+  },
+  RATE_LIMITED: {
+    summary: 'Too many attempts were refused.',
+    hint: 'Wait a minute, then try again.',
+  },
+  UNAUTHORIZED: {
+    summary: 'The request was not authorized.',
+    hint: 'Reconnect the editor, or pair the DevTools panel again.',
+  },
+  CAPTURE_ALREADY_ACTIVE: {
+    summary: 'Another session is already capturing this project.',
+    hint: 'Stop that capture or end its session, then start capture again.',
+  },
+  CAPTURE_EMPTY: {
+    summary: 'No telemetry was captured.',
+    hint: 'Interact with the page while capture is running, then Capture again.',
+  },
+  SESSION_INVALID_STATE: {
+    summary: 'The session was not in a state that allows this step.',
+    hint: 'Check the session status, then retry the step.',
+  },
+  SESSION_NOT_FOUND: {
+    summary: 'The session no longer exists.',
+    hint: 'Start a new session from the Debug Generator view.',
+  },
+  TAB_NOT_BOUND: {
+    summary: 'No browser tab is bound to this session.',
+    hint: "Open the Debug Generator DevTools panel on the application's tab.",
+  },
+  FS_UNSAFE_PATH: {
+    summary: 'A file path was refused as unsafe.',
+    hint: 'Check that DEBUGGEN_HOME is a private directory you own, then retry.',
+  },
+  PATH_OUTSIDE_PROJECT: {
+    summary: 'A path outside the project was refused.',
+    hint: 'Only files inside the project being debugged can be used.',
+  },
+  PROJECT_NOT_FOUND: {
+    summary: 'The project could not be found or read.',
+    hint: 'Open the project folder in VS Code, then start the session again.',
+  },
+  AGENT_NOT_READY: {
+    summary: 'The page agent is not ready in the bound tab.',
+    hint: 'Reload the page, then start capture again.',
+  },
+  DEV_SERVER_LAUNCH_FAILED: {
+    summary: 'The dev server could not be launched.',
+    hint: "Check the project's dev script, then launch the dev server again.",
+  },
+  DEV_SERVER_UNAVAILABLE: {
+    summary: 'The dev server did not answer.',
+    hint: 'Start the dev server, then retry.',
+  },
+  SERVER_AGENT_NOT_READY: {
+    summary: 'The dev server is not running with the telemetry preload.',
+    hint: 'Relaunch the dev server from Debug Generator, then retry.',
+  },
+  CLEANUP_PARTIAL: {
+    summary: 'Some instrumentation could not be removed.',
+    hint: 'Review the modifications list, then end the session again to retry cleanup.',
+  },
+  INSTRUMENTATION_INSTALL_FAILED: {
+    summary: 'Instrumentation could not be installed.',
+    hint: 'Review the modifications list, then ask the question again to retry.',
+  },
+  INSTRUMENTATION_UNAVAILABLE: {
+    summary: 'The planned instrumentation is not available here.',
+    hint: 'Check the dev server and the DevTools panel, then retry.',
+  },
+  MODIFICATION_CONFLICT: {
+    summary: 'An instrumented file was edited during the session.',
+    hint: 'Debug Generator did not overwrite it; review the conflict in the modifications list.',
+  },
+  PATCH_TARGET_NOT_FOUND: {
+    summary: 'A planned instrumentation target was not found in the code.',
+    hint: 'Ask the question again so the plan is rebuilt from the current code.',
+  },
+  PATCH_UNSUPPORTED: {
+    summary: 'A planned instrumentation target cannot be wrapped safely.',
+    hint: 'Ask the question again so the plan is rebuilt from the current code.',
+  },
+  CODE_INDEX_FAILED: {
+    summary: 'The project could not be indexed.',
+    hint: "Check that the project's tsconfig.json loads, then start the session again.",
+  },
+  MODEL_OUTPUT_INVALID: {
+    summary: "The model's output failed validation.",
+    hint: 'Retry the step; if it keeps failing, switch DEBUGGEN_PROVIDER.',
+  },
+  MODEL_UNAVAILABLE: {
+    summary: 'Model provider unavailable (MODEL_UNAVAILABLE).',
+    hint: 'Check ANTHROPIC_API_KEY or switch DEBUGGEN_PROVIDER.',
+  },
+  PANEL_INVALID: {
+    summary: 'The generated panel failed validation.',
+    hint: 'Retry panel generation; the captured evidence is kept.',
+  },
+  PANEL_SEMANTIC_INVALID: {
+    summary: 'The generated panel cited evidence the capture does not hold.',
+    hint: 'Retry panel generation; the captured evidence is kept.',
+  },
+  PLAN_INVALID: {
+    summary: 'The instrumentation plan failed validation.',
+    hint: 'Ask the question again to build a new plan.',
+  },
+  PROTOCOL_INVALID_MESSAGE: {
+    summary: 'A message between Debug Generator components was malformed.',
+    hint: 'Update the VS Code and Chrome extensions to match the service, then retry.',
+  },
+  STORE_ERROR: {
+    summary: 'The session store failed.',
+    hint: 'Check the free space and permissions of DEBUGGEN_HOME, then retry.',
+  },
+  TRANSPORT_DISCONNECTED: {
+    summary: 'A connection between Debug Generator components was lost.',
+    hint: 'Check that the Debug Generator service is running, then retry.',
+  },
+  INTERNAL: {
+    summary: 'An unexpected error stopped this step.',
+    hint: 'Retry the step; the service log records the failure under the reference shown.',
+  },
+  NOT_IMPLEMENTED: {
+    summary: 'This step is not available in this version.',
+    hint: 'Update Debug Generator, then retry.',
+  },
+} as const satisfies Readonly<Record<DebuggenErrorCode, PublicFailureCopy>>);
+
+/** The public text of one failed stage, as {@link publicFailureCopy} composes it. */
+export interface PublicStageFailure {
+  /** `‹stage title› failed: ‹summary›` — the row's first line. */
+  readonly message: string;
+  /** The code's next step from {@link FAILURE_COPY_BY_CODE}. */
+  readonly hint: string;
+}
+
+/**
+ * Composes the public text of `code` failing in `stage`: the stage's title
+ * from {@link PROGRESS_STAGE_TITLES} and the code's copy from
+ * {@link FAILURE_COPY_BY_CODE}, and nothing else.
+ *
+ * Pure and total. A stage or code read from outside the type system that is
+ * not in its vocabulary falls back to the generic "this step" wording and the
+ * `INTERNAL` copy rather than echoing the value, so whatever a caller passes,
+ * the result is product copy.
+ *
+ * @param stage The failing stage.
+ * @param code The failure's code.
+ * @returns The row's message and the code's default hint.
+ *
+ * @example
+ * ```ts
+ * publicFailureCopy('understand', 'MODEL_UNAVAILABLE');
+ * // { message: 'Understanding problem failed: Model provider unavailable (MODEL_UNAVAILABLE).',
+ * //   hint: 'Check ANTHROPIC_API_KEY or switch DEBUGGEN_PROVIDER.' }
+ * ```
+ */
+export function publicFailureCopy(
+  stage: ProgressStage,
+  code: DebuggenErrorCode,
+): PublicStageFailure {
+  const title: string = Object.hasOwn(PROGRESS_STAGE_TITLES, stage)
+    ? PROGRESS_STAGE_TITLES[stage]
+    : 'This step';
+  const copy: PublicFailureCopy = Object.hasOwn(FAILURE_COPY_BY_CODE, code)
+    ? FAILURE_COPY_BY_CODE[code]
+    : FAILURE_COPY_BY_CODE.INTERNAL;
+  return { message: `${title} failed: ${copy.summary}`, hint: copy.hint };
+}
+
+/**
+ * Whether `error`'s message is text copied from the value it wraps rather than
+ * a sentence the product wrote.
+ *
+ * `DebuggenError.from` keeps a wrapped `Error`'s message — or its name, when
+ * the message is empty — and a thrown string verbatim, and sets that value as
+ * the `cause`; that is exactly the shape tested here. A failure whose
+ * properties cannot even be read is treated as copied text, the conservative
+ * answer for something about to be shown to a developer.
+ *
+ * A surface that shows an error's message verbatim — standard error at
+ * start-up, an HTTP refusal body — asks this first and shows
+ * {@link FAILURE_COPY_BY_CODE} instead when it answers `true`.
+ *
+ * @param error A failure about to be shown.
+ * @returns `true` when its message is the wrapped value's own text.
+ *
+ * @example
+ * ```ts
+ * carriesWrappedExceptionText(DebuggenError.from(new Error('EACCES: /home/dev/x')));  // true
+ * carriesWrappedExceptionText(new DebuggenError('SESSION_NOT_FOUND', 'No such session.')); // false
+ * ```
+ */
+export function carriesWrappedExceptionText(error: DebuggenError): boolean {
+  try {
+    const cause: unknown = error.cause;
+    if (typeof cause === 'string') {
+      return error.message === cause;
+    }
+    if (cause instanceof Error) {
+      return error.message === cause.message || error.message === cause.name;
+    }
+    return false;
+  } catch {
+    // A hostile accessor or a `Proxy` trap on the cause: nothing about the
+    // message is known to be product copy, so it is treated as copied text.
+    return true;
+  }
+}
+
+/**
+ * The most distinct product-authored texts {@link authorProductText}
+ * remembers at once. The oldest registration is forgotten first, so the
+ * registry's memory is bounded however many sessions a service runs.
+ */
+export const PRODUCT_TEXT_REGISTRY_LIMIT = 512;
+
+/**
+ * The longest text {@link authorProductText} registers, in UTF-16 code units.
+ * Longer text is returned unchanged but never recorded, so it is never shown as
+ * the product's.
+ */
+export const PRODUCT_TEXT_MAX_LENGTH = 2000;
+
+/**
+ * The texts {@link FAILURE_COPY_BY_CODE} holds: product copy by construction,
+ * and therefore product-authored without being registered.
+ */
+const FIXED_PRODUCT_TEXTS: ReadonlySet<string> = new Set(
+  Object.values(FAILURE_COPY_BY_CODE).flatMap((copy: PublicFailureCopy) => [
+    copy.summary,
+    copy.hint,
+  ]),
+);
+
+/**
+ * Registered product texts, in registration order (a `Map`'s iteration order),
+ * so the first key is the least recently registered or recognised one.
+ */
+const registeredProductTexts = new Map<string, true>();
+
+/**
+ * Records `text` as written by this product and returns it unchanged.
+ *
+ * A failure surface — a failed progress row, `instrumentation.failed`, an HTTP
+ * refusal — shows a failure's own message or hint only when
+ * {@link isProductAuthoredText} recognises it; anything else is replaced by the
+ * code's {@link FAILURE_COPY_BY_CODE} copy (CWE-209). A builder that composes a
+ * recovery sentence from product templates and service-derived values — the
+ * dev-server relaunch command, a readiness gate's reason — passes its result
+ * through here at the point of composition, which is the proof the surface
+ * later relies on: exact equality with text the product itself produced in
+ * this process. A value an adapter, a dependency or a thrown exception
+ * supplied is never passed here, so it can never match, whatever it says.
+ *
+ * Bounded: at most {@link PRODUCT_TEXT_REGISTRY_LIMIT} texts, each at most
+ * {@link PRODUCT_TEXT_MAX_LENGTH} long; registering an already-known text makes
+ * it the most recent. Never throws.
+ *
+ * @param text A sentence the product composed.
+ * @returns `text`, unchanged, so a builder can register what it returns inline.
+ *
+ * @example
+ * ```ts
+ * const hint = authorProductText(`Restart the dev server with: ${command}`);
+ * isProductAuthoredText(hint); // true
+ * isProductAuthoredText(thrown.message); // false, unless it is that exact sentence
+ * ```
+ */
+export function authorProductText<T extends string>(text: T): T {
+  if (typeof text !== 'string' || text.length === 0 || text.length > PRODUCT_TEXT_MAX_LENGTH) {
+    return text;
+  }
+  if (FIXED_PRODUCT_TEXTS.has(text)) {
+    return text;
+  }
+  registeredProductTexts.delete(text);
+  registeredProductTexts.set(text, true);
+  while (registeredProductTexts.size > PRODUCT_TEXT_REGISTRY_LIMIT) {
+    const oldest = registeredProductTexts.keys().next();
+    if (oldest.done === true) {
+      break;
+    }
+    registeredProductTexts.delete(oldest.value);
+  }
+  return text;
+}
+
+/**
+ * Whether `text` is proven product copy: one of {@link FAILURE_COPY_BY_CODE}'s
+ * texts, or a text a product builder registered with
+ * {@link authorProductText} and that is still remembered.
+ *
+ * The comparison is exact — no trimming, no case folding — so a failure's text
+ * is shown only when it is, character for character, something the product
+ * wrote. Recognising a registered text makes it the most recent, so the texts
+ * in use are the last to be forgotten. Never throws.
+ *
+ * @param text A failure's message or hint, of any type.
+ * @returns `true` only for a non-empty string the product authored.
+ */
+export function isProductAuthoredText(text: unknown): text is string {
+  if (typeof text !== 'string' || text.length === 0 || text.length > PRODUCT_TEXT_MAX_LENGTH) {
+    return false;
+  }
+  if (FIXED_PRODUCT_TEXTS.has(text)) {
+    return true;
+  }
+  if (!registeredProductTexts.has(text)) {
+    return false;
+  }
+  registeredProductTexts.delete(text);
+  registeredProductTexts.set(text, true);
+  return true;
+}
 
 /**
  * The most rows either builder returns for its stage, including the single
@@ -218,8 +624,50 @@ export const PROGRESS_RECIPIENT_KINDS: readonly ClientKind[] = Object.freeze([
 /** The one row the database class produces, whenever a call site was found. */
 const DATABASE_DEPENDENCY_MESSAGE = 'Found database dependency';
 
+/**
+ * The one row the event-handler class produces, whenever a handler was traced
+ * (prompt §11, Step 8, verbatim). The traced symbols are the row's evidence and
+ * travel in its `detail`; they are never folded into the message, because both
+ * user interfaces key rows on `(stage, message)` and the Step-8 wording is a
+ * fixed label, not a template.
+ */
+const TRACED_EVENT_HANDLER_MESSAGE = 'Traced event handler';
+
 /** The logger binding naming this folder, per `../logging.ts`'s convention. */
 const LOG_SUBSYSTEM = 'sessions';
+
+/**
+ * The `msg` of the `warn` record each stage failure is logged with: the
+ * record whose `ref` field is the reference its `failed` row shows. Its error
+ * field carries the failure's code, its message — which the service's error
+ * serializer never emits at `warn` — and its hint only when that hint is
+ * proven product text, so the record is safe at the service's default level.
+ */
+export const STAGE_FAILURE_LOG_MESSAGE =
+  'a stage failed; its row shows the public copy under this reference';
+
+/**
+ * The `msg` of the `debug` twin of {@link STAGE_FAILURE_LOG_MESSAGE}: the same
+ * session, stage, code and reference, with the failure's own message and hint
+ * — proven or not — under the error field.
+ *
+ * Written at `debug` because that is the one level family at which the
+ * service's error serializer adds an error's message and stack, after masking
+ * URL query values and SQL literals and removing source codeframes. So the
+ * reference a developer reads off a `failed` row leads, once
+ * `DEBUGGEN_LOG_LEVEL=debug` is set, to a detailed and redacted local
+ * diagnostic, and at the default level to nothing that could quote a path, a
+ * statement or a credential.
+ *
+ * @example
+ * ```text
+ * {"level":20,"subsystem":"sessions","sessionId":"ses_…","stage":"plan",
+ *  "code":"INTERNAL","ref":"msg_…","err":{"type":"DebuggenError",
+ *  "code":"INTERNAL","message":"…redacted…","hint":"…"},"msg":"…"}
+ * ```
+ */
+export const STAGE_FAILURE_DIAGNOSTIC_MESSAGE =
+  'the diagnostic of a failed stage, under the reference its row shows';
 
 /**
  * Display bound for one finding name — a component, a handler symbol, a route
@@ -260,6 +708,21 @@ const CALL_SITE_PATTERN = /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*(?:\(\))?$/u;
 
 /** Trailing sentence punctuation stripped from a reason before it is quoted. */
 const TRAILING_PUNCTUATION_PATTERN = /[\s.]+$/u;
+
+/**
+ * The only shape a diagnostic reference may take before a `failed` row shows
+ * it: an identifier-like token such as `newMessageId()`'s `msg_…`, bounded.
+ * A reference from an injected generator that does not match is replaced by
+ * a fresh message id, so the row can never carry a generator's free text.
+ */
+const DIAGNOSTIC_REF_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/u;
+
+/**
+ * The fallback of a failure whose code is outside the closed vocabulary: the
+ * code {@link publicFailureCopy} words it as, and therefore the code its row
+ * names.
+ */
+const UNKNOWN_FAILURE_CODE: DebuggenErrorCode = 'INTERNAL';
 
 // ---------------------------------------------------------------------------
 // Section B — the builders' inputs and output
@@ -730,21 +1193,60 @@ function databaseRows(findings: readonly Finding[]): ProgressRow[] {
 }
 
 /**
+ * The single event-handler row: emitted only when at least one handler was
+ * traced, with a detail listing the traced symbols (bounded, with an omission
+ * note past the bound) and the origin file of the first handler that has one —
+ * so one handler reads `` `${symbol} · ${file}` ``. The file part is omitted
+ * when no traced handler resolved to a file.
+ *
+ * One row for the whole class rather than one per handler: both user
+ * interfaces de-duplicate rows by `(stage, message)`, so several rows sharing
+ * the fixed Step-8 label would collapse into one and lose all but the first
+ * handler's evidence.
+ */
+function eventHandlerRows(findings: readonly Finding[]): ProgressRow[] {
+  if (findings.length === 0) {
+    return [];
+  }
+
+  const origin = findings.find((finding) => finding.file !== undefined)?.file;
+  const parts = [
+    joinBounded(
+      findings.map((finding) => finding.name),
+      DETAIL_LIST_SEPARATOR,
+      MAX_DETAIL_TEXT_LENGTH / 2,
+    ),
+  ];
+
+  if (origin !== undefined) {
+    parts.push(origin);
+  }
+
+  return [
+    makeRow('investigate', 'done', TRACED_EVENT_HANDLER_MESSAGE, parts.join(DETAIL_PART_SEPARATOR)),
+  ];
+}
+
+/**
  * Builds the investigation stage's finding rows from what the investigation
  * actually found.
  *
  * - one `` `Found ${name}` `` row per component found;
- * - one `` `Traced ${symbol}` `` row per event handler traced — the symbol
- *   rather than a generic phrase, so the row is evidence;
+ * - one "Traced event handler" row when at least one event handler was traced
+ *   — the Step-8 label verbatim, with the traced symbols as its evidence;
  * - one `` `Found ${routePath}` `` row per API route resolved;
  * - one "Found database dependency" row when at least one call site was found.
  *
- * Each row's `detail` is the finding's origin file when one is known (a
- * project-relative path the editor can open). A class with no finding emits no
- * row, and an empty input returns an empty array. Output is bounded by
- * {@link MAX_FINDING_ROWS_PER_STAGE}, follows input order within each class,
- * and is identical for identical input. All rows belong to the `investigate`
- * stage and are `done`.
+ * A component or route row's `detail` is the finding's origin file when one is
+ * known (a project-relative path the editor can open). The event-handler and
+ * database rows each stand for their whole class, so their `detail` lists the
+ * class's findings — the traced handler symbols, the call sites — then the
+ * origin file of the first finding that has one, separated by `` ` · ` ``
+ * (`` `${symbol} · ${file}` `` for a single traced handler). A class with no
+ * finding emits no row, and an empty input returns an empty array. Output is
+ * bounded by {@link MAX_FINDING_ROWS_PER_STAGE}, follows input order within
+ * each class, and is identical for identical input. All rows belong to the
+ * `investigate` stage and are `done`.
  *
  * Pure, synchronous and I/O-free: no store, no transport, no clock, no logger.
  *
@@ -777,9 +1279,7 @@ export function buildInvestigationRows(findings: InvestigationFindings): readonl
     components.map((finding) =>
       makeRow('investigate', 'done', `Found ${finding.name}`, finding.file),
     ),
-    handlers.map((finding) =>
-      makeRow('investigate', 'done', `Traced ${finding.name}`, finding.file),
-    ),
+    eventHandlerRows(handlers),
     routes.map((finding) => makeRow('investigate', 'done', `Found ${finding.name}`, finding.file)),
     databaseRows(database),
   ];
@@ -1037,7 +1537,9 @@ export interface ProgressBroadcaster {
   /**
    * Sends `message` to every connected client of `sessionId` whose kind is in
    * `kinds`. Delivery is best effort and synchronous; a client that is offline
-   * simply misses the frame and recovers it through the persisted replay.
+   * misses the frame and recovers it through the persisted replay — provided
+   * the row was persisted. A row whose persistence failed is sent here all the
+   * same, and a client that misses that frame never receives the row.
    */
   broadcastToKinds(
     sessionId: SessionId,
@@ -1052,10 +1554,21 @@ export interface SessionProgressDeps {
   readonly sessions: Pick<SessionsRepo, 'appendProgress'>;
   /** Where finished `session.progress` frames go. */
   readonly broadcaster: ProgressBroadcaster;
-  /** The service logger; defaults to `noopLogger`. Bound to `subsystem: "sessions"`. */
+  /**
+   * The service logger; defaults to `noopLogger`. Wrapped by `guardLogger`, so
+   * a logger that throws from any method or from `child()` never costs a row,
+   * then bound to `subsystem: "sessions"`.
+   */
   readonly logger?: Logger;
   /** The clock rows and frames are stamped with; defaults to `nowEpochMs`. */
   readonly now?: () => number;
+  /**
+   * Mints the diagnostic reference of one stage failure — shown in its row's
+   * detail and carried by its two log records; defaults to `newMessageId`. A
+   * generator that throws, or answers anything but a short identifier-like
+   * token, is replaced by `newMessageId` for that failure.
+   */
+  readonly newRef?: () => string;
 }
 
 /**
@@ -1071,8 +1584,10 @@ export interface SessionProgressDeps {
  * - **A row the store cannot persist, or the transport cannot deliver, is a
  *   degraded success**: progress is advisory, so the failure is logged at `warn`
  *   and the method still returns `ok`. Persistence precedes the broadcast, so
- *   a replayed session is never missing a row a client already saw; a
- *   persistence failure does not withhold the live row either.
+ *   every row that was persisted is in the log before any client sees it and
+ *   replays with the session. A persistence failure does not withhold the live
+ *   row — it is still broadcast, best effort — but that row is absent from the
+ *   log, so a replayed session lacks it even though a connected client saw it.
  *
  * None of these methods changes a session's status (see the module overview).
  */
@@ -1107,14 +1622,47 @@ export interface SessionProgress {
   ): Result<SessionProgressPayload, DebuggenError>;
 
   /**
-   * The `failed` row of the failing stage: its stage, its message, and its hint
-   * with its error code as the detail.
+   * The `failed` row of the failing stage, projected onto public text.
    *
    * This row is how the failing stage reaches both user interfaces: protocol's
    * `SessionRecord` has no failure field, so the persisted `failed` progress row,
    * together with the `error` / `instrumentation.failed` message the caller
    * sends, is the carrier (AAP §0.5.5). `./manager.ts` emits it as part of every
-   * transition into `failed`.
+   * transition into `failed`, which makes this method the single point every
+   * stage failure — of any stage, the orchestrator, the manager or a route —
+   * reaches a client through. The projection is therefore applied here, once:
+   *
+   * - **message** — `publicFailureCopy(failure.stage, failure.code).message`,
+   *   e.g. `Generating debugging panel failed: Model provider unavailable
+   *   (MODEL_UNAVAILABLE).` Never `failure.message`, which `DebuggenError.from`
+   *   may have copied from an arbitrary exception quoting a path, a statement,
+   *   a URL or a credential (CWE-209).
+   * - **detail** — the failure's own hint when {@link isProductAuthoredText}
+   *   proves it product text (a sentence of {@link FAILURE_COPY_BY_CODE}, or
+   *   one a product builder registered through {@link authorProductText} when
+   *   it composed it — such as the exact dev-server relaunch command AAP §0.5.5
+   *   requires), else the code's default hint; then
+   *   `(error code: ‹code›, ref: ‹ref›)`. Provenance is judged on the raw
+   *   hint, before any display normalisation. A hint `DebuggenError.from`
+   *   salvaged, or an adapter or dependency supplied, is never proven and is
+   *   never shown. A code outside the closed vocabulary is shown, and worded,
+   *   as `INTERNAL`.
+   * - **ref** — one fresh diagnostic reference per call, from `deps.newRef`.
+   *
+   * The failure is logged locally twice under the same session, stage, code
+   * and reference, so a developer can match the row to its diagnostic, and in
+   * no other field than the error field:
+   *
+   * - at `warn`, {@link STAGE_FAILURE_LOG_MESSAGE}, whose error carries the
+   *   code, the message (which the serializer withholds at that level) and
+   *   the hint only when it was proven;
+   * - at `debug`, {@link STAGE_FAILURE_DIAGNOSTIC_MESSAGE}, whose error carries
+   *   the failure's own message and hint, emitted redacted by the service's
+   *   error serializer when `debug` is enabled.
+   *
+   * Both go through the guarded logger, so neither can cost the row.
+   *
+   * @returns The payload as sent, or `Err` when the schema rejected the row.
    */
   stageFailed(
     sessionId: SessionId,
@@ -1152,8 +1700,20 @@ export interface SessionProgress {
   ): Result<readonly SessionProgressPayload[], DebuggenError>;
 
   /**
-   * The instrumentation stage's closing `done` row,
-   * {@link READY_TO_CAPTURE_MESSAGE}. Emitted once readiness is satisfied.
+   * Closes the instrumentation stage once readiness is satisfied, in two rows:
+   * first the stage's title row as `done` — exactly what
+   * {@link SessionProgress.stageCompleted} emits for `instrument`, settling the
+   * group header its `running` row opened — then
+   * {@link READY_TO_CAPTURE_MESSAGE}, which stays the stage's last row.
+   *
+   * This is the instrument stage's only closing call: a caller does not also
+   * call `stageCompleted` for it. The Ready row is emitted even when the header
+   * row was rejected, because the developer's next step depends on it; that
+   * rejection is logged by {@link SessionProgress.emit} and does not fail this
+   * call.
+   *
+   * @returns The Ready row's payload as sent, or `Err` when the schema rejected
+   * the Ready row.
    */
   readyToCapture(sessionId: SessionId): Result<SessionProgressPayload, DebuggenError>;
 }
@@ -1171,18 +1731,101 @@ function stageLine(stage: ProgressStage, message: string | undefined): string {
 }
 
 /**
- * The detail of a stage-failure row: the developer's next step first, then the
- * error code a report or a log search can be matched on.
+ * A failure's code as its row may name it: the code itself when it is in the
+ * closed `DEBUGGEN_ERROR_CODES` vocabulary, {@link UNKNOWN_FAILURE_CODE}
+ * otherwise — the same fallback {@link publicFailureCopy} words it with, so a
+ * row's message and its detail always agree on the code.
  */
-function failureDetail(failure: SessionFailure): string {
-  const hint = toDisplayText(failure.hint, MAX_DETAIL_TEXT_LENGTH);
-  const code = toDisplayText(failure.code, MAX_FINDING_TEXT_LENGTH);
+function publicCodeOf(code: unknown): DebuggenErrorCode {
+  return DEBUGGEN_ERROR_CODES.find((known) => known === code) ?? UNKNOWN_FAILURE_CODE;
+}
 
-  if (code.length === 0) {
-    return hint;
-  }
+/** The public text of one stage failure: exactly what its `failed` row shows. */
+interface ProjectedFailure {
+  /** The code the row names, from the closed vocabulary. */
+  readonly code: DebuggenErrorCode;
+  /**
+   * Whose next step the detail shows: the failure's own hint, which is then
+   * proven product text, or the code's default.
+   */
+  readonly hintSource: 'failure' | 'code';
+  /** `‹stage title› failed: ‹summary›`, from {@link publicFailureCopy}. */
+  readonly message: string;
+  /** The next step, then `(error code: ‹code›, ref: ‹ref›)`. */
+  readonly detail: string;
+}
 
-  return hint.length === 0 ? `Error code: ${code}` : `${hint} (error code: ${code})`;
+/**
+ * Projects a stage failure onto the text its `failed` row may carry (see
+ * {@link SessionProgress.stageFailed}).
+ *
+ * Pure apart from refreshing the provenance registry's recency.
+ * `failure.message` is not read: the row's message is the fixed copy of the
+ * failure's stage and code. The hint is the failure's own only when
+ * {@link isProductAuthoredText} proves the raw value product text — the
+ * stage's recovery step as a product builder composed it (a relaunch command,
+ * a reload request) — and the code's default hint otherwise, however
+ * plausible an unproven hint reads: a hint salvaged from an exception or
+ * propagated from an adapter can quote a path, a statement or a URL. The
+ * proof is taken on the raw value before any normalisation, because the
+ * registry proves exact text and a normalised string is not what was
+ * registered. The hint shown is clipped so that it and the suffix fit the
+ * detail bound together, and the suffix — code and reference — is never the
+ * part cut.
+ *
+ * @param failure The failure being filed.
+ * @param ref The diagnostic reference minted for it.
+ * @returns The row's code, message and detail.
+ */
+function projectFailure(failure: SessionFailure, ref: string): ProjectedFailure {
+  const code = publicCodeOf(failure.code);
+  const copy = publicFailureCopy(failure.stage, code);
+  const suffix = `(error code: ${code}, ref: ${ref})`;
+  const hintBound = Math.max(0, MAX_DETAIL_TEXT_LENGTH - suffix.length - 1);
+  const stated = isProductAuthoredText(failure.hint) ? toDisplayText(failure.hint, hintBound) : '';
+  const hint = stated.length > 0 ? stated : toDisplayText(copy.hint, hintBound);
+
+  return {
+    code,
+    hintSource: stated.length > 0 ? 'failure' : 'code',
+    message: toDisplayText(copy.message, MAX_MESSAGE_TEXT_LENGTH),
+    detail: hint.length > 0 ? `${hint} ${suffix}` : suffix,
+  };
+}
+
+/**
+ * The failure as the error of one of its local log records: its closed code
+ * and its own message, verbatim, and its hint when `withHint` admits it — the
+ * only place those words go.
+ *
+ * The service's error serializer emits a `DebuggenError`'s message and hint
+ * only in records written at `debug`/`trace`, redacted, and at every other
+ * level keeps only its closed code and content-free details. The `warn` record
+ * still passes `withHint` only for a hint {@link isProductAuthoredText} proved
+ * — so the record holds no unproven text even under a logger that serializes
+ * errors differently — and the `debug` diagnostic passes it always: an
+ * unproven hint is treated as the free text it may be, exactly like the
+ * message.
+ *
+ * A fresh `DebuggenError` rather than the value the caller caught, which is
+ * not part of a `SessionFailure`; a message or hint of the wrong type at run
+ * time is dropped rather than coerced, so no foreign `toString` is invoked.
+ *
+ * @param failure The failure being logged.
+ * @param code The code its row names.
+ * @param withHint Whether the failure's hint belongs in this record.
+ * @returns The error for the record's {@link LOG_ERROR_FIELD_KEY} field.
+ */
+function failureDiagnostic(
+  failure: SessionFailure,
+  code: DebuggenErrorCode,
+  withHint: boolean,
+): DebuggenError {
+  const message = typeof failure.message === 'string' ? failure.message : '';
+
+  return withHint && typeof failure.hint === 'string'
+    ? new DebuggenError(code, message, { hint: failure.hint })
+    : new DebuggenError(code, message);
 }
 
 /**
@@ -1203,13 +1846,23 @@ function failureDetail(failure: SessionFailure): string {
 export function createSessionProgress(deps: SessionProgressDeps): SessionProgress {
   const { sessions, broadcaster } = deps;
   const clock = deps.now ?? nowEpochMs;
-  const log = subsystemLogger(deps.logger ?? noopLogger, LOG_SUBSYSTEM);
+  // Guarded before the child is derived, so neither the child's creation nor
+  // any later call can throw: `emit` logs a persistence failure *before* it
+  // broadcasts, and a throwing destination there would otherwise cost every
+  // connected client the live row as well as the replay.
+  const log = subsystemLogger(guardLogger(deps.logger ?? noopLogger), LOG_SUBSYSTEM);
 
   /**
    * One timestamp per row, shared by the stored line and the frame so a replay
    * carries the same time a live client saw. A clock that throws or answers
    * something other than a positive finite number is replaced by the wall
    * clock rather than allowed to fail the row.
+   *
+   * The replacement is a deliberate best-effort decision: an injected clock is
+   * a test seam, and its failure must not cost the developer a progress row.
+   * A throwing clock is recorded at `debug` by its closed exception class only
+   * — never its message — so the decision stays visible without the log
+   * becoming a channel for whatever the clock threw.
    */
   function stamp(): number {
     try {
@@ -1218,12 +1871,48 @@ export function createSessionProgress(deps: SessionProgressDeps): SessionProgres
       if (Number.isFinite(value) && value > 0) {
         return value;
       }
-    } catch {
-      // Fall through to the wall clock: an injected clock is a test seam, and
-      // its failure must not cost the developer a progress row.
+    } catch (thrown) {
+      log.debug('the injected progress clock failed; the row is stamped with the wall clock', {
+        ...describeException(thrown),
+      });
     }
 
     return nowEpochMs();
+  }
+
+  /**
+   * The diagnostic reference of one stage failure: the injected generator's
+   * answer when it is a short identifier-like token, a fresh message id
+   * otherwise. Either replacement is logged at `debug` and never fails the row.
+   */
+  function diagnosticRef(): string {
+    const generate = deps.newRef;
+
+    if (generate === undefined) {
+      return newMessageId();
+    }
+
+    let candidate: unknown;
+
+    try {
+      candidate = generate();
+    } catch (thrown) {
+      log.debug('the injected diagnostic-reference generator failed; a message id is used', {
+        ...describeException(thrown),
+      });
+
+      return newMessageId();
+    }
+
+    if (typeof candidate === 'string' && DIAGNOSTIC_REF_PATTERN.test(candidate)) {
+      return candidate;
+    }
+
+    log.debug('the injected diagnostic-reference generator answered an unusable reference', {
+      referenceType: typeof candidate,
+    });
+
+    return newMessageId();
   }
 
   function emit(
@@ -1337,10 +2026,44 @@ export function createSessionProgress(deps: SessionProgressDeps): SessionProgres
     },
 
     stageFailed(sessionId: SessionId, failure: SessionFailure) {
-      const stated = toDisplayText(failure.message, MAX_MESSAGE_TEXT_LENGTH);
-      const message = stated.length > 0 ? stated : `${PROGRESS_STAGE_TITLES[failure.stage]} failed`;
+      const ref = diagnosticRef();
+      const projected = projectFailure(failure, ref);
+      const sent = emit(
+        sessionId,
+        makeRow(failure.stage, 'failed', projected.message, projected.detail),
+      );
 
-      return emit(sessionId, makeRow(failure.stage, 'failed', message, failureDetail(failure)));
+      // The failure's own words — possibly an exception's message, or a hint
+      // an adapter supplied, quoting a path, a statement or a credential —
+      // travel only as the error field of these two local records, under the
+      // reference the row shows. The `warn` record is written at the default
+      // level, so it carries a hint only when the projection proved it; the
+      // `debug` twin carries the message and the hint as the failure stated
+      // them, which the service's serializer emits redacted at that level
+      // alone. Both calls go through the guarded logger and cannot throw.
+      const identity = {
+        [LOG_BINDING_KEYS.sessionId]: sessionId,
+        ...(Object.hasOwn(PROGRESS_STAGE_TITLES, failure.stage) ? { stage: failure.stage } : {}),
+        code: projected.code,
+        ref,
+      };
+
+      log.warn(STAGE_FAILURE_LOG_MESSAGE, {
+        ...identity,
+        hintSource: projected.hintSource,
+        rowSent: sent.ok,
+        [LOG_ERROR_FIELD_KEY]: failureDiagnostic(
+          failure,
+          projected.code,
+          projected.hintSource === 'failure',
+        ),
+      });
+      log.debug(STAGE_FAILURE_DIAGNOSTIC_MESSAGE, {
+        ...identity,
+        [LOG_ERROR_FIELD_KEY]: failureDiagnostic(failure, projected.code, true),
+      });
+
+      return sent;
     },
 
     finding(sessionId: SessionId, stage: ProgressStage, message: string, detail?: string) {
@@ -1364,6 +2087,11 @@ export function createSessionProgress(deps: SessionProgressDeps): SessionProgres
     },
 
     readyToCapture(sessionId: SessionId) {
+      // Settle the stage's group header first, so the Ready row stays the
+      // stage's last. Its result is deliberately not returned: `emit` has
+      // already logged a rejection, and the Ready row is sent regardless.
+      emit(sessionId, makeRow('instrument', 'done', PROGRESS_STAGE_TITLES.instrument));
+
       return emit(sessionId, makeRow('instrument', 'done', READY_TO_CAPTURE_MESSAGE));
     },
   } satisfies SessionProgress);

@@ -27,10 +27,17 @@
  *    view moved while a stale row stayed, or the reverse — is caught by the
  *    disagreement.
  *
- * `target.request` has no service producer (the harness uses a client-sent one
- * only as its ordering barrier), so the bound-tab routing is asserted through
- * `agent.config` and the session fan-out, which resolve their recipient through
- * the same binding.
+ * The bound-tab routing is asserted through `agent.config`, the session fan-out
+ * and `target.request`, which all resolve their recipient through the same
+ * binding. `target.request` is produced by the editor's real
+ * `POST /sessions/:id/target/request`, which the replacement test calls to
+ * prove the request follows the binding to the replacing tab (the harness's
+ * client-sent `target.request` is only its ordering barrier, refused like any
+ * spoofed service push). A `target.selected` is judged against the bound
+ * tab's *current document* as well as its credential: the navigation suite
+ * proves a stale selection, a foreign origin and its near misses refused with
+ * the session's target untouched, and a query or fragment variant of the
+ * current document accepted.
  *
  * ## Fixtures and state
  *
@@ -86,16 +93,20 @@ import {
   createAnalysisResult,
   errorCodeSchema,
   isMessageOfType,
+  progressStageSchema,
   sessionBindPayloadSchema,
   sessionBoundPayloadSchema,
   sessionUnbindPayloadSchema,
   tabNavigatedPayloadSchema,
+  targetRequestPayloadSchema,
   targetSelectedPayloadSchema,
 } from '@debuggen/protocol';
 import type {
   AgentConfigPayload,
   AnalysisResult,
+  CreateEnvelopeOptions,
   ErrorPayload,
+  HttpOperationId,
   MessagePayload,
   MessageType,
   PanelSpec,
@@ -106,11 +117,13 @@ import type {
 } from '@debuggen/protocol';
 import { isErr, newPanelId, newSessionId } from '@debuggen/shared';
 import type { CaptureId, DebuggenError, Result, SessionId } from '@debuggen/shared';
-import { computeCaptureSummary } from '@debuggen/telemetry';
+import { REDACTION_MARKER, computeCaptureSummary, scrub } from '@debuggen/telemetry';
 
+import { redactSelectedTarget } from '../../src/server/routes/binding.js';
 import { REPLAY_MESSAGE_ORDER } from '../../src/sessions/reopen.js';
 import type { ProgressEntry, TabBinding } from '../../src/store/sessions-repo.js';
 import {
+  randomSecretLike,
   readFixtureJson,
   readTelemetryBatch,
   startHarness,
@@ -152,6 +165,15 @@ const [
 
 /** Two of protocol's progress statuses, for the stored history of the replayed session. */
 const [PROGRESS_RUNNING, PROGRESS_DONE] = PROGRESS_STATUSES;
+
+/** The stage a reload during capture is reported under, from protocol's stage vocabulary. */
+const PROGRESS_CAPTURE = progressStageSchema.enum.capture;
+
+/**
+ * The developer-facing entry AAP §0.5.5 prescribes for an application that
+ * reloads while a capture is open.
+ */
+const RELOAD_NOTICE = 'Page reloaded during capture';
 
 /** Protocol's closed error-code vocabulary, keyed by code. */
 const CODES = errorCodeSchema.enum;
@@ -197,7 +219,16 @@ const SESSION_BOUND = messageTypeOf(sessionBoundPayloadSchema);
 const TAB_NAVIGATED = messageTypeOf(tabNavigatedPayloadSchema);
 const SESSION_UNBIND = messageTypeOf(sessionUnbindPayloadSchema);
 const AGENT_CONFIG = messageTypeOf(agentConfigPayloadSchema);
+const TARGET_REQUEST = messageTypeOf(targetRequestPayloadSchema);
 const TARGET_SELECTED = messageTypeOf(targetSelectedPayloadSchema);
+
+/**
+ * The editor's HTTP operation that makes the service push {@link TARGET_REQUEST}
+ * to a session's bound tab. Protocol names the HTTP leg after the push it
+ * produces, so it is derived from the message rather than spelled, and
+ * `satisfies` proves the name is also an operation of the route table.
+ */
+const TARGET_REQUEST_OPERATION = TARGET_REQUEST satisfies HttpOperationId;
 
 /**
  * The page-agent signals the capturing session's plan asks for: browser-tier
@@ -316,6 +347,14 @@ function targetOn(url: string): SelectedTarget {
   };
 }
 
+/**
+ * {@link targetOn} with a selector naming `probe`, so the session record shows
+ * which of several selections it holds.
+ */
+function probeTarget(url: string, probe: string): SelectedTarget {
+  return { ...targetOn(url), selector: `main > section > button[data-probe="${probe}"]` };
+}
+
 /** A DevTools connection for one inspected tab, with a fresh or a given credential. */
 function openPanel(tabId: number, credential?: DevtoolsCredential): Promise<DevtoolsConnection> {
   return service().connectDevtools({ tabId, credential });
@@ -377,6 +416,80 @@ function rowsFor(filter: { readonly tabId?: number; readonly sessionId?: string 
   );
 }
 
+/** The stored `sessions.record` document of one session, as the raw JSON text the row holds. */
+function storedRecordJson(sessionId: SessionId): string {
+  const row = service().store.statement('SELECT record FROM sessions WHERE id = ?').get(sessionId);
+  const record = row?.['record'];
+  if (typeof record !== 'string') {
+    throw new Error(`Session ${sessionId} has no stored record document.`);
+  }
+  return record;
+}
+
+/**
+ * The stored `sessions.record` document and every `bindings` row as raw text —
+ * the view in which a value the service was meant to redact would show up
+ * whichever column or field it leaked into.
+ */
+function storedText(sessionId: SessionId): string {
+  return `${storedRecordJson(sessionId)}\n${JSON.stringify(bindingRows())}`;
+}
+
+/** How many record-write failures this file has injected, for unique trigger names. */
+let injectedFailures = 0;
+
+/** The shape of every session id the service mints, checked before one is spelled into DDL. */
+const INJECTABLE_ID = /^[A-Za-z0-9_-]+$/u;
+
+/**
+ * Runs `body` while every update of one session's row is refused by a
+ * temporary trigger on the service's own store connection — a real failure of
+ * the session manager's record write (its upsert takes the `UPDATE` path for
+ * an existing session), not a stub. The trigger is dropped whatever `body`
+ * does, so no later test inherits it.
+ */
+async function withRecordWritesRefused<T>(
+  sessionId: SessionId,
+  body: () => Promise<T>,
+): Promise<T> {
+  if (!INJECTABLE_ID.test(sessionId)) {
+    throw new Error('A session id with unexpected characters cannot be named in a trigger.');
+  }
+  injectedFailures += 1;
+  const trigger = `binding_suite_refuse_${String(injectedFailures)}`;
+  const { db } = service().store;
+  db.exec(
+    `CREATE TEMP TRIGGER ${trigger} BEFORE UPDATE ON sessions WHEN OLD.id = '${sessionId}'
+     BEGIN SELECT RAISE(ABORT, 'injected record write failure'); END`,
+  );
+  try {
+    return await body();
+  } finally {
+    db.exec(`DROP TRIGGER IF EXISTS temp.${trigger}`);
+  }
+}
+
+/**
+ * Asserts the binding route's log since record index `from` shows a clean
+ * compensation: no `error` record (a compensation step that failed), no
+ * displaced binding left without its live half, and no URL of any session's
+ * origin — the route logs ids, reasons and codes only.
+ */
+function expectCleanCompensation(from: number): void {
+  const records = service()
+    .logger.records.slice(from)
+    .filter((record) => record.fields['subsystem'] === 'binding');
+  expect(records.length, 'the refused bind was logged').toBeGreaterThan(0);
+  expect(records.filter((record) => record.level === 'error')).toEqual([]);
+  expect(records.filter((record) => record.message.includes('re-established'))).toEqual([]);
+  const { capturing, created, generated } = suite();
+  for (const record of records) {
+    for (const origin of [capturing.origin, created.origin, generated.origin]) {
+      expect(record.line).not.toContain(origin);
+    }
+  }
+}
+
 /** The id of the session's open capture window, if it has one. */
 function openCaptureId(sessionId: SessionId): string | undefined {
   const active = unwrap(
@@ -431,15 +544,18 @@ interface Settled {
 /**
  * Sends one frame and waits for the harness's ordering barrier behind it, so
  * the service has finished handling the frame — and every frame the handling
- * pushed to this connection has arrived — before anything is read.
+ * pushed to this connection has arrived — before anything is read. `options`
+ * sets envelope fields, such as the acting `tabId` a multiplexing DevTools
+ * connection names on every frame it sends for a tab.
  */
 async function sendSettled<K extends MessageType>(
   client: HarnessWsClient,
   type: K,
   payload: MessagePayload<K>,
+  options?: CreateEnvelopeOptions,
 ): Promise<Settled> {
   const mark = client.received.length;
-  const receipt = client.send(type, payload);
+  const receipt = client.send(type, payload, options);
   if (isErr(receipt.result)) {
     throw new Error(`${type} could not be sent: ${receipt.result.error.message}`);
   }
@@ -468,6 +584,19 @@ function bind(client: HarnessWsClient, request: BindRequest): Promise<Settled> {
     ...(request.sessionId === undefined ? {} : { sessionId: request.sessionId }),
   });
   return sendSettled(client, SESSION_BIND, payload);
+}
+
+/** Sends a schema-valid `target.selected` of `target` for `sessionId` and settles it. */
+function select(
+  client: HarnessWsClient,
+  sessionId: SessionId,
+  target: SelectedTarget,
+): Promise<Settled> {
+  return sendSettled(
+    client,
+    TARGET_SELECTED,
+    targetSelectedPayloadSchema.parse({ sessionId, target }),
+  );
 }
 
 /**
@@ -507,6 +636,14 @@ function expectRefused(settled: Settled, code: ErrorPayload['code']): ErrorPaylo
   expect(refusal).toMatchObject({ code, ref: settled.id });
   expect(refusal.message.trim().length).toBeGreaterThan(0);
   return refusal;
+}
+
+/** Asserts a refusal quotes nothing of the page it refused: neither its host nor its path. */
+function expectNoUrlIn(refusal: ErrorPayload, url: string): void {
+  const { host, pathname } = new URL(url);
+  const text = JSON.stringify(refusal);
+  expect(text).not.toContain(host);
+  expect(text).not.toContain(pathname);
 }
 
 /**
@@ -996,10 +1133,11 @@ describe(SESSION_BIND, () => {
       ),
       CODES.TAB_NOT_BOUND,
     );
-    // Nor can it claim the session by naming it from a page of another origin.
+    // Nor can it claim the session by naming it from a page of another origin —
+    // for its own hello's tab, so the origin rule is what refuses it.
     expectRefused(
       await bind(intruder.client, {
-        tabId: freshTab(),
+        tabId,
         url: pageOf(capturing, '/reports'),
         sessionId: created.sessionId,
       }),
@@ -1013,16 +1151,29 @@ describe(SESSION_BIND, () => {
     expectRefused(editorBind, CODES.UNAUTHORIZED);
     expect(bindingRows()).toEqual(rowsBefore);
 
-    // Authority is the credential: a second connection of the owner's credential,
-    // announcing a different tab in its hello, acts on the session without binding.
+    // The owner's credential alone is not authority: it is shared by every tab
+    // the paired extension inspects. A second connection of that credential
+    // announcing another tab in its hello acts for that tab only, so it may not
+    // act on the session — not by default, and not by naming the bound tab on
+    // the frame against its own hello.
     const sibling = await openPanel(freshTab(), owner.credential);
-    const ownerMark = owner.client.received.length;
     const target = targetOn(url);
-    const selected = await sendSettled(
-      sibling.client,
-      TARGET_SELECTED,
-      targetSelectedPayloadSchema.parse({ sessionId: created.sessionId, target }),
+    const selection = targetSelectedPayloadSchema.parse({ sessionId: created.sessionId, target });
+    expectRefused(
+      await sendSettled(sibling.client, TARGET_SELECTED, selection),
+      CODES.TAB_NOT_BOUND,
     );
+    expectRefused(
+      await sendSettled(sibling.client, TARGET_SELECTED, selection, { tabId }),
+      CODES.TAB_NOT_BOUND,
+    );
+    expect(recordOf(created.sessionId).target).not.toEqual(target);
+
+    // A connection of the owner's credential for the bound tab itself — the
+    // service worker reconnecting — acts on the session without a re-bind.
+    const reconnected = await openPanel(tabId, owner.credential);
+    const ownerMark = owner.client.received.length;
+    const selected = await sendSettled(reconnected.client, TARGET_SELECTED, selection);
     expect(selected.errors).toEqual([]);
     expect(recordOf(created.sessionId).target).toEqual(target);
 
@@ -1107,6 +1258,29 @@ describe('replacement', () => {
     await waitFor(second.client, REPLAY_SESSION_UPDATED, (_message, index) => index >= secondLater);
     await settleAll(first.client);
     expect(typesSince(first.client, firstLater)).toEqual([]);
+
+    // The editor's element request follows the binding too: the service asks
+    // the replacing tab, names it in the reply, and never asks the displaced one.
+    const firstAsked = first.client.received.length;
+    const secondAsked = second.client.received.length;
+    const asked = unwrap(
+      await service()
+        .http()
+        .request(TARGET_REQUEST_OPERATION, { params: { id: capturing.sessionId }, body: {} }),
+      'Requesting a target of the bound tab',
+    );
+    expect(asked).toEqual({ sessionId: capturing.sessionId, tabId: secondTab });
+    const request = await waitFor(
+      second.client,
+      TARGET_REQUEST,
+      (_message, index) => index >= secondAsked,
+    );
+    expect(targetRequestPayloadSchema.parse(request.payload)).toEqual({
+      sessionId: capturing.sessionId,
+    });
+    await settleAll(first.client, second.client);
+    expect(framesSince(second.client, TARGET_REQUEST, secondAsked)).toHaveLength(1);
+    expect(typesSince(first.client, firstAsked)).toEqual([]);
 
     // And the displaced panel may no longer act on the session.
     expectRefused(
@@ -1205,6 +1379,376 @@ describe('replacement', () => {
     ]);
     expect(recordOf(created.sessionId).boundTab).toEqual({ tabId, url });
   });
+
+  it('refuses a replacement whose record mirror fails, restores the displaced binding everywhere and announces nothing', async () => {
+    const { capturing } = suite();
+    const firstTab = freshTab();
+    const secondTab = freshTab();
+    const first = await openPanel(firstTab);
+    const second = await openPanel(secondTab);
+    const firstUrl = pageOf(capturing, '/reports');
+
+    const firstBind = await bind(first.client, { tabId: firstTab, url: firstUrl });
+    expectEstablished(first.client, firstBind, capturing.sessionId, firstTab);
+    await waitForArming(first.client, capturing, firstBind.mark);
+    const rowsBefore = bindingRows();
+    const storedBefore = storedBindingOfTab(firstTab);
+    expect(recordOf(capturing.sessionId).boundTab).toEqual({ tabId: firstTab, url: firstUrl });
+    const firstMark = first.client.received.length;
+    const editorMark = capturing.editor.received.length;
+    const logMark = service().logger.records.length;
+
+    // The second tab's bind reaches the record mirror, which the store refuses.
+    const refused = await withRecordWritesRefused(capturing.sessionId, () =>
+      bind(second.client, { tabId: secondTab, url: pageOf(capturing, '/reports/weekly') }),
+    );
+    expectRefused(refused, CODES.STORE_ERROR);
+    await settleAll(first.client, capturing.editor);
+    expectCleanCompensation(logMark);
+
+    // Nothing was announced: no replacement to the displaced panel or the
+    // editor, no establishment, no re-arm of the refused tab.
+    expect(announcementsSince(first.client, firstMark)).toEqual([]);
+    expect(announcementsSince(capturing.editor, editorMark)).toEqual([]);
+    expect(announcementsSince(second.client, refused.mark)).toEqual([]);
+    expect(framesSince(second.client, AGENT_CONFIG, refused.mark)).toEqual([]);
+
+    // The durable row — its bound-at stamp included — and the record are as they were.
+    expect(bindingRows()).toEqual(rowsBefore);
+    expect(storedBindingOfTab(firstTab)).toEqual(storedBefore);
+    expect(storedBindingOfTab(secondTab)).toBeUndefined();
+    expect(recordOf(capturing.sessionId).boundTab).toEqual({ tabId: firstTab, url: firstUrl });
+
+    // The live routing is the first tab's again: the session fan-out reaches
+    // its connection and not the refused one's …
+    const firstLater = first.client.received.length;
+    const secondLater = second.client.received.length;
+    unwrap(
+      await service().manager.patch(capturing.sessionId, { target: targetOn(firstUrl) }),
+      'Patching the session',
+    );
+    await waitFor(first.client, REPLAY_SESSION_UPDATED, (_message, index) => index >= firstLater);
+    await settleAll(second.client);
+    expect(framesSince(second.client, REPLAY_SESSION_UPDATED, secondLater)).toEqual([]);
+
+    // … and the first tab's credential still owns the binding: its reload is
+    // kept and re-arms the open capture there.
+    const reloaded = await sendSettled(
+      first.client,
+      TAB_NAVIGATED,
+      tabNavigatedPayloadSchema.parse({ tabId: firstTab, url: firstUrl }),
+    );
+    expect(reloaded.errors).toEqual([]);
+    expect(announcementsSince(first.client, reloaded.mark)).toEqual([
+      {
+        sessionId: capturing.sessionId,
+        tabId: firstTab,
+        url: firstUrl,
+        reason: REASON_NAVIGATED,
+      },
+    ]);
+    expectArmedFor(
+      (await waitForArming(first.client, capturing, reloaded.mark)).payload,
+      capturing,
+    );
+  });
+
+  it('refuses moving a tab whose new session’s record fails, and puts the tab back on its first session in the store, the registry and both records', async () => {
+    const { capturing, created } = suite();
+    const tabId = freshTab();
+    const { client } = await openPanel(tabId);
+    const otherTab = freshTab();
+    const other = await openPanel(otherTab);
+    const firstUrl = pageOf(capturing, '/reports');
+    const otherUrl = pageOf(created, '/dashboard');
+
+    expectEstablished(
+      client,
+      await bind(client, { tabId, url: firstUrl }),
+      capturing.sessionId,
+      tabId,
+    );
+    expectEstablished(
+      other.client,
+      await bind(other.client, { tabId: otherTab, url: otherUrl }),
+      created.sessionId,
+      otherTab,
+    );
+    const rowsBefore = bindingRows();
+    const storedBefore = [storedBindingOfTab(tabId), storedBindingOfTab(otherTab)];
+    expect(recordOf(capturing.sessionId).boundTab).toEqual({ tabId, url: firstUrl });
+    expect(recordOf(created.sessionId).boundTab).toEqual({ tabId: otherTab, url: otherUrl });
+    const otherMark = other.client.received.length;
+    const firstEditorMark = capturing.editor.received.length;
+    const secondEditorMark = created.editor.received.length;
+    const logMark = service().logger.records.length;
+
+    // Moving the tab clears the first session's record, then the second
+    // session's record refuses the tab — displacing its own tab along the way.
+    const moved = await withRecordWritesRefused(created.sessionId, () =>
+      bind(client, { tabId, url: pageOf(created, '/orders') }),
+    );
+    expectRefused(moved, CODES.STORE_ERROR);
+    await settleAll(client, other.client, capturing.editor, created.editor);
+    expectCleanCompensation(logMark);
+
+    // Neither side of the move, nor the second session's own tab, heard a thing.
+    expect(announcementsSince(client, moved.mark)).toEqual([]);
+    expect(announcementsSince(other.client, otherMark)).toEqual([]);
+    expect(announcementsSince(capturing.editor, firstEditorMark)).toEqual([]);
+    expect(announcementsSince(created.editor, secondEditorMark)).toEqual([]);
+
+    // Both durable rows are back, stamps included, and the first session's
+    // cleared record shows its tab again.
+    expect(bindingRows()).toEqual(rowsBefore);
+    expect([storedBindingOfTab(tabId), storedBindingOfTab(otherTab)]).toEqual(storedBefore);
+    expect(recordOf(capturing.sessionId).boundTab).toEqual({ tabId, url: firstUrl });
+    expect(recordOf(created.sessionId).boundTab).toEqual({ tabId: otherTab, url: otherUrl });
+
+    // Live: the tab is bound to its first session again — a reload is kept
+    // there and re-arms that session's capture …
+    const reloaded = await sendSettled(
+      client,
+      TAB_NAVIGATED,
+      tabNavigatedPayloadSchema.parse({ tabId, url: firstUrl }),
+    );
+    expect(reloaded.errors).toEqual([]);
+    expect(announcementsSince(client, reloaded.mark)).toEqual([
+      { sessionId: capturing.sessionId, tabId, url: firstUrl, reason: REASON_NAVIGATED },
+    ]);
+    expectArmedFor((await waitForArming(client, capturing, reloaded.mark)).payload, capturing);
+
+    // … and the second session's own tab still carries that session's fan-out.
+    const otherLater = other.client.received.length;
+    unwrap(
+      await service().manager.patch(created.sessionId, { target: targetOn(otherUrl) }),
+      'Patching the second session',
+    );
+    await waitFor(other.client, REPLAY_SESSION_UPDATED, (_message, index) => index >= otherLater);
+  });
+
+  it('refuses a re-bind of the same tab and session at a new URL whose record mirror fails, keeping the existing binding, its URL and its stamp everywhere and announcing nothing', async () => {
+    const { created } = suite();
+    const tabId = freshTab();
+    const { client } = await openPanel(tabId);
+    const firstUrl = pageOf(created, '/orders');
+    const nextUrl = pageOf(created, '/orders/7');
+
+    expectEstablished(
+      client,
+      await bind(client, { tabId, url: firstUrl }),
+      created.sessionId,
+      tabId,
+    );
+    const rowsBefore = bindingRows();
+    const storedBefore = storedBindingOfTab(tabId);
+    expect(storedBefore).toMatchObject({
+      sessionId: created.sessionId,
+      tab: { tabId, url: firstUrl },
+    });
+    expect(recordOf(created.sessionId).boundTab).toEqual({ tabId, url: firstUrl });
+    const editorMark = created.editor.received.length;
+    const logMark = service().logger.records.length;
+
+    // The same credential re-binds the tab to its own session at another page:
+    // neither store reports the existing binding displaced, and the record
+    // mirror of the new URL is refused.
+    const refused = await withRecordWritesRefused(created.sessionId, () =>
+      bind(client, { tabId, url: nextUrl, sessionId: created.sessionId }),
+    );
+    expectRefused(refused, CODES.STORE_ERROR);
+    await settleAll(created.editor);
+    expectCleanCompensation(logMark);
+
+    // No `session.bound` — establishment or replacement — reached the panel or the editor.
+    expect(announcementsSince(client, refused.mark)).toEqual([]);
+    expect(announcementsSince(created.editor, editorMark)).toEqual([]);
+
+    // The durable row keeps its URL and its bound-at stamp, and the record
+    // still shows the tab at its first URL.
+    expect(bindingRows()).toEqual(rowsBefore);
+    expect(storedBindingOfTab(tabId)).toEqual(storedBefore);
+    expect(recordOf(created.sessionId).boundTab).toEqual({ tabId, url: firstUrl });
+
+    // The live binding still names the session: its fan-out reaches the tab.
+    const fanOutMark = client.received.length;
+    unwrap(
+      await service().manager.patch(created.sessionId, { target: targetOn(firstUrl) }),
+      'Patching the session',
+    );
+    await waitFor(client, REPLAY_SESSION_UPDATED, (_message, index) => index >= fanOutMark);
+
+    // It holds the first URL and the first stamp too: a navigation the record
+    // refuses writes the row back from the live binding's own URL and stamp,
+    // so the row reads exactly as it did before the refused re-bind.
+    const probe = await withRecordWritesRefused(created.sessionId, () =>
+      sendSettled(
+        client,
+        TAB_NAVIGATED,
+        tabNavigatedPayloadSchema.parse({ tabId, url: pageOf(created, '/orders/8') }),
+      ),
+    );
+    expectRefused(probe, CODES.STORE_ERROR);
+    expect(storedBindingOfTab(tabId)).toEqual(storedBefore);
+    expect(announcementsSince(client, probe.mark)).toEqual([]);
+
+    // A later navigation and an unbind both work against that binding.
+    const reloaded = await sendSettled(
+      client,
+      TAB_NAVIGATED,
+      tabNavigatedPayloadSchema.parse({ tabId, url: firstUrl }),
+    );
+    expect(reloaded.errors).toEqual([]);
+    expect(announcementsSince(client, reloaded.mark)).toEqual([
+      { sessionId: created.sessionId, tabId, url: firstUrl, reason: REASON_NAVIGATED },
+    ]);
+    expect(storedBindingOfTab(tabId)).toEqual(storedBefore);
+    const unbound = await sendSettled(
+      client,
+      SESSION_UNBIND,
+      sessionUnbindPayloadSchema.parse({ tabId }),
+    );
+    expect(unbound.errors).toEqual([]);
+    expect(announcementsSince(client, unbound.mark)).toEqual([
+      { sessionId: created.sessionId, tabId, url: firstUrl, reason: REASON_UNBOUND },
+    ]);
+    expect(rowsFor({ tabId })).toEqual([]);
+    expect(recordOf(created.sessionId).boundTab).toBeUndefined();
+  });
+
+  it('refuses a re-bind of the same tab and session from a new DevTools connection whose record mirror fails, leaving the binding with the credential that made it', async () => {
+    const { created } = suite();
+    const tabId = freshTab();
+    const first = await openPanel(tabId);
+    const firstUrl = pageOf(created, '/orders');
+
+    expectEstablished(
+      first.client,
+      await bind(first.client, { tabId, url: firstUrl }),
+      created.sessionId,
+      tabId,
+    );
+    const rowsBefore = bindingRows();
+    const storedBefore = storedBindingOfTab(tabId);
+    const second = await openPanel(tabId);
+    const firstMark = first.client.received.length;
+    const editorMark = created.editor.received.length;
+    const logMark = service().logger.records.length;
+
+    // Another credential re-binds the same tab to the same session: the store
+    // reports no displaced row, and the record refuses the new URL.
+    const refused = await withRecordWritesRefused(created.sessionId, () =>
+      bind(second.client, { tabId, url: pageOf(created, '/orders/7') }),
+    );
+    expectRefused(refused, CODES.STORE_ERROR);
+    await settleAll(first.client, created.editor);
+    expectCleanCompensation(logMark);
+
+    // Nobody heard a thing, and the row, its stamp and the record are as they were.
+    expect(announcementsSince(first.client, firstMark)).toEqual([]);
+    expect(announcementsSince(second.client, refused.mark)).toEqual([]);
+    expect(announcementsSince(created.editor, editorMark)).toEqual([]);
+    expect(bindingRows()).toEqual(rowsBefore);
+    expect(storedBindingOfTab(tabId)).toEqual(storedBefore);
+    expect(recordOf(created.sessionId).boundTab).toEqual({ tabId, url: firstUrl });
+
+    // The binding is still the first credential's: the second may not unbind
+    // it, and the first unbinds it at the URL it bound.
+    expectRefused(
+      await sendSettled(second.client, SESSION_UNBIND, sessionUnbindPayloadSchema.parse({ tabId })),
+      CODES.TAB_NOT_BOUND,
+    );
+    const unbound = await sendSettled(
+      first.client,
+      SESSION_UNBIND,
+      sessionUnbindPayloadSchema.parse({ tabId }),
+    );
+    expect(unbound.errors).toEqual([]);
+    expect(announcementsSince(first.client, unbound.mark)).toEqual([
+      { sessionId: created.sessionId, tabId, url: firstUrl, reason: REASON_UNBOUND },
+    ]);
+    expect(rowsFor({ tabId })).toEqual([]);
+  });
+
+  it('tells the tabs of one multiplexing connection apart: each acts for its own binding, a displaced tab for none', async () => {
+    const { created } = suite();
+    const credential = service().issueDevtoolsCredential();
+    // Exactly like the MV3 service worker: one credential, one connection, and
+    // no tab in the hello — every frame names the tab it acts for instead.
+    const mux = await service().ws({
+      client: 'devtools',
+      token: credential.token,
+      origin: credential.origin,
+    });
+    expect(mux.authenticated, mux.describe()).toBe(true);
+    expect(mux.identity.tabId).toBeUndefined();
+    const firstTab = freshTab();
+    const secondTab = freshTab();
+    const firstUrl = pageOf(created, '/orders');
+    const secondUrl = pageOf(created, '/orders/7');
+
+    /** A `target.selected` for the session, acting for `tab` (none when `undefined`). */
+    const select = (tab: number | undefined, url: string): Promise<Settled> =>
+      sendSettled(
+        mux,
+        TARGET_SELECTED,
+        targetSelectedPayloadSchema.parse({
+          sessionId: created.sessionId,
+          target: targetOn(url),
+        }),
+        tab === undefined ? undefined : { tabId: tab },
+      );
+
+    // A binding frame is authorized for the tab its own payload names.
+    expectEstablished(
+      mux,
+      await bind(mux, { tabId: firstTab, url: firstUrl, sessionId: created.sessionId }),
+      created.sessionId,
+      firstTab,
+    );
+    expect((await select(firstTab, firstUrl)).errors).toEqual([]);
+    // The credential's other tab, and a frame that names no tab, may not act on it.
+    expectRefused(await select(secondTab, firstUrl), CODES.TAB_NOT_BOUND);
+    expectRefused(await select(undefined, firstUrl), CODES.TAB_NOT_BOUND);
+
+    // The second tab of the same credential takes the session over …
+    expectEstablished(
+      mux,
+      await bind(mux, { tabId: secondTab, url: secondUrl, sessionId: created.sessionId }),
+      created.sessionId,
+      secondTab,
+    );
+    expect(storedBindingOfSession(created.sessionId)?.tab).toEqual({
+      tabId: secondTab,
+      url: secondUrl,
+    });
+
+    // … after which the displaced tab may no longer act on it, and the new one may.
+    expectRefused(await select(firstTab, firstUrl), CODES.TAB_NOT_BOUND);
+    const target = targetOn(secondUrl);
+    expect((await select(secondTab, secondUrl)).errors).toEqual([]);
+    expect(recordOf(created.sessionId).target).toEqual(target);
+
+    // Binding frames keep naming their own tab: a navigation of the displaced
+    // tab touches nothing, and unbinding the bound tab drops the binding.
+    const navigated = await sendSettled(
+      mux,
+      TAB_NAVIGATED,
+      tabNavigatedPayloadSchema.parse({ tabId: firstTab, url: firstUrl }),
+      { tabId: firstTab },
+    );
+    expect(navigated.errors).toEqual([]);
+    expect(storedBindingOfSession(created.sessionId)?.tab.tabId).toBe(secondTab);
+    const unbound = await sendSettled(
+      mux,
+      SESSION_UNBIND,
+      sessionUnbindPayloadSchema.parse({ tabId: secondTab }),
+      { tabId: secondTab },
+    );
+    expect(unbound.errors).toEqual([]);
+    expect(storedBindingOfSession(created.sessionId)).toBeUndefined();
+    expectRefused(await select(secondTab, secondUrl), CODES.TAB_NOT_BOUND);
+  });
 });
 
 /* -------------------------------------------------------------------------------------------------
@@ -1275,6 +1819,238 @@ describe(TAB_NAVIGATED, () => {
       sessionId: capturing.sessionId,
       captureId: capturing.captureId,
     });
+  });
+
+  it('refuses a target.selected of the document the tab navigated away from, and accepts a query or fragment variant of the current one', async () => {
+    const { capturing } = suite();
+    const tabId = freshTab();
+    const { client } = await openPanel(tabId);
+    const firstUrl = pageOf(capturing, '/reports');
+    const nextUrl = pageOf(capturing, '/reports/weekly');
+    expectEstablished(
+      client,
+      await bind(client, { tabId, url: firstUrl }),
+      capturing.sessionId,
+      tabId,
+    );
+
+    // A selection of the document the tab shows is accepted, so the refusal
+    // below is about the document and not about the sender.
+    const current = probeTarget(firstUrl, 'current');
+    expect((await select(client, capturing.sessionId, current)).errors).toEqual([]);
+    expect(recordOf(capturing.sessionId).target).toEqual(current);
+
+    // A same-origin navigation keeps the binding and moves its URL on …
+    const navigated = await sendSettled(
+      client,
+      TAB_NAVIGATED,
+      tabNavigatedPayloadSchema.parse({ tabId, url: nextUrl }),
+    );
+    expect(navigated.errors).toEqual([]);
+    expect(storedBindingOfTab(tabId)?.tab.url).toBe(nextUrl);
+    await settleAll(capturing.editor, client);
+    const editorMark = capturing.editor.received.length;
+
+    // … so a selection still made in the document the tab left is stale: refused
+    // with the frame's id as `ref`, in words that quote no URL, and never recorded.
+    const stale = await select(client, capturing.sessionId, probeTarget(firstUrl, 'stale'));
+    const refusal = expectRefused(stale, CODES.TAB_NOT_BOUND);
+    expectNoUrlIn(refusal, firstUrl);
+    expect(recordOf(capturing.sessionId).target).toEqual(current);
+    await settleAll(capturing.editor);
+    expect(framesSince(capturing.editor, REPLAY_SESSION_UPDATED, editorMark)).toEqual([]);
+
+    // The current document with another query string and a fragment is the same
+    // document: accepted, and announced as the session's target — in the form
+    // every stored descriptor takes, its query values and fragment masked.
+    const variant = probeTarget(`${nextUrl}?range=week&page=2#totals`, 'variant');
+    const recorded = redactSelectedTarget(variant);
+    expect(recorded.url).toBe(`${nextUrl}?range=?&page=?#?`);
+    const accepted = await select(client, capturing.sessionId, variant);
+    expect(accepted.errors).toEqual([]);
+    await waitFor(
+      client,
+      REPLAY_SESSION_UPDATED,
+      (message, index) =>
+        index >= accepted.mark && isDeepStrictEqual(message.payload.session.target, recorded),
+    );
+    expect(recordOf(capturing.sessionId).target).toEqual(recorded);
+  });
+
+  it('refuses a target.selected that names another origin than the bound tab’s, near misses included', async () => {
+    const { capturing, created } = suite();
+    const tabId = freshTab();
+    const { client } = await openPanel(tabId);
+    const url = pageOf(capturing, '/reports');
+    expectEstablished(client, await bind(client, { tabId, url }), capturing.sessionId, tabId);
+    const current = probeTarget(url, 'origin-baseline');
+    expect((await select(client, capturing.sessionId, current)).errors).toEqual([]);
+    await settleAll(client);
+    const mark = client.received.length;
+
+    // Another session's dev server on the same path, then every near-miss origin.
+    const foreign = [
+      { label: 'another session’s dev server', page: pageOf(created, '/reports') },
+      ...NEAR_MISSES.map((nearMiss) => ({
+        label: nearMiss.label,
+        page: nearMiss.page(capturing, takenPorts()),
+      })),
+    ];
+    for (const { label, page } of foreign) {
+      expect(new URL(page).origin, label).not.toBe(capturing.origin);
+      const forged = await select(client, capturing.sessionId, probeTarget(page, 'forged'));
+      expectNoUrlIn(expectRefused(forged, CODES.TAB_NOT_BOUND), page);
+      expect(recordOf(capturing.sessionId).target, label).toEqual(current);
+    }
+
+    // Nothing reached the session: no update, and the binding is where it was.
+    await settleAll(client);
+    expect(framesSince(client, REPLAY_SESSION_UPDATED, mark)).toEqual([]);
+    expect(storedBindingOfTab(tabId)).toMatchObject({
+      sessionId: capturing.sessionId,
+      tab: { tabId, url },
+    });
+    expect(client.authenticated).toBe(true);
+  });
+
+  it('reports each reload during an open capture exactly once, as a stored capture-stage progress row the panel and the editor both receive', async () => {
+    const { capturing } = suite();
+    const tabId = freshTab();
+    const { client } = await openPanel(tabId);
+    const url = pageOf(capturing, '/reports?range=week');
+    const progressBefore = progressOf(capturing.sessionId);
+
+    // Binding a tab, and re-binding it redundantly, is not a reload: neither
+    // stores a progress row, though both re-arm the open capture.
+    const bound = await bind(client, { tabId, url });
+    expectEstablished(client, bound, capturing.sessionId, tabId);
+    await waitForArming(client, capturing, bound.mark);
+    const again = await bind(client, { tabId, url });
+    expectEstablished(client, again, capturing.sessionId, tabId);
+    await waitForArming(client, capturing, again.mark);
+    expect(progressOf(capturing.sessionId)).toEqual(progressBefore);
+
+    const expectedRow = {
+      stage: PROGRESS_CAPTURE,
+      status: PROGRESS_DONE,
+      message: RELOAD_NOTICE,
+    };
+
+    for (const [count, next] of [
+      [1, url],
+      [2, pageOf(capturing, '/reports/weekly?range=month')],
+    ] as const) {
+      const panelMark = client.received.length;
+      const editorMark = capturing.editor.received.length;
+      const navigated = await sendSettled(
+        client,
+        TAB_NAVIGATED,
+        tabNavigatedPayloadSchema.parse({ tabId, url: next }),
+      );
+      expect(navigated.errors).toEqual([]);
+      await waitForArming(client, capturing, panelMark);
+      await settleAll(capturing.editor);
+
+      // One stored row per navigation, appended after everything before it.
+      const added = progressOf(capturing.sessionId).slice(progressBefore.length);
+      expect(added, `after navigation ${String(count)}`).toHaveLength(count);
+      const row = added.at(-1);
+      expect(row).toMatchObject({ sessionId: capturing.sessionId, ...expectedRow });
+      expect(typeof row?.detail).toBe('string');
+
+      // Exactly one frame per navigation, to the bound panel and to the editor.
+      for (const [receiver, from] of [
+        [client, panelMark],
+        [capturing.editor, editorMark],
+      ] as const) {
+        const frames = framesSince(receiver, REPLAY_SESSION_PROGRESS, from);
+        expect(frames, receiver.describe()).toHaveLength(1);
+        expect(frames[0]?.payload).toMatchObject({
+          sessionId: capturing.sessionId,
+          ...expectedRow,
+        });
+        expect(frames[0]?.payload.detail).toBe(row?.detail);
+      }
+
+      // The notice says whether the agent resumed; it carries no URL.
+      expect(JSON.stringify(row)).not.toContain(capturing.origin);
+      expect(JSON.stringify(row)).not.toContain('range=');
+    }
+  });
+
+  it('reports no reload for a navigation of a session without an open capture', async () => {
+    const { created } = suite();
+    const tabId = freshTab();
+    const { client } = await openPanel(tabId);
+    expectEstablished(
+      client,
+      await bind(client, { tabId, url: pageOf(created, '/orders') }),
+      created.sessionId,
+      tabId,
+    );
+    const progressBefore = progressOf(created.sessionId);
+    const panelMark = client.received.length;
+    const editorMark = created.editor.received.length;
+
+    const navigated = await sendSettled(
+      client,
+      TAB_NAVIGATED,
+      tabNavigatedPayloadSchema.parse({ tabId, url: pageOf(created, '/orders/7') }),
+    );
+    expect(navigated.errors).toEqual([]);
+    expect(announcementsSince(client, navigated.mark)).toHaveLength(1);
+    await settleAll(created.editor);
+
+    expect(progressOf(created.sessionId)).toEqual(progressBefore);
+    expect(framesSince(client, REPLAY_SESSION_PROGRESS, panelMark)).toEqual([]);
+    expect(framesSince(created.editor, REPLAY_SESSION_PROGRESS, editorMark)).toEqual([]);
+  });
+
+  it('refuses a same-origin navigation whose URL the session record will not take, keeping the previous URL everywhere and announcing nothing', async () => {
+    const { capturing } = suite();
+    const tabId = freshTab();
+    const { client } = await openPanel(tabId);
+    const url = pageOf(capturing, '/reports');
+
+    const bound = await bind(client, { tabId, url });
+    expectEstablished(client, bound, capturing.sessionId, tabId);
+    await waitForArming(client, capturing, bound.mark);
+    const rowsBefore = bindingRows();
+    const storedBefore = storedBindingOfTab(tabId);
+    const progressBefore = progressOf(capturing.sessionId);
+    const editorMark = capturing.editor.received.length;
+
+    const refused = await withRecordWritesRefused(capturing.sessionId, () =>
+      sendSettled(
+        client,
+        TAB_NAVIGATED,
+        tabNavigatedPayloadSchema.parse({ tabId, url: pageOf(capturing, '/reports/weekly') }),
+      ),
+    );
+    expectRefused(refused, CODES.STORE_ERROR);
+    await settleAll(capturing.editor);
+
+    // No surface heard of the URL, and the agent was not re-armed for it.
+    expect(announcementsSince(client, refused.mark)).toEqual([]);
+    expect(announcementsSince(capturing.editor, editorMark)).toEqual([]);
+    expect(framesSince(client, AGENT_CONFIG, refused.mark)).toEqual([]);
+    expect(progressOf(capturing.sessionId)).toEqual(progressBefore);
+
+    // The row, its stamp and the record still show the previous URL …
+    expect(bindingRows()).toEqual(rowsBefore);
+    expect(storedBindingOfTab(tabId)).toEqual(storedBefore);
+    expect(recordOf(capturing.sessionId).boundTab).toEqual({ tabId, url });
+
+    // … and so does the live binding, whose URL an unbind announces.
+    const unbound = await sendSettled(
+      client,
+      SESSION_UNBIND,
+      sessionUnbindPayloadSchema.parse({ tabId }),
+    );
+    expect(unbound.errors).toEqual([]);
+    expect(announcementsSince(client, unbound.mark)).toEqual([
+      { sessionId: capturing.sessionId, tabId, url, reason: REASON_UNBOUND },
+    ]);
   });
 
   it('unbinds a tab that navigates to another origin and announces it, without ending the session or discarding its capture', async () => {
@@ -1428,10 +2204,12 @@ describe(SESSION_UNBIND, () => {
     const { client } = await openPanel(tabId);
     const rowsBefore = bindingRows();
 
+    // The connection's own tab, before anything bound it: a single-tab
+    // connection may unbind no other tab at all.
     const never = await sendSettled(
       client,
       SESSION_UNBIND,
-      sessionUnbindPayloadSchema.parse({ tabId: freshTab() }),
+      sessionUnbindPayloadSchema.parse({ tabId }),
     );
     expect(never.errors).toEqual([]);
     expect(announcementsSince(client, never.mark)).toEqual([]);
@@ -1546,6 +2324,459 @@ describe(SESSION_UNBIND, () => {
     );
     expect(announcementsSince(second.client, mark)).toEqual([]);
     expect(bindingRows()).toEqual(rowsBefore);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * Privacy: no raw inspected URL or selected-element text is stored or announced
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * The query values planted in URLs a selected element's labels embed. Neither
+ * is secret-shaped, so no content rule masks them: only URL redaction keeps
+ * them out of the store and off the wire.
+ */
+const EMBEDDED_QUERY_VALUE = 'samplevalue';
+const EMBEDDED_SELECTOR_VALUE = 'QQZZ7';
+
+/** One selected-element descriptor whose labels embed URLs, and what the service must keep of it. */
+interface EmbeddedUrlCase {
+  readonly label: string;
+  /** The descriptor as the panel (or the editor's `session.create`) sends it. */
+  readonly target: SelectedTarget;
+  /** The descriptor the record and every `session.updated` must carry. */
+  readonly expected: SelectedTarget;
+  /** The masked `key=?` forms the stored record and every frame must show. */
+  readonly masked: readonly string[];
+}
+
+/** A page on the dev server at `origin`. */
+function pageAt(origin: string, path: string): string {
+  return new URL(path, origin).toString();
+}
+
+/**
+ * Descriptors whose labels embed URLs, each built for the dev server at a
+ * given origin: a sentence quoting an origin-relative link, selected through
+ * an attribute selector that names another; and a link whose visible text is
+ * its own absolute address. Every embedded query value must become `?` per
+ * key, with keys, paths and the surrounding text kept — the rule the document
+ * URL itself is held to (AAP §0.5.2).
+ */
+const EMBEDDED_URL_CASES: readonly ((origin: string) => EmbeddedUrlCase)[] = [
+  (origin) => ({
+    label: 'a relative link quoted in the text and one named by the selector',
+    target: {
+      selector: `a[href="/p?id=${EMBEDDED_SELECTOR_VALUE}"]`,
+      tagName: 'a',
+      text: `Visit /reset?coupon=${EMBEDDED_QUERY_VALUE}`,
+      componentChain: ['LinkRow'],
+      url: pageAt(origin, '/reset'),
+    },
+    expected: {
+      selector: 'a[href="/p?id=?"]',
+      tagName: 'a',
+      text: 'Visit /reset?coupon=?',
+      componentChain: ['LinkRow'],
+      url: pageAt(origin, '/reset'),
+    },
+    masked: ['coupon=?', 'id=?'],
+  }),
+  (origin) => ({
+    label: 'a link whose text is its own absolute address',
+    target: {
+      selector: 'main > section > a',
+      tagName: 'a',
+      text: pageAt(origin, `/reset?coupon=${EMBEDDED_QUERY_VALUE}`),
+      componentChain: [],
+      url: pageAt(origin, '/reset'),
+    },
+    expected: {
+      selector: 'main > section > a',
+      tagName: 'a',
+      text: pageAt(origin, '/reset?coupon=?'),
+      componentChain: [],
+      url: pageAt(origin, '/reset'),
+    },
+    masked: ['coupon=?'],
+  }),
+];
+
+/**
+ * Asserts one stored or broadcast text holds no embedded query value and
+ * shows every masked form the case expects.
+ */
+function expectEmbeddedUrlsMasked(text: string, where: string, masked: readonly string[]): void {
+  for (const leaked of [EMBEDDED_QUERY_VALUE, EMBEDDED_SELECTOR_VALUE]) {
+    expect(text, `${where} leaks ${leaked}`).not.toContain(leaked);
+  }
+  for (const form of masked) {
+    expect(text, `${where} lacks ${form}`).toContain(form);
+  }
+}
+
+/**
+ * Waits for a `session.updated` of `sessionId` carrying `expected` at or after
+ * `from`, then asserts every `session.updated` of that session since `from`
+ * carries the redacted descriptor and nothing of the raw one.
+ */
+async function expectUpdatesMasked(
+  receiver: HarnessWsClient,
+  sessionId: SessionId,
+  from: number,
+  embedded: EmbeddedUrlCase,
+  where: string,
+): Promise<void> {
+  await waitFor(
+    receiver,
+    REPLAY_SESSION_UPDATED,
+    (message, index) =>
+      index >= from &&
+      message.payload.session.id === sessionId &&
+      isDeepStrictEqual(message.payload.session.target, embedded.expected),
+  );
+  const updates = framesSince(receiver, REPLAY_SESSION_UPDATED, from).filter(
+    (message) => message.payload.session.id === sessionId,
+  );
+  expect(updates.length, where).toBeGreaterThan(0);
+  for (const update of updates) {
+    expect(update.payload.session.target, where).toEqual(embedded.expected);
+    expectEmbeddedUrlsMasked(JSON.stringify(update), where, embedded.masked);
+  }
+}
+
+describe('privacy of the inspected document', () => {
+  it('stores, mirrors and announces only the query-redacted URL on bind, same-origin navigation and an origin change', async () => {
+    const { capturing, created } = suite();
+    const tabId = freshTab();
+    const { client } = await openPanel(tabId);
+    const rawUrl = pageOf(created, '/orders?token=abc&sort=price');
+    const redactedUrl = pageOf(created, '/orders?token=?&sort=?');
+    const editorMark = created.editor.received.length;
+
+    // Bound by origin from the raw URL, recorded and announced redacted.
+    const bound = await bind(client, { tabId, url: rawUrl });
+    expect(expectEstablished(client, bound, created.sessionId, tabId).url).toBe(redactedUrl);
+    expect(rowsFor({ tabId })).toEqual([{ tabId, sessionId: created.sessionId, url: redactedUrl }]);
+    expect(storedBindingOfTab(tabId)?.tab).toEqual({ tabId, url: redactedUrl });
+    expect(recordOf(created.sessionId).boundTab).toEqual({ tabId, url: redactedUrl });
+    await settleAll(created.editor);
+    expect(
+      announcementsSince(created.editor, editorMark).filter((payload) => payload.tabId === tabId),
+    ).toEqual([{ sessionId: created.sessionId, tabId, url: redactedUrl, reason: REASON_BOUND }]);
+
+    // A redundant re-bind from the same raw URL is still recognised as one.
+    const again = await bind(client, { tabId, url: rawUrl });
+    expectEstablished(client, again, created.sessionId, tabId);
+    expect(
+      announcementsSince(client, again.mark).filter((payload) => payload.reason !== REASON_BOUND),
+    ).toEqual([]);
+
+    // A same-origin navigation keeps the binding under the redacted new URL,
+    // its fragment masked as well as its query values.
+    const nextRaw = pageOf(created, '/orders/7?token=def&page=2#receipt-q7x');
+    const nextRedacted = pageOf(created, '/orders/7?token=?&page=?#?');
+    const navigated = await sendSettled(
+      client,
+      TAB_NAVIGATED,
+      tabNavigatedPayloadSchema.parse({ tabId, url: nextRaw }),
+    );
+    expect(navigated.errors).toEqual([]);
+    expect(announcementsSince(client, navigated.mark)).toEqual([
+      { sessionId: created.sessionId, tabId, url: nextRedacted, reason: REASON_NAVIGATED },
+    ]);
+    expect(rowsFor({ tabId })).toEqual([
+      { tabId, sessionId: created.sessionId, url: nextRedacted },
+    ]);
+    expect(recordOf(created.sessionId).boundTab).toEqual({ tabId, url: nextRedacted });
+
+    // Leaving the origin drops the binding and announces the new document redacted too.
+    const awayRaw = pageOf(capturing, '/reports?invite=ghi');
+    const left = await sendSettled(
+      client,
+      TAB_NAVIGATED,
+      tabNavigatedPayloadSchema.parse({ tabId, url: awayRaw }),
+    );
+    expect(left.errors).toEqual([]);
+    expect(announcementsSince(client, left.mark)).toEqual([
+      {
+        sessionId: created.sessionId,
+        tabId,
+        url: pageOf(capturing, '/reports?invite=?'),
+        reason: REASON_ORIGIN_CHANGED,
+      },
+    ]);
+
+    // No query value, fragment or raw URL reached any stored column or frame.
+    const stored = storedText(created.sessionId);
+    const heard = JSON.stringify([client.received, created.editor.received]);
+    for (const leaked of [
+      'token=abc',
+      'sort=price',
+      'token=def',
+      'page=2',
+      'receipt-q7x',
+      'invite=ghi',
+    ]) {
+      expect(stored, leaked).not.toContain(leaked);
+      expect(heard, leaked).not.toContain(leaked);
+    }
+  });
+
+  it('stores a selected target with its URL query and secret-shaped text redacted', async () => {
+    const { created } = suite();
+    const tabId = freshTab();
+    const { client } = await openPanel(tabId);
+    const pageUrl = pageOf(created, '/orders');
+    expectEstablished(
+      client,
+      await bind(client, { tabId, url: pageUrl }),
+      created.sessionId,
+      tabId,
+    );
+
+    const secret = randomSecretLike('bearer');
+    const [, secretBody] = secret.split(' ');
+    if (secretBody === undefined) {
+      throw new Error('The assembled bearer credential has no body.');
+    }
+    const target: SelectedTarget = {
+      selector: 'main > section > button',
+      tagName: 'button',
+      text: secret,
+      componentChain: ['OrderRow', 'OrderTable'],
+      url: pageOf(created, '/orders?token=abc&sort=price#row-7'),
+    };
+    const mark = client.received.length;
+    const editorMark = created.editor.received.length;
+    const selected = await sendSettled(
+      client,
+      TARGET_SELECTED,
+      targetSelectedPayloadSchema.parse({ sessionId: created.sessionId, target }),
+    );
+    expect(selected.errors).toEqual([]);
+
+    // The record holds the redacted descriptor: the query values and the
+    // fragment masked, the credential in the text replaced, the rest intact.
+    const expected: SelectedTarget = {
+      selector: target.selector,
+      tagName: target.tagName,
+      text: scrub(secret),
+      componentChain: [...target.componentChain],
+      url: pageOf(created, '/orders?token=?&sort=?#?'),
+    };
+    expect(expected.text).toContain(REDACTION_MARKER);
+    expect(recordOf(created.sessionId).target).toEqual(expected);
+
+    // So does the `session.updated` fan-out, to the panel and to the editor.
+    for (const [receiver, from] of [
+      [client, mark],
+      [created.editor, editorMark],
+    ] as const) {
+      const updated = await waitFor(
+        receiver,
+        REPLAY_SESSION_UPDATED,
+        (message, index) =>
+          index >= from && message.payload.session.target?.selector === target.selector,
+      );
+      expect(updated.payload.session.target).toEqual(expected);
+    }
+
+    // The credential and the query values are nowhere in the store or on the wire.
+    const stored = storedText(created.sessionId);
+    const heard = JSON.stringify([client.received.slice(mark), created.editor.received]);
+    for (const leaked of [secretBody, 'token=abc', 'sort=price', 'row-7']) {
+      expect(stored, 'stored').not.toContain(leaked);
+      expect(heard, 'broadcast').not.toContain(leaked);
+    }
+  });
+
+  it('stores the target a session.create carries redacted', async () => {
+    const running = service();
+    const project = await running.copyFixtureProject();
+    // `session.create` resolves the project's dev server, so it needs a live one.
+    unwrap(await running.launchDevServer(project.root), 'Launching the dev server');
+    const secret = randomSecretLike('jwt');
+    const target: SelectedTarget = {
+      selector: '#checkout > button',
+      tagName: 'button',
+      text: `Token ${secret}`,
+      componentChain: ['CheckoutButton'],
+      url: pageOf(suite().created, '/checkout?coupon=abc&step=2'),
+    };
+
+    const session = await running.createSession({
+      projectRoot: project.root,
+      question: 'Why does checkout hang after the second step?',
+      target,
+    });
+
+    const expected: SelectedTarget = {
+      selector: target.selector,
+      tagName: target.tagName,
+      text: scrub(target.text),
+      componentChain: [...target.componentChain],
+      url: pageOf(suite().created, '/checkout?coupon=?&step=?'),
+    };
+    expect(expected.text).toContain(REDACTION_MARKER);
+    expect(session.target).toEqual(expected);
+    expect(recordOf(session.id).target).toEqual(expected);
+    const stored = storedText(session.id);
+    for (const leaked of [secret, 'coupon=abc', 'step=2']) {
+      expect(stored).not.toContain(leaked);
+    }
+  });
+
+  it('masks the query value of every URL a selected target’s text or selector embeds, in the record and in every session.updated', async () => {
+    const { created } = suite();
+    const tabId = freshTab();
+    const { client } = await openPanel(tabId);
+    // Bound to the document every case's element is of: a selection of another
+    // document is refused before anything is recorded.
+    expectEstablished(
+      client,
+      await bind(client, { tabId, url: pageOf(created, '/reset') }),
+      created.sessionId,
+      tabId,
+    );
+    const firstMark = client.received.length;
+    const firstEditorMark = created.editor.received.length;
+
+    for (const build of EMBEDDED_URL_CASES) {
+      const embedded = build(created.origin);
+      const mark = client.received.length;
+      const editorMark = created.editor.received.length;
+      const selected = await sendSettled(
+        client,
+        TARGET_SELECTED,
+        targetSelectedPayloadSchema.parse({
+          sessionId: created.sessionId,
+          target: embedded.target,
+        }),
+      );
+      expect(selected.errors, embedded.label).toEqual([]);
+
+      // The stored record holds the masked descriptor, and its raw JSON holds
+      // no embedded query value …
+      expect(recordOf(created.sessionId).target, embedded.label).toEqual(embedded.expected);
+      expectEmbeddedUrlsMasked(
+        storedRecordJson(created.sessionId),
+        `the stored record (${embedded.label})`,
+        embedded.masked,
+      );
+
+      // … and so does every `session.updated` the panel and the editor received.
+      await expectUpdatesMasked(
+        client,
+        created.sessionId,
+        mark,
+        embedded,
+        `the panel (${embedded.label})`,
+      );
+      await expectUpdatesMasked(
+        created.editor,
+        created.sessionId,
+        editorMark,
+        embedded,
+        `the editor (${embedded.label})`,
+      );
+    }
+
+    // Nothing either connection heard, and no stored column, holds a raw value.
+    const heard = JSON.stringify([
+      client.received.slice(firstMark),
+      created.editor.received.slice(firstEditorMark),
+    ]);
+    const stored = storedText(created.sessionId);
+    for (const leaked of [EMBEDDED_QUERY_VALUE, EMBEDDED_SELECTOR_VALUE]) {
+      expect(heard, 'broadcast').not.toContain(leaked);
+      expect(stored, 'stored').not.toContain(leaked);
+    }
+  });
+
+  it('accepts a selection of the document the tab shows though its path carries a secret the binding holds scrubbed', async () => {
+    const { created } = suite();
+    const tabId = freshTab();
+    const { client } = await openPanel(tabId);
+    const secret = randomSecretLike('jwt');
+    const page = pageOf(created, `/invite/${secret}`);
+    const bound = expectEstablished(
+      client,
+      await bind(client, { tabId, url: page }),
+      created.sessionId,
+      tabId,
+    );
+    // The binding holds the path scrubbed; the page reports its own URL, raw.
+    expect(bound.url).not.toContain(secret);
+    expect(storedBindingOfTab(tabId)?.tab.url).toBe(bound.url);
+
+    const selection = probeTarget(page, 'secret-path');
+    const recorded = redactSelectedTarget(selection);
+    expect(recorded.url).toBe(bound.url);
+    const selected = await select(client, created.sessionId, selection);
+    expect(selected.errors).toEqual([]);
+    await waitFor(
+      client,
+      REPLAY_SESSION_UPDATED,
+      (message, index) =>
+        index >= selected.mark && isDeepStrictEqual(message.payload.session.target, recorded),
+    );
+    expect(recordOf(created.sessionId).target).toEqual(recorded);
+    expect(storedText(created.sessionId)).not.toContain(secret);
+
+    // Another document of the same origin is still another document.
+    const elsewhere = await select(
+      client,
+      created.sessionId,
+      probeTarget(pageOf(created, '/orders'), 'elsewhere'),
+    );
+    expectRefused(elsewhere, CODES.TAB_NOT_BOUND);
+    expect(recordOf(created.sessionId).target).toEqual(recorded);
+  });
+
+  it('masks the query value of every URL the labels of a session.create target embed, in the record and in every session.updated', async () => {
+    const running = service();
+    for (const build of EMBEDDED_URL_CASES) {
+      // One project per case: `session.create` resolves the project's dev
+      // server, so each needs a live one, and the descriptor names its page.
+      const project = await running.copyFixtureProject();
+      const launched = unwrap(
+        await running.launchDevServer(project.root),
+        'Launching the dev server',
+      );
+      const embedded = build(new URL(launched.devServerUrl).origin);
+      const editor = await running.editor(project.root);
+      const editorMark = editor.received.length;
+
+      const session = await running.createSession({
+        projectRoot: project.root,
+        question: 'Why does following this link take so long?',
+        target: embedded.target,
+      });
+
+      // The answer, the record and its raw stored JSON hold the masked descriptor …
+      expect(session.target, embedded.label).toEqual(embedded.expected);
+      expect(recordOf(session.id).target, embedded.label).toEqual(embedded.expected);
+      expectEmbeddedUrlsMasked(
+        storedRecordJson(session.id),
+        `the stored record (${embedded.label})`,
+        embedded.masked,
+      );
+
+      // … and every `session.updated` the project's editor received carries no raw value.
+      await expectUpdatesMasked(
+        editor,
+        session.id,
+        editorMark,
+        embedded,
+        `the editor (${embedded.label})`,
+      );
+      const heard = JSON.stringify(editor.received.slice(editorMark));
+      for (const leaked of [EMBEDDED_QUERY_VALUE, EMBEDDED_SELECTOR_VALUE]) {
+        expect(heard, 'broadcast').not.toContain(leaked);
+        expect(storedText(session.id), 'stored').not.toContain(leaked);
+      }
+    }
   });
 });
 

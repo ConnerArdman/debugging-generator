@@ -48,21 +48,31 @@
  *     the fixture file stays the one place those values are authored;
  *   - only the extension under development loads (`--disable-extensions`,
  *     extension dependencies skipped, nothing installed from a marketplace),
- *     and editor telemetry is off.
+ *     and editor telemetry is off. The one exception is deliberate and lives
+ *     outside this editor: the packaged-vsix suite starts a second window,
+ *     without `--disable-extensions`, on its own throwaway profile inside its
+ *     scratch directory, because the VSIX it installed there is what that
+ *     window must load.
  *
  * ENVIRONMENT KNOBS, each optional, each validated:
  *   - `VSCODE_TEST_VERSION`  editor to download: `stable` (default),
  *     `insiders`, a commit, or `X.Y.Z`, which must satisfy
- *     `engines.vscode` in package.json. CI pins through this variable.
- *   - `VSCODE_TEST_PATH`     an already-installed editor executable to use
- *     instead of downloading one; wins over `VSCODE_TEST_VERSION`.
+ *     `engines.vscode` in package.json. CI pins `1.139.0` on the `verify`
+ *     job's "Extension-host tests" step in `.github/workflows/ci.yml`; a local
+ *     run that sets neither this nor `VSCODE_TEST_PATH` tests `stable`.
+ *   - `VSCODE_TEST_PATH`     the absolute path of an already-installed editor
+ *     executable to use instead of downloading one; wins over
+ *     `VSCODE_TEST_VERSION`.
  *   - `DEBUGGEN_VSCODE_TEST_TIMEOUT_MS`  default mocha timeout per test and
  *     hook; `0` disables it (debugging). Default 600000.
  *   - `DEBUGGEN_VSCODE_TEST_KEEP_STATE=1`  keep the throwaway directory for
  *     inspection (logs live under `user-data/logs/`); its path is printed.
- *   - `DEBUGGEN_TEST_NODE`   Node executable the suites spawn the embedded
- *     service with; defaults to the Node running this CLI (the repository's
- *     pinned runtime when invoked through pnpm), never Electron.
+ *   - `DEBUGGEN_TEST_NODE`   Node executable `resolveNodeExecutable()` in
+ *     `test/helpers.ts` hands a suite that runs a Node program itself;
+ *     defaults to the Node running this CLI (the repository's pinned runtime
+ *     when invoked through pnpm), never Electron. The embedded service is not
+ *     started that way: the packaged-vsix suite has the installed extension
+ *     start it, on the runtime `src/service/process.ts` chooses.
  * These are read here and are not forwarded as-is: the editor receives only
  * the environment assembled in {@link extensionHostEnvironment}.
  *
@@ -139,9 +149,12 @@ const PREPARE_COMMAND = 'pnpm --filter debug-generator run pretest:vscode';
 
 /**
  * Ten minutes. The slowest suite, packaged-vsix, runs a production build,
- * `vsce ls`, `vsce package`, an install into a throwaway profile and a service
- * start, on a machine whose CPUs may be shared with other builds; the other
- * suites finish in seconds and are unaffected by a generous ceiling.
+ * `vsce ls`, `vsce package`, an install into a throwaway profile and a second,
+ * isolated editor window in which the installed extension starts its embedded
+ * service, on a machine whose CPUs may be shared with other builds; the other
+ * suites finish in seconds and are unaffected by a generous ceiling. That
+ * suite sets a longer timeout of its own for its steps, each of which bounds
+ * every command and window it starts well inside it.
  */
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 
@@ -346,18 +359,34 @@ function resolveVersion() {
 }
 
 /**
- * An installed editor executable from `VSCODE_TEST_PATH`, absolute, or
+ * The installed editor executable `VSCODE_TEST_PATH` names, normalised, or
  * `undefined` to let `@vscode/test-electron` download {@link resolveVersion}.
  * A path that is set but wrong fails here rather than silently falling back to
  * a download.
  *
+ * The path must be absolute. A relative one is refused rather than resolved:
+ * `pnpm test:vscode` runs `vscode-test` from `apps/vscode-extension` through
+ * `pnpm --filter`, while a developer or the test explorer may start it from
+ * another directory, so the same relative value would name different files
+ * depending on how the run was launched.
+ *
  * @returns {string | undefined}
+ * @throws {TestConfigurationError} when the path is relative or is not an
+ * existing file.
  */
 function resolveInstallation() {
   const configured = readEnv('VSCODE_TEST_PATH');
   if (configured === undefined) {
     return undefined;
   }
+  if (!path.isAbsolute(configured)) {
+    throw new TestConfigurationError(
+      `VSCODE_TEST_PATH=${configured} is not an absolute path.`,
+      'Give the absolute path of the editor binary (for example /opt/…/vscode-linux-x64-<version>/code): `pnpm --filter` runs vscode-test from apps/vscode-extension, so a relative path would be ambiguous.',
+    );
+  }
+  // Absolute already, so this only normalises it (`..`, `.`, repeated or
+  // trailing separators); it no longer depends on the working directory.
   const executable = path.resolve(configured);
   if (!isFile(executable)) {
     throw new TestConfigurationError(
@@ -636,13 +665,16 @@ function removeThrowawayState(root, keep) {
  *   - `DEBUGGEN_HOME` is the throwaway `home/`;
  *   - `DEBUGGEN_PROVIDER=deterministic`: nothing leaves the machine and no API
  *     key is needed (AAP 0.5.3);
- *   - `DEBUGGEN_TEST_NODE` is the Node the suites spawn the embedded service
- *     with. Inside the extension host `process.execPath` is Electron, whose
- *     Node is not the repository's pinned runtime that built-in `node:sqlite`
- *     needs, so the absolute path of the Node running this CLI is passed on
- *     unless one is configured explicitly;
- *   - `VSCODE_TEST_EXECUTABLE_PATH` names the editor binary for the suites that
- *     drive its CLI (`--install-extension`), when that binary is known here.
+ *   - `DEBUGGEN_TEST_NODE` is the Node `resolveNodeExecutable()` hands a suite
+ *     that runs a Node program itself. Inside the extension host
+ *     `process.execPath` is Electron, not the repository's pinned runtime, so
+ *     the absolute path of the Node running this CLI is passed on unless one
+ *     is configured explicitly;
+ *   - `VSCODE_TEST_EXECUTABLE_PATH` names the editor binary, when that binary is
+ *     known here, for the suites that drive its CLI (`--install-extension`) and
+ *     for the packaged-vsix suite, which also launches it directly as a
+ *     second, isolated window on its throwaway profile (`test/helpers.ts`
+ *     `resolveVsCodeExecutable()`), so the window runs exactly this build.
  *
  * @param {ThrowawayState} state
  * @param {string | undefined} vscodeExecutable

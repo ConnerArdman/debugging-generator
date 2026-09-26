@@ -15,7 +15,9 @@
  * - {@link createEditorClient} — an {@link EditorClientHandle}: an editor-role
  *   (`vscode`) `ReconnectingWsClient` that records every inbound envelope in
  *   order, so {@link EditorClientHandle.waitFor} resolves from what already
- *   arrived before it waits for what has not.
+ *   arrived before it waits for what has not. The one frame it sends as an
+ *   editor is `source.open` ({@link EditorClientHandle.sendSourceOpen}), which
+ *   `./editor-host`'s warm-up uses to prove a real VS Code window is connected.
  * - The resolution helpers {@link debuggenHome}, {@link readEditorToken},
  *   {@link serviceBaseUrl} and {@link serviceWsUrl}.
  *
@@ -67,8 +69,13 @@
  *   `sinceIndex`, because the e2e workflow driver scopes every wait to the
  *   messages that followed a mark instead of clearing the buffer mid-session.
  * - `getCurrentPanel` answers the `PanelSpec` (or `null`) rather than the
- *   response wrapper, and `getModifications`/`listSessions` likewise unwrap
- *   their arrays — the wrappers carry nothing else.
+ *   response wrapper, and `getModifications`/`listSessions` likewise answer
+ *   their paged listings as one array: each walks every page from offset `0`
+ *   at the listing's largest page size, following `nextOffset` until `null`,
+ *   and throws rather than answer part of a listing as the whole — on a page
+ *   that does not advance, a walk longer than `total` allows, or a listing that
+ *   changes under the walk. Every reversibility check reads the complete
+ *   journal, and every session lookup sees every listed row.
  *
  * This file declares no `test(...)`, `describe(...)` or fixture:
  * `tests/e2e/helpers/fixtures.ts` turns these handles into Playwright fixtures.
@@ -84,6 +91,7 @@ import {
   CAPTURE_CONFLICT_ERROR_CODE,
   HttpClient,
   isCompatibleProtocolVersion,
+  LIST_PAGE_MAX_LIMITS,
   PROTOCOL_VERSION,
   ReconnectingWsClient,
   resolveWsUrl,
@@ -106,6 +114,7 @@ import type {
   HttpOperation,
   HttpRequestArgs,
   HttpResponseBody,
+  ListPageOperation,
   MessageByType,
   MessagePayload,
   MessageType,
@@ -114,12 +123,14 @@ import type {
   PairStartResponse,
   PanelSpec,
   ProtocolMessage,
+  SendOutcome,
   SessionCreateRequest,
   SessionEndResponse,
+  SessionListItem,
   SessionRecord,
   WsUnauthorizedDetail,
 } from '@debuggen/protocol';
-import type { DebuggenError, Result } from '@debuggen/shared';
+import type { DebuggenError, Result, SourceLocation } from '@debuggen/shared';
 
 import {
   debuggenHome as configuredDebuggenHome,
@@ -149,6 +160,7 @@ export type {
   PairStartResponse,
   PanelSpec,
   SessionEndResponse,
+  SessionListItem,
   SessionRecord,
 };
 
@@ -675,8 +687,13 @@ export interface ServiceHandle {
   askFollowUp(sessionId: string, question: string): Promise<SessionRecord>;
   /** `GET /sessions/:id`. */
   getSession(sessionId: string): Promise<SessionRecord>;
-  /** `GET /sessions`, unwrapped to the array. */
-  listSessions(): Promise<readonly SessionRecord[]>;
+  /**
+   * `GET /sessions`, every page walked (`nextOffset` until `null`, at
+   * `SESSION_LIST_MAX_LIMIT`) and answered as one array of rows, most recently
+   * updated first. Throws when the list changes under the walk or its paging
+   * does not advance.
+   */
+  listSessions(): Promise<readonly SessionListItem[]>;
   /**
    * `POST /sessions/:id/capture/start`.
    *
@@ -691,7 +708,13 @@ export interface ServiceHandle {
   getCurrentPanel(sessionId: string): Promise<PanelSpec | null>;
   /** `GET /sessions/:id/panels/:panelId`. */
   getPanel(sessionId: string, panelId: string): Promise<PanelSpec>;
-  /** `GET /sessions/:id/modifications`, unwrapped to the array (in application order). */
+  /**
+   * `GET /sessions/:id/modifications`, every page walked (`nextOffset` until
+   * `null`, at `MODIFICATIONS_PAGE_MAX_LIMIT`; the diff budget may end a page
+   * early) and answered as the whole journal in application order. Throws when
+   * the journal changes under the walk, its paging does not advance, or the
+   * records collected differ from its `total`.
+   */
   getModifications(sessionId: string): Promise<readonly ModificationRecord[]>;
   /**
    * One page of `POST /sessions/:id/panel-data`, typed by the query's source
@@ -820,6 +843,141 @@ function pageItems(page: PagedDataResult): readonly unknown[] {
       throw new Error(`pageItems: unhandled paged source in ${JSON.stringify(unhandled)}`);
     }
   }
+}
+
+/**
+ * The window echo a paged listing (`GET /sessions`, `GET /sessions/:id/modifications`)
+ * answers with, picked from the protocol's response types rather than restated.
+ */
+type ListPageEcho = Pick<HttpResponseBody<ListPageOperation>, 'total' | 'offset' | 'nextOffset'>;
+
+/** One page of a paged listing: its window echo, and its items under one name whichever listing it is. */
+interface ListingPage<Item> extends ListPageEcho {
+  /** The page's items — the response's `sessions` or `modifications`. */
+  readonly items: readonly Item[];
+}
+
+/** The window one page of a {@link collectListing} walk asks for. */
+interface ListingWindow {
+  /** The listing's largest page size (`LIST_PAGE_MAX_LIMITS`). */
+  readonly limit: number;
+  /** `0`, then each page's `nextOffset`. */
+  readonly offset: number;
+}
+
+/**
+ * How a walked listing's collected items must relate to its `total`.
+ *
+ * - `exact` — the listing answers every item it counts, so the walk collects
+ *   exactly `total` (the modification journal: a page's `nextOffset` is its
+ *   offset plus its record count, even when the diff budget ends it early).
+ * - `at-most` — the listing may leave out a stored item it counts and still
+ *   move past it (the session list skips a row it cannot read or may not show
+ *   rather than empty the Sessions tree), so the walk collects at most `total`.
+ */
+type ListingCompleteness = 'exact' | 'at-most';
+
+/** What {@link collectListing} walks. */
+interface ListingWalk<Item> {
+  /** The listing operation; it names the page size through `LIST_PAGE_MAX_LIMITS`. */
+  readonly operation: ListPageOperation;
+  /** The walk's name in a failure message, for example `listSessions`. */
+  readonly label: string;
+  /** How the collected items must relate to `total`. */
+  readonly completeness: ListingCompleteness;
+  /** Fetches one page; a refusal is thrown as a {@link ServiceCallError}. */
+  readonly fetchPage: (window: ListingWindow) => Promise<ListingPage<Item>>;
+}
+
+/** A listing response as a {@link ListingPage} of `items`. */
+function listingPage<Item>(echo: ListPageEcho, items: readonly Item[]): ListingPage<Item> {
+  return { items, total: echo.total, offset: echo.offset, nextOffset: echo.nextOffset };
+}
+
+/**
+ * Every item of a paged listing: requests pages from offset `0` at the
+ * listing's largest page size, follows `nextOffset` until it is `null`, and
+ * answers the pages' items concatenated in the service's order.
+ *
+ * The protocol client already refuses a page that breaks the paging rule
+ * (`nextOffset` past the page and below `total`). Each check here is the
+ * harness failing loudly, with the listing and the offsets named, where a
+ * broken or moving listing would otherwise loop or pass part of itself off as
+ * the whole:
+ *
+ * - each page echoes the offset it was asked for;
+ * - `total` holds across pages — a listing that grows or shrinks mid-walk (a
+ *   session created, a record appended) is not one snapshot;
+ * - no item id repeats — a listing whose order shifted under the walk (a
+ *   session updated between two pages) repeats one item and skips another;
+ * - `nextOffset` advances past the page's offset;
+ * - the walk ends within `max(1, total)` pages, since every page before the
+ *   last starts at a distinct offset below `total`;
+ * - the collected count matches `total` as `completeness` requires.
+ *
+ * @returns The concatenated items, in the service's order.
+ * @throws {Error} When the listing breaks any rule above.
+ */
+async function collectListing<Item extends { readonly id: string }>(
+  walk: ListingWalk<Item>,
+): Promise<readonly Item[]> {
+  const { label } = walk;
+  const limit = LIST_PAGE_MAX_LIMITS[walk.operation];
+  const items: Item[] = [];
+  const seen = new Set<string>();
+  let offset = 0;
+  let total: number | undefined;
+  let pages = 0;
+  for (;;) {
+    const page = await walk.fetchPage({ limit, offset });
+    pages += 1;
+    if (page.offset !== offset) {
+      throw new Error(
+        `${label}: the service echoed offset ${String(page.offset)} for a request at offset ${String(offset)}.`,
+      );
+    }
+    if (total === undefined) {
+      total = page.total;
+    } else if (page.total !== total) {
+      throw new Error(
+        `${label}: total changed from ${String(total)} to ${String(page.total)} on page ${String(pages)} (offset ${String(offset)}) — the listing changed under the walk; read it again once it has settled.`,
+      );
+    }
+    for (const item of page.items) {
+      if (seen.has(item.id)) {
+        throw new Error(
+          `${label}: ${item.id} appeared again on page ${String(pages)} (offset ${String(offset)}) — the listing's order shifted under the walk, so another item may have been skipped; read it again once it has settled.`,
+        );
+      }
+      seen.add(item.id);
+      items.push(item);
+    }
+    if (page.nextOffset === null) {
+      break;
+    }
+    if (page.nextOffset <= offset) {
+      throw new Error(
+        `${label}: nextOffset ${String(page.nextOffset)} does not advance past offset ${String(offset)}.`,
+      );
+    }
+    if (pages >= Math.max(1, total)) {
+      throw new Error(
+        `${label}: still paging after ${String(pages)} page(s) of a listing of ${String(total)} item(s) (nextOffset ${String(page.nextOffset)}); every page before the last starts at a distinct offset below total, so the service's paging is broken.`,
+      );
+    }
+    offset = page.nextOffset;
+  }
+  const consistent = walk.completeness === 'exact' ? items.length === total : items.length <= total;
+  if (!consistent) {
+    const rule =
+      walk.completeness === 'exact'
+        ? 'this listing answers every item it counts'
+        : 'this listing may leave an item out, never add one';
+    throw new Error(
+      `${label}: collected ${String(items.length)} item(s) over ${String(pages)} page(s), but total is ${String(total)} and ${rule}.`,
+    );
+  }
+  return items;
 }
 
 /** The actionable account of a silent `/health`. */
@@ -990,8 +1148,16 @@ function buildServiceHandle(options: ServiceHandleOptions): ServiceHandle {
       });
     },
 
-    async listSessions() {
-      return unwrap('session.list', await call('session.list')).sessions;
+    listSessions() {
+      return collectListing({
+        operation: 'session.list',
+        label: 'listSessions',
+        completeness: 'at-most',
+        fetchPage: async (query) => {
+          const page = unwrap('session.list', await call('session.list', { query }));
+          return listingPage(page, page.sessions);
+        },
+      });
     },
 
     async startCapture(sessionId) {
@@ -1035,12 +1201,20 @@ function buildServiceHandle(options: ServiceHandleOptions): ServiceHandle {
       ).panel;
     },
 
-    async getModifications(sessionId) {
-      return unwrap(
-        'modifications.list',
-        await call('modifications.list', { params: { id: sessionId } }),
-        { sessionId },
-      ).modifications;
+    getModifications(sessionId) {
+      return collectListing({
+        operation: 'modifications.list',
+        label: `getModifications for session ${sessionId}`,
+        completeness: 'exact',
+        fetchPage: async (query) => {
+          const page = unwrap(
+            'modifications.list',
+            await call('modifications.list', { params: { id: sessionId }, query }),
+            { sessionId },
+          );
+          return listingPage(page, page.modifications);
+        },
+      });
     },
 
     async queryPanelData<S extends DataQuerySource>(sessionId: string, query: DataQueryFor<S>) {
@@ -1309,6 +1483,25 @@ export interface EditorClientHandle {
   protocolErrors(): readonly string[];
   /** Forget every retained envelope; indices keep counting, so earlier marks stay valid. */
   clear(): void;
+  /**
+   * Send `source.open { sessionId, location }` over this editor-role
+   * connection — the one frame the suite sends as an editor.
+   *
+   * The service accepts it from an editor connection for a session whose
+   * project lies inside the workspace this connection announced, validates and
+   * contains the location exactly as it does a DevTools click, and forwards it
+   * to the session's editor connections (which may include this one). That
+   * lets a spec drive the editor end of the source-open path without a panel —
+   * `./editor-host`'s warm-up proves a real VS Code window is connected this
+   * way. Nothing here waits for an acknowledgement: what the forwarded frame
+   * caused is what a caller observes.
+   *
+   * @returns `'sent'` when the frame was written, `'queued'` when the protocol
+   *   client holds it for its next connection.
+   * @throws When this client is closed, or the frame could not be encoded or
+   *   queued (the message names the protocol error code).
+   */
+  sendSourceOpen(sessionId: string, location: SourceLocation): SendOutcome;
   /**
    * Close the socket (the service releases this connection's workspace
    * announcement), reject every pending wait and clear every timer.
@@ -1682,6 +1875,19 @@ async function connectEditorClient(
     clear() {
       recorded.length = 0;
       counters.firstRetained = counters.nextIndex;
+    },
+
+    sendSourceOpen(sessionId, location) {
+      if (live.closed) {
+        throw closedError('sending source.open');
+      }
+      const sent = client.send('source.open', { sessionId, location });
+      if (!sent.ok) {
+        throw new Error(
+          `The editor client could not send source.open for session ${sessionId}: ${sent.error.code}: ${sent.error.message}`,
+        );
+      }
+      return sent.value;
     },
 
     close() {

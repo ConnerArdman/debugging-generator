@@ -521,6 +521,79 @@ export interface ErrorSummary {
 }
 
 /**
+ * How the stop barrier that closed a capture window ended — the closed
+ * vocabulary of {@link CaptureCoverage.drain}.
+ *
+ * When a capture stops, the service disarms both producers and then waits,
+ * bounded, for the batches they flush on disarm (and any already in flight) to
+ * land before it summarises the window:
+ *
+ * - `'quiescent'` — ingest for the window went quiet for the barrier's quiet
+ *   period: nothing the producers sent is known to be missing.
+ * - `'deadline'` — events were still arriving when the barrier's upper bound
+ *   ran out, so the window's last events may be missing from it.
+ * - `'unverified'` — whether anything was still in flight is unknown: the
+ *   store could not be read to watch the window, or ingest went quiet but a
+ *   producer that contributed events to the window could not be confirmed to
+ *   have received its disarm (its dormant configuration unsent, its dev-server
+ *   preload unreachable, or the disarm itself failed), so its final flush may
+ *   never have arrived. A producer that contributed no event never makes the
+ *   barrier unverified.
+ * - `'not-applicable'` — no live window was closed by this summary (a capture
+ *   rolled back before anything was armed, or one already stopped earlier).
+ */
+export const CAPTURE_DRAIN_OUTCOMES = Object.freeze([
+  'quiescent',
+  'deadline',
+  'unverified',
+  'not-applicable',
+] as const);
+
+/** One member of {@link CAPTURE_DRAIN_OUTCOMES}. */
+export type CaptureDrainOutcome = (typeof CAPTURE_DRAIN_OUTCOMES)[number];
+
+/**
+ * How completely a capture summary covers what the capture's producers
+ * observed — the evidence-loss diagnostics a summary must carry so it never
+ * looks whole when it is not.
+ *
+ * {@link computeCaptureSummary} never sets it: it summarises the events it is
+ * handed and cannot know what it was not handed. The service attaches it when
+ * it closes a capture window (`apps/local-service/src/pipeline/stages/capture.ts`),
+ * from the store's count of the window's events, the per-capture loss reports
+ * the producers sent and the outcome of the stop barrier. Plain JSON, safe to
+ * log and broadcast: counts and a vocabulary member only.
+ */
+export interface CaptureCoverage {
+  /** How many events the store holds for the capture window when it closed. */
+  readonly storedEvents: number;
+  /**
+   * How many of them the summary was computed from — {@link storedEvents}, or
+   * fewer when the window held more than the service summarises in one pass.
+   */
+  readonly summarizedEvents: number;
+  /**
+   * How many events the producers reported discarding before delivery (the
+   * page agent's bounded buffer while the bridge was away). Counts the reports
+   * the summarising service process received; `0` when none were reported.
+   */
+  readonly producerDroppedEvents: number;
+  /**
+   * How the stop barrier ended — `'unverified'` also when the window went quiet
+   * but a producer that contributed events to it could not be confirmed to
+   * have flushed (see {@link CAPTURE_DRAIN_OUTCOMES}).
+   */
+  readonly drain: CaptureDrainOutcome;
+  /**
+   * `true` only when nothing is known to be missing: every stored event was
+   * summarised, no producer reported a loss, and the barrier did not end at its
+   * deadline or unverified — so never while a contributing producer's final
+   * flush is unconfirmed.
+   */
+  readonly complete: boolean;
+}
+
+/**
  * Everything a finished capture measured, in one bounded object.
  *
  * The payload of the `capture.stop` response and the `capture.stopped`
@@ -608,6 +681,13 @@ export interface CaptureSummary {
   readonly truncated: boolean;
   /** The ids whose metric value is unavailable, in `METRIC_IDS` order. */
   readonly unavailableMetrics: readonly MetricId[];
+  /**
+   * How completely this summary covers the capture window, attached by the
+   * service when it closes the window; see {@link CaptureCoverage}. Absent on a
+   * summary {@link computeCaptureSummary} returns directly, which describes
+   * exactly the events it was handed.
+   */
+  readonly coverage?: CaptureCoverage;
 }
 
 /**

@@ -36,6 +36,13 @@
  *    so a manifest that names a version no file provides — or a prompt whose
  *    placeholders have drifted from the stage that renders it — fails here
  *    rather than at the first stage of a developer's first session.
+ * 6. **A committed prompt version never changes.** AAP 0.5.3 makes every
+ *    `vNNN.md` immutable once committed, because a session records the
+ *    versions it used and a reopened session or a follow-up replays them. The
+ *    same cases pin each committed version to a SHA-256 digest and load every
+ *    version the manifest lists — superseded ones included — through
+ *    `loadVersion`, so an in-place rewrite of a version a stored session cites
+ *    fails here instead of silently changing what that session replays.
  *
  * ## How caching is observed without mocking the filesystem
  *
@@ -87,6 +94,7 @@
  */
 
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import {
   existsSync,
   mkdirSync,
@@ -1967,6 +1975,66 @@ function readShippedManifest(): unknown {
 }
 
 /**
+ * The SHA-256 digest of every committed prompt version, by stage and version.
+ *
+ * AAP 0.5.3 makes a committed `vNNN.md` immutable: a session records the
+ * versions it rendered, and a reopened session or a follow-up loads exactly
+ * those versions again through `loadVersion`. A file rewritten in place under a
+ * version a stored session already cites would therefore replay different
+ * instructions under the same identifier, with nothing anywhere recording the
+ * change. This table is what makes that rewrite visible: every committed
+ * version is pinned here, and the case that reads it fails on any edit.
+ *
+ * Maintenance is the prompt-versioning protocol itself. Changing a stage's
+ * instructions means adding `vNNN+1.md`, moving that stage's `current` in the
+ * manifest, and adding the new file's digest below; an existing entry is never
+ * edited. The digest is taken over the file's UTF-8 text with CRLF line endings
+ * folded to LF (see {@link promptDigest}), so a checkout that converts line
+ * endings still matches while any change to the words does not.
+ */
+const COMMITTED_PROMPT_DIGESTS: Readonly<Record<PromptStage, Readonly<Record<string, string>>>> = {
+  understand: {
+    v001: '3d21672e91553b52f332cea37265c684c2655744e155c08a5a8e3ff484ca9c1c',
+    v002: '0aa7ca05b859dbcdbbc6fae8f4cdc9703b3e3e7945c86db79baf0aee541318d6',
+  },
+  investigate: {
+    v001: '9603fc48c643f7919f8cb733153b63e044ab7d587ca2d598289ca6fc06a515bf',
+    v002: '1d2a1d0c7c563af716676176138780369553720681d16619d42a2e481826b12a',
+  },
+  plan: {
+    v001: '96266adca3d906385bb96717309fa1e42fe0f5daec8635829b542ec5a915e660',
+    v002: '0e5b55dd0355bf41f7be221166969428e9c72e74921fdc534e61d685caf62f93',
+  },
+  analyze: {
+    v001: 'fb861aeed5342437bd4d0dda9a4b720ebe43975b0851493b6714a8a1c0301af0',
+    v002: '2d3b1d36e6fad3752524632c8c6479ed89d2d8eafc7e615bb67eaed2b8861a75',
+  },
+  'generate-panel': {
+    v001: 'c9ecb64790086384d6beccc9619ae8205de4ca8feafc349e9d1e0da1f3b14f63',
+    v002: '33b8b9dd75aa0035cffb40aa0e869506dec3d13688bd2301eb4b7b28aefc9385',
+  },
+  followup: {
+    v001: 'bba6f625546296e13a53beb454e069b9334aa5dfc63da43820635ba6e19115f9',
+    v002: '4a6942eed49c2fe06ab1711b27de5be238a04d5c4ce9f749df7d0ad7d50e4d85',
+  },
+};
+
+/**
+ * The digest {@link COMMITTED_PROMPT_DIGESTS} pins: SHA-256, as lowercase hex,
+ * of a prompt file's UTF-8 text with every CRLF folded to LF.
+ *
+ * Folding line endings is the one normalisation applied, and it is there for a
+ * checkout that rewrites them (`core.autocrlf`), which changes bytes without
+ * changing a word of the instructions. Nothing else is normalised: trailing
+ * whitespace, a byte-order mark or a reflowed paragraph all change what a model
+ * is sent, so each of them changes the digest.
+ */
+function promptDigest(stage: PromptStage, version: string): string {
+  const text = readFileSync(join(SHIPPED_PROMPTS_DIR, stage, `${version}.md`), 'utf8');
+  return createHash('sha256').update(text.replace(/\r\n/g, '\n'), 'utf8').digest('hex');
+}
+
+/**
  * Every file in the shipped tree with its byte length, as one sorted string.
  *
  * The read-only guarantee, made executable: the fingerprint is taken before
@@ -2098,6 +2166,69 @@ describe('the shipped prompt tree', () => {
 
         expect(error.code).toBe('CONFIG_INVALID');
         expect(error.details?.missingPlaceholders).toEqual([withheld]);
+      }
+    }
+  });
+
+  it('pins every committed prompt version to the text it was committed with', () => {
+    // THE IMMUTABILITY CASE (AAP 0.5.3). A version file on disk that the table
+    // does not know is an unregistered version; a digest that no longer matches
+    // is a committed version rewritten in place, which is exactly the change a
+    // stored session citing that version cannot detect.
+    for (const stage of PROMPT_STAGES) {
+      const pinned = COMMITTED_PROMPT_DIGESTS[stage];
+
+      expect(
+        versionsOnDisk(stage),
+        `prompts/${stage}/ holds a version whose digest is not pinned in COMMITTED_PROMPT_DIGESTS; ` +
+          'add the new file\u2019s digest in the same change that adds the file',
+      ).toEqual(Object.keys(pinned).sort());
+
+      for (const [version, digest] of Object.entries(pinned)) {
+        expect(
+          promptDigest(stage, version),
+          `prompts/${stage}/${version}.md changed after it was committed. Restore it, ship the ` +
+            'new wording as the next vNNN.md and move the stage\u2019s current version in manifest.json to it',
+        ).toBe(digest);
+      }
+    }
+  });
+
+  it('loads and renders every version the manifest lists, superseded ones included', () => {
+    // A reopened session and a follow-up replay the versions recorded on the
+    // session, which are superseded as soon as a stage's current moves on. Each
+    // listed version must therefore still load by name, render from its stage's
+    // placeholder set, and hand back its own text rather than the current one.
+    const parsed = promptManifestSchema.safeParse(readShippedManifest());
+    expect(parsed.success).toBe(true);
+    if (!parsed.success) {
+      return;
+    }
+    const loader = createPromptLoader({ promptsDir: SHIPPED_PROMPTS_DIR, env: {} });
+
+    for (const stage of PROMPT_STAGES) {
+      const entry = parsed.data.stages[stage];
+      const available = entry?.available ?? [];
+      const current = valueOf(loader.load(stage));
+      const declared = SHIPPED_PLACEHOLDERS[stage];
+
+      expect(available).toContain(entry?.current);
+      for (const version of available) {
+        const prompt = valueOf(loader.loadVersion(stage, version));
+
+        expect(prompt.stage).toBe(stage);
+        expect(prompt.version).toBe(version);
+        expect(prompt.path).toBe(join(SHIPPED_PROMPTS_DIR, stage, `${version}.md`));
+        expect([...new Set(tokensOf(prompt.text))].sort()).toEqual([...declared].sort());
+
+        const rendered = valueOf(renderPrompt(prompt.text, valuesFor(declared)));
+        expect(rendered).not.toContain('{{');
+
+        if (version === entry?.current) {
+          expect(prompt.text).toBe(current.text);
+        } else {
+          expect(prompt.text).not.toBe(current.text);
+        }
       }
     }
   });

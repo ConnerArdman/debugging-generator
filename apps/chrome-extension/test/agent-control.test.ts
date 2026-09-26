@@ -16,10 +16,12 @@
  *   §0.4.2) and answered with the tab's desired configuration — the **same**
  *   `captureId` (AAP §0.5.5, "Page reloaded during capture").
  * - **A reload happens only with explicit developer consent.** A late fiber
- *   hook (`installedBeforeReact === false`) is surfaced as an offer, never
- *   acted on; only `requestConsentedReload` calls the injected `reload`, and
- *   its wait for the new document's `agent.ready` is bounded by
- *   `PENDING_READY_TIMEOUT_MS`.
+ *   hook (`installedBeforeReact === false`) and a tab with no agent at all (no
+ *   report and no attached bridge: a page loaded before the extension) are
+ *   surfaced as an offer (`getReloadOffer`), never acted on; only
+ *   `requestConsentedReload` calls the injected `reload`, by the same rule the
+ *   offer states, and its wait for the new document's `agent.ready` is bounded
+ *   by `PENDING_READY_TIMEOUT_MS`.
  *
  * The real exports are the authority. Where they refine the brief, the spec
  * follows them: `applyConfig` resolves the bound tab through the injected
@@ -71,10 +73,15 @@ import type {
   ProtocolSend,
   WorkerTimerApi,
 } from '../src/background/messages';
-import { EXTENSION_CHANNEL, PORT_PROTOCOL_VERSION } from '../src/shared/messages';
+import {
+  EXTENSION_CHANNEL,
+  PANEL_RELOAD_NOT_NEEDED,
+  PORT_PROTOCOL_VERSION,
+} from '../src/shared/messages';
 import type {
   BridgeDownstreamMessage,
   PageAgentReadyPayload,
+  PanelReloadState,
   PortBindingPush,
 } from '../src/shared/messages';
 
@@ -207,7 +214,10 @@ interface LogEntry {
 /** Everything a case drives or inspects. */
 interface Harness {
   readonly control: AgentControl;
-  /** Tabs whose bridge port is attached; the fake `BridgeSend` answers from it. */
+  /**
+   * Tabs whose bridge port is attached; the fake `BridgeSend` and the injected
+   * `hasBridge` both answer from it.
+   */
   readonly attached: Set<TabId>;
   /** The binding each session holds, as the injected lookup answers it. */
   readonly bindings: Map<SessionId, AgentBindingTarget>;
@@ -293,6 +303,7 @@ function createHarness(): Harness {
     resolveBinding,
     tabs: { reload },
     timers: { setTimeout: setTimer, clearTimeout: clearTimer },
+    hasBridge: (tabId) => attached.has(tabId),
     now: () => NOW_MS,
     pushStatus,
     onChange,
@@ -1098,7 +1109,10 @@ describe('createAgentControl', () => {
       await expect(pending).resolves.toEqual(timedOut);
     });
 
-    it('refuses, reloading nothing, when no report says the hook arrived after React', async () => {
+    it('refuses, reloading nothing, while the tab’s bridge is attached but no report came, or the hook was installed before React', async () => {
+      // The bridge is attached: the agent is present and its report is on its way.
+      h.attached.add(BOUND_TAB);
+      expect(h.control.getReloadOffer(BOUND_TAB)).toEqual(PANEL_RELOAD_NOT_NEEDED);
       await expect(h.control.requestConsentedReload(BOUND_TAB)).resolves.toEqual({
         kind: 'not-consented',
         tabId: BOUND_TAB,
@@ -1107,6 +1121,7 @@ describe('createAgentControl', () => {
 
       h.control.handleAgentReady(BOUND_TAB, readyPayload({ installedBeforeReact: true }));
 
+      expect(h.control.getReloadOffer(BOUND_TAB)).toEqual(PANEL_RELOAD_NOT_NEEDED);
       await expect(h.control.requestConsentedReload(BOUND_TAB)).resolves.toEqual({
         kind: 'not-consented',
         tabId: BOUND_TAB,
@@ -1115,6 +1130,75 @@ describe('createAgentControl', () => {
       expect(h.reload).not.toHaveBeenCalled();
       expect(h.setTimer).not.toHaveBeenCalled();
       expect(h.control.isReloadPending(BOUND_TAB)).toBe(false);
+      expect(changesOfKind(h, 'reload-started')).toEqual([]);
+    });
+
+    it('with consent, reloads a tab no agent runs in — no report, no bridge — exactly once and resolves on the first agent.ready', async () => {
+      // A page loaded before the extension was enabled: bound and armed for,
+      // but Chrome injected no content script, so there is no bridge and no report.
+      bind(h, SESSION_A, BOUND_TAB);
+      const config = armedConfig();
+      await expect(h.control.applyConfig(config)).resolves.toMatchObject({
+        kind: 'routed',
+        delivery: 'pending-bridge',
+      });
+      expect(h.control.getReloadOffer(BOUND_TAB)).toEqual({
+        kind: 'offered',
+        reason: 'agent-missing',
+      });
+
+      const pending = h.control.requestConsentedReload(BOUND_TAB);
+
+      expect(h.reload).toHaveBeenCalledTimes(1);
+      expect(h.reload).toHaveBeenCalledWith(BOUND_TAB);
+      expect(h.setTimer).toHaveBeenCalledTimes(1);
+      expect(h.setTimer).toHaveBeenCalledWith(expect.any(Function), PENDING_READY_TIMEOUT_MS);
+      expect(h.control.isReloadPending(BOUND_TAB)).toBe(true);
+      expect(h.control.getReloadOffer(BOUND_TAB)).toEqual({ kind: 'reloading' });
+      const started = changesOfKind(h, 'reload-started');
+      expect(started).toEqual([
+        { kind: 'reload-started', tabId: BOUND_TAB, previousDocumentId: undefined },
+      ]);
+      expect(started[0]).toHaveProperty('previousDocumentId', undefined);
+
+      // Chrome has started the reload, but the outcome waits on the agent.
+      const current = watch(pending);
+      await settle();
+      expect(current()).toBeUndefined();
+
+      // The new document's bridge attaches and its agent reports: there is no
+      // replaced document to tell apart, so this first report settles the wait.
+      h.attached.add(BOUND_TAB);
+      const ready = h.control.handleAgentReady(
+        BOUND_TAB,
+        readyPayload({ documentId: 'doc-first', producerId: 'producer-first' }),
+      );
+
+      expect(ready).toMatchObject({ kind: 'recorded', config: 'delivered', reloadOffered: false });
+      const expected: ReloadOutcome = {
+        kind: 'ready',
+        tabId: BOUND_TAB,
+        readiness: {
+          tabId: BOUND_TAB,
+          documentId: 'doc-first',
+          producerId: 'producer-first',
+          installedBeforeReact: true,
+          reactDetected: true,
+          receivedAt: NOW_MS,
+        },
+      };
+      await expect(pending).resolves.toEqual(expected);
+      expect(changesOfKind(h, 'reload-settled')).toEqual([
+        { kind: 'reload-settled', tabId: BOUND_TAB, outcome: expected },
+      ]);
+
+      // The held configuration armed the new document, and the wait is over.
+      expect(configsTo(h, BOUND_TAB)).toEqual([config]);
+      expect(h.control.isReloadPending(BOUND_TAB)).toBe(false);
+      expect(h.control.getReloadOffer(BOUND_TAB)).toEqual(PANEL_RELOAD_NOT_NEEDED);
+      expect(h.clearTimer).toHaveBeenCalledTimes(1);
+      expect(vi.getTimerCount()).toBe(0);
+      expect(h.reload).toHaveBeenCalledTimes(1);
     });
 
     it('shares one reload between repeated requests while it is in flight', async () => {
@@ -1164,6 +1248,45 @@ describe('createAgentControl', () => {
         expect(h.reload).toHaveBeenCalledTimes(2);
         h.control.handleAgentReady(BOUND_TAB, readyPayload({ documentId: 'doc-reloaded' }));
         await expect(retry).resolves.toMatchObject({ kind: 'ready', tabId: BOUND_TAB });
+      },
+    );
+
+    it.each(refusals)(
+      'settles as no-tab when Chrome %s the reload of a tab no agent runs in, inventing no readiness',
+      async (_label, refuse) => {
+        h.reload.mockImplementationOnce(refuse);
+
+        await expect(h.control.requestConsentedReload(BOUND_TAB)).resolves.toEqual({
+          kind: 'no-tab',
+          tabId: BOUND_TAB,
+          reason: 'reload-failed',
+        });
+        expect(h.reload).toHaveBeenCalledTimes(1);
+        expect(h.control.isReloadPending(BOUND_TAB)).toBe(false);
+        expect(vi.getTimerCount()).toBe(0);
+        // There was no memo to restore, so none is made up.
+        expect(h.control.getReadiness(BOUND_TAB)).toBeUndefined();
+        expect(relayedReadies(h)).toEqual([]);
+        expect(h.control.reannounce(BOUND_TAB)).toBe(false);
+        expect(changesOfKind(h, 'reload-settled')).toEqual([
+          {
+            kind: 'reload-settled',
+            tabId: BOUND_TAB,
+            outcome: { kind: 'no-tab', tabId: BOUND_TAB, reason: 'reload-failed' },
+          },
+        ]);
+
+        // Nothing was replaced: the offer stands, and no document was retired,
+        // so the tab's first report is recorded rather than dropped as stale.
+        expect(h.control.getReloadOffer(BOUND_TAB)).toEqual({
+          kind: 'offered',
+          reason: 'agent-missing',
+        });
+        h.attached.add(BOUND_TAB);
+        expect(h.control.handleAgentReady(BOUND_TAB, readyPayload())).toMatchObject({
+          kind: 'recorded',
+          tabId: BOUND_TAB,
+        });
       },
     );
 
@@ -1227,6 +1350,128 @@ describe('createAgentControl', () => {
       expect(h.reload).not.toHaveBeenCalled();
       expect(h.setTimer).not.toHaveBeenCalled();
       expect(changesOfKind(h, 'reload-started')).toEqual([]);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // The reload offer: the same rule the consented reload applies
+  // -------------------------------------------------------------------------
+
+  describe('the reload offer', () => {
+    it('answers every state of a tab by the rule requestConsentedReload applies, and acts on none', async () => {
+      // A tab nothing is held for, with no bridge: no agent runs in it.
+      expect(h.control.getReloadOffer(OTHER_TAB)).toEqual({
+        kind: 'offered',
+        reason: 'agent-missing',
+      });
+      // The same tab once its bridge attaches: the agent is present and will report.
+      h.attached.add(OTHER_TAB);
+      expect(h.control.getReloadOffer(OTHER_TAB)).toEqual(PANEL_RELOAD_NOT_NEEDED);
+
+      // The bound tab, its hook in place before React.
+      h.attached.add(BOUND_TAB);
+      bind(h, SESSION_A, BOUND_TAB);
+      await h.control.applyConfig(armedConfig());
+      h.control.handleAgentReady(BOUND_TAB, readyPayload({ documentId: 'doc-early' }));
+      expect(h.control.getReloadOffer(BOUND_TAB)).toEqual(PANEL_RELOAD_NOT_NEEDED);
+      // The document's own report outranks a bridge that went away (a page
+      // mid-navigation): the recorded readiness still says nothing is needed.
+      h.attached.delete(BOUND_TAB);
+      expect(h.control.getReloadOffer(BOUND_TAB)).toEqual(PANEL_RELOAD_NOT_NEEDED);
+      h.attached.add(BOUND_TAB);
+
+      // A later document whose hook arrived after React.
+      h.control.handleAgentReady(
+        BOUND_TAB,
+        readyPayload({ documentId: 'doc-late', installedBeforeReact: false }),
+      );
+      const lateHook: PanelReloadState = { kind: 'offered', reason: 'hook-after-react' };
+      expect(h.control.getReloadOffer(BOUND_TAB)).toEqual(lateHook);
+      // Reading the offer is not consent: nothing was reloaded or scheduled.
+      expect(h.reload).not.toHaveBeenCalled();
+      expect(h.setTimer).not.toHaveBeenCalled();
+
+      // Consented: the offer reads `reloading` until the new document reports.
+      const reloading = h.control.requestConsentedReload(BOUND_TAB);
+      expect(h.control.getReloadOffer(BOUND_TAB)).toEqual({ kind: 'reloading' });
+      h.control.handleAgentReady(BOUND_TAB, readyPayload({ documentId: 'doc-reloaded' }));
+      await expect(reloading).resolves.toMatchObject({ kind: 'ready', tabId: BOUND_TAB });
+
+      // Settled on a document whose hook is in place: nothing more to offer.
+      expect(h.control.getReloadOffer(BOUND_TAB)).toEqual(PANEL_RELOAD_NOT_NEEDED);
+      expect(h.reload).toHaveBeenCalledTimes(1);
+    });
+
+    it('after a reload times out, offers it again only when no agent arrived in the tab', async () => {
+      h.attached.add(BOUND_TAB);
+      bind(h, SESSION_A, BOUND_TAB);
+      await h.control.applyConfig(armedConfig());
+      h.control.handleAgentReady(
+        BOUND_TAB,
+        readyPayload({ documentId: 'doc-late', installedBeforeReact: false }),
+      );
+      const reloading = h.control.requestConsentedReload(BOUND_TAB);
+      // The old document's bridge goes with it, and no new one attaches.
+      h.attached.delete(BOUND_TAB);
+
+      await vi.advanceTimersByTimeAsync(PENDING_READY_TIMEOUT_MS);
+      await expect(reloading).resolves.toEqual({
+        kind: 'timeout',
+        tabId: BOUND_TAB,
+        timeoutMs: PENDING_READY_TIMEOUT_MS,
+      });
+
+      // No report and no bridge: no agent runs in the reloaded document.
+      expect(h.control.getReloadOffer(BOUND_TAB)).toEqual({
+        kind: 'offered',
+        reason: 'agent-missing',
+      });
+      // A bridge that attaches late means its agent will report: nothing to offer.
+      h.attached.add(BOUND_TAB);
+      expect(h.control.getReloadOffer(BOUND_TAB)).toEqual(PANEL_RELOAD_NOT_NEEDED);
+      expect(h.reload).toHaveBeenCalledTimes(1);
+    });
+
+    it('without a bridge lookup, or with one that throws, never offers a reload on a missing report alone', async () => {
+      const logs: LogEntry[] = [];
+      const timers = { setTimeout: h.setTimer, clearTimeout: h.clearTimer };
+      const withoutLookup = createAgentControl({
+        sendToBridge: h.sendToBridge,
+        send: h.send,
+        resolveBinding: h.resolveBinding,
+        tabs: { reload: h.reload },
+        timers,
+      });
+      const throwingLookup = createAgentControl({
+        sendToBridge: h.sendToBridge,
+        send: h.send,
+        resolveBinding: h.resolveBinding,
+        tabs: { reload: h.reload },
+        timers,
+        hasBridge: () => {
+          throw new Error('The port registry is unavailable.');
+        },
+        logger: createRecordingLogger(logs),
+      });
+
+      try {
+        for (const control of [withoutLookup, throwingLookup]) {
+          expect(control.getReloadOffer(BOUND_TAB)).toEqual(PANEL_RELOAD_NOT_NEEDED);
+          await expect(control.requestConsentedReload(BOUND_TAB)).resolves.toEqual({
+            kind: 'not-consented',
+            tabId: BOUND_TAB,
+            reason: 'no-agent-report',
+          });
+        }
+        expect(h.reload).not.toHaveBeenCalled();
+        expect(h.setTimer).not.toHaveBeenCalled();
+        expect(
+          logs.filter((entry) => entry.level === 'warn').map((entry) => entry.message),
+        ).toContain('bridge lookup threw');
+      } finally {
+        withoutLookup.dispose();
+        throwingLookup.dispose();
+      }
     });
   });
 
@@ -1327,6 +1572,136 @@ describe('createAgentControl', () => {
       });
       expect(configsTo(h, BOUND_TAB).at(-1)).toEqual(dormant);
       expect(bridgeAttemptsFor(h, OTHER_TAB)).toBe(0);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // The service's replay of the arming state
+  // -------------------------------------------------------------------------
+
+  /*
+   * The protocol carries no producer acknowledgement (AAP §0.4.2): an
+   * `agent.config` reaching the bound tab's DevTools connection is the receipt,
+   * and the service repairs a missed or outdated one by replaying it — the open
+   * capture's armed configuration to a connection that reconnects, and, once a
+   * service restart has wiped its in-memory arming state, the dormant form of
+   * the session's last capture to a tab that re-binds. These cases hold the
+   * worker's half of that contract: a replay is routed like any other
+   * configuration, replaces what the tab held, and is what the tab's next
+   * document is handed. The third leg — a dormant replay for a session whose
+   * binding the worker no longer holds, which must still reach the former armed
+   * holder — is "forwards the service’s own all-false agent.config as it
+   * arrives, even after the binding is gone", above, and is not repeated here.
+   */
+  describe('the service’s replay of the arming state', () => {
+    it.each([
+      { bridge: 'attached', delivery: 'delivered' },
+      { bridge: 'detached', delivery: 'pending-bridge' },
+    ] as const)(
+      'returns a tab still holding the stale armed configuration to dormant when the re-bound service replays the dormant config for that capture, and re-arms its next document dormant (bridge $bridge)',
+      async ({ bridge, delivery }) => {
+        h.attached.add(BOUND_TAB);
+        bind(h, SESSION_A, BOUND_TAB);
+        h.control.handleAgentReady(BOUND_TAB, readyPayload({ documentId: 'doc-before-restart' }));
+        const armed = armedConfig(SESSION_A, CAPTURE_1);
+        await h.control.applyConfig(armed);
+        expect(configsTo(h, BOUND_TAB)).toEqual([armed]);
+
+        // The service restarts. The worker still holds the armed configuration
+        // as the tab's desired state, while the service no longer knows it armed
+        // anything. The tab re-binds to the same session and the service answers
+        // with the dormant form of that session's last capture — while the page
+        // is live, or while it is mid-reload with no bridge attached.
+        if (bridge === 'detached') {
+          h.attached.delete(BOUND_TAB);
+        }
+        const dormant = dormantConfig(SESSION_A, CAPTURE_1);
+
+        const outcome = await h.control.applyConfig(dormant);
+
+        const routed = {
+          kind: 'routed',
+          tabId: BOUND_TAB,
+          sessionId: SESSION_A,
+          captureId: CAPTURE_1,
+          dormant: true,
+          delivery,
+        } as const;
+        expect(outcome).toEqual(routed);
+        expect(changesOfKind(h, 'config-routed').at(-1)).toEqual({
+          ...routed,
+          kind: 'config-routed',
+        });
+        expect(h.control.getDesiredConfig(BOUND_TAB)).toEqual(dormant);
+        // A live bridge takes the dormant frame at once; with none attached the
+        // worker holds it for the next document.
+        expect(configsTo(h, BOUND_TAB)).toEqual(bridge === 'attached' ? [armed, dormant] : [armed]);
+
+        // The page reloads: the fresh document's agent reports in and is handed
+        // the dormant desired state — never the stale armed configuration.
+        h.attached.add(BOUND_TAB);
+        const ready = h.control.handleAgentReady(
+          BOUND_TAB,
+          readyPayload({ documentId: 'doc-after-restart', producerId: 'producer-after-restart' }),
+        );
+
+        expect(ready).toMatchObject({ kind: 'recorded', tabId: BOUND_TAB, config: 'delivered' });
+        expect(configsTo(h, BOUND_TAB)).toEqual(
+          bridge === 'attached' ? [armed, dormant, dormant] : [armed, dormant],
+        );
+        expect(h.control.getDesiredConfig(BOUND_TAB)).toEqual(dormant);
+        expect(bridgeAttemptsFor(h, OTHER_TAB)).toBe(0);
+      },
+    );
+
+    it('routes the identical armed configuration the service re-sends on a reconnect to the same tab, under the same capture, and leaves its readiness alone', async () => {
+      h.attached.add(BOUND_TAB);
+      h.attached.add(OTHER_TAB);
+      bind(h, SESSION_A, BOUND_TAB);
+      h.control.handleAgentReady(BOUND_TAB, readyPayload({ documentId: 'doc-live' }));
+      const armed = armedConfig(SESSION_A, CAPTURE_1);
+      await h.control.applyConfig(armed);
+      const readinessBefore = h.control.getReadiness(BOUND_TAB);
+      expect(readinessBefore).toMatchObject({ tabId: BOUND_TAB, documentId: 'doc-live' });
+      const relaysBefore = relayedReadies(h).length;
+      const readyChangesBefore = changesOfKind(h, 'agent-ready').length;
+      const pushesBefore = h.pushStatus.mock.calls.length;
+
+      // The DevTools connection reconnects while the capture is open, and the
+      // service re-sends the capture's configuration: a fresh object off the
+      // wire, equal to the one the tab already runs.
+      const replayed = armedConfig(SESSION_A, CAPTURE_1);
+
+      const outcome = await h.control.applyConfig(replayed);
+
+      expect(outcome).toEqual({
+        kind: 'routed',
+        tabId: BOUND_TAB,
+        sessionId: SESSION_A,
+        captureId: CAPTURE_1,
+        dormant: false,
+        delivery: 'delivered',
+      });
+      expect(configsTo(h, BOUND_TAB)).toEqual([armed, armed]);
+      expect(h.control.getDesiredConfig(BOUND_TAB)).toEqual(armed);
+      expect(bridgeAttemptsFor(h, OTHER_TAB)).toBe(0);
+      // A tab handed its own capture again is not displaced from it.
+      expect(changesOfKind(h, 'disarmed')).toEqual([]);
+
+      // The readiness memo is the very record the document's report produced:
+      // nothing was relayed, re-announced, pushed or reloaded on its account.
+      expect(h.control.getReadiness(BOUND_TAB)).toBe(readinessBefore);
+      expect(relayedReadies(h)).toHaveLength(relaysBefore);
+      expect(changesOfKind(h, 'agent-ready')).toHaveLength(readyChangesBefore);
+      expect(h.pushStatus).toHaveBeenCalledTimes(pushesBefore);
+      expect(h.control.isReloadPending(BOUND_TAB)).toBe(false);
+      expect(h.reload).not.toHaveBeenCalled();
+
+      // The capture carries on: the tab's next document is re-armed with it.
+      h.control.handleAgentReady(BOUND_TAB, readyPayload({ documentId: 'doc-live-2' }));
+      const frames = configsTo(h, BOUND_TAB);
+      expect(frames).toEqual([armed, armed, armed]);
+      expect(frames.every((frame) => frame.captureId === CAPTURE_1)).toBe(true);
     });
   });
 

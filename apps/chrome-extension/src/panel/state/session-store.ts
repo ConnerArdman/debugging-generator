@@ -40,12 +40,14 @@
  *   fields is mirrored into a sibling slice. The slices beside `session` hold
  *   only what arrives out of band or must be maintained incrementally: progress
  *   rows, the current panel specification (the record holds only `panelIds`),
- *   the analysis as pushed, capture counters, the live tail, the selection and
- *   the optimistic pending target.
- * - **No wording.** Status labels and the "Tab left ‹origin›" sentence belong to
- *   the components, which render `PANEL_CONNECTION_LABELS` and
- *   `formatTabLeftMessage` from `../../shared/messages`. This module stores the
- *   imported vocabulary values and never a label.
+ *   the analysis as pushed, capture counters, the live tail and its capture
+ *   notices, the selection and the optimistic pending target.
+ * - **No wording.** Status labels, the "Tab left ‹origin›" sentence and the
+ *   "Page reloaded during capture" entry belong to the components, which render
+ *   `PANEL_CONNECTION_LABELS` and `formatTabLeftMessage` from
+ *   `../../shared/messages` and label each {@link PanelTailNotice} by its
+ *   `kind`. This module stores the imported vocabulary values and the notice's
+ *   data — its kind, capture, tab, document and time — and never a label.
  * - **No design tokens, no UI, no credential.** The devtools credential lives in
  *   `chrome.storage.local`, owned by the service worker; no field here holds it.
  *
@@ -108,7 +110,7 @@ import type {
   TelemetryEvent,
 } from '@debuggen/protocol';
 import { assertNever, nowEpochMs } from '@debuggen/shared';
-import type { CaptureId, PanelId, SessionId } from '@debuggen/shared';
+import type { CaptureId, MessageId, PanelId, SessionId } from '@debuggen/shared';
 
 import type {
   PanelBindingState,
@@ -145,6 +147,17 @@ export const LIVE_TAIL_MAX_EVENTS = 1000;
  * never a limit an ordinary run approaches.
  */
 export const PANEL_PROGRESS_MAX_ENTRIES = 200;
+
+/**
+ * The most capture notices the live tail keeps; the oldest are dropped first.
+ *
+ * A notice is recorded once per same-origin navigation of the bound tab during
+ * a running capture, and the list is cleared when a new capture starts, so a
+ * capture accumulates a handful at most. The cap bounds the panel's memory for
+ * a pathological capture — a page reloading itself in a loop — and is never a
+ * limit an ordinary capture approaches.
+ */
+export const LIVE_TAIL_MAX_NOTICES = 100;
 
 /*
  * ===========================================================================
@@ -253,6 +266,49 @@ export interface PanelCaptureSlice {
 }
 
 /**
+ * What a capture notice reports.
+ *
+ * - `page-reloaded` — the bound tab committed a same-origin navigation (a
+ *   reload, or a move to another page of the application) while a capture was
+ *   running: the service kept the binding, re-armed the agent in the new
+ *   document and the same capture continued (AAP §0.5.5).
+ *
+ * `LiveTail` words each kind; this module stores the kind only.
+ */
+export type PanelTailNoticeKind = 'page-reloaded';
+
+/**
+ * One capture-scoped entry of the live tail that is not a telemetry event: the
+ * developer-facing record of something that happened to the capture itself
+ * (AAP §0.5.5: "Application reloads mid-session → event log entry 'Page
+ * reloaded during capture'; the same captureId continues").
+ *
+ * Every notice belongs to the capture on screen: the list is emptied when a
+ * new capture starts, when a hydration reports a different capture and when
+ * the session changes, and it is kept when the capture stops, like the tail.
+ */
+export interface PanelTailNotice {
+  /**
+   * The id of the envelope that reported it — unique per frame, so it is the
+   * notice's identity and a stable rendering key.
+   */
+  readonly id: MessageId;
+  /** What happened. */
+  readonly kind: PanelTailNoticeKind;
+  /** The running capture the event happened in, which continues across it. */
+  readonly captureId: CaptureId;
+  /** The bound tab that navigated. */
+  readonly tabId: SessionBoundPayload['tabId'];
+  /**
+   * The new document's URL, exactly as the `session.bound` frame carried it —
+   * the same value the binding stores. `LiveTail` presents its path only.
+   */
+  readonly url: string;
+  /** When the service stamped the frame, in epoch milliseconds. */
+  readonly ts: number;
+}
+
+/**
  * The element-picking state that precedes the service's confirmation.
  *
  * Not a duplicate of `SessionRecord.target`, which is the confirmed target:
@@ -328,6 +384,11 @@ export interface PanelSnapshot {
   readonly liveTail: readonly TelemetryEvent[];
   /** How many events the live tail dropped to stay within its bound. */
   readonly liveTailDropped: number;
+  /**
+   * The capture's notices — such as a page reload during the capture — oldest
+   * first, bounded by {@link LIVE_TAIL_MAX_NOTICES}.
+   */
+  readonly tailNotices: readonly PanelTailNotice[];
   /** The event the `EventDetails` drawer shows; `undefined` closes it. */
   readonly selectedEvent: EventRef | undefined;
   /** The element-picking state that precedes the service's confirmation. */
@@ -378,6 +439,7 @@ const SNAPSHOT_KEYS = [
   'capture',
   'liveTail',
   'liveTailDropped',
+  'tailNotices',
   'selectedEvent',
   'target',
   'instrumentation',
@@ -425,6 +487,9 @@ const EMPTY_PROGRESS: readonly PanelProgressEntry[] = Object.freeze([]);
 
 /** The shared empty live tail. */
 const EMPTY_TAIL: readonly TelemetryEvent[] = Object.freeze([]);
+
+/** The shared empty list of capture notices. */
+const EMPTY_NOTICES: readonly PanelTailNotice[] = Object.freeze([]);
 
 /** No session holds the inspected tab. */
 const UNBOUND: PanelBindingState = Object.freeze({ kind: 'unbound' });
@@ -482,6 +547,7 @@ const SESSION_SCOPED_INITIAL = Object.freeze({
   capture: INITIAL_CAPTURE,
   liveTail: EMPTY_TAIL,
   liveTailDropped: 0,
+  tailNotices: EMPTY_NOTICES,
   selectedEvent: undefined,
   target: INITIAL_TARGET,
   instrumentation: INITIAL_INSTRUMENTATION,
@@ -770,6 +836,22 @@ function sameProgressEntry(left: PanelProgressEntry, right: PanelProgressEntry):
   );
 }
 
+/**
+ * Whether two capture notices record the same occurrence: the same frame, or a
+ * frame identical in everything a notice records — the redelivery of the
+ * announcement an existing notice was made from.
+ */
+function sameTailNotice(left: PanelTailNotice, right: PanelTailNotice): boolean {
+  return (
+    left.id === right.id ||
+    (left.kind === right.kind &&
+      left.captureId === right.captureId &&
+      left.tabId === right.tabId &&
+      left.url === right.url &&
+      left.ts === right.ts)
+  );
+}
+
 /*
  * ===========================================================================
  * Section I — slice builders
@@ -929,6 +1011,23 @@ function mergeProgress(
   return Object.freeze(replaced);
 }
 
+/**
+ * The capture notices with `notice` appended — or `notices` itself when the
+ * same occurrence is already recorded, so a redelivered frame changes nothing.
+ * Past {@link LIVE_TAIL_MAX_NOTICES} the oldest notices are dropped.
+ */
+function appendTailNotice(
+  notices: readonly PanelTailNotice[],
+  notice: PanelTailNotice,
+): readonly PanelTailNotice[] {
+  if (notices.some((recorded) => sameTailNotice(recorded, notice))) {
+    return notices;
+  }
+  const appended = [...notices, notice];
+  const overflow = appended.length - LIVE_TAIL_MAX_NOTICES;
+  return Object.freeze(overflow > 0 ? appended.slice(overflow) : appended);
+}
+
 /** A progress row from a `session.progress` payload and its envelope timestamp. */
 function progressEntry(payload: SessionProgressPayload, ts: number): PanelProgressEntry {
   return Object.freeze({
@@ -1038,10 +1137,27 @@ function currentPanelFor(
  * session. A record for a different session than the one on screen (with the
  * tab unbound) is a change of session identity and resets the session-scoped
  * slices first.
+ *
+ * A record of the session on screen that is **older** than the one held — the
+ * service worker's stored snapshot (`GET /sessions/:id`, pushed on bind) racing
+ * a newer `session.updated` — is dropped, and so is the very object already
+ * held. Every frame carries the whole record (AAP §0.4.2), so applying a stale
+ * one would regress the panel and re-render every subscriber for nothing;
+ * returning the unchanged snapshot keeps the store's identity and notifies no
+ * one. A record with an equal `updatedAt` is applied: two writes can share a
+ * millisecond, and the later frame is the later write.
  */
 function reduceSessionRecord(snapshot: PanelSnapshot, record: SessionRecord): PanelSnapshot {
   const binding = snapshot.connection.binding;
   if (binding.kind === 'bound' && binding.sessionId !== record.id) {
+    return snapshot;
+  }
+  const held = snapshot.session;
+  if (
+    held !== undefined &&
+    held.id === record.id &&
+    (held === record || record.updatedAt < held.updatedAt)
+  ) {
     return snapshot;
   }
   const base = isSessionSwitch(snapshot, record.id) ? resetSessionScope(snapshot) : snapshot;
@@ -1075,6 +1191,59 @@ function reduceTelemetryTail(
   });
 }
 
+/** The relayed `session.bound` envelope. */
+type SessionBoundMessage = Extract<RelayedProtocolMessage, { readonly type: 'session.bound' }>;
+
+/**
+ * Apply `session.bound`: move to the binding it announces (see
+ * {@link bindingFromBound}) and, for a same-origin navigation during a running
+ * capture, record a `page-reloaded` notice in the same commit.
+ *
+ * The notice is recorded only when all of these hold, so it always describes
+ * this panel's capture:
+ *
+ * - the reason is `'navigated'` — the service kept the binding across a
+ *   committed navigation of the bound tab and re-armed the agent (AAP §0.5.5).
+ *   An establishment or a re-announcement after a reconnect (`'bound'`, or no
+ *   reason), a replacement and both drops are not a reload of the captured
+ *   page;
+ * - the announcement is about this panel's binding — `bindingFromBound`
+ *   returned one, which it does not for another tab's navigation — and it did
+ *   not change the session on screen: a change of session identity has
+ *   already reset the capture slice, so the next condition fails;
+ * - a capture is running with a known id, which is the capture the notice
+ *   belongs to and which continues across the navigation.
+ *
+ * A frame that repeats a recorded notice (see {@link sameTailNotice}) adds
+ * nothing; with an unchanged binding it leaves the snapshot reference intact.
+ */
+function reduceSessionBound(snapshot: PanelSnapshot, message: SessionBoundMessage): PanelSnapshot {
+  const payload = message.payload;
+  const binding = bindingFromBound(snapshot, payload);
+  if (binding === undefined) {
+    return snapshot;
+  }
+  const next = applyBinding(snapshot, binding);
+  const capture = next.capture;
+  if (
+    payload.reason !== 'navigated' ||
+    binding.kind !== 'bound' ||
+    !capture.active ||
+    capture.captureId === undefined
+  ) {
+    return next;
+  }
+  const notice: PanelTailNotice = Object.freeze({
+    id: message.id,
+    kind: 'page-reloaded',
+    captureId: capture.captureId,
+    tabId: binding.tabId,
+    url: binding.url,
+    ts: message.ts,
+  });
+  return withChanges(next, { tailNotices: appendTailNotice(next.tailNotices, notice) });
+}
+
 /**
  * The snapshot after one relayed protocol frame.
  *
@@ -1101,10 +1270,8 @@ function reduceRelayedMessage(
       });
     }
 
-    case 'session.bound': {
-      const binding = bindingFromBound(snapshot, message.payload);
-      return binding === undefined ? snapshot : applyBinding(snapshot, binding);
-    }
+    case 'session.bound':
+      return reduceSessionBound(snapshot, message);
 
     case 'capture.started': {
       const payload = message.payload;
@@ -1115,7 +1282,7 @@ function reduceRelayedMessage(
       ) {
         return snapshot;
       }
-      // A new capture starts from a clean log and a zero counter.
+      // A new capture starts from a clean log, no notices and a zero counter.
       return withChanges(snapshot, {
         capture: Object.freeze({
           active: true,
@@ -1126,6 +1293,7 @@ function reduceRelayedMessage(
         }),
         liveTail: EMPTY_TAIL,
         liveTailDropped: 0,
+        tailNotices: EMPTY_NOTICES,
       });
     }
 
@@ -1298,9 +1466,10 @@ function reduceRelayedMessage(
  * record's latest capture, since the answer carries no counters of its own).
  * Preserved, because a reconnect after an MV3 worker suspension is not
  * something the developer did: the selected event, the pending target, the
- * accumulated live tail, the progress rows, the instrumentation outcome, the
- * cleanup outcome and the last error — unless the answer names a different
- * session, which resets them, or a different capture, which clears the tail.
+ * accumulated live tail and its capture notices, the progress rows, the
+ * instrumentation outcome, the cleanup outcome and the last error — unless the
+ * answer names a different session, which resets them, or a different capture,
+ * which clears the tail and its notices.
  *
  * A record that is not the bound session's, and a panel or an analysis that is
  * not the shown session's, is dropped rather than rendered.
@@ -1355,7 +1524,9 @@ function reduceSessionSnapshot(
     analysis,
     capture,
     target: record === undefined ? base.target : reconcileTarget(base.target, record, base.session),
-    ...(captureChanged ? { liveTail: EMPTY_TAIL, liveTailDropped: 0 } : {}),
+    ...(captureChanged
+      ? { liveTail: EMPTY_TAIL, liveTailDropped: 0, tailNotices: EMPTY_NOTICES }
+      : {}),
   });
 }
 

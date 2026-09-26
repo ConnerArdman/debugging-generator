@@ -29,8 +29,22 @@
  *   `server-agent` WebSocket for its project (`client.hello { client:
  *   'server-agent', projectRoot }`), so "a `server-agent` connection exists for
  *   this project" is exactly "the preload is loaded and active". That fact
- *   arrives through the injected {@link ServerAgentPresence} port; this module
- *   never sniffs a process table, a command line or an HTTP header.
+ *   arrives through the injected {@link ServerAgentPresence} port and nowhere
+ *   else: preload presence is never inferred from a process table, a command
+ *   line or an HTTP header.
+ * - **Server identity is evidence too.** An HTTP answer at the session URL
+ *   proves only that *something* listens there. The answering server counts as
+ *   this project's dev server only when the response carries the framework's
+ *   own signature — for Next.js, `X-Powered-By: Next.js` or the
+ *   `next-router-state-tree` token in `Vary`, which `next dev` sends on every
+ *   response, its 404 and 500 pages included. A connected `server-agent` does
+ *   not identify the answer: presence is known per *project*, not per port, so
+ *   an agent whose dev server listens at another address says nothing about
+ *   whatever holds this one. Any unsigned answer is reported as
+ *   {@link DevServerDetection.occupied} — another process holding the address,
+ *   which a caller must neither reuse nor launch over, so `canLaunch` is
+ *   `false` — whatever the registry says. Header values are read only to match
+ *   that signature: none is ever stored, returned or logged.
  * - **Degradation is data.** {@link detectDevServer} never throws and never
  *   returns an error: every partial failure becomes a `notes` entry, because a
  *   detection failure must not fail the session — capture proceeds with the
@@ -58,6 +72,12 @@
  * developer-facing hint always leads with the token-free route — the editor's
  * "Debug Generator: Launch Dev Server" command, which mints the credential
  * itself — and offers the manual line as the fallback.
+ *
+ * Every relaunch hint and every preload-gap reason this module composes is
+ * registered with `../sessions/progress.ts`'s `authorProductText` as it is
+ * composed, so the failure surfaces that show only product-authored text
+ * (CWE-209) can still show this exact command. The registry is in-memory and
+ * bounded; nothing is written anywhere.
  *
  * @example
  * ```ts
@@ -113,7 +133,8 @@ import {
 import { readFileNoFollow } from '@debuggen/shared/node';
 
 import type { ServiceConfig } from '../config.js';
-import { subsystemLogger } from '../logging.js';
+import { describeException, subsystemLogger } from '../logging.js';
+import { authorProductText } from '../sessions/progress.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -192,6 +213,41 @@ export const DEV_SERVER_PRELOAD_REASONS = Object.freeze([
   'unknown',
 ] as const);
 
+/**
+ * Every framework whose dev server {@link probeDevServer} can recognise from
+ * its own response signature — the value of
+ * {@link DevServerProbeResult.framework}.
+ */
+export const DEV_SERVER_FRAMEWORKS = Object.freeze(['next'] as const);
+
+/**
+ * Every value {@link DevServerIdentityEvidence} can take: the framework's
+ * response signature, the only evidence that ties an answer to the address it
+ * came from. A `server-agent` connection is not among them — the registry
+ * knows a project has one, not which port that agent's server holds.
+ */
+export const DEV_SERVER_IDENTITY_EVIDENCE = Object.freeze(['framework-signature'] as const);
+
+/**
+ * The response signature each {@link DEV_SERVER_FRAMEWORKS} member's dev
+ * server sends, matched case-insensitively:
+ *
+ * - `poweredBy` — a substring of the `X-Powered-By` value (`next dev` sends
+ *   `Next.js` on pages and on its 404 page);
+ * - `varyToken` — one token of the comma-separated `Vary` list (`next dev`
+ *   lists `rsc, next-router-state-tree, next-router-prefetch, …` on every
+ *   response, route handlers and 500s included, so an app that disables
+ *   `X-Powered-By` is still recognised).
+ *
+ * Only these fixed markers are compared; the header values themselves never
+ * leave {@link frameworkOf}.
+ */
+const FRAMEWORK_RESPONSE_SIGNATURES: Readonly<
+  Record<DevServerFramework, { readonly poweredBy: string; readonly varyToken: string }>
+> = Object.freeze({
+  next: Object.freeze({ poweredBy: 'next.js', varyToken: 'next-router-state-tree' }),
+});
+
 /** Every value {@link DevServerPackageManagerSource} can take, by precedence. */
 export const PACKAGE_MANAGER_SOURCES = Object.freeze([
   'project-summary',
@@ -264,8 +320,36 @@ export type PackageManagerId = ProjectSummary['packageManager'];
 /** A {@link PackageManagerId} with a real runner binary. */
 export type KnownPackageManagerId = Exclude<PackageManagerId, 'unknown'>;
 
-/** Why a dev server is, or is not, known to carry the preload. */
+/**
+ * Why a dev server is, or is not, known to carry the preload.
+ *
+ * - `'server-agent-connected'` — this project's dev server answered (its
+ *   framework signature identified it) and a `server-agent` is connected for
+ *   the project: the preload is attached.
+ * - `'no-server-agent-connection'` — this project's dev server answered (its
+ *   framework signature identified it) and the registry reports no
+ *   `server-agent` connection: it runs without the preload.
+ * - `'not-running'` — this project's dev server was not found answering at the
+ *   session URL: nothing answered, no URL was known, or whatever answered
+ *   carried no framework signature ({@link DevServerDetection.occupied}), even
+ *   with a `server-agent` connected for the project.
+ * - `'unknown'` — this project's dev server answered, but the registry was
+ *   unavailable or failed, so whether it carries the preload is unknown.
+ */
 export type DevServerPreloadReason = (typeof DEV_SERVER_PRELOAD_REASONS)[number];
+
+/** A framework whose dev server {@link probeDevServer} recognises by its response signature. */
+export type DevServerFramework = (typeof DEV_SERVER_FRAMEWORKS)[number];
+
+/**
+ * What identified the server answering at the session URL as this project's
+ * dev server.
+ *
+ * - `'framework-signature'` — the response carried the framework's own
+ *   signature ({@link DevServerProbeResult.framework}). Whether a
+ *   `server-agent` is connected decides preload presence, never identity.
+ */
+export type DevServerIdentityEvidence = (typeof DEV_SERVER_IDENTITY_EVIDENCE)[number];
 
 /**
  * Which route produced {@link DevServerDetection.packageManager}.
@@ -293,15 +377,26 @@ export interface DevServerProbeError {
 /**
  * The outcome of one loopback probe.
  *
- * `reachable` is `true` for **any** HTTP status: a dev server answering 404 or
- * 500 is still running. `url` is the probed origin and pathname only — the
- * query and fragment are never recorded (AAP §0.5.2).
+ * `reachable` is `true` for **any** HTTP status: something answering 404 or
+ * 500 is still listening. Whether it is *this project's* dev server is a
+ * separate fact, and `framework` is the whole of it (see
+ * {@link DevServerDetection.identifiedBy}). `url` is
+ * the probed origin and pathname only — the query and fragment are never
+ * recorded (AAP §0.5.2) — and no header value is ever recorded.
  */
 export interface DevServerProbeResult {
   readonly url: string;
   readonly reachable: boolean;
   /** The HTTP status, when a response arrived. */
   readonly status?: number;
+  /**
+   * The framework whose dev-server signature the response carried — for
+   * `'next'`, an `X-Powered-By` value containing `Next.js` or a `Vary` list
+   * with the `next-router-state-tree` token, both matched case-insensitively.
+   * Present only when a response arrived and its headers matched; absent when
+   * the response carried no signature or its headers could not be read.
+   */
+  readonly framework?: DevServerFramework;
   /** Wall time of the probe from the injected clock; finite and `>= 0`. */
   readonly durationMs: number;
   /** Why no response arrived, when `reachable` is `false`. */
@@ -343,8 +438,29 @@ export interface DevServerDetection {
   readonly projectRoot: string;
   /** The probed dev-server URL (origin and pathname), when one was known and valid. */
   readonly devServerUrl?: string;
-  /** Whether the dev server answered the probe with any HTTP status. */
+  /**
+   * Whether **this project's** dev server answered the probe: an HTTP response
+   * (any status) arrived *and* it carried the framework's response signature
+   * ({@link DevServerDetection.identifiedBy}). A `server-agent` connection for
+   * the project never makes an unsigned answer `running`. An unsigned answer
+   * is `running: false` with {@link DevServerDetection.occupied}.
+   */
   readonly running: boolean;
+  /**
+   * What identified the answering server as this project's dev server.
+   * Present exactly when `running` is `true`, and then always
+   * `'framework-signature'`.
+   */
+  readonly identifiedBy?: DevServerIdentityEvidence;
+  /**
+   * `true` exactly when an HTTP response arrived at the session URL but carried
+   * no framework signature, whatever the `server-agent` registry reports:
+   * another process holds the address, which a caller must neither reuse nor
+   * launch over (`canLaunch` is `false`). When a `server-agent` is connected
+   * for the project, a note says its dev server may be listening at a
+   * different address. Absent otherwise — never `false`.
+   */
+  readonly occupied?: true;
   /** The probe outcome, when a probe was attempted. */
   readonly probe?: DevServerProbeResult;
   /** `running` and a `server-agent` connection exists for this project. */
@@ -365,8 +481,10 @@ export interface DevServerDetection {
   readonly relaunchHint: string;
   /**
    * Whether the launcher can start a dev server from this detection alone:
-   * nothing is running and a dev script was found. A launch request that
-   * supplies its own `command` may still succeed when this is `false`.
+   * this project's dev server is not running, no other process holds the
+   * session URL (`occupied` is absent) and a dev script was found. A launch
+   * request that supplies its own `command` may still succeed when this is
+   * `false`.
    */
   readonly canLaunch: boolean;
   /** Human-readable notes on every degraded step, in the order they occurred. */
@@ -410,9 +528,13 @@ export interface RelaunchCommandInput {
  * The client registry's answer to "is a `server-agent` connected for this
  * project?" — satisfied structurally by `src/server/clients.ts`, which tracks
  * connected clients by kind, project and tab. The only evidence of preload
- * presence this module accepts.
+ * presence this module accepts. It is never identity evidence: the registry
+ * knows that a project has a connected agent, not which address that agent's
+ * server listens on, so it cannot vouch for whatever answers at the session
+ * URL ({@link DevServerIdentityEvidence}).
  */
 export interface ServerAgentPresence {
+  /** Whether a `server-agent` connection is online for `projectRoot`; only `true` counts. */
   hasServerAgentForProject(projectRoot: string): boolean;
 }
 
@@ -424,12 +546,16 @@ export interface FetchLikeInit {
 }
 
 /**
- * The slice of a fetch response a probe reads. `body` is optional so a test
- * stub can return `{ status }` alone; when present it is cancelled unread.
+ * The slice of a fetch response a probe reads. `body` and `headers` are
+ * optional so a test stub can return `{ status }` alone; a body is cancelled
+ * unread, and headers (undici's `Headers` satisfies the shape) are consulted
+ * only for the framework signature, by a lower-case name, defensively — a
+ * `get` that throws or returns a non-string is "no signature", never a crash.
  */
 export interface FetchLikeResponse {
   readonly status: number;
   readonly body?: { cancel(reason?: unknown): Promise<void> } | null | undefined;
+  readonly headers?: { get(name: string): string | null } | null | undefined;
 }
 
 /** The narrow slice of `fetch` a probe calls. Defaults to Node's global `fetch`. */
@@ -469,7 +595,10 @@ export interface DevServerDetectDeps {
   readonly config?: Pick<ServiceConfig, 'host' | 'port'> | undefined;
   /** Parent logger; lines are bound to `subsystem: "dev-server"`. Default: no-op. */
   readonly logger?: Logger | undefined;
-  /** Preload evidence. Absent → a running server's preload state is `'unknown'`. */
+  /**
+   * Preload evidence only; identity always comes from the framework signature.
+   * Absent → a running server's preload state is `'unknown'`.
+   */
   readonly serverAgents?: ServerAgentPresence | undefined;
   /** HTTP client for the probe. Default: the global `fetch`. */
   readonly fetchImpl?: FetchLike | undefined;
@@ -513,6 +642,17 @@ export interface DevServerDetectDeps {
  * neither sent, recorded nor logged. Redirects are not followed, and the
  * response body is cancelled unread.
  *
+ * `reachable` says only that *something* listens. When a response arrived,
+ * its headers are also matched against each framework's dev-server signature
+ * (for Next.js: `X-Powered-By` containing `Next.js`, or the
+ * `next-router-state-tree` token in `Vary`, case-insensitively), and a match
+ * sets {@link DevServerProbeResult.framework} — the only evidence
+ * {@link detectDevServer} uses to tell this project's dev server from another
+ * process on the port, whether or not a `server-agent` is connected. Headers are read
+ * defensively (a missing, throwing or non-string `get` is "no signature"), and
+ * no header value is ever stored, returned or logged; the debug line carries
+ * the matched framework name only.
+ *
  * @param url The dev-server URL, e.g. the session's `devServerUrl`.
  * @param deps `fetchImpl`, `now`, `probeTimeoutMs` and `logger` are read.
  * @returns The probe outcome, or `CONFIG_INVALID` for a URL that may not be probed.
@@ -521,7 +661,8 @@ export interface DevServerDetectDeps {
  * ```ts
  * const probe = await probeDevServer('http://127.0.0.1:3000/', { probeTimeoutMs: 500 });
  * if (isOk(probe) && probe.value.reachable) {
- *   // something answered, whatever the status
+ *   // something answered, whatever the status; `probe.value.framework === 'next'`
+ *   // when the answer carried the Next.js dev-server signature
  * }
  * ```
  */
@@ -549,11 +690,16 @@ export async function probeDevServer(
 
   if (outcome.kind === 'response') {
     const status = outcome.response.status;
-    const result: DevServerProbeResult = Number.isInteger(status)
-      ? { url: probedUrl, reachable: true, status, durationMs }
-      : { url: probedUrl, reachable: true, durationMs };
+    const framework = frameworkOf(outcome.response);
+    const result: DevServerProbeResult = {
+      url: probedUrl,
+      reachable: true,
+      ...(Number.isInteger(status) ? { status } : {}),
+      ...(framework === undefined ? {} : { framework }),
+      durationMs,
+    };
     logSafely(() => {
-      logger.debug('Dev-server probe answered', { url: probedUrl, status, durationMs });
+      logger.debug('Dev-server probe answered', { url: probedUrl, status, framework, durationMs });
     });
     return ok(result);
   }
@@ -723,6 +869,55 @@ function releaseBody(response: FetchLikeResponse): void {
 /** Swallows a rejection whose only consequence would be an unhandled-rejection warning. */
 function ignoreRejection(): undefined {
   return undefined;
+}
+
+/**
+ * The framework whose dev-server signature a response carries, or `undefined`.
+ *
+ * Each {@link FRAMEWORK_RESPONSE_SIGNATURES} entry is tried in
+ * {@link DEV_SERVER_FRAMEWORKS} order; a response matches when its
+ * `X-Powered-By` value contains the entry's marker or its comma-separated
+ * `Vary` list holds the entry's token (both case-insensitive, tokens trimmed).
+ * The header values are compared here and dropped: only the framework name
+ * leaves this function.
+ */
+function frameworkOf(response: FetchLikeResponse): DevServerFramework | undefined {
+  const poweredBy = headerValueOf(response, 'x-powered-by')?.toLowerCase();
+  const varyTokens = new Set(
+    (headerValueOf(response, 'vary') ?? '')
+      .split(',')
+      .map((token) => token.trim().toLowerCase())
+      .filter((token) => token.length > 0),
+  );
+
+  return DEV_SERVER_FRAMEWORKS.find((framework) => {
+    const signature = FRAMEWORK_RESPONSE_SIGNATURES[framework];
+    return (
+      (poweredBy !== undefined && poweredBy.includes(signature.poweredBy)) ||
+      varyTokens.has(signature.varyToken)
+    );
+  });
+}
+
+/**
+ * One response header's value, read without trusting the response's shape:
+ * `undefined` when the response has no headers, when reading them or calling
+ * `get` throws (a getter that throws, a `get` that is not a function), or when
+ * `get` answers anything but a string.
+ */
+function headerValueOf(response: FetchLikeResponse, name: string): string | undefined {
+  try {
+    const headers = response.headers;
+    if (headers === undefined || headers === null) {
+      return undefined;
+    }
+    const value: unknown = headers.get(name);
+    return typeof value === 'string' ? value : undefined;
+  } catch {
+    // An unreadable header is "no signature": the probe's answer — that
+    // something responded — stands, and identity falls to the registry.
+    return undefined;
+  }
 }
 
 /**
@@ -1271,9 +1466,14 @@ function isControlCode(code: number): boolean {
 // Relaunch hint
 // ---------------------------------------------------------------------------
 
-/** The situation a hint speaks to; picks its first sentence and its verb. */
+/**
+ * The situation a hint speaks to; picks its first sentence and its verb.
+ * `'occupied'` is an unidentified server answering at the session URL
+ * ({@link DevServerDetection.occupied}), which is neither this project's dev
+ * server nor a free address the launcher could use.
+ */
 type HintSituation =
-  'attached' | 'running-without-preload' | 'unconfirmed' | 'not-running' | 'generic';
+  'attached' | 'running-without-preload' | 'unconfirmed' | 'occupied' | 'not-running' | 'generic';
 
 /** Opening sentence of the hint for each situation. */
 const HINT_CONSEQUENCES: Readonly<Record<HintSituation, string>> = Object.freeze({
@@ -1282,6 +1482,8 @@ const HINT_CONSEQUENCES: Readonly<Record<HintSituation, string>> = Object.freeze
     "This project's dev server is running without the Debug Generator preload, so server and database spans cannot be captured.",
   unconfirmed:
     "Whether this project's dev server carries the Debug Generator preload could not be confirmed; without it, server and database spans cannot be captured.",
+  occupied:
+    "Another process answers at this project's dev-server address, not this project's dev server, so server and database spans cannot be captured.",
   'not-running':
     'No dev server with the Debug Generator preload is running for this project, so server and database spans cannot be captured.',
   generic:
@@ -1293,6 +1495,7 @@ const HINT_ACTIONS: Readonly<Record<HintSituation, string>> = Object.freeze({
   attached: `If you restart it, run "${LAUNCH_DEV_SERVER_COMMAND_TITLE}" in VS Code, which keeps the preload attached`,
   'running-without-preload': `Stop it, then run "${LAUNCH_DEV_SERVER_COMMAND_TITLE}" in VS Code, which starts it with the preload and a fresh ingest credential`,
   unconfirmed: `If it lacks the preload, stop it, then run "${LAUNCH_DEV_SERVER_COMMAND_TITLE}" in VS Code, which starts it with the preload and a fresh ingest credential`,
+  occupied: `Stop the process holding that address, or set debuggen.devServerUrl to this project's dev-server address, then run "${LAUNCH_DEV_SERVER_COMMAND_TITLE}" in VS Code, which starts it with the preload and a fresh ingest credential`,
   'not-running': `Run "${LAUNCH_DEV_SERVER_COMMAND_TITLE}" in VS Code, which starts it with the preload and a fresh ingest credential`,
   generic: `Run "${LAUNCH_DEV_SERVER_COMMAND_TITLE}" in VS Code, which starts it with the preload and a fresh ingest credential`,
 });
@@ -1304,9 +1507,10 @@ const HINT_ACTIONS: Readonly<Record<HintSituation, string>> = Object.freeze({
  * command) and, as the fallback, the exact relaunch command.
  *
  * Given a {@link DevServerDetection}, it speaks to that detection's situation
- * (running without the preload, not running, unconfirmed, attached) and quotes
- * its `relaunchCommand` verbatim; given a {@link RelaunchCommandInput}, it
- * formats the command with {@link formatRelaunchCommand} and speaks generically.
+ * (running without the preload, not running, another process holding the
+ * address, unconfirmed, attached) and quotes its `relaunchCommand` verbatim;
+ * given a {@link RelaunchCommandInput}, it formats the command with
+ * {@link formatRelaunchCommand} and speaks generically.
  * This is the string `src/instrumentation/readiness.ts` places in an
  * `UnavailableSignal.hint` (AAP §0.5.5).
  *
@@ -1322,12 +1526,20 @@ export function buildRelaunchHint(input: DevServerDetection | RelaunchCommandInp
   return composeRelaunchHint('generic', formatRelaunchCommand(input));
 }
 
-/** Which hint situation a detection's facts describe. */
+/**
+ * Which hint situation a detection's facts describe. `occupied` is optional
+ * in the facts, so a caller holding only the four older fields (for example a
+ * detection `src/instrumentation/readiness.ts` re-situates) is read unchanged.
+ */
 function situationOf(
-  facts: Pick<DevServerDetection, 'running' | 'preloadAttached' | 'preloadReason'>,
+  facts: Pick<DevServerDetection, 'running' | 'preloadAttached' | 'preloadReason'> &
+    Partial<Pick<DevServerDetection, 'occupied'>>,
 ): HintSituation {
   if (facts.preloadAttached) {
     return 'attached';
+  }
+  if (facts.occupied === true) {
+    return 'occupied';
   }
   if (!facts.running) {
     return 'not-running';
@@ -1337,7 +1549,18 @@ function situationOf(
     : 'unconfirmed';
 }
 
-/** Compose the hint text, choosing the longest form that fits the hint limit. */
+/**
+ * Compose the hint text, choosing the longest form that fits the hint limit.
+ *
+ * The one composer of every relaunch hint — {@link buildRelaunchHint}, a
+ * detection's `relaunchHint` and the degraded detection's all come from here —
+ * so the result is registered with `authorProductText` at this point of
+ * composition. That registration is the proof a failure surface (a failed row,
+ * `instrumentation.failed`, an HTTP refusal) later checks before it shows a
+ * failure's hint verbatim: an adapter's own relaunch text, or any other hint
+ * this function did not produce, never matches and is replaced by fixed copy
+ * (CWE-209), while this exact command still reaches the developer (AAP §0.5.5).
+ */
 function composeRelaunchHint(situation: HintSituation, command: string): string {
   const consequence = HINT_CONSEQUENCES[situation];
   const action = HINT_ACTIONS[situation];
@@ -1367,11 +1590,11 @@ function composeRelaunchHint(situation: HintSituation, command: string): string 
     `${consequence} ${action}.`,
   ];
 
-  return (
+  return authorProductText(
     candidates.find(
       (candidate) =>
         candidate.length <= READINESS_HINT_MAX_LENGTH && !hasControlCharacter(candidate),
-    ) ?? `${consequence} ${action}.`
+    ) ?? `${consequence} ${action}.`,
   );
 }
 
@@ -1389,16 +1612,19 @@ function joinWords(words: readonly string[]): string {
  * `relaunchHint` as its hint, so every surface shows the same exact command.
  * Empty when the preload is attached. Only server signals are reported (a
  * browser-only signal in `signals` is ignored), each at most once, in the
- * order given.
+ * order given. A detection with {@link DevServerDetection.occupied} is
+ * reported as another process holding the dev-server address.
  *
- * @param detection The detection to report on.
+ * @param detection The detection to report on; `occupied` is optional, so a
+ *   caller holding only the other four fields compiles and reads unchanged.
  * @param signals The planned signals; defaults to {@link PRELOAD_DEPENDENT_SIGNALS}.
  */
 export function buildPreloadUnavailableSignals(
   detection: Pick<
     DevServerDetection,
     'running' | 'preloadAttached' | 'preloadReason' | 'relaunchHint'
-  >,
+  > &
+    Partial<Pick<DevServerDetection, 'occupied'>>,
   signals: readonly CaptureSignal[] = PRELOAD_DEPENDENT_SIGNALS,
 ): readonly UnavailableSignal[] {
   if (detection.preloadAttached) {
@@ -1406,7 +1632,9 @@ export function buildPreloadUnavailableSignals(
   }
 
   const serverSignals = new Set<CaptureSignal>(SERVER_CAPTURE_SIGNALS);
-  const reason = preloadGapReason(situationOf(detection));
+  // Registered as the product's own words, like the relaunch hint, so the
+  // capture gate may quote it in a refusal ("Could not enable ‹signal›: …").
+  const reason = authorProductText(preloadGapReason(situationOf(detection)));
   const reported = new Set<CaptureSignal>();
   const unavailable: UnavailableSignal[] = [];
 
@@ -1426,6 +1654,8 @@ function preloadGapReason(situation: HintSituation): string {
       return 'no dev-server preload is attached for this project';
     case 'not-running':
       return 'no dev server with the preload is running for this project';
+    case 'occupied':
+      return 'another process holds the dev-server address for this project';
     case 'unconfirmed':
     case 'generic':
     case 'attached':
@@ -1440,19 +1670,30 @@ function preloadGapReason(situation: HintSituation): string {
 // ---------------------------------------------------------------------------
 
 /**
- * Answer, for one project: is a dev server running at the session's URL, does
- * it carry the preload, which package manager and script would start it, and
- * what exact command relaunches it instrumented.
+ * Answer, for one project: is this project's dev server running at the
+ * session's URL (or does another process hold that address), does it carry
+ * the preload, which package manager and script would start it, and what
+ * exact command relaunches it instrumented.
  *
  * Steps, each of which degrades to a `notes` entry instead of failing:
  * 1. **Probe** `input.devServerUrl` with {@link probeDevServer}. No URL → no
  *    probe and `running: false`; a refused URL or no answer → a note.
- * 2. **Preload**: `preloadAttached` is `running` and a `server-agent`
- *    connection for the project, from the injected {@link ServerAgentPresence}.
- *    `preloadReason` is `'not-running'` whenever nothing answered (that is the
- *    fact, whatever the registry says), otherwise `'server-agent-connected'`,
- *    `'no-server-agent-connection'`, or `'unknown'` when no registry was
- *    injected or it failed.
+ * 2. **Identity and preload**, from the probe and the injected
+ *    {@link ServerAgentPresence} (queried once; no registry, or one that
+ *    throws, is "unknown"):
+ *    - `running` — a response arrived (any status) *and* it carried a
+ *      framework signature; `identifiedBy` is then `'framework-signature'`.
+ *      The registry plays no part in identity.
+ *    - `occupied: true` — a response arrived without a signature, whatever the
+ *      registry says; a note names the probed URL and status (never a header
+ *      value) and, when a `server-agent` is connected for the project, says
+ *      that agent's server may be on another address. `canLaunch` is `false`,
+ *      because launching would collide with the process holding the address.
+ *    - `preloadAttached` — `running` and a `server-agent` connection.
+ *    - `preloadReason` — `'not-running'` whenever this project's dev server was
+ *      not found answering (that is the fact, whatever the registry says),
+ *      otherwise `'server-agent-connected'`, `'no-server-agent-connection'`,
+ *      or `'unknown'` when no registry was injected or it failed.
  * 3. **Manifest and dev script** with {@link readTargetManifest} and
  *    {@link selectDevScript}.
  * 4. **Package manager**, by precedence: the injected `projectSummary` or
@@ -1482,6 +1723,8 @@ export async function detectDevServer(
         projectRoot: detection.projectRoot,
         devServerUrl: detection.devServerUrl,
         running: detection.running,
+        identifiedBy: detection.identifiedBy,
+        occupied: detection.occupied === true,
         preloadAttached: detection.preloadAttached,
         preloadReason: detection.preloadReason,
         packageManager: detection.packageManager,
@@ -1495,10 +1738,13 @@ export async function detectDevServer(
   } catch (error) {
     // Last resort. Every step above degrades on its own; this catches a
     // collaborator failing in a way no step anticipated, so the caller still
-    // gets a usable, honest answer rather than an exception.
+    // gets a usable, honest answer rather than an exception. The failure is
+    // named by its closed class and code only: an unanticipated value's own
+    // `name` and `message` are whatever it was built with, a path or a URL
+    // included, and never enter the record.
     logSafely(() => {
       logger.warn('Dev-server detection failed unexpectedly; reporting a degraded result', {
-        errorName: propertyOf(error, 'name'),
+        ...describeException(error),
       });
     });
     return degradedDetection(input);
@@ -1515,8 +1761,7 @@ async function runDetection(
   const projectRoot = input.projectRoot;
 
   const probe = await probeSessionUrl(input.devServerUrl, deps, notes);
-  const running = probe?.reachable === true;
-  const presence = observePreload(projectRoot, running, deps.serverAgents, notes);
+  const presence = observePreload(projectRoot, probe, deps.serverAgents, notes);
 
   const manifest = readManifestForDetection(projectRoot, deps, notes);
   const devScript = manifest === undefined ? undefined : selectDevScript(manifest);
@@ -1540,12 +1785,14 @@ async function runDetection(
     preloadUrl: preloadUrlFromPath(deps.preloadPath, notes),
     ingestUrl: ingestUrlFor(deps, notes),
   });
-  const relaunchHint = composeRelaunchHint(situationOf({ running, ...presence }), relaunchCommand);
+  const relaunchHint = composeRelaunchHint(situationOf(presence), relaunchCommand);
 
   return {
     projectRoot,
     ...(probe === undefined ? {} : { devServerUrl: probe.url, probe }),
-    running,
+    running: presence.running,
+    ...(presence.identifiedBy === undefined ? {} : { identifiedBy: presence.identifiedBy }),
+    ...(presence.occupied === undefined ? {} : { occupied: presence.occupied }),
     preloadAttached: presence.preloadAttached,
     preloadReason: presence.preloadReason,
     packageManager: packageManager.id,
@@ -1553,7 +1800,9 @@ async function runDetection(
     ...(devScript === undefined ? {} : { devScript }),
     relaunchCommand,
     relaunchHint,
-    canLaunch: !running && devScript !== undefined,
+    // An occupied address is not launchable: a child bound to the same port
+    // would fail to listen, or answer beside a process that is not this project's.
+    canLaunch: !presence.running && presence.occupied !== true && devScript !== undefined,
     notes: Object.freeze([...notes]),
   };
 }
@@ -1582,49 +1831,124 @@ async function probeSessionUrl(
   return probed.value;
 }
 
-/** Step 2: preload presence, from the client registry only. */
+/** What step 2 establishes: whose server answered, and whether it carries the preload. */
+type PreloadObservation = Pick<
+  DevServerDetection,
+  'running' | 'identifiedBy' | 'occupied' | 'preloadAttached' | 'preloadReason'
+>;
+
+/**
+ * The registry's answer for a project: `true` only for a literal `true` (a
+ * JavaScript port answering `1` is not evidence), `false` for any other value,
+ * `'unknown'` when no registry was injected or it threw.
+ */
+type RegistryAnswer = boolean | 'unknown';
+
+/**
+ * Step 2: identity and preload presence.
+ *
+ * The answering server is this project's dev server only when the probe
+ * matched a framework signature. The registry decides preload presence alone
+ * and never identity: a `server-agent` connected for the project may belong to
+ * a dev server listening on another port, so it cannot vouch for an unsigned
+ * responder at this one. An unsigned answer is `occupied`, with a note that
+ * names the probed URL and status and never a header value.
+ */
 function observePreload(
   projectRoot: string,
-  running: boolean,
+  probe: DevServerProbeResult | undefined,
   serverAgents: ServerAgentPresence | undefined,
   notes: string[],
-): Pick<DevServerDetection, 'preloadAttached' | 'preloadReason'> {
-  if (serverAgents === undefined) {
-    if (running) {
-      notes.push(
-        'No server-agent registry was available, so whether the running dev server carries the preload is unknown.',
-      );
-      return { preloadAttached: false, preloadReason: 'unknown' };
-    }
-    return { preloadAttached: false, preloadReason: 'not-running' };
-  }
-
-  let connected: boolean;
-  try {
-    connected = serverAgents.hasServerAgentForProject(projectRoot) === true;
-  } catch {
-    notes.push(
-      'The server-agent registry could not be queried, so whether the dev server carries the preload is unknown.',
-    );
-    return { preloadAttached: false, preloadReason: running ? 'unknown' : 'not-running' };
-  }
+): PreloadObservation {
+  const connected = queryServerAgents(projectRoot, serverAgents, notes);
+  const answer = probe?.reachable === true ? probe : undefined;
+  const running = answer !== undefined && answer.framework !== undefined;
 
   if (!running) {
-    if (connected) {
+    if (answer !== undefined) {
+      notes.push(occupiedNote(answer, connected));
+      return {
+        running: false,
+        occupied: true,
+        preloadAttached: false,
+        preloadReason: 'not-running',
+      };
+    }
+    if (connected === true) {
       notes.push(
         'A server-agent is connected for this project, but no dev server answered at the session URL; check that debuggen.devServerUrl names the dev server this project runs.',
       );
     }
-    return { preloadAttached: false, preloadReason: 'not-running' };
+    return { running: false, preloadAttached: false, preloadReason: 'not-running' };
   }
 
-  if (connected) {
-    return { preloadAttached: true, preloadReason: 'server-agent-connected' };
+  if (connected === true) {
+    return {
+      running: true,
+      identifiedBy: 'framework-signature',
+      preloadAttached: true,
+      preloadReason: 'server-agent-connected',
+    };
   }
-  notes.push(
-    'The dev server is running, but no server-agent connection exists for this project: it was not started with the Debug Generator preload.',
-  );
-  return { preloadAttached: false, preloadReason: 'no-server-agent-connection' };
+
+  if (connected === false) {
+    notes.push(
+      'The dev server is running, but no server-agent connection exists for this project: it was not started with the Debug Generator preload.',
+    );
+    return {
+      running: true,
+      identifiedBy: 'framework-signature',
+      preloadAttached: false,
+      preloadReason: 'no-server-agent-connection',
+    };
+  }
+
+  if (serverAgents === undefined) {
+    // A registry that threw has already said so in its own note.
+    notes.push(
+      'No server-agent registry was available, so whether the running dev server carries the preload is unknown.',
+    );
+  }
+  return {
+    running: true,
+    identifiedBy: 'framework-signature',
+    preloadAttached: false,
+    preloadReason: 'unknown',
+  };
+}
+
+/** Ask the registry once; a missing or throwing registry is `'unknown'` (the latter with a note). */
+function queryServerAgents(
+  projectRoot: string,
+  serverAgents: ServerAgentPresence | undefined,
+  notes: string[],
+): RegistryAnswer {
+  if (serverAgents === undefined) {
+    return 'unknown';
+  }
+  try {
+    return serverAgents.hasServerAgentForProject(projectRoot) === true;
+  } catch {
+    notes.push(
+      'The server-agent registry could not be queried, so whether the dev server carries the preload is unknown.',
+    );
+    return 'unknown';
+  }
+}
+
+/**
+ * The note for an unsigned answer: fixed text plus the probed URL (origin and
+ * pathname, as the probe recorded it) and the status only — never a header
+ * value. When a `server-agent` is connected for the project, the note says so,
+ * because the likeliest cause is then a session URL that names another
+ * process while the agent's own dev server listens elsewhere.
+ */
+function occupiedNote(answer: DevServerProbeResult, connected: RegistryAnswer): string {
+  const status = answer.status === undefined ? 'an HTTP response' : `HTTP ${answer.status}`;
+  const unidentified = `Something answered at ${answer.url} with ${status}, but the response carries no Next.js signature, so it is not identifiable as this project's dev server and is treated as another process holding the address.`;
+  return connected === true
+    ? `${unidentified} A server-agent is connected for this project, but the process answering at that URL was not identified, so the agent's dev server may be listening at a different address; check that debuggen.devServerUrl names it.`
+    : unidentified;
 }
 
 /** Step 3: the manifest, or a note explaining why there is none. */

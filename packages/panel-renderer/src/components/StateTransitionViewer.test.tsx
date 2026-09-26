@@ -142,7 +142,6 @@ import {
   MAX_PREVIEW_LENGTH,
   NOT_AVAILABLE_LABEL,
   formatCount,
-  formatKindLabel,
   humanizeLabel,
   oneLinePreview,
 } from '../utils/format';
@@ -340,6 +339,44 @@ const TRUNCATED_LABEL = 'Transitions dropped';
 
 /** The label for a row whose producer could not name a component. */
 const UNNAMED_COMPONENT_LABEL = 'Component not named';
+
+/**
+ * The word the trigger cell's kind chip shows, for exactly the trigger kinds
+ * the fixtures below attribute a transition to.
+ *
+ * Spelled out here rather than derived from the formatter the component calls:
+ * an oracle computed by the code under test moves with it, so a formatter that
+ * went blank or wrong would change both sides of the assertion and pass. Read
+ * through {@link triggerKindLabel}, which refuses a kind missing from here.
+ */
+const TRIGGER_KIND_LABELS: Readonly<
+  Partial<Record<NonNullable<StateTransition['triggerKind']>, string>>
+> = Object.freeze({
+  interaction: 'Interaction',
+  commit: 'Commit',
+});
+
+/**
+ * The pinned chip word for a fixture's trigger kind.
+ *
+ * Throws for a kind {@link TRIGGER_KIND_LABELS} does not spell — a fixture that
+ * starts using another kind must pin its word there — and asserts the word is
+ * not blank, so no case can pass by finding an empty string in a cell.
+ *
+ * @param kind The trigger kind a fixture carries.
+ * @returns The literal word the chip must show.
+ */
+function triggerKindLabel(kind: StateTransition['triggerKind']): string {
+  const label = kind === undefined ? undefined : TRIGGER_KIND_LABELS[kind];
+
+  if (label === undefined) {
+    throw new Error(`no chip word is pinned for the trigger kind "${String(kind)}"`);
+  }
+
+  expect(label.trim()).not.toBe('');
+
+  return label;
+}
 
 /*
  * ---------------------------------------------------------------------------
@@ -1477,7 +1514,9 @@ describe('StateTransitionViewer rows', () => {
     await screen.findByRole('grid');
 
     const cells = cellsOf(rowWithValueBefore(NUMBER_BEFORE));
-    expect(within(cells.trigger).getByText(formatKindLabel('interaction'))).toBeDefined();
+    expect(
+      within(cells.trigger).getByText(triggerKindLabel(WIDGET_VALUE_TRANSITION.triggerKind)),
+    ).toBeDefined();
   });
 
   it('says what the producer could not name, instead of guessing at it', async () => {
@@ -1865,7 +1904,7 @@ describe('StateTransitionViewer clipped cells', () => {
       const hook = transition.hookLabel ?? `Hook #${String(transition.hookIndex ?? Number.NaN)}`;
       const dimension = humanizeLabel(transition.transitionSource ?? '');
       const trigger = transition.triggerName ?? '';
-      const kind = formatKindLabel(transition.triggerKind ?? 'interaction');
+      const kind = triggerKindLabel(transition.triggerKind);
 
       expect(within(cells.component).getByText(component).getAttribute('title')).toBe(component);
       expect(within(cells.hook).getByText(hook).getAttribute('title')).toBe(hook);
@@ -1909,7 +1948,9 @@ describe('StateTransitionViewer clipped cells', () => {
     }
 
     expect(triggerStack.classList.contains('dg-stack--wrap')).toBe(true);
-    expect(within(triggerStack).getByText(formatKindLabel('interaction'))).toBeDefined();
+    expect(
+      within(triggerStack).getByText(triggerKindLabel(WIDGET_VALUE_TRANSITION.triggerKind)),
+    ).toBeDefined();
 
     // The hook label and its changed-dimension chip, likewise.
     const hookStack = elementWithClass(cells.hook, 'dg-state-transitions__hook');

@@ -1,8 +1,8 @@
 /**
  * The contract of `components/TargetBadge` — the editor's view of the element
- * selected in the Chrome DevTools panel (the `target.selected` payload of AAP
- * 0.4.2) and the control that asks that panel to enter picker mode again
- * (`target.request`, AAP 0.7.3).
+ * selected in the Chrome DevTools panel (the `SelectedTarget` of AAP 0.4.2, as
+ * the session record's `target` carries it) and the control that asks that
+ * panel to enter picker mode again (`target.request`, AAP 0.7.3).
  *
  * Pinned here:
  *
@@ -322,6 +322,12 @@ describe('TargetBadge without a target', () => {
 
     expect(screen.queryByText('No target')).not.toBeNull();
     expect(screen.queryByText(/no element is selected/i)).not.toBeNull();
+    // Honest about what the control does: it puts the DevTools panel into
+    // picker mode, and names no application route or identifier.
+    const message = screen.getByText(/no element is selected/i).textContent;
+    expect(message).toMatch(/picker mode/i);
+    expect(message).toMatch(/chrome devtools/i);
+    expect(message).not.toMatch(/\/api\b/i);
 
     const status = screen.getByRole('status');
     expect(status.getAttribute('aria-busy')).toBeNull();
@@ -410,7 +416,10 @@ describe('TargetBadge error and pending states', () => {
     expect(rootOf(container)).toBe(status);
     expect(status.getAttribute('aria-busy')).toBe('true');
     expect(status.className).toContain(ROOT_CLASS);
-    expect(status.textContent).toMatch(/waiting for an element/i);
+    // The request only switches the bound panel into picker mode; the label
+    // must say that, never that an element is already being picked.
+    expect(status.textContent).toMatch(/asking chrome devtools to enter picker mode/i);
+    expect(status.textContent).not.toMatch(/waiting for an element/i);
 
     expect(screen.queryAllByRole('button')).toHaveLength(0);
     expect(container.querySelectorAll(CHAIN_ITEM_SELECTOR)).toHaveLength(0);

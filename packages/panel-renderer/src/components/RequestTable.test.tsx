@@ -113,7 +113,11 @@ import type { DataProvider, DataQueryResolver, DataQueryResponse } from '../host
 import { PanelActionsContext, PanelSelectionContext } from '../host/PanelActions';
 import type { PanelActions, PanelEventRef, PanelSelection } from '../host/PanelActions';
 import { PAGE_FAILURE_TITLE, formatDataQuery } from '../host/useQuery';
+import { DATA_TABLE_COLUMN_TRACKS } from '../primitives/DataTable';
+import type { DataTableColumnWidth } from '../primitives/DataTable';
 import { FOCUS_KEY_ATTRIBUTE } from '../primitives/ErrorState';
+import { DESIGN_TOKENS, cssVar } from '../tokens/tokens';
+import type { TokenKey, TokenValues } from '../tokens/tokens';
 import {
   NOT_AVAILABLE_LABEL,
   formatBytes,
@@ -4115,63 +4119,61 @@ describe('RequestTable one Tab stop per grid', () => {
  * ---------------------------------------------------------------------------
  * Layout contracts
  *
- * What happy-dom can decide without a layout engine: the column tracks the
- * grid is handed, and the shape of the markup the stylesheet lays out. The
- * resulting geometry — horizontal scrolling in a narrow panel, chips inside
- * their cells, aligned occurrence columns — is what these structures produce in
- * a browser, and is asserted there.
+ * What happy-dom can decide without a layout engine: the width role of each
+ * column, the token-built tracks and floor the grid is handed for them, and the
+ * shape of the markup the stylesheet lays out. The resulting geometry —
+ * horizontal scrolling in a narrow panel, chips inside their cells, aligned
+ * occurrence columns — is what these structures produce in a browser, and is
+ * asserted there.
  * ---------------------------------------------------------------------------
  */
 
 /**
- * Split a grid track list into its top-level tracks, keeping the spaces and
- * commas inside a function such as `minmax(12ch, 1fr)` with the track they
- * belong to.
- *
- * @param template A `grid-template-columns` value.
- * @returns One string per track, in order.
+ * The width role of each column, in the order {@link COLUMN_HEADERS} names
+ * them. See `COLUMN_WIDTHS` in `./RequestTable` for why each column takes its
+ * role.
  */
-function topLevelTracks(template: string): string[] {
-  const tracks: string[] = [];
-  let depth = 0;
-  let current = '';
-
-  for (const character of template.trim()) {
-    if (character === '(') {
-      depth += 1;
-    } else if (character === ')') {
-      depth -= 1;
-    }
-
-    if (depth === 0 && /\s/u.test(character)) {
-      if (current.length > 0) {
-        tracks.push(current);
-      }
-      current = '';
-    } else {
-      current += character;
-    }
-  }
-
-  if (current.length > 0) {
-    tracks.push(current);
-  }
-
-  return tracks;
-}
+const COLUMN_WIDTHS: readonly DataTableColumnWidth[] = [
+  'text',
+  'status',
+  'count',
+  'count',
+  'quantity',
+  'quantity',
+  'quantity',
+  'quantity',
+  'name',
+];
 
 /**
- * The guaranteed minimum of one track, in `ch`: the first argument of a
- * `minmax()` or a bare `ch` track, and `undefined` for any track without one.
- *
- * @param track One top-level track.
- * @returns Its minimum in `ch`, or `undefined`.
+ * A reference to one of the column-geometry tokens a role track is built from.
+ * Removing every such reference from a track template must leave nothing but
+ * the `minmax()` frames and the spaces between tracks: no number and no unit is
+ * the component's own (AAP 0.6.4).
  */
-function trackMinimumCh(track: string): number | undefined {
-  const match = /^minmax\((\d+(?:\.\d+)?)ch,/u.exec(track) ?? /^(\d+(?:\.\d+)?)ch$/u.exec(track);
-  const value = match?.[1];
+const COLUMN_TOKEN_REFERENCE = /var\(--dg-column-(?:min|share)-[a-z]+\)/gu;
 
-  return value === undefined ? undefined : Number(value);
+/** Every theme's token set, each of which must give every column a floor. */
+const THEMES: readonly TokenValues[] = [
+  DESIGN_TOKENS.dark,
+  DESIGN_TOKENS.light,
+  DESIGN_TOKENS.highContrast,
+];
+
+/**
+ * The magnitude, in `ch`, that a role's floor token resolves to in one theme.
+ *
+ * @param width The column's width role.
+ * @param theme The token set to resolve against.
+ * @returns The floor in `ch`, or `undefined` when the floor is no `ch` token.
+ */
+function floorChOf(width: DataTableColumnWidth, theme: TokenValues): number | undefined {
+  const { minimum } = DATA_TABLE_COLUMN_TRACKS[width];
+  const keys = Object.keys(theme) as TokenKey[];
+  const key = keys.find((candidate) => cssVar(candidate) === minimum);
+  const magnitude = key === undefined ? undefined : /^(\d+(?:\.\d+)?)ch$/u.exec(theme[key])?.[1];
+
+  return magnitude === undefined ? undefined : Number(magnitude);
 }
 
 /** A caller label that is itself the location its occurrence resolved to. */
@@ -4244,31 +4246,38 @@ describe('RequestTable layout contracts', () => {
 
     const grid = await screen.findByRole('grid');
     const template = grid.style.getPropertyValue('--dgc-columns');
-    const tracks = topLevelTracks(template);
 
-    // One track per column, and not one of them free to collapse: a
-    // `minmax(0, …)` track squeezed to its padding in a narrow panel, and the
-    // grouping chip then painted across the Status column beside it.
-    expect(tracks).toHaveLength(COLUMN_HEADERS.length);
+    // One role per column, resolved to the design system's track for that role
+    // and to nothing the component sized itself.
+    expect(COLUMN_WIDTHS).toHaveLength(COLUMN_HEADERS.length);
+    expect(template).toBe(
+      COLUMN_WIDTHS.map((width) => DATA_TABLE_COLUMN_TRACKS[width].track).join(' '),
+    );
+    expect(template.replace(COLUMN_TOKEN_REFERENCE, '')).toMatch(/^(?:minmax\(, \)| )+$/u);
+
+    // Not one track is free to collapse: a `minmax(0, …)` track squeezed to its
+    // padding in a narrow panel, and the grouping chip then painted across the
+    // Status column beside it. Each role's floor is a positive length in every
+    // theme, and the identity column, which holds the toggle, the method, the
+    // grouping chip and a readable run of the URL, has the widest floor of all.
     expect(template).not.toContain('minmax(0');
+    for (const theme of THEMES) {
+      const [requestFloor = 0, ...otherFloors] = COLUMN_WIDTHS.map(
+        (width) => floorChOf(width, theme) ?? 0,
+      );
 
-    const minimums = tracks.map((track) => trackMinimumCh(track));
-
-    for (const minimum of minimums) {
-      expect(minimum).toBeDefined();
-      expect(minimum ?? 0).toBeGreaterThan(0);
+      expect(requestFloor).toBeGreaterThan(Math.max(...otherFloors));
+      for (const floor of otherFloors) {
+        expect(floor).toBeGreaterThan(0);
+      }
     }
 
-    // The identity column, which holds the toggle, the method, the grouping
-    // chip and a readable run of the URL, needs the widest minimum of all.
-    const [requestMinimum = 0, ...otherMinimums] = minimums.map((minimum) => minimum ?? 0);
-    expect(requestMinimum).toBeGreaterThan(Math.max(...otherMinimums));
-
-    // The grid publishes every minimum as its floor, which is what makes a
-    // panel narrower than their sum scroll instead of squeeze.
-    expect(grid.style.getPropertyValue('--dgc-min-inline').match(/\d+ch/gu)).toHaveLength(
-      COLUMN_HEADERS.length,
+    // The grid publishes every column's floor as its own minimum, which is what
+    // makes a panel narrower than their sum scroll instead of squeeze.
+    expect(grid.style.getPropertyValue('--dgc-min-inline')).toBe(
+      `calc(${COLUMN_WIDTHS.map((width) => DATA_TABLE_COLUMN_TRACKS[width].minimum).join(' + ')})`,
     );
+    expect(grid.style.getPropertyValue('--dgc-column-count')).toBe(String(COLUMN_HEADERS.length));
   });
 
   it('lays each occurrence out as exactly four slots, in column order', async () => {

@@ -8,8 +8,13 @@
  * AAP §0.2.3 fixes the shape, and this module is the only statement of it:
  *
  * ```text
- * { id, type, sessionId?, ts, payload }
+ * { id, type, sessionId?, tabId?, ts, payload }
  * ```
+ *
+ * The optional acting `tabId` is the one field beyond §0.2.3's list. It is
+ * additive — absent on every frame that does not act for a tab, so such a frame
+ * is byte-identical to the §0.2.3 shape — and it exists because §0.5.6's
+ * DevTools rule cannot be enforced without it (see "One frame, one tab" below).
  *
  * - `id` — a per-frame identifier, minted by {@link createEnvelope}. It exists
  *   because frames are re-sent routinely rather than exceptionally: the MV3
@@ -17,7 +22,7 @@
  *   `client/ws-client.ts` reconnects with backoff and a receiver needs a stable
  *   handle to correlate a reply with a request (`error.ref`) or to notice a
  *   duplicate.
- * - `type` — the discriminant, one of the twenty-five names `./messages/index.ts`
+ * - `type` — the discriminant, one of the twenty-six names `./messages/index.ts`
  *   declares in `MESSAGE_TYPES`.
  * - `sessionId` — the service's **routing** key, present when the frame belongs
  *   to a session. Optional because a handshake (`client.hello`) and a tab-level
@@ -26,6 +31,13 @@
  *   `session.created` / `session.updated` broadcast carries — a present routing
  *   key must be that same session, and a frame where the two disagree is
  *   refused (see "One frame, one session" below).
+ * - `tabId` — the **acting tab**: the inspected Chrome tab a DevTools frame acts
+ *   for, a non-negative safe-integer tab id (`tabIdSchema` from
+ *   `./messages/binding.ts`). Set by the Chrome service worker, which
+ *   multiplexes every inspected tab over one connection, on the frames it sends
+ *   for a tab; absent on every other frame. When the payload carries a `tabId`
+ *   of its own, a present acting tab must be that same tab (see "One frame, one
+ *   tab" below).
  * - `ts` — the moment the sender stamped the frame, on the product's one time
  *   base: Unix epoch **milliseconds** as a double, sub-millisecond precision
  *   preserved (AAP §0.2.3). The schema is `epochMsSchema` from `./version.ts`,
@@ -43,7 +55,7 @@
  * `MESSAGE_PAYLOAD_SCHEMAS`. Nothing here lists a message by hand, so a message
  * added to `messages/**` cannot be forgotten in the union: it arrives through
  * the registry, and `messages/index.ts` proves at compile time that the registry
- * and the tuple name the same twenty-five types.
+ * and the tuple name the same twenty-six types.
  *
  * The direction of that dependency is load bearing and runs one way only:
  * **`messages/*.ts` must never import this file** — this file imports them.
@@ -65,9 +77,11 @@
  * A receiver validates what arrived because that is where the value came from
  * another process; a sender validating its own typed literal only pays twice.
  *
- * The one check the send path does make is not payload validation: it is the
- * constant-time comparison below, of two identifiers the caller supplied, and
- * it exists because the type system cannot express it.
+ * The checks the send path does make are not payload validation: they are the
+ * constant-time comparisons below, of identifiers the caller supplied — the
+ * routing key against the payload's session, and the acting tab against the
+ * payload's tab, after a scalar check that the acting tab is a tab id at all —
+ * and they exist because the type system cannot express them.
  *
  * ## One frame, one session
  *
@@ -93,6 +107,37 @@
  * An absent routing key stays valid, and so does a routing key on a payload that
  * names no session of its own (`client.hello`, `agent.ready`, `tab.navigated`,
  * `session.unbind`, `telemetry.event`, `error`): there is nothing to contradict.
+ *
+ * ## One frame, one tab
+ *
+ * One paired DevTools credential and one MV3 service-worker WebSocket carry
+ * every inspected tab, so neither the credential nor the connection says which
+ * tab a frame is for — and AAP §0.5.6 allows a DevTools principal to act only
+ * for the session bound to *its* tab. The envelope's acting `tabId` is that
+ * missing statement. The service worker fills it from Chrome's own port
+ * metadata on every frame it sends for a tab — `telemetry.event`,
+ * `target.selected` and `source.open`, and optionally `agent.ready` and the
+ * binding frames — and the service authorizes a DevTools frame for a session
+ * only when that session's live binding is this tab's. Every other frame, and
+ * every frame the service or an editor sends, carries no `tabId` key at all.
+ *
+ * A frame can name a tab twice as well: the acting `tabId`, and the payload's
+ * own `tabId` (`agent.ready`, `session.bind`, `session.bound`, `tab.navigated`,
+ * `session.unbind`, and a DevTools `client.hello`). The same confused-deputy
+ * argument applies — one field would pass the tab check while the other names
+ * the tab that is changed — so the same rule does:
+ *
+ * - {@link protocolMessageSchema} refuses a frame whose two tabs differ, as a
+ *   `custom` issue at path `tabId` with the label `acting-tab-matches-payload`
+ *   and never either tab id;
+ * - {@link createEnvelope} throws `PROTOCOL_INVALID_MESSAGE` for a `tabId`
+ *   option that is not a tab id or that contradicts the payload's own, and it
+ *   never lifts a payload's `tabId` into the envelope, so a service push such
+ *   as `session.bound` stays exactly as it was.
+ *
+ * An absent acting tab stays valid on every frame — whether one is *required*
+ * is the service's authorization decision, not a shape rule — and so does an
+ * acting tab on a payload with no `tabId` of its own.
  *
  * ## A rejected frame is never echoed
  *
@@ -126,6 +171,10 @@ import { z } from 'zod';
 import { DebuggenError, assertNever, err, newMessageId, nowEpochMs, ok } from '@debuggen/shared';
 import type { MessageId, Result, SessionId } from '@debuggen/shared';
 
+// Imported from its own module rather than through the messages barrel, which
+// forwards message payloads and their vocabularies only; `./messages/binding.ts`
+// imports nothing from this file, so the dependency still runs one way.
+import { tabIdSchema } from './messages/binding.js';
 import { MESSAGE_PAYLOAD_SCHEMAS, MESSAGE_TYPES } from './messages/index.js';
 import type { MessageType } from './messages/index.js';
 import { epochMsSchema, isPlainRecord, protocolParseError } from './version.js';
@@ -170,7 +219,7 @@ const identifierSchema = z
 /**
  * The four envelope fields every message shares, as a Zod shape record.
  *
- * Written once and spread into all twenty-five union members, so the envelope
+ * Written once and spread into all twenty-six union members, so the envelope
  * cannot end up meaning something slightly different for one message type. It
  * is exported for the same reason: `apps/local-service/src/server/ws.ts` and the
  * two extension transports occasionally need to describe an envelope without
@@ -195,9 +244,28 @@ export const envelopeBaseShape = Object.freeze({
    * a present `undefined` — which is also the only spelling that survives a JSON
    * round trip unchanged. Its agreement with the payload's own subject is a
    * cross-field rule, so it is enforced per union member by
-   * {@link requireRoutingKeyMatchesSubject} rather than by this field schema.
+   * {@link requireFrameSubjectsAgree} rather than by this field schema.
    */
   sessionId: identifierSchema.optional(),
+  /**
+   * The acting tab: the inspected Chrome tab a DevTools frame acts for.
+   *
+   * Set by the Chrome service worker — which multiplexes every inspected tab
+   * over one connection and one paired credential — on the frames it sends for
+   * a tab (`telemetry.event`, `target.selected`, `source.open`; optionally
+   * `agent.ready` and the binding frames), and absent on every other frame. The
+   * service authorizes a DevTools frame for a session only when that session's
+   * live binding is this tab's (AAP §0.5.6), so this field is a claim the
+   * service verifies, never a capability.
+   *
+   * The same schema a payload's `tabId` uses (`./messages/binding.ts`):
+   * `-1` (`chrome.tabs.TAB_ID_NONE`), a fraction, a string and anything beyond
+   * the safe-integer range are refused. Optional, and therefore an absent key
+   * rather than a present `undefined`, exactly like `sessionId`; its agreement
+   * with the payload's own `tabId` is enforced by
+   * {@link requireFrameSubjectsAgree}.
+   */
+  tabId: tabIdSchema.optional(),
   /** The sender's timestamp, in epoch milliseconds. See `./version.ts`. */
   ts: epochMsSchema,
 });
@@ -224,7 +292,9 @@ export const envelopeBaseShape = Object.freeze({
  * compiler, not by a comment — that this hand-written type and
  * {@link protocolMessageSchema}'s inferred type describe the same frames.
  * {@link createEnvelope} still omits the key entirely when there is no session,
- * so no envelope this package builds carries an explicit `undefined`.
+ * so no envelope this package builds carries an explicit `undefined`. `tabId`
+ * is spelled `?: number | undefined` for the same reason, and is likewise
+ * omitted when a frame acts for no tab.
  *
  * Every field is `readonly`: a frame is a value that has been sent or received,
  * not a mutable buffer. Readonly-ness is not part of structural assignability,
@@ -237,6 +307,12 @@ export interface Envelope<K extends MessageType, P> {
   readonly type: K;
   /** The session this frame routes to, where it belongs to one. */
   readonly sessionId?: SessionId | undefined;
+  /**
+   * The inspected Chrome tab a DevTools frame acts for, where it acts for one:
+   * set by the service worker, verified by the service against its live
+   * tab-to-session binding (AAP §0.5.6), absent on every other frame.
+   */
+  readonly tabId?: number | undefined;
   /** When the sender stamped the frame, in epoch milliseconds. */
   readonly ts: number;
   /** The message's body, as its domain module's schema defines it. */
@@ -286,7 +362,7 @@ export type MessageByType<K extends MessageType> = Envelope<K, MessagePayload<K>
 export type ProtocolMessageMap = { readonly [K in MessageType]: MessageByType<K> };
 
 /**
- * Any frame of this protocol: the union of all twenty-five envelope types.
+ * Any frame of this protocol: the union of all twenty-six envelope types.
  *
  * The return type of {@link parseMessage} and {@link decodeMessage}, the
  * argument type of {@link encodeMessage}, and the type a transport hands to its
@@ -377,6 +453,24 @@ const ROUTING_MISMATCH_RULE =
   'expected the routing sessionId to equal the session the payload names';
 
 /**
+ * The label an acting-tab contradiction is reported under.
+ *
+ * Rendered by `describeZodIssues` as
+ * `tabId (custom label=acting-tab-matches-payload)`: the rule that failed, and
+ * neither tab id. Like {@link ROUTING_MISMATCH_LABEL} it passes the renderer's
+ * name gate, so it is shown verbatim.
+ */
+const ACTING_TAB_MISMATCH_LABEL = 'acting-tab-matches-payload';
+
+/**
+ * The issue message of an acting-tab contradiction.
+ *
+ * Constant for the reason {@link ROUTING_MISMATCH_RULE} is: it names the two
+ * fields and never their values (AAP §0.5.2).
+ */
+const ACTING_TAB_MISMATCH_RULE = 'expected the acting tabId to equal the tab the payload names';
+
+/**
  * The session a payload is *about*, read structurally, if it names one.
  *
  * Two spellings exist in the registry, and both are read:
@@ -424,7 +518,7 @@ function payloadSubjectSessionId(payload: unknown): SessionId | undefined {
  * Whether a routing key names a different session than its payload does.
  *
  * The single statement of the rule, shared by the receive path
- * ({@link requireRoutingKeyMatchesSubject}) and the send path
+ * ({@link requireFrameSubjectsAgree}) and the send path
  * ({@link createEnvelope}), so a frame this package builds and a frame it
  * accepts cannot disagree about it. A payload with no subject contradicts
  * nothing.
@@ -441,28 +535,83 @@ function routingKeyContradictsPayload(routingKey: string, payload: unknown): boo
 }
 
 /**
- * Refuses a frame whose routing key and payload subject name different
- * sessions: the object-level check every union member carries.
+ * Reads the payload's own numeric `tabId`, if it has one.
  *
- * The service routes and authorizes by the envelope's `sessionId`, while a
- * handler acts on the payload's own subject. AAP §0.5.6 authorizes a devtools
- * principal only for the session bound to its tab, so a frame that satisfied the
- * check with one field while naming another session in the other would make the
- * service a confused deputy. Refusing the frame here, at the one validator every
- * receiver shares, closes that without each handler having to remember which
- * field it authorized.
+ * Structural, for the reason {@link sessionIdFromPayload} is: six payloads in
+ * the registry carry a top-level `tabId` — `agent.ready`, `session.bind`,
+ * `session.bound`, `tab.navigated`, `session.unbind`, and `client.hello` for a
+ * DevTools connection — and asking the value keeps the acting-tab rule correct
+ * for every one of them, and for a payload added later, without a per-type
+ * table beside the registry. Only a number counts: a payload whose `tabId` is
+ * a string is refused by its own schema on receive, and naming no tab here
+ * keeps that refusal the only issue it is reported for.
  *
- * Reported on the `sessionId` path with {@link ROUTING_MISMATCH_LABEL}, and
- * with `input` left empty, exactly as `../analysis.ts`'s object check is: the
- * rejection names the rule, never either identifier (AAP §0.5.2).
+ * Deliberately never used to *fill* the envelope's `tabId`:
+ * {@link createEnvelope} does not lift it, so a service push such as
+ * `session.bound`, whose payload names a tab, keeps the §0.2.3 shape exactly.
  *
- * The comparison is made only on an otherwise valid frame. Zod skips an object
- * check after an *aborting* issue, but a string-length bound is not one — an
- * empty payload `sessionId` still reaches this function — so the guard is
- * explicit: a frame that already has an issue is already refused, and comparing
- * the routing key with a malformed identifier would add noise rather than
- * information. A frame whose payload is wrong is therefore reported by its
- * payload issues alone.
+ * @param payload A frame's payload, validated or not.
+ * @returns The tab the payload names, or `undefined` when it names none.
+ */
+function payloadTabId(payload: unknown): number | undefined {
+  if (!isPlainRecord(payload)) {
+    return undefined;
+  }
+
+  const candidate = payload.tabId;
+
+  return typeof candidate === 'number' ? candidate : undefined;
+}
+
+/**
+ * Whether an acting tab names a different tab than its payload does.
+ *
+ * The single statement of the "one frame, one tab" rule, shared by the receive
+ * path ({@link requireFrameSubjectsAgree}) and the send path
+ * ({@link createEnvelope}) exactly as {@link routingKeyContradictsPayload} is. A
+ * payload with no `tabId` of its own contradicts nothing.
+ *
+ * @param actingTab The envelope's `tabId`.
+ * @param payload The frame's payload.
+ * @returns `true` only when the payload names a tab and it is not `actingTab`.
+ */
+function actingTabContradictsPayload(actingTab: number, payload: unknown): boolean {
+  const own = payloadTabId(payload);
+
+  return own !== undefined && own !== actingTab;
+}
+
+/**
+ * Refuses a frame that names two different sessions or two different tabs: the
+ * one object-level check every union member carries.
+ *
+ * Two cross-field rules, evaluated together so a frame that breaks both is
+ * reported for both:
+ *
+ * - **One frame, one session.** The service routes and authorizes by the
+ *   envelope's `sessionId`, while a handler acts on the payload's own subject.
+ *   A routing key that contradicts the subject is reported on the `sessionId`
+ *   path with {@link ROUTING_MISMATCH_LABEL}.
+ * - **One frame, one tab.** The service authorizes a DevTools frame by its
+ *   acting `tabId`, while a binding handler acts on the payload's own `tabId`.
+ *   An acting tab that contradicts it is reported on the `tabId` path with
+ *   {@link ACTING_TAB_MISMATCH_LABEL}.
+ *
+ * AAP §0.5.6 authorizes a devtools principal only for the session bound to its
+ * tab, so a frame that satisfied the check with one field while naming another
+ * session or tab in the other would make the service a confused deputy.
+ * Refusing it here, at the one validator every receiver shares, closes that
+ * without each handler having to remember which field it authorized. Each issue
+ * leaves `input` empty, exactly as `../analysis.ts`'s object check does: the
+ * rejection names the rule, never an identifier (AAP §0.5.2).
+ *
+ * Both comparisons are made only on an otherwise valid frame. Zod skips an
+ * object check after an *aborting* issue, but a string-length bound is not one —
+ * an empty payload `sessionId` still reaches this function — so the guard is
+ * explicit and taken once, before either rule: a frame that already has a field
+ * issue is already refused, and comparing an envelope field with a malformed
+ * payload value would add noise rather than information. A frame whose payload
+ * is wrong is therefore reported by its payload issues alone.
  *
  * `payload` is declared optional in the parameter type for the compiler's sake
  * alone. {@link envelopeSchemaFor} is generic in `K`, and while `K` is
@@ -473,9 +622,10 @@ function routingKeyContradictsPayload(routingKey: string, payload: unknown): boo
  *
  * @param parsed The member's parse state, whose `value` is the parsed frame.
  */
-function requireRoutingKeyMatchesSubject(
+function requireFrameSubjectsAgree(
   parsed: z.core.ParsePayload<{
     readonly sessionId?: string | undefined;
+    readonly tabId?: number | undefined;
     readonly payload?: unknown;
   }>,
 ): void {
@@ -483,21 +633,30 @@ function requireRoutingKeyMatchesSubject(
     return;
   }
 
-  const routingKey = parsed.value.sessionId;
+  const { sessionId: routingKey, tabId: actingTab, payload } = parsed.value;
 
-  if (routingKey === undefined || !routingKeyContradictsPayload(routingKey, parsed.value.payload)) {
-    return;
+  if (routingKey !== undefined && routingKeyContradictsPayload(routingKey, payload)) {
+    parsed.issues.push({
+      code: 'custom',
+      path: ['sessionId'],
+      message: ROUTING_MISMATCH_RULE,
+      params: { label: ROUTING_MISMATCH_LABEL },
+      // Left empty on purpose: a failure here never carries the identifiers
+      // that caused it (AAP §0.5.2).
+      input: undefined,
+    });
   }
 
-  parsed.issues.push({
-    code: 'custom',
-    path: ['sessionId'],
-    message: ROUTING_MISMATCH_RULE,
-    params: { label: ROUTING_MISMATCH_LABEL },
-    // Left empty on purpose: a failure here never carries the identifiers that
-    // caused it (AAP §0.5.2).
-    input: undefined,
-  });
+  if (actingTab !== undefined && actingTabContradictsPayload(actingTab, payload)) {
+    parsed.issues.push({
+      code: 'custom',
+      path: ['tabId'],
+      message: ACTING_TAB_MISMATCH_RULE,
+      params: { label: ACTING_TAB_MISMATCH_LABEL },
+      // Left empty for the same reason: neither tab id is echoed.
+      input: undefined,
+    });
+  }
 }
 
 /**
@@ -509,17 +668,20 @@ function requireRoutingKeyMatchesSubject(
  * rather than a blurred object whose `type` is the whole union and whose
  * `payload` is the union of all payloads.
  *
- * `z.strictObject` rather than `z.object`: a frame carrying a fifth top-level
- * key is a protocol violation, not a message with extra information. Tolerating
- * it would let a producer's typo (`sessionID` beside a dropped `sessionId`) look
- * like a valid session-less frame and quietly break routing, and it would let an
- * unknown field ride through a boundary this package exists to define.
+ * `z.strictObject` rather than `z.object`: a frame carrying a top-level key
+ * beyond the six declared is a protocol violation, not a message with extra
+ * information. Tolerating it would let a producer's typo (`sessionID` beside a
+ * dropped `sessionId`, `tabID` beside a dropped `tabId`) look like a valid
+ * session-less or tab-less frame and quietly break routing or authorization,
+ * and it would let an unknown field ride through a boundary this package exists
+ * to define.
  *
- * `.check(requireRoutingKeyMatchesSubject)` adds the one cross-field rule of the
- * envelope (see "One frame, one session" in the module documentation). A check
- * returns the same `ZodObject` type, so the member keeps its `.shape`, the union
- * still discriminates on `type`, and {@link ProtocolMessageMatchesSchema} is
- * unaffected: the rule narrows which values are accepted, not their type.
+ * `.check(requireFrameSubjectsAgree)` adds the envelope's two cross-field rules
+ * (see "One frame, one session" and "One frame, one tab" in the module
+ * documentation). A check returns the same `ZodObject` type, so the member keeps
+ * its `.shape`, the union still discriminates on `type`, and
+ * {@link ProtocolMessageMatchesSchema} is unaffected: the rules narrow which
+ * values are accepted, not their type.
  */
 function envelopeSchemaFor<K extends MessageType>(type: K) {
   return z
@@ -528,7 +690,7 @@ function envelopeSchemaFor<K extends MessageType>(type: K) {
       type: z.literal(type),
       payload: payloadSchemaFor(type),
     })
-    .check(requireRoutingKeyMatchesSubject);
+    .check(requireFrameSubjectsAgree);
 }
 
 /**
@@ -564,7 +726,7 @@ type EnvelopeSchemaTuple<T extends readonly MessageType[]> = {
  * build — `Object.keys` would agree today and is not a contract.
  *
  * The assertion is the one unavoidable cast in this module: `Array.prototype.map`
- * yields an array, and no runtime expression can produce a twenty-five-element
+ * yields an array, and no runtime expression can produce a twenty-six-element
  * tuple type. It is not taken on trust, and the two halves of the guarantee are
  * checked in two different places, deliberately:
  *
@@ -625,7 +787,7 @@ export type ProtocolMessageSchema = typeof protocolMessageSchema;
  *
  * The tuple wrappers stop a union from distributing, so this answers about the
  * two types as written rather than about their members — which is the point
- * here, since both operands are unions of twenty-five object types.
+ * here, since both operands are unions of twenty-six object types.
  */
 type MutuallyAssignable<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
 
@@ -687,7 +849,7 @@ const INVALID_MESSAGE_PREFIX = 'Invalid protocol message';
  * is held to the same rule as the message (AAP §0.5.2).
  */
 const INVALID_MESSAGE_HINT =
-  'A protocol frame is { id, type, sessionId?, ts, payload } with no other top-level key: `type` must be one of the declared message types, `ts` a Unix epoch timestamp in milliseconds, `payload` must match that type’s schema, and a routing `sessionId` must equal the session the payload names (its own `sessionId`, or `session.id`) when both are present.';
+  'A protocol frame is { id, type, sessionId?, tabId?, ts, payload } with no other top-level key: `type` must be one of the declared message types, `ts` a Unix epoch timestamp in milliseconds, `payload` must match that type’s schema, a routing `sessionId` must equal the session the payload names (its own `sessionId`, or `session.id`) when both are present, and an acting `tabId` must be a non-negative integer Chrome tab id equal to the payload’s own `tabId` when both are present.';
 
 /**
  * What {@link createEnvelope} throws when an explicit routing key contradicts
@@ -703,6 +865,35 @@ const ROUTING_CONTRADICTION_MESSAGE =
 /** The constant next step for {@link ROUTING_CONTRADICTION_MESSAGE}. */
 const ROUTING_CONTRADICTION_HINT =
   'Omit options.sessionId so the routing key is taken from the payload, or build the payload for the session the frame is routed to; every receiver refuses a frame whose two sessions disagree.';
+
+/**
+ * What {@link createEnvelope} throws when `options.tabId` is not a Chrome tab
+ * id: a negative number (`-1` is `chrome.tabs.TAB_ID_NONE`), a fraction, a
+ * non-finite number, a value beyond the safe-integer range, or not a number.
+ *
+ * Constant, so the rejected value is never interpolated (AAP §0.5.2); `details`
+ * carries only the message type.
+ */
+const ACTING_TAB_INVALID_MESSAGE =
+  'Cannot build a protocol frame: options.tabId is not a non-negative safe-integer Chrome tab id';
+
+/** The constant next step for {@link ACTING_TAB_INVALID_MESSAGE}. */
+const ACTING_TAB_INVALID_HINT =
+  'Pass the inspected tab’s id as Chrome reports it (a port sender’s tab.id, or chrome.devtools.inspectedWindow.tabId), or omit options.tabId for a frame that acts for no tab.';
+
+/**
+ * What {@link createEnvelope} throws when `options.tabId` names a different tab
+ * than the payload's own `tabId` does.
+ *
+ * Constant for the reason {@link ROUTING_CONTRADICTION_MESSAGE} is: neither tab
+ * id is interpolated, and `details` carries only the message type.
+ */
+const ACTING_TAB_CONTRADICTION_MESSAGE =
+  'Cannot build a protocol frame: options.tabId names a different tab than the payload does';
+
+/** The constant next step for {@link ACTING_TAB_CONTRADICTION_MESSAGE}. */
+const ACTING_TAB_CONTRADICTION_HINT =
+  'Set options.tabId to the tab the payload names, or build the payload for the tab the frame acts for; every receiver refuses a frame whose two tabs disagree.';
 
 /**
  * What a frame that is not JSON at all is reported as.
@@ -735,7 +926,7 @@ const NOT_JSON_HINT =
  *   neither side crashes or acts on a message it does not understand.
  * - A frame whose `type` is known but whose payload is wrong is validated
  *   against that one member, so the issue paths name the offending payload
- *   fields rather than reporting twenty-five failed branches.
+ *   fields rather than reporting twenty-six failed branches.
  * - Either way the failure is a value, not an exception. This function never
  *   throws, never logs and never echoes its input: the message and `details`
  *   come from `protocolParseError`, which renders issue paths, issue codes and
@@ -850,10 +1041,14 @@ export function encodeMessage(message: ProtocolMessage): string {
 /**
  * The injectable parts of {@link createEnvelope}.
  *
- * All three fields exist so a caller can be explicit where it matters and a test
- * can be deterministic: with `id` and `ts` supplied, `createEnvelope` is a pure
+ * The fields exist so a caller can be explicit where it matters and a test can
+ * be deterministic: with `id` and `ts` supplied, `createEnvelope` is a pure
  * function of its arguments and two runs produce byte-identical frames. An
  * explicit `undefined` means the same as an absent key for every field.
+ *
+ * `client/ws-client.ts` forwards these options to {@link createEnvelope}
+ * unchanged, so a `send` with `{ tabId }` stamps the acting tab without the
+ * client knowing anything about it.
  */
 export interface CreateEnvelopeOptions {
   /**
@@ -870,6 +1065,22 @@ export interface CreateEnvelopeOptions {
    * receiver would refuse the frame it built.
    */
   readonly sessionId?: SessionId | undefined;
+  /**
+   * The acting tab: the inspected Chrome tab this frame acts for.
+   *
+   * Supplied by the Chrome service worker, from Chrome's own port metadata, on
+   * every frame it sends for a tab; the service authorizes a DevTools frame for
+   * a session only when that session's live binding is this tab's
+   * (AAP §0.5.6). When omitted the frame carries no `tabId` key at all —
+   * {@link createEnvelope} **never** lifts one from the payload, so a service
+   * push such as `session.bound`, whose payload names a tab, is unchanged.
+   *
+   * It must be a Chrome tab id (`tabIdSchema` from `./messages/binding.ts`) and
+   * may restate the payload's own `tabId` but never contradict it; either
+   * mistake makes {@link createEnvelope} throw `PROTOCOL_INVALID_MESSAGE`,
+   * because every receiver would refuse the frame it built.
+   */
+  readonly tabId?: number | undefined;
   /** The frame identifier. Defaults to a freshly minted `newMessageId()`. */
   readonly id?: MessageId | undefined;
   /**
@@ -883,7 +1094,7 @@ export interface CreateEnvelopeOptions {
 /**
  * Reads a routable `sessionId` off a payload, if it has one.
  *
- * Structural rather than type-driven on purpose: the twenty-five payload schemas
+ * Structural rather than type-driven on purpose: the twenty-six payload schemas
  * are owned by eleven separate modules and most, but not all, carry a
  * `sessionId`. Asking the value — is it a plain record, is its `sessionId` a
  * string — keeps this one function correct for every payload without a
@@ -947,6 +1158,23 @@ function sessionIdFromPayload(payload: unknown): SessionId | undefined {
  * never rewrite: no `.transform()`, no `.default()`, no `.coerce` appears
  * anywhere in it.
  *
+ * ## The `tabId` rule, which is never lifted
+ *
+ * The envelope's `tabId` is the **acting tab** (see "One frame, one tab" in the
+ * module documentation), and it is taken from `options.tabId` alone:
+ *
+ * 1. a value that is not a Chrome tab id — negative, fractional, non-finite,
+ *    beyond the safe-integer range, not a number — throws
+ *    `PROTOCOL_INVALID_MESSAGE`;
+ * 2. a value that contradicts the payload's own `tabId` throws
+ *    `PROTOCOL_INVALID_MESSAGE`, and one equal to it is merely explicit;
+ * 3. an absent option leaves the key **omitted entirely**.
+ *
+ * Unlike the routing key it is never lifted from the payload. The acting tab is
+ * the service worker's statement of which tab a frame is for, made from
+ * Chrome's port metadata; a payload's `tabId` is data, and every service push
+ * whose payload names a tab (`session.bound`) must keep the shape it had.
+ *
  * ## What it deliberately does not do
  *
  * It does not validate the payload. The signature is already type-safe — the
@@ -954,10 +1182,11 @@ function sessionIdFromPayload(payload: unknown): SessionId | undefined {
  * payload is a compile error — and validating every send would double the cost
  * of the `telemetry.event` path, which carries up to a few thousand events per
  * frame while a capture runs. Validation happens on receive
- * ({@link parseMessage}). The routing-key comparison in step 1 is not
- * validation in that sense: it reads at most two fields of the payload, costs
- * the same for a batch of one event as for five thousand, and guards the one
- * mistake the compiler cannot see, because both identifiers are plain strings.
+ * ({@link parseMessage}). The two comparisons above are not validation in that
+ * sense: each reads at most two fields of the payload, costs the same for a
+ * batch of one event as for five thousand, and guards a mistake the compiler
+ * cannot see, because the identifiers are plain strings and numbers. The
+ * acting-tab check is a scalar check of one option, not of the payload.
  *
  * It does not mutate or copy the payload either: the returned frame holds the
  * caller's own payload reference, which is what keeps a large telemetry batch a
@@ -974,14 +1203,23 @@ function sessionIdFromPayload(payload: unknown): SessionId | undefined {
  *
  * @param type The message being sent.
  * @param payload That message's payload, as its domain module defines it.
- * @param options Optional overrides for the routing key, the frame id and the
- * timestamp.
+ * @param options Optional overrides for the routing key, the acting tab, the
+ * frame id and the timestamp.
  * @returns A plain JSON-safe frame, typed as that message's envelope.
  * @throws DebuggenError With code `'PROTOCOL_INVALID_MESSAGE'` when
- * `options.sessionId` names a different session than the payload does. The
- * message and hint are constant and `details` carries only `type`, so neither
- * identifier is echoed (AAP §0.5.2). `client/ws-client.ts` calls this inside
- * `tryCatch`, so its `send` answers that error as an `err` rather than throwing.
+ * `options.sessionId` names a different session than the payload does, when
+ * `options.tabId` is not a Chrome tab id, or when it names a different tab than
+ * the payload does. Each message and hint is constant and `details` carries
+ * only `type`, so no identifier is echoed (AAP §0.5.2). `client/ws-client.ts`
+ * calls this inside `tryCatch`, so its `send` answers that error as an `err`
+ * rather than throwing.
+ *
+ * @example
+ * ```ts
+ * // The service worker relaying a page agent's batch, with `tabId` read from
+ * // the relaying runtime port's `sender.tab.id` rather than from the page:
+ * const frame = createEnvelope('telemetry.event', { events }, { tabId });
+ * ```
  */
 export function createEnvelope<K extends MessageType>(
   type: K,
@@ -991,6 +1229,7 @@ export function createEnvelope<K extends MessageType>(
   const id = options?.id ?? newMessageId();
   const ts = options?.ts ?? nowEpochMs();
   const explicitSessionId = options?.sessionId;
+  const tabId = options?.tabId;
 
   // The same rule `protocolMessageSchema` applies on receive, checked here so
   // the mistake is reported at the call site that made it rather than as an
@@ -1002,13 +1241,41 @@ export function createEnvelope<K extends MessageType>(
     });
   }
 
+  if (tabId !== undefined) {
+    // The field schema every receiver applies, on one scalar: a frame carrying
+    // `-1` or `7.5` would be refused on arrival, so it is refused here instead.
+    if (!tabIdSchema.safeParse(tabId).success) {
+      throw new DebuggenError(INVALID_MESSAGE_CODE, ACTING_TAB_INVALID_MESSAGE, {
+        hint: ACTING_TAB_INVALID_HINT,
+        details: { type },
+      });
+    }
+
+    if (actingTabContradictsPayload(tabId, payload)) {
+      throw new DebuggenError(INVALID_MESSAGE_CODE, ACTING_TAB_CONTRADICTION_MESSAGE, {
+        hint: ACTING_TAB_CONTRADICTION_HINT,
+        details: { type },
+      });
+    }
+  }
+
   const sessionId = explicitSessionId ?? sessionIdFromPayload(payload);
 
-  // Two literals rather than a spread, so the key order matches the documented
-  // shape and an absent routing key is an absent key rather than a present
-  // `undefined` (`exactOptionalPropertyTypes` makes that distinction real, and
-  // JSON.stringify makes it observable).
-  return sessionId === undefined ? { id, type, ts, payload } : { id, type, sessionId, ts, payload };
+  // Literals rather than spreads, so the key order matches the documented shape
+  // and an absent routing key or acting tab is an absent key rather than a
+  // present `undefined` (`exactOptionalPropertyTypes` makes that distinction
+  // real, and JSON.stringify makes it observable). The tab-less pair comes
+  // first: it is every frame but the service worker's, and it is exactly the
+  // shape this function built before the acting tab existed.
+  if (tabId === undefined) {
+    return sessionId === undefined
+      ? { id, type, ts, payload }
+      : { id, type, sessionId, ts, payload };
+  }
+
+  return sessionId === undefined
+    ? { id, type, tabId, ts, payload }
+    : { id, type, sessionId, tabId, ts, payload };
 }
 
 // ---------------------------------------------------------------------------
@@ -1056,7 +1323,7 @@ export function isMessageOfType<K extends MessageType>(
  *
  * Call it in the `default` arm of an exhaustive `switch` over `message.type`: in
  * a complete switch the parameter is `never`, so the call compiles; add a
- * twenty-sixth message type and the arm receives a real frame, the parameter
+ * twenty-seventh message type and the arm receives a real frame, the parameter
  * stops being `never`, and `tsc -b` reports the unhandled case at the router
  * rather than letting a frame fall through it at run time.
  *

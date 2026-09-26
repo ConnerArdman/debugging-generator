@@ -159,7 +159,13 @@ import {
   type RedactionRuleId,
 } from './rules.js';
 import { redactSqlStatement } from './sql.js';
-import { URL_ATTRIBUTE_KEYS, isUrlAttributeKey, redactStackUrls, redactUrl } from './url.js';
+import {
+  URL_ATTRIBUTE_KEYS,
+  isUrlAttributeKey,
+  redactQueryString,
+  redactStackUrls,
+  redactUrl,
+} from './url.js';
 
 /*
  * ---------------------------------------------------------------------------
@@ -1242,8 +1248,50 @@ function readTreeNodeKey(
     return undefined;
   }
   // Judged by content alone: `key` is in the deny list's name vocabulary, and
-  // the name rule would replace every React key in the tree.
-  return boundTreeLabel(raw, ARRAY_ELEMENT_KEY, state, walk);
+  // the name rule would replace every React key in the tree. A key that
+  // embeds a URL's search parameters has their values masked first.
+  const masked = maskKeySearchParams(raw);
+  if (masked !== raw) {
+    walk.maskedValues += 1;
+  }
+  return boundTreeLabel(masked, ARRAY_ELEMENT_KEY, state, walk);
+}
+
+/**
+ * A React key with the values of the search parameters it embeds masked.
+ *
+ * A router may key an element by its URL: Next.js keys a page segment
+ * `/__PAGE__?{"q":"…"}`, the page's search parameters serialised as JSON after
+ * the `?`. That is a query in all but syntax, and AAP 0.5.2 lets no query
+ * parameter value travel, so it is masked as one: the text before the first
+ * `?` is kept, a JSON object after it keeps its parameter names with every
+ * value replaced by `?`, and any other text after it is masked as a query
+ * string (`id=42` becomes `id=?`). A key without a `?` — nearly every key — is
+ * returned as it is.
+ *
+ * Idempotent, like the URL rules it mirrors: a masked key masks to itself.
+ * Never throws.
+ */
+function maskKeySearchParams(raw: string): string {
+  const at = raw.indexOf('?');
+  if (at < 0) {
+    return raw;
+  }
+  const head = raw.slice(0, at);
+  const search = raw.slice(at + 1);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(search);
+  } catch {
+    parsed = undefined;
+  }
+  if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    // `fromEntries` defines each name as an own property, so a parameter
+    // called `__proto__` is kept as a name rather than setting a prototype.
+    const names = Object.fromEntries(Object.keys(parsed).map((name) => [name, '?']));
+    return `${head}?${JSON.stringify(names)}`;
+  }
+  return `${head}?${redactQueryString(search)}`;
 }
 
 /** A non-negative integer count, or `undefined` for anything else. */

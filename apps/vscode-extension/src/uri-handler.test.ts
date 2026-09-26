@@ -39,6 +39,16 @@
  *
  * Link-dependent cases are skipped only when this process cannot create a
  * symbolic link at all, detected by trying once — never by platform name.
+ *
+ * ## The other end of the same click
+ *
+ * This URI is the fallback for a click in the DevTools panel when no editor is
+ * connected; when one is, the editor answers the forwarded `source.open` with
+ * a `source.result` built by `sourceResultFor` in `./source/open-location`.
+ * That pure builder is covered here too — this is the extension host's one
+ * colocated suite, and the substitute above already carries everything that
+ * module reaches — including an answer built from real `openSourceLocation`
+ * failures, which must repeat none of the location or path they carried.
  */
 
 import { lstatSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs';
@@ -50,10 +60,20 @@ import { URLSearchParams } from 'node:url';
 import type * as vscode from 'vscode';
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
 
-import { ok } from '@debuggen/shared';
-import type { LogFields, Logger } from '@debuggen/shared';
+import { EDITOR_OPEN_URI, parseSourceResultPayload } from '@debuggen/protocol';
+import type { SourceResultPayload } from '@debuggen/protocol';
+import { DEBUGGEN_ERROR_CODES, DebuggenError, err, ok } from '@debuggen/shared';
+import type {
+  DebuggenErrorCode,
+  LogFields,
+  Logger,
+  Result,
+  SourceLocation,
+} from '@debuggen/shared';
 
+import { openSourceLocation, sourceResultFor } from './source/open-location';
 import {
+  OPEN_SOURCE_URI_PATH,
   createOpenSourceUriHandler,
   type ParsedOpenRequest,
   type UriHandlerDeps,
@@ -237,10 +257,21 @@ function folder(fsPath: string): vscode.WorkspaceFolder {
 /**
  * A `vscode://debuggen.debug-generator/open` URI as VS Code routes it: the
  * path and the already-decoded query are all the handler reads.
+ *
+ * The path and the parameter names are `EDITOR_OPEN_URI`'s — the table the
+ * DevTools panel's `buildEditorOpenUri` writes from — so every case below also
+ * proves the handler reads the names the producer writes. The substitute has no
+ * `Uri.parse`, so the query is handed over already decoded once, as the real
+ * editor would; the encode-and-decode round trip itself is proved against the
+ * real `vscode.Uri.parse` in `test/suite/uri-handler.test.ts`.
  */
 function openUri(file: string = REQUESTED_FILE): vscode.Uri {
-  const query = new URLSearchParams({ file, line: '3', col: '2' }).toString();
-  return { path: '/open', query } as vscode.Uri;
+  const query = new URLSearchParams({
+    [EDITOR_OPEN_URI.fileParameter]: file,
+    [EDITOR_OPEN_URI.lineParameter]: '3',
+    [EDITOR_OPEN_URI.columnParameter]: '2',
+  }).toString();
+  return { path: EDITOR_OPEN_URI.path, query } as vscode.Uri;
 }
 
 type ConfirmFn = NonNullable<UriHandlerDeps['confirm']>;
@@ -618,6 +649,29 @@ describe("createOpenSourceUriHandler — the editor's copy", () => {
   });
 });
 
+describe('createOpenSourceUriHandler — the editor-open URI of @debuggen/protocol', () => {
+  it('answers to exactly the path buildEditorOpenUri writes', () => {
+    expect(OPEN_SOURCE_URI_PATH).toBe(EDITOR_OPEN_URI.path);
+  });
+
+  it('reads the column only under EDITOR_OPEN_URI.columnParameter, never another spelling', async () => {
+    // `column` is the spelling a hand-written link reaches for; the contract's
+    // is `col`, and a handler accepting both would make it a suggestion.
+    expect(EDITOR_OPEN_URI.columnParameter).not.toBe('column');
+    const query = new URLSearchParams({
+      [EDITOR_OPEN_URI.fileParameter]: REQUESTED_FILE,
+      [EDITOR_OPEN_URI.lineParameter]: '3',
+      column: '2',
+    }).toString();
+    const harness = buildHandler(sandbox);
+
+    await harness.handler.handleUri({ path: EDITOR_OPEN_URI.path, query } as vscode.Uri);
+
+    expectRefused(harness, sandbox, 'missing-parameter');
+    expect(harness.confirm).not.toHaveBeenCalled();
+  });
+});
+
 describe('createOpenSourceUriHandler — one dialog at a time', () => {
   it('refuses a second request as busy while a confirmation is open, and releases afterwards', async () => {
     let answer: (confirmed: boolean) => void = () => undefined;
@@ -644,5 +698,138 @@ describe('createOpenSourceUriHandler — one dialog at a time', () => {
     expect(harness.confirm).toHaveBeenCalledTimes(2);
     expect(harness.reveal).toHaveBeenCalledTimes(2);
     expect(refusalReasons(harness)).toEqual(['busy']);
+  });
+});
+
+/** The `source.open` frame every answer below responds to. */
+const ANSWERED = Object.freeze({ sessionId: 'sess_answered', ref: 'msg_forwarded' });
+
+/** The `failed` member of the `source.result` payload union. */
+type FailedSourceResult = Extract<SourceResultPayload, { status: 'failed' }>;
+
+/** The failed answer inside `result`, or a test failure naming what came back instead. */
+function expectFailedAnswer(
+  result: Result<SourceResultPayload, DebuggenError>,
+): FailedSourceResult {
+  if (!result.ok || result.value.status !== 'failed') {
+    throw new Error(`expected a failed source.result, got ${JSON.stringify(result)}`);
+  }
+  return result.value;
+}
+
+/** A location inside the sandbox workspace, as a forwarded `source.open` carries it. */
+function forwardedLocation(): SourceLocation {
+  return { file: REQUESTED_FILE, line: 3, column: 2, resolvedBy: 'patch', confidence: 1 };
+}
+
+describe("sourceResultFor — the editor's answer to a forwarded source.open", () => {
+  it('answers an opened location with the session and the ref, and nothing else', () => {
+    expect(sourceResultFor(ANSWERED, { kind: 'opened' })).toEqual(
+      ok({ sessionId: ANSWERED.sessionId, ref: ANSWERED.ref, status: 'opened' }),
+    );
+  });
+
+  it('answers a session this window does not know as SESSION_NOT_FOUND', () => {
+    const answer = expectFailedAnswer(sourceResultFor(ANSWERED, { kind: 'unknown-session' }));
+
+    expect(answer).toMatchObject({ sessionId: ANSWERED.sessionId, ref: ANSWERED.ref });
+    expect(answer.error.code).toBe('SESSION_NOT_FOUND');
+    expect(answer.error.hint).toEqual(expect.any(String));
+  });
+
+  it('answers an attempt that threw as INTERNAL', () => {
+    const answer = expectFailedAnswer(sourceResultFor(ANSWERED, { kind: 'unexpected' }));
+
+    expect(answer.error.code).toBe('INTERNAL');
+    expect(answer.error.hint).toEqual(expect.any(String));
+  });
+
+  it('keeps the code of any failure and answers it with a payload the service accepts', () => {
+    for (const code of DEBUGGEN_ERROR_CODES) {
+      const answer = expectFailedAnswer(sourceResultFor(ANSWERED, { kind: 'not-opened', code }));
+
+      expect(answer.error.code).toBe(code);
+      expect(parseSourceResultPayload(answer)).toEqual(ok(answer));
+    }
+  });
+
+  it('gives each refusal openSourceLocation reports a sentence of its own', () => {
+    const codes: readonly DebuggenErrorCode[] = [
+      'PROTOCOL_INVALID_MESSAGE',
+      'PATH_OUTSIDE_PROJECT',
+      'PROJECT_NOT_FOUND',
+      'INTERNAL',
+    ];
+    const messages = codes.map(
+      (code) =>
+        expectFailedAnswer(sourceResultFor(ANSWERED, { kind: 'not-opened', code })).error.message,
+    );
+
+    expect(new Set(messages).size).toBe(codes.length);
+  });
+
+  it('repeats nothing a failed open carried: not the location, the path or the local message', async () => {
+    const notices: string[] = [];
+    const showWarning = (message: string): void => {
+      notices.push(message);
+    };
+    const unrevealable = new DebuggenError(
+      'PROJECT_NOT_FOUND',
+      `The editor could not open ${sandbox.target}`,
+    );
+    const failures = [
+      // Refused before any editor call: the session has no usable project root.
+      await openSourceLocation(forwardedLocation(), { projectRoot: ' ' }, { showWarning }),
+      // Contained, and the editor could not load it; its error quotes the path.
+      await openSourceLocation(
+        forwardedLocation(),
+        { projectRoot: sandbox.workspace },
+        { showWarning, reveal: () => Promise.resolve(err(unrevealable)) },
+      ),
+    ];
+
+    expect(failures.map((failure) => (failure.ok ? 'ok' : failure.error.code))).toEqual([
+      'PATH_OUTSIDE_PROJECT',
+      'PROJECT_NOT_FOUND',
+    ]);
+    // The developer was told in this window, once per failure.
+    expect(notices).toHaveLength(failures.length);
+    for (const failure of failures) {
+      if (failure.ok) {
+        continue;
+      }
+      const answer = expectFailedAnswer(
+        sourceResultFor(ANSWERED, { kind: 'not-opened', code: failure.error.code }),
+      );
+      const wire = JSON.stringify(answer);
+
+      expect(answer.error.code).toBe(failure.error.code);
+      expect(wire).not.toContain(sandbox.root);
+      expect(wire).not.toContain(REQUESTED_FILE);
+      expect(wire).not.toContain(failure.error.message);
+    }
+  });
+
+  it('answers a location openSourceLocation revealed as opened', async () => {
+    const opened = await openSourceLocation(
+      forwardedLocation(),
+      { projectRoot: sandbox.workspace },
+      { showWarning: () => undefined, reveal: () => Promise.resolve(REVEALED) },
+    );
+
+    expect(opened.ok).toBe(true);
+    expect(sourceResultFor(ANSWERED, { kind: 'opened' })).toMatchObject({
+      ok: true,
+      value: { status: 'opened' },
+    });
+  });
+
+  it('refuses, without throwing, a ref the service would refuse', () => {
+    for (const ref of ['', 'r'.repeat(65)]) {
+      const answer = sourceResultFor({ ...ANSWERED, ref }, { kind: 'opened' });
+
+      expect(answer.ok).toBe(false);
+      expect(answer.ok ? undefined : answer.error.code).toBe('PROTOCOL_INVALID_MESSAGE');
+    }
   });
 });

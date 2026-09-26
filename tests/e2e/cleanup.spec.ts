@@ -73,7 +73,7 @@ import type { Page } from '@playwright/test';
 
 import type { INSTRUMENTATION_MARKERS } from '@debuggen/instrumentation';
 
-import { DEMO_LAUNCH_TIMEOUT_MS, diffSnapshots } from './helpers/demo-app';
+import { DEMO_LAUNCH_TIMEOUT_MS, diffSnapshots, waitForStreamedContent } from './helpers/demo-app';
 import type { MarkerFinding } from './helpers/demo-app';
 import {
   DEFAULT_SESSION_TIMEOUTS,
@@ -428,6 +428,7 @@ async function prepareCheckout(page: Page, baseUrl: string): Promise<void> {
   await page.goto(new URL(CHECKOUT_PATH, baseUrl).toString(), {
     timeout: E2E_TIMEOUTS.pageReady,
   });
+  await waitForStreamedContent(page);
   const placeOrder = page.locator(PLACE_ORDER_SELECTOR);
   await expect(
     placeOrder,

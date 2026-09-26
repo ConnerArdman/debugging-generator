@@ -7,11 +7,20 @@
  *
  * ```text
  * argument (Sessions tree row / inline action)   ─┐
- *                                                  ├─▶ session id ─▶ GET /sessions/:id
+ *                                                  ├─▶ session id
  * Command Palette ─▶ quick pick of stored sessions ─┘        │
- *                                                            ▼
- *                         ExtensionState: reset (if another session was active)
- *                                         + applySessionRecord(authoritative record)
+ *                                        shutting down? ─────┼─yes─▶ done, nothing sent
+ *                         another start/reopen in flight? ───┼─yes─▶ one notice, done
+ *                                                            │ no
+ *                             beginSessionCreation ─▶ GET /sessions/:id ──Err──▶ one notice
+ *                                                            │
+ *                  a different, live session is active? ─────┼─yes─▶ "End and Reopen"?
+ *                                                            │         │ declined ─▶ done,
+ *                                                            │         │   nothing changed
+ *                                                            │ ◀───────┘ accepted
+ *                         endBeforeReplacing (POST /sessions/:id/end) ──false──▶ stop
+ *                                                            │ true
+ *                               window.adopt(authoritative record + held frames)
  *                                                            │
  *                                                            ▼
  *                                          reveal the `debuggen.session` view
@@ -22,22 +31,37 @@
  * panel re-renders the stored panel and this editor receives the panel summary
  * the record itself cannot carry. That replay belongs to the service
  * (`apps/local-service/src/sessions/reopen.ts`); this module performs none of
- * it and sends nothing over the socket.
+ * it and sends nothing over the socket. The creation window is opened before
+ * the request, so a replayed frame that arrives while the previous session is
+ * still being ended is held and applied on adoption rather than dropped.
+ *
+ * ## Why the session in view is ended first
+ *
+ * `deactivate()` in `src/extension.ts` ends the active session (and the
+ * sessions its creates in flight produce), never one the store has already
+ * replaced, so switching the view to another session while the current one is
+ * live would orphan its patches and hooks (AAP §0.5.1). Unlike a new question,
+ * reopening is not a start-over the developer asked for, so a live session is
+ * ended only after a confirmation that says what ending does; declining leaves
+ * everything as it was. {@link endBeforeReplacing} then sends `session.end`,
+ * awaits the settled cleanup, and stops the reopen, with one notice, whenever
+ * the verdict leaves anything for the developer to see. A session that has
+ * already ended is replaced without asking. Reopening the session already in
+ * view ends and resets nothing: its record is merged.
  *
  * ## Why this command writes session-scoped state
  *
- * Every other command in this folder leaves the session-scoped fields of
- * `ExtensionState` to the WebSocket broadcast. Reopening is the exception the
- * requirements name: the value applied is the service's own authoritative
- * record, applied exactly as a `session.updated` push would apply it, so the
- * replay that follows is idempotent with it. Applying it here is what makes
- * the view repopulate even while the socket is still reconnecting.
+ * The value adopted is the service's own authoritative record, merged under
+ * the same rules as a `session.updated` push, so the replay that follows is
+ * idempotent with it. Adopting it here is what makes the view repopulate even
+ * while the socket is still reconnecting.
  *
  * ## Invariants
  *
- * - **Thin.** Resolve the id, one `GET /sessions/:id`, apply, reveal. The only
- *   other request is the single `GET /sessions` refresh of the empty-list
- *   palette path, issued through the Sessions tree's single-flight loader.
+ * - **Thin.** Resolve the id, one `GET /sessions/:id`, end the session in view
+ *   when it must go, adopt, reveal. The only other request is the single
+ *   `GET /sessions` refresh of the empty-list palette path, issued through the
+ *   Sessions tree's single-flight loader.
  * - **Ids are resolved, never made.** An id comes from the invoking argument
  *   or from a stored session the developer picked; nothing is constructed,
  *   guessed or derived from the question.
@@ -57,7 +81,8 @@
  * bundled to CommonJS by `esbuild.mjs` (no top-level `await`), Node and
  * `vscode` types only. `vscode` is imported for its types alone, and `./index`
  * — which imports this module at runtime — for types alone, keeping the
- * folder's module graph acyclic.
+ * folder's module graph acyclic; the one runtime edge within the folder is to
+ * `./end-session`, which imports nothing from here.
  *
  * @example
  * ```ts
@@ -79,7 +104,14 @@ import { DebuggenError, isErr } from '@debuggen/shared';
 import { formatSessionLabel, summarizeSession } from '../views/sessions-tree';
 import type { SessionListItem } from '../views/sessions-tree';
 
-import type { CommandContext, CommandId, CommandNotice, SESSION_VIEW_FOCUS_COMMAND } from './index';
+import { captureServiceEndpoint, endBeforeReplacing } from './end-session';
+import type {
+  CommandContext,
+  CommandId,
+  CommandNotice,
+  DestructiveConfirmation,
+  SESSION_VIEW_FOCUS_COMMAND,
+} from './index';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -143,6 +175,28 @@ const CONNECTION_PENDING_NOTICE: CommandNotice = Object.freeze({
     'The stored panel re-renders here and in the DevTools panel once the connection is restored.',
 });
 
+/**
+ * Asked before a live session in view is ended so that another can be
+ * reopened. It states what ending does and what it keeps.
+ */
+const END_AND_REOPEN_CONFIRMATION: DestructiveConfirmation = Object.freeze({
+  message: 'End the current session and reopen the selected one?',
+  detail:
+    'The current session is still live. Reopening another session ends it first, which removes its instrumentation and restores the files it modified. Its data stays stored, so you can reopen it later.',
+  confirmLabel: 'End and Reopen',
+});
+
+/**
+ * Shown when a start or reopen is already replacing the active session: a
+ * second one in flight could adopt a session the first has not ended, so it is
+ * refused rather than queued.
+ */
+const REPLACEMENT_IN_FLIGHT_NOTICE: CommandNotice = Object.freeze({
+  level: 'info',
+  message: 'A debugging session is already being started or reopened.',
+  detail: 'Wait for it to appear in the Debug Generator view, then reopen the session again.',
+});
+
 /** Control characters: never part of a session id (the protocol's id schema refuses them). */
 const CONTROL_CHARACTER = /\p{Cc}/u;
 
@@ -169,12 +223,20 @@ interface SessionPickItem extends vscode.QuickPickItem {
  * session) the developer picks from the stored sessions; cancelling the pick
  * ends the command silently.
  *
- * The record is fetched with one `GET /sessions/:id`. On failure — a session
- * purged by retention, an unreachable service — exactly one explanation is
- * shown and the view is left untouched. On success, a different active
- * session is cleared first so none of its progress, modifications, analysis or
- * panel lingers, the record is applied as one coalesced change, and the view
- * is revealed.
+ * Once the extension is shutting down (`ExtensionState.isShuttingDown`) the
+ * command refuses silently — before the request, after it, and after the
+ * session in view was ended — so nothing is adopted that `deactivate()` would
+ * not end. While another start or reopen is replacing the active session, the
+ * command refuses with one notice. Otherwise it opens a creation window and fetches the
+ * record with one `GET /sessions/:id`. On failure — a session purged by
+ * retention, an unreachable service — exactly one explanation is shown and the
+ * view is left untouched. On success, a different session still live in view
+ * is ended first, after the developer confirms (see the module documentation);
+ * declining, or a cleanup that leaves something to review, stops the reopen
+ * with the view as it was or showing the ended session's verdict. The record
+ * is then adopted as one coalesced change — none of the previous session's
+ * progress, modifications, analysis or panel lingers — and the view is
+ * revealed.
  *
  * @param ctx The resolved command context.
  * @param args What VS Code invoked the command with; only `args[0]` is read.
@@ -188,28 +250,70 @@ export async function reopenSession(
     return;
   }
 
-  const loaded = await ctx.client.getSession(sessionId);
-  if (isErr(loaded)) {
-    await ctx.ui.notifyFailure(loaded.error, { prefix: REOPEN_FAILURE_PREFIX });
+  if (ctx.state.isShuttingDown) {
+    logShutdownRefusal(ctx, 'before-request');
+    return;
+  }
+  if (ctx.state.sessionCreationPending) {
+    ctx.logger.info('Session reopen refused while another replacement is in flight', {
+      command: COMMAND_ID,
+    });
+    await ctx.ui.notify(REPLACEMENT_IN_FLIGHT_NOTICE);
     return;
   }
 
-  const record = loaded.value;
-  if (record.id !== sessionId) {
-    // A contract breach, not an expected outcome: applying it would show a
-    // session the developer did not ask for.
-    await ctx.ui.notifyFailure(
-      new DebuggenError(
-        'PROTOCOL_INVALID_MESSAGE',
-        'The local service answered with a different session than the one requested.',
-        { hint: 'Refresh the Sessions view and select the session again.' },
-      ),
-      { prefix: REOPEN_FAILURE_PREFIX },
-    );
-    return;
+  const reopening = ctx.state.beginSessionCreation();
+  try {
+    // The service that answers holds the session, so its address is captured
+    // before the request is sent and becomes the reopened session's owning
+    // endpoint: a `debuggen.serviceUrl` change mid-request must not re-home it.
+    const captured = captureServiceEndpoint(ctx);
+    if (isErr(captured)) {
+      await ctx.ui.notifyFailure(captured.error, { prefix: REOPEN_FAILURE_PREFIX });
+      return;
+    }
+    const endpoint = captured.value;
+
+    const loaded = await ctx.client.getSession(sessionId, { endpoint });
+    if (isErr(loaded)) {
+      await ctx.ui.notifyFailure(loaded.error, { prefix: REOPEN_FAILURE_PREFIX });
+      return;
+    }
+
+    const record = loaded.value;
+    if (record.id !== sessionId) {
+      // A contract breach, not an expected outcome: applying it would show a
+      // session the developer did not ask for.
+      await ctx.ui.notifyFailure(
+        new DebuggenError(
+          'PROTOCOL_INVALID_MESSAGE',
+          'The local service answered with a different session than the one requested.',
+          { hint: 'Refresh the Sessions view and select the session again.' },
+        ),
+        { prefix: REOPEN_FAILURE_PREFIX },
+      );
+      return;
+    }
+
+    // Shutdown closes every window: a `deactivate()` that ran while the record
+    // was being fetched stops the reopen before it asks anything.
+    if (ctx.state.isShuttingDown || !reopening.isOpen) {
+      logShutdownRefusal(ctx, 'after-request');
+      return;
+    }
+    if (!(await endActiveBeforeReopening(ctx, record))) {
+      return;
+    }
+    if (ctx.state.isShuttingDown || !reopening.isOpen) {
+      logShutdownRefusal(ctx, 'after-replacing');
+      return;
+    }
+    reopening.adopt(record, endpoint);
+  } finally {
+    // A no-op once adopted; closes the window on every other exit.
+    reopening.abandon();
   }
 
-  applyReopenedRecord(ctx, record);
   await revealSessionView(ctx);
 
   if (ctx.client.state !== 'open') {
@@ -217,6 +321,25 @@ export async function reopenSession(
   }
 
   ctx.logger.info('Session reopened', { command: COMMAND_ID });
+}
+
+/**
+ * Logs that a reopen was refused because the extension is shutting down. No
+ * notice is shown: the window is closing, and `deactivate()` owns what is
+ * left.
+ *
+ * @param ctx The command context.
+ * @param point Where the gate closed: before `GET /sessions/:id`, after it, or
+ *   after the session in view was ended.
+ */
+function logShutdownRefusal(
+  ctx: CommandContext,
+  point: 'before-request' | 'after-request' | 'after-replacing',
+): void {
+  ctx.logger.info('Session reopen refused because the extension is shutting down', {
+    command: COMMAND_ID,
+    point,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -389,23 +512,40 @@ function compareTimestampsDescending(a: number, b: number): number {
 // ---------------------------------------------------------------------------
 
 /**
- * Makes `record` the session in view, as one coalesced store change.
+ * Ends the session in view before `record` replaces it, and says whether the
+ * reopen may proceed.
  *
- * `applySessionRecord` adopts a record as the active session only when no
- * session is active or it is the active one, so a different active session is
- * reset first — which also clears its progress rows, modifications, analysis
- * and panel summary. Reopening the session already in view resets nothing; a
- * stored record older than the one held is ignored by the store itself.
+ * Nothing is ended when no session is active or `record` is the session in
+ * view (its record is merged; nothing is reset). A different session that is
+ * still live is ended only after the developer confirms; declining returns
+ * `false` silently, with nothing changed. The end itself — and every notice a
+ * refused or unsettled end produces — is {@link endBeforeReplacing}'s, which
+ * also lets an already-ended session with a settled verdict go without a
+ * request.
+ *
+ * @param ctx The command context.
+ * @param record The authoritative record of the session being reopened.
+ * @returns `true` when the store may adopt `record`.
  */
-function applyReopenedRecord(ctx: CommandContext, record: SessionRecord): void {
-  const { state } = ctx;
-  state.batch(() => {
-    const activeSessionId = state.activeSessionId;
-    if (activeSessionId !== undefined && activeSessionId !== record.id) {
-      state.resetSession();
+async function endActiveBeforeReopening(
+  ctx: CommandContext,
+  record: SessionRecord,
+): Promise<boolean> {
+  const active = ctx.state.activeSession;
+  if (active === undefined || active.id === record.id) {
+    return true;
+  }
+  if (active.status !== 'ended') {
+    const confirmed = await ctx.ui.confirmDestructive(END_AND_REOPEN_CONFIRMATION);
+    if (!confirmed) {
+      ctx.logger.info('Session reopen declined; the current session stays live', {
+        command: COMMAND_ID,
+        sessionId: active.id,
+      });
+      return false;
     }
-    state.applySessionRecord(record);
-  });
+  }
+  return endBeforeReplacing(ctx, 'reopen');
 }
 
 /**

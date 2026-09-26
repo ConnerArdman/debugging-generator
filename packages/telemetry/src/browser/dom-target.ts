@@ -35,8 +35,8 @@
  *
  * **2. Everything returned is strictly JSON-compliant.** `inspectedWindow.eval`
  * can only hand back JSON-compliant values, and the same descriptor is also
- * structured-cloned through `window.postMessage` on its way from the page to
- * the isolated-world bridge. So a returned object holds strings, finite
+ * rendered to JSON by `./transport.ts` on its way from the page to the
+ * isolated-world bridge. So a returned object holds strings, finite
  * numbers, arrays of strings and nested plain objects only — never a DOM node,
  * never a fiber, never an `Error`, never a function or a symbol, and never a
  * key whose value is `undefined`. Optional fields are omitted rather than set

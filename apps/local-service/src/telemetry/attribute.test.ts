@@ -6,7 +6,9 @@
  * capture window a batch belongs to, or why it belongs to none:
  *
  * 1. **Browser origin.** A relayed batch belongs to the session its tab is
- *    bound to, and only while that session has an open capture window.
+ *    bound to, and only while that session has an open capture window — and,
+ *    when the batch names the capture its agent was armed for, only if that is
+ *    the open one (`stale-capture`: a late batch is refused, never relabelled).
  * 2. **Server origin and credential scope (AAP §0.5.6).** A preload batch
  *    belongs to the capture owner of the project its credential is scoped to,
  *    and the project the body names must be *exactly* that project after POSIX
@@ -820,6 +822,203 @@ describe('resolveBatch: browser origin', () => {
 
     expect(error.code).toBe('INTERNAL');
     expect(error.details?.['fault']).toBe('dependency-threw');
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * resolveBatch — the producer's capture identity (stale-capture)
+ * ---------------------------------------------------------------------------------------------- */
+
+describe('resolveBatch: the producer’s armed capture', () => {
+  /**
+   * A browser world whose open capture can be replaced mid-case, the way a
+   * Stop followed by a Start replaces it: `open` is read on every
+   * `getActiveCapture` call, so a batch resolved after `open = next` sees the
+   * new window.
+   */
+  function rearmableWorld(): {
+    readonly sessionId: SessionId;
+    readonly first: CaptureId;
+    readonly second: CaptureId;
+    readonly setOpen: (captureId: CaptureId | undefined) => void;
+    readonly log: LogCapture;
+    readonly attributor: IngestAttributor;
+  } {
+    const sessionId = newSessionId();
+    const first = newCaptureId();
+    const second = newCaptureId();
+    let open: CaptureId | undefined = first;
+    const repo = fakeRepo({
+      bindings: [[TAB_ID, sessionId]],
+      sessions: [{ id: sessionId, projectRoot: PROJECT_ONE }],
+      getActiveCapture: () => ok(open === undefined ? undefined : { capture: { id: open } }),
+    });
+    const log = recordingLogger();
+    const attributor = createIngestAttributor({
+      sessions: repo,
+      logger: log.logger,
+      now: fixedClock,
+    });
+
+    return {
+      sessionId,
+      first,
+      second,
+      setOpen: (captureId) => {
+        open = captureId;
+      },
+      log,
+      attributor,
+    };
+  }
+
+  it('attributes a batch naming the open capture exactly as one that names none', async () => {
+    const world = browserWorld();
+
+    const named = expectResolved(
+      await world.attributor.resolveBatch({
+        ...browserContext(),
+        armedCaptureId: world.captureId,
+      }),
+    );
+    const unnamed = expectResolved(await world.attributor.resolveBatch(browserContext()));
+    const explicitlyAbsent = expectResolved(
+      await world.attributor.resolveBatch({ ...browserContext(), armedCaptureId: undefined }),
+    );
+
+    // Naming the open capture adds nothing to the attribution: the identity
+    // still comes from the binding and the store's open capture row.
+    expect(named).toStrictEqual(unnamed);
+    expect(explicitlyAbsent).toStrictEqual(unnamed);
+    expect(named.captureId).toBe(world.captureId);
+    expect(expectAttributed(world.attributor.attributeEvent(makeIngress(), named)).captureId).toBe(
+      world.captureId,
+    );
+  });
+
+  // The defect this reason exists for: a batch recorded during capture A that
+  // arrives after B opened must never be filed under B.
+  it('refuses a batch recorded for the previous capture after the next one opened, whole', async () => {
+    const world = rearmableWorld();
+
+    // While A is open, A's batch is A's.
+    const during = expectResolved(
+      await world.attributor.resolveBatch({ ...browserContext(), armedCaptureId: world.first }),
+    );
+    expect(during.captureId).toBe(world.first);
+
+    // Stop A, start B: A's late batch is refused, B's own batch is B's.
+    world.setOpen(world.second);
+    const late = expectDrop(
+      await world.attributor.resolveBatch({ ...browserContext(), armedCaptureId: world.first }),
+      'stale-capture',
+    );
+    const current = expectResolved(
+      await world.attributor.resolveBatch({ ...browserContext(), armedCaptureId: world.second }),
+    );
+
+    expect(current.captureId).toBe(world.second);
+    expect(late.code).toBe(DROP_REASON_ERROR_CODES['stale-capture']);
+    expect(late.code).toBe('SESSION_INVALID_STATE');
+    expect(late.details).toMatchObject({
+      origin: 'browser-agent',
+      tabId: TAB_ID,
+      sessionId: world.sessionId,
+      // The refusal names the capture it protected — never the one the page named.
+      captureId: world.second,
+    });
+    expect(late.details).not.toHaveProperty('fault');
+    expect(errorText(late)).not.toContain(world.first);
+
+    // Logged once, at warn — evidence this capture is missing — and only ever
+    // under the open capture's binding.
+    const dropped = world.log.lines.filter((line) => line.message === 'telemetry batch dropped');
+    expect(dropped).toHaveLength(1);
+    expect(dropped[0]?.level).toBe('warn');
+    expect(dropped[0]?.fields).toMatchObject({
+      reason: 'stale-capture',
+      code: 'SESSION_INVALID_STATE',
+      tabId: TAB_ID,
+    });
+    expect(dropped[0]?.fields['captureId']).toBe(world.second);
+    expect(JSON.stringify(dropped)).not.toContain(world.first);
+    // Two batches resolved (A during A, B during B); the late one did not.
+    expect(
+      world.log.lines.filter((line) => line.message === 'telemetry batch resolved'),
+    ).toHaveLength(2);
+  });
+
+  it('refuses a batch naming any capture other than the open one, before anything is attributed', async () => {
+    const world = browserWorld();
+
+    const error = expectDrop(
+      await world.attributor.resolveBatch({ ...browserContext(), armedCaptureId: newCaptureId() }),
+      'stale-capture',
+    );
+
+    expect(error.details?.['captureId']).toBe(world.captureId);
+    // The store was read exactly as for any batch: binding, session, capture.
+    expect(world.repo.calls.getBindingByTab).toStrictEqual([TAB_ID]);
+    expect(world.repo.calls.get).toStrictEqual([world.sessionId]);
+    expect(world.repo.calls.getActiveCapture).toStrictEqual([world.sessionId]);
+    expect(world.log.lines.map((line) => line.message)).not.toContain('telemetry batch resolved');
+  });
+
+  it('answers a named capture while none is open as no-active-capture, the routine boundary flush', async () => {
+    const world = rearmableWorld();
+    world.setOpen(undefined);
+
+    const error = expectDrop(
+      await world.attributor.resolveBatch({ ...browserContext(), armedCaptureId: world.first }),
+      'no-active-capture',
+    );
+
+    expect(error.code).toBe(DROP_REASON_ERROR_CODES['no-active-capture']);
+    expect(error.details).not.toHaveProperty('captureId');
+    const dropped = world.log.lines.filter((line) => line.message === 'telemetry batch dropped');
+    expect(dropped.map((line) => line.level)).toStrictEqual(['debug']);
+    expect(dropped[0]?.fields['reason']).toBe('no-active-capture');
+  });
+
+  it('refuses a malformed armed capture as stale-capture with its fault, never attributing it', async () => {
+    for (const malformed of ['', 42, null, { id: 'capture' }]) {
+      const world = browserWorld();
+
+      const error = expectDrop(
+        await world.attributor.resolveBatch({
+          ...browserContext(),
+          armedCaptureId: malformed as unknown as CaptureId,
+        }),
+        'stale-capture',
+      );
+
+      expect(error.code).toBe('SESSION_INVALID_STATE');
+      expect(error.details?.['fault']).toBe('invalid-armed-capture');
+      expect(error.details?.['captureId']).toBe(world.captureId);
+    }
+  });
+
+  it('never echoes the page-supplied capture name, the URL or the document id into the refusal', async () => {
+    const world = browserWorld();
+
+    const error = expectDrop(
+      await world.attributor.resolveBatch({
+        ...browserContext({ url: `http://127.0.0.1:3000/${SENTINEL}?q=${SENTINEL}` }),
+        documentId: SENTINEL,
+        armedCaptureId: SENTINEL,
+      }),
+      'stale-capture',
+    );
+
+    expectNoSentinel(error.message);
+    expectNoSentinel(error.hint ?? '');
+    expectNoSentinel(JSON.stringify(error.toPayload()));
+    expectNoSentinel(errorText(error));
+    expectNoSentinel(world.log.text());
+    expect(world.log.text()).not.toContain('127.0.0.1');
+    // The refusal's own words name no identifier at all.
+    expect(error.message).not.toContain(world.captureId);
+    expect(error.hint ?? '').not.toContain(world.captureId);
   });
 });
 

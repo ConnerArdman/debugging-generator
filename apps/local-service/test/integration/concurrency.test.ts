@@ -52,7 +52,19 @@
  * other's state, exactly as a developer's sessions would: session A (the
  * deterministic owner) and session B (runtime-only) share the harness's copy of
  * the sample project; session C lives on a second copy; sessions D and E are
- * opened on the first copy once A has ended, for the races.
+ * opened on the first copy once A has ended, for the races — and are then
+ * reused, both back in `ready`, for the store-failure checks.
+ *
+ * ## Injected store failures
+ *
+ * The last tests prove that ownership follows the **store**, not the attempt:
+ * a capture window that cannot be closed keeps its session the project's owner,
+ * whether a failure, an end or a rebuild of the owner index (`hydrate`, which
+ * reads the open windows and closes orphans) tried to close it.
+ * The failure is injected with a `TEMP` trigger on {@link Harness.store} — the
+ * service's own connection — that aborts the one `UPDATE` closing a chosen
+ * window. A temporary trigger lives on that connection only, never reaches the
+ * database file, and is dropped in a `finally` by the test that created it.
  *
  * @module
  */
@@ -81,6 +93,11 @@ import type { DebuggenError, Result } from '@debuggen/shared';
 import type { TelemetryEventIngress } from '@debuggen/telemetry';
 
 import { HTTP_ERROR_STATUS_BY_CODE } from '../../src/server/http.js';
+import {
+  SESSION_REQUEST_DIAGNOSTIC_MESSAGE,
+  SESSION_REQUEST_REFUSED_LOG_MESSAGE,
+} from '../../src/server/routes/sessions.js';
+import { FAILURE_COPY_BY_CODE } from '../../src/sessions/progress.js';
 import {
   DROP_REASONS,
   PRODUCING_ORIGIN_BY_TIER,
@@ -165,6 +182,19 @@ const EVENT_COUNT_SQL = 'SELECT COUNT(*) AS total FROM telemetry_events';
 /** How many capture windows are open on one project root. */
 const OPEN_CAPTURES_SQL =
   'SELECT COUNT(*) AS total FROM captures JOIN sessions ON sessions.id = captures.session_id WHERE captures.stopped_at IS NULL AND sessions.project_root = ?';
+
+/**
+ * The only shape of id a trigger's `WHEN` clause may quote. DDL cannot bind a
+ * parameter, so an id is checked against this before it is written into one;
+ * every id the service mints (`cap_…`) matches.
+ */
+const TRIGGER_SAFE_ID = /^[A-Za-z0-9_-]+$/u;
+
+/** What the injected store failure aborts the closing `UPDATE` with. */
+const INJECTED_CLOSE_FAILURE = 'concurrency suite: injected capture-window close failure';
+
+/** The code a store write the injected trigger aborted is reported with. */
+const STORE_ERROR_CODE = 'STORE_ERROR' as const;
 
 /* -------------------------------------------------------------------------------------------------
  * The plan queue
@@ -528,6 +558,53 @@ function expectDropped(
   }
 }
 
+/**
+ * Makes the store refuse to close one capture window: a `TEMP` trigger on the
+ * service's own connection aborts every `UPDATE` of that row's `stopped_at`.
+ *
+ * @returns The function that drops the trigger again; call it in a `finally`.
+ */
+function blockCaptureClose(captureId: string): () => void {
+  if (!TRIGGER_SAFE_ID.test(captureId)) {
+    throw new Error('The capture id cannot be quoted into a trigger.');
+  }
+  const trigger = `concurrency_block_close_${captureId.replaceAll('-', '_')}`;
+  harness.store.db.exec(
+    `CREATE TEMP TRIGGER ${trigger} BEFORE UPDATE OF stopped_at ON captures WHEN OLD.id = '${captureId}' BEGIN SELECT RAISE(ABORT, '${INJECTED_CLOSE_FAILURE}'); END;`,
+  );
+  return () => {
+    harness.store.db.exec(`DROP TRIGGER IF EXISTS temp.${trigger};`);
+  };
+}
+
+/**
+ * Opens a capture window straight in the store for a session that keeps its
+ * status — the orphan a start interrupted between the window and the status
+ * leaves behind, which the manager itself can no longer produce.
+ *
+ * @returns The orphan window's capture id.
+ */
+function openOrphanWindow(sessionId: string): string {
+  const plan = harness.repos.sessions.latestPlanVersion(sessionId);
+  if (isErr(plan) || plan.value === undefined) {
+    throw new Error(`Session ${sessionId} has no plan to open an orphan window under.`);
+  }
+  const opened = harness.repos.sessions.startCapture({ sessionId, planVersion: plan.value });
+  if (isErr(opened)) {
+    throw new Error(`The orphan window could not be opened (${opened.error.code}).`);
+  }
+  return opened.value.capture.id;
+}
+
+/** How many `failed` progress rows the store holds for a session. */
+function failedRowCount(sessionId: string): number {
+  const rows = harness.repos.sessions.listProgress(sessionId);
+  if (isErr(rows)) {
+    throw new Error(`The progress of ${sessionId} could not be read (${rows.error.code}).`);
+  }
+  return rows.value.filter((row) => row.status === 'failed').length;
+}
+
 /** The capture id of a successful `capture.start`, or a failure naming the refusal. */
 function expectStarted(
   result: Result<{ readonly captureId: string }, DebuggenError>,
@@ -591,6 +668,8 @@ describe('one capture per project root, across the real service boundary', () =>
   let sessionB: SessionUnderTest;
   /** Opened on the primary copy once A has ended and restored its patch. */
   let sessionD: SessionUnderTest;
+  /** D's runtime-only rival in the race, reused with D by the store-failure checks. */
+  let sessionE: SessionUnderTest;
   let captureA: string;
   let captureB: string;
   /** Every editor and DevTools connection, for "this frame reached nobody else" checks. */
@@ -858,7 +937,7 @@ describe('one capture per project root, across the real service boundary', () =>
   });
 
   it('lets exactly one of two concurrent capture.start requests win', async () => {
-    const sessionE = await openSession(primary, 'runtime-only');
+    sessionE = await openSession(primary, 'runtime-only');
     uiClients.push(sessionE.devtools);
     const contenders = [sessionD, sessionE] as const;
 
@@ -909,6 +988,28 @@ describe('one capture per project root, across the real service boundary', () =>
     expect(repeatedRaw.status).toBe(INVALID_STATE_STATUS);
     expect(httpErrorResponseSchema.safeParse(repeatedRaw.json).success).toBe(true);
     expect(captureStartConflictResponseSchema.safeParse(repeatedRaw.json).success).toBe(false);
+    // The refusal was composed outside the route layer and registered by no
+    // product builder, so it is answered with its code's fixed copy and a
+    // diagnostic reference that the refusal record and its debug twin repeat.
+    const repeatedBody = httpErrorResponseSchema.safeParse(repeatedRaw.json);
+    if (!repeatedBody.success) {
+      throw new Error(`The repeated capture.start answered no error body: ${repeatedRaw.text}`);
+    }
+    expect(repeatedBody.data.message).toBe(FAILURE_COPY_BY_CODE.SESSION_INVALID_STATE.summary);
+    const repeatedRef = repeatedBody.data.ref;
+    expect(repeatedRef).toMatch(/^msg_/u);
+    expect(
+      harness.logger
+        .withMessage(SESSION_REQUEST_REFUSED_LOG_MESSAGE)
+        .filter((record) => record.fields['ref'] === repeatedRef)
+        .map((record) => [record.level, record.fields['errorCode']]),
+    ).toEqual([['warn', INVALID_STATE_CODE]]);
+    expect(
+      harness.logger
+        .withMessage(SESSION_REQUEST_DIAGNOSTIC_MESSAGE)
+        .filter((record) => record.fields['ref'] === repeatedRef)
+        .map((record) => record.level),
+    ).toEqual(['debug']);
     expect(openCaptures(primary.root)).toBe(1);
     expect(activeCaptureId(winner.session.id)).toBe(winner.captureId);
 
@@ -931,6 +1032,185 @@ describe('one capture per project root, across the real service boundary', () =>
     if (isErr(released)) {
       throw new Error(`the winner's capture.stop was refused (${released.error.code})`);
     }
+    expect(ownerOf(primary.root)).toBeUndefined();
+    expect(openCaptures(primary.root)).toBe(0);
+  });
+
+  /**
+   * Proves `holder` still captures the primary project on `captureId` — in the
+   * store and in the owner index — and that `competitor` is answered the typed
+   * `409` naming it, with nothing opened for the competitor.
+   */
+  async function expectProjectHeld(
+    holder: SessionUnderTest,
+    competitor: SessionUnderTest,
+    captureId: string,
+  ): Promise<void> {
+    expect(storedSession(holder.id).status).toBe('capturing');
+    expect(activeCaptureId(holder.id)).toBe(captureId);
+    expect(ownerOf(primary.root)).toEqual({ sessionId: holder.id, captureId });
+    expect(openCaptures(primary.root)).toBe(1);
+
+    const refused = expectRefused(
+      await harness.http().startCapture(competitor.id),
+      "the competitor's capture.start",
+    );
+    expect(refused.code).toBe(CAPTURE_CONFLICT_ERROR_CODE);
+    expect(owningSessionIdOf(refused)).toBe(holder.id);
+    expect(refused.details?.['status']).toBe(CONFLICT_STATUS);
+    expect(activeCaptureId(competitor.id)).toBeUndefined();
+    expect(storedSession(competitor.id).status).toBe('ready');
+    expect(openCaptures(primary.root)).toBe(1);
+  }
+
+  it('keeps ownership while a failing or ending session cannot close its capture window', async () => {
+    const [holder, competitor] = [sessionD, sessionE];
+    expect(storedSession(holder.id).status).toBe('ready');
+    expect(storedSession(competitor.id).status).toBe('ready');
+    const held = expectStarted(await harness.http().startCapture(holder.id), 'the holder');
+    expect(ownerOf(primary.root)).toEqual({ sessionId: holder.id, captureId: held });
+    const failedRowsBefore = failedRowCount(holder.id);
+
+    const unblock = blockCaptureClose(held);
+    try {
+      // A stage failure cannot file the holder `failed` while its window stays
+      // open: the whole move is refused, and no failed row is reported.
+      const failed = expectRefused(
+        await harness.manager.fail(holder.id, {
+          stage: 'capture',
+          code: STORE_ERROR_CODE,
+          message: 'The capture could not be completed.',
+        }),
+        'the failure transition',
+      );
+      expect(failed.code).toBe(STORE_ERROR_CODE);
+      expect(failedRowCount(holder.id)).toBe(failedRowsBefore);
+      await expectProjectHeld(holder, competitor, held);
+
+      // Ending it is refused before cleanup runs, with ownership retained.
+      const ended = expectRefused(await harness.endSession(holder.id), 'session.end');
+      expect(ended.code).toBe(STORE_ERROR_CODE);
+      await expectProjectHeld(holder, competitor, held);
+    } finally {
+      unblock();
+    }
+
+    // Once the window can close, stopping releases the project and the store agrees.
+    const stopped = await harness.stopCapture(holder.id);
+    if (isErr(stopped)) {
+      throw new Error(`the holder's capture.stop was refused (${stopped.error.code})`);
+    }
+    expect(stopped.value.summary.captureId).toBe(held);
+    expect(activeCaptureId(holder.id)).toBeUndefined();
+    expect(storedSession(holder.id).status).toBe('ready');
+    expect(ownerOf(primary.root)).toBeUndefined();
+    expect(openCaptures(primary.root)).toBe(0);
+
+    // The competitor is admitted now, and named.
+    const next = expectStarted(await harness.http().startCapture(competitor.id), 'the competitor');
+    expect(ownerOf(primary.root)).toEqual({ sessionId: competitor.id, captureId: next });
+    const releasedNext = await harness.stopCapture(competitor.id);
+    if (isErr(releasedNext)) {
+      throw new Error(`the competitor's capture.stop was refused (${releasedNext.error.code})`);
+    }
+    expect(ownerOf(primary.root)).toBeUndefined();
+    expect(openCaptures(primary.root)).toBe(0);
+  });
+
+  it('rebuilds the owner index from the open windows: an open capture keeps its owner, an orphan is closed, an unseen or unclosable orphan owns the project', async () => {
+    const [capturer, orphaned] = [sessionE, sessionD];
+    expect(storedSession(capturer.id).status).toBe('ready');
+    expect(storedSession(orphaned.id).status).toBe('ready');
+
+    // A rebuild while a capture is open names the same owner, and still refuses the rival.
+    const held = expectStarted(await harness.http().startCapture(capturer.id), 'the capturer');
+    const logMark = harness.logger.records.length;
+    const rebuilt = await harness.manager.hydrate();
+    expect(isErr(rebuilt) ? rebuilt.error.code : 'ok').toBe('ok');
+    await expectProjectHeld(capturer, orphaned, held);
+    // The rebuild read the one open window, not the sessions the store holds.
+    const rebuildRecords = harness.logger.records
+      .slice(logMark)
+      .filter((record) => record.message === 'capture-owner index rebuilt');
+    expect(rebuildRecords.map((record) => record.fields)).toEqual([
+      expect.objectContaining({ windows: 1, owners: 1, orphansClosed: 0, orphansOpen: 0 }),
+    ]);
+    const stopped = await harness.stopCapture(capturer.id);
+    if (isErr(stopped)) {
+      throw new Error(`the capturer's capture.stop was refused (${stopped.error.code})`);
+    }
+    expect(ownerOf(primary.root)).toBeUndefined();
+    expect(openCaptures(primary.root)).toBe(0);
+
+    // An orphan window on a `ready` session is closed by the rebuild, not indexed.
+    const capturesBefore = storedSession(orphaned.id).captures;
+    const orphan = openOrphanWindow(orphaned.id);
+    expect(openCaptures(primary.root)).toBe(1);
+    const cleared = await harness.manager.hydrate();
+    expect(isErr(cleared) ? cleared.error.code : 'ok').toBe('ok');
+    expect(activeCaptureId(orphaned.id)).toBeUndefined();
+    const closedOrphan = harness.repos.sessions.getCapture(orphan);
+    expect(isErr(closedOrphan) ? undefined : closedOrphan.value?.capture.stoppedAt).toEqual(
+      expect.any(Number),
+    );
+    expect(openCaptures(primary.root)).toBe(0);
+    expect(ownerOf(primary.root)).toBeUndefined();
+    expect(storedSession(orphaned.id).status).toBe('ready');
+    expect(storedSession(orphaned.id).captures).toEqual(capturesBefore);
+
+    // A window the owner index has never seen still refuses a rival — the
+    // store's own project check, inside the start's transaction — and the
+    // index adopts its session as the owner.
+    const unseen = openOrphanWindow(orphaned.id);
+    expect(ownerOf(primary.root)).toBeUndefined();
+    const adopted = expectRefused(
+      await harness.http().startCapture(capturer.id),
+      "the capturer's capture.start",
+    );
+    expect(adopted.code).toBe(CAPTURE_CONFLICT_ERROR_CODE);
+    expect(owningSessionIdOf(adopted)).toBe(orphaned.id);
+    expect(adopted.details?.['status']).toBe(CONFLICT_STATUS);
+    expect(activeCaptureId(capturer.id)).toBeUndefined();
+    expect(storedSession(capturer.id).status).toBe('ready');
+    expect(openCaptures(primary.root)).toBe(1);
+    expect(ownerOf(primary.root)).toEqual({ sessionId: orphaned.id, captureId: unseen });
+    const adoptedCleared = await harness.manager.hydrate();
+    expect(isErr(adoptedCleared) ? adoptedCleared.error.code : 'ok').toBe('ok');
+    expect(activeCaptureId(orphaned.id)).toBeUndefined();
+    expect(ownerOf(primary.root)).toBeUndefined();
+
+    // An orphan the store refuses to close is reported, and its session owns
+    // the project until the window is verifiably closed.
+    const stuck = openOrphanWindow(orphaned.id);
+    const unblock = blockCaptureClose(stuck);
+    try {
+      const refused = await harness.manager.hydrate();
+      if (!isErr(refused)) {
+        throw new Error('hydrate was expected to report the unclosable orphan, but it succeeded.');
+      }
+      expect(refused.error.code).toBe(STORE_ERROR_CODE);
+      expect(activeCaptureId(orphaned.id)).toBe(stuck);
+      expect(storedSession(orphaned.id).status).toBe('ready');
+      expect(ownerOf(primary.root)).toEqual({ sessionId: orphaned.id, captureId: stuck });
+
+      const conflict = expectRefused(
+        await harness.http().startCapture(capturer.id),
+        "the capturer's capture.start",
+      );
+      expect(conflict.code).toBe(CAPTURE_CONFLICT_ERROR_CODE);
+      expect(owningSessionIdOf(conflict)).toBe(orphaned.id);
+      expect(conflict.details?.['status']).toBe(CONFLICT_STATUS);
+      expect(activeCaptureId(capturer.id)).toBeUndefined();
+      expect(storedSession(capturer.id).status).toBe('ready');
+      expect(openCaptures(primary.root)).toBe(1);
+    } finally {
+      unblock();
+    }
+
+    // Closable again: the next rebuild closes it and frees the project.
+    const recovered = await harness.manager.hydrate();
+    expect(isErr(recovered) ? recovered.error.code : 'ok').toBe('ok');
+    expect(activeCaptureId(orphaned.id)).toBeUndefined();
     expect(ownerOf(primary.root)).toBeUndefined();
     expect(openCaptures(primary.root)).toBe(0);
   });

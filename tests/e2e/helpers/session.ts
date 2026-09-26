@@ -1536,6 +1536,42 @@ async function preselectTargetStep(
 }
 
 /** Whether two descriptors name the same element of the same document. */
+/** How long a re-selection waits for the page to present its target as it was first described. */
+const DESCRIPTION_SETTLE_TIMEOUT_MS = 10_000;
+
+/** How many consecutive polls must find the described path matching exactly one element. */
+const DESCRIPTION_STABLE_POLLS = 3;
+
+/** The interval between those polls, in milliseconds. */
+const DESCRIPTION_POLL_INTERVAL_MS = 200;
+
+/**
+ * Wait, within {@link DESCRIPTION_SETTLE_TIMEOUT_MS}, until `appPage` has
+ * matched `selector` — the path the product built when the element was first
+ * described — to exactly one element on {@link DESCRIPTION_STABLE_POLLS}
+ * consecutive polls. Installing the plan reloads the page through Fast
+ * Refresh, and for a moment after that reload the depth-bounded path can match
+ * a second node, which the product rightly disambiguates with a leaf
+ * `:nth-child(n)`. Selecting once the page presents the element as it did
+ * before the question compares like with like. Never throws: on the deadline
+ * the selection goes ahead and the comparison after it reports any difference.
+ */
+async function awaitSettledDescription(appPage: Page, selector: string): Promise<void> {
+  const deadline = Date.now() + DESCRIPTION_SETTLE_TIMEOUT_MS;
+  let stable = 0;
+  while (Date.now() < deadline && !appPage.isClosed()) {
+    const count = await appPage
+      .waitForLoadState('load', { timeout: DESCRIPTION_SETTLE_TIMEOUT_MS })
+      .then(() => appPage.locator(selector).count())
+      .catch(() => undefined);
+    stable = count === 1 ? stable + 1 : 0;
+    if (stable >= DESCRIPTION_STABLE_POLLS) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, DESCRIPTION_POLL_INTERVAL_MS));
+  }
+}
+
 function sameElement(a: SelectedTarget, b: SelectedTarget): boolean {
   return a.selector === b.selector && a.tagName === b.tagName && a.url === b.url;
 }
@@ -2089,6 +2125,7 @@ export async function runDebugSession(
     // session, which must record the same element.
     if (target.selector !== undefined && preselected !== undefined) {
       const targetPhase = driver.begin('target');
+      await awaitSettledDescription(appPage, preselected.selector);
       selected = await selectTargetStep(
         driver,
         targetPhase,

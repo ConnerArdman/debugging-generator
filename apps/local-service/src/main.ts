@@ -11,15 +11,21 @@
  *   and as the target of `"start": "node dist/main.js"`.
  * - The root `playwright.config.ts` `webServer` entry runs
  *   `node apps/local-service/dist/main.js`, polls `GET ${serviceUrl}/health`
- *   until it answers and stops the process with **SIGTERM** and a 10 s grace
+ *   until it answers and stops the process with **SIGTERM** and a 12 s grace
  *   period, so the health route and the signal handling are load-bearing for
- *   every browser and end-to-end suite (AAP 0.8.3).
+ *   every browser and end-to-end suite (AAP 0.8.3). The whole shutdown is held
+ *   inside that grace, and inside the VS Code extension's 10 s one, by
+ *   {@link SHUTDOWN_BUDGET}; `main.test.ts` fails if either grace shrinks
+ *   below it.
  * - `apps/vscode-extension/esbuild.mjs` re-bundles these same sources into the
  *   VSIX, which is why every import is static and top-level (a computed
  *   `import()` of a local module would not survive that second bundle), why
  *   the prompt directory is always taken from `config.promptsDir` and never
  *   assumed to sit beside the bundle, and why {@link StartServiceOptions}
- *   accepts the store DDL inline.
+ *   accepts the store DDL inline: that bundle embeds `schema.sql` as a string
+ *   (`embeddedSchemaSql()` of `./store/db.js`) and {@link main} hands it to
+ *   {@link startService}, so the VSIX ships no `.sql` file. Every other build
+ *   embeds nothing and the store finds its DDL on disk.
  *
  * ## Start-up order, and why it is this order
  *
@@ -52,6 +58,8 @@
  *    session.
  * 7. **Retention — before serving** (AAP 0.4.2): `runRetention` purges aged
  *    sessions, stale index caches and orphan backups, conflict backups exempt.
+ *    The same dependencies back `POST /sessions/purge`, which the editor
+ *    command `debuggen.purgeSessions` calls to run the sweep on demand.
  * 8. **The model provider** — `createModelProvider` over the validated
  *    selection. An unusable selection is a configuration error and fails the
  *    start; a transport failure is a runtime condition reported per session by
@@ -60,7 +68,15 @@
  *    the manifest and every stage's current prompt are loaded eagerly, so a
  *    broken prompt tree fails the start rather than a session.
  * 10. **Subsystem wiring**, in dependency order, each handed only the
- *     collaborators it declares.
+ *     collaborators it declares. Once the session manager has hydrated, the
+ *     sessions the previous process left `instrumenting`, `ready` or
+ *     `capturing` are settled by `settleInterruptedSessions` — still before
+ *     serving: an interrupted install, a session whose patches step 6 removed
+ *     and every capture the restart interrupted are failed, so no capture is
+ *     advertised before a producer has taken its configuration; each failed
+ *     capture's producers are owed their dormant configuration, and its
+ *     cleanup verdict stays `partial` until they take it. A session that could
+ *     not be settled fails the start.
  * 11. **One HTTP server, two protocols** — a single `node:http` server whose
  *     request listener is the hono application of `./server/http.js` and whose
  *     `upgrade` event is routed to the WebSocket server of `./server/ws.js` at
@@ -80,31 +96,70 @@
  *   written by the WebSocket router and read by the readiness gate;
  * - the **server-agent presence** view of the client registry;
  * - the **source-open delivery** port over the client registry;
- * - the **credential issuer** the dev-server launcher mints its scoped
- *   `server-agent` credentials through;
+ * - the **credential issuer** the dev-server launcher mints, renews and revokes
+ *   its scoped `server-agent` credential leases through — one credential per
+ *   call, so one child's exit never revokes another dev server's credential;
  * - the **capture-time readiness re-evaluation** the capture stage uses to move
  *   a session whose page was not ready at install time to `ready`;
+ * - the **producer replay** wiring: every producer connection is announced to
+ *   the instrumentation service as it registers, a tab bound without an open
+ *   capture has its page agent reconciled to dormant, and a cleanup verdict
+ *   upgraded once a producer took its dormant configuration is recorded
+ *   through the session manager;
  * - an **effective configuration** whose `port` is the bound port once the
  *   socket listens, which is what a launched dev server's ingest URL and the
  *   dev-server probe's self-exclusion need under `port: 0`.
  *
  * ## Shutdown
  *
- * {@link ServiceHandle.close} is idempotent and bounded. It stops accepting
- * requests, cancels in-flight pipeline work, stops the dev servers this service
- * launched (which expires their scoped credentials), closes every WebSocket
- * with the normal going-away code (never 4401, which means unauthorized),
- * releases the in-memory subsystems and finally checkpoints and closes the
- * database. It deliberately does **not** restore instrumented files: the
- * journal is durable and step 6 of the next start restores them, so a stuck
- * restore can never hold up a stop, and a stop that is killed part-way loses
- * nothing (AAP 0.5.1 lists service start as a cleanup trigger for exactly this
- * reason).
+ * {@link ServiceHandle.close} is idempotent and runs against **one end-to-end
+ * deadline** ({@link SHUTDOWN_BUDGET}), not a bound per step, so its total
+ * duration is known and smaller than the grace of every process that manages
+ * the service. In order ({@link releaseParts}):
+ *
+ * 1. it stops accepting work and cancels in-flight pipeline operations;
+ * 2. it **ends every live session** — every session still holding
+ *    instrumentation — through `SessionManager.end`, exactly as an explicit
+ *    `session.end` would: the capture window closes, the page agent goes
+ *    dormant, the dev-server preload disables its instrumentations, every
+ *    patched file is restored (a developer-edited one is left untouched and
+ *    reported as a conflict) and `cleanup.completed` reaches the connected
+ *    clients (AAP 0.5.1). Sessions whose patches overlap in one file are
+ *    ended last-applied-first;
+ * 3. it stops the dev servers this service launched, which revokes their
+ *    scoped credentials, from a slice of the deadline no earlier step may use,
+ *    and revokes those credentials itself should the launcher not confirm
+ *    (AAP 0.5.6);
+ * 4. it closes every WebSocket with the normal going-away code (never 4401,
+ *    which means unauthorized), releases the in-memory subsystems and finally
+ *    checkpoints and closes the database.
+ *
+ * Step 2 is bounded like every other step, and each session gets a fair share
+ * of it, so one stalled session never starves another. A session it cannot
+ * finish in time has its producers disarmed anyway and keeps its durable
+ * journal, and step 6 of the next start restores it, so a stuck restore never
+ * holds up a stop and a stop that is killed part-way loses nothing. A
+ * referenced watchdog keeps the process alive until the database is closed,
+ * even once the listener and sockets are gone. A crash (an uncaught exception) closes with
+ * `{ liveSessions: 'retain' }`: a process that has just thrown past every
+ * handler does not let its possibly inconsistent state drive writes into the
+ * developer's tree, and leaves them to that same reconciliation.
+ *
+ * A launched dev server is counted as stopped only when the launcher observed
+ * its exit. One that outlived its whole termination ladder is named — pid and
+ * project root — in an `error` record for the `dev-servers` step, and the
+ * shutdown's final record is then written at `warn` with the pids (or with
+ * `devServers: 'unconfirmed'` when that step failed or was abandoned) instead
+ * of as a clean stop.
  */
 
 import { config as loadDotenvFile } from 'dotenv';
 
-import { createAdapterRegistry, type AdapterRegistry } from '@debuggen/instrumentation';
+import {
+  createAdapterRegistry,
+  type AdapterRegistry,
+  type ModificationRecord,
+} from '@debuggen/instrumentation';
 import {
   PROMPT_STAGES,
   createModelProvider,
@@ -115,11 +170,14 @@ import {
 import {
   HTTP_ROUTES,
   PROTOCOL_VERSION,
+  SESSION_STATUSES,
   WS_PATH,
   type AgentReadyPayload,
   type ClientKind,
+  type CleanupStatus,
   type ProtocolMessage,
   type SelectedTarget,
+  type SessionStatus,
 } from '@debuggen/protocol';
 import {
   DebuggenError,
@@ -137,10 +195,20 @@ import { ensureSecureDir } from '@debuggen/shared/node';
 import { realpathSync } from 'node:fs';
 import { createServer, type RequestListener, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { performance } from 'node:perf_hooks';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { reconcileModificationsOnStartup, createSessionCleanup } from './cleanup/cleanup.js';
-import type { SessionCleanup, StartupReconciliationReport } from './cleanup/cleanup.js';
+import {
+  reconcileModificationsOnStartup,
+  createSessionCleanup,
+  settleInterruptedSessions,
+} from './cleanup/cleanup.js';
+import type {
+  CleanupOutcomeSink,
+  InterruptedSessionsReport,
+  SessionCleanup,
+  StartupReconciliationReport,
+} from './cleanup/cleanup.js';
 import {
   describeServiceConfig,
   loadServiceConfig,
@@ -148,8 +216,19 @@ import {
   type ServiceConfig,
   type ServiceConfigOverrides,
 } from './config.js';
-import { createDevServerLauncher } from './dev-server/launcher.js';
-import type { DevServerLauncher, ServerAgentCredentialIssuer } from './dev-server/launcher.js';
+import { probeDevServer } from './dev-server/detect.js';
+import {
+  addressedServerAgentPresence,
+  createDevServerLauncher,
+  serverAgentCredentialIssuer,
+} from './dev-server/launcher.js';
+import type {
+  DevServerLauncher,
+  DevServerLauncherDeps,
+  DevServerTerminationReport,
+  ServerAgentConnections,
+} from './dev-server/launcher.js';
+import { documentLogFields } from './instrumentation/document-fingerprint.js';
 import {
   MAX_RELOAD_WAIT_MS,
   collectObservedReadiness,
@@ -164,10 +243,21 @@ import type {
   WaitForAgentReadyOptions,
 } from './instrumentation/readiness.js';
 import { createInstrumentationService } from './instrumentation/service.js';
-import type { CodeAnalysisHandles, InstrumentationService } from './instrumentation/service.js';
+import type {
+  CodeAnalysisHandles,
+  InstrumentationService,
+  ProducerReconciler,
+} from './instrumentation/service.js';
 import { createInstrumentationWatcher } from './instrumentation/watcher.js';
 import type { InstrumentationWatcher } from './instrumentation/watcher.js';
-import { createServiceLogger, subsystemLogger, type ServiceLoggerOptions } from './logging.js';
+import {
+  LOG_ERROR_FIELD_KEY,
+  createServiceLogger,
+  describeException,
+  guardLogger,
+  subsystemLogger,
+  type ServiceLoggerOptions,
+} from './logging.js';
 import { createAnalysisFacts } from './analysis/facts.js';
 import { createAnalysisSummarizer } from './analysis/summarize.js';
 import { createPanelDataResolver } from './panels/data.js';
@@ -180,12 +270,12 @@ import { createCodeIndexLoader, createPipelineOrchestrator } from './pipeline/or
 import type { CodeIndexPort, PipelineOrchestrator } from './pipeline/orchestrator.js';
 import type { CaptureReadinessRequest, CaptureReadinessSource } from './pipeline/stages/capture.js';
 import { createAuthService } from './server/auth.js';
-import type { AuthService } from './server/auth.js';
+import type { AuthService, ConnectionRevoker } from './server/auth.js';
 import { WS_CLOSE_GOING_AWAY, createClientRegistry } from './server/clients.js';
 import type { ClientRegistry } from './server/clients.js';
 import { createHttpApp } from './server/http.js';
 import type { HttpApp } from './server/http.js';
-import { createBindingRoutes } from './server/routes/binding.js';
+import { createBindingRoutes, redactSelectedTarget } from './server/routes/binding.js';
 import type { BindingRoutes } from './server/routes/binding.js';
 import { devServerLookupFromLaunches } from './server/routes/sessions.js';
 import { createWsServer } from './server/ws.js';
@@ -197,27 +287,44 @@ import type {
 } from './server/ws.js';
 import { createSessionManager } from './sessions/manager.js';
 import type { SessionManager } from './sessions/manager.js';
-import { createSessionProgress } from './sessions/progress.js';
+import {
+  carriesWrappedExceptionText,
+  createSessionProgress,
+  isProductAuthoredText,
+} from './sessions/progress.js';
 import type { SessionProgress } from './sessions/progress.js';
 import { createSessionReopener } from './sessions/reopen.js';
 import { createSourceOpenHandler } from './source/open.js';
 import type { SourceOpenClientPort } from './source/open.js';
-import { createSourceResolver } from './source/resolve.js';
+import {
+  createCorroborationCache,
+  createSourceMapScopes,
+  createSourceResolver,
+} from './source/resolve.js';
 import type { ModificationCorroborationPort, ParentEventPort } from './source/resolve.js';
-import { openStore } from './store/db.js';
+import { embeddedSchemaSql, openStore } from './store/db.js';
 import type { Store } from './store/db.js';
 import { createModificationsRepo } from './store/modifications-repo.js';
-import type { ModificationsRepo } from './store/modifications-repo.js';
+import type {
+  ModificationCorroborationReader,
+  ModificationsRepo,
+} from './store/modifications-repo.js';
 import { createPanelsRepo } from './store/panels-repo.js';
 import type { PanelsRepo } from './store/panels-repo.js';
 import { runRetention } from './store/retention.js';
-import type { RetentionReport } from './store/retention.js';
-import { createSessionsRepo } from './store/sessions-repo.js';
+import type { RetentionDeps, RetentionReport } from './store/retention.js';
+import { MAX_SESSION_LIST_LIMIT, createSessionsRepo } from './store/sessions-repo.js';
 import type { SessionsRepo } from './store/sessions-repo.js';
 import { createTelemetryRepo } from './store/telemetry-repo.js';
 import type { TelemetryRepo } from './store/telemetry-repo.js';
 import { createIngestAttributor } from './telemetry/attribute.js';
-import { createTraceCorrelator } from './telemetry/correlate.js';
+import type { AttributedEvent } from './telemetry/attribute.js';
+import {
+  TRACE_CACHE_LIMIT,
+  TRACE_CACHE_MAX_TREE_NODES,
+  TRACE_CACHE_NODE_BUDGET,
+  createTraceCorrelator,
+} from './telemetry/correlate.js';
 import type { TraceCorrelator } from './telemetry/correlate.js';
 import { createTelemetryIngest } from './telemetry/ingest.js';
 import type { IngestSourceLocator } from './telemetry/ingest.js';
@@ -264,19 +371,120 @@ export const SERVICE_VERSION = '0.1.0';
 /**
  * How long the HTTP server waits for open connections to drain before closing
  * them itself, in milliseconds. Idle keep-alive sockets are released at once;
- * this bounds the in-flight ones so the rest of the shutdown sequence runs well
- * inside Playwright's 10 s SIGTERM window.
+ * this bounds the in-flight ones. The drain starts with the first shutdown step,
+ * so it has ended long before {@link SHUTDOWN_BUDGET} does.
  */
 const HTTP_DRAIN_GRACE_MS = 3_000;
 
 /**
- * The bound on each awaited shutdown step, in milliseconds. A step that has not
- * settled by then is logged as abandoned and the sequence moves on, so a stuck
- * collaborator — a dev server that ignores SIGTERM, a pipeline stage blocked on
- * the network — cannot keep the process alive. The launcher's own escalation to
- * SIGKILL happens inside this window (its default grace is 5 s).
+ * How one shutdown spends its time, in milliseconds. See {@link SHUTDOWN_BUDGET}.
  */
-const SHUTDOWN_STEP_TIMEOUT_MS = 6_000;
+export interface ShutdownBudget {
+  /**
+   * The end-to-end bound: from the first step of {@link releaseParts} to the
+   * store's close. A step that has not settled when its slice ends is logged as
+   * abandoned and the sequence moves on.
+   */
+  readonly totalMs: number;
+
+  /** The most the cancellation of in-flight pipeline operations may take. */
+  readonly pipelineMs: number;
+
+  /**
+   * Held back from every step before the dev-server launcher, so terminating
+   * the children this service launched — `SIGTERM`, the launcher's
+   * {@link DEV_SERVER_STOP_GRACE_MS}, `SIGKILL`, its exit confirmation and the
+   * revocation of their credentials — always has its time, however long ending
+   * the live sessions took.
+   */
+  readonly launcherReserveMs: number;
+
+  /**
+   * Held back from every step before the last ones: flushing the live tail,
+   * the WebSocket close handshakes, the HTTP listener, the in-memory subsystems
+   * and the store's checkpoint and close.
+   */
+  readonly finalReserveMs: number;
+}
+
+/**
+ * The shutdown budget of this service.
+ *
+ * `totalMs` is chosen against the two processes that stop the service, each of
+ * which sends `SIGTERM` and escalates to `SIGKILL` after a grace:
+ *
+ * | Manager | Grace | Where |
+ * | --- | --- | --- |
+ * | the VS Code extension's service supervisor | 10 s | `apps/vscode-extension/src/service/process.ts` |
+ * | Playwright's `webServer` | 12 s | `playwright.config.ts` |
+ *
+ * The service's own lifetime after `SIGTERM` is at most `totalMs` plus the
+ * {@link EXIT_BACKSTOP_MS} backstop — 8.5 s — so it has exited before either
+ * grace ends; `main.test.ts` reads both graces and fails if one shrinks below
+ * that. Within the total, the launcher's reserve covers its worst case — the
+ * {@link DEV_SERVER_STOP_GRACE_MS} wait, `SIGKILL`, its
+ * {@link LAUNCHER_KILL_CONFIRM_MS} exit confirmation — **plus**
+ * {@link LAUNCHER_REVOCATION_SLACK_MS} for the credential revocation it performs
+ * only after both waits, so a child that is slow to die still has its
+ * credential revoked before the store closes. Ending the live sessions receives
+ * everything the pipeline does not use up to those two reserves: at least 1 s,
+ * and in the usual case — a pipeline that cancels at once — about 2 s, against
+ * the few milliseconds a restore of a handful of files takes.
+ */
+export const SHUTDOWN_BUDGET: ShutdownBudget = Object.freeze({
+  totalMs: 8_000,
+  pipelineMs: 1_000,
+  launcherReserveMs: 4_500,
+  finalReserveMs: 1_500,
+});
+
+/**
+ * The `SIGTERM` → `SIGKILL` grace this service gives a dev server it launched,
+ * in milliseconds — shorter than the launcher's 5 s default so that the
+ * termination, its escalation and its exit confirmation fit
+ * {@link ShutdownBudget.launcherReserveMs}. `next dev` stops on `SIGTERM` in
+ * well under a second; the grace only matters for a child that ignores it.
+ */
+export const DEV_SERVER_STOP_GRACE_MS = 2_000;
+
+/**
+ * How long the launcher waits for a child's exit after `SIGKILL` before it
+ * gives up observing it and revokes the child's credential anyway, in
+ * milliseconds. The launcher's own constant (`KILL_CONFIRM_MS` in
+ * `./dev-server/launcher.ts`) is private; this mirror is what the budget is
+ * computed from, and `main.test.ts` fails if the two ever differ.
+ */
+export const LAUNCHER_KILL_CONFIRM_MS = 2_000;
+
+/**
+ * The margin the launcher's reserve keeps beyond its two waits, in
+ * milliseconds: the revocation of the child's credential and the removal of
+ * its registry entry, which the launcher performs only after both waits, plus
+ * timer granularity.
+ */
+export const LAUNCHER_REVOCATION_SLACK_MS = 500;
+
+/**
+ * How long past the deadline the shutdown watchdog keeps the event loop alive,
+ * in milliseconds. Every step is bounded by the deadline, so the sequence has
+ * finished well before the watchdog would release the loop.
+ */
+const SHUTDOWN_WATCHDOG_MARGIN_MS = 1_000;
+
+/**
+ * How much margin the backstop around ending the live sessions adds to their
+ * slice, in milliseconds. {@link endLiveSessions} enforces the slice itself and
+ * reports what it left; the backstop only fires if something it awaits before
+ * the first session (reading the journal) never answers.
+ */
+const LIVE_SESSIONS_BACKSTOP_MARGIN_MS = 100;
+
+/**
+ * The `msg` of the record a shutdown writes when launched dev servers are still
+ * running after the dev-server step. Constant; the record names them by pid and
+ * project root.
+ */
+const DEV_SERVERS_SURVIVED_MESSAGE = 'launched dev servers are still running after shutdown';
 
 /**
  * How often the client registry sweeps: it unregisters connections that stayed
@@ -294,6 +502,13 @@ const MAX_TRACKED_AGENT_TABS = 256;
 
 /** The client kind that can display a pairing code (AAP 0.5.6). */
 const PAIRING_DISPLAY_KIND: ClientKind = 'vscode';
+
+/**
+ * The tier whose events carry page-document stacks the source-map route maps
+ * (fetch/XHR initiators and browser errors), and so the only tier whose
+ * `producerId` keys a shared source-map scope in {@link createIngestSourceLocator}.
+ */
+const BROWSER_TIER = 'browser' satisfies AttributedEvent['tier'];
 
 /** The signals that mean "stop": the two a developer and a test runner send. */
 const SHUTDOWN_SIGNALS = ['SIGINT', 'SIGTERM'] as const;
@@ -347,8 +562,23 @@ export interface StartServiceOptions {
   /**
    * The session store's DDL, inlined by an embedding host's bundler. Forwarded
    * to `openStore`, where it replaces the filesystem probe for `schema.sql`.
+   *
+   * {@link main} passes `embeddedSchemaSql()` from `./store/db.js`: the text
+   * `apps/vscode-extension/esbuild.mjs` embeds in the editor extension's
+   * service bundle, `undefined` in every other build. A suite passes its own
+   * text or leaves it out.
    */
   readonly inlineSchemaSql?: string | undefined;
+
+  /**
+   * Builds the dev-server launcher from the collaborators this function
+   * composes (the effective configuration, the root logger, the access
+   * boundary's credential issuer, the environment). Defaults to
+   * `createDevServerLauncher`; a suite substitutes a wrapper around it to
+   * observe what the shutdown does with the launcher's termination report
+   * without spawning a process.
+   */
+  readonly createLauncher?: ((deps: DevServerLauncherDeps) => DevServerLauncher) | undefined;
 }
 
 /**
@@ -361,6 +591,14 @@ export interface StartupReport {
 
   /** The modification reconciliation's report: restored, closed, conflicts. */
   readonly reconciliation: StartupReconciliationReport;
+
+  /**
+   * What became of the sessions the previous process left `instrumenting`,
+   * `ready` or `capturing`: which were failed, and why. Taken after the
+   * reconciliation, so a session whose patches it removed is never left
+   * claiming them; a start that returns has no unsettled session.
+   */
+  readonly interruptedSessions: InterruptedSessionsReport;
 
   /**
    * The retention sweep's report, or `undefined` when the sweep could not run
@@ -421,9 +659,30 @@ export interface ServiceHandle {
 
   /**
    * Stops the service: see this module's "Shutdown" section. Idempotent — every
-   * call returns the same promise — bounded, and never rejects.
+   * call returns the same promise, so the first call's `options` decide —
+   * bounded by {@link SHUTDOWN_BUDGET}, and never rejects.
    */
-  close(): Promise<void>;
+  close(options?: ServiceCloseOptions): Promise<void>;
+}
+
+/**
+ * What a stop does with the sessions that still hold instrumentation.
+ *
+ * - `end` — end each one through `SessionManager.end`, exactly as an explicit
+ *   `session.end` would: its patched files are restored (or reported as
+ *   conflicts), its page agent and dev-server preload are disarmed and its
+ *   clients receive `cleanup.completed`. What a graceful stop does.
+ * - `retain` — leave each one, and its modification journal, exactly as it is,
+ *   for the next start's reconciliation (AAP 0.5.1): the state a crashed or
+ *   killed process leaves. What the crash handlers of {@link main} use, and how
+ *   a suite reproduces a crash in-process.
+ */
+export type LiveSessionDisposition = 'end' | 'retain';
+
+/** Options for {@link ServiceHandle.close}. */
+export interface ServiceCloseOptions {
+  /** What happens to the live sessions. Defaults to `end`. */
+  readonly liveSessions?: LiveSessionDisposition | undefined;
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -436,10 +695,35 @@ export interface ServiceHandle {
  * put their own `subsystem` field on their records, and a child already bound
  * to that key would emit it twice in one JSON record.
  */
-interface ServiceLoggers {
+export interface ServiceLoggers {
   readonly root: Logger;
   readonly service: Logger;
   readonly server: Logger;
+}
+
+/**
+ * The collaborators a stop ends the live sessions through
+ * ({@link endLiveSessions}).
+ */
+export interface LiveSessionPorts {
+  /** The one writer of session state; `end` runs the whole end-of-session sequence. */
+  readonly manager: Pick<SessionManager, 'end'>;
+
+  /** The session index, read for the non-terminal sessions. */
+  readonly sessions: Pick<SessionsRepo, 'list'>;
+
+  /** The modification journal, read for the sessions whose files are patched. */
+  readonly modifications: Pick<ModificationsRepo, 'listAllOpen'>;
+
+  /**
+   * The arming state, read for the sessions whose producers are armed, and the
+   * disarm a session that could not be ended in time is still given, so its
+   * page agent and dev-server preload never outlive the stop.
+   */
+  readonly instrumentation?:
+    | (Pick<InstrumentationService, 'arming'> &
+        Partial<Pick<InstrumentationService, 'disarmCapture'>>)
+    | undefined;
 }
 
 /**
@@ -447,30 +731,59 @@ interface ServiceLoggers {
  * start proceeds. One shutdown sequence ({@link releaseParts}) reads it, both
  * for {@link ServiceHandle.close} and for a start that fails part-way, so the
  * two paths cannot release in different orders.
+ *
+ * Each member is typed by what the sequence calls on it, which is also what
+ * lets `main.test.ts` drive the sequence with stand-ins that hang or fail.
  */
-interface ServiceParts {
-  store?: Store;
-  auth?: AuthService;
-  clients?: ClientRegistry;
-  ledger?: AgentReadyLedger;
-  watcher?: InstrumentationWatcher;
-  instrumentation?: InstrumentationService;
-  cleanup?: SessionCleanup;
-  correlator?: TraceCorrelator;
-  liveTail?: LiveTail;
-  launcher?: DevServerLauncher;
-  orchestrator?: PipelineOrchestrator;
-  http?: HttpApp;
-  ws?: WsServer;
+export interface ServiceParts {
+  store?: Pick<Store, 'close'>;
+  auth?: Pick<AuthService, 'close' | 'revokeServerAgentCredentials'>;
+  clients?: Pick<ClientRegistry, 'closeAll'>;
+  ledger?: Pick<AgentReadyLedger, 'close'>;
+  watcher?: Pick<InstrumentationWatcher, 'dispose'>;
+  instrumentation?: Pick<InstrumentationService, 'dispose'>;
+  cleanup?: Pick<SessionCleanup, 'dispose'>;
+  correlator?: Pick<TraceCorrelator, 'close'>;
+  liveTail?: Pick<LiveTail, 'flush' | 'close'>;
+  launcher?: Pick<DevServerLauncher, 'dispose' | 'list'>;
+  orchestrator?: Pick<PipelineOrchestrator, 'dispose'>;
+  http?: Pick<HttpApp, 'close'>;
+  ws?: Pick<WsServer, 'close'>;
   server?: Server;
+
+  /**
+   * Set only once the service is serving, so a start refused part-way — a
+   * port already in use, say — never ends a session it did not serve.
+   */
+  liveSessions?: LiveSessionPorts;
 }
+
+/**
+ * What {@link releaseParts} learned about the dev servers this service
+ * launched, so the shutdown's final record never calls a stop clean that was
+ * not:
+ *
+ * - `stopped` — none is left running (or none was launched);
+ * - `running` — the launcher reported these pids still running after their
+ *   termination ran to the end;
+ * - `unconfirmed` — the dev-server step failed or was abandoned at its bound,
+ *   so whether any is still running is unknown.
+ */
+export type DevServerRelease =
+  | { readonly kind: 'stopped' }
+  | { readonly kind: 'running'; readonly pids: readonly number[] }
+  | { readonly kind: 'unconfirmed' };
+
+/** The {@link DevServerRelease} of a shutdown that left no launched dev server running. */
+const DEV_SERVERS_STOPPED: DevServerRelease = Object.freeze({ kind: 'stopped' });
 
 /** The repositories over the one store, built once and shared. */
 interface Repositories {
   readonly sessions: SessionsRepo;
   readonly panels: PanelsRepo;
   readonly telemetry: TelemetryRepo;
-  readonly modifications: ModificationsRepo;
+  /** The journal, with the metadata-only read the ingest locator corroborates through. */
+  readonly modifications: ModificationsRepo & ModificationCorroborationReader;
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -478,17 +791,64 @@ interface Repositories {
  * ---------------------------------------------------------------------------------------------- */
 
 /**
+ * The `msg` of the record a refused start writes. Constant, so the record can
+ * never carry the failure's own text: it names the failure by its `step` and
+ * `code` (see {@link errorFields}) instead.
+ */
+const STARTUP_REFUSED_MESSAGE = 'the Debug Generator service could not start';
+
+/**
+ * The start-up step a refused start names, in the order {@link startService}
+ * runs them — the closed context that replaces the failure's message in the
+ * record, so two failures with one code are still told apart.
+ */
+type StartupStep =
+  | 'state-tree'
+  | 'store'
+  | 'access-boundary'
+  | 'editor-credential'
+  | 'server-agent-leases'
+  | 'reconciliation'
+  | 'model-provider'
+  | 'prompts'
+  | 'session-hydration'
+  | 'cleanup-settlement'
+  | 'interrupted-sessions'
+  | 'http'
+  | 'websocket'
+  | 'websocket-attach'
+  | 'listen';
+
+/**
+ * What standard error says in place of a failure message that is text copied
+ * from a wrapped exception (see `carriesWrappedExceptionText` in
+ * `./sessions/progress.ts`).
+ */
+const STARTUP_FAILURE_FALLBACK_MESSAGE = 'The Debug Generator service could not start.';
+
+/** The next step standard error names when the failure carried none of its own. */
+const STARTUP_FAILURE_FALLBACK_HINT =
+  'Check the DEBUGGEN_* settings and the service log, which names the start-up step that failed, then start the service again.';
+
+/**
  * Wraps a caught value as the typed error a caller reports, keeping the original
  * reachable as `cause`. A specific code raised deeper survives; anything else
- * takes `fallbackCode`. The underlying message goes into `details.reason`, so
- * what a user interface renders stays short and stable.
+ * takes `fallbackCode`.
+ *
+ * The message and hint are the caller's fixed sentences. What the caught value
+ * was enters `details` only as its closed `errorClass` / `errorCode` from
+ * {@link describeException} — never its own message or name, which quote
+ * whatever the failing call was handed (a path, an address, a statement) and
+ * would reach whatever surface reads `details` (CWE-532). The log record
+ * itself is written through {@link errorFields}, which copies neither the
+ * hint nor the details into ordinary fields.
  *
  * @param cause The caught value.
  * @param fallbackCode The code to apply when `cause` carries none.
  * @param message A complete sentence naming what failed.
  * @param hint The developer's next step.
- * @param details Diagnostic context — paths, ports, reasons; logged, so nothing
- * secret belongs in it.
+ * @param details Diagnostic context — paths, ports, subsystems; logged, so
+ * nothing secret belongs in it.
  * @returns The error to return inside an `Err`.
  */
 function wrapStartupFailure(
@@ -501,26 +861,43 @@ function wrapStartupFailure(
   const normalized = DebuggenError.from(cause, fallbackCode);
   return new DebuggenError(normalized.code, message, {
     hint,
-    details: { ...details, reason: normalized.message },
+    details: { ...details, ...describeException(cause) },
     cause,
   });
 }
 
 /**
- * The loggable view of a failure: its code, hint and details beside the
- * message, never the message twice.
+ * The loggable view of a failure: its code, the closed class and code of the
+ * value it wraps (`causeClass`, `causeCode`), and the error itself under
+ * {@link LOG_ERROR_FIELD_KEY}. The caller adds the `step` that met it.
+ *
+ * Never the message, the hint or the details as ordinary fields (CWE-532).
+ * A failure reaching this file from a collaborator may have been built by
+ * `DebuggenError.from`, which keeps a wrapped exception's message verbatim, and
+ * a collaborator's `hint` and `details` are free text and free-form context it
+ * composed — a path, a URL with its query, a statement — which the logger's
+ * field walk only credential-scrubs, so at `error` they would reach a record
+ * written to a file by default. Nothing here can tell that text from a sentence
+ * the product wrote, so none of it is copied: the record names the failure by
+ * its code and step, and the error travels under the error key, where the
+ * service logger's error serializer — the one place that decides what an error
+ * may contribute at each level — emits it.
+ *
+ * @example
+ * ```ts
+ * log.error(STARTUP_REFUSED_MESSAGE, { step: 'prompts', ...errorFields(error) });
+ * // {"step":"prompts","code":"CONFIG_INVALID","err":{"type":"DebuggenError","code":"CONFIG_INVALID",…}}
+ * ```
  */
 function errorFields(error: DebuggenError): LogFields {
+  const cause: unknown = error.cause;
+  const described = cause === undefined ? undefined : describeException(cause);
   return {
     code: error.code,
-    ...(error.hint === undefined ? {} : { hint: error.hint }),
-    ...(error.details === undefined ? {} : { details: error.details }),
+    ...(described === undefined ? {} : { causeClass: described.errorClass }),
+    ...(described?.errorCode === undefined ? {} : { causeCode: described.errorCode }),
+    [LOG_ERROR_FIELD_KEY]: error,
   };
-}
-
-/** The message of a caught value, for a `reason` field; never the value itself. */
-function reasonOf(cause: unknown): string {
-  return DebuggenError.from(cause, 'INTERNAL').message;
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -614,61 +991,126 @@ function formatServiceUrl(host: string, port: number): string {
  * Bounded waiting
  * ---------------------------------------------------------------------------------------------- */
 
+/** A monotonic clock in milliseconds: what every shutdown deadline is measured on. */
+function monotonicNow(): number {
+  return performance.now();
+}
+
+/** How a bounded wait ended. */
+type BoundedOutcome<T> =
+  | { readonly kind: 'settled'; readonly value: T }
+  | { readonly kind: 'rejected'; readonly cause: unknown }
+  | { readonly kind: 'timeout' };
+
 /**
- * Awaits `work` for at most `timeoutMs`, never rejecting.
- *
- * Used for every awaited shutdown step. A rejection is logged; a timeout is
- * logged as the step being abandoned (what AAP-level "force-killed" means for a
- * step this file does not own — the launcher escalates its own children to
- * SIGKILL inside the window). The timer is cleared on settlement and `unref`'d,
- * so the bound itself never keeps the event loop alive.
- *
- * @param work The step, started by the caller.
- * @param timeoutMs The bound.
- * @param step A short name for the log record.
- * @param logger Where the outcome is reported.
- * @returns Whether the step settled within the bound.
+ * Starts `work` and waits for it for at most `timeoutMs`, never rejecting. A
+ * synchronous throw from `work` is a rejection like any other. The timer is
+ * cleared on settlement and `unref`'d, so the bound itself never keeps the event
+ * loop alive; work that times out keeps running unobserved.
  */
-async function settleWithin(
-  work: Promise<unknown>,
+async function raceWithin<T>(
+  work: () => PromiseLike<T> | T,
   timeoutMs: number,
-  step: string,
-  logger: Logger,
-): Promise<boolean> {
+): Promise<BoundedOutcome<T>> {
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<'timeout'>((resolve) => {
-    timer = setTimeout(() => {
-      resolve('timeout');
-    }, timeoutMs);
+  const timeout = new Promise<BoundedOutcome<T>>((resolve) => {
+    timer = setTimeout(
+      () => {
+        resolve({ kind: 'timeout' });
+      },
+      Math.max(0, timeoutMs),
+    );
     timer.unref();
   });
 
-  const settled = work.then(
-    () => 'settled' as const,
-    (cause: unknown) => {
-      logger.error('a shutdown step failed; continuing with the next one', {
-        step,
-        reason: reasonOf(cause),
-      });
-      return 'settled' as const;
-    },
-  );
+  let running: Promise<BoundedOutcome<T>>;
+  try {
+    running = Promise.resolve(work()).then(
+      (value): BoundedOutcome<T> => ({ kind: 'settled', value }),
+      (cause: unknown): BoundedOutcome<T> => ({ kind: 'rejected', cause }),
+    );
+  } catch (cause) {
+    running = Promise.resolve({ kind: 'rejected', cause });
+  }
 
   try {
-    const outcome = await Promise.race([settled, timeout]);
-    if (outcome === 'timeout') {
-      logger.warn('a shutdown step did not finish in time and was abandoned', {
-        step,
-        timeoutMs,
-      });
-      return false;
-    }
-    return true;
+    return await Promise.race([running, timeout]);
   } finally {
     if (timer !== undefined) {
       clearTimeout(timer);
     }
   }
+}
+
+/**
+ * Runs one awaited shutdown step for at most `timeoutMs`, never rejecting.
+ *
+ * A failure is logged and the sequence continues; a timeout is logged as the
+ * step being abandoned (what "force-killed" means for a step this file does not
+ * own — the launcher escalates its own children to `SIGKILL` inside its slice).
+ *
+ * @param work Starts the step.
+ * @param timeoutMs The step's slice of the deadline.
+ * @param step A short name for the log record.
+ * @param logger Where the outcome is reported.
+ * @returns How the step ended: `settled` within its slice, with the value the
+ * step resolved — so a step that reports something (the dev-server launcher's
+ * termination report) is read rather than discarded — `rejected`, or `timeout`
+ * (abandoned). The last two have already been logged.
+ */
+async function settleWithin<T>(
+  work: () => PromiseLike<T> | T,
+  timeoutMs: number,
+  step: string,
+  logger: Logger,
+): Promise<BoundedOutcome<T>> {
+  const outcome = await raceWithin(work, timeoutMs);
+  switch (outcome.kind) {
+    case 'settled':
+      break;
+    case 'rejected':
+      logger.error('a shutdown step failed; continuing with the next one', {
+        step,
+        ...describeException(outcome.cause),
+      });
+      break;
+    case 'timeout':
+      logger.warn('a shutdown step did not finish in time and was abandoned', {
+        step,
+        timeoutMs: Math.max(0, Math.round(timeoutMs)),
+      });
+      break;
+  }
+  return outcome;
+}
+
+/**
+ * The one deadline of a shutdown: every awaited step is handed a slice of what
+ * is left of it, never a bound of its own.
+ */
+interface ShutdownDeadline {
+  /** What is left of the deadline, in milliseconds; never negative. */
+  remainingMs(): number;
+
+  /**
+   * What the next step may spend: what is left, less `reserveMs` held back for
+   * the steps after it, and no more than `capMs` when one is given. Never
+   * negative — a step whose slice is zero is started and abandoned at once.
+   */
+  allowance(reserveMs: number, capMs?: number): number;
+}
+
+/** Starts a deadline `totalMs` from now on `clock`. */
+function createShutdownDeadline(totalMs: number, clock: () => number): ShutdownDeadline {
+  const dueAt = clock() + totalMs;
+  const remainingMs = (): number => Math.max(0, dueAt - clock());
+  return Object.freeze({
+    remainingMs,
+    allowance: (reserveMs: number, capMs?: number): number => {
+      const available = Math.max(0, remainingMs() - reserveMs);
+      return capMs === undefined ? available : Math.min(capMs, available);
+    },
+  });
 }
 
 /**
@@ -681,8 +1123,91 @@ function releaseQuietly(step: string, logger: Logger, release: () => unknown): v
   } catch (cause) {
     logger.error('a shutdown step failed; continuing with the next one', {
       step,
-      reason: reasonOf(cause),
+      ...describeException(cause),
     });
+  }
+}
+
+/**
+ * Reads the dev-server step's report: every launched dev server the launcher
+ * could not end — its credential already revoked, its exit never observed — is
+ * named in one `error` record under the failed-step convention of this
+ * section (`step: 'dev-servers'`), by count, pid and project root, the
+ * launcher having logged each one's refused signals itself.
+ *
+ * @param report What `DevServerLauncher.dispose` resolved.
+ * @param logger Where the survivors are reported.
+ * @returns The pids still running; empty when every launched dev server stopped.
+ */
+function reportDevServerSurvivors(
+  report: DevServerTerminationReport,
+  logger: Logger,
+): readonly number[] {
+  const pids = report.survivors.map((survivor) => survivor.pid);
+  if (pids.length > 0) {
+    logger.error(DEV_SERVERS_SURVIVED_MESSAGE, {
+      step: 'dev-servers',
+      survivors: pids.length,
+      pids,
+      projectRoots: report.survivors.map((survivor) => survivor.projectRoot),
+    });
+  }
+  return pids;
+}
+
+/**
+ * The distinct project roots of the dev servers the launcher holds, read
+ * before it is disposed — what {@link revokeLaunchedCredentials} needs should
+ * the disposal not settle. A launcher that cannot list is logged and answers
+ * none.
+ */
+function launchedProjectRoots(launcher: Pick<DevServerLauncher, 'list'>, logger: Logger): string[] {
+  try {
+    return [...new Set(launcher.list().map((server) => server.projectRoot))];
+  } catch (cause) {
+    logger.error('the launched dev servers could not be listed before stopping them', {
+      ...describeException(cause),
+    });
+    return [];
+  }
+}
+
+/**
+ * The fallback of shutdown step 5: the launcher did not settle, so it may not
+ * yet have revoked the scoped credential of a child it could not confirm
+ * stopped — and a launched child's credential has no expiry of its own, it
+ * lasts until revoked. Every server-agent credential of each such project is
+ * therefore revoked here, before the store closes (AAP 0.5.6: the credential
+ * ends with the launched process). Deliberately project-wide: a credential the
+ * launcher cannot account for is not left valid across a restart. A process
+ * that is in fact still running re-authenticates only through a new launch or
+ * a new credential. Logged, never raised.
+ */
+function revokeLaunchedCredentials(
+  auth: Pick<AuthService, 'revokeServerAgentCredentials'>,
+  projectRoots: readonly string[],
+  logger: Logger,
+): void {
+  for (const projectRoot of projectRoots) {
+    try {
+      const revoked = auth.revokeServerAgentCredentials(projectRoot);
+      if (isErr(revoked)) {
+        logger.error('the credentials of a launched dev server could not be revoked at shutdown', {
+          projectRoot,
+          code: revoked.error.code,
+        });
+      } else {
+        logger.warn(
+          'the launcher did not confirm its dev servers stopped; their server-agent credentials were revoked before the store closed',
+          { projectRoot, revoked: revoked.value },
+        );
+      }
+    } catch (cause) {
+      logger.error('the credentials of a launched dev server could not be revoked at shutdown', {
+        projectRoot,
+        ...describeException(cause),
+      });
+    }
   }
 }
 
@@ -723,7 +1248,12 @@ export interface AgentReadyReceipt {
 
 /** Collaborators of {@link createAgentReadyLedger}. */
 export interface AgentReadyLedgerDeps {
-  /** Where accepted reports are noted at `debug`. Never receives a page URL. */
+  /**
+   * Where accepted reports are noted at `debug`. Never receives a page URL or
+   * a raw document id: the page-supplied `documentId` is logged only as its
+   * `document` fingerprint and `documentIdCanonical` flag
+   * (`./instrumentation/document-fingerprint.ts`).
+   */
   readonly logger: Logger;
   /** The clock a report is stamped with, in epoch milliseconds. */
   readonly now?: (() => number) | undefined;
@@ -806,9 +1336,11 @@ export function createAgentReadyLedger(deps: AgentReadyLedgerDeps): AgentReadyLe
       );
     }
     remember(payload.tabId, { payload, receivedAt: now() });
+    // The id is page-controlled text: the ledger keeps it for matching, the
+    // log line carries only its fingerprint and shape flag (CWE-532).
     log.debug('recorded a page-agent readiness report', {
       tabId: payload.tabId,
-      documentId: payload.documentId,
+      ...documentLogFields(payload.documentId),
       reactDetected: payload.reactDetected,
       installedBeforeReact: payload.installedBeforeReact,
       clientId: client.id,
@@ -912,20 +1444,61 @@ function serverAgentPresenceOf(clients: ClientRegistry): ServerAgentReadinessSou
 }
 
 /**
- * The dev-server launcher's credential port, over the access boundary: a
- * launched child receives a `server-agent` credential scoped to its one project
- * root (AAP 0.5.6), and the credentials of that project are revoked when the
- * child exits or is stopped.
+ * The launcher's view of the connected preloads, over the client registry:
+ * whether an online `server-agent` connection authenticated with a given
+ * credential digest. The launcher matches it against its children's own
+ * credentials, so preload evidence is about one process — never the project.
+ * Exported for its tests.
  */
-function credentialIssuerOf(auth: AuthService): ServerAgentCredentialIssuer {
+export function serverAgentConnectionsOf(clients: ClientRegistry): ServerAgentConnections {
   return Object.freeze({
-    issue: (input: { readonly projectRoot: string; readonly expiresAt?: number | undefined }) =>
-      auth.issueServerAgentCredential({
-        projectRoot: input.projectRoot,
-        expiresAt: input.expiresAt,
-      }),
-    revoke: (input: { readonly projectRoot: string }) =>
-      auth.revokeServerAgentCredentials(input.projectRoot),
+    isCredentialConnected: (tokenHash: string): boolean =>
+      clients
+        .list({ kind: 'server-agent', online: true })
+        .some((client) => client.principal.tokenHash === tokenHash),
+  });
+}
+
+/**
+ * The readiness gate's preload evidence for one session's dev-server address:
+ * {@link addressedServerAgentPresence} over the client registry — a connection
+ * the launcher places at another address of the project is no evidence for
+ * this one.
+ */
+function serverAgentsAt(
+  clients: ClientRegistry,
+  launcher: Pick<DevServerLauncher, 'addressOfCredential'>,
+  devServerUrl: string | undefined,
+): ServerAgentReadinessSource {
+  return addressedServerAgentPresence(clients, launcher, devServerUrl);
+}
+
+/**
+ * The access boundary's connection revoker, over the client registry:
+ * rotation closes every socket (`revokeAll`), and revoking one credential
+ * closes exactly the connections authenticated with it (`closeCredential`) —
+ * a revoked dev server's socket, never another credential's of the same
+ * project. Exported for its tests.
+ */
+export function connectionRevokerOf(clients: ClientRegistry): ConnectionRevoker {
+  return Object.freeze({
+    revokeAll: (code: number, reason?: string) => clients.revokeAll(code, reason),
+    closeCredential: (tokenHash: string, code: number, reason?: string): number => {
+      let closed = 0;
+      for (const client of clients.list()) {
+        if (client.principal.tokenHash !== tokenHash) {
+          continue;
+        }
+        try {
+          client.socket.close(code, reason);
+          closed += 1;
+        } catch {
+          // A socket that cannot be closed is gone already; the registry forgets it below.
+        }
+        clients.unregister(client.id);
+      }
+      return closed;
+    },
   });
 }
 
@@ -975,11 +1548,16 @@ function sourceOpenDeliveryOf(
  * Where a `target.selected` goes: the session record's current target, which
  * the first pipeline stage reads. The WebSocket router has already proved the
  * sender holds the session's tab binding.
+ *
+ * The descriptor is redacted before the record sees it (AAP §0.5.2): its URL's
+ * query values become `?` per key and its text, selector, tag and component
+ * names are pattern-scrubbed, so neither the store nor the `session.updated`
+ * broadcast ever holds what the page rendered raw.
  */
 function targetSelectionOf(manager: SessionManager): TargetSelectionPort {
   return Object.freeze({
     selected: (sessionId: SessionId, target: SelectedTarget) =>
-      manager.patch(sessionId, { target }),
+      manager.patch(sessionId, { target: redactSelectedTarget(target) }),
   });
 }
 
@@ -1000,12 +1578,21 @@ export interface IngestSourceLocatorDeps {
   readonly sessions: Pick<SessionsRepo, 'get'>;
   /** The code index shared with the pipeline, so a project is indexed once. */
   readonly codeIndex: Pick<CodeIndexPort, 'load'>;
-  /** The modification journal the patch route corroborates a stamp against. */
+  /**
+   * The modification journal the patch route corroborates a stamp against —
+   * in production its metadata-only `listCorroborationsBySession`, which never
+   * loads a diff, and `listPatchEvidenceBySessionFile`, which loads the diffs
+   * of one file the metadata found in force, to prove the stamp's exact
+   * position and symbol. Read through a per-capture cache (see
+   * {@link createIngestSourceLocator}).
+   */
   readonly modifications: ModificationCorroborationPort;
   /** The stored spans a database query's enclosing function is found through. */
   readonly events: ParentEventPort;
   /** The service's root logger. */
   readonly logger: Logger;
+  /** The clock the cross-batch caches expire entries on; defaults to `nowEpochMs`. */
+  readonly now?: (() => number) | undefined;
 }
 
 /**
@@ -1015,19 +1602,54 @@ export interface IngestSourceLocatorDeps {
  * its dev-server URL, which pins where the source-map route may fetch a chunk's
  * map from (AAP §0.4.2, "Source resolution path").
  *
- * The resolver is built per batch, so one batch shares one source-map cache
- * and a chunk the dev server rebuilt between batches is never mapped through
- * a stale document. The code index is the pipeline's, normally loaded already
- * by the session's own stages; a load that is still running is shared rather
- * than started again for every batch of a burst. An index that cannot be
- * loaded leaves the routes that need none — patch metadata and the source map
- * — to answer on their own.
+ * A resolver is built per batch over what outlives the batch. Source maps come
+ * from one {@link createSourceMapScopes} registry held by this port: a batch
+ * uses the scope of its dev-server URL, its capture and the one page document
+ * (`producerId`, minted per document — AAP §0.2.3) its browser events came
+ * from, and takes that scope's lookup for one batch
+ * (the scope's `forBatch`). A batch reads each chunk its events point
+ * into once; the batches of one document in one capture share the parsed maps,
+ * so a map is fetched and parsed once per build of its chunk rather than once
+ * per batch. A batch with no browser event (a dev-server preload's spans, which
+ * no source map describes), or whose browser events came from more than one
+ * document, uses no shared scope and resolves through a cache of its own.
+ *
+ * A rebuilt chunk is never mapped through its old map, however it was rebuilt —
+ * by the product's own patch between captures or by a developer's edit applied
+ * by hot module replacement during one: the scope keeps a parsed map with the
+ * digest of the chunk it was read for, and the batch's own read of the chunk
+ * decides whether it still applies (see {@link createSourceMapScopes}). Idle
+ * expiry and the registry's bound release the maps of documents and captures
+ * that are gone.
+ *
+ * The code index is the pipeline's, normally loaded already by the session's
+ * own stages; a load that is still running is shared rather than started again
+ * for every batch of a burst. An index that cannot be loaded leaves the routes
+ * that need none — patch metadata and the source map — to answer on their own.
+ *
+ * The patch route's journal reads go through one {@link createCorroborationCache}
+ * held by this port and keyed by the batch's `(session, capture)`, so the
+ * batches of one capture window share one metadata-only read (file, status and
+ * applied time — never a diff) instead of making one each.
+ *
+ * Ingest hands each call its locate budget as `options.signal`, and it is
+ * honoured as a budget rather than a cancellation: it is forwarded to
+ * `resolveEvents` as `budget`, which stops starting events when it fires and
+ * answers with the locations found by then, and the wait for a still-loading
+ * code index is raced against it. When the budget fires before the index has
+ * loaded, the call answers with no locations at once — the batch is stored
+ * without them — while the shared load runs on for the batches after it.
  *
  * @param deps The session store, code index, journal, telemetry store and logger.
  * @returns The port handed to `createTelemetryIngest`.
  */
 export function createIngestSourceLocator(deps: IngestSourceLocatorDeps): IngestSourceLocator {
   const loading = new Map<string, Promise<Result<PipelineCodeHandles, DebuggenError>>>();
+  const corroborations = createCorroborationCache({
+    journal: deps.modifications,
+    now: deps.now,
+  });
+  const sourceMaps = createSourceMapScopes({ now: deps.now });
 
   const codeFor = (projectRoot: string): Promise<Result<PipelineCodeHandles, DebuggenError>> => {
     const inFlight = loading.get(projectRoot);
@@ -1042,7 +1664,8 @@ export function createIngestSourceLocator(deps: IngestSourceLocatorDeps): Ingest
   };
 
   return Object.freeze({
-    locate: async (events, attribution) => {
+    locate: async (events, attribution, options) => {
+      const budget = options?.signal;
       const session = deps.sessions.get(attribution.sessionId);
       if (!session.ok) {
         return session;
@@ -1051,21 +1674,111 @@ export function createIngestSourceLocator(deps: IngestSourceLocatorDeps): Ingest
       if (record === undefined) {
         return ok(new Map());
       }
-      const code = await codeFor(record.projectRoot);
+      const loaded = await withinBudget(codeFor(record.projectRoot), budget);
+      if (loaded.kind === 'expired') {
+        // The budget expired while the index was still loading: nothing could
+        // be started in time, so the batch is stored without locations. The
+        // shared load keeps running, and a later batch finds it ready.
+        return ok(new Map());
+      }
+      const code = loaded.value;
       const handles = code.ok ? code.value : undefined;
+      // One page document's batches within one capture share a scope; see the
+      // notes above. Only a browser event can take the source-map route, so a
+      // batch without one (a dev-server preload's spans) is resolved without a
+      // shared scope and never takes a slot a page document's maps would
+      // otherwise keep; nor is a batch whose browser events span two documents,
+      // which may run different builds of the same chunk.
+      const document = soleBrowserDocument(events);
+      const sourceMap =
+        document === undefined
+          ? undefined
+          : sourceMaps.scopeFor(
+              `${record.devServerUrl}\u0000${attribution.captureId}\u0000${document}`,
+            );
       const resolver = createSourceResolver({
         projectRoot: record.projectRoot,
         queries: handles?.queries,
         routeMap: handles?.routeMap,
         graph: handles?.graph,
-        modifications: deps.modifications,
+        modifications: corroborations.forCapture(attribution.captureId),
         events: deps.events,
         devServerOrigin: record.devServerUrl,
+        sourceMapLookup: sourceMap?.forBatch(),
         logger: deps.logger,
       });
-      return resolver.resolveEvents(events);
+      return resolver.resolveEvents(events, budget === undefined ? undefined : { budget });
     },
   } satisfies IngestSourceLocator);
+}
+
+/**
+ * The page document a batch's browser events all came from: their shared
+ * `producerId`, or `undefined` when the batch has no browser event or its
+ * browser events came from more than one document (a relayed buffer that
+ * straddles a reload), neither of which may take a shared source-map scope.
+ */
+function soleBrowserDocument(events: readonly AttributedEvent[]): string | undefined {
+  let document: string | undefined;
+  for (const event of events) {
+    if (event.tier !== BROWSER_TIER) {
+      continue;
+    }
+    if (document === undefined) {
+      document = event.producerId;
+    } else if (event.producerId !== document) {
+      return undefined;
+    }
+  }
+  return document;
+}
+
+/** What {@link withinBudget} observed: the promise settled first, or the budget fired first. */
+type BudgetedWait<T> =
+  { readonly kind: 'settled'; readonly value: T } | { readonly kind: 'expired' };
+
+/**
+ * Awaits `pending` unless `budget` fires first.
+ *
+ * Only this caller stops waiting: the promise is a load other batches may be
+ * sharing, so it is neither cancelled nor dropped, and its settlement is still
+ * observed. A rejection is passed on exactly as awaiting `pending` directly
+ * would pass it on.
+ *
+ * @param pending The load to wait for.
+ * @param budget The caller's budget, if it has one.
+ * @returns `settled` with the value, or `expired` when the budget fired first
+ * (including when it had fired already).
+ */
+function withinBudget<T>(
+  pending: Promise<T>,
+  budget: AbortSignal | undefined,
+): Promise<BudgetedWait<T>> {
+  const settled = pending.then((value): BudgetedWait<T> => ({ kind: 'settled', value }));
+  if (budget === undefined) {
+    return settled;
+  }
+  if (budget.aborted) {
+    // Observed, so a later rejection of the shared load is never unhandled here.
+    settled.catch(() => undefined);
+    return Promise.resolve({ kind: 'expired' });
+  }
+  return new Promise<BudgetedWait<T>>((resolve, reject) => {
+    const onBudget = (): void => {
+      resolve({ kind: 'expired' });
+    };
+    budget.addEventListener('abort', onBudget, { once: true });
+    settled.then(
+      (outcome) => {
+        budget.removeEventListener('abort', onBudget);
+        resolve(outcome);
+      },
+      (cause: unknown) => {
+        budget.removeEventListener('abort', onBudget);
+        reject(cause instanceof Error ? cause : new Error('The code index load failed.'));
+      },
+    );
+  });
 }
 
 /** Collaborators of {@link createCaptureReadinessSource}. */
@@ -1076,6 +1789,12 @@ interface CaptureReadinessDeps {
   readonly adapters: AdapterRegistry;
   readonly progress: SessionProgress;
   readonly observe: Omit<CollectObservedReadinessDeps, 'logger' | 'now'>;
+  /**
+   * The preload evidence for a session's dev-server address, replacing
+   * `observe.serverAgents` for that session (see {@link serverAgentsAt}).
+   */
+  readonly serverAgentsAt?:
+    ((devServerUrl: string | undefined) => ServerAgentReadinessSource) | undefined;
   readonly logger: Logger;
   readonly now?: (() => number) | undefined;
 }
@@ -1103,17 +1822,25 @@ function createCaptureReadinessSource(deps: CaptureReadinessDeps): CaptureReadin
     if (isErr(session)) {
       return session;
     }
-    const devServerUrl = session.value?.devServerUrl;
+    const recordedUrl = session.value?.devServerUrl;
+    const devServerUrl =
+      recordedUrl === undefined || recordedUrl.length === 0 ? undefined : recordedUrl;
 
     const evidence = await collectReadinessEvidence(
-      { ...deps.observe, logger: deps.logger, now: deps.now },
+      {
+        ...deps.observe,
+        ...(deps.serverAgentsAt === undefined
+          ? {}
+          : { serverAgents: deps.serverAgentsAt(devServerUrl) }),
+        logger: deps.logger,
+        now: deps.now,
+      },
       {
         sessionId: request.sessionId,
         projectRoot: request.projectRoot,
         boundTab: request.boundTab,
         plan: request.plan,
-        devServerUrl:
-          devServerUrl === undefined || devServerUrl.length === 0 ? undefined : devServerUrl,
+        devServerUrl,
         signal: request.signal,
       },
     );
@@ -1252,6 +1979,98 @@ export function regatingBindingRoutes(
       return bound;
     },
     handleTabNavigated: (payload, connection) => binding.handleTabNavigated(payload, connection),
+    handleSessionUnbind: (payload, connection) => binding.handleSessionUnbind(payload, connection),
+  } satisfies BindingRoutes);
+}
+
+/**
+ * The binding routes with one addition: a tab bound (or kept across a
+ * same-origin navigation) while its session has no open capture has its page
+ * agent reconciled to dormant.
+ *
+ * The binding route re-arms an open capture itself. Without one, the tab's
+ * page agent may still hold the session's last capture: a dormant
+ * `agent.config` that could not be delivered while the service worker was
+ * away, or a configuration the service worker kept across a restart of this
+ * service, which forgot that it had ever armed it. The instrumentation
+ * service's `reconcileBoundSession` sends the dormant configuration for the
+ * outstanding disarm, the capture it still has armed there, or a last stored
+ * capture an earlier process opened — nothing when it knows that page is
+ * dormant, which is why the capture's start time is passed along. The route's
+ * own answer is returned unchanged; the reconciliation never delays or fails
+ * it. The unbind route is delegated explicitly, so a route added to
+ * {@link BindingRoutes} is a compile error here rather than a missing member.
+ *
+ * @param binding The binding routes that do the work.
+ * @param producers The instrumentation service's producer reconciler.
+ * @param sessions The session store, read for the project root and last capture.
+ * @param logger The service's root logger.
+ * @returns The routes handed on to the WebSocket router.
+ */
+export function reconcilingBindingRoutes(
+  binding: BindingRoutes,
+  producers: Pick<ProducerReconciler, 'reconcileBoundSession'>,
+  sessions: Pick<SessionsRepo, 'get'>,
+  logger: Logger,
+): BindingRoutes {
+  const log = subsystemLogger(logger, SUBSYSTEM_READINESS);
+
+  /** Reconciles the page agent of a session whose tab the route did not re-arm. */
+  function reconcile(sessionId: string, tabId: number): void {
+    try {
+      const loaded = sessions.get(sessionId);
+      if (isErr(loaded) || loaded.value === undefined) {
+        log.debug('the bound session could not be read, so its page agent was not reconciled', {
+          sessionId,
+          tabId,
+          ...(isErr(loaded) ? { code: loaded.error.code } : {}),
+        });
+        return;
+      }
+      const record = loaded.value;
+      const last = record.captures.at(-1);
+      const reconciled = producers.reconcileBoundSession({
+        sessionId,
+        projectRoot: record.projectRoot,
+        ...(last === undefined
+          ? {}
+          : { lastCaptureId: last.id, lastCaptureStartedAt: last.startedAt }),
+      });
+      if (isErr(reconciled)) {
+        log.warn('the bound tab’s page agent could not be reconciled', {
+          sessionId,
+          tabId,
+          code: reconciled.error.code,
+        });
+      }
+    } catch (cause) {
+      log.error('reconciling the bound tab’s page agent threw', {
+        sessionId,
+        tabId,
+        code: DebuggenError.from(cause, 'INTERNAL').code,
+      });
+    }
+  }
+
+  return Object.freeze({
+    handleSessionBind: async (payload, connection) => {
+      const bound = await binding.handleSessionBind(payload, connection);
+      if (bound.ok && bound.value.rearm.status === 'no-active-capture') {
+        reconcile(bound.value.sessionId, bound.value.tabId);
+      }
+      return bound;
+    },
+    handleTabNavigated: async (payload, connection) => {
+      const navigated = await binding.handleTabNavigated(payload, connection);
+      if (
+        navigated.ok &&
+        navigated.value.kind === 'kept' &&
+        navigated.value.rearm.status === 'no-active-capture'
+      ) {
+        reconcile(navigated.value.announced.payload.sessionId, payload.tabId);
+      }
+      return navigated;
+    },
     handleSessionUnbind: (payload, connection) => binding.handleSessionUnbind(payload, connection),
   } satisfies BindingRoutes);
 }
@@ -1422,26 +2241,557 @@ function closeHttpServer(server: Server, logger: Logger): Promise<void> {
  * Releasing what a start acquired
  * ---------------------------------------------------------------------------------------------- */
 
+/** Every session status but the terminal one: the statuses a stop can end. */
+const ENDABLE_STATUSES: readonly SessionStatus[] = Object.freeze(
+  SESSION_STATUSES.filter((status) => status !== 'ended'),
+);
+
+/**
+ * The statuses in which a session holds instrumentation whatever its journal
+ * says: an install that may have configured producers or written files before
+ * the pipeline was cancelled, and an open capture window with armed producers.
+ */
+const INSTRUMENTING_STATUSES: ReadonlySet<SessionStatus> = new Set<SessionStatus>([
+  'instrumenting',
+  'capturing',
+]);
+
+/** The most file paths or session ids one shutdown log record lists. */
+const MAX_LOGGED_SHUTDOWN_ITEMS = 50;
+
+/** One live session a stop ended, and what its cleanup reported. */
+export interface EndedLiveSession {
+  readonly sessionId: SessionId;
+
+  /** The session's recorded cleanup verdict, as its clients received it in `cleanup.completed`. */
+  readonly cleanup: CleanupStatus;
+
+  /**
+   * The project-relative files left as the developer edited them — never
+   * overwritten, their originals kept in `$DEBUGGEN_HOME/backups`.
+   */
+  readonly conflictFiles: readonly string[];
+}
+
+/** What {@link endLiveSessions} did. */
+export interface LiveSessionsReport {
+  /**
+   * The live sessions found, in the order they were ended: every session whose
+   * patch was applied on top of another's before that other, otherwise most
+   * recently updated first (see {@link orderForRestore}).
+   */
+  readonly live: readonly SessionId[];
+
+  /** The sessions that reached `ended`, with their cleanup verdicts. */
+  readonly ended: readonly EndedLiveSession[];
+
+  /**
+   * The live sessions not ended — refused, failed, out of time, or left because
+   * a session whose patch sits on top of theirs was one of those. Each was
+   * still sent its dormant producer configurations; its journal is durable, and
+   * the next start restores its files.
+   */
+  readonly unfinished: readonly SessionId[];
+
+  /** Whether any session's end did not settle within its share of the slice. */
+  readonly timedOut: boolean;
+}
+
+/** Options for {@link endLiveSessions}. */
+export interface EndLiveSessionsOptions {
+  /** The slice of the shutdown deadline this step may spend, in milliseconds. */
+  readonly timeoutMs: number;
+
+  /** Where the outcome is reported. */
+  readonly logger: Logger;
+
+  /** The monotonic clock the slice is measured on. Defaults to `performance.now`. */
+  readonly clock?: (() => number) | undefined;
+}
+
+/**
+ * The live sessions: every session that is not `ended` and still holds
+ * instrumentation this service must remove — an open (non-`reverted`) journal
+ * record, whatever the session's status (AAP 0.5.1); an install or capture in
+ * progress; or producers the instrumentation service still has armed. A session
+ * that holds none of these has nothing to clean up, so it is left open and a
+ * follow-up can continue it after the restart.
+ *
+ * A journal that cannot be read is logged and the other criteria still apply;
+ * the next start's reconciliation reads the journal again.
+ *
+ * @returns The live sessions, most recently updated first, with the open
+ * journal records of those sessions; or the store failure that prevented
+ * listing the sessions at all.
+ */
+async function findLiveSessions(
+  ports: LiveSessionPorts,
+  logger: Logger,
+): Promise<Result<LiveSessionSet, DebuggenError>> {
+  let open: readonly ModificationRecord[] = [];
+  const read = await ports.modifications.listAllOpen();
+  if (isErr(read)) {
+    logger.warn(
+      'the modification journal could not be read at shutdown; only installing, capturing and armed sessions are ended now',
+      { code: read.error.code },
+    );
+  } else {
+    open = read.value;
+  }
+  const patched = new Set<string>(open.map((record) => record.sessionId));
+
+  const sessions: LiveSession[] = [];
+  let offset = 0;
+  for (;;) {
+    const page = ports.sessions.list({
+      statuses: ENDABLE_STATUSES,
+      limit: MAX_SESSION_LIST_LIMIT,
+      offset,
+    });
+    if (isErr(page)) {
+      return page;
+    }
+    const { items, total } = page.value;
+    for (const item of items) {
+      if (
+        patched.has(item.id) ||
+        INSTRUMENTING_STATUSES.has(item.status) ||
+        ports.instrumentation?.arming(item.id)?.armedCaptureId !== undefined
+      ) {
+        sessions.push({ sessionId: item.id, projectRoot: item.projectRoot });
+      }
+    }
+    offset += items.length;
+    if (items.length === 0 || offset >= total) {
+      const live = new Set<string>(sessions.map((session) => session.sessionId));
+      return ok({ sessions, records: open.filter((record) => live.has(record.sessionId)) });
+    }
+  }
+}
+
+/** One live session: what ending it, or disarming it, needs. */
+interface LiveSession {
+  readonly sessionId: SessionId;
+  readonly projectRoot: string;
+}
+
+/** The live sessions, most recently updated first, and their open journal records. */
+interface LiveSessionSet {
+  readonly sessions: readonly LiveSession[];
+  readonly records: readonly ModificationRecord[];
+}
+
+/**
+ * Whether the record `later` was applied on top of `earlier` — both on the
+ * same file — which means `later` must be restored first. Exact when the two
+ * hashes chain (`later` found the file exactly as `earlier` left it); otherwise
+ * the application times decide, and equal times decide nothing.
+ */
+function appliedOnTop(later: ModificationRecord, earlier: ModificationRecord): boolean {
+  if (later.originalHash === earlier.instrumentedHash) {
+    return true;
+  }
+  if (earlier.originalHash === later.instrumentedHash) {
+    return false;
+  }
+  return later.appliedAt > earlier.appliedAt;
+}
+
+/**
+ * The order the live sessions are ended in, so that the patches of different
+ * sessions on one file are unwound strictly last-applied-first.
+ *
+ * Each session restores its own records in reverse; across sessions, the
+ * engine verifies every restore against that record's `instrumentedHash`, so a
+ * file restored out of order is reported as a conflict instead of being
+ * overwritten — safe, but a false conflict that leaves a patch behind. For
+ * every file two live sessions have both patched, the session whose patch was
+ * applied on top of the other's ({@link appliedOnTop}) therefore goes first; the
+ * sessions are sorted topologically over those edges, ties and unconstrained
+ * sessions keeping the session index's order (most recently updated first). A
+ * cycle — two sessions each on top of the other in different files — has no
+ * safe order at session granularity: it is broken at the earliest remaining
+ * session in index order and logged, and whatever it leaves is reported as a
+ * conflict, never overwritten.
+ *
+ * @param set The live sessions and their open records.
+ * @param logger Where a broken cycle is reported.
+ * @returns Every live session exactly once, and for each the sessions whose
+ * patches sit on top of its own.
+ */
+function orderForRestore(set: LiveSessionSet, logger: Logger): RestoreOrder {
+  // Records are keyed by project and file: two projects may share a relative path.
+  const projectOf = new Map<string, string>(
+    set.sessions.map((session) => [session.sessionId, session.projectRoot]),
+  );
+  const byFile = new Map<string, ModificationRecord[]>();
+  for (const record of set.records) {
+    const key = `${projectOf.get(record.sessionId) ?? ''}\u0000${record.file}`;
+    const onFile = byFile.get(key);
+    if (onFile === undefined) {
+      byFile.set(key, [record]);
+    } else {
+      onFile.push(record);
+    }
+  }
+
+  // before.get(a) holds every session that must be ended before `a`.
+  const before = new Map<string, Set<string>>(
+    set.sessions.map((session) => [session.sessionId, new Set<string>()]),
+  );
+  for (const onFile of byFile.values()) {
+    for (const a of onFile) {
+      for (const b of onFile) {
+        if (a.sessionId !== b.sessionId && appliedOnTop(b, a)) {
+          before.get(a.sessionId)?.add(b.sessionId);
+        }
+      }
+    }
+  }
+
+  const ordered: LiveSession[] = [];
+  const done = new Set<string>();
+  const remaining = [...set.sessions];
+  while (remaining.length > 0) {
+    let index = remaining.findIndex((session) =>
+      [...(before.get(session.sessionId) ?? [])].every((id) => done.has(id)),
+    );
+    if (index === -1) {
+      index = 0;
+      logger.warn(
+        'live sessions patched the same files in an interleaved order; a patch that cannot be unwound in order is reported as a conflict',
+        { sessionId: remaining[0]?.sessionId },
+      );
+    }
+    const [next] = remaining.splice(index, 1);
+    if (next !== undefined) {
+      ordered.push(next);
+      done.add(next.sessionId);
+    }
+  }
+  return { sessions: ordered, onTopOf: before };
+}
+
+/** What {@link orderForRestore} decided. */
+interface RestoreOrder {
+  /** Every live session exactly once, in the order to end them. */
+  readonly sessions: readonly LiveSession[];
+
+  /**
+   * For each session, the sessions whose patches were applied on top of its
+   * own in some file — every one must be unwound before this session can be.
+   */
+  readonly onTopOf: ReadonlyMap<string, ReadonlySet<string>>;
+}
+
+/**
+ * Ends every live session (see {@link findLiveSessions}) within `timeoutMs` —
+ * the first half of AAP 0.5.1's end-of-session guarantee at a graceful stop.
+ *
+ * Each session is ended through `SessionManager.end`, the same sequence an
+ * explicit `session.end` runs, so nothing here restates it: the capture window
+ * closes, the conflict watcher stops, the page agent receives its dormant
+ * `agent.config` and the dev-server preload its capture-less
+ * `server-agent.config`, every patched file is restored with its hash verified
+ * — a file the developer edited is left untouched and reported as a conflict —
+ * and the one `cleanup.completed` message goes to the session's clients.
+ *
+ * Sessions are ended one at a time, in {@link orderForRestore}'s order, so the
+ * patches two sessions made to one file are unwound last-applied-first and a
+ * restore never races another restore.
+ *
+ * The slice is enforced here, and shared fairly: each session may spend at
+ * most what is left divided by the sessions still to end, so one session whose
+ * end stalls cannot starve an independent one — every live session is
+ * attempted. A session whose end does not settle in its share, or that could
+ * not be ended at all, is reported `unfinished` and is still sent its dormant
+ * `agent.config` and capture-less `server-agent.config` directly, so no
+ * producer outlives the stop; its journal is durable, the cleanup runner's
+ * disposal that follows stops an abandoned pass before its next record, and
+ * the next start restores the files. A session under an unfinished one — whose
+ * patch that other session's sits on top of, in some file — is not attempted
+ * either, because its restore would meet the other session's bytes and record
+ * a false conflict; it is disarmed and left to the next start the same way.
+ * Never rejects.
+ *
+ * @param ports The manager, the session index, the journal and the arming state.
+ * @param options The slice, the logger and the clock.
+ * @returns What was ended, what was not, and whether any share ran out.
+ */
+export async function endLiveSessions(
+  ports: LiveSessionPorts,
+  options: EndLiveSessionsOptions,
+): Promise<LiveSessionsReport> {
+  const clock = options.clock ?? monotonicNow;
+  const log = options.logger;
+  const dueAt = clock() + Math.max(0, options.timeoutMs);
+  const nothing: LiveSessionsReport = Object.freeze({
+    live: [],
+    ended: [],
+    unfinished: [],
+    timedOut: false,
+  });
+
+  const found = await raceWithin(() => findLiveSessions(ports, log), dueAt - clock());
+  if (found.kind === 'timeout') {
+    log.warn('the live sessions could not be listed in time; the next start restores their files', {
+      timeoutMs: options.timeoutMs,
+    });
+    return Object.freeze({ ...nothing, timedOut: true });
+  }
+  if (found.kind === 'rejected') {
+    log.error('the live sessions could not be listed; the next start restores their files', {
+      ...describeException(found.cause),
+    });
+    return nothing;
+  }
+  if (isErr(found.value)) {
+    log.error('the live sessions could not be listed; the next start restores their files', {
+      code: found.value.error.code,
+      reason: found.value.error.message,
+    });
+    return nothing;
+  }
+
+  const order = orderForRestore(found.value.value, log);
+  const live = order.sessions;
+  if (live.length === 0) {
+    log.debug('no session holds instrumentation, so none is ended');
+    return nothing;
+  }
+  log.info('ending the live sessions before stopping', {
+    sessions: live.length,
+    timeoutMs: Math.round(options.timeoutMs),
+  });
+
+  const ended: EndedLiveSession[] = [];
+  const unfinished: LiveSession[] = [];
+  const unfinishedIds = new Set<string>();
+  let timedOut = false;
+
+  for (const [index, session] of live.entries()) {
+    const { sessionId } = session;
+    // A patch still sitting on top of this session's could not be unwound, so
+    // restoring this session now would meet those bytes and record a false
+    // conflict. Its producers are disarmed below and the journal is left intact.
+    const blockedBy = [...(order.onTopOf.get(sessionId) ?? [])].filter((id) =>
+      unfinishedIds.has(id),
+    );
+    if (blockedBy.length > 0) {
+      log.warn(
+        'a live session was not ended because a session that patched the same files after it could not be ended',
+        { sessionId, blockedBy: blockedBy.slice(0, MAX_LOGGED_SHUTDOWN_ITEMS) },
+      );
+      unfinished.push(session);
+      unfinishedIds.add(sessionId);
+      continue;
+    }
+    // A fair share of what is left: a stalled end spends no more than its
+    // share, and every later session still receives its own.
+    const share = (dueAt - clock()) / (live.length - index);
+    const outcome =
+      share > 0 ? await raceWithin(() => ports.manager.end(sessionId), share) : undefined;
+    if (outcome === undefined || outcome.kind === 'timeout') {
+      timedOut = true;
+      log.warn('a live session did not finish ending within its share of the shutdown deadline', {
+        sessionId,
+        shareMs: Math.max(0, Math.round(share)),
+      });
+      unfinished.push(session);
+      unfinishedIds.add(sessionId);
+      continue;
+    }
+    if (outcome.kind === 'rejected') {
+      log.error('ending a live session failed; the next start restores its files', {
+        sessionId,
+        ...describeException(outcome.cause),
+      });
+      unfinished.push(session);
+      unfinishedIds.add(sessionId);
+      continue;
+    }
+    if (isErr(outcome.value)) {
+      log.warn('a live session could not be ended; the next start restores its files', {
+        sessionId,
+        code: outcome.value.error.code,
+      });
+      unfinished.push(session);
+      unfinishedIds.add(sessionId);
+      continue;
+    }
+
+    const cleanup = outcome.value.value.cleanup;
+    const conflictFiles = cleanup.conflicts.map((conflict) => conflict.file);
+    ended.push(Object.freeze({ sessionId, cleanup: cleanup.status, conflictFiles }));
+    if (cleanup.status === 'conflict') {
+      log.warn(
+        'files edited while instrumented were not overwritten; their originals are kept in the backup directory',
+        {
+          sessionId,
+          conflicts: conflictFiles.length,
+          files: conflictFiles.slice(0, MAX_LOGGED_SHUTDOWN_ITEMS),
+        },
+      );
+    } else if (cleanup.status !== 'clean') {
+      log.warn('a live session ended with its cleanup incomplete; the next start retries it', {
+        sessionId,
+        cleanup: cleanup.status,
+      });
+    }
+  }
+
+  // What could not be ended still has its producers disarmed now; its files
+  // are restored from the durable journal by the next start.
+  for (const session of unfinished) {
+    disarmUnfinished(ports, session, log);
+  }
+
+  const unfinishedList = unfinished.map((session) => session.sessionId);
+  if (unfinishedList.length > 0) {
+    log.warn(
+      'some live sessions could not be ended before stopping; their producers were disarmed and the next start restores their files',
+      {
+        unfinished: unfinishedList.length,
+        timedOut,
+        sessionIds: unfinishedList.slice(0, MAX_LOGGED_SHUTDOWN_ITEMS),
+      },
+    );
+  }
+  log.info('live sessions ended', {
+    ended: ended.length,
+    clean: ended.filter((session) => session.cleanup === 'clean').length,
+    conflict: ended.filter((session) => session.cleanup === 'conflict').length,
+    unfinished: unfinishedList.length,
+  });
+
+  return Object.freeze({
+    live: Object.freeze(live.map((session) => session.sessionId)),
+    ended: Object.freeze(ended),
+    unfinished: Object.freeze(unfinishedList),
+    timedOut,
+  });
+}
+
+/**
+ * Sends a live session that could not be ended its dormant page-agent and
+ * capture-less dev-server configurations, through the instrumentation service
+ * that owns both (the same call cleanup makes first). Idempotent, synchronous
+ * and file-free, so it is safe beside an end still running in the background.
+ * Logged, never raised.
+ */
+function disarmUnfinished(ports: LiveSessionPorts, session: LiveSession, logger: Logger): void {
+  const { sessionId, projectRoot } = session;
+  try {
+    const disarmed = ports.instrumentation?.disarmCapture?.({ sessionId, projectRoot });
+    if (disarmed === undefined) {
+      return;
+    }
+    if (isErr(disarmed)) {
+      logger.warn('the producers of a session that could not be ended were not disarmed', {
+        sessionId,
+        code: disarmed.error.code,
+      });
+      return;
+    }
+    logger.info('the producers of a session that could not be ended were disarmed', {
+      sessionId,
+      agentDisarmed: disarmed.value.agentDisarmed,
+      serverAgent: disarmed.value.serverAgent,
+    });
+  } catch (cause) {
+    logger.error('disarming a session that could not be ended failed', {
+      sessionId,
+      ...describeException(cause),
+    });
+  }
+}
+
 /**
  * Releases everything in `parts`, in the one order both a failed start and
- * {@link ServiceHandle.close} use. Every step is guarded, awaited steps are
- * bounded by {@link SHUTDOWN_STEP_TIMEOUT_MS}, and nothing here throws:
+ * {@link ServiceHandle.close} use, against one deadline. Every step is guarded,
+ * every awaited step is handed a slice of what is left of `budget.totalMs`, and
+ * nothing here throws:
  *
- * 1. stop accepting — new requests on a kept-alive connection are answered
- *    `503`, the listener stops accepting, pending agent-readiness waits resolve;
- * 2. stop the cleanup runner (the journal stays durable; the next start
- *    restores anything a cut-short cleanup left) and cancel in-flight pipeline
- *    operations, which may otherwise still be writing the store;
- * 3. stop the dev servers this service launched, which also revokes their
- *    scoped `server-agent` credentials;
- * 4. flush the live tail, then close every WebSocket with the going-away code
- *    and wait for the HTTP server to finish;
- * 5. release the in-memory subsystems and the client registry;
- * 6. checkpoint the write-ahead log and close the database — last, so nothing
- *    above can write to a closed store.
+ * 1. **stop accepting** — new requests on a kept-alive connection are answered
+ *    `503`, the listener stops accepting and starts draining, pending
+ *    agent-readiness waits resolve;
+ * 2. **cancel in-flight pipeline operations** (at most `budget.pipelineMs`),
+ *    which may otherwise still be installing instrumentation or writing the
+ *    store — an install still running would make its session's cleanup refuse;
+ * 3. **end the live sessions** ({@link endLiveSessions}) with everything left
+ *    but the two reserves — while the sockets that carry the disarming
+ *    configurations and `cleanup.completed` are still open, the dev servers
+ *    whose preload is disarmed are still running and the cleanup runner is
+ *    still live. Skipped for `liveSessions: 'retain'` and for a start that was
+ *    refused before serving;
+ * 4. **stop the cleanup runner**: a pass abandoned in step 3 stops before its
+ *    next record, and the durable journal leaves the rest to the next start;
+ * 5. **stop the dev servers this service launched**, which revokes their scoped
+ *    `server-agent` credentials, from a slice that includes
+ *    `budget.launcherReserveMs` — no earlier step can have spent it — and
+ *    reading the launcher's report, so a dev server that outlived its
+ *    termination is named rather than counted as stopped. Should the
+ *    launcher still not settle, the outcome is unconfirmed and the
+ *    server-agent credentials of every project it had launched are revoked
+ *    here, before the store closes, so no launched child's credential
+ *    survives the stop (AAP 0.5.6);
+ * 6. **flush the live tail**, close every WebSocket with the going-away code
+ *    and wait for the HTTP listener, from `budget.finalReserveMs`;
+ * 7. release the in-memory subsystems, the client registry and the access
+ *    boundary;
+ * 8. **checkpoint the write-ahead log and close the database** — always, and
+ *    last, so nothing above writes to a closed store.
+ *
+ * Every step timer is `unref`'d so that it never keeps a *finished* process
+ * alive. The sequence itself must keep it alive, though: once the listener and
+ * the sockets have closed, a step waiting on a promise that nothing references
+ * would otherwise let Node exit mid-sequence, skipping every later step — the
+ * store's close included. A **referenced** watchdog timer therefore holds the
+ * event loop open from the first step until the store is closed, and at most
+ * {@link SHUTDOWN_WATCHDOG_MARGIN_MS} past the deadline.
+ *
+ * Exported for `main.test.ts`, which drives it with stand-ins that hang, in
+ * this process and in a child process that receives no other handle.
+ *
+ * @param parts What the start acquired.
+ * @param loggers The service's loggers.
+ * @param options What happens to the live sessions, the budget and the clock.
+ * @returns What became of the launched dev servers, for the shutdown's final
+ * record.
  */
-async function releaseParts(parts: ServiceParts, loggers: ServiceLoggers): Promise<void> {
+export async function releaseParts(
+  parts: ServiceParts,
+  loggers: ServiceLoggers,
+  options: ReleasePartsOptions = {},
+): Promise<DevServerRelease> {
+  const budget = options.budget ?? SHUTDOWN_BUDGET;
+  const watchdog = setTimeout(() => {
+    loggers.service.warn(
+      'the shutdown watchdog released the event loop before the sequence ended',
+      {
+        deadlineMs: budget.totalMs,
+      },
+    );
+  }, budget.totalMs + SHUTDOWN_WATCHDOG_MARGIN_MS);
+  try {
+    return await runReleaseSequence(parts, loggers, options, budget);
+  } finally {
+    clearTimeout(watchdog);
+  }
+}
+
+/** The eight steps of {@link releaseParts}, under the watchdog it holds. */
+async function runReleaseSequence(
+  parts: ServiceParts,
+  loggers: ServiceLoggers,
+  options: ReleasePartsOptions,
+  budget: ShutdownBudget,
+): Promise<DevServerRelease> {
   const log = loggers.service;
+  const clock = options.clock ?? monotonicNow;
+  const startedAt = clock();
+  const deadline = createShutdownDeadline(budget.totalMs, clock);
+  const beforeLauncher = budget.launcherReserveMs + budget.finalReserveMs;
   const {
     store,
     auth,
@@ -1457,6 +2807,7 @@ async function releaseParts(parts: ServiceParts, loggers: ServiceLoggers): Promi
     http,
     ws,
     server,
+    liveSessions,
   } = parts;
 
   // 1 — stop accepting.
@@ -1473,36 +2824,85 @@ async function releaseParts(parts: ServiceParts, loggers: ServiceLoggers): Promi
     });
   }
 
-  // 2 — cleanup and pipeline work in flight.
+  // 2 — pipeline work in flight.
+  if (orchestrator !== undefined) {
+    await settleWithin(
+      () => orchestrator.dispose(),
+      deadline.allowance(beforeLauncher, budget.pipelineMs),
+      'pipeline',
+      log,
+    );
+  }
+
+  // 3 — the live sessions, while everything their cleanup needs still runs.
+  if (liveSessions !== undefined) {
+    if ((options.liveSessions ?? 'end') === 'end') {
+      // `endLiveSessions` enforces `slice` itself and reports what it left; the
+      // outer bound is only the backstop for a journal read that never answers.
+      const slice = deadline.allowance(beforeLauncher);
+      await settleWithin(
+        () => endLiveSessions(liveSessions, { timeoutMs: slice, logger: log, clock }),
+        slice + LIVE_SESSIONS_BACKSTOP_MARGIN_MS,
+        'live-sessions',
+        log,
+      );
+    } else {
+      log.info(
+        'live sessions are retained as they are; the next start reconciles their modification journal',
+      );
+    }
+  }
+
+  // 4 — the cleanup runner.
   if (cleanup !== undefined) {
     releaseQuietly('session-cleanup', log, () => {
       cleanup.dispose();
     });
   }
-  if (orchestrator !== undefined) {
-    await settleWithin(orchestrator.dispose(), SHUTDOWN_STEP_TIMEOUT_MS, 'pipeline', log);
-  }
 
-  // 3 — launched dev servers and their credentials.
+  // 5 — launched dev servers and their credentials. The report is read, not
+  // discarded: a dev server still running is named, and a step that failed
+  // or was abandoned leaves the outcome unconfirmed rather than clean.
+  let devServers: DevServerRelease = DEV_SERVERS_STOPPED;
   if (launcher !== undefined) {
-    await settleWithin(launcher.dispose(), SHUTDOWN_STEP_TIMEOUT_MS, 'dev-servers', log);
+    const launched = launchedProjectRoots(launcher, log);
+    const disposed = await settleWithin(
+      () => launcher.dispose(),
+      deadline.allowance(budget.finalReserveMs),
+      'dev-servers',
+      log,
+    );
+    if (disposed.kind === 'settled') {
+      const pids = reportDevServerSurvivors(disposed.value, log);
+      devServers = pids.length === 0 ? DEV_SERVERS_STOPPED : { kind: 'running', pids };
+    } else {
+      devServers = { kind: 'unconfirmed' };
+      if (auth !== undefined) {
+        revokeLaunchedCredentials(auth, launched, log);
+      }
+    }
   }
 
-  // 4 — the live tail, the sockets, the listener.
+  // 6 — the live tail, the sockets, the listener.
   if (liveTail !== undefined) {
-    await settleWithin(liveTail.flush(), SHUTDOWN_STEP_TIMEOUT_MS, 'live-tail', log);
+    await settleWithin(() => liveTail.flush(), deadline.allowance(0), 'live-tail', log);
   }
   if (ws !== undefined) {
-    await settleWithin(ws.close(), SHUTDOWN_STEP_TIMEOUT_MS, 'websockets', log);
+    await settleWithin(() => ws.close(), deadline.allowance(0), 'websockets', log);
   }
-  await settleWithin(serverClosed, SHUTDOWN_STEP_TIMEOUT_MS, 'http-server', log);
+  await settleWithin(() => serverClosed, deadline.allowance(0), 'http-server', log);
 
-  // 5 — in-memory subsystems.
+  // 7 — in-memory subsystems.
   if (instrumentation !== undefined) {
-    await settleWithin(instrumentation.dispose(), SHUTDOWN_STEP_TIMEOUT_MS, 'instrumentation', log);
+    await settleWithin(
+      () => instrumentation.dispose(),
+      deadline.allowance(0),
+      'instrumentation',
+      log,
+    );
   }
   if (watcher !== undefined) {
-    await settleWithin(watcher.dispose(), SHUTDOWN_STEP_TIMEOUT_MS, 'watcher', log);
+    await settleWithin(() => watcher.dispose(), deadline.allowance(0), 'watcher', log);
   }
   if (liveTail !== undefined) {
     releaseQuietly('live-tail', log, () => {
@@ -1525,12 +2925,33 @@ async function releaseParts(parts: ServiceParts, loggers: ServiceLoggers): Promi
     });
   }
 
-  // 6 — the store, last.
+  // 8 — the store, last.
   if (store !== undefined) {
     releaseQuietly('store', log, () => {
       store.close();
     });
   }
+
+  const elapsedMs = Math.round(clock() - startedAt);
+  const fields = { elapsedMs, deadlineMs: budget.totalMs };
+  if (elapsedMs > budget.totalMs) {
+    log.warn('the shutdown sequence overran its deadline', fields);
+  } else {
+    log.debug('the shutdown sequence finished within its deadline', fields);
+  }
+  return devServers;
+}
+
+/** Options for {@link releaseParts}. */
+export interface ReleasePartsOptions {
+  /** What happens to the live sessions. Defaults to `end`. */
+  readonly liveSessions?: LiveSessionDisposition | undefined;
+
+  /** The time budget. Defaults to {@link SHUTDOWN_BUDGET}. */
+  readonly budget?: ShutdownBudget | undefined;
+
+  /** The monotonic clock the deadline is measured on. Defaults to `performance.now`. */
+  readonly clock?: (() => number) | undefined;
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -1583,8 +3004,10 @@ export async function startService(
   const resolved = loaded.value;
 
   // 2 — logging. The configuration is logged once, through its credential-free
-  // view, on the root (its fields carry their own `subsystem`).
-  const root = options.logger ?? createServiceLogger(resolved, options.loggerOptions);
+  // view, on the root (its fields carry their own `subsystem`). An injected
+  // logger is guarded like the built one, so no log call on a shutdown or
+  // failure path of this file can throw and skip the step after it.
+  const root = guardLogger(options.logger ?? createServiceLogger(resolved, options.loggerOptions));
   const loggers: ServiceLoggers = {
     root,
     service: subsystemLogger(root, SUBSYSTEM_SERVICE),
@@ -1599,13 +3022,19 @@ export async function startService(
   // 3 — the state tree, before anything writes into it.
   const tree = prepareStateTree(config);
   if (isErr(tree)) {
-    loggers.service.error(tree.error.message, errorFields(tree.error));
+    loggers.service.error(STARTUP_REFUSED_MESSAGE, {
+      step: 'state-tree' satisfies StartupStep,
+      ...errorFields(tree.error),
+    });
     return tree;
   }
 
   const parts: ServiceParts = {};
-  const refuse = async (error: DebuggenError): Promise<Result<never, DebuggenError>> => {
-    loggers.service.error(error.message, errorFields(error));
+  const refuse = async (
+    step: StartupStep,
+    error: DebuggenError,
+  ): Promise<Result<never, DebuggenError>> => {
+    loggers.service.error(STARTUP_REFUSED_MESSAGE, { step, ...errorFields(error) });
     await releaseParts(parts, loggers);
     return err(error);
   };
@@ -1613,7 +3042,7 @@ export async function startService(
   // 4 — the session store and its repositories.
   const opened = openStore({ config, logger: root, inlineDdl: options.inlineSchemaSql });
   if (isErr(opened)) {
-    return refuse(opened.error);
+    return refuse('store', opened.error);
   }
   const store = opened.value;
   parts.store = store;
@@ -1639,22 +3068,39 @@ export async function startService(
     store,
     config,
     logger: root,
-    revoker: clients,
+    revoker: connectionRevokerOf(clients),
     ...clock,
   });
   if (isErr(authCreated)) {
-    return refuse(authCreated.error);
+    return refuse('access-boundary', authCreated.error);
   }
   const auth = authCreated.value;
   parts.auth = auth;
   const editor = auth.ensureEditorCredential();
   if (isErr(editor)) {
-    return refuse(editor.error);
+    return refuse('editor-credential', editor.error);
   }
   loggers.service.info('editor credential ready', {
     authFilePath: config.authFilePath,
     created: editor.value.created,
   });
+
+  // A dev server a crashed service launched is supervised by nothing now, and
+  // no retry of a revocation that service could not finish survives it: revoke
+  // those leases before serving (AAP 0.5.6). A lease whose holder still runs
+  // is left to that holder. Each lease row is the durable record of its own
+  // pending revocation, so a failure here fails the start, like the journal
+  // reconciliation below: serving would leave a credential authenticating that
+  // no process supervises, and the next start tries again.
+  const orphanedLeases = auth.revokeOrphanedServerAgentLeases();
+  if (isErr(orphanedLeases)) {
+    return refuse('server-agent-leases', orphanedLeases.error);
+  }
+  if (orphanedLeases.value > 0) {
+    loggers.service.info('revoked leftover dev-server credential leases', {
+      revoked: orphanedLeases.value,
+    });
+  }
 
   // 6 — crash recovery, before anything can serve: every open journal record,
   // whatever its session's status. A journal that cannot be read at all fails
@@ -1668,7 +3114,7 @@ export async function startService(
     ...clock,
   });
   if (isErr(reconciled)) {
-    return refuse(reconciled.error);
+    return refuse('reconciliation', reconciled.error);
   }
   if (reconciled.value.conflicts > 0 || reconciled.value.unresolved > 0) {
     loggers.service.warn('start-up reconciliation left files for the developer to resolve', {
@@ -1680,8 +3126,10 @@ export async function startService(
   }
 
   // 7 — retention. Housekeeping, not correctness: a sweep that cannot run is
-  // logged and the start continues, and the next start sweeps again.
-  const swept = await runRetention({
+  // logged and the start continues, and the next start sweeps again. The same
+  // dependencies serve `session.purge` (`debuggen.purgeSessions`) below, so the
+  // start-up pass and the on-demand one apply one rule set.
+  const retentionDeps: RetentionDeps = {
     store,
     sessions: repos.sessions,
     telemetry: repos.telemetry,
@@ -1690,13 +3138,14 @@ export async function startService(
     config,
     logger: root,
     ...clock,
-  });
+  };
+  const swept = await runRetention(retentionDeps);
   let retention: RetentionReport | undefined;
   if (isErr(swept)) {
-    loggers.service.error('the retention sweep could not run; it runs again on the next start', {
-      ...errorFields(swept.error),
-      reason: swept.error.message,
-    });
+    loggers.service.error(
+      'the retention sweep could not run; it runs again on the next start',
+      errorFields(swept.error),
+    );
   } else {
     retention = swept.value;
     if (swept.value.errors.length > 0) {
@@ -1717,7 +3166,7 @@ export async function startService(
       logger: root,
     });
     if (isErr(created)) {
-      return refuse(created.error);
+      return refuse('model-provider', created.error);
     }
     provider = created.value;
   } else {
@@ -1728,7 +3177,7 @@ export async function startService(
   const promptLoader = createPromptLoader({ promptsDir: config.promptsDir, env, logger: root });
   const prompts = validatePromptTree(promptLoader);
   if (isErr(prompts)) {
-    return refuse(prompts.error);
+    return refuse('prompts', prompts.error);
   }
   loggers.service.info('model provider and prompts ready', {
     provider: provider.id,
@@ -1749,7 +3198,14 @@ export async function startService(
   });
 
   // Telemetry: correlation, the live tail and ingest.
-  const correlator = createTraceCorrelator({ telemetry: repos.telemetry, logger: root });
+  // The trace cache is capped by entries and by total nodes (≈1 KiB each, so ≈50 MiB at most).
+  const correlator = createTraceCorrelator({
+    telemetry: repos.telemetry,
+    logger: root,
+    cacheLimit: TRACE_CACHE_LIMIT,
+    cacheNodeBudget: TRACE_CACHE_NODE_BUDGET,
+    maxCachedTreeNodes: TRACE_CACHE_MAX_TREE_NODES,
+  });
   parts.correlator = correlator;
   const liveTail = createLiveTail({ broadcaster: clients, logger: root, ...clock });
   parts.liveTail = liveTail;
@@ -1768,12 +3224,16 @@ export async function startService(
     ...clock,
   });
   parts.watcher = watcher;
-  const launcher = createDevServerLauncher({
+  const launcher = (options.createLauncher ?? createDevServerLauncher)({
     config,
     logger: root,
-    credentials: credentialIssuerOf(auth),
+    credentials: serverAgentCredentialIssuer(auth),
+    // Preload evidence is matched to each child's own credential, never to
+    // the project (a plain server on another port would pass that test).
+    serverAgentConnections: serverAgentConnectionsOf(clients),
     parentEnv: env,
     detectDeps: { serverAgents },
+    stopGraceMs: DEV_SERVER_STOP_GRACE_MS,
     ...clock,
   });
   parts.launcher = launcher;
@@ -1784,6 +3244,7 @@ export async function startService(
     modifications: repos.modifications,
     progress,
     broadcaster: clients,
+    agentChannel: clients,
     serverAgentChannel: clients,
     watcher,
     agents: ledger,
@@ -1798,7 +3259,26 @@ export async function startService(
   });
   parts.instrumentation = instrumentation;
 
-  // Cleanup, then the sessions it serves.
+  // Cleanup, then the sessions it serves. A cleanup verdict upgraded after the
+  // pass — its runtime hooks confirmed dormant once a producer reconnected —
+  // is recorded through the manager, the single emitter of
+  // `cleanup.completed`; the manager is created after the runner, so the sink
+  // is late-bound, and nothing can confirm dormancy before `listen`.
+  const outcomeSink: CleanupOutcomeSink = {
+    recordCleanupOutcome: (sessionId, outcome) =>
+      managerRef.current === undefined
+        ? err(
+            new DebuggenError(
+              'SESSION_INVALID_STATE',
+              'The cleanup verdict arrived before the session manager was ready.',
+              {
+                hint: 'The session keeps its earlier cleanup verdict; end the session again to re-run cleanup.',
+                details: { sessionId },
+              },
+            ),
+          )
+        : managerRef.current.recordCleanupOutcome(sessionId, outcome),
+  };
   const cleanup = createSessionCleanup({
     modifications: repos.modifications,
     sessions: repos.sessions,
@@ -1806,6 +3286,7 @@ export async function startService(
     instrumentation,
     watcher,
     progress,
+    outcomeSink,
     logger: root,
     ...clock,
   });
@@ -1815,6 +3296,8 @@ export async function startService(
     broadcaster: clients,
     progress,
     cleanup,
+    // Ending a session stops the dev servers launched for it (AAP 0.7.1 Group 2).
+    devServers: launcher,
     config,
     logger: root,
     ...clock,
@@ -1822,7 +3305,63 @@ export async function startService(
   managerRef.current = sessionManager;
   const hydrated = await sessionManager.hydrate();
   if (isErr(hydrated)) {
-    return refuse(hydrated.error);
+    return refuse('session-hydration', hydrated.error);
+  }
+  // The cleanup reports the previous service could not complete — a stopped
+  // dev server whose credential still authenticated when it stopped — are
+  // settled now that every lease it held is revoked (step 5) and the journal
+  // is reconciled (step 6). A report that cannot be settled stays `partial`,
+  // truthfully; a store error fails the start like the passes before it.
+  const settledCleanups = await sessionManager.settleIncompleteCleanups();
+  if (isErr(settledCleanups)) {
+    return refuse('cleanup-settlement', settledCleanups.error);
+  }
+  if (settledCleanups.value > 0) {
+    loggers.service.info('settled the partial cleanup reports of ended sessions', {
+      settled: settledCleanups.value,
+    });
+  }
+  // The second half of crash recovery, before the first client is served: a
+  // session left `instrumenting` or `capturing` by the previous process, or
+  // `ready` with patches the reconciliation above removed, is failed. A failed
+  // capture's producers are owed their dormant configuration until they
+  // reconnect, and its session's cleanup is held at `partial` by the runner
+  // until they are confirmed dormant.
+  const settled = await settleInterruptedSessions(
+    {
+      sessions: repos.sessions,
+      manager: sessionManager,
+      instrumentation,
+      verdicts: cleanup,
+      logger: root,
+      ...clock,
+    },
+    reconciled.value,
+  );
+  if (isErr(settled)) {
+    return refuse('interrupted-sessions', settled.error);
+  }
+  const interruptedSessions = settled.value;
+  // Fail closed: a session that could not be failed would be served as still
+  // capturing what the restart ended, and one whose verdict could not be held
+  // would be served claiming a clean cleanup. The next start settles them again.
+  const [unsettled] = interruptedSessions.errors;
+  if (unsettled !== undefined) {
+    return refuse(
+      'interrupted-sessions',
+      new DebuggenError(
+        unsettled.code,
+        'The sessions the previous run left in progress could not be settled, so the Debug Generator service did not start.',
+        {
+          hint: 'Check that the Debug Generator state directory is writable and not full, then start the service again.',
+          details: {
+            reason: 'interrupted-sessions-unsettled',
+            sessionId: unsettled.sessionId,
+            unsettled: interruptedSessions.errors.length,
+          },
+        },
+      ),
+    );
   }
   const reopener = createSessionReopener({
     sessions: repos.sessions,
@@ -1850,9 +3389,16 @@ export async function startService(
     sources: createIngestSourceLocator({
       sessions: repos.sessions,
       codeIndex,
-      modifications: repos.modifications,
+      // Metadata first: a patch stamp's diff is read only for a file the
+      // metadata found in force, and only that file's records.
+      modifications: {
+        listBySession: (sessionId) => repos.modifications.listCorroborationsBySession(sessionId),
+        listPatchEvidence: (sessionId, file) =>
+          repos.modifications.listPatchEvidenceBySessionFile(sessionId, file),
+      },
       events: repos.telemetry,
       logger: root,
+      ...clock,
     }),
     logger: root,
     ...clock,
@@ -1919,6 +3465,7 @@ export async function startService(
     adapters,
     progress,
     observe,
+    serverAgentsAt: (devServerUrl) => serverAgentsAt(clients, launcher, devServerUrl),
     logger: root,
     now,
   });
@@ -1941,7 +3488,15 @@ export async function startService(
     broadcaster: clients,
     adapters,
     observeReadiness: (request) =>
-      collectObservedReadiness({ ...observe, logger: root, now }, request),
+      collectObservedReadiness(
+        {
+          ...observe,
+          serverAgents: serverAgentsAt(clients, launcher, request.devServerUrl),
+          logger: root,
+          now,
+        },
+        request,
+      ),
     codeIndex,
     ...clock,
   });
@@ -1959,7 +3514,37 @@ export async function startService(
     panels: repos.panels,
     modifications: repos.modifications,
     bindings: clients,
-    devServers: devServerLookupFromLaunches(launcher),
+    // A new session's dev server: one the launcher started, else the URL the
+    // editor sent once a loopback probe got an answer (AAP 0.2.3).
+    devServers: devServerLookupFromLaunches(launcher, {
+      probe: (url: string) => probeDevServer(url, { logger: root }),
+    }),
+    // `session.purge` (`debuggen.purgeSessions`): the start-up sweep's own
+    // dependencies, reported the way the start-up sweep is. The sweep logs its
+    // counts itself; a request that joins a running sweep shares its result.
+    // Unlike the start-up pass, this one runs beside a warm trace cache, so
+    // each purged session's cached trees are dropped as its rows are.
+    retention: {
+      purge: async () => {
+        const purged = await runRetention({
+          ...retentionDeps,
+          onSessionDeleted: (sessionId) => {
+            correlator.invalidate(sessionId);
+          },
+        });
+        if (isErr(purged)) {
+          loggers.service.error('the on-demand retention sweep could not run', {
+            ...errorFields(purged.error),
+            reason: purged.error.message,
+          });
+        } else if (purged.value.errors.length > 0) {
+          loggers.service.warn('the on-demand retention sweep left some items in place', {
+            issues: purged.value.errors.length,
+          });
+        }
+        return purged;
+      },
+    },
     resolver: panelData,
     ingest,
     launcher,
@@ -1967,7 +3552,7 @@ export async function startService(
     isPairingAvailable: () => clients.list({ kind: PAIRING_DISPLAY_KIND, online: true }).length > 0,
   });
   if (isErr(http)) {
-    return refuse(http.error);
+    return refuse('http', http.error);
   }
   parts.http = http.value;
 
@@ -1977,21 +3562,27 @@ export async function startService(
     manager: sessionManager,
     reopener,
     arming: instrumentation,
+    progress,
     logger: root,
     ...clock,
   });
   const ws = createWsServer({
     auth,
     clients,
-    binding: regatingBindingRoutes(binding, orchestrator, root),
+    binding: regatingBindingRoutes(
+      reconcilingBindingRoutes(binding, instrumentation, repos.sessions, root),
+      orchestrator,
+      root,
+    ),
     telemetry: http.value.telemetry,
     readiness: regatingReadinessPort(ledger, clients, orchestrator, root),
     targets: targetSelectionOf(sessionManager),
     sourceOpen,
+    producers: instrumentation,
     logger: root,
   });
   if (isErr(ws)) {
-    return refuse(ws.error);
+    return refuse('websocket', ws.error);
   }
   parts.ws = ws.value;
 
@@ -1999,18 +3590,26 @@ export async function startService(
   parts.server = server;
   const attached = ws.value.attach(server);
   if (isErr(attached)) {
-    return refuse(attached.error);
+    return refuse('websocket-attach', attached.error);
   }
   const listened = await listen(server, resolved);
   if (isErr(listened)) {
-    return refuse(listened.error);
+    return refuse('listen', listened.error);
   }
   bound.port = listened.value;
   server.on('error', (cause: unknown) => {
     loggers.server.error('the HTTP server reported an error after start-up', {
-      reason: reasonOf(cause),
+      ...describeException(cause),
     });
   });
+  // Only now does a stop end live sessions: a start refused before this point
+  // served no client, so it leaves every session to whoever serves them next.
+  parts.liveSessions = {
+    manager: sessionManager,
+    sessions: repos.sessions,
+    modifications: repos.modifications,
+    instrumentation,
+  };
 
   // 12 — serving. `GET /health` answers from here on.
   return ok(
@@ -2026,6 +3625,7 @@ export async function startService(
       startup: {
         editorCredentialCreated: editor.value.created,
         reconciliation: reconciled.value,
+        interruptedSessions,
         retention,
       },
       parts,
@@ -2053,23 +3653,35 @@ interface ServiceHandleInput {
  * The shutdown is memoised in one promise, which makes
  * {@link ServiceHandle.close} idempotent under both signals, a suite's explicit
  * call and a crash handler at once: the first caller runs the sequence and every
- * other caller awaits it. The handle is frozen because it is shared with signal
- * handlers and must not be re-pointed by whoever holds it.
+ * other caller awaits it, so the first caller's options decide. The handle is
+ * frozen because it is shared with signal handlers and must not be re-pointed
+ * by whoever holds it.
  */
 function createServiceHandle(input: ServiceHandleInput): ServiceHandle {
   const { loggers, parts, url } = input;
   let closing: Promise<void> | undefined;
 
-  const shutdown = async (): Promise<void> => {
-    loggers.service.info('stopping the Debug Generator service', { url });
+  const shutdown = async (options: ServiceCloseOptions): Promise<void> => {
+    const liveSessions = options.liveSessions ?? 'end';
+    loggers.service.info('stopping the Debug Generator service', { url, liveSessions });
     try {
-      await releaseParts(parts, loggers);
-      loggers.service.info('the Debug Generator service has stopped', { url });
+      const devServers = await releaseParts(parts, loggers, { liveSessions });
+      // The final record does not call the stop clean while a launched dev
+      // server may still be running: it says which, or that it is unknown.
+      if (devServers.kind === 'stopped') {
+        loggers.service.info('the Debug Generator service has stopped', { url });
+      } else {
+        loggers.service.warn('the Debug Generator service has stopped', {
+          url,
+          devServers: devServers.kind,
+          ...(devServers.kind === 'running' ? { devServerPids: devServers.pids } : {}),
+        });
+      }
     } catch (cause) {
       // `releaseParts` guards every step; this keeps the memoised promise
       // resolvable even if a guard is ever bypassed, because a rejected
       // `closing` would make every later `close()` reject too.
-      loggers.service.error('the shutdown sequence failed', { reason: reasonOf(cause) });
+      loggers.service.error('the shutdown sequence failed', { ...describeException(cause) });
     }
   };
 
@@ -2084,8 +3696,8 @@ function createServiceHandle(input: ServiceHandleInput): ServiceHandle {
     manager: input.manager,
     auth: input.auth,
     startup: Object.freeze(input.startup),
-    close: (): Promise<void> => {
-      closing ??= shutdown();
+    close: (options: ServiceCloseOptions = {}): Promise<void> => {
+      closing ??= shutdown(options);
       return closing;
     },
   });
@@ -2099,9 +3711,11 @@ function createServiceHandle(input: ServiceHandleInput): ServiceHandle {
  * How long after a completed shutdown the process is ended explicitly if
  * something outside the service's control still holds the event loop open (a
  * third-party handle, a child that ignored every signal). `unref`'d, so a clean
- * stop exits on its own well before it fires.
+ * stop exits on its own well before it fires. Part of the service's lifetime
+ * after `SIGTERM`, so {@link SHUTDOWN_BUDGET} plus this value is what the
+ * managing processes' graces are checked against.
  */
-const EXIT_BACKSTOP_MS = 2_000;
+export const EXIT_BACKSTOP_MS = 500;
 
 /**
  * Writes a start-up failure to stderr in the form a developer reads in a
@@ -2110,11 +3724,39 @@ const EXIT_BACKSTOP_MS = 2_000;
  * stderr rather than the logger, because a failure may predate a usable
  * logger (a rejected `DEBUGGEN_LOG_LEVEL` is itself a configuration failure).
  * `details` are deliberately omitted: they are diagnostic context for the log.
+ *
+ * The message is printed only when it is product copy — a configuration
+ * refusal, a {@link wrapStartupFailure} sentence, a collaborator's own
+ * sentence. A failure that reached here through `DebuggenError.from` (a
+ * collaborator's catch-all, or this module's own last-resort `catch`) carries
+ * the wrapped exception's text instead, which may quote a path, an address or
+ * a statement, and the terminal, the VS Code output channel and Playwright's
+ * captured output all keep what is written here; so {@link carriesWrappedExceptionText}
+ * swaps it for {@link STARTUP_FAILURE_FALLBACK_MESSAGE} and a `cause:` line
+ * naming the wrapped value's closed class and code, and prints such a
+ * failure's hint only when {@link isProductAuthoredText} proves it, else
+ * {@link STARTUP_FAILURE_FALLBACK_HINT} (CWE-209).
  */
 function reportStartupFailure(error: DebuggenError): void {
-  const lines = [`debuggen: ${error.code}: ${error.message}`];
-  if (error.hint !== undefined) {
-    lines.push(`debuggen: hint: ${error.hint}`);
+  const wrapped = carriesWrappedExceptionText(error);
+  const lines = [
+    `debuggen: ${error.code}: ${wrapped ? STARTUP_FAILURE_FALLBACK_MESSAGE : error.message}`,
+  ];
+  if (wrapped) {
+    const cause = describeException(error.cause);
+    const causeCode = cause.errorCode === undefined ? '' : ` ${cause.errorCode}`;
+    lines.push(`debuggen: cause: ${cause.errorClass}${causeCode}`);
+  }
+  // A wrapped failure's hint is as untrusted as its message — `DebuggenError.from`
+  // salvages one from a branded foreign error — so it is printed only when it is
+  // proven product text; otherwise the fixed fallback hint is.
+  const hint = wrapped
+    ? isProductAuthoredText(error.hint)
+      ? error.hint
+      : STARTUP_FAILURE_FALLBACK_HINT
+    : error.hint;
+  if (hint !== undefined) {
+    lines.push(`debuggen: hint: ${hint}`);
   }
   process.stderr.write(`${lines.join('\n')}\n`);
 }
@@ -2122,13 +3764,18 @@ function reportStartupFailure(error: DebuggenError): void {
 /**
  * Wires the process's signals and crash handlers to one shutdown.
  *
- * - **SIGINT / SIGTERM** close the handle once. A repeated signal while the
- *   shutdown is running — Ctrl-C pressed twice — ends the process at once; the
- *   journal is durable, so the next start still restores every patched file.
+ * - **SIGINT / SIGTERM** close the handle once, ending every live session so
+ *   the developer's files are restored and the producers disarmed before the
+ *   process exits (AAP 0.5.1). A repeated signal while the shutdown is running
+ *   — Ctrl-C pressed twice — ends the process at once; the journal is durable,
+ *   so the next start still restores every patched file.
  * - **`uncaughtException` / `unhandledRejection`** are logged at `fatal`
  *   through the service's own logger, set exit code 1 and run the same
- *   shutdown, so a crash is never silent and never leaves a listening socket
- *   in a state nobody can reason about.
+ *   shutdown with `liveSessions: 'retain'`, so a crash is never silent and
+ *   never leaves a listening socket in a state nobody can reason about, while
+ *   the state that has just thrown does not drive writes into the developer's
+ *   tree — the next start's reconciliation restores those files from the
+ *   journal.
  *
  * `process.exitCode` is set rather than exiting at once, so stdout still flushes
  * the record that explains the exit; an `unref`'d backstop ends the process if
@@ -2138,13 +3785,13 @@ function installProcessHandlers(handle: ServiceHandle): void {
   const lifecycle = subsystemLogger(handle.logger, SUBSYSTEM_SERVICE);
   let stopping = false;
 
-  const stop = (reason: string, fields: LogFields): void => {
+  const stop = (reason: string, fields: LogFields, liveSessions: LiveSessionDisposition): void => {
     if (stopping) {
       return;
     }
     stopping = true;
     lifecycle.info(reason, fields);
-    void handle.close().then(() => {
+    void handle.close({ liveSessions }).then(() => {
       setTimeout(() => {
         lifecycle.warn('the process was still alive after shutdown; exiting', {
           backstopMs: EXIT_BACKSTOP_MS,
@@ -2160,18 +3807,20 @@ function installProcessHandlers(handle: ServiceHandle): void {
         lifecycle.warn('received a second shutdown signal; exiting without waiting', { signal });
         process.exit(process.exitCode ?? 1);
       }
-      stop('received a shutdown signal', { signal });
+      stop('received a shutdown signal', { signal }, 'end');
     });
   }
 
   const crash = (kind: string, cause: unknown): void => {
-    const error = DebuggenError.from(cause, 'INTERNAL');
+    // A value that reached the process boundary is by definition one no step
+    // anticipated, so none of its own text is known to be safe: the record
+    // carries its product code and its closed class only.
     lifecycle.fatal(`${kind} reached the process boundary`, {
-      ...errorFields(error),
-      reason: error.message,
+      code: DebuggenError.from(cause, 'INTERNAL').code,
+      ...describeException(cause),
     });
     process.exitCode = 1;
-    stop(`stopping after ${kind}`, {});
+    stop(`stopping after ${kind}`, {}, 'retain');
   };
 
   process.on('uncaughtException', (cause: unknown) => {
@@ -2201,7 +3850,9 @@ function installProcessHandlers(handle: ServiceHandle): void {
 export async function main(): Promise<void> {
   loadDotenvFile({ quiet: true });
 
-  const started = await startService({ env: process.env });
+  // The DDL the editor extension's bundle embeds (none in any other build), so
+  // the packaged service migrates its store without a `.sql` file on disk.
+  const started = await startService({ env: process.env, inlineSchemaSql: embeddedSchemaSql() });
   if (isErr(started)) {
     reportStartupFailure(started.error);
     process.exitCode = 1;

@@ -298,10 +298,48 @@ export function normalizePairingRefusal(error: DebuggenError): DebuggenError {
 
 /** Why a request body was refused before it reached the access boundary. */
 interface BodyRejection {
-  /** `413` for an oversized body, `400` for one that is unreadable, not JSON or off-schema. */
-  readonly status: 400 | 413;
+  /**
+   * `413` for an oversized body, `408` for one that did not arrive in time,
+   * `400` for one that is unreadable, not JSON or off-schema.
+   */
+  readonly status: 400 | 408 | 413;
   /** The refusal; its message never quotes the body. */
   readonly error: DebuggenError;
+}
+
+/** The `details` key `../http.ts`'s request-body guard records its refusal reason under. */
+const GUARD_REASON_DETAIL_KEY = 'reason';
+
+/**
+ * The `details.reason` values of the refusal `../http.ts`'s request-body guard
+ * errors a body stream with — what `c.req.text()` rejects with when the body
+ * crosses {@link MAX_PAIR_REQUEST_BODY_BYTES} while it is read, or does not
+ * arrive within the time ceiling. Stated here because a route module never
+ * imports `../http.ts` (which imports it); they must equal that module's
+ * `REQUEST_BODY_REFUSAL_REASONS`, and `../http-body-guard.test.ts` holds them to it.
+ */
+const GUARD_BODY_TOO_LARGE_REASON = 'body-too-large';
+
+/** See {@link GUARD_BODY_TOO_LARGE_REASON}. */
+const GUARD_BODY_READ_TIMEOUT_REASON = 'body-read-timeout';
+
+/**
+ * Which ceiling `../http.ts`'s request-body guard refused a body at, read
+ * from what a body read rejected with.
+ *
+ * @param caught The rejection of `c.req.text()`.
+ * @returns The guard's reason, or `undefined` for any other read failure.
+ */
+function guardRefusalOf(
+  caught: unknown,
+): typeof GUARD_BODY_TOO_LARGE_REASON | typeof GUARD_BODY_READ_TIMEOUT_REASON | undefined {
+  if (!DebuggenError.is(caught)) {
+    return undefined;
+  }
+  const reason = caught.details?.[GUARD_REASON_DETAIL_KEY];
+  return reason === GUARD_BODY_TOO_LARGE_REASON || reason === GUARD_BODY_READ_TIMEOUT_REASON
+    ? reason
+    : undefined;
 }
 
 /** The refusal of a body larger than {@link MAX_PAIR_REQUEST_BODY_BYTES}. */
@@ -314,6 +352,21 @@ function bodyTooLarge(operation: PairOperation): BodyRejection {
       {
         hint: `Send a JSON body of at most ${String(MAX_PAIR_REQUEST_BODY_BYTES)} bytes.`,
         details: { operation, maxBytes: MAX_PAIR_REQUEST_BODY_BYTES },
+      },
+    ),
+  };
+}
+
+/** The refusal of a body that did not arrive within `../http.ts`'s time ceiling. */
+function bodyReadTimedOut(operation: PairOperation): BodyRejection {
+  return {
+    status: 408,
+    error: new DebuggenError(
+      'PROTOCOL_INVALID_MESSAGE',
+      `The ${operation} request body did not arrive in time.`,
+      {
+        hint: 'Send the whole JSON body at once, then wait for the reply.',
+        details: { operation, problem: GUARD_BODY_READ_TIMEOUT_REASON },
       },
     ),
   };
@@ -338,12 +391,17 @@ function bodyNotJson(operation: PairOperation, problem: 'unreadable' | 'not-json
  * Reads a request body as JSON, bounded by {@link MAX_PAIR_REQUEST_BODY_BYTES}.
  *
  * A declared `Content-Length` above the bound is refused before anything is
- * read; the text actually read is measured again, which covers a chunked body
- * that declared no length. The text is read through hono's cached accessor, so
- * a body a middleware already consumed is still available here. An empty body
- * reads as `undefined`, which protocol's request schema then refuses for both
- * operations. `JSON.parse`'s own error is discarded, because Node's message for
- * it quotes the offending input.
+ * read. A body that declares no length (a chunked upload to this
+ * unauthenticated route) is bounded while it is read: `../http.ts`'s
+ * request-body guard errors the stream at the same bound — and at its time
+ * ceiling — so `c.req.text()` rejects with the guard's refusal instead of
+ * buffering an unbounded body, and that rejection is answered `413` or `408`
+ * here. The text read is measured once more, which keeps the bound for a
+ * handler composed without the guard. The text is read through hono's cached
+ * accessor, so a body a middleware already consumed is still available here.
+ * An empty body reads as `undefined`, which protocol's request schema then
+ * refuses for both operations. `JSON.parse`'s own error is discarded, because
+ * Node's message for it quotes the offending input.
  *
  * @param c The request context.
  * @param operation The operation the body belongs to, for the refusal message.
@@ -364,7 +422,14 @@ async function readJsonBody(
   let text: string;
   try {
     text = await c.req.text();
-  } catch {
+  } catch (caught) {
+    const refusal = guardRefusalOf(caught);
+    if (refusal === GUARD_BODY_TOO_LARGE_REASON) {
+      return err(bodyTooLarge(operation));
+    }
+    if (refusal === GUARD_BODY_READ_TIMEOUT_REASON) {
+      return err(bodyReadTimedOut(operation));
+    }
     return err(bodyNotJson(operation, 'unreadable'));
   }
   if (Buffer.byteLength(text, 'utf8') > MAX_PAIR_REQUEST_BODY_BYTES) {
@@ -472,7 +537,8 @@ function answerResponseDrift(c: Context<ServerEnv>): Response {
  * | success | `200 { code, expiresAt }` | `200 { token }` |
  * | no resolved principal | `401` (`missing-credential`) | — |
  * | not the editor role | `403` (`role-not-permitted`) | — |
- * | oversized body | `413` | `413` |
+ * | oversized body, declared or as it arrives | `413` | `413` |
+ * | body not arrived within `../http.ts`'s time ceiling | `408` | `408` |
  * | unreadable / non-JSON / off-schema body | `400` | `400` |
  * | origin not `chrome-extension://<id>` | — | `403` (auth.ts's verdict) |
  * | wrong, used or expired code | — | `401` uniform `PAIRING_INVALID` |

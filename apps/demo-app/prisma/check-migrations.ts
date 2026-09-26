@@ -4,11 +4,38 @@
  * `prisma/schema.prisma` describes.
  *
  * It needs no database. The schema side is Prisma's own rendering of the schema
- * from nothing - `prisma migrate diff --from-empty --to-schema ... --script`,
- * piped in on standard input - and the migrations side is the `migration.sql`
- * of every directory under `prisma/migrations`, read in the order Prisma
- * applies them. Neither side is executed: each is reduced to the set of schema
- * objects it creates, and the two sets must be equal.
+ * from nothing - `prisma migrate diff --from-empty --to-schema
+ * prisma/schema.prisma --script`, which this check runs itself - and the
+ * migrations side is the `migration.sql` of every directory under
+ * `prisma/migrations`, read in the order Prisma applies them. Neither side is
+ * executed: each is reduced to the set of schema objects it creates, and the
+ * two sets must be equal.
+ *
+ * **How the schema is rendered.** The check starts the Prisma CLI as a child
+ * process and reads its standard output, so the package script is a plain
+ * `tsx prisma/check-migrations.ts` with no shell syntax in it. Two details of
+ * that child are deliberate:
+ *
+ *  - It is `node <prisma>/build/index.js migrate diff ...` - the running Node
+ *    binary (`process.execPath`) given the CLI entry point that `bin.prisma`
+ *    names, resolved from this workspace's dependencies - and never a shell or
+ *    the `node_modules/.bin/prisma` shim. A shell is what made the former
+ *    `DATABASE_URL= prisma ... | tsx ...` script POSIX-only: `cmd.exe` rejects
+ *    the `VAR= command` prefix, and on Windows the `.bin` shim is a `.cmd` file
+ *    that cannot be spawned without one. Spawning Node directly behaves the same
+ *    on every platform, and keeps the CLI's argv as `[node,
+ *    .../prisma/build/index.js, 'migrate', 'diff', ...]`, the positional shape
+ *    `invokedCommandName()` in prisma.config.ts reads.
+ *  - Its environment is this one with `DATABASE_URL` present and empty. The
+ *    rendering must never depend on a live database, and blanking the variable
+ *    (rather than deleting it) is what guarantees that: prisma.config.ts loads
+ *    the git-ignored `.env` with `process.loadEnvFile()`, which leaves a
+ *    variable that is already present untouched, and it treats a blank value as
+ *    absent, so `migrate diff` is given its credential-free offline dialect
+ *    placeholder whatever `.env` or the calling shell holds.
+ *
+ * Prisma's own diagnostics reach the terminal unchanged: the child's standard
+ * error is this process's standard error.
  *
  * **Why a reduction rather than a text comparison.** While the history was one
  * initial migration, that migration and the rendering were the same text, and
@@ -33,16 +60,61 @@
  * `pnpm migrate`.
  *
  * Exits `0` when the migrations reproduce the schema, `1` when they do not (the
- * differing facts are printed on both sides), and `2` when nothing was rendered
- * or a statement could not be replayed.
+ * differing facts are printed on both sides), and `2` when the rendering failed
+ * or was empty, or a statement could not be replayed.
+ *
+ * It runs from any working directory - `pnpm run check:migration` inside
+ * apps/demo-app, `pnpm --filter @debuggen/demo-app check:migration` from the
+ * repository root, or `tsx apps/demo-app/prisma/check-migrations.ts` - because
+ * every path it uses is resolved against this file rather than against
+ * `process.cwd()`.
  */
 
 import { Buffer } from 'node:buffer';
+import { spawn } from 'node:child_process';
 import { readFileSync, readdirSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import process from 'node:process';
+import { fileURLToPath } from 'node:url';
 
 /** Where the committed history lives, beside this file. */
 const MIGRATIONS = new URL('./migrations/', import.meta.url);
+
+/**
+ * The workspace directory (apps/demo-app), which the Prisma CLI is started in:
+ * it finds prisma.config.ts there, and resolves the schema path below against
+ * it.
+ */
+const WORKSPACE = fileURLToPath(new URL('../', import.meta.url));
+
+/**
+ * The Prisma CLI entry point - the file `bin.prisma` of prisma 7.10.0 names, and
+ * an exported subpath of the package - as a specifier resolved from this file,
+ * so the CLI that runs is the one this workspace depends on.
+ */
+const PRISMA_CLI = 'prisma/build/index.js';
+
+/**
+ * The CLI arguments that render the schema from nothing, as the SQL script that
+ * would create it on an empty database.
+ */
+const RENDER_ARGUMENTS: readonly string[] = [
+  'migrate',
+  'diff',
+  '--from-empty',
+  '--to-schema',
+  'prisma/schema.prisma',
+  '--script',
+];
+
+/** The rendering command as a developer would type it, for messages. */
+const RENDER_COMMAND = `prisma ${RENDER_ARGUMENTS.join(' ')}`;
+
+/**
+ * The variable blanked in the child's environment so that the rendering never
+ * reaches a database; see "How the schema is rendered" above.
+ */
+const DATABASE_URL = 'DATABASE_URL';
 
 /** The file every migration directory holds. */
 const SCRIPT = 'migration.sql';
@@ -51,8 +123,8 @@ const SCRIPT = 'migration.sql';
 const DRIFT = 1;
 
 /**
- * Exit code for input this check cannot judge: nothing rendered, a statement it
- * cannot replay, or a history it could not read.
+ * Exit code for input this check cannot judge: a rendering that failed or came
+ * back empty, a statement it cannot replay, or a history it could not read.
  */
 const UNUSABLE = 2;
 
@@ -237,34 +309,79 @@ function surplus(from: Map<string, number>, to: Map<string, number>): string[] {
 }
 
 /**
- * Everything written to standard input, once the writer has closed it.
+ * The schema rendered from nothing: everything {@link RENDER_COMMAND} writes to
+ * standard output, once it has exited successfully.
  *
- * Read as a stream rather than with a synchronous read of descriptor `0`: the
- * rendering arrives through a pipe from a process that is still starting, and a
- * synchronous read of a pipe with nothing in it yet fails instead of waiting.
+ * The child is `process.execPath` running the resolved {@link PRISMA_CLI} in
+ * {@link WORKSPACE}, with `DATABASE_URL` present and blank, no standard input,
+ * and this process's standard error - see "How the schema is rendered" above
+ * for why each is what it is. Output is collected as bytes and decoded once, so
+ * a multi-byte character split across two chunks survives.
+ *
+ * The promise settles on `close`, which follows both the exit and the end of
+ * the child's output, so nothing written last is lost.
+ *
+ * @returns The rendered script, decoded as UTF-8.
+ * @throws Error When the CLI cannot be resolved or started, its output cannot
+ * be read, or it exits with a non-zero code or on a signal; Prisma's own
+ * account of such a failure has already been written to standard error.
  */
-async function input(): Promise<string> {
-  const chunks: Buffer[] = [];
+async function render(): Promise<string> {
+  const cli = createRequire(import.meta.url).resolve(PRISMA_CLI);
 
-  for await (const chunk of process.stdin) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
-  }
+  return new Promise<string>((resolve, reject) => {
+    const child = spawn(process.execPath, [cli, ...RENDER_ARGUMENTS], {
+      cwd: WORKSPACE,
+      env: { ...process.env, [DATABASE_URL]: '' },
+      stdio: ['ignore', 'pipe', 'inherit'],
+      windowsHide: true,
+    });
+    const chunks: Buffer[] = [];
 
-  return Buffer.concat(chunks).toString('utf8');
+    child.stdout.on('data', (chunk: unknown) => {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
+    });
+
+    // Without a listener a stream error is thrown as an uncaught exception,
+    // which would end this process with exit code 1 and read as drift.
+    child.stdout.on('error', (error: Error) => {
+      reject(new Error(`could not read the output of \`${RENDER_COMMAND}\`: ${error.message}`));
+    });
+
+    child.on('error', (error: Error) => {
+      reject(new Error(`could not start \`${RENDER_COMMAND}\`: ${error.message}`));
+    });
+
+    child.on('close', (code: number | null, signal: NodeJS.Signals | null) => {
+      if (code === 0) {
+        resolve(Buffer.concat(chunks).toString('utf8'));
+
+        return;
+      }
+
+      reject(
+        new Error(
+          signal === null
+            ? `\`${RENDER_COMMAND}\` exited with code ${String(code)}; Prisma's report is above`
+            : `\`${RENDER_COMMAND}\` was terminated by ${signal}`,
+        ),
+      );
+    });
+  });
 }
 
 /**
- * Runs the check over the rendering on standard input.
+ * Renders the schema, replays the committed history, and compares the two.
  *
  * @returns The process exit code.
  */
 async function main(): Promise<number> {
   try {
-    const rendered = await input();
+    const rendered = await render();
 
     if (statements(rendered).length === 0) {
       throw new Error(
-        'no SQL arrived on standard input; pipe `prisma migrate diff --from-empty --to-schema prisma/schema.prisma --script` into this check',
+        `\`${RENDER_COMMAND}\` succeeded but rendered no SQL; prisma.config.ts must give \`migrate diff\` a datasource dialect when ${DATABASE_URL} is blank, or Prisma renders nothing`,
       );
     }
 
@@ -295,9 +412,10 @@ async function main(): Promise<number> {
 
     return DRIFT;
   } catch (failure) {
-    // Every failure here is one this check cannot judge past - a statement it
-    // cannot replay, a history it could not read - and is reported as that
-    // rather than as drift, which would claim a comparison that never happened.
+    // Every failure here is one this check cannot judge past - a rendering that
+    // failed or came back empty, a statement it cannot replay, a history it
+    // could not read - and is reported as that rather than as drift, which
+    // would claim a comparison that never happened.
     console.error(
       `check-migrations: ${failure instanceof Error ? failure.message : String(failure)}`,
     );

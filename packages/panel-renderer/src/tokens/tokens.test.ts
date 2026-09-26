@@ -28,11 +28,12 @@
  *   3. **Reach.** The two authored stylesheets consume the table and extend it
  *      nowhere: neither declares a custom property, every property a rule reads
  *      is either a catalogued token or a component-scoped `--dgc-*` value, no
- *      length is written as a literal outside the one unit-bridge form and one
- *      documented clip box, and no retired constant namespace is named in a
- *      rule or a comment. A value declared beside the tokens is covered by none
- *      of the checks here, which would leave this suite describing less of the
- *      product than it appears to.
+ *      length is written as a literal outside one documented clip box — a
+ *      measured `--dgc-*` number takes its unit from `--dg-pixel-unit` — no
+ *      border or outline width is written as a keyword, and no retired
+ *      constant namespace is named in a rule or a comment. A value declared
+ *      beside the tokens is covered by none of the checks here, which would
+ *      leave this suite describing less of the product than it appears to.
  *   4. **Contrast.** Every text/surface and status/surface pair of every theme
  *      is measured and held to the text minimum, and the span-kind scale — used
  *      as fills that carry their own text labels — and the relationship-edge
@@ -273,14 +274,20 @@ const TOKEN_KEYS = Object.keys(DESIGN_TOKENS.dark) as TokenKey[];
  * `--dg-shadow-1` — which a naive camel-to-kebab conversion renders as
  * `--dg-space0` and `--dg-shadow1`, matching nothing in the stylesheet.
  *
- * The families AAP 0.6.3 tabulates are here verbatim. Eight of these names are
- * not in that table and belong to it all the same: `--dg-font-weight-medium`,
+ * The families AAP 0.6.3 tabulates are here verbatim. The names beyond that
+ * table belong to it all the same: `--dg-font-weight-medium`,
  * `--dg-motion-duration`, `--dg-motion-easing` and `--dg-shimmer-duration`
  * carry a weight, two durations and an easing function; `--dg-graph-edge` is
  * the stroke of a relationship connector, which neither border colour can
- * carry at the 3:1 non-text bar; and `--dg-icon-size`, `--dg-spinner-size` and
- * `--dg-icon-button-size` are the glyph, spinner and icon-only control boxes.
- * The stylesheets need every one of them and 0.6.3 does not enumerate them.
+ * carry at the 3:1 non-text bar; `--dg-icon-size`, `--dg-spinner-size`,
+ * `--dg-icon-button-size` and `--dg-line-block-size` are the glyph, spinner,
+ * icon-only control and one-line boxes; `--dg-border-width-hairline` and
+ * `--dg-border-width-marker` are the two edge weights; `--dg-pixel-unit` is
+ * the unit a measured coordinate is given; and the `--dg-column-min-*` and
+ * `--dg-column-share-*` families are the floors and spare-width shares every
+ * data-table column role is built from (`src/primitives/DataTable.tsx`).
+ * The stylesheets and the table primitive need every one of them and 0.6.3
+ * does not enumerate them.
  * AAP 0.6.4 permits no literal for any of them and 0.6.6 records no exception,
  * so the only lawful place for them is this table — which is also what puts
  * them under every check below, the property a parallel "internal constant"
@@ -291,6 +298,20 @@ const EXPECTED_CSS_PROPERTY_NAMES: readonly string[] = [
   '--dg-accent-muted',
   '--dg-border-strong',
   '--dg-border-subtle',
+  '--dg-border-width-hairline',
+  '--dg-border-width-marker',
+  '--dg-column-min-count',
+  '--dg-column-min-label',
+  '--dg-column-min-name',
+  '--dg-column-min-ordinal',
+  '--dg-column-min-quantity',
+  '--dg-column-min-standard',
+  '--dg-column-min-status',
+  '--dg-column-min-text',
+  '--dg-column-share-compact',
+  '--dg-column-share-default',
+  '--dg-column-share-wide',
+  '--dg-column-share-widest',
   '--dg-danger',
   '--dg-duration-critical',
   '--dg-duration-fast',
@@ -323,10 +344,12 @@ const EXPECTED_CSS_PROPERTY_NAMES: readonly string[] = [
   '--dg-kind-render-ink',
   '--dg-kind-service',
   '--dg-kind-service-ink',
+  '--dg-line-block-size',
   '--dg-mono-md',
   '--dg-mono-sm',
   '--dg-motion-duration',
   '--dg-motion-easing',
+  '--dg-pixel-unit',
   '--dg-radius-lg',
   '--dg-radius-md',
   '--dg-radius-sm',
@@ -495,10 +518,11 @@ const GRAPH_EDGE_RULES = ['.dg-dependency-graph__edge', '.dg-timeline__edge'] as
  *
  * They are font-relative by design (see the token source), so each is pinned
  * to its exact expression: `1em` for the glyph square, an alias of the glyph
- * square for the spinner, and a sum of the glyph square and two space tokens
- * for the icon-only control. A value in an absolute unit would still render,
- * which is exactly why it has to fail here instead — a fixed square next to
- * scaling type is the defect these tokens exist to prevent.
+ * square for the spinner, a sum of the glyph square and two space tokens for
+ * the icon-only control, and `1lh` for the one-line box. A value in an absolute
+ * unit would still render, which is exactly why it has to fail here instead — a
+ * fixed square next to scaling type is the defect these tokens exist to
+ * prevent.
  */
 const SIZE_TOKENS = [
   { key: 'iconSize', value: '1em' },
@@ -507,7 +531,88 @@ const SIZE_TOKENS = [
     key: 'iconButtonSize',
     value: 'calc(var(--dg-icon-size) + var(--dg-space-1) * 2 + var(--dg-space-0))',
   },
+  { key: 'lineBlockSize', value: '1lh' },
 ] as const satisfies readonly { readonly key: TokenKey; readonly value: string }[];
+
+/**
+ * The two border widths, pinned to the CSS width keywords they carry.
+ *
+ * A keyword rather than a length on purpose: `thin` and `medium` are resolved
+ * by the browser to device-crisp strokes, so a hairline never renders as a
+ * blurred fraction of a device pixel at a fractional zoom. The keyword lives
+ * here, once, and the reach suite forbids it in the stylesheets.
+ */
+const BORDER_WIDTH_TOKENS = [
+  { key: 'borderWidthHairline', value: 'thin' },
+  { key: 'borderWidthMarker', value: 'medium' },
+] as const satisfies readonly { readonly key: TokenKey; readonly value: string }[];
+
+/**
+ * The readable floor of each data-table column role (`columnMin*`), which
+ * `src/primitives/DataTable.tsx` sums into the table's own minimum width.
+ * Each must be a strictly positive `ch` length: `ch` resolves against the
+ * table's own type, which is what the floors are sized in, and a zero floor
+ * would let a column collapse to its padding in a narrow panel.
+ */
+const COLUMN_MINIMUM_KEYS = [
+  'columnMinOrdinal',
+  'columnMinCount',
+  'columnMinQuantity',
+  'columnMinStatus',
+  'columnMinLabel',
+  'columnMinName',
+  'columnMinText',
+  'columnMinStandard',
+] as const satisfies readonly TokenKey[];
+
+/**
+ * The spare-width share of each column role (`columnShare*`): a strictly
+ * positive `fr` flex factor, ordered from the figures' compact share to free
+ * text's widest one.
+ */
+const COLUMN_SHARE_KEYS = [
+  'columnShareCompact',
+  'columnShareDefault',
+  'columnShareWide',
+  'columnShareWidest',
+] as const satisfies readonly TokenKey[];
+
+/** A strictly positive `ch` length, captured as its magnitude. */
+const CH_LENGTH_PATTERN = /^(\d+(?:\.\d+)?)ch$/u;
+
+/** A strictly positive `fr` flex factor, captured as its magnitude. */
+const FR_FACTOR_PATTERN = /^(\d*\.?\d+)fr$/u;
+
+/**
+ * The component-scoped properties that carry a MEASURED number of CSS pixels,
+ * handed to the stylesheet unitless: the virtualized canvas height and row
+ * offset `src/primitives/DataTable.tsx` publishes, and the viewport coordinates
+ * of an open `src/primitives/Tooltip.tsx` bubble. A COUNT such as a tree depth
+ * is not one of them — it scales a space token, and carries no unit of its own.
+ */
+const MEASURED_GEOMETRY_PROPERTIES = [
+  '--dgc-virtual-total',
+  '--dgc-virtual-start',
+  '--dgc-tooltip-block',
+  '--dgc-tooltip-inline',
+] as const;
+
+/**
+ * A border or outline width written as a CSS keyword, anywhere in a
+ * declaration's value. The keywords are the weights `--dg-border-width-*`
+ * carry, so a stylesheet that writes one has chosen an edge weight outside the
+ * token table.
+ */
+const BORDER_WIDTH_KEYWORD_PATTERN = /(?<![\w-])(?:thin|medium|thick)(?![\w-])/u;
+
+/**
+ * The properties whose value carries a border or outline width: every border
+ * shorthand and longhand except the ones that hold no width at all (colour,
+ * style, radius, image, collapse, spacing), plus the outline and column-rule
+ * families. `scrollbar-width: thin` is not a border and stays out of scope.
+ */
+const BORDER_WIDTH_PROPERTY_PATTERN =
+  /^(?:border(?:-(?:block|inline|top|right|bottom|left)(?:-(?:start|end))?)?(?:-width)?|outline(?:-width)?|column-rule(?:-width)?)$/u;
 
 /**
  * A CSS length written as a literal: a number followed by an absolute,
@@ -519,14 +624,6 @@ const SIZE_TOKENS = [
  */
 const LENGTH_LITERAL_PATTERN =
   /(?<![\w.-])\d*\.?\d+(?:px|em|rem|ex|ch|cap|ic|lh|rlh|vw|vh|vi|vb|vmin|vmax|svw|svh|lvw|lvh|dvw|dvh|cqw|cqh|cqi|cqb|cqmin|cqmax|pt|pc|in|cm|mm|q)(?![\w-])/giu;
-
-/**
- * The one length a declaration may still carry: the unit given to a UNITLESS
- * number a component supplies through a `--dgc-*` property, in the exact
- * consumption form `src/primitives/DataTable.tsx` declares. The number is the
- * value; `1px` is only the unit it is given, so this encodes no design value.
- */
-const UNIT_BRIDGE_PATTERN = /calc\(var\(--dgc-[a-z][a-z-]*, 0\) \* 1px\)/gu;
 
 /**
  * The declarations that may carry a length literal although they are not a
@@ -639,6 +736,8 @@ const DURATION_ALIASES = [
  * a failure says which family drifted.
  */
 const THEME_INVARIANT_FAMILIES = [
+  // The high-contrast theme raises border colours (delta 1), never widths.
+  { family: 'border widths', keys: ['borderWidthHairline', 'borderWidthMarker'] },
   {
     family: 'spacing scale',
     keys: ['space0', 'space1', 'space2', 'space3', 'space4', 'space5', 'space6', 'space7'],
@@ -650,7 +749,28 @@ const THEME_INVARIANT_FAMILIES = [
     keys: ['textXs', 'textSm', 'textMd', 'textLg', 'heading', 'monoSm', 'monoMd'],
   },
   { family: 'radii', keys: ['radiusSm', 'radiusMd', 'radiusLg'] },
-  { family: 'glyph and control sizes', keys: ['iconSize', 'spinnerSize', 'iconButtonSize'] },
+  {
+    family: 'glyph and control sizes',
+    keys: ['iconSize', 'spinnerSize', 'iconButtonSize', 'lineBlockSize'],
+  },
+  { family: 'measured geometry', keys: ['pixelUnit'] },
+  {
+    family: 'table column minimums',
+    keys: [
+      'columnMinOrdinal',
+      'columnMinCount',
+      'columnMinQuantity',
+      'columnMinStatus',
+      'columnMinLabel',
+      'columnMinName',
+      'columnMinText',
+      'columnMinStandard',
+    ],
+  },
+  {
+    family: 'table column shares',
+    keys: ['columnShareCompact', 'columnShareDefault', 'columnShareWide', 'columnShareWidest'],
+  },
   // Reducing motion is a user preference expressed through a media query, not a
   // theme, so a theme never shortens or removes a duration.
   { family: 'motion constants', keys: ['motionDuration', 'motionEasing', 'shimmerDuration'] },
@@ -1069,7 +1189,7 @@ describe('generated token stylesheet', () => {
   });
 
   it('declares exactly the catalogued custom properties', () => {
-    expect(EXPECTED_CSS_PROPERTY_NAMES).toHaveLength(71);
+    expect(EXPECTED_CSS_PROPERTY_NAMES).toHaveLength(87);
     expect(
       new Set(EXPECTED_CSS_PROPERTY_NAMES).size,
       'the catalogue lists a custom property twice',
@@ -1278,6 +1398,83 @@ describe('design token completeness', () => {
     });
   }
 
+  for (const { key, value } of BORDER_WIDTH_TOKENS) {
+    it(`keeps ${String(key)} the "${value}" width keyword in every theme`, () => {
+      for (const theme of PANEL_THEMES) {
+        expect(
+          DESIGN_TOKENS[theme][key],
+          `${theme}.${String(key)} must be exactly "${value}": the stylesheets name an edge's ` +
+            'role through this token, and its weight is decided here and nowhere else',
+        ).toBe(value);
+      }
+    });
+  }
+
+  it('keeps the measured-geometry unit exactly one CSS pixel', () => {
+    // Every virtualizer offset, canvas height and tooltip coordinate is a
+    // number the DOM measured in CSS pixels; the stylesheet multiplies it by
+    // this token, so any other value would misplace every measured element.
+    for (const theme of PANEL_THEMES) {
+      expect(DESIGN_TOKENS[theme].pixelUnit, `${theme}.pixelUnit`).toBe('1px');
+    }
+    expect(cssVar('pixelUnit'), 'the form a stylesheet rule writes').toBe('var(--dg-pixel-unit)');
+  });
+
+  it('gives every column role a strictly positive ch floor', () => {
+    for (const key of COLUMN_MINIMUM_KEYS) {
+      const value = DESIGN_TOKENS.dark[key];
+      const [, magnitude] = CH_LENGTH_PATTERN.exec(value) ?? [];
+
+      expect(
+        magnitude,
+        `${String(key)} holds "${value}", which is not a ch length: a column floor is sized in ` +
+          'characters of the table type, and the table sums the floors into its own minimum',
+      ).toBeDefined();
+      expect(Number(magnitude), `${String(key)} must keep a non-zero floor`).toBeGreaterThan(0);
+    }
+  });
+
+  it('orders the column-role floors from the shortest content to the longest', () => {
+    // A position number is narrower than a count, a count than a formatted
+    // quantity, a label than a name and a name than free text: the roles are
+    // defined by that ordering, so a floor that breaks it names the wrong role.
+    const floor = (key: TokenKey): number =>
+      Number(CH_LENGTH_PATTERN.exec(DESIGN_TOKENS.dark[key])?.[1] ?? Number.NaN);
+    const ascending = [
+      floor('columnMinOrdinal'),
+      floor('columnMinCount'),
+      floor('columnMinStatus'),
+      floor('columnMinQuantity'),
+      floor('columnMinLabel'),
+      floor('columnMinName'),
+      floor('columnMinText'),
+    ];
+
+    expect(ascending).toEqual([...ascending].sort((first, second) => first - second));
+    expect(new Set(ascending).size, 'two roles share one floor').toBe(ascending.length);
+  });
+
+  it('gives every column role a strictly positive fr share, compact to widest', () => {
+    const shares = COLUMN_SHARE_KEYS.map((key) => {
+      const value = DESIGN_TOKENS.dark[key];
+      const [, magnitude] = FR_FACTOR_PATTERN.exec(value) ?? [];
+
+      expect(
+        magnitude,
+        `${String(key)} holds "${value}", which is not an fr flex factor`,
+      ).toBeDefined();
+      expect(Number(magnitude), `${String(key)} must take a share`).toBeGreaterThan(0);
+
+      return Number(magnitude);
+    });
+
+    expect(shares, 'the shares must grow from compact to widest').toEqual(
+      [...shares].sort((first, second) => first - second),
+    );
+    expect(new Set(shares).size, 'two shares carry one factor').toBe(shares.length);
+    expect(DESIGN_TOKENS.dark.columnShareDefault, 'the default share is one part').toBe('1fr');
+  });
+
   it('builds the icon-only control size from tokens alone', () => {
     // Every var() the calc() reads must name a real token, and nothing else in
     // it may be a length: the expression is the control's recipe, stated in
@@ -1372,15 +1569,15 @@ describe('authored stylesheets', () => {
       it('states every length through a token', () => {
         // A length literal is a visual dimension decided outside the token
         // table — the shape a hardcoded glyph box or a hardcoded inset takes.
-        // Two forms are not: the unit a unitless component value is given, and
-        // the documented clip box of content that paints nothing.
+        // That includes the unit a UNITLESS measured `--dgc-*` number is given:
+        // it is `--dg-pixel-unit`, never a `1px` written here. One form is
+        // exempt: the documented clip box of content that paints nothing.
         const exempt = STRUCTURAL_LENGTH_DECLARATIONS.filter((entry) => entry.rel === rel);
         const offenders: string[] = [];
 
         for (const { selector, declarations } of styleRules(rules)) {
           for (const declaration of declarations) {
-            const withoutBridges = declaration.replace(UNIT_BRIDGE_PATTERN, '');
-            if (withoutBridges.match(LENGTH_LITERAL_PATTERN) === null) {
+            if (declaration.match(LENGTH_LITERAL_PATTERN) === null) {
               continue;
             }
             const sanctioned = exempt.some(
@@ -1397,6 +1594,80 @@ describe('authored stylesheets', () => {
           'a length written as a literal is a visual value outside the token table (AAP 0.6.4). ' +
             'Resolve it to a --dg-* token — add one to src/tokens/tokens.ts if none fits',
         ).toEqual([]);
+      });
+
+      it('states every border and outline width through a token', () => {
+        // `thin`, `medium` and `thick` are edge weights, and an edge weight is
+        // a visual decision: the stylesheet names the edge's role through
+        // `--dg-border-width-hairline` or `--dg-border-width-marker`, and the
+        // weight itself lives in the token table (AAP 0.6.4).
+        const offenders: string[] = [];
+
+        for (const { selector, declarations } of styleRules(rules)) {
+          for (const declaration of declarations) {
+            const separator = declaration.indexOf(':');
+            if (separator < 0) {
+              continue;
+            }
+            const property = declaration.slice(0, separator).trim();
+            const value = declaration.slice(separator + 1);
+            if (
+              BORDER_WIDTH_PROPERTY_PATTERN.test(property) &&
+              BORDER_WIDTH_KEYWORD_PATTERN.test(value)
+            ) {
+              offenders.push(`${selector} { ${declaration} }`);
+            }
+          }
+        }
+
+        expect(
+          offenders,
+          'a border width written as a keyword is an edge weight outside the token table ' +
+            '(AAP 0.6.4). Use var(--dg-border-width-hairline) or var(--dg-border-width-marker)',
+        ).toEqual([]);
+      });
+
+      it('gives every measured --dgc-* number its unit through the pixel-unit token', () => {
+        // The unitless-number bridge is the one place a unit meets a measured
+        // component value; it must read the unit from the table, in the fixed
+        // form the components' contracts document:
+        // `calc(var(--dgc-…, 0) * var(--dg-pixel-unit))`. Every reference to a
+        // measured property must be that bridge — a bare use, or one scaled by
+        // anything else, would place the element by a number with no unit or
+        // the wrong one.
+        const offenders: string[] = [];
+        let bridges = 0;
+
+        for (const property of MEASURED_GEOMETRY_PROPERTIES) {
+          const references = occurrencesOf(rules, `var(${property}`);
+          const bridged = [
+            ...rules.matchAll(
+              new RegExp(
+                String.raw`var\(${property},\s*0\)\s*\*\s*var\(${cssVarName('pixelUnit')}\)`,
+                'gu',
+              ),
+            ),
+          ].length;
+
+          bridges += bridged;
+          if (bridged !== references) {
+            offenders.push(
+              `${property}: ${String(references - bridged)} of ${String(references)} ` +
+                'references are not multiplied by var(--dg-pixel-unit)',
+            );
+          }
+        }
+
+        expect(
+          offenders,
+          'a measured --dgc-* number must be multiplied by var(--dg-pixel-unit)',
+        ).toEqual([]);
+        if (rel === 'src/styles/components.css') {
+          expect(
+            bridges,
+            'the canvas height, row offset and tooltip coordinates are each bridged here',
+          ).toBeGreaterThanOrEqual(MEASURED_GEOMETRY_PROPERTIES.length);
+        }
       });
 
       it('keeps every structural length exemption pointing at a real declaration', () => {

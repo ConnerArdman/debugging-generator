@@ -54,7 +54,7 @@
  * path produces is held to the same deterministic steps Stage 3 uses —
  * `normalizePlan` → `instrumentationPlanSchema` → `checkPlanFeasibility` — and
  * a normalisation or internal-validation failure is a product defect logged
- * with its input and never re-prompted.
+ * by its closed shape and its failing paths, and never re-prompted.
  *
  * ## What this stage owns, and what it hands on
  *
@@ -74,12 +74,44 @@
  *   Nothing here computes a version, and no row is ever updated in place.
  * - **Plan version n+1 is recorded only after its install succeeded**, so a
  *   delta that failed part-way leaves the session's plan ladder — and the
- *   baseline of the next follow-up — at version n.
+ *   baseline of the next follow-up — at version n. `SessionManager.recordPlan`
+ *   writes the `plans` row and the session record that mirrors it in one
+ *   transaction, so the ladder this stage reads and the `SessionRecord.plans`
+ *   the capture stage arms from move together or not at all.
+ * - **An install that cannot be kept is undone here.** The installer unwinds a
+ *   delta that fails inside its own call. Every failure after the delta is on
+ *   disk — an install that reports an error once it has applied, an install
+ *   that leaves another version active, a plan version that could not be
+ *   recorded — is compensated by this stage (AAP §0.4.2, Follow-up row): the
+ *   journal records of plan version n+1 are reverse-restored newest first with
+ *   `@debuggen/instrumentation`'s `restoreModification`, which never
+ *   overwrites a file a developer has edited, and the service's arming state is
+ *   returned to plan version n with `InstrumentationService.restoreArming`, so
+ *   the files, the next capture and the plan ladder all stand at version n
+ *   again. A failed operation is never left at n+1.
+ * - **Claims are verified, not trusted.** An install error that names version
+ *   n active is the installer's claim that its own unwind finished; the
+ *   journal is read to confirm no record of n+1 is still open, and a record
+ *   that is — the unwind left a conflict, a failure or an unread journal — is
+ *   compensated here too. A `recordPlan` failure whose re-read ladder is at
+ *   n+1 is kept only when the stored plan is this run's and the session record
+ *   holds it as well (a failure after the commit, such as a broadcast); any
+ *   other split is undone and reported.
+ * - **Conflicts are reported, never touched.** A record of n+1 already in
+ *   `conflict` — a developer edited the file after the patch — stops its
+ *   file's chain like a conflict found while restoring: nothing is written,
+ *   its backup is kept, the records under it are reported skipped, and the
+ *   compensation is not claimed complete.
+ * - **Clients see the outcome.** The service announced the n+1 records as
+ *   applied before the failure; once a compensation has settled them, their
+ *   final states are mirrored onto `SessionRecord.modifications` with
+ *   `SessionManager.patch`, which broadcasts `session.updated`.
  * - **Session status is never written.** The orchestrator performs every
  *   transition through the session manager; {@link FollowUpStageInput.onPathChosen}
  *   and {@link FollowUpStageInput.beforeInstall} are its seams. This module
- *   records the follow-up with `SessionManager.appendFollowUp` and its outcome
- *   links with `recordFollowUpOutcome`.
+ *   records the follow-up with `SessionManager.appendFollowUp`, its outcome
+ *   links with `recordFollowUpOutcome`, and a compensation's record states
+ *   with `patch`, whose `SessionPatch` has no status member.
  * - **Progress.** The `followup` group, the `plan` group of the new-capture
  *   path and the `generate-panel` group of the existing-evidence path are
  *   emitted here with the titles `../../sessions/progress.ts` owns. The
@@ -99,13 +131,15 @@
  * ## Privacy (AAP §0.5.2)
  *
  * Log records carry the stage, the path, plan, analysis and panel versions,
- * counts, rejection reason codes, prompt versions and error codes — never the
+ * counts, rejection reason codes, prompt versions, error codes and the
+ * product-minted ids of modification records a compensation touched — never the
  * question, a prompt, the model output, a statement, a file's contents, a diff,
- * SQL, a URL or a token. The one sanctioned exception is the product-defect
- * record of a normalisation failure, which carries the authoring input for
- * whoever fixes the defect (AAP §0.5.3), exactly as Stage 3's does. Errors
- * composed here carry codes, product-minted ids, counts and enumerated
- * reasons, never payload values.
+ * SQL, a URL or a token. The product-defect record of a plan version that
+ * failed normalisation or validation (AAP §0.5.3) is no exception: exactly as
+ * Stage 3's does, it describes the authoring input by its closed shape and
+ * names where the defect is, never the input's objective, hypotheses or
+ * rationales (CWE-532). Errors composed here carry codes, product-minted ids,
+ * counts and enumerated reasons, never payload values.
  *
  * @module
  */
@@ -119,6 +153,8 @@ import {
   instrumentationPlanSchema,
   instrumentationTargetInputSchema,
   normalizePlan,
+  orderRestorationChain,
+  restoreModification,
 } from '@debuggen/instrumentation';
 import type {
   AdapterRegistry,
@@ -129,9 +165,12 @@ import type {
   InstrumentationPlan,
   InstrumentationPlanInput,
   InstrumentationTargetInput,
+  ModificationRecord,
+  ModificationStatus,
   ObservedReadinessInputs,
   PlanAdapterResolver,
   ProblemUnderstanding,
+  RestoreOutcome,
 } from '@debuggen/instrumentation';
 import {
   DEFAULT_MAX_REPAIRS,
@@ -140,7 +179,7 @@ import {
 } from '@debuggen/model-provider';
 import type { ModelProvider, PromptStage } from '@debuggen/model-provider';
 import type { PanelSpec } from '@debuggen/panel-schema';
-import { isPlainRecord, opaqueSchema } from '@debuggen/protocol';
+import { isPlainRecord } from '@debuggen/protocol';
 import type { AnalysisResult, ProgressStage, SessionRecord } from '@debuggen/protocol';
 import {
   DebuggenError,
@@ -155,7 +194,6 @@ import {
 import type { DebuggenErrorCode, LogFields, Logger, Result } from '@debuggen/shared';
 import type { CaptureSummary } from '@debuggen/telemetry';
 
-import type { AnalysisFacts } from '../../analysis/facts.js';
 import type { AnalysisFollowUpContext, AnalysisSummarizer } from '../../analysis/summarize.js';
 import type {
   CodeAnalysisHandles,
@@ -165,7 +203,12 @@ import type {
 } from '../../instrumentation/service.js';
 import { sessionLogger, subsystemLogger } from '../../logging.js';
 import type { PanelGenerationResult, PanelRegenerationRequest } from '../../panels/generate.js';
-import type { FollowUpOutcome, SessionManager } from '../../sessions/manager.js';
+import type { FollowUpOutcome, RecordedPlan, SessionManager } from '../../sessions/manager.js';
+import {
+  FAILURE_COPY_BY_CODE,
+  authorProductText,
+  isProductAuthoredText,
+} from '../../sessions/progress.js';
 import type { SessionProgress } from '../../sessions/progress.js';
 import type { SessionFailure } from '../../sessions/state-machine.js';
 import type { ModificationsRepo } from '../../store/modifications-repo.js';
@@ -178,6 +221,8 @@ import type {
   StageRequestBuild,
 } from '../context-builder.js';
 import type { AnalyzeStageInput, AnalyzeStageResult } from './analyze.js';
+import { authoredPlanShape, refusedFieldPath } from './plan.js';
+import { buildFollowUpDecisionSchema } from './reply-schemas.js';
 
 /* -------------------------------------------------------------------------------------------------
  * Vocabulary
@@ -209,9 +254,9 @@ const PIPELINE_SUBSYSTEM = 'pipeline';
 
 /**
  * The artifact name the structured-output loop quotes in repair feedback and
- * in a rejection's `details.schemaName`. An opaque schema yields terse issues,
- * so this label is what tells a repair turn which artifact it is rewriting
- * (AAP §0.5.3, the repair loop of every structured output).
+ * in a rejection's `details.schemaName`. The guard's refusal is one terse root
+ * issue, so this label is what tells a repair turn which artifact it is
+ * rewriting (AAP §0.5.3, the repair loop of every structured output).
  */
 export const FOLLOW_UP_DECISION_SCHEMA_NAME = 'follow-up decision';
 
@@ -301,7 +346,7 @@ export type FollowUpPromptPlaceholdersCovered = AssertTrue<
 >;
 
 /* -------------------------------------------------------------------------------------------------
- * The FollowUpDecision contract — owned by this stage (the no-zod path)
+ * The FollowUpDecision contract — owned by this stage: a total guard, and the schema built on it
  * ---------------------------------------------------------------------------------------------- */
 
 /**
@@ -323,11 +368,12 @@ export type FollowUpAdditionalAction = InstrumentationTargetInput | Instrumentat
  * instrumentation it needs.
  *
  * `prompts/followup/v001.md` states that this artifact's schema is owned by the
- * stage module, and `zod` is not imported by this workspace, so the runtime
- * check is {@link isFollowUpDecision} behind {@link followUpDecisionSchema}.
- * **If an upstream schema for this shape ever appears, switch to it and delete
- * the local guard**: two definitions of a cross-boundary shape is the defect
- * AAP §0.2.3 names.
+ * stage module, so the runtime check is this module's total guard
+ * {@link isFollowUpDecision}, and {@link followUpDecisionSchema} is built on it
+ * by `./reply-schemas.ts` — the one module of this folder that imports the
+ * validation library, which this module does not. **If an upstream schema for
+ * this shape ever appears, switch to it and delete the local guard**: two
+ * definitions of a cross-boundary shape is the defect AAP §0.2.3 names.
  */
 export interface FollowUpDecision {
   /** Whether answering the follow-up needs a new capture. A real boolean, never a truthy value. */
@@ -577,17 +623,26 @@ export function isFollowUpDecision(value: unknown): value is FollowUpDecision {
 }
 
 /**
- * The schema of the {@link FollowUpDecision} artifact, for
- * `generateStructuredWithRepair` (AAP §0.5.3). Built with protocol's
- * `opaqueSchema` over {@link isFollowUpDecision}, so the guard and the schema
- * cannot disagree; a rejection reads `expected FollowUpDecision`, and the
- * stage passes {@link FOLLOW_UP_DECISION_SCHEMA_NAME} so the repair turn names
- * the artifact it is rewriting.
+ * The authoring schema of the {@link FollowUpDecision} artifact, for
+ * `generateStructuredWithRepair` (AAP §0.4.2, §0.5.3).
+ *
+ * Built by `./reply-schemas.ts` because this is the schema a real provider
+ * renders for the model, and both of its routes (the schema-constrained format
+ * and the forced tool call) need a JSON Schema document with an object root,
+ * which an opaque schema cannot produce. {@link isFollowUpDecision} decides
+ * first, so the guard and the schema cannot disagree and a hostile value never
+ * reaches the structural half; a refusal reads `expected FollowUpDecision` and
+ * quotes nothing, and the stage passes {@link FOLLOW_UP_DECISION_SCHEMA_NAME}
+ * so the repair turn names the artifact it is rewriting. The structural half —
+ * `needsNewCapture` and the upstream target and action schemas — is what the
+ * model is constrained by. A parse returns a structurally equal copy of the
+ * decision.
  */
-export const followUpDecisionSchema = opaqueSchema<FollowUpDecision>(
-  FOLLOW_UP_DECISION_LABEL,
-  isFollowUpDecision,
-);
+export const followUpDecisionSchema = buildFollowUpDecisionSchema({
+  label: FOLLOW_UP_DECISION_LABEL,
+  admits: isFollowUpDecision,
+  maxAdditionalActions: MAX_FOLLOW_UP_ADDITIONAL_ACTIONS,
+});
 
 /* -------------------------------------------------------------------------------------------------
  * The additive-only rule — pure, and enforced in code
@@ -963,7 +1018,12 @@ export interface AnalysisRegenerationPort {
  * Each member is typed as the narrowest slice of its owner's interface this
  * stage calls, so the full service objects — and a test's fakes — are
  * accepted, and the types themselves document that this stage writes no
- * status, no analysis row, no panel row and no modification record.
+ * status, no analysis row, no panel row and appends no modification record.
+ * The one journal transition it causes is a compensation's: an installed delta
+ * that cannot be kept has its records moved to `reverted` (or `conflict`) by
+ * `restoreModification`, through the journal of the context the
+ * instrumentation service builds — and those final states are then mirrored
+ * onto the session record's `modifications` with `SessionManager.patch`.
  */
 export interface FollowUpStageDeps {
   /** Renders the versioned follow-up prompt and runs the outbound guard. */
@@ -972,26 +1032,52 @@ export interface FollowUpStageDeps {
   readonly provider: ModelProvider;
   /** The bounded follow-up context (previous analysis and panel ids) and the stored capture summary. */
   readonly summarizer: Pick<AnalysisSummarizer, 'buildFollowUpContext' | 'loadCaptureSummary'>;
-  /** The analysis ladder, read to prove a regeneration appended a version rather than mutating one. */
-  readonly facts: Pick<AnalysisFacts, 'history'>;
   /** Regenerates the analysis on the existing-evidence path (normally the analyze stage). */
   readonly analysisRegeneration: AnalysisRegenerationPort;
   /** Regenerates the panel on the existing-evidence path (normally the panel generator). */
   readonly panelRegeneration: PanelRegenerationPort;
-  /** Builds the adapter context and installs the delta — the only writer to the project. */
-  readonly instrumentation: Pick<InstrumentationService, 'buildContext' | 'install'>;
+  /**
+   * Builds the adapter context and installs the delta — the only writer to the
+   * project — and, when an installed delta cannot be kept, restores the
+   * service's arming state to the previous plan version (`restoreArming`). The
+   * compensation's file restores go through `restoreModification` over the
+   * context this service builds, so its journal and backup store are the
+   * service's own; a successful run never reaches `restoreArming`.
+   */
+  readonly instrumentation: Pick<
+    InstrumentationService,
+    'buildContext' | 'install' | 'restoreArming'
+  >;
   /** The live adapter registry: the only source of adapter identity and install mode. */
   readonly registry: AdapterRegistry;
-  /** The plan ladder: the installed version and the next version's number. */
-  readonly sessions: Pick<SessionsRepo, 'latestPlanVersion' | 'getPlan' | 'nextPlanVersion'>;
-  /** The analysis and panel history: the latest version of each. */
-  readonly panels: Pick<PanelsRepo, 'getLatestAnalysis' | 'getLatestPanel'>;
+  /**
+   * The plan ladder — the installed version and the next version's number —
+   * and the session record, read (never written) for two things only: to
+   * confirm that a plan version whose recording reported a failure is held by
+   * both the ladder and the record before the run keeps it, and as the base a
+   * compensation's record states are merged onto.
+   */
+  readonly sessions: Pick<
+    SessionsRepo,
+    'latestPlanVersion' | 'getPlan' | 'nextPlanVersion' | 'get'
+  >;
+  /**
+   * The analysis and panel history, read one row at a time: the latest version
+   * of each, and — to prove a regeneration appended a version rather than
+   * mutating one — the superseded analysis by its id. The whole ladder is never
+   * listed, so a follow-up's reads stay constant as the session's history grows.
+   */
+  readonly panels: Pick<PanelsRepo, 'getAnalysis' | 'getLatestAnalysis' | 'getLatestPanel'>;
   /** The modification journal, read only: the chain head of each file the delta patches. */
   readonly modifications: Pick<ModificationsRepo, 'latestRecordForFile'>;
-  /** Records the follow-up, its outcome links and plan version n + 1; never a status. */
+  /**
+   * Records the follow-up, its outcome links and plan version n + 1, and —
+   * after a compensation — patches `modifications` with the final states of
+   * the records it settled. Never a status: `SessionPatch` has no such member.
+   */
   readonly sessionManager: Pick<
     SessionManager,
-    'appendFollowUp' | 'recordFollowUpOutcome' | 'recordPlan'
+    'appendFollowUp' | 'recordFollowUpOutcome' | 'recordPlan' | 'patch'
   >;
   /** Emits the `followup`, `plan` and `generate-panel` groups; owns every title. */
   readonly progress: Pick<SessionProgress, 'stageStarted' | 'stageCompleted' | 'stageFailed'>;
@@ -1016,6 +1102,13 @@ export interface FollowUpStageDeps {
 export interface FollowUpStageInput {
   /** The follow-up question, verbatim. Rendered into prompts only; never compared or searched. */
   readonly followUpQuestion: string;
+  /**
+   * The identity of this ask (protocol's `followUpAttemptIdSchema`), handed to
+   * `SessionManager.appendFollowUp` untouched: a fresh id records a new
+   * follow-up, the id of the session's latest unanswered follow-up retries it
+   * in place. This stage never mints, compares or rewrites it.
+   */
+  readonly attemptId: string;
   /**
    * The follow-up prompt version to use. Absent, the version recorded on the
    * session is reused — a reopened session's follow-up keeps the prompt it
@@ -1176,7 +1269,16 @@ export interface FollowUpStage {
    * the failing subsystem's own `DebuggenError`, with `details.stage` set to the
    * stage it belongs to (`followup`, `plan`, `instrument`, `analyze` or
    * `generate-panel`) so the orchestrator can file the session's failure under
-   * it. The stage writes no session status.
+   * it. The stage writes no session status. A new-capture failure after the
+   * delta was installed keeps the failing subsystem's code, has one sentence
+   * appended to its message stating what the compensation left in the project,
+   * carries the compensation's report in `details.deltaRollback` (with
+   * `mirrored` saying whether the settled records reached the session record)
+   * and `details.activePlanVersion` only when the session provably stands at
+   * version n again. A plan row stored without the session record accounting
+   * for it adds `details.planStored: true` and `recordMirrored: false`. A
+   * `recordPlan` failure after both were stored is not a failure: the run
+   * completes with the recorded plan.
    *
    * @param context The run's stage context.
    * @param input The follow-up question and the run's seams and options.
@@ -1207,16 +1309,59 @@ const CANCELLED_LOG = 'Follow-up stage cancelled.';
 /**
  * Error record of a plan version n + 1 that passed the authoring schema but
  * failed normalisation, internal validation or the installed-action check — a
- * product defect (AAP §0.5.3). The one record in this module that carries a
- * value: the authoring input, which whoever fixes the defect needs, routed
- * through the service logger's redaction layers.
+ * product defect (AAP §0.5.3). Fields: stage, step, error code, plan version,
+ * the authoring input's closed shape (`authoredPlanShape` of `./plan.ts`:
+ * counts and action types) and where the defect is — the normaliser's
+ * structural field path, the internal issues' paths and codes, or the altered
+ * action's index. Never the input itself: its objective, hypotheses and
+ * rationales are model prose that the service logger's key-based redaction
+ * cannot recognise (CWE-532).
  */
 const PRODUCT_DEFECT_LOG =
   'A follow-up plan version failed deterministic normalisation or validation; it was rejected without a re-prompt and nothing was installed.';
 
-/** Error record of a delta that was installed but whose plan version could not be recorded. */
+/**
+ * Error record of a delta that was installed but whose plan version could not
+ * be recorded. Fields: stage, plan version, error code, whether the plan row
+ * was found stored (`planStored`: `true`, `false` or `'unknown'`) and, when it
+ * was, why it could not be kept (`planCheck`, a {@link PlanCheck}).
+ */
 const UNRECORDED_PLAN_LOG =
-  'A follow-up delta was installed but its plan version could not be recorded; the session must not continue on it.';
+  'A follow-up delta was installed but recording its plan version failed.';
+
+/**
+ * Warn record of a plan version that the ladder and the session record both
+ * hold although recording it reported a failure — a failure after the commit,
+ * such as a broadcast — so the run completes with it. Fields: plan version,
+ * error code.
+ */
+const PLAN_RECORDED_DESPITE_REPORT_LOG =
+  'The follow-up plan version was recorded on the plan ladder and the session record although recording it reported a failure; the run continues with it.';
+
+/**
+ * Warn record of a compensation whose settled record states could not be
+ * mirrored onto the session record. Fields: step (`read` or `patch`), error
+ * code.
+ */
+const DELTA_MIRROR_FAILED_LOG =
+  'The records a follow-up compensation settled could not be mirrored onto the session record; clients keep the states they were last sent.';
+
+/**
+ * Info record of an installed delta that could not be kept and was undone in
+ * full: every file modification of plan version n + 1 restored and the arming
+ * state back at version n. Fields: trigger, versions, error code, counts and
+ * record ids.
+ */
+const DELTA_ROLLED_BACK_LOG =
+  'An installed follow-up delta could not be kept and was reverse-restored; the session stays at its previous plan version.';
+
+/**
+ * Error record of a compensation that could not undo everything: a conflict, a
+ * restore failure, an unreadable journal or arming state that could not be
+ * returned. Fields as {@link DELTA_ROLLED_BACK_LOG}, plus the failure codes.
+ */
+const DELTA_ROLLBACK_INCOMPLETE_LOG =
+  'An installed follow-up delta could not be kept and was only partly reverse-restored; the remaining modifications stay for cleanup.';
 
 /** Warn record of an outcome link that could not be stamped. Fields: path, error code. */
 const OUTCOME_UNRECORDED_LOG =
@@ -1365,13 +1510,21 @@ function analysisLadderError(): DebuggenError {
   );
 }
 
-/** The instrumentation service reported a different active plan version than the one installed. */
+/**
+ * The instrumentation service reported a different active plan version than
+ * the one installed. The delta is compensated before this error is returned,
+ * so its hint is the one shown when that compensation left the project intact
+ * — product text, registered as it is built so a failed row may show it
+ * ({@link compensatedHint}).
+ */
 function activeVersionMismatchError(planVersion: number, activePlanVersion: number): DebuggenError {
   return new DebuggenError(
     'INSTRUMENTATION_INSTALL_FAILED',
     'The follow-up delta install did not leave the new plan version active, so it was not recorded.',
     {
-      hint: 'End the session to restore every instrumented file, then start again.',
+      hint: authorProductText(
+        'Ask the follow-up again to install its instrumentation afresh; if the service keeps reporting another active plan version, restart the Debug Generator service first.',
+      ),
       details: {
         stage: INSTRUMENT_STAGE,
         reason: 'active-version-mismatch',
@@ -1588,6 +1741,518 @@ function durationFields(now: () => number, startedAt: number | undefined): LogFi
   return endedAt === undefined ? {} : { durationMs: Math.max(0, Math.round(endedAt - startedAt)) };
 }
 
+/**
+ * Ends a message the way a sentence appended after it needs: trimmed, with a
+ * full stop when it had no terminal punctuation.
+ */
+function asSentence(text: string): string {
+  const trimmed = text.trim();
+  return /[.!?]$/u.test(trimmed) ? trimmed : `${trimmed}.`;
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * Delta compensation — undoing an installed delta that cannot be kept (AAP §0.4.2, Follow-up row)
+ *
+ * The installer reverse-restores a delta that fails inside its own call. What it cannot see is a
+ * failure after it returned with the delta on disk, and its own unwind can leave records open, so
+ * this stage compensates both: the journal records of plan version n + 1 are restored newest first,
+ * the arming state is returned to n, and the records' final states are mirrored onto the session
+ * record. Everything here reports ids, counts and codes — never a path, a digest, a diff or file
+ * content.
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * Which post-install failure a compensation answers:
+ *
+ * - `install-failed` — the install returned `Err` without saying it unwound
+ *   the call itself: the service's "installed, but reporting it failed", a
+ *   readiness evaluation that failed after the apply, or an error naming no
+ *   active version at all (an unexpected throw).
+ * - `install-unwind-incomplete` — the install returned `Err` naming version n
+ *   active, but the journal still holds a record of n + 1 that is open (or
+ *   could not be read to prove otherwise): the installer's own rollback left a
+ *   conflict, a failure or an unread journal behind. The service stamps n on
+ *   every failed install, so the stamp alone proves nothing.
+ * - `active-version-mismatch` — the install returned `Ok` but left another
+ *   plan version active.
+ * - `plan-unrecorded` — the install succeeded, recording plan version n + 1
+ *   failed, and the ladder is — or may still be — at version n, or holds n + 1
+ *   without the session record accounting for it.
+ */
+type DeltaRollbackTrigger =
+  'install-failed' | 'install-unwind-incomplete' | 'active-version-mismatch' | 'plan-unrecorded';
+
+/** The journal status of a record there is nothing left to undo for. */
+const REVERTED_STATUS = 'reverted' as const satisfies ModificationStatus;
+
+/** The journal status of a record whose file no longer holds this product's bytes. */
+const CONFLICT_STATUS = 'conflict' as const satisfies ModificationStatus;
+
+/**
+ * The statuses of a plan version n + 1 record a compensation has to account
+ * for — every status but `reverted`, which is already undone:
+ *
+ * - `pending`, `applied` and `failed` are reverse-restored, each settled by the
+ *   reconciliation table `restoreModification` applies (AAP §0.5.1);
+ * - `conflict` is reported as a conflict and never handed to a restore: the
+ *   file is no longer what this product wrote, closing the conflict is the
+ *   developer's decision, and cleanup re-reports it. Its presence means the
+ *   delta is **not** undone, so it can never be counted as a clean rollback.
+ */
+const OPEN_DELTA_STATUSES: ReadonlySet<ModificationStatus> = new Set<ModificationStatus>([
+  'pending',
+  'applied',
+  'failed',
+  CONFLICT_STATUS,
+]);
+
+/** The error detail naming the plan version the session is left at; claimed only when proven. */
+const ACTIVE_PLAN_VERSION_KEY = 'activePlanVersion';
+
+/** The code a compensation's mirror reports when the session record it would patch is gone. */
+const SESSION_NOT_FOUND_CODE = 'SESSION_NOT_FOUND' as const satisfies DebuggenErrorCode;
+
+/** The most record ids one list of a compensation report carries; the counts are always complete. */
+const MAX_REPORTED_RECORDS = 20;
+
+/**
+ * The hint of a compensated failure that left nothing behind, when the original
+ * error had none — or had one describing what an unwind left, which the
+ * compensation has since undone.
+ */
+const DELTA_REASK_HINT =
+  'Nothing from this follow-up remains in the project; ask the follow-up again to install its instrumentation afresh.';
+
+/** A record a compensation could not restore, with the code of the error that stopped it. */
+interface DeltaRollbackFailure {
+  readonly recordId: string;
+  readonly code: DebuggenErrorCode;
+}
+
+/** What reverse-restoring the file modifications of plan version n + 1 did. */
+interface DeltaFilesReport {
+  /** How many records of plan version n + 1 were open: to be reversed, or found in conflict. */
+  readonly attempted: number;
+  /** The records restored — or found already holding their original and closed. */
+  readonly restored: readonly string[];
+  /**
+   * The records whose files no longer held this product's bytes — found so by
+   * a restore, or already in `conflict` — left exactly as they stand.
+   */
+  readonly conflicts: readonly string[];
+  /** The records after a conflict or a failure in the same file's chain: not attempted. */
+  readonly skipped: readonly string[];
+  /** The records a restore could not finish. */
+  readonly failures: readonly DeltaRollbackFailure[];
+  /**
+   * `listed` when the journal answered and the set is the records of plan
+   * version n + 1 it holds; `unreadable` when it did not, and the set fell back
+   * to the records the install reported.
+   */
+  readonly journal: 'listed' | 'unreadable';
+  /** The code of the error that kept the journal from answering. */
+  readonly journalCode?: DebuggenErrorCode | undefined;
+  /**
+   * The last known state of every plan version n + 1 record — the journal
+   * listed again after the restores, or, when it cannot be, what the restores
+   * returned over what was listed before. What the session record is patched
+   * with; never logged and never placed in an error.
+   */
+  readonly records: readonly ModificationRecord[];
+}
+
+/** What one compensation did: the file restores, the trigger, the arming state and the mirror. */
+interface DeltaRollbackReport extends DeltaFilesReport {
+  readonly trigger: DeltaRollbackTrigger;
+  /** Whether `restoreArming` returned the service's arming state to plan version n. */
+  readonly arming: 'restored' | 'failed';
+  /** The code of the error that kept the arming state from being restored. */
+  readonly armingCode?: DebuggenErrorCode | undefined;
+  /**
+   * Whether the records' final states reached `SessionRecord.modifications`;
+   * absent when no record was open, so there was nothing to mirror. A mirror
+   * that fails never changes the failure's code.
+   */
+  readonly mirrored?: boolean | undefined;
+}
+
+/**
+ * The session's journal as one compensation reads it: a restore context built
+ * for plan version n + 1 without the run's signal, and the listing through it.
+ * Opened once, so the check of an installer's unwind and the compensation it
+ * may lead to read the same listing.
+ */
+interface DeltaJournal {
+  /** The restore context, or the error that kept it from being built. */
+  readonly context: Result<InstrumentationContext, DebuggenError>;
+  /** The session's records as the journal listed them, or why it could not. */
+  readonly listed: Result<readonly ModificationRecord[], DebuggenError>;
+}
+
+/** How one compensation is carried out and worded, beyond its trigger and its failure. */
+interface CompensationOptions {
+  /** The journal as the caller already opened it for this compensation; absent, it is opened afresh. */
+  readonly journal?: DeltaJournal | undefined;
+  /** The recovery when nothing is left behind; absent, the original error's own — or the re-ask. */
+  readonly settledHint?: string | undefined;
+  /** A condition the compensation cannot change; it leads whatever recovery the hint names. */
+  readonly standingHint?: string | undefined;
+}
+
+/**
+ * The records of plan version n + 1 a compensation has to account for: the
+ * session's own, at that version, in an {@link OPEN_DELTA_STATUSES} status.
+ */
+function openDeltaRecords(
+  records: readonly ModificationRecord[],
+  sessionId: string,
+  planVersion: number,
+): ModificationRecord[] {
+  return records.filter(
+    (record) =>
+      record.sessionId === sessionId &&
+      record.planVersion === planVersion &&
+      OPEN_DELTA_STATUSES.has(record.status),
+  );
+}
+
+/**
+ * The session record's modifications with `settled` upserted by id: a record
+ * already listed is replaced in place, a new one appended, in order — the
+ * merge the orchestrator applies to an install's records, so both user
+ * interfaces keep one row per record.
+ */
+function mergeModificationRecords(
+  current: readonly ModificationRecord[],
+  settled: readonly ModificationRecord[],
+): ModificationRecord[] {
+  const byId = new Map(settled.map((record) => [record.id, record]));
+  const merged = current.map((record) => byId.get(record.id) ?? record);
+  const known = new Set(current.map((record) => record.id));
+  for (const record of settled) {
+    if (!known.has(record.id)) {
+      merged.push(record);
+      known.add(record.id);
+    }
+  }
+  return merged;
+}
+
+/**
+ * Whether every file modification of plan version n + 1 is undone: the
+ * journal answered, and nothing conflicted, failed or was skipped.
+ */
+function isFilesIntact(report: DeltaFilesReport): boolean {
+  return (
+    report.journal === 'listed' &&
+    report.conflicts.length === 0 &&
+    report.skipped.length === 0 &&
+    report.failures.length === 0
+  );
+}
+
+/** Whether a compensation left the session exactly at plan version n: its files and its arming. */
+function isRollbackIntact(report: DeltaRollbackReport): boolean {
+  return isFilesIntact(report) && report.arming === 'restored';
+}
+
+/**
+ * The sentence — two when the arming state could not be restored — appended to
+ * a compensated failure's message, stating what the project now holds.
+ *
+ * @example
+ * `All 2 file modification(s) of plan version 3 were restored, so the project
+ * holds exactly what plan version 2 installed.`
+ */
+function describeDeltaRollback(
+  report: DeltaRollbackReport,
+  planVersion: number,
+  previousPlanVersion: number,
+): string {
+  const next = String(planVersion);
+  const previous = String(previousPlanVersion);
+  const restored = String(report.restored.length);
+  const attempted = String(report.attempted);
+  const leftAsTheyStand = String(report.conflicts.length + report.skipped.length);
+  const failed = String(report.failures.length);
+  let files: string;
+  if (report.journal === 'unreadable') {
+    files =
+      report.attempted === 0
+        ? `The modification journal could not be read, so no file modification of plan version ${next} could be looked up or restored.`
+        : `The modification journal could not be read; of the ${attempted} file modification(s) of plan version ${next} the install reported, ${restored} were restored, ${leftAsTheyStand} were left exactly as they stand and ${failed} could not be restored.`;
+  } else if (isFilesIntact(report)) {
+    files =
+      report.attempted === 0
+        ? `No file modification of plan version ${next} remained in the project, so it holds exactly what plan version ${previous} installed.`
+        : `All ${attempted} file modification(s) of plan version ${next} were restored, so the project holds exactly what plan version ${previous} installed.`;
+  } else {
+    files = `${restored} of ${attempted} file modification(s) of plan version ${next} were restored; ${leftAsTheyStand} were left exactly as they stand and ${failed} could not be restored.`;
+  }
+  return report.arming === 'restored'
+    ? files
+    : `${files} The capture configuration could not be returned to plan version ${previous}.`;
+}
+
+/**
+ * The recovery a compensated failure's hint names, after the statement of
+ * what the project holds ({@link compensatedHint}): `settledHint` when the
+ * compensation left nothing behind — normally the original error's own, which
+ * names the recovery for the cause — and otherwise the recovery for what was
+ * left: an unreadable journal, files left as they stand (a conflict among them), or
+ * arming state still at the new version. A `standingHint` — a condition the
+ * compensation cannot change, such as a plan row the session record does not
+ * account for — leads that recovery, so it is never lost behind it.
+ */
+function deltaRollbackHint(
+  report: DeltaRollbackReport,
+  previousPlanVersion: number,
+  settledHint: string,
+  standingHint?: string,
+): string {
+  let recovery: string;
+  if (report.journal === 'unreadable') {
+    recovery =
+      'The modification journal did not answer, so this follow-up’s instrumentation could not be confirmed restored: check the session store, then end the session to restore every file it instrumented.';
+  } else if (!isFilesIntact(report)) {
+    recovery =
+      report.conflicts.length > 0
+        ? 'Nothing was overwritten: a file edited after it was instrumented is reported as a conflict and keeps its original bytes in this session’s backup directory, as does every other file left as it stands. Review the session’s modifications, then end the session to restore what remains.'
+        : 'Nothing was overwritten: every file left as it stands keeps its original bytes in this session’s backup directory. Review the session’s modifications, then end the session to restore what remains.';
+  } else if (report.arming !== 'restored') {
+    recovery = `Restart the Debug Generator service before capturing again, so the next capture arms only what plan version ${String(previousPlanVersion)} installed.`;
+  } else {
+    return settledHint;
+  }
+  return standingHint === undefined ? recovery : `${asSentence(standingHint)} ${recovery}`;
+}
+
+/** The hint a compensation that left nothing behind carries: `hint` when it has text, else the re-ask. */
+function settledHintOf(hint: string | undefined): string {
+  return hint !== undefined && hint.trim().length > 0 ? hint : DELTA_REASK_HINT;
+}
+
+/**
+ * Whether the recovery {@link deltaRollbackHint} chose for `report` is text the
+ * product wrote.
+ *
+ * A compensation that left something behind names one of its own recovery
+ * templates — proven, unless a `standingHint` no product builder registered
+ * leads it. One that left nothing names `settledHint`: the re-ask
+ * ({@link DELTA_REASK_HINT}) is the product's, and a hint carried over from
+ * the original failure is proven only when `isProductAuthoredText` recognises
+ * it — an adapter's, a dependency's or a thrown exception's words never are.
+ *
+ * @param report The compensation's report.
+ * @param settledHint The recovery of a compensation that left nothing behind.
+ * @param standingHint The condition that leads any other recovery, if any.
+ * @returns `true` when the recovery may be shown as the product's own.
+ */
+function isRecoveryProven(
+  report: DeltaRollbackReport,
+  settledHint: string,
+  standingHint: string | undefined,
+): boolean {
+  if (isRollbackIntact(report)) {
+    return settledHint === DELTA_REASK_HINT || isProductAuthoredText(settledHint);
+  }
+  return standingHint === undefined || isProductAuthoredText(standingHint);
+}
+
+/**
+ * The hint a compensated failure carries: the statement of what the project
+ * now holds ({@link describeDeltaRollback}), then the recovery
+ * ({@link deltaRollbackHint}).
+ *
+ * The run's `failed` progress row never shows a failure's message, and shows
+ * its hint only when that hint is proven product text
+ * (`../../sessions/progress.ts`, CWE-209), so this hint is where the developer
+ * reads what the compensation left. The statement is composed from the
+ * product's templates, plan versions and counts. A recovery that is not
+ * proven ({@link isRecoveryProven}) is replaced by the fixed hint of the
+ * failure's code — the words the row would have shown in its place — so what
+ * the hint says is wholly the product's and is registered with
+ * `authorProductText` as it is built. The original failure, with its own
+ * hint, stays the compensated error's `cause`.
+ *
+ * @param description What the project now holds.
+ * @param recovery The recovery for the cause, or for what was left behind.
+ * @param proven Whether `recovery` is product text.
+ * @param code The failure's code, whose fixed hint stands in for an unproven recovery.
+ * @returns The registered hint.
+ *
+ * @example
+ * `All 1 file modification(s) of plan version 3 were restored, so the project
+ * holds exactly what plan version 2 installed. Check the free space and
+ * permissions of DEBUGGEN_HOME, then retry.`
+ */
+function compensatedHint(
+  description: string,
+  recovery: string,
+  proven: boolean,
+  code: DebuggenErrorCode,
+): string {
+  const fixed = Object.hasOwn(FAILURE_COPY_BY_CODE, code)
+    ? FAILURE_COPY_BY_CODE[code].hint
+    : FAILURE_COPY_BY_CODE.INTERNAL.hint;
+  return authorProductText(`${description} ${proven ? recovery : fixed}`);
+}
+
+/** A compensation report as `details.deltaRollback` and its log record carry it: ids capped, counts complete. */
+function deltaRollbackDetails(report: DeltaRollbackReport): Record<string, unknown> {
+  return {
+    trigger: report.trigger,
+    attempted: report.attempted,
+    restored: report.restored.length,
+    conflicts: report.conflicts.slice(0, MAX_REPORTED_RECORDS),
+    conflictCount: report.conflicts.length,
+    skipped: report.skipped.slice(0, MAX_REPORTED_RECORDS),
+    skippedCount: report.skipped.length,
+    failures: report.failures.slice(0, MAX_REPORTED_RECORDS).map((failure) => ({ ...failure })),
+    failureCount: report.failures.length,
+    journal: report.journal,
+    ...(report.journalCode !== undefined ? { journalCode: report.journalCode } : {}),
+    arming: report.arming,
+    ...(report.armingCode !== undefined ? { armingCode: report.armingCode } : {}),
+    ...(report.mirrored !== undefined ? { mirrored: report.mirrored } : {}),
+  };
+}
+
+/**
+ * The error detail values a compensated failure carries over from the
+ * original: everything but its claim about the active plan version, which the
+ * compensation re-derives — `n` only once it proved the session stands there.
+ */
+function carriedDetails(error: DebuggenError): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(error.details ?? {}).filter(([key]) => key !== ACTIVE_PLAN_VERSION_KEY),
+  );
+}
+
+/**
+ * The records of a delta grouped by file, the files ordered **latest-touched
+ * first** — by their newest `appliedAt`, then by file descending so the order
+ * never depends on the journal's — exactly as `cleanupSession` takes them. The
+ * order within one file is `orderRestorationChain`'s, applied by the caller.
+ */
+function groupByFileLatestFirst(records: readonly ModificationRecord[]): ModificationRecord[][] {
+  const byFile = new Map<string, ModificationRecord[]>();
+  for (const record of records) {
+    const group = byFile.get(record.file);
+    if (group === undefined) {
+      byFile.set(record.file, [record]);
+    } else {
+      group.push(record);
+    }
+  }
+  const newest = (group: readonly ModificationRecord[]): number =>
+    group.reduce((latest, record) => Math.max(latest, record.appliedAt), 0);
+  return [...byFile.entries()]
+    .sort(
+      ([leftFile, left], [rightFile, right]) =>
+        newest(right) - newest(left) || compareCodeUnits(rightFile, leftFile),
+    )
+    .map(([, group]) => group);
+}
+
+/**
+ * Lists one session's journal through a restore context. A throw, a rejection
+ * or an answer that is not a `Result` of a list becomes an `Err`, so a journal
+ * that breaks its contract costs the compensation its listing and nothing else.
+ */
+async function listSessionJournal(
+  context: InstrumentationContext,
+  sessionId: string,
+): Promise<Result<readonly ModificationRecord[], DebuggenError>> {
+  let answered: unknown;
+  try {
+    answered = await context.journal.listBySession(sessionId);
+  } catch (thrown) {
+    return err(DebuggenError.from(thrown, 'STORE_ERROR'));
+  }
+  if (typeof answered === 'object' && answered !== null && 'ok' in answered) {
+    if (answered.ok === true && 'value' in answered && Array.isArray(answered.value)) {
+      return ok(answered.value as readonly ModificationRecord[]);
+    }
+    if (answered.ok === false && 'error' in answered) {
+      return err(DebuggenError.from(answered.error, 'STORE_ERROR'));
+    }
+  }
+  return err(
+    new DebuggenError(
+      'STORE_ERROR',
+      'The modification journal answered a listing with something other than a list of records.',
+      { details: { reason: 'journal-listing-invalid' } },
+    ),
+  );
+}
+
+/**
+ * Why a plan row found at version n + 1 after a failed `recordPlan` could not
+ * be kept — the `details.planCheck` and log field of that failure:
+ *
+ * - `plan-unreadable` — the stored plan could not be read back;
+ * - `plan-missing` — the ladder named n + 1 but the row was gone on reading;
+ * - `plan-differs` — the stored plan is not this run's: another version or
+ *   other actions;
+ * - `record-unreadable` — the session record could not be read;
+ * - `record-lacks-plan` — the session record's `plans` do not hold n + 1, so
+ *   the capture stage would arm version n while the ladder says n + 1.
+ */
+type PlanCheck =
+  'plan-unreadable' | 'plan-missing' | 'plan-differs' | 'record-unreadable' | 'record-lacks-plan';
+
+/**
+ * Whether a stored plan version is the one this run recorded: the same
+ * version, and the same actions by id in the same order — the identity every
+ * later delta and every modification chain is computed against.
+ */
+function isSamePlanVersion(stored: InstrumentationPlan, expected: InstrumentationPlan): boolean {
+  const storedActions = stored.instrumentationTargets;
+  const expectedActions = expected.instrumentationTargets;
+  return (
+    stored.planVersion === expected.planVersion &&
+    storedActions.length === expectedActions.length &&
+    storedActions.every((action, index) => action.id === expectedActions[index]?.id)
+  );
+}
+
+/**
+ * The error of a plan row stored at version n + 1 that the session record does
+ * not account for (or that could not be confirmed as this run's), before the
+ * compensation appends what it left in the project. `recordPlan` writes both
+ * in one transaction, so this is a store that no longer agrees with itself:
+ * the files and the arming state are returned to version n, which is what
+ * the record — the capture stage's source — holds, and the hint names the plan
+ * row that remains. The hint is product text composed from the two versions,
+ * registered as it is built so a failed row may show it ({@link compensatedHint}).
+ */
+function planSplitError(
+  error: DebuggenError,
+  planVersion: number,
+  previousPlanVersion: number,
+  check: PlanCheck,
+): DebuggenError {
+  const version = String(planVersion);
+  return new DebuggenError(
+    error.code,
+    `${asSentence(error.message)} Plan version ${version} was stored, but the session record does not account for it.`,
+    {
+      hint: authorProductText(
+        `The session store holds plan version ${version} although the session record stands at plan version ${String(previousPlanVersion)}, so a later follow-up in this session would build on instrumentation that is no longer installed: end this session to restore every file it instrumented, then start a new one.`,
+      ),
+      details: {
+        ...(error.details ?? {}),
+        planVersion,
+        planStored: true,
+        recordMirrored: false,
+        planCheck: check,
+      },
+      cause: error,
+    },
+  );
+}
+
 /* -------------------------------------------------------------------------------------------------
  * Factory
  * ---------------------------------------------------------------------------------------------- */
@@ -1657,7 +2322,9 @@ interface OutcomeRecord {
  *    → `getPlan`), the latest analysis and panel, the summarizer's follow-up
  *    context (whose ids must agree with them) and the summary of the capture
  *    the analysis was drawn from — and the question is recorded with
- *    `SessionManager.appendFollowUp`.
+ *    `SessionManager.appendFollowUp` under the input's `attemptId`: appended
+ *    as a new follow-up, or recorded in place of the failed attempt it
+ *    retries.
  * 3. `ContextBuilder.buildFollowUpRequest` with the prompt's seven
  *    placeholders and the session's recorded prompt version; a builder `Err`
  *    (the outbound guard, a prompt that cannot load) means the provider is
@@ -1667,14 +2334,28 @@ interface OutcomeRecord {
  *    {@link followUpPathFor}. The `followup` group closes.
  * 5. **Existing evidence**: the `onPathChosen` seam; the analysis port with
  *    `regenerate: true` and the previous analysis as `supersedes`, checked
- *    against the analysis ladder; the `generate-panel` group around the panel
- *    port's `regenerate`.
+ *    against the analysis ladder with two indexed single-row reads — the
+ *    superseded analysis by id (`PanelsRepo.getAnalysis`) must be unchanged and
+ *    the session's newest (`getLatestAnalysis`) must be the new one; the
+ *    `generate-panel` group around the panel port's `regenerate`.
  * 6. **New capture**: the `plan` group around `nextPlanVersion`, the adapter
  *    context, {@link buildFollowUpPlanInput}, `normalizePlan` with the previous
  *    actions, `instrumentationPlanSchema`, the installed-action check,
  *    `checkPlanFeasibility` and the chain-head read; then the `onPathChosen`
  *    and `beforeInstall` seams, the delta install, and — only once it has
- *    succeeded — `SessionManager.recordPlan`.
+ *    succeeded — `SessionManager.recordPlan`, which stores the plan row and
+ *    the session record together. A failure after the delta is on disk is
+ *    compensated before the run fails: an install `Err` that does not name
+ *    the previous version as active; one that does while the journal — listed
+ *    read-only to check the claim — still holds an open record of n + 1; an
+ *    `Ok` that leaves another version active; and a `recordPlan` failure
+ *    unless the ladder, the stored plan and the session record all hold this
+ *    run's n + 1 (then the run rolls forward). Each compensation walks plan
+ *    version n + 1's open records newest first — `orderRestorationChain` per
+ *    file, files latest-touched first, `restoreModification` per record, a
+ *    record already in `conflict` stopping its file untouched — then puts
+ *    `restoreArming` back to plan version n and patches the records' final
+ *    states onto `SessionRecord.modifications`.
  * 7. The outcome links through `SessionManager.recordFollowUpOutcome`.
  *
  * The factory holds no state beyond its collaborators; one instance serves
@@ -1686,12 +2367,13 @@ interface OutcomeRecord {
  * @example
  * ```ts
  * const followUp = createFollowUpStage({
- *   contextBuilder, provider, summarizer, facts, analysisRegeneration: analyzeStage,
+ *   contextBuilder, provider, summarizer, analysisRegeneration: analyzeStage,
  *   panelRegeneration: panelGenerator, instrumentation, registry, sessions, panels,
  *   modifications, sessionManager, progress, logger,
  * });
  * const outcome = await followUp.run(context, {
  *   followUpQuestion,
+ *   attemptId,
  *   onPathChosen: (path) =>
  *     manager.transitionTo(sessionId, path === 'new-capture' ? 'planning' : 'analyzing'),
  *   beforeInstall: () => manager.transitionTo(sessionId, 'instrumenting'),
@@ -2040,17 +2722,23 @@ export function createFollowUpStage(deps: FollowUpStageDeps): FollowUpStage {
       return fail(context, log, state, analysisLadderError(), startedAt);
     }
     // Versioned, never mutated: the previous version is still on the ladder, unchanged, and the
-    // new one is the newest entry.
-    const ladder = callSync(() => deps.facts.history(sessionId), 'STORE_ERROR');
-    if (!ladder.ok) {
-      return fail(context, log, state, ladder.error, startedAt);
+    // new one is the newest entry. Two indexed single-row reads — the predecessor by its primary
+    // key, the newest by one seek on UNIQUE (session_id, version) — rather than the whole ladder,
+    // so a follow-up costs the same however many analyses the session already holds.
+    const predecessor = callSync(() => deps.panels.getAnalysis(previousAnalysis.id), 'STORE_ERROR');
+    if (!predecessor.ok) {
+      return fail(context, log, state, predecessor.error, startedAt);
     }
-    const kept = ladder.value.some(
-      (entry) =>
-        entry.id === previousAnalysis.id &&
-        entry.analysisVersion === previousAnalysis.analysisVersion,
-    );
-    if (!kept || ladder.value.at(-1)?.id !== analysis.id) {
+    const newest = callSync(() => deps.panels.getLatestAnalysis(sessionId), 'STORE_ERROR');
+    if (!newest.ok) {
+      return fail(context, log, state, newest.error, startedAt);
+    }
+    const kept =
+      predecessor.value !== undefined &&
+      predecessor.value.id === previousAnalysis.id &&
+      predecessor.value.sessionId === sessionId &&
+      predecessor.value.analysisVersion === previousAnalysis.analysisVersion;
+    if (!kept || newest.value?.id !== analysis.id) {
       return fail(context, log, state, analysisLadderError(), startedAt);
     }
     if (isAborted(context.signal)) {
@@ -2160,7 +2848,8 @@ export function createFollowUpStage(deps: FollowUpStageDeps): FollowUpStage {
    * ids) → `instrumentationPlanSchema` → `checkPlanFeasibility` — plus the
    * check only a follow-up needs: every installed action survives unchanged.
    * A normalisation or validation failure is a product defect, logged with the
-   * authoring input and rejected without a re-prompt. Nothing is written.
+   * authoring input's closed shape — never its prose — and rejected without a
+   * re-prompt. Nothing is written.
    */
   const gateNextPlan = async (
     context: PipelineStageContext,
@@ -2207,12 +2896,14 @@ export function createFollowUpStage(deps: FollowUpStageDeps): FollowUpStage {
       newActionId: deps.newActionId,
     });
     if (!normalized.ok) {
+      const field = refusedFieldPath(normalized.error);
       log.error(PRODUCT_DEFECT_LOG, {
         stage: PLAN_STAGE,
         step: 'normalize',
         code: normalized.error.code,
         planVersion,
-        input: authored,
+        ...(field !== undefined ? { field } : {}),
+        ...authoredPlanShape(authored),
       });
       return err(normalized.error);
     }
@@ -2226,7 +2917,8 @@ export function createFollowUpStage(deps: FollowUpStageDeps): FollowUpStage {
         code: 'PLAN_INVALID',
         planVersion,
         issues,
-        input: authored,
+        issueCount: internal.error.issues.length,
+        ...authoredPlanShape(authored),
       });
       return err(
         new DebuggenError(
@@ -2258,7 +2950,7 @@ export function createFollowUpStage(deps: FollowUpStageDeps): FollowUpStage {
         code: 'PLAN_INVALID',
         planVersion,
         index: altered,
-        input: authored,
+        ...authoredPlanShape(authored),
       });
       return err(installedActionAlteredError(altered, planVersion));
     }
@@ -2302,12 +2994,514 @@ export function createFollowUpStage(deps: FollowUpStageDeps): FollowUpStage {
   };
 
   /**
+   * Builds the restore context for plan version n + 1 — without the run's
+   * signal, so a cancelled run still reads and unwinds — and lists the
+   * session's journal through it, so `restoreModification` later sees the
+   * session's own journal and backup store. Read only: nothing is written, and
+   * the one listing serves both the check of an installer's unwind and the
+   * compensation it may lead to. Never rejects.
+   */
+  const openDeltaJournal = async (
+    context: PipelineStageContext,
+    input: FollowUpStageInput,
+    plan: InstrumentationPlan,
+  ): Promise<DeltaJournal> => {
+    const built = callSync(
+      () =>
+        deps.instrumentation.buildContext({
+          sessionId: context.sessionId,
+          projectRoot: context.projectRoot,
+          plan: { planVersion: plan.planVersion },
+          code: codeHandlesOf(context),
+          readiness: input.readiness ?? {},
+        }),
+      'INTERNAL',
+    );
+    if (!built.ok) {
+      return { context: built, listed: err(built.error) };
+    }
+    return { context: built, listed: await listSessionJournal(built.value, context.sessionId) };
+  };
+
+  /**
+   * Reverse-restores the file modifications of plan version n + 1 — and only
+   * those — strictly newest first.
+   *
+   * - **The set comes from the journal.** Every record of the session whose
+   *   `planVersion` is n + 1 and whose status is one
+   *   {@link OPEN_DELTA_STATUSES} names. Earlier versions' records are
+   *   never touched, so a chained file returns to the bytes plan version n
+   *   wrote rather than to its pristine ones. When the journal does not
+   *   answer, the records the install reported are used instead and the report
+   *   says so (`journal: 'unreadable'`).
+   * - **The order is cleanup's.** Files are taken latest-touched first
+   *   ({@link groupByFileLatestFirst}); within a file `orderRestorationChain`
+   *   orders the records last-applied first, and the walk stops at the first
+   *   conflict or failure, because every earlier record's expectation of the
+   *   file is then unsatisfiable. The rest of that file is reported skipped.
+   * - **A conflict is never touched.** A record already in `conflict` is
+   *   reported as a conflict without a call to `restoreModification` and stops
+   *   its file exactly like a conflict a restore finds, so the rollback can
+   *   never be reported complete while one stands. Its backup stays.
+   * - **A shared backup survives.** Backups are content-addressed, so a record
+   *   keeps its backup (`retainBackup`) while any other record of the session
+   *   that is not reverted — an earlier version's, a conflict's, or a delta
+   *   record still to come — is filed under the same path. Without a journal
+   *   listing every backup is kept: deleting one another record still needs
+   *   is the one irreversible outcome.
+   * - **It runs without the run's signal**, over the context
+   *   {@link openDeltaJournal} built — or the one `opened` carries.
+   * - **It reports where the records ended up.** Once any record was handed to
+   *   a restore, the journal is listed again and plan version n + 1's records
+   *   are reported as it holds them; failing that, as the restores returned
+   *   them over the first listing.
+   *
+   * @param opened The journal as the caller already listed it; absent, it is
+   * opened here.
+   * @returns The report. Never rejects: every record's fate lands in one list.
+   */
+  const reverseRestoreDelta = async (
+    context: PipelineStageContext,
+    input: FollowUpStageInput,
+    plan: InstrumentationPlan,
+    installation: InstrumentationOutcome | undefined,
+    opened?: DeltaJournal,
+  ): Promise<DeltaFilesReport> => {
+    const { sessionId } = context;
+    const reported = openDeltaRecords(installation?.applied ?? [], sessionId, plan.planVersion);
+
+    const opening = opened ?? (await openDeltaJournal(context, input, plan));
+    if (!opening.context.ok) {
+      const { code } = opening.context.error;
+      return {
+        attempted: reported.length,
+        restored: [],
+        conflicts: [],
+        skipped: [],
+        failures: reported.map((record) => ({ recordId: record.id, code })),
+        journal: 'unreadable',
+        journalCode: code,
+        records: reported,
+      };
+    }
+    const restoreContext = opening.context.value;
+    const { listed } = opening;
+
+    const journal = listed.ok
+      ? listed.value.filter((record) => record.sessionId === sessionId)
+      : undefined;
+    const delta =
+      journal === undefined ? reported : openDeltaRecords(journal, sessionId, plan.planVersion);
+    const holders = journal?.filter((record) => record.status !== REVERTED_STATUS);
+
+    const restored: string[] = [];
+    const conflicts: string[] = [];
+    const skipped: string[] = [];
+    const failures: DeltaRollbackFailure[] = [];
+    const undone = new Set<string>();
+    // Each record's last known state: as listed, then as its restore returned it.
+    const latest = new Map<string, ModificationRecord>(delta.map((record) => [record.id, record]));
+    let handedToRestore = false;
+    const backupStillNeeded = (record: ModificationRecord): boolean =>
+      holders === undefined ||
+      holders.some(
+        (other) =>
+          other.id !== record.id && other.backupPath === record.backupPath && !undone.has(other.id),
+      );
+
+    for (const group of groupByFileLatestFirst(delta)) {
+      const ordered = callSync(() => orderRestorationChain(group), 'INTERNAL');
+      if (!ordered.ok) {
+        // No reverse order exists for this file's records, so none of them is read or written.
+        const { code } = ordered.error;
+        failures.push(...group.map((record) => ({ recordId: record.id, code })));
+        continue;
+      }
+      let stopped = false;
+      for (const record of ordered.value) {
+        if (stopped) {
+          skipped.push(record.id);
+          continue;
+        }
+        if (record.status === CONFLICT_STATUS) {
+          // Already a conflict: the file no longer holds this product's bytes, so nothing is
+          // written, the backup stays, and every earlier link of this file is unsatisfiable.
+          conflicts.push(record.id);
+          stopped = true;
+          continue;
+        }
+        const retainBackup = backupStillNeeded(record);
+        handedToRestore = true;
+        const outcome: Result<RestoreOutcome, DebuggenError> = await settle(
+          () => restoreModification(record, restoreContext, { retainBackup }),
+          'CLEANUP_PARTIAL',
+        );
+        if (!outcome.ok) {
+          failures.push({ recordId: record.id, code: outcome.error.code });
+          stopped = true;
+          continue;
+        }
+        latest.set(record.id, outcome.value.record);
+        const { kind } = outcome.value;
+        if (
+          kind === 'restored' ||
+          kind === 'already-original' ||
+          (kind === 'skipped' && outcome.value.record.status === REVERTED_STATUS)
+        ) {
+          restored.push(record.id);
+          undone.add(record.id);
+        } else if (kind === 'conflict') {
+          conflicts.push(record.id);
+          stopped = true;
+        } else {
+          skipped.push(record.id);
+          stopped = true;
+        }
+      }
+    }
+
+    // Where plan version n + 1's records ended up: the journal's own word once a restore may have
+    // moved one, and otherwise the first listing with each restore's returned record over it.
+    const known =
+      journal === undefined
+        ? [...latest.values()]
+        : journal
+            .filter((record) => record.planVersion === plan.planVersion)
+            .map((record) => latest.get(record.id) ?? record);
+    let records: readonly ModificationRecord[] = known;
+    if (handedToRestore) {
+      const relisted = await listSessionJournal(restoreContext, sessionId);
+      if (relisted.ok) {
+        records = relisted.value.filter(
+          (record) => record.sessionId === sessionId && record.planVersion === plan.planVersion,
+        );
+      }
+    }
+
+    return {
+      attempted: delta.length,
+      restored,
+      conflicts,
+      skipped,
+      failures,
+      journal: listed.ok ? 'listed' : 'unreadable',
+      ...(listed.ok ? {} : { journalCode: listed.error.code }),
+      records,
+    };
+  };
+
+  /**
+   * Mirrors the final states of plan version n + 1's records onto
+   * `SessionRecord.modifications` through `SessionManager.patch`, which
+   * broadcasts `session.updated` — the correction to the `instrumentation.ready`
+   * the service sent for them before the failure, since both user interfaces
+   * treat the record's modifications as the live journal. The records are
+   * upserted by id over a fresh read of the record
+   * ({@link mergeModificationRecords}); the patch writes no status.
+   *
+   * @returns Whether the patch landed. Never rejects: a failure is logged with
+   * its step and code only.
+   */
+  const mirrorDeltaRecords = async (
+    context: PipelineStageContext,
+    log: Logger,
+    records: readonly ModificationRecord[],
+  ): Promise<boolean> => {
+    const read = callSync(() => deps.sessions.get(context.sessionId), 'STORE_ERROR');
+    if (!read.ok || read.value === undefined) {
+      log.warn(DELTA_MIRROR_FAILED_LOG, {
+        step: 'read',
+        code: read.ok ? SESSION_NOT_FOUND_CODE : read.error.code,
+      });
+      return false;
+    }
+    const modifications = mergeModificationRecords(read.value.modifications, records);
+    const patched = await settle(
+      () => deps.sessionManager.patch(context.sessionId, { modifications }),
+      'STORE_ERROR',
+    );
+    if (!patched.ok) {
+      log.warn(DELTA_MIRROR_FAILED_LOG, { step: 'patch', code: patched.error.code });
+      return false;
+    }
+    return true;
+  };
+
+  /**
+   * Undoes an installed delta that cannot be kept, and composes the error the
+   * run fails with (AAP §0.4.2, Follow-up row: "reverse-restores the delta
+   * records applied so far and leaves the session at its previous plan
+   * version").
+   *
+   * The files first ({@link reverseRestoreDelta}), then — always, whatever the
+   * files did — `restoreArming` with plan version n, because the service
+   * already holds n + 1's widened hooks after an install that returned, and
+   * the next capture would otherwise arm them (or be refused for a version the
+   * ladder does not hold). Then, when any record of n + 1 was open, their final
+   * states are mirrored onto the session record ({@link mirrorDeltaRecords}).
+   * One log record states the outcome: `info` when the session stands exactly
+   * at version n again, `error` otherwise.
+   *
+   * @param context The run's stage context.
+   * @param log The run's logger.
+   * @param input The run's input; its readiness facts go on the restore context.
+   * @param previous Plan version n: the stored plan the session returns to.
+   * @param plan Plan version n + 1: the installed, unrecorded plan.
+   * @param installation The install's outcome, when it returned `Ok`: the
+   * fallback record set when the journal does not answer.
+   * @param trigger Which post-install failure is being compensated.
+   * @param original The failure itself.
+   * @param options A journal already opened for this compensation, and hint
+   * overrides; see {@link CompensationOptions}.
+   * @returns `original`'s code with its message plus one sentence stating what
+   * the project now holds ({@link describeDeltaRollback}), a registered hint
+   * repeating that sentence before the recovery for what remains
+   * ({@link compensatedHint}), `original`'s details with
+   * `deltaRollback` — and `activePlanVersion: n` only when nothing remains,
+   * any claim `original` made about the active version dropped otherwise —
+   * and `original` as the cause. Never rejects.
+   */
+  const compensateDelta = async (
+    context: PipelineStageContext,
+    log: Logger,
+    input: FollowUpStageInput,
+    previous: InstrumentationPlan,
+    plan: InstrumentationPlan,
+    installation: InstrumentationOutcome | undefined,
+    trigger: DeltaRollbackTrigger,
+    original: DebuggenError,
+    options: CompensationOptions = {},
+  ): Promise<DebuggenError> => {
+    let files: DeltaFilesReport;
+    try {
+      files = await reverseRestoreDelta(context, input, plan, installation, options.journal);
+    } catch (thrown) {
+      // A collaborator broke its never-throw contract mid-walk: nothing can be claimed restored.
+      const { code } = DebuggenError.from(thrown, 'INTERNAL');
+      const reported = openDeltaRecords(
+        installation?.applied ?? [],
+        context.sessionId,
+        plan.planVersion,
+      );
+      files = {
+        attempted: reported.length,
+        restored: [],
+        conflicts: [],
+        skipped: [],
+        failures: reported.map((record) => ({ recordId: record.id, code })),
+        journal: 'unreadable',
+        journalCode: code,
+        records: reported,
+      };
+    }
+
+    const armed = callSync(
+      () =>
+        deps.instrumentation.restoreArming({
+          sessionId: context.sessionId,
+          projectRoot: context.projectRoot,
+          plan: previous,
+        }),
+      'INTERNAL',
+    );
+
+    // The service announced n + 1's records as applied; the clients are told what became of them.
+    const mirrored =
+      files.records.length > 0 && (files.attempted > 0 || files.conflicts.length > 0)
+        ? await mirrorDeltaRecords(context, log, files.records)
+        : undefined;
+
+    const report: DeltaRollbackReport = {
+      ...files,
+      trigger,
+      arming: armed.ok ? 'restored' : 'failed',
+      ...(armed.ok ? {} : { armingCode: armed.error.code }),
+      ...(mirrored === undefined ? {} : { mirrored }),
+    };
+    const intact = isRollbackIntact(report);
+    const details = deltaRollbackDetails(report);
+
+    const fields: LogFields = {
+      planVersion: plan.planVersion,
+      previousPlanVersion: previous.planVersion,
+      code: original.code,
+      ...details,
+    };
+    if (intact) {
+      log.info(DELTA_ROLLED_BACK_LOG, fields);
+    } else {
+      log.error(DELTA_ROLLBACK_INCOMPLETE_LOG, fields);
+    }
+
+    const description = describeDeltaRollback(report, plan.planVersion, previous.planVersion);
+    const settledHint = options.settledHint ?? settledHintOf(original.hint);
+    const recovery = deltaRollbackHint(
+      report,
+      previous.planVersion,
+      settledHint,
+      options.standingHint,
+    );
+    return new DebuggenError(original.code, `${asSentence(original.message)} ${description}`, {
+      hint: compensatedHint(
+        description,
+        recovery,
+        isRecoveryProven(report, settledHint, options.standingHint),
+        original.code,
+      ),
+      details: {
+        ...carriedDetails(original),
+        ...(intact ? { [ACTIVE_PLAN_VERSION_KEY]: previous.planVersion } : {}),
+        deltaRollback: details,
+      },
+      cause: original,
+    });
+  };
+
+  /**
+   * Whether the plan version a failed `recordPlan` left on the ladder is this
+   * run's, recorded in full: the stored plan equals `plan`
+   * ({@link isSamePlanVersion}) and the session record's `plans` hold its
+   * version. Read only.
+   *
+   * @returns The stored record and plan, or the first {@link PlanCheck} that
+   * failed.
+   */
+  const confirmRecordedPlan = (
+    sessionId: string,
+    plan: InstrumentationPlan,
+  ): { readonly recorded: RecordedPlan } | { readonly check: PlanCheck } => {
+    const stored = callSync(
+      () => deps.sessions.getPlan(sessionId, plan.planVersion),
+      'STORE_ERROR',
+    );
+    if (!stored.ok) {
+      return { check: 'plan-unreadable' };
+    }
+    if (stored.value === undefined) {
+      return { check: 'plan-missing' };
+    }
+    if (!isSamePlanVersion(stored.value, plan)) {
+      return { check: 'plan-differs' };
+    }
+    const record = callSync(() => deps.sessions.get(sessionId), 'STORE_ERROR');
+    if (!record.ok || record.value === undefined) {
+      return { check: 'record-unreadable' };
+    }
+    if (!record.value.plans.some((entry) => entry.planVersion === plan.planVersion)) {
+      return { check: 'record-lacks-plan' };
+    }
+    return { recorded: { session: record.value, plan: stored.value } };
+  };
+
+  /**
+   * Settles a `recordPlan` failure after the delta was installed. The ladder is
+   * read again to learn whether the plan row landed:
+   *
+   * - **at n + 1, and recorded in full** — the stored plan is this run's and
+   *   the session record holds it ({@link confirmRecordedPlan}). `recordPlan`
+   *   writes both in one transaction, so only a failure after its commit (a
+   *   broadcast, say) gets here: the run rolls forward, logged at `warn`, and
+   *   completes with that record and plan;
+   * - **at n + 1 otherwise** — the record lacks it, a read fails, the plan
+   *   differs — the store disagrees with itself. The files and the arming state
+   *   are returned to n, which is what the record the capture stage arms from
+   *   holds, and the failure says a plan row remains ({@link planSplitError},
+   *   `details.planStored: true`, `recordMirrored: false`);
+   * - **at n, or unreadable** — the delta is compensated
+   *   ({@link compensateDelta}): when the ladder cannot be read, restoring the
+   *   files is the side that can never leave instrumentation the ladder does
+   *   not account for.
+   *
+   * A failed operation is never left at n + 1.
+   *
+   * @returns The recorded session and plan when the run rolls forward, or the
+   * compensated failure. Never rejects.
+   */
+  const settleUnrecordedPlan = async (
+    context: PipelineStageContext,
+    log: Logger,
+    input: FollowUpStageInput,
+    previous: InstrumentationPlan,
+    plan: InstrumentationPlan,
+    installation: InstrumentationOutcome,
+    error: DebuggenError,
+  ): Promise<Result<RecordedPlan, DebuggenError>> => {
+    const { sessionId } = context;
+    const reread = callSync(() => deps.sessions.latestPlanVersion(sessionId), 'STORE_ERROR');
+    const planStored: boolean | 'unknown' = !reread.ok
+      ? 'unknown'
+      : reread.value === plan.planVersion
+        ? true
+        : reread.value === previous.planVersion
+          ? false
+          : 'unknown';
+
+    let check: PlanCheck | undefined;
+    if (planStored === true) {
+      const confirmed = confirmRecordedPlan(sessionId, plan);
+      if ('recorded' in confirmed) {
+        log.warn(PLAN_RECORDED_DESPITE_REPORT_LOG, {
+          planVersion: plan.planVersion,
+          code: error.code,
+        });
+        return ok(confirmed.recorded);
+      }
+      check = confirmed.check;
+    }
+
+    log.error(UNRECORDED_PLAN_LOG, {
+      stage: PLAN_STAGE,
+      planVersion: plan.planVersion,
+      code: error.code,
+      planStored,
+      ...(check === undefined ? {} : { planCheck: check }),
+      ...(reread.ok ? {} : { rereadCode: reread.error.code }),
+    });
+
+    if (check !== undefined) {
+      const split = planSplitError(error, plan.planVersion, previous.planVersion, check);
+      return err(
+        await compensateDelta(
+          context,
+          log,
+          input,
+          previous,
+          plan,
+          installation,
+          'plan-unrecorded',
+          split,
+          { standingHint: split.hint },
+        ),
+      );
+    }
+    return err(
+      await compensateDelta(
+        context,
+        log,
+        input,
+        previous,
+        plan,
+        installation,
+        'plan-unrecorded',
+        annotate(error, { planStored }),
+      ),
+    );
+  };
+
+  /**
    * The new-capture path (`generated → planning → instrumenting → ready`):
    * plan version n + 1 is gated, the delta — and only the delta — is installed
    * by the instrumentation service, and the version is recorded once the
    * install has succeeded. A delta that fails part-way is reverse-restored by
-   * the installer itself and leaves the session at version n; nothing is
-   * rolled back here and nothing is recorded.
+   * the installer itself, which says so by naming version n as active — a claim
+   * the journal is listed to confirm; every other failure once the install was
+   * attempted — an unwind that left a record of n + 1 open, an install `Err`
+   * that names no version n, an `Ok` that left another version active, a plan
+   * version that could not be recorded — is compensated here
+   * ({@link compensateDelta}), so the files, the arming state and the ladder
+   * all stand at version n again. A `recordPlan` failure after both the plan
+   * row and the session record were stored rolls forward instead
+   * ({@link settleUnrecordedPlan}).
    */
   const runNewCapture = async (
     context: PipelineStageContext,
@@ -2365,31 +3559,83 @@ export function createFollowUpStage(deps: FollowUpStageDeps): FollowUpStage {
     };
     const installed = await settle(() => deps.instrumentation.install(request), 'INTERNAL');
     if (!installed.ok) {
-      return fail(context, log, state, installed.error, startedAt);
+      // The installer's own unwind names the previous version as the one left active — but the
+      // service stamps it on every failed install, even one whose rollback left a conflict, a
+      // failure or an unread journal. So the claim is checked: the journal is listed, read only and
+      // without the run's signal, and passed through unchanged only when no record of n + 1 is
+      // still open. Any other install error — one raised after the apply, or one naming no
+      // version — may have left the delta on disk. (No second install of this session can be
+      // running: the orchestrator serialises a session's operations.)
+      if (installed.error.details?.[ACTIVE_PLAN_VERSION_KEY] === previous.planVersion) {
+        const journal = await openDeltaJournal(context, input, plan);
+        const left = journal.listed.ok
+          ? openDeltaRecords(journal.listed.value, sessionId, plan.planVersion)
+          : undefined;
+        if (left !== undefined && left.length === 0) {
+          return fail(context, log, state, installed.error, startedAt);
+        }
+        // The installer's hint described what its unwind left; the compensation changes that, so
+        // a compensation that leaves nothing names the re-ask instead.
+        const unwound = await compensateDelta(
+          context,
+          log,
+          input,
+          previous,
+          plan,
+          undefined,
+          'install-unwind-incomplete',
+          installed.error,
+          { journal, settledHint: DELTA_REASK_HINT },
+        );
+        return fail(context, log, state, unwound, startedAt);
+      }
+      const compensated = await compensateDelta(
+        context,
+        log,
+        input,
+        previous,
+        plan,
+        undefined,
+        'install-failed',
+        installed.error,
+      );
+      return fail(context, log, state, compensated, startedAt);
     }
     const installation = installed.value;
     if (installation.activePlanVersion !== plan.planVersion) {
-      return fail(
+      const compensated = await compensateDelta(
         context,
         log,
-        state,
+        input,
+        previous,
+        plan,
+        installation,
+        'active-version-mismatch',
         activeVersionMismatchError(plan.planVersion, installation.activePlanVersion),
-        startedAt,
       );
+      return fail(context, log, state, compensated, startedAt);
     }
 
     // Recorded only now: a failed delta never advances the ladder the next follow-up builds on.
+    // The plan row and the session record are one transaction; a failure is settled — rolled
+    // forward when both hold this run's n + 1, compensated otherwise.
     enterDelegated(state, PLAN_STAGE);
-    const recorded = await settle(
+    const recording = await settle(
       () => deps.sessionManager.recordPlan(sessionId, plan),
       'STORE_ERROR',
     );
+    const recorded = recording.ok
+      ? recording
+      : await settleUnrecordedPlan(
+          context,
+          log,
+          input,
+          previous,
+          plan,
+          installation,
+          recording.error,
+        );
     if (!recorded.ok) {
-      log.error(UNRECORDED_PLAN_LOG, {
-        stage: PLAN_STAGE,
-        planVersion: plan.planVersion,
-        code: recorded.error.code,
-      });
       return fail(context, log, state, recorded.error, startedAt);
     }
     const recordedPlan = recorded.value.plan;
@@ -2465,8 +3711,15 @@ export function createFollowUpStage(deps: FollowUpStageDeps): FollowUpStage {
     const artifacts = loaded.value;
 
     // Recorded when asked, before any outcome exists; stored, never inspected.
+    // The attempt id decides whether this is a new follow-up or a retry of the
+    // failed one, recorded in its place.
     const asked = await settle(
-      () => deps.sessionManager.appendFollowUp(context.sessionId, input.followUpQuestion),
+      () =>
+        deps.sessionManager.appendFollowUp(
+          context.sessionId,
+          input.followUpQuestion,
+          input.attemptId,
+        ),
       'STORE_ERROR',
     );
     if (!asked.ok) {

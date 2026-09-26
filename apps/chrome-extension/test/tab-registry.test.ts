@@ -17,14 +17,33 @@
  *   a same-origin one keeps the binding and its running capture and answers
  *   "re-arm", a cross-origin one sends `session.unbind`, drops the record and
  *   pushes the "Tab left ‹origin›" state, whose text is `formatTabLeftMessage`.
+ *   A navigation to a URL the service cannot accept is handed over as the tab
+ *   id alone and unbinds a bound tab with `session.unbind` only — never a
+ *   `tab.navigated`, so the URL never leaves the worker.
  * - **Unbinding.** DevTools closing, the tab closing and the session ending
  *   all send `session.unbind` and clear the record.
+ * - **Unbind tombstones.** Every unbind is written ahead to its own storage key
+ *   before the frame is reported, survives a worker restart, and is re-sent
+ *   by `flushPendingUnbinds` until the service acknowledges it, a bind of the
+ *   tab the service *confirms* supersedes it, it exhausts its delivery count
+ *   (one count per connection), or — once delivered — its age limit.
+ *   `requestBind` sends the owed unbind ahead of the bind and holds the
+ *   tombstone back from this generation's flushes, never retiring it; a bind
+ *   lost, refused or rejected leaves it owed. A tombstone key that cannot be
+ *   read is retried and merged, never overwritten; a failed tombstone write is
+ *   retried until it lands. Malformed stored tombstones are dropped, never
+ *   cast.
  * - **Persistence through worker suspension.** A Manifest V3 service worker is
  *   evicted after about thirty seconds idle, so the bindings live in
  *   `chrome.storage.session`. The restart cases discard the registry, build a
  *   fresh one over the *same* storage record and prove the bindings — capture
  *   ids included — come back. Without that, suspension silently drops the
  *   session.
+ * - **Worker wiring.** The last cases compose the real `createWorker` over
+ *   in-memory fakes and prove `service-worker.ts` drives those paths: a bound
+ *   tab committing any document off the app — including one whose URL has no
+ *   reportable form — is unbound, and the tombstones an earlier worker left are
+ *   re-sent as soon as the socket opens.
  *
  * **Harness.** Collected by the root `vitest.config.ts` into the
  * `chrome-extension` project. The registry is built for injection
@@ -44,16 +63,32 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Mock } from 'vitest';
 
+import type { WebSocketConstructorLike, WebSocketLike, WsEventMapLike } from '@debuggen/protocol';
+import { noopLogger } from '@debuggen/shared';
+
+import { DEVTOOLS_TOKEN_STORAGE_KEY, STORED_CREDENTIAL_VERSION } from '../src/background/auth';
 import { workerError } from '../src/background/messages';
 import type {
   PortPushSink,
   ProtocolSend,
   TabBindingRecord,
   TabBindingSnapshot,
+  WorkerTimerApi,
 } from '../src/background/messages';
+import { createWorker } from '../src/background/service-worker';
+import type {
+  DebugGeneratorWorker,
+  WorkerEnvironment,
+  WorkerEvent,
+  WorkerTab,
+  WorkerTabChange,
+} from '../src/background/service-worker';
 import {
   BINDING_STORAGE_KEY,
+  MAX_UNBIND_TOMBSTONE_DELIVERIES,
   TAB_UNBIND_CAUSES,
+  UNBIND_TOMBSTONE_STORAGE_KEY,
+  UNBIND_TOMBSTONE_TTL_MS,
   createTabRegistry,
 } from '../src/background/tab-registry';
 import type {
@@ -63,6 +98,7 @@ import type {
   TabRegistryDeps,
   TabRegistryStorageArea,
   TabUnbindCause,
+  TabUnbindTombstone,
 } from '../src/background/tab-registry';
 import {
   EXTENSION_CHANNEL,
@@ -145,6 +181,14 @@ const SENT: SendResult = { ok: true, value: 'sent' };
 /** The transport's answer when it queued a frame while reconnecting. */
 const QUEUED: SendResult = { ok: true, value: 'queued' };
 
+/** The transport's answer when it refused a frame (the socket is closed). */
+function refusedSend(): SendResult {
+  return {
+    ok: false,
+    error: workerError('TRANSPORT_DISCONNECTED', 'The test transport is closed.'),
+  };
+}
+
 /** The instant the clock reports on its `reading`-th call (1-based). */
 function clockReading(reading: number): number {
   return CLOCK_START_MS + reading * CLOCK_STEP_MS;
@@ -182,11 +226,16 @@ class FakeSessionStorageArea implements TabRegistryStorageArea {
   readFailure: Error | undefined = undefined;
   /** When set, every `set` and `remove` rejects with it. */
   writeFailure: Error | undefined = undefined;
+  /** Per-key read failures: a `get` of a key listed here rejects with its error. */
+  readonly keyReadFailures = new Map<string, Error>();
+  /** Per-key write failures: a `set` or `remove` touching a key listed here rejects. */
+  readonly keyWriteFailures = new Map<string, Error>();
 
   get(keys: string): Promise<Record<string, unknown>> {
     this.reads += 1;
-    if (this.readFailure !== undefined) {
-      return Promise.reject(this.readFailure);
+    const failure = this.readFailure ?? this.keyReadFailures.get(keys);
+    if (failure !== undefined) {
+      return Promise.reject(failure);
     }
     return Promise.resolve(
       Object.hasOwn(this.items, keys) ? { [keys]: jsonClone(this.items[keys]) } : {},
@@ -195,8 +244,13 @@ class FakeSessionStorageArea implements TabRegistryStorageArea {
 
   set(items: Record<string, unknown>): Promise<void> {
     this.writes += 1;
-    if (this.writeFailure !== undefined) {
-      return Promise.reject(this.writeFailure);
+    const failure =
+      this.writeFailure ??
+      Object.keys(items)
+        .map((key) => this.keyWriteFailures.get(key))
+        .find((error) => error !== undefined);
+    if (failure !== undefined) {
+      return Promise.reject(failure);
     }
     for (const [key, value] of Object.entries(items)) {
       this.items[key] = jsonClone(value);
@@ -206,8 +260,9 @@ class FakeSessionStorageArea implements TabRegistryStorageArea {
 
   remove(keys: string): Promise<void> {
     this.writes += 1;
-    if (this.writeFailure !== undefined) {
-      return Promise.reject(this.writeFailure);
+    const failure = this.writeFailure ?? this.keyWriteFailures.get(keys);
+    if (failure !== undefined) {
+      return Promise.reject(failure);
     }
     delete this.items[keys];
     return Promise.resolve();
@@ -216,6 +271,11 @@ class FakeSessionStorageArea implements TabRegistryStorageArea {
   /** Whatever is stored under the registry's key, if anything. */
   stored(): unknown {
     return this.items[BINDING_STORAGE_KEY];
+  }
+
+  /** Whatever is stored under the registry's unbind tombstone key, if anything. */
+  storedTombstones(): unknown {
+    return this.items[UNBIND_TOMBSTONE_STORAGE_KEY];
   }
 }
 
@@ -252,9 +312,14 @@ function createRecordingLogger(): RecordingLogger {
   return logger;
 }
 
-/** A deterministic, strictly increasing clock: reading `n` is {@link clockReading}(n). */
-function createClock(): Mock<Clock> {
-  let readings = 0;
+/**
+ * A deterministic, strictly increasing clock: its reading `n` is
+ * {@link clockReading}(`readingsBefore + n`). A restarted worker whose clock
+ * must keep running past the earlier generation's — as the wall clock does —
+ * is built with `readingsBefore` set past the readings that generation took.
+ */
+function createClock(readingsBefore = 0): Mock<Clock> {
+  let readings = readingsBefore;
   return vi.fn<Clock>(() => {
     readings += 1;
     return clockReading(readings);
@@ -283,13 +348,17 @@ interface Harness {
  * Build one worker generation over `storage` — a fresh area by default, or
  * the area an earlier generation wrote to when simulating a worker restart.
  * Transport, panel sink, logger and clock are always new, as they are after a
- * real eviction.
+ * real eviction; `clockReadingsBefore` starts the clock past that many
+ * readings (see {@link createClock}).
  */
-function createHarness(storage: FakeSessionStorageArea = new FakeSessionStorageArea()): Harness {
+function createHarness(
+  storage: FakeSessionStorageArea = new FakeSessionStorageArea(),
+  clockReadingsBefore = 0,
+): Harness {
   const send = vi.fn<ProtocolSend>(() => SENT);
   const notify = vi.fn<PortPushSink>();
   const logger = createRecordingLogger();
-  const now = createClock();
+  const now = createClock(clockReadingsBefore);
   const registry = createTabRegistry({ storage, send, notify, logger, now });
   const changes: TabBindingChange[] = [];
   registry.onChange((change) => {
@@ -301,10 +370,12 @@ function createHarness(storage: FakeSessionStorageArea = new FakeSessionStorageA
 /**
  * Simulate the Manifest V3 worker being evicted and revived: the previous
  * registry (and its in-memory cache) is dropped, and a fresh one is built
- * over the same storage record.
+ * over the same storage record. `clockReadingsBefore` keeps the new clock
+ * running past the old one's readings, for a case that orders decisions of
+ * the two generations by time.
  */
-function restartWorker(previous: Harness): Harness {
-  return createHarness(previous.storage);
+function restartWorker(previous: Harness, clockReadingsBefore = 0): Harness {
+  return createHarness(previous.storage, clockReadingsBefore);
 }
 
 /** Forget what the fakes observed so far, keeping their implementations. */
@@ -984,8 +1055,9 @@ describe('persistence through chrome.storage.session', () => {
 
     expect(await revived.registry.getTabForSession(SESSION_ALPHA)).toBe(TAB_ONE);
     expect(await revived.registry.getBinding(TAB_ONE)).toStrictEqual(record);
-    // One read hydrates the new generation's cache; later reads are served from it.
-    expect(revived.storage.reads).toBe(readsBeforeRestart + 1);
+    // One hydration reads the new generation's caches — the binding key and the
+    // unbind tombstone key, once each; later reads are served from memory.
+    expect(revived.storage.reads).toBe(readsBeforeRestart + 2);
   });
 
   it('continues the same capture when the page reloads after the worker was revived', async () => {
@@ -1267,6 +1339,1025 @@ describe('handleNavigated — keep and re-arm, or unbind', () => {
   });
 });
 
+describe('unbind tombstones — an unbind outlives the worker that decided it', () => {
+  /** Make the transport answer `outcome` for every frame of one type, SENT otherwise. */
+  function answerFor(harness: Harness, type: string, outcome: () => SendResult): void {
+    harness.send.mockImplementation((sentType) => (sentType === type ? outcome() : SENT));
+  }
+
+  it('a cross-origin navigation queued while reconnecting leaves a tombstone a restarted worker flushes', async () => {
+    await confirmBinding(h, TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW);
+    h.send.mockReturnValue(QUEUED);
+
+    const decision = await h.registry.handleNavigated({ tabId: TAB_ONE, url: URL_B_LANDING });
+
+    expect(decision).toMatchObject({ kind: 'unbound-cross-origin', reported: true });
+    const pending: TabUnbindTombstone = {
+      tabId: TAB_ONE,
+      sessionId: SESSION_ALPHA,
+      cause: 'navigated-away',
+      createdAt: clockReading(2),
+      deliveries: 0,
+    };
+    // Queued is not a delivery: the frame only sits in the socket client's memory.
+    expect(h.storage.storedTombstones()).toStrictEqual([pending]);
+    expect(Object.hasOwn(h.storage.items, BINDING_STORAGE_KEY)).toBe(false);
+
+    // The worker is evicted, taking the socket client's queue with it.
+    const revived = restartWorker(h);
+    const resent = await revived.registry.flushPendingUnbinds();
+
+    expect(resent).toBe(1);
+    expect(sentFrames(revived)).toStrictEqual([
+      { type: 'session.unbind', payload: { tabId: TAB_ONE } },
+    ]);
+    expect(revived.storage.storedTombstones()).toStrictEqual([{ ...pending, deliveries: 1 }]);
+    expect(await revived.registry.listBindings()).toStrictEqual([]);
+    expect(revived.notify).not.toHaveBeenCalled();
+    expect(revived.changes).toStrictEqual([]);
+  });
+
+  it('writes the tombstone before the unbind frame is reported and before the record is dropped', async () => {
+    const record = await confirmBinding(h, TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW);
+    const atReport: { tombstones: unknown; bindings: unknown }[] = [];
+    h.send.mockImplementation((type) => {
+      if (type === 'session.unbind') {
+        atReport.push({
+          tombstones: jsonClone(h.storage.storedTombstones()),
+          bindings: jsonClone(h.storage.stored()),
+        });
+      }
+      return SENT;
+    });
+
+    await h.registry.handleNavigated({ tabId: TAB_ONE, url: URL_B_LANDING });
+
+    expect(atReport).toStrictEqual([
+      {
+        tombstones: [
+          {
+            tabId: TAB_ONE,
+            sessionId: SESSION_ALPHA,
+            cause: 'navigated-away',
+            createdAt: clockReading(2),
+            deliveries: 0,
+          },
+        ],
+        bindings: { [String(TAB_ONE)]: record },
+      },
+    ]);
+    // Handed to an open socket, the frame counts one delivery.
+    expect(h.storage.storedTombstones()).toMatchObject([{ tabId: TAB_ONE, deliveries: 1 }]);
+  });
+
+  it.each([...TAB_UNBIND_CAUSES])(
+    'the %s unbind persists a tombstone naming the session',
+    async (cause) => {
+      await confirmBinding(h, TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW);
+      h.send.mockReturnValue(QUEUED);
+
+      await h.registry.unbind(TAB_ONE, cause);
+
+      const expected: TabUnbindTombstone[] = [
+        {
+          tabId: TAB_ONE,
+          sessionId: SESSION_ALPHA,
+          cause,
+          createdAt: clockReading(2),
+          deliveries: 0,
+        },
+      ];
+      expect(h.storage.storedTombstones()).toStrictEqual(expected);
+    },
+  );
+
+  it('an ended session persists a session-ended tombstone for the tab that held it', async () => {
+    await confirmBinding(h, TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW);
+    h.send.mockReturnValue(QUEUED);
+
+    await h.registry.handleSessionEnded(SESSION_ALPHA);
+
+    expect(h.storage.storedTombstones()).toStrictEqual([
+      {
+        tabId: TAB_ONE,
+        sessionId: SESSION_ALPHA,
+        cause: 'session-ended',
+        createdAt: clockReading(2),
+        deliveries: 0,
+      },
+    ]);
+  });
+
+  it('DevTools closing on a tab with no record persists a tombstone naming no session', async () => {
+    await h.registry.unbind(TAB_UNKNOWN, 'devtools-closed');
+
+    expect(h.storage.storedTombstones()).toStrictEqual([
+      { tabId: TAB_UNKNOWN, cause: 'devtools-closed', createdAt: clockReading(1), deliveries: 1 },
+    ]);
+  });
+
+  it('closing a tab this worker never bound stores no tombstone', async () => {
+    await h.registry.unbind(TAB_UNKNOWN, 'tab-closed');
+
+    expect(Object.hasOwn(h.storage.items, UNBIND_TOMBSTONE_STORAGE_KEY)).toBe(false);
+    expect(await h.registry.flushPendingUnbinds()).toBe(0);
+    expect(h.send).not.toHaveBeenCalled();
+  });
+
+  it('a refused unbind keeps the tombstone as it was, and a later flush delivers it', async () => {
+    await confirmBinding(h, TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW);
+    answerFor(h, 'session.unbind', refusedSend);
+
+    await h.registry.unbind(TAB_ONE, 'tab-closed');
+
+    const pending: TabUnbindTombstone = {
+      tabId: TAB_ONE,
+      sessionId: SESSION_ALPHA,
+      cause: 'tab-closed',
+      createdAt: clockReading(2),
+      deliveries: 0,
+    };
+    expect(h.storage.storedTombstones()).toStrictEqual([pending]);
+
+    // Still refused: nothing handed over, nothing counted.
+    expect(await h.registry.flushPendingUnbinds()).toBe(0);
+    expect(h.storage.storedTombstones()).toStrictEqual([pending]);
+
+    h.send.mockImplementation(() => SENT);
+    resetObservations(h);
+    expect(await h.registry.flushPendingUnbinds()).toBe(1);
+    expect(sentFrames(h)).toStrictEqual([{ type: 'session.unbind', payload: { tabId: TAB_ONE } }]);
+    expect(h.storage.storedTombstones()).toStrictEqual([{ ...pending, deliveries: 1 }]);
+  });
+
+  it.each(['unbound', 'origin-changed', 'replaced'] as const)(
+    "the service's %s announcement acknowledges the tombstone although no record is held",
+    async (reason) => {
+      await confirmBinding(h, TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW);
+      await h.registry.unbind(TAB_ONE, 'devtools-closed');
+      expect(h.storage.storedTombstones()).toMatchObject([{ tabId: TAB_ONE }]);
+      resetObservations(h);
+
+      const outcome = unwrap(
+        await h.registry.applyBound(bound(TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW, reason)),
+      );
+
+      // The outcome stays 'ignored' — there is no record to drop — but the intent is settled.
+      expect(outcome).toStrictEqual({ kind: 'ignored', reason });
+      expect(Object.hasOwn(h.storage.items, UNBIND_TOMBSTONE_STORAGE_KEY)).toBe(false);
+      expect(h.notify).not.toHaveBeenCalled();
+      expect(h.changes).toStrictEqual([]);
+      expect(await h.registry.flushPendingUnbinds()).toBe(0);
+      expect(h.send).not.toHaveBeenCalled();
+    },
+  );
+
+  it('an acknowledgement for another session of the tab keeps the tombstone', async () => {
+    await confirmBinding(h, TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW);
+    await h.registry.unbind(TAB_ONE, 'tab-closed');
+
+    await h.registry.applyBound(bound(TAB_ONE, SESSION_BETA, URL_A_OVERVIEW, 'unbound'));
+
+    expect(h.storage.storedTombstones()).toMatchObject([
+      { tabId: TAB_ONE, sessionId: SESSION_ALPHA },
+    ]);
+  });
+
+  it('a tombstone naming no session is acknowledged by a drop for any session of the tab', async () => {
+    await h.registry.unbind(TAB_UNKNOWN, 'devtools-closed');
+
+    await h.registry.applyBound(bound(TAB_UNKNOWN, SESSION_BETA, URL_A_OVERVIEW, 'unbound'));
+
+    expect(Object.hasOwn(h.storage.items, UNBIND_TOMBSTONE_STORAGE_KEY)).toBe(false);
+  });
+
+  /**
+   * Bind `TAB_ONE` to `SESSION_ALPHA`, then navigate it off the origin while
+   * the socket reconnects, so its unbind is only queued: the tombstone it
+   * leaves (created at the clock's second reading) has no delivery yet.
+   */
+  async function leaveWhileReconnecting(harness: Harness): Promise<TabUnbindTombstone> {
+    await confirmBinding(harness, TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW);
+    harness.send.mockReturnValue(QUEUED);
+    await harness.registry.handleNavigated({ tabId: TAB_ONE, url: URL_B_LANDING });
+    const pending: TabUnbindTombstone = {
+      tabId: TAB_ONE,
+      sessionId: SESSION_ALPHA,
+      cause: 'navigated-away',
+      createdAt: clockReading(2),
+      deliveries: 0,
+    };
+    expect(harness.storage.storedTombstones()).toStrictEqual([pending]);
+    return pending;
+  }
+
+  /** The panel asks to bind `TAB_ONE` again, on its original origin. */
+  function rebindTabOne(harness: Harness): ReturnType<TabRegistry['requestBind']> {
+    return harness.registry.requestBind({ tabId: TAB_ONE, url: URL_A_OVERVIEW, origin: ORIGIN_A });
+  }
+
+  it('requestBind of a tab holding a tombstone sends session.unbind, then session.bind, and keeps the tombstone', async () => {
+    const pending = await leaveWhileReconnecting(h);
+    resetObservations(h);
+    const atBind: unknown[] = [];
+    h.send.mockImplementation((type) => {
+      if (type === 'session.bind') {
+        atBind.push(jsonClone(h.storage.storedTombstones()));
+      }
+      return SENT;
+    });
+
+    const result = await rebindTabOne(h);
+
+    expect(unwrap(result)).toBe('sent');
+    // The owed unbind leaves first, so the FIFO transport delivers it ahead of the bind.
+    expect(sentFrames(h)).toStrictEqual([
+      { type: 'session.unbind', payload: { tabId: TAB_ONE } },
+      { type: 'session.bind', payload: { tabId: TAB_ONE, url: URL_A_OVERVIEW, origin: ORIGIN_A } },
+    ]);
+    // Asking supersedes nothing: the tombstone is stored when the bind leaves and after,
+    // with the unbind's hand-off to the open socket counted.
+    const delivered: TabUnbindTombstone = { ...pending, deliveries: 1 };
+    expect(atBind).toStrictEqual([[delivered]]);
+    expect(h.storage.storedTombstones()).toStrictEqual([delivered]);
+    expect(await h.registry.listBindings()).toStrictEqual([]);
+  });
+
+  it('the binding the service then confirms for the tab retires the tombstone', async () => {
+    await leaveWhileReconnecting(h);
+    h.send.mockReturnValue(SENT);
+    await rebindTabOne(h);
+    expect(h.storage.storedTombstones()).toMatchObject([{ tabId: TAB_ONE }]);
+
+    const record = await confirmBinding(h, TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW);
+
+    expect(record).toMatchObject({ tabId: TAB_ONE, sessionId: SESSION_ALPHA });
+    expect(Object.hasOwn(h.storage.items, UNBIND_TOMBSTONE_STORAGE_KEY)).toBe(false);
+    // Neither this generation nor the next has anything left to end the new binding with.
+    resetObservations(h);
+    expect(await h.registry.flushPendingUnbinds()).toBe(0);
+    const revived = restartWorker(h);
+    expect(await revived.registry.flushPendingUnbinds()).toBe(0);
+    expect(h.send).not.toHaveBeenCalled();
+    expect(revived.send).not.toHaveBeenCalled();
+  });
+
+  it('a flush in the same generation after that requestBind sends nothing for the tab, and still sends the rest', async () => {
+    await confirmBinding(h, TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW);
+    await confirmBinding(h, TAB_TWO, SESSION_BETA, URL_A_SETTINGS);
+    h.send.mockReturnValue(QUEUED);
+    await h.registry.handleNavigated({ tabId: TAB_ONE, url: URL_B_LANDING });
+    await h.registry.unbind(TAB_TWO, 'tab-closed');
+    await rebindTabOne(h);
+    resetObservations(h);
+    h.send.mockReturnValue(SENT);
+
+    expect(await h.registry.flushPendingUnbinds()).toBe(1);
+
+    // Flushed now, TAB_ONE's unbind would follow its pending bind and end it.
+    expect(sentFrames(h)).toStrictEqual([{ type: 'session.unbind', payload: { tabId: TAB_TWO } }]);
+    // Held back, not retired.
+    expect(h.storage.storedTombstones()).toMatchObject([
+      { tabId: TAB_ONE, deliveries: 0 },
+      { tabId: TAB_TWO, deliveries: 1 },
+    ]);
+  });
+
+  it("a queued bind lost with the worker: the next generation's flush re-sends the unbind", async () => {
+    const pending = await leaveWhileReconnecting(h);
+
+    // Unbind and bind both wait in the socket client's queue …
+    expect(unwrap(await rebindTabOne(h))).toBe('queued');
+    expect(await h.registry.flushPendingUnbinds()).toBe(0);
+
+    // … which the eviction discards, together with the mark that held the tombstone back.
+    const revived = restartWorker(h);
+    expect(await revived.registry.flushPendingUnbinds()).toBe(1);
+
+    expect(sentFrames(revived)).toStrictEqual([
+      { type: 'session.unbind', payload: { tabId: TAB_ONE } },
+    ]);
+    expect(revived.storage.storedTombstones()).toStrictEqual([{ ...pending, deliveries: 1 }]);
+  });
+
+  it('a bind the transport refuses leaves the tombstone flushable in the same generation', async () => {
+    await confirmBinding(h, TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW);
+    h.send.mockReturnValue(QUEUED);
+    await h.registry.unbind(TAB_ONE, 'devtools-closed');
+    answerFor(h, 'session.bind', refusedSend);
+    resetObservations(h);
+
+    const result = await rebindTabOne(h);
+
+    expect(result).toMatchObject({ ok: false, error: { code: 'TRANSPORT_DISCONNECTED' } });
+    expect(sentFrames(h).map((frame) => frame.type)).toStrictEqual([
+      'session.unbind',
+      'session.bind',
+    ]);
+    expect(h.storage.storedTombstones()).toMatchObject([
+      { tabId: TAB_ONE, cause: 'devtools-closed', deliveries: 1 },
+    ]);
+
+    // No bind is pending, so nothing holds the tombstone back.
+    h.send.mockImplementation(() => SENT);
+    resetObservations(h);
+    expect(await h.registry.flushPendingUnbinds()).toBe(1);
+    expect(sentFrames(h)).toStrictEqual([{ type: 'session.unbind', payload: { tabId: TAB_ONE } }]);
+    expect(h.storage.storedTombstones()).toMatchObject([{ tabId: TAB_ONE, deliveries: 2 }]);
+  });
+
+  it('a refused owed unbind withholds the bind, which would otherwise leave unordered', async () => {
+    await confirmBinding(h, TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW);
+    h.send.mockReturnValue(QUEUED);
+    await h.registry.unbind(TAB_ONE, 'tab-closed');
+    const pending = h.storage.storedTombstones();
+    h.send.mockImplementation(refusedSend);
+    resetObservations(h);
+
+    const result = await rebindTabOne(h);
+
+    expect(result).toMatchObject({ ok: false, error: { code: 'TRANSPORT_DISCONNECTED' } });
+    expect(sentFrames(h).map((frame) => frame.type)).toStrictEqual(['session.unbind']);
+    expect(h.storage.storedTombstones()).toStrictEqual(pending);
+
+    h.send.mockImplementation(() => SENT);
+    resetObservations(h);
+    expect(await h.registry.flushPendingUnbinds()).toBe(1);
+    expect(sentFrames(h)).toStrictEqual([{ type: 'session.unbind', payload: { tabId: TAB_ONE } }]);
+  });
+
+  it('a bind the service rejects — no session.bound arrives — keeps the tombstone owed', async () => {
+    await leaveWhileReconnecting(h);
+    h.send.mockReturnValue(SENT);
+    expect(unwrap(await rebindTabOne(h))).toBe('sent');
+
+    // The service's refusal is an `error` frame the registry never sees: nothing is recorded.
+    expect(await h.registry.listBindings()).toStrictEqual([]);
+    expect(h.storage.storedTombstones()).toMatchObject([
+      { tabId: TAB_ONE, sessionId: SESSION_ALPHA, deliveries: 1 },
+    ]);
+
+    // On the next connection the flush still holds it back, and the panel's next
+    // request sends the unbind ahead of that bind as well — one count for the new epoch.
+    expect(await h.registry.flushPendingUnbinds()).toBe(0);
+    resetObservations(h);
+    await rebindTabOne(h);
+    expect(sentFrames(h).map((frame) => frame.type)).toStrictEqual([
+      'session.unbind',
+      'session.bind',
+    ]);
+    expect(h.storage.storedTombstones()).toMatchObject([{ tabId: TAB_ONE, deliveries: 2 }]);
+  });
+
+  it('counts one delivery per epoch, however often requestBind re-sends the unbind on one connection', async () => {
+    await confirmBinding(h, TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW);
+    h.send.mockReturnValue(QUEUED);
+    await h.registry.unbind(TAB_ONE, 'devtools-closed');
+    h.send.mockReturnValue(SENT);
+    resetObservations(h);
+
+    for (let attempt = 0; attempt <= MAX_UNBIND_TOMBSTONE_DELIVERIES; attempt += 1) {
+      await rebindTabOne(h);
+    }
+
+    const unbinds = sentFrames(h).filter((frame) => frame.type === 'session.unbind');
+    expect(unbinds).toHaveLength(MAX_UNBIND_TOMBSTONE_DELIVERIES + 1);
+    expect(h.storage.storedTombstones()).toMatchObject([{ tabId: TAB_ONE, deliveries: 1 }]);
+  });
+
+  it('closing a tab while its bind is pending over a tombstone sends the unbind now, flushable', async () => {
+    await leaveWhileReconnecting(h);
+    await rebindTabOne(h);
+    h.send.mockReturnValue(SENT);
+    resetObservations(h);
+
+    const removed = await h.registry.unbind(TAB_ONE, 'tab-closed');
+
+    expect(removed).toBeUndefined();
+    // Sent after the pending bind, it ends that bind if the service applies it.
+    expect(sentFrames(h)).toStrictEqual([{ type: 'session.unbind', payload: { tabId: TAB_ONE } }]);
+    expect(h.storage.storedTombstones()).toStrictEqual([
+      { tabId: TAB_ONE, cause: 'tab-closed', createdAt: clockReading(3), deliveries: 1 },
+    ]);
+    resetObservations(h);
+    expect(await h.registry.flushPendingUnbinds()).toBe(1);
+    expect(sentFrames(h)).toStrictEqual([{ type: 'session.unbind', payload: { tabId: TAB_ONE } }]);
+  });
+
+  it('an invalid bind request leaves the tombstone untouched', async () => {
+    await confirmBinding(h, TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW);
+    await h.registry.unbind(TAB_ONE, 'tab-closed');
+    const pending = h.storage.storedTombstones();
+    const writes = h.storage.writes;
+
+    await h.registry.requestBind({ tabId: TAB_ONE, url: URL_A_OVERVIEW, origin: `${ORIGIN_A}/` });
+
+    expect(h.storage.storedTombstones()).toStrictEqual(pending);
+    expect(h.storage.writes).toBe(writes);
+  });
+
+  it('a binding the service records for the tab supersedes its tombstone', async () => {
+    await h.registry.unbind(TAB_ONE, 'devtools-closed');
+    expect(h.storage.storedTombstones()).toMatchObject([{ tabId: TAB_ONE }]);
+
+    const record = await confirmBinding(h, TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW);
+
+    expect(record).toMatchObject({ tabId: TAB_ONE, sessionId: SESSION_ALPHA });
+    expect(Object.hasOwn(h.storage.items, UNBIND_TOMBSTONE_STORAGE_KEY)).toBe(false);
+    resetObservations(h);
+    expect(await h.registry.flushPendingUnbinds()).toBe(0);
+    expect(h.send).not.toHaveBeenCalled();
+  });
+
+  it(`retires an unacknowledged tombstone after ${String(MAX_UNBIND_TOMBSTONE_DELIVERIES)} sent deliveries`, async () => {
+    await confirmBinding(h, TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW);
+    // The unbind itself is the first delivery to the open socket.
+    await h.registry.unbind(TAB_ONE, 'tab-closed');
+    expect(h.storage.storedTombstones()).toMatchObject([{ tabId: TAB_ONE, deliveries: 1 }]);
+
+    for (let delivered = 2; delivered <= MAX_UNBIND_TOMBSTONE_DELIVERIES; delivered += 1) {
+      expect(await h.registry.flushPendingUnbinds()).toBe(1);
+    }
+
+    expect(Object.hasOwn(h.storage.items, UNBIND_TOMBSTONE_STORAGE_KEY)).toBe(false);
+    resetObservations(h);
+    expect(await h.registry.flushPendingUnbinds()).toBe(0);
+    expect(h.send).not.toHaveBeenCalled();
+  });
+
+  it('does not count frames queued while reconnecting as deliveries', async () => {
+    await confirmBinding(h, TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW);
+    h.send.mockReturnValue(QUEUED);
+    await h.registry.unbind(TAB_ONE, 'tab-closed');
+
+    for (let flush = 0; flush <= MAX_UNBIND_TOMBSTONE_DELIVERIES; flush += 1) {
+      expect(await h.registry.flushPendingUnbinds()).toBe(1);
+    }
+
+    expect(h.storage.storedTombstones()).toMatchObject([{ tabId: TAB_ONE, deliveries: 0 }]);
+  });
+
+  it('a never-delivered tombstone older than the TTL is still flushed', async () => {
+    await confirmBinding(h, TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW);
+    h.send.mockReturnValue(QUEUED);
+    await h.registry.unbind(TAB_ONE, 'tab-closed');
+    const createdAt = clockReading(2);
+    resetObservations(h);
+
+    // Only ever queued, it has told the service nothing: age alone never retires it.
+    h.now.mockReturnValueOnce(createdAt + 2 * UNBIND_TOMBSTONE_TTL_MS);
+    expect(await h.registry.flushPendingUnbinds()).toBe(1);
+    expect(sentFrames(h)).toStrictEqual([{ type: 'session.unbind', payload: { tabId: TAB_ONE } }]);
+    expect(h.storage.storedTombstones()).toMatchObject([
+      { tabId: TAB_ONE, createdAt, deliveries: 0 },
+    ]);
+
+    // It survives a restart just as long, and its first open socket delivers it.
+    const revived = restartWorker(h);
+    revived.now.mockReturnValueOnce(createdAt + 2 * UNBIND_TOMBSTONE_TTL_MS);
+    expect(await revived.registry.flushPendingUnbinds()).toBe(1);
+    expect(revived.storage.storedTombstones()).toMatchObject([
+      { tabId: TAB_ONE, createdAt, deliveries: 1 },
+    ]);
+  });
+
+  it('a delivered tombstone older than the TTL is retired', async () => {
+    await confirmBinding(h, TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW);
+    // Handed to the open socket, the unbind itself is the first delivery.
+    await h.registry.unbind(TAB_ONE, 'tab-closed');
+    const createdAt = clockReading(2);
+    expect(h.storage.storedTombstones()).toMatchObject([{ tabId: TAB_ONE, deliveries: 1 }]);
+    resetObservations(h);
+
+    h.now.mockReturnValueOnce(createdAt + UNBIND_TOMBSTONE_TTL_MS - 1);
+    expect(await h.registry.flushPendingUnbinds()).toBe(1);
+    expect(h.storage.storedTombstones()).toMatchObject([
+      { tabId: TAB_ONE, createdAt, deliveries: 2 },
+    ]);
+
+    resetObservations(h);
+    h.now.mockReturnValueOnce(createdAt + UNBIND_TOMBSTONE_TTL_MS);
+    expect(await h.registry.flushPendingUnbinds()).toBe(0);
+    expect(h.send).not.toHaveBeenCalled();
+    expect(Object.hasOwn(h.storage.items, UNBIND_TOMBSTONE_STORAGE_KEY)).toBe(false);
+  });
+
+  it('flushes pending unbinds oldest first', async () => {
+    await confirmBinding(h, TAB_TWO, SESSION_BETA, URL_A_SETTINGS);
+    await confirmBinding(h, TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW);
+    h.send.mockReturnValue(QUEUED);
+    await h.registry.unbind(TAB_TWO, 'tab-closed');
+    await h.registry.handleNavigated({ tabId: TAB_ONE, url: URL_B_LANDING });
+    resetObservations(h);
+
+    expect(await h.registry.flushPendingUnbinds()).toBe(2);
+
+    expect(sentFrames(h)).toStrictEqual([
+      { type: 'session.unbind', payload: { tabId: TAB_TWO } },
+      { type: 'session.unbind', payload: { tabId: TAB_ONE } },
+    ]);
+  });
+
+  it('with nothing pending, a flush sends nothing and writes nothing', async () => {
+    expect(await h.registry.flushPendingUnbinds()).toBe(0);
+
+    expect(h.send).not.toHaveBeenCalled();
+    expect(h.storage.writes).toBe(0);
+    expect(h.now).not.toHaveBeenCalled();
+  });
+
+  it('a newer unbind of the same tab replaces its tombstone', async () => {
+    h.send.mockReturnValue(QUEUED);
+    await h.registry.unbind(TAB_ONE, 'devtools-closed');
+    await confirmBinding(h, TAB_TWO, SESSION_BETA, URL_A_SETTINGS);
+    await h.registry.unbind(TAB_ONE, 'devtools-closed');
+
+    expect(h.storage.storedTombstones()).toStrictEqual([
+      { tabId: TAB_ONE, cause: 'devtools-closed', createdAt: clockReading(3), deliveries: 0 },
+    ]);
+  });
+
+  it('drops malformed stored tombstones on reload and writes the cleaned list back', async () => {
+    const valid: TabUnbindTombstone = {
+      tabId: TAB_ONE,
+      sessionId: SESSION_ALPHA,
+      cause: 'navigated-away',
+      createdAt: clockReading(4),
+      deliveries: 1,
+    };
+    h.storage.items[UNBIND_TOMBSTONE_STORAGE_KEY] = [
+      valid,
+      // Not a tab id.
+      { ...valid, tabId: -1 },
+      // A cause outside the vocabulary.
+      { ...valid, tabId: TAB_TWO, cause: 'navigated' },
+      // An empty session id.
+      { ...valid, tabId: TAB_TWO, sessionId: '' },
+      // A fractional delivery count.
+      { ...valid, tabId: TAB_TWO, deliveries: 1.5 },
+      // No creation stamp.
+      { tabId: TAB_TWO, cause: 'tab-closed', deliveries: 0 },
+      // Not a record at all.
+      'not-a-tombstone',
+      // A second, older tombstone for the same tab.
+      { ...valid, createdAt: clockReading(1) },
+    ];
+
+    expect(await h.registry.reload()).toStrictEqual([]);
+
+    expect(h.storage.storedTombstones()).toStrictEqual([valid]);
+    expect(await h.registry.flushPendingUnbinds()).toBe(1);
+    expect(sentFrames(h)).toStrictEqual([{ type: 'session.unbind', payload: { tabId: TAB_ONE } }]);
+  });
+
+  it('drops a stored tombstone value that is not a list', async () => {
+    h.storage.items[UNBIND_TOMBSTONE_STORAGE_KEY] = { [String(TAB_ONE)]: 'not-a-list' };
+
+    await h.registry.reload();
+
+    expect(Object.hasOwn(h.storage.items, UNBIND_TOMBSTONE_STORAGE_KEY)).toBe(false);
+    expect(await h.registry.flushPendingUnbinds()).toBe(0);
+    expect(h.send).not.toHaveBeenCalled();
+  });
+
+  it('hydration lets the later decision win when a crash left a tab with a record and a tombstone', async () => {
+    const endedByTombstone: TabBindingRecord = {
+      tabId: TAB_ONE,
+      sessionId: SESSION_ALPHA,
+      url: URL_A_OVERVIEW,
+      origin: ORIGIN_A,
+      boundAt: clockReading(1),
+    };
+    const newerThanItsTombstone: TabBindingRecord = {
+      tabId: TAB_TWO,
+      sessionId: SESSION_BETA,
+      url: URL_A_SETTINGS,
+      origin: ORIGIN_A,
+      boundAt: clockReading(5),
+    };
+    const unbindAfterBind: TabUnbindTombstone = {
+      tabId: TAB_ONE,
+      sessionId: SESSION_ALPHA,
+      cause: 'navigated-away',
+      createdAt: clockReading(2),
+      deliveries: 0,
+    };
+    h.storage.items[BINDING_STORAGE_KEY] = {
+      [String(TAB_ONE)]: endedByTombstone,
+      [String(TAB_TWO)]: newerThanItsTombstone,
+    };
+    h.storage.items[UNBIND_TOMBSTONE_STORAGE_KEY] = [
+      unbindAfterBind,
+      {
+        tabId: TAB_TWO,
+        sessionId: SESSION_BETA,
+        cause: 'tab-closed',
+        createdAt: clockReading(3),
+        deliveries: 0,
+      },
+    ];
+
+    expect(await h.registry.reload()).toStrictEqual([newerThanItsTombstone]);
+
+    expect(h.storage.stored()).toStrictEqual({ [String(TAB_TWO)]: newerThanItsTombstone });
+    expect(h.storage.storedTombstones()).toStrictEqual([unbindAfterBind]);
+    expect(h.send).not.toHaveBeenCalled();
+    expect(h.changes).toStrictEqual([]);
+  });
+
+  /** What the registry logs, code alone, each time the tombstone key cannot be read. */
+  const TOMBSTONE_READ_FAILED =
+    'Unbind tombstones could not be read from session storage; the read is retried on the next operation';
+
+  /** What the registry logs, code alone, each time the tombstone list cannot be written. */
+  const TOMBSTONE_WRITE_FAILED =
+    'Unbind tombstones could not be written to session storage; kept in memory and retried on the next operation';
+
+  /** Make every read of the tombstone key reject, as an unavailable storage area does. */
+  function failTombstoneReads(storage: FakeSessionStorageArea): void {
+    storage.keyReadFailures.set(
+      UNBIND_TOMBSTONE_STORAGE_KEY,
+      new Error('session storage unavailable'),
+    );
+  }
+
+  /** Make every write of the tombstone key reject, as a full storage area does. */
+  function failTombstoneWrites(storage: FakeSessionStorageArea): void {
+    storage.keyWriteFailures.set(
+      UNBIND_TOMBSTONE_STORAGE_KEY,
+      new Error('session storage quota exceeded'),
+    );
+  }
+
+  it('a transient tombstone read failure is retried on the next operation; the stored tombstone is neither lost nor clobbered', async () => {
+    const record = await confirmBinding(h, TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW);
+    await confirmBinding(h, TAB_TWO, SESSION_BETA, URL_A_SETTINGS);
+    h.send.mockReturnValue(QUEUED);
+    await h.registry.unbind(TAB_TWO, 'tab-closed');
+    const stored: TabUnbindTombstone = {
+      tabId: TAB_TWO,
+      sessionId: SESSION_BETA,
+      cause: 'tab-closed',
+      createdAt: clockReading(3),
+      deliveries: 0,
+    };
+    expect(h.storage.storedTombstones()).toStrictEqual([stored]);
+
+    // The next generation's clock runs on past this one's three readings.
+    const revived = restartWorker(h, 3);
+    failTombstoneReads(revived.storage);
+    revived.send.mockReturnValue(QUEUED);
+    expect(await revived.registry.reload()).toStrictEqual([record]);
+    expect(revived.logger.entries).toContainEqual({
+      level: 'error',
+      message: TOMBSTONE_READ_FAILED,
+      fields: { code: 'STORE_ERROR', inMemory: 0 },
+    });
+
+    // Decided while the key is unreadable: the unbind still leaves and the record
+    // still goes, but nothing is written over the stored list this worker has not read.
+    await revived.registry.unbind(TAB_ONE, 'tab-closed');
+    expect(sentFrames(revived)).toStrictEqual([
+      { type: 'session.unbind', payload: { tabId: TAB_ONE } },
+    ]);
+    expect(await revived.registry.getBinding(TAB_ONE)).toBeUndefined();
+    expect(revived.storage.storedTombstones()).toStrictEqual([stored]);
+
+    // Storage recovers: the very next operation reads the key, merges it under the
+    // newer in-memory intent and writes both through.
+    revived.storage.keyReadFailures.clear();
+    expect(await revived.registry.listBindings()).toStrictEqual([]);
+    const decidedMeanwhile: TabUnbindTombstone = {
+      tabId: TAB_ONE,
+      sessionId: SESSION_ALPHA,
+      cause: 'tab-closed',
+      createdAt: clockReading(4),
+      deliveries: 0,
+    };
+    expect(revived.storage.storedTombstones()).toStrictEqual([stored, decidedMeanwhile]);
+
+    resetObservations(revived);
+    revived.send.mockReturnValue(SENT);
+    expect(await revived.registry.flushPendingUnbinds()).toBe(2);
+    expect(sentFrames(revived)).toStrictEqual([
+      { type: 'session.unbind', payload: { tabId: TAB_TWO } },
+      { type: 'session.unbind', payload: { tabId: TAB_ONE } },
+    ]);
+  });
+
+  it('a binding the service confirms while the key is unreadable outranks the stored tombstone read later', async () => {
+    await leaveWhileReconnecting(h);
+    const revived = restartWorker(h, 2);
+    failTombstoneReads(revived.storage);
+    expect(await revived.registry.reload()).toStrictEqual([]);
+
+    // The tombstone is unknown, so the bind leaves alone — and the service confirms it.
+    expect(unwrap(await rebindTabOne(revived))).toBe('sent');
+    expect(sentFrames(revived).map((frame) => frame.type)).toStrictEqual(['session.bind']);
+    const record = await confirmBinding(revived, TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW);
+
+    revived.storage.keyReadFailures.clear();
+    resetObservations(revived);
+    expect(await revived.registry.flushPendingUnbinds()).toBe(0);
+
+    // The confirmed bind is the newer decision: the stale intent is neither sent nor kept.
+    expect(revived.send).not.toHaveBeenCalled();
+    expect(Object.hasOwn(revived.storage.items, UNBIND_TOMBSTONE_STORAGE_KEY)).toBe(false);
+    expect(await revived.registry.getBinding(TAB_ONE)).toStrictEqual(record);
+  });
+
+  it('a bind requested while the key is unreadable holds back the stored tombstone read later', async () => {
+    const pending = await leaveWhileReconnecting(h);
+    const revived = restartWorker(h, 2);
+    failTombstoneReads(revived.storage);
+    await revived.registry.reload();
+    expect(unwrap(await rebindTabOne(revived))).toBe('sent');
+
+    // Readable again before any answer to that bind: the stored tombstone is merged,
+    // but flushed now it would follow the pending bind and end it.
+    revived.storage.keyReadFailures.clear();
+    resetObservations(revived);
+    expect(await revived.registry.flushPendingUnbinds()).toBe(0);
+    expect(revived.send).not.toHaveBeenCalled();
+    expect(revived.storage.storedTombstones()).toStrictEqual([pending]);
+
+    // The panel's next request sends the owed unbind ahead of its bind.
+    await rebindTabOne(revived);
+    expect(sentFrames(revived).map((frame) => frame.type)).toStrictEqual([
+      'session.unbind',
+      'session.bind',
+    ]);
+  });
+
+  it.each([
+    [
+      'navigated-away',
+      {
+        kind: 'tab-left',
+        origin: ORIGIN_A,
+        sessionId: SESSION_ALPHA,
+        reason: 'origin-changed',
+      } satisfies PanelBindingState,
+      'origin-changed',
+      undefined,
+    ],
+    ['tab-closed', { kind: 'unbound' } satisfies PanelBindingState, 'unbound', 'tab-closed'],
+  ] as const)(
+    'a %s tombstone read back late ends the record it outranks, and announces it',
+    async (cause, state, reason, changeCause) => {
+      const record: TabBindingRecord = {
+        tabId: TAB_ONE,
+        sessionId: SESSION_ALPHA,
+        url: URL_A_OVERVIEW,
+        origin: ORIGIN_A,
+        boundAt: clockReading(1),
+      };
+      const tombstone: TabUnbindTombstone = {
+        tabId: TAB_ONE,
+        sessionId: SESSION_ALPHA,
+        cause,
+        createdAt: clockReading(2),
+        deliveries: 0,
+      };
+      h.storage.items[BINDING_STORAGE_KEY] = { [String(TAB_ONE)]: record };
+      h.storage.items[UNBIND_TOMBSTONE_STORAGE_KEY] = [tombstone];
+      failTombstoneReads(h.storage);
+
+      // A worker died between writing the tombstone and dropping the record; with the
+      // tombstone unreadable, the record is all this generation can see.
+      expect(await h.registry.reload()).toStrictEqual([record]);
+      expect(await h.registry.getPanelBindingState(TAB_ONE)).toMatchObject({ kind: 'bound' });
+
+      h.storage.keyReadFailures.clear();
+
+      // The later decision wins, and the panel that was shown "bound" is told.
+      expect(await h.registry.getPanelBindingState(TAB_ONE)).toStrictEqual(state);
+      expect(Object.hasOwn(h.storage.items, BINDING_STORAGE_KEY)).toBe(false);
+      expect(h.notify.mock.calls).toStrictEqual([[TAB_ONE, bindingPushFrame(state)]]);
+      expect(h.changes).toStrictEqual([
+        {
+          kind: 'removed',
+          tabId: TAB_ONE,
+          previous: record,
+          current: undefined,
+          state,
+          reason,
+          cause: changeCause,
+        },
+      ]);
+      expect(h.storage.storedTombstones()).toStrictEqual([tombstone]);
+      expect(await h.registry.flushPendingUnbinds()).toBe(1);
+      expect(sentFrames(h)).toStrictEqual([
+        { type: 'session.unbind', payload: { tabId: TAB_ONE } },
+      ]);
+    },
+  );
+
+  it('a transient tombstone write failure is persisted by the next operation; the unbind is sent and the record dropped meanwhile', async () => {
+    await confirmBinding(h, TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW);
+    failTombstoneWrites(h.storage);
+    h.send.mockReturnValue(QUEUED);
+    resetObservations(h);
+
+    const removed = await h.registry.unbind(TAB_ONE, 'tab-closed');
+
+    // The tab did close: the unbind leaves and the record goes, so nothing routes to it.
+    expect(removed).toMatchObject({ tabId: TAB_ONE, sessionId: SESSION_ALPHA });
+    expect(sentFrames(h)).toStrictEqual([{ type: 'session.unbind', payload: { tabId: TAB_ONE } }]);
+    expect(Object.hasOwn(h.storage.items, BINDING_STORAGE_KEY)).toBe(false);
+    expect(h.storage.storedTombstones()).toBeUndefined();
+
+    // Still failing, the next operation's retry fails too — one line per failure, the
+    // code alone — and the intent stays in memory.
+    expect(await h.registry.getBinding(TAB_ONE)).toBeUndefined();
+    expect(h.storage.storedTombstones()).toBeUndefined();
+    const writeFailures = h.logger.entries.filter(
+      (entry) => entry.message === TOMBSTONE_WRITE_FAILED,
+    );
+    expect(writeFailures).toStrictEqual([
+      { level: 'error', message: TOMBSTONE_WRITE_FAILED, fields: { code: 'STORE_ERROR' } },
+      { level: 'error', message: TOMBSTONE_WRITE_FAILED, fields: { code: 'STORE_ERROR' } },
+    ]);
+
+    // Storage recovers: the next operation — here the flush — writes it through first.
+    h.storage.keyWriteFailures.clear();
+    expect(await h.registry.flushPendingUnbinds()).toBe(1);
+    expect(h.storage.storedTombstones()).toStrictEqual([
+      {
+        tabId: TAB_ONE,
+        sessionId: SESSION_ALPHA,
+        cause: 'tab-closed',
+        createdAt: clockReading(2),
+        deliveries: 0,
+      },
+    ]);
+
+    // Durable now, the intent outlives the worker.
+    const revived = restartWorker(h);
+    expect(await revived.registry.flushPendingUnbinds()).toBe(1);
+    expect(sentFrames(revived)).toStrictEqual([
+      { type: 'session.unbind', payload: { tabId: TAB_ONE } },
+    ]);
+  });
+
+  it('a retirement whose write failed is written by the next operation, whatever it is', async () => {
+    await confirmBinding(h, TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW);
+    await h.registry.unbind(TAB_ONE, 'devtools-closed');
+    expect(h.storage.storedTombstones()).toMatchObject([{ tabId: TAB_ONE }]);
+    failTombstoneWrites(h.storage);
+
+    await h.registry.applyBound(bound(TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW, 'unbound'));
+    expect(h.storage.storedTombstones()).toMatchObject([{ tabId: TAB_ONE }]);
+
+    h.storage.keyWriteFailures.clear();
+    expect(await h.registry.getTabForSession(SESSION_ALPHA)).toBeUndefined();
+    expect(Object.hasOwn(h.storage.items, UNBIND_TOMBSTONE_STORAGE_KEY)).toBe(false);
+  });
+
+  it('a flush never rejects, even when the transport throws or a log sink fails', async () => {
+    await confirmBinding(h, TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW);
+    h.send.mockReturnValue(QUEUED);
+    await h.registry.unbind(TAB_ONE, 'tab-closed');
+
+    const throwing = createHarness(h.storage);
+    throwing.send.mockImplementation(() => {
+      throw new Error('transport exploded');
+    });
+    expect(await throwing.registry.flushPendingUnbinds()).toBe(0);
+    expect(throwing.storage.storedTombstones()).toMatchObject([{ tabId: TAB_ONE, deliveries: 0 }]);
+
+    const failingLogger = createRecordingLogger();
+    const faulty = createTabRegistry({
+      storage: h.storage,
+      send: vi.fn<ProtocolSend>(() => SENT),
+      notify: vi.fn<PortPushSink>(),
+      logger: {
+        ...failingLogger,
+        info: () => {
+          throw new Error('log sink failed');
+        },
+        child: () => ({
+          ...failingLogger,
+          info: () => {
+            throw new Error('log sink failed');
+          },
+        }),
+      },
+      now: createClock(),
+    });
+    await expect(faulty.flushPendingUnbinds()).resolves.toBe(0);
+    expect(failingLogger.entries).toContainEqual(
+      expect.objectContaining({ level: 'error', message: 'Pending unbinds could not be flushed' }),
+    );
+  });
+});
+
+describe('handleUnreportableNavigation — a navigation the service cannot be told about', () => {
+  it('unbinds a bound tab with session.unbind alone, pushes tab-left and answers the decision', async () => {
+    const record = await confirmBinding(h, TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW);
+    await h.registry.setCaptureId(TAB_ONE, CAPTURE_ONE);
+    resetObservations(h);
+
+    const decision = await h.registry.handleUnreportableNavigation(TAB_ONE);
+
+    const expected: NavigationDecision = {
+      kind: 'unbound-cross-origin',
+      tabId: TAB_ONE,
+      sessionId: SESSION_ALPHA,
+      captureId: CAPTURE_ONE,
+      previousOrigin: ORIGIN_A,
+      origin: undefined,
+      notice: formatTabLeftMessage(ORIGIN_A),
+      reported: false,
+    };
+    expect(decision).toStrictEqual(expected);
+
+    // No tab.navigated: the URL never leaves the worker. Only the sanitized unbind does.
+    expect(sentFrames(h)).toStrictEqual([{ type: 'session.unbind', payload: { tabId: TAB_ONE } }]);
+    expect(await h.registry.getBinding(TAB_ONE)).toBeUndefined();
+    expect(await h.registry.getTabForSession(SESSION_ALPHA)).toBeUndefined();
+    expect(Object.hasOwn(h.storage.items, BINDING_STORAGE_KEY)).toBe(false);
+
+    const left: PanelBindingState = {
+      kind: 'tab-left',
+      origin: ORIGIN_A,
+      sessionId: SESSION_ALPHA,
+      reason: 'origin-changed',
+    };
+    expect(h.notify.mock.calls).toStrictEqual([[TAB_ONE, bindingPushFrame(left)]]);
+    expect(await h.registry.getPanelBindingState(TAB_ONE)).toStrictEqual(left);
+    expect(h.changes).toStrictEqual([
+      {
+        kind: 'removed',
+        tabId: TAB_ONE,
+        previous: { ...record, captureId: CAPTURE_ONE },
+        current: undefined,
+        state: left,
+        reason: 'origin-changed',
+        cause: undefined,
+      },
+    ]);
+    expect(h.storage.storedTombstones()).toStrictEqual([
+      {
+        tabId: TAB_ONE,
+        sessionId: SESSION_ALPHA,
+        cause: 'navigated-away',
+        createdAt: clockReading(2),
+        deliveries: 1,
+      },
+    ]);
+  });
+
+  it('leaves a tombstone a restarted worker flushes when the unbind was only queued', async () => {
+    await confirmBinding(h, TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW);
+    h.send.mockReturnValue(QUEUED);
+
+    await h.registry.handleUnreportableNavigation(TAB_ONE);
+
+    const revived = restartWorker(h);
+    expect(await revived.registry.flushPendingUnbinds()).toBe(1);
+    expect(sentFrames(revived)).toStrictEqual([
+      { type: 'session.unbind', payload: { tabId: TAB_ONE } },
+    ]);
+  });
+
+  it('on a tab with no binding sends, stores and announces nothing', async () => {
+    await confirmBinding(h, TAB_TWO, SESSION_BETA, URL_A_SETTINGS);
+    resetObservations(h);
+    const writes = h.storage.writes;
+
+    const decision = await h.registry.handleUnreportableNavigation(TAB_UNKNOWN);
+
+    expect(decision).toStrictEqual({ kind: 'not-bound', tabId: TAB_UNKNOWN, reported: false });
+    expect(h.send).not.toHaveBeenCalled();
+    expect(h.notify).not.toHaveBeenCalled();
+    expect(h.changes).toStrictEqual([]);
+    expect(h.storage.writes).toBe(writes);
+    expect(Object.hasOwn(h.storage.items, UNBIND_TOMBSTONE_STORAGE_KEY)).toBe(false);
+    expect(await h.registry.getPanelBindingState(TAB_UNKNOWN)).toStrictEqual({ kind: 'unbound' });
+  });
+
+  it('refuses an invalid tab id without touching storage', async () => {
+    const decision = await h.registry.handleUnreportableNavigation(-1);
+
+    expect(decision).toStrictEqual({ kind: 'not-bound', tabId: -1, reported: false });
+    expect(h.send).not.toHaveBeenCalled();
+    expect(h.storage.reads).toBe(0);
+    expect(h.storage.writes).toBe(0);
+  });
+
+  it('runs on the operation queue, after a binding still being recorded', async () => {
+    const binding = h.registry.applyBound(bound(TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW));
+    const leaving = h.registry.handleUnreportableNavigation(TAB_ONE);
+
+    const [bindResult, decision] = await Promise.all([binding, leaving]);
+
+    expect(unwrap(bindResult).kind).toBe('recorded');
+    expect(decision).toMatchObject({ kind: 'unbound-cross-origin', sessionId: SESSION_ALPHA });
+    expect(await h.registry.listBindings()).toStrictEqual([]);
+  });
+});
+
 describe('onChange — listeners observe bind, replace and unbind', () => {
   it('fires on each change in order, and stops after unsubscribe', async () => {
     const seen: TabBindingChange[] = [];
@@ -1335,5 +2426,353 @@ describe('privacy', () => {
     for (const entry of h.logger.entries) {
       expect(JSON.stringify(entry)).not.toContain(PATH_SEGMENT);
     }
+  });
+
+  it('never writes a document URL into a log line on the tombstone paths', async () => {
+    await confirmBinding(h, TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW);
+    await confirmBinding(h, TAB_TWO, SESSION_BETA, URL_A_SETTINGS);
+    h.send.mockReturnValue(QUEUED);
+    await h.registry.handleNavigated({ tabId: TAB_ONE, url: URL_B_LANDING });
+    await h.registry.handleUnreportableNavigation(TAB_TWO);
+    await h.registry.flushPendingUnbinds();
+    await h.registry.requestBind({ tabId: TAB_ONE, url: URL_A_OVERVIEW, origin: ORIGIN_A });
+    await h.registry.applyBound(bound(TAB_TWO, SESSION_BETA, URL_A_SETTINGS, 'unbound'));
+    const revived = restartWorker(h);
+    await revived.registry.flushPendingUnbinds();
+
+    const entries = [...h.logger.entries, ...revived.logger.entries];
+    expect(entries.some((entry) => entry.message === 'Pending unbinds flushed')).toBe(true);
+    for (const entry of entries) {
+      expect(JSON.stringify(entry)).not.toContain(PATH_SEGMENT);
+    }
+  });
+});
+
+/*
+ * ===========================================================================
+ * The composed worker — `createWorker` wiring of the registry's unbind paths
+ *
+ * The registry decides; `service-worker.ts` must call it. These cases compose
+ * the real worker over in-memory fakes — `chrome.storage` areas backed by
+ * {@link FakeSessionStorageArea}, events that record their listeners, timers
+ * that never fire and a socket the case accepts by hand — and read what
+ * reached the socket:
+ *
+ * - a bound tab that commits a document off the app (`about:blank`, a
+ *   `chrome://` page, a `file:` document, or a URL with no reportable form at
+ *   all) is unbound, shows "Tab left ‹origin›", and leaves a tombstone;
+ * - the tombstones an earlier worker generation left are re-sent as soon as
+ *   the socket opens, before anything else of the tab is said.
+ * ===========================================================================
+ */
+
+/** The WHATWG `WebSocket.readyState` values the fake socket moves through. */
+const SOCKET_CONNECTING = 0;
+const SOCKET_OPEN = 1;
+
+/** A syntactically valid devtools credential, invented for this spec. */
+const WORKER_TOKEN = 'test-devtools-credential';
+
+/** The extension id the composed worker's port hub validates senders against. */
+const WORKER_EXTENSION_ID = 'abcdefghijklmnopabcdefghijklmnop';
+
+/** A socket the case opens by hand; it records every text frame written to it. */
+interface HandSocket extends WebSocketLike {
+  /** Every text frame written, in order. */
+  readonly sent: readonly string[];
+  /** The service accepted the connection: `readyState` OPEN, then `open`. */
+  accept(): void;
+}
+
+/** A recording socket constructor and every socket it built. */
+function handSocketFactory(): {
+  readonly ctor: WebSocketConstructorLike;
+  readonly sockets: HandSocket[];
+} {
+  const sockets: HandSocket[] = [];
+  class RecordingSocket implements HandSocket {
+    readyState: number = SOCKET_CONNECTING;
+    readonly sent: string[] = [];
+    private readonly openListeners = new Set<(event: WsEventMapLike['open']) => void>();
+
+    constructor() {
+      sockets.push(this);
+    }
+
+    addEventListener<K extends keyof WsEventMapLike>(
+      type: K,
+      listener: (event: WsEventMapLike[K]) => void,
+    ): void {
+      if (type === 'open') {
+        this.openListeners.add(listener as (event: WsEventMapLike['open']) => void);
+      }
+    }
+
+    removeEventListener<K extends keyof WsEventMapLike>(
+      type: K,
+      listener: (event: WsEventMapLike[K]) => void,
+    ): void {
+      if (type === 'open') {
+        this.openListeners.delete(listener as (event: WsEventMapLike['open']) => void);
+      }
+    }
+
+    send(data: string): void {
+      if (this.readyState !== SOCKET_OPEN) {
+        throw new Error('the hand socket is not open');
+      }
+      this.sent.push(data);
+    }
+
+    close(): void {
+      this.readyState = SOCKET_CONNECTING;
+    }
+
+    accept(): void {
+      this.readyState = SOCKET_OPEN;
+      for (const listener of [...this.openListeners]) {
+        listener({ type: 'open' });
+      }
+    }
+  }
+  return { ctor: RecordingSocket, sockets };
+}
+
+/** A `WorkerEvent` that records its listeners, so a case can fire them. */
+interface FiringEvent<Listener> extends WorkerEvent<Listener> {
+  readonly listeners: Set<Listener>;
+}
+
+function firingEvent<Listener>(): FiringEvent<Listener> {
+  const listeners = new Set<Listener>();
+  return {
+    listeners,
+    addListener(listener: Listener): void {
+      listeners.add(listener);
+    },
+    removeListener(listener: Listener): void {
+      listeners.delete(listener);
+    },
+  };
+}
+
+/** Timers that never fire: nothing in these cases waits on a backoff or a deadline. */
+const DORMANT_TIMERS: WorkerTimerApi = {
+  setTimeout: (): number => 0,
+  clearTimeout: (): void => undefined,
+};
+
+/** One composed worker and the fakes a case drives it through. */
+interface WorkerHarness {
+  readonly worker: DebugGeneratorWorker;
+  readonly session: FakeSessionStorageArea;
+  readonly sockets: readonly HandSocket[];
+  readonly onUpdated: FiringEvent<(tabId: TabId, change: WorkerTabChange, tab: WorkerTab) => void>;
+}
+
+/** Every worker a case composed, disposed after it. */
+const composedWorkers: DebugGeneratorWorker[] = [];
+
+/**
+ * Compose a paired worker whose session storage holds `bindings` (and
+ * `tombstones`, when given), and wait for its cold start — after which its
+ * socket exists but has not opened.
+ */
+async function composeWorker(
+  bindings: readonly TabBindingRecord[],
+  tombstones?: readonly TabUnbindTombstone[],
+): Promise<WorkerHarness> {
+  const session = new FakeSessionStorageArea();
+  const snapshot: TabBindingSnapshot = Object.fromEntries(
+    bindings.map((binding) => [String(binding.tabId), binding]),
+  );
+  if (bindings.length > 0) {
+    await session.set({ [BINDING_STORAGE_KEY]: snapshot });
+  }
+  if (tombstones !== undefined) {
+    await session.set({ [UNBIND_TOMBSTONE_STORAGE_KEY]: tombstones });
+  }
+  const local = new FakeSessionStorageArea();
+  await local.set({
+    [DEVTOOLS_TOKEN_STORAGE_KEY]: { version: STORED_CREDENTIAL_VERSION, token: WORKER_TOKEN },
+  });
+  const { ctor, sockets } = handSocketFactory();
+  const onUpdated = firingEvent<(tabId: TabId, change: WorkerTabChange, tab: WorkerTab) => void>();
+  const environment: WorkerEnvironment = {
+    runtime: {
+      id: WORKER_EXTENSION_ID,
+      onConnect: firingEvent(),
+      onInstalled: firingEvent(),
+      onStartup: firingEvent(),
+    },
+    tabs: {
+      reload: (): Promise<void> => Promise.resolve(),
+      get: (): Promise<WorkerTab> => Promise.resolve({}),
+      onUpdated,
+      onRemoved: firingEvent(),
+    },
+    alarms: {
+      create: (): Promise<void> => Promise.resolve(),
+      clear: (): Promise<boolean> => Promise.resolve(false),
+      onAlarm: firingEvent(),
+    },
+    storage: { local, session },
+    webSocketConstructor: ctor,
+    timers: DORMANT_TIMERS,
+    logger: noopLogger,
+  };
+  const worker = createWorker(environment);
+  composedWorkers.push(worker);
+  await worker.ready;
+  return { worker, session, sockets, onUpdated };
+}
+
+/** Open the worker's socket and wait until its `client.hello` has been written. */
+async function openSocket(harness: WorkerHarness): Promise<HandSocket> {
+  const socket = required(harness.sockets.at(-1), 'the worker socket');
+  socket.accept();
+  await vi.waitFor(() => {
+    expect(socketFrames(socket).length).toBeGreaterThan(0);
+  });
+  return socket;
+}
+
+/** Every frame written to a socket, decoded to its type and payload. */
+function socketFrames(socket: HandSocket): SentFrame[] {
+  return socket.sent.map((text) => {
+    const frame = JSON.parse(text) as { readonly type: string; readonly payload: unknown };
+    return { type: frame.type, payload: frame.payload };
+  });
+}
+
+/** The frames of one type written to a socket, by payload. */
+function framesOfType(socket: HandSocket, type: string): unknown[] {
+  return socketFrames(socket)
+    .filter((frame) => frame.type === type)
+    .map((frame) => frame.payload);
+}
+
+/** Fire `chrome.tabs.onUpdated` for a committed navigation of `tabId` to `url`. */
+function commitNavigation(harness: WorkerHarness, tabId: TabId, url: string): void {
+  for (const listener of [...harness.onUpdated.listeners]) {
+    listener(tabId, { url, status: 'loading' }, { url });
+  }
+}
+
+/** A binding as the registry writes it to `chrome.storage.session`. */
+function storedBinding(tabId: TabId, sessionId: string): TabBindingRecord {
+  return { tabId, sessionId, url: URL_A_OVERVIEW, origin: ORIGIN_A, boundAt: CLOCK_START_MS };
+}
+
+describe('createWorker — a bound tab that leaves the app is unbound, however its URL reads', () => {
+  afterEach(() => {
+    for (const worker of composedWorkers.splice(0)) {
+      worker.dispose();
+    }
+  });
+
+  it.each([
+    ['about:blank', 'about:blank'],
+    ['a chrome:// page', 'chrome://newtab/'],
+    ['a file: document', 'file:///home/dev/notes.html'],
+  ])('unbinds on a navigation to %s and shows the tab left', async (_label, url) => {
+    const harness = await composeWorker([storedBinding(TAB_ONE, SESSION_ALPHA)]);
+    const socket = await openSocket(harness);
+
+    commitNavigation(harness, TAB_ONE, url);
+
+    await vi.waitFor(async () => {
+      expect(await harness.worker.registry.getBinding(TAB_ONE)).toBeUndefined();
+    });
+    expect(framesOfType(socket, 'session.unbind')).toContainEqual({ tabId: TAB_ONE });
+    expect(await harness.worker.registry.getPanelBindingState(TAB_ONE)).toStrictEqual({
+      kind: 'tab-left',
+      origin: ORIGIN_A,
+      sessionId: SESSION_ALPHA,
+      reason: 'origin-changed',
+    });
+    // Nothing of the document's path reaches the service.
+    expect(socket.sent.join('\n')).not.toContain('/home/dev/');
+  });
+
+  it('unbinds with session.unbind alone when the new URL has no form the service accepts', async () => {
+    const harness = await composeWorker([storedBinding(TAB_ONE, SESSION_ALPHA)]);
+    const socket = await openSocket(harness);
+
+    commitNavigation(harness, TAB_ONE, 'not an absolute url');
+
+    await vi.waitFor(async () => {
+      expect(await harness.worker.registry.getBinding(TAB_ONE)).toBeUndefined();
+    });
+    expect(framesOfType(socket, 'session.unbind')).toStrictEqual([{ tabId: TAB_ONE }]);
+    expect(framesOfType(socket, 'tab.navigated')).toStrictEqual([]);
+    expect(await harness.worker.registry.getPanelBindingState(TAB_ONE)).toMatchObject({
+      kind: 'tab-left',
+      origin: ORIGIN_A,
+    });
+    expect(harness.session.storedTombstones()).toMatchObject([
+      { tabId: TAB_ONE, sessionId: SESSION_ALPHA, cause: 'navigated-away' },
+    ]);
+  });
+
+  it('reports nothing for an unbound tab, whatever its URL', async () => {
+    const harness = await composeWorker([storedBinding(TAB_ONE, SESSION_ALPHA)]);
+    const socket = await openSocket(harness);
+    const before = socket.sent.length;
+
+    commitNavigation(harness, TAB_TWO, 'not an absolute url');
+    commitNavigation(harness, TAB_TWO, 'about:blank');
+
+    await Promise.resolve();
+    expect(await harness.worker.registry.getBinding(TAB_ONE)).toBeDefined();
+    expect(socket.sent.slice(before)).toStrictEqual([]);
+  });
+});
+
+describe('createWorker — tombstones left by an earlier worker are delivered on connect', () => {
+  afterEach(() => {
+    for (const worker of composedWorkers.splice(0)) {
+      worker.dispose();
+    }
+  });
+
+  it('re-sends every pending unbind as soon as the socket opens', async () => {
+    const pending: TabUnbindTombstone[] = [
+      {
+        tabId: TAB_ONE,
+        sessionId: SESSION_ALPHA,
+        cause: 'tab-closed',
+        createdAt: Date.now(),
+        deliveries: 0,
+      },
+      { tabId: TAB_TWO, cause: 'devtools-closed', createdAt: Date.now(), deliveries: 0 },
+    ];
+    const harness = await composeWorker([], pending);
+    expect(harness.sockets.length).toBe(1);
+
+    const socket = await openSocket(harness);
+
+    await vi.waitFor(() => {
+      expect(framesOfType(socket, 'session.unbind')).toStrictEqual([
+        { tabId: TAB_ONE },
+        { tabId: TAB_TWO },
+      ]);
+    });
+    expect(socketFrames(socket)[0]?.type).toBe('client.hello');
+    // Delivered on an open socket, each is counted against its bound.
+    await vi.waitFor(() => {
+      expect(harness.session.storedTombstones()).toMatchObject([
+        { tabId: TAB_ONE, deliveries: 1 },
+        { tabId: TAB_TWO, deliveries: 1 },
+      ]);
+    });
+  });
+
+  it('sends nothing on connect when no unbind is pending', async () => {
+    const harness = await composeWorker([]);
+    const socket = await openSocket(harness);
+
+    await Promise.resolve();
+    expect(framesOfType(socket, 'session.unbind')).toStrictEqual([]);
   });
 });

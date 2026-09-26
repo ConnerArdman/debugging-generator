@@ -12,11 +12,17 @@
  *   streamed line by line, bounded in memory, with an unconditional heartbeat, a hard
  *   timeout (SIGTERM, then SIGKILL) and a diagnosable failure message; plus the timeout
  *   budgets every sibling passes instead of inventing its own.
- * - **How git is asked about the tree** — {@link runGit}, the single git entry point of
- *   `tests/e2e/helpers`, and {@link listTrackedFiles}, the tracked-path enumerator the
- *   demo and fixture snapshots hash.
- * - **How a working tree is materialised elsewhere** — {@link copyTrackedTree}, the
- *   `.git`-free copy `clean-clone.spec.ts` builds its two independent clones from.
+ * - **How git is asked about the tree** — {@link runGit}, the git entry point of
+ *   `tests/e2e/helpers` for every inspection, {@link listTrackedFiles}, the tracked-path
+ *   enumerator the demo and fixture snapshots hash, {@link resolveHeadCommit}, the commit the
+ *   checkout's `HEAD` names, and {@link listCommitFiles}, the paths that commit tracks.
+ * - **How a commit is materialised elsewhere** — {@link cloneRepository}, the single
+ *   sanctioned `git clone` of this module: a fresh, self-contained, remote-less clone of the
+ *   LOCAL checkout, detached at a named commit. `clean-clone.spec.ts` builds its two
+ *   independent clones with it.
+ * - **How a working tree is copied elsewhere** — {@link copyTrackedTree}, a `.git`-free copy
+ *   of the working-tree bytes of every tracked file, for a caller that needs the working tree
+ *   as it stands (uncommitted edits included) rather than a commit.
  *
  * It is the foundation of this folder: it imports no sibling helper, no `@debuggen/*`
  * package and no Playwright fixture, and it has no import-time side effect, so
@@ -25,18 +31,25 @@
  *
  * ## Three prohibitions
  *
- * 1. **Nothing under `.git/` is ever read, copied, archived or logged** (AAP 0.2.1): the
- *    repository's `origin` URL embeds a live access token. Running git as a *command* whose
- *    output is paths only (`git ls-files -z`, `git status --porcelain`) is the sanctioned
- *    mechanism; {@link runGit} additionally refuses the subcommands that print remotes or
- *    configuration (`remote`, `config`, `ls-remote`, `credential`, ...).
+ * 1. **Nothing under the checkout's `.git/` is ever read, copied, archived or logged** (AAP
+ *    0.2.1): the repository's `origin` URL embeds a live access token. Running git as a
+ *    *command* whose output is paths or object ids only (`git ls-files -z`, `git status
+ *    --porcelain`, `git rev-parse`) is the sanctioned mechanism; {@link runGit} additionally
+ *    refuses the subcommands that print remotes or configuration or that reach the network
+ *    (`remote`, `config`, `ls-remote`, `credential`, `clone`, `fetch`, ...). The one exception
+ *    to that refusal is {@link cloneRepository}, and it cannot carry the token: its source is
+ *    always the checkout's absolute PATH (never a URL, and never the checkout's remote), a
+ *    clone never copies its source's `.git/config`, the clone's own `origin` — which names only
+ *    that local path — is removed before it resolves, and none of its git output is echoed. It
+ *    inspects the clone's metadata by `lstat` only (`.git` is a directory, no
+ *    `objects/info/alternates`); no file under any `.git/` is opened.
  * 2. **Nothing is written into either project tree** (AAP 0.5.1 — helpers read, the product
  *    writes): this module never creates, modifies, truncates or deletes a path under
  *    `apps/demo-app` or `tests/fixtures/sample-next-app`, or anywhere else in the checkout.
- *    {@link copyTrackedTree} writes only into a caller-supplied destination that it proves
- *    (by real path) lies outside {@link repoRoot}. The caller owns that destination and its
- *    cleanup; it belongs under `os.tmpdir()` (for example `fs.mkdtemp(path.join(os.tmpdir(),
- *    'debuggen-clean-clone-'))`).
+ *    {@link cloneRepository} and {@link copyTrackedTree} write only into a caller-supplied
+ *    destination that they prove (by real path) lies outside {@link repoRoot}. The caller owns
+ *    that destination and its cleanup; it belongs under `os.tmpdir()` (for example
+ *    `fs.mkdtemp(path.join(os.tmpdir(), 'debuggen-clean-clone-'))`).
  * 3. **No credential reaches output** (AAP 0.3.4, `pnpm check:secrets`): no environment
  *    *value* is ever logged, attached or returned by a diagnostic path — sanitisation and its
  *    reports work on variable *names* and on value *shapes* only — and this file contains no
@@ -137,6 +150,14 @@ export const SHORT_COMMAND_TIMEOUT_MS = 60_000;
  */
 export const GIT_COMMAND_TIMEOUT_MS = 30_000;
 
+/**
+ * Each git step of {@link cloneRepository}: `git clone --no-local` (every reachable object
+ * repacked through `upload-pack` — no hardlinks, no alternates) and the checkout of one
+ * commit's ~900 files. Local and network-free; seconds normally, and the budget covers a long
+ * history on a contended CI disk.
+ */
+export const CLONE_TIMEOUT_MS = 5 * 60_000;
+
 /** Grace between SIGTERM and SIGKILL, the same five seconds `tests/browser/fixtures.ts` uses. */
 export const TERMINATION_GRACE_MS = 5_000;
 
@@ -161,6 +182,13 @@ const MAX_TRACKED_LISTING_BYTES = 256 * 1024 * 1024;
 
 /** Parallel file copies in {@link copyTrackedTree}. */
 const COPY_CONCURRENCY = 16;
+
+/**
+ * A full commit object id: 40 lower-case hex digits (SHA-1) or 64 (SHA-256 repositories).
+ * Abbreviations and symbolic names are refused, so a clone can only ever name one commit and
+ * no argument can be read as an option.
+ */
+const COMMIT_ID_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
 // ---------------------------------------------------------------------------
 // Repository root
@@ -861,7 +889,9 @@ export function runPnpm(
 /**
  * Git subcommands {@link runGit} refuses because their output (or effect) can carry the
  * `origin` URL, which embeds a live access token, or reaches the network: none of them is
- * needed to enumerate or inspect a working tree.
+ * needed to enumerate or inspect a working tree. Creating a clone is {@link cloneRepository}'s
+ * job alone — it runs `clone` and `remote` under its own fixed, audited argument lists — so
+ * this set stays closed for every other caller.
  */
 const REFUSED_GIT_SUBCOMMANDS: ReadonlySet<string> = new Set([
   'remote',
@@ -970,9 +1000,51 @@ export async function listTrackedFiles(relDir?: string): Promise<string[]> {
     maxCapturedBytes: MAX_TRACKED_LISTING_BYTES,
     expectSuccess: true,
   });
+  return parsePathListing(result, 'listTrackedFiles()', '`git ls-files`');
+}
+
+/**
+ * The full object id of the commit the checkout's `HEAD` names —
+ * `git rev-parse --verify HEAD^{commit}` from {@link repoRoot} — so a caller can pin work (a
+ * {@link cloneRepository} target, a {@link listCommitFiles} listing) to one immutable commit
+ * rather than to a working tree that may change under it. Prints nothing.
+ *
+ * @throws When `HEAD` names no commit (an unborn branch) or git answers something that is not a
+ *   full object id.
+ */
+export async function resolveHeadCommit(): Promise<string> {
+  const result = await runGit(['rev-parse', '--verify', 'HEAD^{commit}'], { expectSuccess: true });
+  return requireCommitId(result.stdout.trim(), 'resolveHeadCommit()');
+}
+
+/**
+ * Every path `commit` tracks — POSIX, repository-relative, de-duplicated and sorted — read
+ * from the commit object with `git ls-tree -r -z --name-only --full-tree <commit>` in
+ * {@link repoRoot}. Unlike {@link listTrackedFiles} (the index), this is independent of the
+ * working tree and of anything staged: it is exactly what a checkout of `commit` contains.
+ *
+ * @param commit A full object id, as {@link resolveHeadCommit} returns.
+ * @throws When `commit` is not a full object id, when git fails, when the listing exceeds the
+ *   budget, or when it names a path that is absolute, under `.git` or outside the repository.
+ */
+export async function listCommitFiles(commit: string): Promise<string[]> {
+  const id = requireCommitId(commit, 'listCommitFiles()');
+  const result = await runGit(['ls-tree', '-r', '-z', '--name-only', '--full-tree', id], {
+    maxCapturedBytes: MAX_TRACKED_LISTING_BYTES,
+    expectSuccess: true,
+  });
+  return parsePathListing(result, 'listCommitFiles()', '`git ls-tree`');
+}
+
+/**
+ * The NUL-separated path listing a git command printed, each entry proven safe by
+ * {@link assertSafeTrackedPath}, de-duplicated and sorted. A truncated capture is an error:
+ * a partial listing would silently drop paths from every comparison built on it.
+ */
+function parsePathListing(result: CommandResult, caller: string, source: string): string[] {
   if (result.truncated) {
     throw new Error(
-      `listTrackedFiles(): \`git ls-files\` printed more than ${String(MAX_TRACKED_LISTING_BYTES)} bytes; refusing to work from a truncated listing.`,
+      `${caller}: ${source} printed more than ${String(MAX_TRACKED_LISTING_BYTES)} bytes; refusing to work from a truncated listing.`,
     );
   }
   const unique = new Set<string>();
@@ -980,9 +1052,19 @@ export async function listTrackedFiles(relDir?: string): Promise<string[]> {
     if (entry === '') {
       continue;
     }
-    unique.add(assertSafeTrackedPath(entry));
+    unique.add(assertSafeTrackedPath(entry, caller));
   }
   return [...unique].sort(compareCodeUnits);
+}
+
+/** `value` when it is a full commit object id (see {@link COMMIT_ID_PATTERN}); throws otherwise. */
+function requireCommitId(value: string, caller: string): string {
+  if (!COMMIT_ID_PATTERN.test(value)) {
+    throw new Error(
+      `${caller}: ${JSON.stringify(value.slice(0, 80))} is not a full commit object id (40 or 64 lower-case hex digits); resolve one with resolveHeadCommit().`,
+    );
+  }
+  return value;
 }
 
 /** Normalise and validate the `relDir` argument of {@link listTrackedFiles}. */
@@ -1007,12 +1089,12 @@ function normalizeRelativeDir(relDir: string): string | undefined {
 }
 
 /** A tracked path as git printed it, proven relative, inside the repository and `.git`-free. */
-function assertSafeTrackedPath(entry: string): string {
+function assertSafeTrackedPath(entry: string, caller: string): string {
   const posix = entry.split('\\').join('/');
   const normalized = path.posix.normalize(posix);
   const reject = (why: string): never => {
     throw new Error(
-      `listTrackedFiles(): git returned ${JSON.stringify(entry)}, which ${why}; refusing to use the listing.`,
+      `${caller}: git returned ${JSON.stringify(entry)}, which ${why}; refusing to use the listing.`,
     );
   };
   if (path.posix.isAbsolute(normalized) || /^[A-Za-z]:/.test(normalized)) {
@@ -1029,6 +1111,241 @@ function assertSafeTrackedPath(entry: string): string {
 
 function hasGitSegment(posixPath: string): boolean {
   return posixPath.split('/').some((segment) => segment.toLowerCase() === '.git');
+}
+
+// ---------------------------------------------------------------------------
+// cloneRepository — a fresh, self-contained, remote-less clone of one commit
+// ---------------------------------------------------------------------------
+
+/** Options of {@link cloneRepository}. */
+export interface CloneRepositoryOptions {
+  /**
+   * The commit to check out, as a full object id (40 or 64 lower-case hex digits) — normally
+   * what {@link resolveHeadCommit} returned. Abbreviations, branch names and `HEAD` are refused.
+   */
+  commit: string;
+  /** Prefix of the one summary line printed; defaults to `clone`. */
+  label?: string | undefined;
+}
+
+/** What {@link cloneRepository} created. Every field was verified before it resolved. */
+export interface CloneRepositoryResult {
+  /** The absolute, symlink-resolved root of the clone's working tree. */
+  readonly dest: string;
+  /** The clone's `HEAD`: detached, and equal to the requested commit. */
+  readonly commit: string;
+  /** `git ls-files -z` in the clone — POSIX, clone-relative, de-duplicated and sorted. */
+  readonly files: string[];
+  /** Wall-clock milliseconds of the clone, the checkout and every verification. */
+  readonly durationMs: number;
+}
+
+/** One git step inside the clone being built; see {@link runCloneStep}. */
+type CloneStep = (
+  step: string,
+  args: readonly string[],
+  maxCapturedBytes?: number,
+) => Promise<CommandResult>;
+
+/**
+ * Clone the LOCAL checkout into `dest` and check out `options.commit` there, detached: what a
+ * fresh `git clone` of this repository contains at that commit, and nothing else.
+ *
+ * Three steps, each a fixed argument list run through {@link runCommand} with `echo: false`,
+ * `GIT_TERMINAL_PROMPT=0`, `GIT_OPTIONAL_LOCKS=0` and `GIT_CEILING_DIRECTORIES` set to the
+ * destination's parent, so git can never discover and use an enclosing repository:
+ *
+ * 1. `git clone --quiet --no-local --no-checkout --template= -- <repoRoot()> <dest>`. The
+ *    source is always the checkout's absolute PATH — never a URL and never the checkout's
+ *    remote — so nothing reaches the network and no credential is consulted, and a clone never
+ *    copies its source's `.git/config`, so the token in the checkout's `origin` URL cannot
+ *    travel (AAP 0.2.1). `--no-local` transfers objects through `upload-pack` instead of
+ *    hardlinking or borrowing the checkout's object store; `--template=` installs no hooks;
+ *    `--no-checkout` leaves the working tree to step 2.
+ * 2. `git checkout --detach --quiet <commit>`: the working tree of exactly that commit.
+ * 3. `git remote remove <name>` for every remote `git remote` lists — the clone's `origin`,
+ *    which names only the local checkout path — so the clone refers to nothing outside itself.
+ *
+ * Before resolving it verifies, and otherwise throws naming the invariant that failed:
+ * `git rev-parse --verify HEAD^{commit}` in the clone is `commit`; `git remote` prints
+ * nothing; `git status --porcelain --ignored --untracked-files=all` is empty (no modified,
+ * untracked or ignored path — a pristine tree); `<dest>/.git` is a real directory, not a
+ * gitlink file or a symbolic link into another repository; and
+ * `<dest>/.git/objects/info/alternates` does not exist, so every object is the clone's own.
+ * Both metadata checks are `lstat` calls: no file under any `.git/` is opened.
+ *
+ * Output discipline: git's output is never echoed. The one line printed names the label, the
+ * commit and the destination; a failure message carries git's own diagnostic (paths and
+ * object ids), never configuration, remotes or the environment.
+ *
+ * `dest` is held to {@link copyTrackedTree}'s rules: absolute, outside {@link repoRoot} by real
+ * path (checked before and after it is created), and empty or absent. The caller owns `dest`
+ * and its removal, including after a failure, when a partial clone may remain; create it under
+ * `os.tmpdir()`. Git writes its pack files read-only (`0444`); `fs.rm` with `force` removes
+ * them all the same, because unlinking needs only a writable parent directory.
+ *
+ * @example
+ * ```ts
+ * const commit = await resolveHeadCommit();
+ * const dir = await realpath(await mkdtemp(path.join(os.tmpdir(), 'debuggen-clean-clone-')));
+ * const clone = await cloneRepository(dir, { commit, label: 'clone-1' });
+ * // clone.commit === commit, and clone.files equals await listCommitFiles(commit)
+ * ```
+ *
+ * @throws When `commit` is not a full object id; when `dest` is relative, inside (or
+ *   containing) the checkout, or not empty; when a git step fails or outlives
+ *   {@link CLONE_TIMEOUT_MS}; or when any invariant above does not hold.
+ */
+export async function cloneRepository(
+  dest: string,
+  options: CloneRepositoryOptions,
+): Promise<CloneRepositoryResult> {
+  const caller = 'cloneRepository()';
+  const label = options.label ?? 'clone';
+  const commit = requireCommitId(options.commit, caller);
+  const root = repoRoot();
+  if (!path.isAbsolute(root)) {
+    // repoRoot() is a resolved real path; an assertion, so the clone source is provably a path.
+    throw new Error(`${caller}: the clone source ${root} is not an absolute local path.`);
+  }
+  if (!path.isAbsolute(dest)) {
+    throw new Error(
+      `${caller}: the destination ${JSON.stringify(dest)} must be an absolute path (create it with fs.mkdtemp under os.tmpdir()).`,
+    );
+  }
+  const target = path.resolve(dest);
+  await assertOutsideRepository(target, root, caller);
+  await prepareEmptyDirectory(target, caller);
+  const realTarget = await realpath(target);
+  // Re-checked on the created directory, which is the path git is handed and runs in.
+  await assertOutsideRepository(realTarget, root, caller);
+
+  const started = performance.now();
+  const git: CloneStep = (step, args, maxCapturedBytes) =>
+    runCloneStep(caller, realTarget, step, args, maxCapturedBytes);
+
+  await git('clone the local checkout', [
+    'clone',
+    '--quiet',
+    '--no-local',
+    '--no-checkout',
+    '--template=',
+    '--',
+    root,
+    realTarget,
+  ]);
+  await git(`check out commit ${commit}`, ['checkout', '--detach', '--quiet', commit]);
+  for (const remote of await listCloneRemotes(git, caller)) {
+    await git(`remove the clone's remote ${JSON.stringify(remote)}`, ['remote', 'remove', remote]);
+  }
+
+  const head = (
+    await git("resolve the clone's HEAD", ['rev-parse', '--verify', 'HEAD^{commit}'])
+  ).stdout.trim();
+  if (head !== commit) {
+    throw new Error(
+      `${caller}: HEAD of the clone at ${realTarget} is ${JSON.stringify(head)}, not the requested commit ${commit}.`,
+    );
+  }
+  const remaining = await listCloneRemotes(git, caller);
+  if (remaining.length > 0) {
+    throw new Error(
+      `${caller}: the clone at ${realTarget} still has the remote(s) ${remaining.join(', ')} after removal; it must refer to nothing outside itself.`,
+    );
+  }
+  const status = await git(
+    "read the clone's status",
+    ['status', '--porcelain', '--ignored', '--untracked-files=all'],
+    MAX_TRACKED_LISTING_BYTES,
+  );
+  const dirty = status.stdout.split('\n').filter((line) => line.trim() !== '');
+  if (dirty.length > 0 || status.truncated) {
+    throw new Error(
+      `${caller}: the fresh clone at ${realTarget} is not pristine (${String(dirty.length)} modified, untracked or ignored path(s)): ${dirty.slice(0, 10).join('; ')}`,
+    );
+  }
+  const gitDir = path.join(realTarget, '.git');
+  const gitDirInfo = await lstat(gitDir).catch((error: unknown) => {
+    throw new Error(
+      `${caller}: the clone at ${realTarget} has no ${gitDir} (${describeError(error)}).`,
+      { cause: error },
+    );
+  });
+  if (!gitDirInfo.isDirectory()) {
+    throw new Error(
+      `${caller}: ${gitDir} is not a directory (a gitlink file or symbolic link would point at another repository's metadata); the clone must own its repository.`,
+    );
+  }
+  if (await pathExists(path.join(gitDir, 'objects', 'info', 'alternates'))) {
+    throw new Error(
+      `${caller}: the clone at ${realTarget} borrows objects from another repository (objects/info/alternates exists); its object store must be self-contained.`,
+    );
+  }
+  const listing = await git(
+    "list the clone's tracked files",
+    ['ls-files', '-z'],
+    MAX_TRACKED_LISTING_BYTES,
+  );
+  const files = parsePathListing(listing, caller, '`git ls-files` in the clone');
+
+  const durationMs = performance.now() - started;
+  process.stdout.write(
+    `[${label}] cloned commit ${commit} into ${realTarget}: ${String(files.length)} tracked files, detached HEAD, no remote, self-contained object store (${formatSeconds(durationMs)})\n`,
+  );
+  return { dest: realTarget, commit: head, files, durationMs };
+}
+
+/**
+ * Run one git step of {@link cloneRepository} in `cloneDir` — the empty destination for the
+ * `clone` itself, the new working tree afterwards — mirroring {@link runGit}'s settings plus a
+ * ceiling that stops repository discovery at the destination. Output is never echoed; a
+ * failure is re-thrown naming the step, with git's own diagnostic as the cause.
+ */
+async function runCloneStep(
+  caller: string,
+  cloneDir: string,
+  step: string,
+  args: readonly string[],
+  maxCapturedBytes?: number,
+): Promise<CommandResult> {
+  try {
+    return await runCommand('git', args, {
+      cwd: cloneDir,
+      timeoutMs: CLONE_TIMEOUT_MS,
+      env: {
+        GIT_TERMINAL_PROMPT: '0',
+        GIT_OPTIONAL_LOCKS: '0',
+        GIT_CEILING_DIRECTORIES: path.dirname(cloneDir),
+      },
+      label: 'git',
+      echo: false,
+      maxCapturedBytes,
+      expectSuccess: true,
+    });
+  } catch (error) {
+    throw new Error(`${caller}: could not ${step} in ${cloneDir}.\n${describeError(error)}`, {
+      cause: error,
+    });
+  }
+}
+
+/**
+ * The remote NAMES of the clone being built (`git remote`, which without `-v` prints names
+ * only, never a URL). A name that could be read as an option is refused rather than passed on.
+ */
+async function listCloneRemotes(git: CloneStep, caller: string): Promise<string[]> {
+  const result = await git("list the clone's remotes", ['remote']);
+  const names = result.stdout
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line !== '');
+  const unsafe = names.filter((name) => name.startsWith('-'));
+  if (unsafe.length > 0) {
+    throw new Error(
+      `${caller}: the clone lists remote name(s) ${unsafe.map((name) => JSON.stringify(name)).join(', ')} that would be read as options; refusing to continue.`,
+    );
+  }
+  return names;
 }
 
 // ---------------------------------------------------------------------------
@@ -1056,8 +1373,10 @@ export interface CopyTrackedTreeResult {
 }
 
 /**
- * Copy the working-tree content of every tracked file into `dest` — the state a fresh checkout
- * would start from, minus the repository metadata.
+ * Copy the working-tree content of every tracked file into `dest` — the working tree as it
+ * stands, uncommitted edits included, minus the repository metadata. It is not a checkout of
+ * any commit: a caller that must test what a fresh clone of a commit contains uses
+ * {@link cloneRepository} instead.
  *
  * **No `.git` is ever created in `dest` and nothing under `.git/` is ever copied.** That is the
  * whole point of enumerating with `git ls-files` instead of copying the directory: the
@@ -1090,12 +1409,12 @@ export async function copyTrackedTree(
     );
   }
   const target = path.resolve(dest);
-  await assertOutsideRepository(target, root);
-  await prepareEmptyDirectory(target);
+  await assertOutsideRepository(target, root, 'copyTrackedTree()');
+  await prepareEmptyDirectory(target, 'copyTrackedTree()');
   const realTarget = await realpath(target);
   // Re-checked on the created directory: the pre-creation check resolved missing components
   // lexically, and this is the path every write below is compared against.
-  await assertOutsideRepository(realTarget, root);
+  await assertOutsideRepository(realTarget, root, 'copyTrackedTree()');
 
   const tracked = await listTrackedFiles();
   const selected = options?.include === undefined ? tracked : tracked.filter(options.include);
@@ -1179,23 +1498,33 @@ export async function copyTrackedTree(
   return { dest: target, files: copied, bytes, missing };
 }
 
-/** Throw unless `candidate` (resolved through its nearest existing ancestor) is outside `root`. */
-async function assertOutsideRepository(candidate: string, root: string): Promise<void> {
+/**
+ * Throw unless `candidate` (resolved through its nearest existing ancestor) is outside `root`.
+ * `caller` (`copyTrackedTree()`, `cloneRepository()`) prefixes the message.
+ */
+async function assertOutsideRepository(
+  candidate: string,
+  root: string,
+  caller: string,
+): Promise<void> {
   const real = await realPathAllowingMissing(candidate);
   if (isPathInside(real, root)) {
     throw new Error(
-      `copyTrackedTree(): the destination ${candidate} (real path ${real}) is inside the repository ${root}; copy into a directory under os.tmpdir() instead, so the working tree is never written.`,
+      `${caller}: the destination ${candidate} (real path ${real}) is inside the repository ${root}; use a directory under os.tmpdir() instead, so the working tree is never written.`,
     );
   }
   if (isPathInside(root, real)) {
     throw new Error(
-      `copyTrackedTree(): the destination ${candidate} (real path ${real}) contains the repository ${root}; use a fresh directory under os.tmpdir().`,
+      `${caller}: the destination ${candidate} (real path ${real}) contains the repository ${root}; use a fresh directory under os.tmpdir().`,
     );
   }
 }
 
-/** Create `directory` when absent; otherwise require an empty, real (non-symlink) directory. */
-async function prepareEmptyDirectory(directory: string): Promise<void> {
+/**
+ * Create `directory` when absent; otherwise require an empty, real (non-symlink) directory.
+ * `caller` prefixes the message.
+ */
+async function prepareEmptyDirectory(directory: string, caller: string): Promise<void> {
   let info: Stats;
   try {
     info = await lstat(directory);
@@ -1208,13 +1537,13 @@ async function prepareEmptyDirectory(directory: string): Promise<void> {
   }
   if (!info.isDirectory()) {
     throw new Error(
-      `copyTrackedTree(): the destination ${directory} exists and is not a directory${info.isSymbolicLink() ? ' (it is a symbolic link)' : ''}; pass a fresh directory from fs.mkdtemp.`,
+      `${caller}: the destination ${directory} exists and is not a directory${info.isSymbolicLink() ? ' (it is a symbolic link)' : ''}; pass a fresh directory from fs.mkdtemp.`,
     );
   }
   const entries = await readdir(directory);
   if (entries.length > 0) {
     throw new Error(
-      `copyTrackedTree(): the destination ${directory} is not empty (${String(entries.length)} entries); pass a fresh directory from fs.mkdtemp so no earlier copy can leak into this one.`,
+      `${caller}: the destination ${directory} is not empty (${String(entries.length)} entries); pass a fresh directory from fs.mkdtemp so nothing earlier can leak into this one.`,
     );
   }
 }

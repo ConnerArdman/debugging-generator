@@ -104,7 +104,7 @@ body {
   padding-block: var(--dg-space-2);
   padding-inline: var(--dg-space-4);
   background: var(--dg-surface-elevated);
-  border-block-end: thin solid var(--dg-border-subtle);
+  border-block-end: var(--dg-border-width-hairline) solid var(--dg-border-subtle);
 }
 
 .dgv-view__body {
@@ -163,10 +163,10 @@ body {
   padding-block: var(--dg-space-2);
   padding-inline: var(--dg-space-3);
   background: var(--dg-surface-elevated);
-  border: thin solid var(--dg-border-subtle);
-  /* The tone edge. A border-width keyword, because the token table has no
-   * border-width family and a length would be a hardcoded value. */
-  border-inline-start: medium solid var(--dg-border-strong);
+  border: var(--dg-border-width-hairline) solid var(--dg-border-subtle);
+  /* The tone edge: the design system's emphasis edge weight, so it matches
+   * every other marker edge in the product. */
+  border-inline-start: var(--dg-border-width-marker) solid var(--dg-border-strong);
   border-radius: var(--dg-radius-sm);
   color: var(--dg-text-secondary);
   font: var(--dg-text-sm);
@@ -461,7 +461,7 @@ body {
   padding-block: var(--dg-space-2);
   padding-inline: var(--dg-space-3);
   background: var(--dg-accent-muted);
-  border-inline-start: medium solid var(--dg-accent);
+  border-inline-start: var(--dg-border-width-marker) solid var(--dg-accent);
   border-radius: var(--dg-radius-sm);
   color: var(--dg-text-primary);
   font: var(--dg-text-md);
@@ -678,7 +678,7 @@ body {
   min-inline-size: 0;
   padding-block: var(--dg-space-1);
   background: var(--dg-surface-elevated);
-  border: thin solid var(--dg-border-subtle);
+  border: var(--dg-border-width-hairline) solid var(--dg-border-subtle);
   border-radius: var(--dg-radius-sm);
 }
 
@@ -696,7 +696,7 @@ body {
   min-inline-size: 0;
   padding-block-end: var(--dg-space-1);
   padding-inline: var(--dg-space-3);
-  border-block-end: thin solid var(--dg-border-subtle);
+  border-block-end: var(--dg-border-width-hairline) solid var(--dg-border-subtle);
 }
 
 .dgv-diff__scroll {
@@ -724,9 +724,10 @@ body {
    * container something to scroll; an intrinsic keyword, not a length. */
   min-inline-size: max-content;
   /* One line of the row's own type role, so an empty line of the diff keeps
-   * its height instead of collapsing; `lh` is relative to the token's line
-   * height, not a design length. */
-  min-block-size: 1lh;
+   * its height instead of collapsing. `--dg-line-block-size` is font-relative
+   * and resolves against this element, so it tracks the `--dg-mono-sm` line
+   * height below rather than stating a length of its own. */
+  min-block-size: var(--dg-line-block-size);
   padding-inline: var(--dg-space-3);
   color: var(--dg-text-primary);
   font: var(--dg-mono-sm);
@@ -864,8 +865,8 @@ body {
   min-inline-size: 0;
   padding-block: var(--dg-space-2);
   padding-inline: var(--dg-space-3);
-  border: thin solid var(--dg-warning);
-  border-inline-start: medium solid var(--dg-warning);
+  border: var(--dg-border-width-hairline) solid var(--dg-warning);
+  border-inline-start: var(--dg-border-width-marker) solid var(--dg-warning);
   border-radius: var(--dg-radius-sm);
   color: var(--dg-warning);
   font: var(--dg-text-sm);
@@ -916,7 +917,7 @@ body {
   padding-block: var(--dg-space-3);
   padding-inline: var(--dg-space-4);
   background: var(--dg-surface-overlay);
-  border: thin solid var(--dg-border-strong);
+  border: var(--dg-border-width-hairline) solid var(--dg-border-strong);
   border-radius: var(--dg-radius-md);
 }
 
@@ -962,8 +963,8 @@ body {
   padding-block: var(--dg-space-2);
   padding-inline: var(--dg-space-3);
   background: var(--dg-surface-elevated);
-  border: thin solid var(--dg-warning);
-  border-inline-start: medium solid var(--dg-warning);
+  border: var(--dg-border-width-hairline) solid var(--dg-warning);
+  border-inline-start: var(--dg-border-width-marker) solid var(--dg-warning);
   border-radius: var(--dg-radius-sm);
   color: var(--dg-text-primary);
   list-style: none;
@@ -1003,8 +1004,8 @@ body {
   padding-block: var(--dg-space-3);
   padding-inline: var(--dg-space-4);
   background: var(--dg-surface-elevated);
-  border: thin solid var(--dg-danger);
-  border-inline-start: medium solid var(--dg-danger);
+  border: var(--dg-border-width-hairline) solid var(--dg-danger);
+  border-inline-start: var(--dg-border-width-marker) solid var(--dg-danger);
   border-radius: var(--dg-radius-sm);
   color: var(--dg-text-primary);
   font: var(--dg-text-sm);

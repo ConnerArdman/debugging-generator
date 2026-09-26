@@ -104,7 +104,7 @@ import type {
   SessionTracker,
   TrackedFileSnapshot,
 } from './helpers/fixtures';
-import { withEditorAnnouncement } from './helpers/demo-app';
+import { waitForStreamedContent, withEditorAnnouncement } from './helpers/demo-app';
 
 // ---------------------------------------------------------------------------
 // The questions, the targets and the demo's observable surface
@@ -671,6 +671,7 @@ async function settlePage(page: Page): Promise<void> {
       })
       .toBeGreaterThanOrEqual(SETTLE_QUIET_MS);
     await page.waitForLoadState('load', { timeout: E2E_TIMEOUTS.pageReady });
+    await waitForStreamedContent(page);
   } finally {
     page.off('request', touch);
     page.off('requestfinished', touch);
@@ -765,6 +766,7 @@ function placeOrderControl(page: Page): Locator {
 /** Opens the checkout page and waits until "Place order" can be pressed. */
 async function openCheckoutPage(page: Page, baseUrl: string): Promise<void> {
   await page.goto(new URL(CHECKOUT_PAGE_PATH, baseUrl).href, { timeout: E2E_TIMEOUTS.pageReady });
+  await waitForStreamedContent(page);
   const control = placeOrderControl(page);
   await expect(control, `"${PLACE_ORDER_SELECTOR}" must match exactly one control.`).toHaveCount(1);
   await expect(control).toHaveAccessibleName(PLACE_ORDER_NAME);

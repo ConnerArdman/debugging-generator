@@ -1868,22 +1868,34 @@ function StateTransitionViewerView(props: StateTransitionViewerProps): ReactElem
  * Columns
  *
  * Six, left to right, and that order is the contract: component, hook, the
- * value before, the trigger, the value after, what was reported. Every track is
- * relational — `DataTable` warns that an intrinsic track sizes itself from one
- * row's own content and so stops lining up with its own header, and these cells
- * hold values of wildly varying width.
+ * value before, the trigger, the value after, what was reported.
  *
- * Every track is `minmax(<floor>, <share>)`. The share splits spare width in
- * the proportions the values need; the floor, in `ch` of the table's type
- * (never a literal length, AAP 0.6.4), is what the column never shrinks below.
- * `DataTable` sums the floors into the grid's own minimum width, so a surface
- * narrower than their sum scrolls the table horizontally with every column
- * still readable, instead of squeezing each one to its padding and letting a
- * cell's content paint over its neighbour. Each floor covers its header and
- * the cell's inline padding, and then: the disclosure control, a readable
- * excerpt of the name and its source chip; a hook label; a readable excerpt of
- * a value summary; the trigger control with its kind chip; the widest reported
- * chip, "Transitions dropped".
+ * Every column declares its width ROLE, never a size (`DataTableColumnWidth`
+ * in `../primitives/DataTable`, AAP 0.6.4): `DataTable` resolves each role to
+ * a track built from the design system's column floor and share tokens, the
+ * same track every other table gives content of that kind. The roles follow
+ * the content:
+ *
+ * - the component — the disclosure control, the name and its source chip — is
+ *   `name`, the identifier role;
+ * - the hook is `label`, a short hook label;
+ * - the value before and the value after are `text`, the free-text role with
+ *   the widest floor and share: they carry the producer's bounded, redacted
+ *   previews, so they need the most room for a readable excerpt;
+ * - the trigger — its control and its kind chip — is `name`, since the control
+ *   names the record it opens;
+ * - what was reported is `label`: one or two short categorical chips
+ *   ("Changed", "No values reported", "Transitions dropped"), each carrying
+ *   its word as a title or tooltip too (see {@link ChangedCell}).
+ *
+ * Every role track is a floor and a ratio, which resolves identically in every
+ * row — `DataTable` warns that an intrinsic track sizes itself from one row's
+ * own content and so stops lining up with its own header, and these cells
+ * hold values of wildly varying width. `DataTable` sums the floors into the
+ * grid's own minimum width, so a surface narrower than their sum scrolls the
+ * table horizontally with every column still readable, instead of squeezing
+ * each one to its padding and letting a cell's content paint over its
+ * neighbour.
  * ---------------------------------------------------------------------------
  */
 
@@ -1915,7 +1927,7 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<StateTra
       key: 'component',
       header: HEADERS.component,
       rowHeader: true,
-      width: 'minmax(30ch, 1.3fr)',
+      width: 'name',
       // The disclosure state and the id of the detail row it reveals come from
       // `DataTable` itself, which renders that row: the one source of truth for
       // both, so the toggle can never report a state the grid is not showing.
@@ -1932,31 +1944,31 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<StateTra
     {
       key: 'hook',
       header: HEADERS.hook,
-      width: 'minmax(18ch, 0.9fr)',
+      width: 'label',
       cell: (row) => <HookCell transition={row} />,
     },
     {
       key: 'previous',
       header: HEADERS.previous,
-      width: 'minmax(20ch, 1.4fr)',
+      width: 'text',
       cell: (row) => <ValueCell summary={row.previousValue} side="previous" />,
     },
     {
       key: 'trigger',
       header: HEADERS.trigger,
-      width: 'minmax(28ch, 1.1fr)',
+      width: 'name',
       cell: (row) => <TriggerCell transition={row} onSelect={context.onTriggerSelect} />,
     },
     {
       key: 'next',
       header: HEADERS.next,
-      width: 'minmax(20ch, 1.4fr)',
+      width: 'text',
       cell: (row) => <ValueCell summary={row.nextValue} side="next" />,
     },
     {
       key: 'changed',
       header: HEADERS.changed,
-      width: 'minmax(20ch, 0.9fr)',
+      width: 'label',
       cell: (row) => <ChangedCell transition={row} />,
     },
   ];

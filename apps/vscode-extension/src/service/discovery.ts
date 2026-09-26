@@ -20,7 +20,11 @@
  * - {@link probeDevServer} is a liveness check of the configured dev-server URL,
  *   so a command can tell the developer "your dev server is already up" or
  *   decide to ask the service to launch one (`POST /dev-server/launch`, issued
- *   by `client.ts`). {@link normalizeDevServerUrl} is its pure input gate.
+ *   by `client.ts`). `debuggen.startSession` also forwards the probed URL as
+ *   `session.create`'s `devServerUrl` when — and only when — it answered: a dev
+ *   server the developer started themselves is otherwise unknown to the
+ *   service, which verifies the URL on loopback again before recording it
+ *   (AAP §0.2.3). {@link normalizeDevServerUrl} is its pure input gate.
  *
  * ## What this module deliberately does not do
  *

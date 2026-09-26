@@ -1224,8 +1224,14 @@ describe('cleanup-conflict across a service restart', () => {
     return lifetime;
   };
 
-  /** Stops a lifetime the way a crash would find it — sessions open — and proves it is gone. */
+  /**
+   * Stops a lifetime the way a crash would find it — sessions open, journal untouched — and
+   * proves it is gone. A graceful `close()` ends every live session and restores its files, so
+   * the service is closed with `liveSessions: 'retain'` first: exactly what a crashed process
+   * leaves. The harness's own teardown then awaits that same memoised close.
+   */
   const stopLifetime = async (lifetime: Harness): Promise<void> => {
+    await lifetime.service.close({ liveSessions: 'retain' });
     expect(await lifetime.stop()).toEqual({ clean: true, problems: [] });
     await lifetime.assertNoLeaks();
   };
@@ -1449,10 +1455,27 @@ describe('cleanup-conflict across a service restart', () => {
     expect(report.status).toBe(CLEANUP.conflict);
 
     // Reconciliation never touches a session's status; it records each verdict on the session.
+    // The start's second half then settles the sessions the crash interrupted: a capture whose
+    // patches were just removed cannot continue, so its session is failed at `instrument` rather
+    // than left claiming a capture it can no longer make; every other status is left alone. Its
+    // files are restored, but the producers the crashed process armed for that capture may still
+    // hold it and none has reconnected yet, so its cleanup is held at `partial`, not `clean`.
     const afterCapturing = storedSession(second, capturing.sessionId);
-    expect(afterCapturing?.status).toBe(SESSION.capturing);
-    expect(afterCapturing?.cleanup.status).toBe(CLEANUP.clean);
+    expect(afterCapturing?.status).toBe(SESSION.failed);
+    expect(afterCapturing?.cleanup.status).toBe(CLEANUP.partial);
     expect(afterCapturing?.cleanup.conflicts).toEqual([]);
+    expect(second.service.startup.interruptedSessions).toMatchObject({
+      examined: 1,
+      failed: [
+        {
+          sessionId: capturing.sessionId,
+          status: SESSION.capturing,
+          reason: 'instrumentation-removed',
+        },
+      ],
+      errors: [],
+      aborted: false,
+    });
 
     const afterFailed = storedSession(second, failed.sessionId);
     expect(afterFailed?.status).toBe(SESSION.failed);
@@ -1480,7 +1503,7 @@ describe('cleanup-conflict across a service restart', () => {
     await stopLifetime(second);
   });
 
-  it('keeps conflicted sessions and their backups through a retention sweep that removes the rest', async () => {
+  it('keeps conflicted sessions through a retention sweep that removes the settled rest, the capture a restart failed included', async () => {
     // A start after the retention window: every session here has aged out.
     const third = await startLifetime(resumeAt);
     const conflicts = [watchedConflict, appliedEditedWhileDown, failedEditedWhileDown];
@@ -1494,7 +1517,12 @@ describe('cleanup-conflict across a service restart', () => {
     expect(reconciliation.closed).toBe(0);
     expect(reconciliation.status).toBe(CLEANUP.conflict);
 
-    // Retention then swept the settled sessions and kept the two that still hold a conflict.
+    // Retention then swept the settled sessions and kept the two that still hold a conflict. The
+    // session that was capturing when the first lifetime stopped is settled too: a capture never
+    // resumes across a restart, so the second start failed it at `instrument`, its window closed
+    // and every record of it restored — a resting session that ages out like any other. Nothing is
+    // retained as active: at start-up no session is in a pipeline stage or holds an open window
+    // (an in-flight session is retained however old it is; `../../src/store/retention.test.ts`).
     const retention = third.service.startup.retention;
     expect(retention).toBeDefined();
     expect([...(retention?.sessionIdsDeleted ?? [])].sort()).toEqual(
@@ -1503,6 +1531,7 @@ describe('cleanup-conflict across a service restart', () => {
     expect([...(retention?.sessionsRetainedForConflicts ?? [])].sort()).toEqual(
       [failed.sessionId, generated.sessionId].sort(),
     );
+    expect(retention?.sessionsRetainedActive).toEqual([]);
     expect(storedSession(third, capturing.sessionId)).toBeUndefined();
     expect(storedSession(third, ended.sessionId)).toBeUndefined();
     expect(storedSession(third, failed.sessionId)?.cleanup.status).toBe(CLEANUP.conflict);
@@ -1520,6 +1549,7 @@ describe('cleanup-conflict across a service restart', () => {
       expect(await sha256OfFile(record.backupPath)).toBe(record.originalHash);
       expect(await hashOf(roots.get(record.sessionId) ?? '', record.file)).toBe(edit.editedHash);
     }
+    // The purged sessions' backup directories went with their rows.
     expect(await backupEntries(home, capturing.sessionId)).toEqual([]);
     expect(await backupEntries(home, ended.sessionId)).toEqual([]);
 

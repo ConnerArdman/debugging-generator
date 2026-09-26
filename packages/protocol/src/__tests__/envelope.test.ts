@@ -11,7 +11,8 @@
  * last group here pins only what the AAP states outright about them.
  *
  * What is on trial here is the **frame**: the shape AAP 0.2.3 fixes
- * (`{ id, type, sessionId?, ts, payload }`), the completeness of the one
+ * (`{ id, type, sessionId?, ts, payload }`, plus the optional acting `tabId`
+ * AAP 0.5.6's tab rule needs), the completeness of the one
  * discriminated union built over it, and the four properties a boundary between
  * four processes lives or dies by. Each group below exists because a producer
  * and a consumer live in different bundles — the local service, the VS Code
@@ -22,7 +23,7 @@
  *   WebSocket text frame, a `window.postMessage` hop and a `chrome.runtime`
  *   port, so a payload that only works in memory — a `Date`, a `Map`, a class
  *   instance, a `NaN` — is a defect that shows up on one transport and not the
- *   others. The round-trip case builds a real frame for each of the twenty-five
+ *   others. The round-trip case builds a real frame for each of the twenty-six
  *   types and proves the decoded value is deep-equal to the frame that was
  *   sent — no key dropped, added or retyped. Byte equality is not the claim:
  *   a validated frame comes back in the schema's key order.
@@ -30,10 +31,11 @@
  *   at compile time that its registry and its tuple agree; this suite proves at
  *   run time that the union has one member per name, no duplicate and no extra,
  *   and that the tuple still names the twenty-five WebSocket messages AAP 0.4.2
- *   specifies — written out literally below so drift fails loudly rather than
- *   quietly redefining the protocol. The five names that are HTTP operations
- *   rather than frames are asserted to be exactly that, so no name from the
- *   user's list is lost in either direction.
+ *   specifies plus `source.result`, the answer to `source.open` — written out
+ *   literally below so drift fails loudly rather than quietly redefining the
+ *   protocol. The five names that are HTTP operations rather than frames are
+ *   asserted to be exactly that, so no name from the user's list is lost in
+ *   either direction.
  * - **A stray field is a violation, not extra information.** The envelope is a
  *   strict object: a sixth top-level key, a missing `id`, a timestamp on the
  *   wrong time base or a `null` where a key should be absent are all rejected,
@@ -56,6 +58,13 @@
  *   `session.created` / `session.updated` record id alike — without naming
  *   either id, and `createEnvelope` refuses to build it; an absent routing key,
  *   and a routing key on a payload that names no session, stay valid.
+ * - **One frame acts for one tab.** One paired DevTools credential and one
+ *   service-worker socket carry every inspected tab, so the envelope's acting
+ *   `tabId` is what the service authorizes a DevTools frame by (AAP 0.5.6). The
+ *   acting-tab cases prove it is a tab id or refused, round-trips on every
+ *   member, is absent unless a caller set it, agrees with a payload's own
+ *   `tabId` or is refused without naming either, and is never lifted from the
+ *   payload by `createEnvelope`.
  * - **The primitives underneath are what the envelope claims they are.**
  *   `../version.ts` supplies the wire version and its handshake predicate, the
  *   epoch-millisecond timestamp every frame carries, the leak-free issue
@@ -170,6 +179,7 @@ import type {
   MessageType,
   PanelGeneratedPayload,
   SessionProgressPayload,
+  SourceResultPayload,
 } from '../messages/index.js';
 import * as messagesModule from '../messages/index.js';
 import type { SessionRecord } from '../session-record.js';
@@ -385,7 +395,7 @@ const ANALYSIS: AnalysisResult = {
  *
  * The mapped type is the point: a missing key, or a payload of the wrong shape
  * for its type, is a compile error — so this table cannot fall behind the
- * registry it mirrors, and a twenty-sixth message type fails `tsc -b` here as
+ * registry it mirrors, and a twenty-seventh message type fails `tsc -b` here as
  * well as in `../messages/index.ts`.
  */
 const VALID_PAYLOADS: { readonly [K in MessageType]: MessagePayload<K> } = {
@@ -528,6 +538,7 @@ const VALID_PAYLOADS: { readonly [K in MessageType]: MessagePayload<K> } = {
       confidence: 0.9,
     },
   },
+  'source.result': { sessionId: SESSION_ID, ref: MESSAGE_ID, status: 'opened' },
   'target.request': { sessionId: SESSION_ID },
   'target.selected': {
     sessionId: SESSION_ID,
@@ -608,6 +619,18 @@ const AAP_WEBSOCKET_MESSAGE_NAMES = [
   'cleanup.completed',
   'error',
 ] as const;
+
+/**
+ * The WebSocket message names this protocol adds to the AAP 0.4.2 list, written
+ * out for the same reason: `source.result`, the correlated answer to
+ * `source.open` that lets a click on a source link be reported as opened, as
+ * falling back to the editor-open URI, or as failed.
+ *
+ * Kept apart from {@link AAP_WEBSOCKET_MESSAGE_NAMES} so that list stays a
+ * verbatim copy of the specification, and an addition is a visible, separate
+ * statement rather than a silent edit to it.
+ */
+const ANSWER_MESSAGE_NAMES = ['source.result'] as const;
 
 /**
  * The five names from the same AAP list that are **HTTP operations**, not
@@ -748,7 +771,7 @@ function issuesOf(schema: z.ZodType, value: unknown): z.core.$ZodIssue[] {
 describe('protocolMessageSchema — one member per declared message type', () => {
   it('has exactly as many options as there are message types', () => {
     expect(protocolMessageSchema.options).toHaveLength(MESSAGE_TYPES.length);
-    expect(MESSAGE_TYPES).toHaveLength(25);
+    expect(MESSAGE_TYPES).toHaveLength(26);
   });
 
   it('discriminates on exactly the declared type names, with no duplicate or extra', () => {
@@ -762,14 +785,18 @@ describe('protocolMessageSchema — one member per declared message type', () =>
     expect(new Set(MESSAGE_TYPES).size).toBe(MESSAGE_TYPES.length);
   });
 
-  it('names exactly the WebSocket messages AAP 0.4.2 specifies', () => {
-    // The literal list is checked first, so a typo in the expectation cannot
-    // pass by being mirrored in the tuple.
+  it('names exactly the WebSocket messages AAP 0.4.2 specifies, plus source.result', () => {
+    // The literal lists are checked first, so a typo in the expectation cannot
+    // pass by being mirrored in the tuple, and the addition cannot hide inside
+    // the specified list.
+    const expected = [...AAP_WEBSOCKET_MESSAGE_NAMES, ...ANSWER_MESSAGE_NAMES];
+
     expect(new Set(AAP_WEBSOCKET_MESSAGE_NAMES).size).toBe(25);
-    expect([...MESSAGE_TYPES].sort()).toEqual([...AAP_WEBSOCKET_MESSAGE_NAMES].sort());
-    expect(Object.keys(MESSAGE_PAYLOAD_SCHEMAS).sort()).toEqual(
-      [...AAP_WEBSOCKET_MESSAGE_NAMES].sort(),
-    );
+    expect(new Set(expected).size).toBe(26);
+    expect([...MESSAGE_TYPES].sort()).toEqual([...expected].sort());
+    expect(Object.keys(MESSAGE_PAYLOAD_SCHEMAS).sort()).toEqual([...expected].sort());
+    // The answer sits in its request's domain, directly after it.
+    expect(MESSAGE_TYPES.indexOf('source.result')).toBe(MESSAGE_TYPES.indexOf('source.open') + 1);
   });
 
   it('keeps the five HTTP operation names out of the union and in the route table', () => {
@@ -790,26 +817,49 @@ describe('protocolMessageSchema — one member per declared message type', () =>
     }
   });
 
-  it('keeps telemetry.event in both vocabularies on purpose: a frame and the ingest route', () => {
-    // Not a collision. AAP 0.4.2 lists two rows under the one name: the browser
-    // agent's batches reach the service as a WebSocket frame (wrapped by the
-    // service worker), and the Node preload posts its spans to
-    // `POST /telemetry/ingest`. It is the only name the two vocabularies share,
-    // and it is not an HTTP-only name — the frame exists too.
+  it('keeps telemetry.event and target.request in both vocabularies on purpose', () => {
+    // Not collisions. AAP 0.4.2 lists two rows under `telemetry.event`: the
+    // browser agent's batches reach the service as a WebSocket frame (wrapped by
+    // the service worker), and the Node preload posts its spans to
+    // `POST /telemetry/ingest`. `target.request` is the service's push asking the
+    // bound DevTools tab to enter picker mode, and `POST /sessions/:id/target/request`
+    // is the editor's request that makes the service send it. These are the only
+    // names the two vocabularies share, and neither is an HTTP-only name — the
+    // frame exists too.
     const operations = new Set<string>(HTTP_OPERATIONS);
+    const httpOnly = new Set<string>(HTTP_ONLY_PAYLOAD_NAMES);
 
-    expect(MESSAGE_TYPES).toContain('telemetry.event');
-    expect(HTTP_OPERATIONS).toContain('telemetry.event');
-    expect(MESSAGE_TYPES.filter((type) => operations.has(type))).toEqual(['telemetry.event']);
-    expect(new Set<string>(HTTP_ONLY_PAYLOAD_NAMES).has('telemetry.event')).toBe(false);
+    expect(MESSAGE_TYPES.filter((type) => operations.has(type))).toEqual([
+      'telemetry.event',
+      'target.request',
+    ]);
+    for (const name of ['telemetry.event', 'target.request'] as const) {
+      expect(MESSAGE_TYPES).toContain(name);
+      expect(HTTP_OPERATIONS).toContain(name);
+      expect(httpOnly.has(name)).toBe(false);
+      expect(parseMessage(VALID_FRAMES[name]).ok).toBe(true);
+    }
 
-    const route = HTTP_ROUTES['telemetry.event'];
-    expect({ method: route.method, pattern: route.pattern, authExempt: route.authExempt }).toEqual({
+    const ingest = HTTP_ROUTES['telemetry.event'];
+    expect({
+      method: ingest.method,
+      pattern: ingest.pattern,
+      authExempt: ingest.authExempt,
+    }).toEqual({
       method: 'POST',
       pattern: '/telemetry/ingest',
       authExempt: false,
     });
-    expect(parseMessage(VALID_FRAMES['telemetry.event']).ok).toBe(true);
+    const picker = HTTP_ROUTES['target.request'];
+    expect({
+      method: picker.method,
+      pattern: picker.pattern,
+      authExempt: picker.authExempt,
+    }).toEqual({
+      method: 'POST',
+      pattern: '/sessions/:id/target/request',
+      authExempt: false,
+    });
   });
 
   it.each([...AAP_HTTP_ONLY_NAMES])('refuses %s sent as a frame rather than a request', (name) => {
@@ -823,19 +873,20 @@ describe('protocolMessageSchema — one member per declared message type', () =>
     expect(parsed.error.message).toContain('type (invalid_union');
   });
 
-  it('declares the three shared envelope fields once, in envelopeBaseShape', () => {
-    expect(Object.keys(envelopeBaseShape)).toEqual(['id', 'sessionId', 'ts']);
+  it('declares the four shared envelope fields once, in envelopeBaseShape', () => {
+    expect(Object.keys(envelopeBaseShape)).toEqual(['id', 'sessionId', 'tabId', 'ts']);
     expect(Object.isFrozen(envelopeBaseShape)).toBe(true);
 
     for (const option of protocolMessageSchema.options) {
       expect(Object.keys(option.shape).sort()).toEqual(
-        ['id', 'payload', 'sessionId', 'ts', 'type'].sort(),
+        ['id', 'payload', 'sessionId', 'tabId', 'ts', 'type'].sort(),
       );
       // Written once and spread, not re-declared per member: every member's
       // envelope fields are the base shape's own schema objects, and each
       // member's payload is the registry's schema for its type.
       expect(option.shape.id).toBe(envelopeBaseShape.id);
       expect(option.shape.sessionId).toBe(envelopeBaseShape.sessionId);
+      expect(option.shape.tabId).toBe(envelopeBaseShape.tabId);
       expect(option.shape.ts).toBe(envelopeBaseShape.ts);
       expect(option.shape.payload).toBe(MESSAGE_PAYLOAD_SCHEMAS[option.shape.type.value]);
     }
@@ -889,20 +940,107 @@ describe('round trip — every message survives encode, decode and re-encode', (
 });
 
 describe('strictness — every member of the union, not just one', () => {
-  it.each([...MESSAGE_TYPES])('%s refuses a stray top-level key and a null sessionId', (type) => {
-    const valid: Record<string, unknown> = { ...VALID_FRAMES[type] };
+  it.each([...MESSAGE_TYPES])(
+    '%s refuses a stray top-level key, a null sessionId and a null tabId',
+    (type) => {
+      const valid: Record<string, unknown> = { ...VALID_FRAMES[type] };
 
-    const withStrayKey = parseMessage({ ...valid, extra: true });
-    const withNullSession = parseMessage({ ...valid, sessionId: null });
+      const withStrayKey = parseMessage({ ...valid, extra: true });
+      const withNullSession = parseMessage({ ...valid, sessionId: null });
+      const withNullTab = parseMessage({ ...valid, tabId: null });
 
-    expect(parseMessage(valid).ok).toBe(true);
-    expect(withStrayKey.ok).toBe(false);
-    expect(withNullSession.ok).toBe(false);
-    if (withStrayKey.ok || withNullSession.ok) {
+      expect(parseMessage(valid).ok).toBe(true);
+      expect(withStrayKey.ok).toBe(false);
+      expect(withNullSession.ok).toBe(false);
+      expect(withNullTab.ok).toBe(false);
+      if (withStrayKey.ok || withNullSession.ok || withNullTab.ok) {
+        return;
+      }
+      expect(withStrayKey.error.message).toContain('<root> (unrecognized_keys keys=extra)');
+      expect(withNullSession.error.message).toContain('sessionId (invalid_type expected=string)');
+      expect(withNullTab.error.message).toBe(
+        'Invalid protocol message: tabId (invalid_type expected=number)',
+      );
+    },
+  );
+});
+
+describe('telemetry.event — the producer’s delivery context', () => {
+  const withContext = {
+    events: [INGRESS_EVENT],
+    armedCaptureId: CAPTURE_ID,
+    droppedCount: 3,
+  };
+
+  it('accepts the armed capture and a loss count beside the batch, unchanged, in a routed frame', () => {
+    const payload = protocol.parseTelemetryEventPayload(withContext);
+    const frame = parseMessage({ ...frameFor('telemetry.event'), payload: withContext });
+
+    expect(payload.ok).toBe(true);
+    expect(frame.ok).toBe(true);
+    if (!payload.ok || !frame.ok) {
       return;
     }
-    expect(withStrayKey.error.message).toContain('<root> (unrecognized_keys keys=extra)');
-    expect(withNullSession.error.message).toContain('sessionId (invalid_type expected=string)');
+    expect(payload.value).toStrictEqual(withContext);
+    expect(frame.value.payload).toStrictEqual(withContext);
+  });
+
+  it('keeps both fields optional, and a zero loss count valid', () => {
+    expect(protocol.parseTelemetryEventPayload({ events: [INGRESS_EVENT] }).ok).toBe(true);
+    expect(
+      protocol.parseTelemetryEventPayload({ events: [INGRESS_EVENT], droppedCount: 0 }).ok,
+    ).toBe(true);
+  });
+
+  it.each([
+    { label: 'negative', droppedCount: -4 },
+    { label: 'fractional', droppedCount: 2.5 },
+    { label: 'beyond the safe-integer range', droppedCount: Number.MAX_SAFE_INTEGER + 2 },
+    { label: 'a numeric string', droppedCount: '7' },
+  ])('refuses a $label loss count without echoing it', ({ droppedCount }) => {
+    const parsed = protocol.parseTelemetryEventPayload({ events: [INGRESS_EVENT], droppedCount });
+
+    expect(parsed.ok).toBe(false);
+    if (parsed.ok) {
+      return;
+    }
+    expect(parsed.error.code).toBe('PROTOCOL_INVALID_MESSAGE');
+    expect(parsed.error.message).toContain('droppedCount');
+    expect(parsed.error.message).not.toContain(String(droppedCount));
+  });
+
+  it.each([
+    { label: 'empty', armedCaptureId: '', echo: 'cap_' },
+    { label: 'padded', armedCaptureId: ` ${CAPTURE_ID}`, echo: CAPTURE_ID },
+    { label: 'longer than an identifier', armedCaptureId: `cap_${'x'.repeat(80)}`, echo: 'xxxx' },
+  ])('refuses an $label armed capture id without echoing it', ({ armedCaptureId, echo }) => {
+    const parsed = protocol.parseTelemetryEventPayload({ events: [INGRESS_EVENT], armedCaptureId });
+
+    expect(parsed.ok).toBe(false);
+    if (parsed.ok) {
+      return;
+    }
+    expect(parsed.error.message).toContain('armedCaptureId');
+    expect(parsed.error.message).not.toContain(echo);
+  });
+
+  it('still refuses attribution: no payload-level sessionId or captureId, no attributed element', () => {
+    const payloadSession = protocol.parseTelemetryEventPayload({
+      events: [INGRESS_EVENT],
+      sessionId: SESSION_ID,
+    });
+    const payloadCapture = protocol.parseTelemetryEventPayload({
+      events: [INGRESS_EVENT],
+      captureId: CAPTURE_ID,
+    });
+    const attributedElement = protocol.parseTelemetryEventPayload({
+      events: [{ ...INGRESS_EVENT, captureId: CAPTURE_ID }],
+      armedCaptureId: CAPTURE_ID,
+    });
+
+    expect(payloadSession.ok).toBe(false);
+    expect(payloadCapture.ok).toBe(false);
+    expect(attributedElement.ok).toBe(false);
   });
 });
 
@@ -1257,6 +1395,234 @@ describe('parseMessage — the routing key agrees with the session the payload n
   });
 });
 
+// One paired DevTools credential and one service-worker socket carry every
+// inspected tab, so the envelope's acting `tabId` is what the service holds a
+// DevTools frame to "only the session bound to that tab" by (AAP 0.5.6). A frame
+// whose acting tab and payload tab differ is a confused-deputy request, refused
+// without naming either tab (AAP 0.5.2).
+describe('parseMessage — the acting tab is a tab id and agrees with the payload’s tab', () => {
+  /**
+   * The tab a payload names in the contradiction cases: distinctive, so its
+   * absence from every surface of a rejection is a precise assertion rather
+   * than a digit that a stack trace's line numbers could supply.
+   */
+  const PAYLOAD_TAB = 5_550_123;
+
+  /** The different tab the envelope claims to act for. */
+  const ACTING_TAB = 8_675_309;
+
+  /** The one rendering an acting-tab contradiction has. */
+  const ACTING_TAB_ISSUE =
+    'Invalid protocol message: tabId (custom label=acting-tab-matches-payload)';
+
+  /** The six payloads that carry a numeric `tabId` of their own. */
+  const TAB_NAMING_TYPES = [
+    'client.hello',
+    'agent.ready',
+    'session.bind',
+    'session.bound',
+    'tab.navigated',
+    'session.unbind',
+  ] as const;
+
+  /** Frames the service worker sends for a tab whose payloads name no tab. */
+  const TABLESS_PAYLOAD_TYPES = ['telemetry.event', 'target.selected', 'source.open'] as const;
+
+  /**
+   * Every message's deterministic frame acting for {@link TAB_ID}, built by
+   * `createEnvelope` and keyed by type — {@link VALID_FRAMES} with the option
+   * set, and indexable by the whole vocabulary for the reason that table is.
+   */
+  const ACTING_FRAMES = Object.fromEntries(
+    MESSAGE_TYPES.map((type) => [
+      type,
+      createEnvelope(type, VALID_PAYLOADS[type], { id: MESSAGE_ID, ts: SENT_AT, tabId: TAB_ID }),
+    ]),
+  ) as FrameTable;
+
+  it.each([...MESSAGE_TYPES])('%s round-trips with an acting tab', (type) => {
+    const frame = ACTING_FRAMES[type];
+    const decoded = decodeMessage(encodeMessage(frame));
+
+    expect(frame.tabId).toBe(TAB_ID);
+    expect(decoded.ok).toBe(true);
+    if (!decoded.ok) {
+      return;
+    }
+    expect(decoded.value).toStrictEqual(frame);
+    expect(decoded.value.tabId).toBe(TAB_ID);
+  });
+
+  it.each([...MESSAGE_TYPES])('%s carries no tabId key unless one was given', (type) => {
+    const frame = VALID_FRAMES[type];
+
+    expect('tabId' in frame).toBe(false);
+    expect(JSON.parse(encodeMessage(frame))).not.toHaveProperty('tabId');
+
+    const parsed = parseMessage(frame);
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+    expect('tabId' in parsed.value).toBe(false);
+  });
+
+  it.each([
+    ['chrome.tabs.TAB_ID_NONE', -1, 'tabId (too_small origin=number min=0)'],
+    ['a fraction', 1.5, 'tabId (invalid_type expected=int)'],
+    ['a stringified tab id', '7', 'tabId (invalid_type expected=number)'],
+    [
+      'the first integer beyond the safe range',
+      Number.MAX_SAFE_INTEGER + 1,
+      'tabId (too_big origin=int max=9007199254740991)',
+    ],
+    ['NaN', Number.NaN, 'tabId (invalid_type expected=number)'],
+    ['an infinite value', Number.POSITIVE_INFINITY, 'tabId (invalid_type expected=number)'],
+    ['a boolean', true, 'tabId (invalid_type expected=number)'],
+  ])('refuses %s as the acting tab', (_label, tabId, issue) => {
+    const parsed = parseMessage({ ...VALID_FRAMES['telemetry.event'], tabId });
+
+    expect(parsed.ok).toBe(false);
+    if (parsed.ok) {
+      return;
+    }
+    expect(parsed.error.code).toBe('PROTOCOL_INVALID_MESSAGE');
+    expect(parsed.error.message).toContain(`Invalid protocol message: ${issue}`);
+    // Every issue is about the acting tab, and none is a contradiction issue:
+    // a malformed tab is reported by its own field issues alone.
+    expect(parsed.error.message).not.toContain('acting-tab-matches-payload');
+    expect(parsed.error.details?.issues).toEqual(
+      expect.arrayContaining([expect.objectContaining({ path: 'tabId' })]),
+    );
+  });
+
+  it('accepts tab 0 and the largest safe integer as the acting tab', () => {
+    for (const tabId of [0, Number.MAX_SAFE_INTEGER]) {
+      const parsed = parseMessage({ ...VALID_FRAMES['telemetry.event'], tabId });
+
+      expect(parsed.ok).toBe(true);
+      if (!parsed.ok) {
+        return;
+      }
+      expect(parsed.value.tabId).toBe(tabId);
+    }
+  });
+
+  it.each(TAB_NAMING_TYPES)(
+    '%s refuses an acting tab that contradicts the payload’s tabId, echoing neither',
+    (type) => {
+      const payload = { ...VALID_PAYLOADS[type], tabId: PAYLOAD_TAB };
+      const frame = { id: MESSAGE_ID, type, ts: SENT_AT, payload, tabId: ACTING_TAB };
+
+      // Precondition: the same frame acting for its own payload's tab is
+      // accepted, so the refusal below is about the acting tab and nothing else.
+      expect(parseMessage({ ...frame, tabId: PAYLOAD_TAB }).ok).toBe(true);
+
+      const parsed = parseMessage(frame);
+
+      expect(parsed.ok).toBe(false);
+      if (parsed.ok) {
+        return;
+      }
+      expect(parsed.error.code).toBe('PROTOCOL_INVALID_MESSAGE');
+      expect(parsed.error.message).toBe(ACTING_TAB_ISSUE);
+      expect(parsed.error.details).toStrictEqual({
+        issueCount: 1,
+        issues: [{ path: 'tabId', code: 'custom' }],
+      });
+      expect(parsed.error.hint).toContain('acting `tabId` must be a non-negative integer');
+      expectNoEcho(parsed.error, String(ACTING_TAB));
+      expectNoEcho(parsed.error, String(PAYLOAD_TAB));
+    },
+  );
+
+  it.each(TAB_NAMING_TYPES)('%s accepts an acting tab equal to the payload’s tabId', (type) => {
+    const parsed = parseMessage({ ...VALID_FRAMES[type], tabId: TAB_ID });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+    expect(parsed.value.tabId).toBe(TAB_ID);
+    expect(parsed.value.payload).toStrictEqual(VALID_PAYLOADS[type]);
+  });
+
+  it('accepts any acting tab on a DevTools client.hello that names no tab of its own', () => {
+    const { tabId: helloTab, ...tablessHello } = VALID_PAYLOADS['client.hello'];
+    const parsed = parseMessage({
+      id: MESSAGE_ID,
+      type: 'client.hello',
+      ts: SENT_AT,
+      tabId: ACTING_TAB,
+      payload: tablessHello,
+    });
+
+    expect(helloTab).toBe(TAB_ID);
+    expect(parsed.ok).toBe(true);
+  });
+
+  it.each(TABLESS_PAYLOAD_TYPES)(
+    '%s names no tab in its payload, so any acting tab is accepted',
+    (type) => {
+      const parsed = parseMessage({ ...VALID_FRAMES[type], tabId: ACTING_TAB });
+
+      expect(parsed.ok).toBe(true);
+      if (!parsed.ok) {
+        return;
+      }
+      expect(parsed.value.tabId).toBe(ACTING_TAB);
+      expect(parsed.value.sessionId).toBe(VALID_FRAMES[type].sessionId);
+    },
+  );
+
+  it('reports a frame that names two sessions and two tabs for both, echoing none', () => {
+    const parsed = parseMessage({
+      ...VALID_FRAMES['session.bound'],
+      sessionId: OTHER_SESSION_ID,
+      tabId: ACTING_TAB,
+      payload: { ...VALID_PAYLOADS['session.bound'], tabId: PAYLOAD_TAB },
+    });
+
+    expect(parsed.ok).toBe(false);
+    if (parsed.ok) {
+      return;
+    }
+    expect(parsed.error.message).toBe(
+      'Invalid protocol message: sessionId (custom label=routing-matches-payload); tabId (custom label=acting-tab-matches-payload)',
+    );
+    expect(parsed.error.details).toStrictEqual({
+      issueCount: 2,
+      issues: [
+        { path: 'sessionId', code: 'custom' },
+        { path: 'tabId', code: 'custom' },
+      ],
+    });
+    expectNoEcho(parsed.error, OTHER_SESSION_ID);
+    expectNoEcho(parsed.error, SESSION_ID);
+    expectNoEcho(parsed.error, String(ACTING_TAB));
+    expectNoEcho(parsed.error, String(PAYLOAD_TAB));
+  });
+
+  it('reports a malformed payload by its own issues, without an acting-tab issue beside them', () => {
+    const parsed = parseMessage({
+      id: MESSAGE_ID,
+      type: 'session.unbind',
+      ts: SENT_AT,
+      tabId: ACTING_TAB,
+      payload: { tabId: -1 },
+    });
+
+    expect(parsed.ok).toBe(false);
+    if (parsed.ok) {
+      return;
+    }
+    expect(parsed.error.message).toBe(
+      'Invalid protocol message: payload.tabId (too_small origin=number min=0)',
+    );
+  });
+});
+
 describe('decodeMessage — text that is not JSON', () => {
   it('rejects malformed JSON without quoting it', () => {
     // V8's SyntaxError quotes the text around the fault, which here is the
@@ -1496,6 +1862,169 @@ describe('createEnvelope — deterministic, non-mutating, routable', () => {
       'payload',
     ]);
     expect(Object.keys(frameFor('client.hello'))).toEqual(['id', 'type', 'ts', 'payload']);
+    expect(
+      Object.keys(
+        createEnvelope('source.open', VALID_PAYLOADS['source.open'], {
+          id: MESSAGE_ID,
+          ts: SENT_AT,
+          tabId: TAB_ID,
+        }),
+      ),
+    ).toEqual(['id', 'type', 'sessionId', 'tabId', 'ts', 'payload']);
+    expect(
+      Object.keys(
+        createEnvelope('telemetry.event', VALID_PAYLOADS['telemetry.event'], {
+          id: MESSAGE_ID,
+          ts: SENT_AT,
+          tabId: TAB_ID,
+        }),
+      ),
+    ).toEqual(['id', 'type', 'tabId', 'ts', 'payload']);
+  });
+});
+
+describe('createEnvelope — the acting tab is set by the caller alone', () => {
+  /** A tab no fixture payload names, so a contradiction is unambiguous. */
+  const OTHER_TAB = 8_675_309;
+
+  it('puts options.tabId on the frame, and the frame parses', () => {
+    const frame = createEnvelope('telemetry.event', VALID_PAYLOADS['telemetry.event'], {
+      id: MESSAGE_ID,
+      ts: SENT_AT,
+      tabId: TAB_ID,
+    });
+
+    expect(frame).toStrictEqual({
+      id: MESSAGE_ID,
+      type: 'telemetry.event',
+      tabId: TAB_ID,
+      ts: SENT_AT,
+      payload: VALID_PAYLOADS['telemetry.event'],
+    });
+    expect(parseMessage(frame).ok).toBe(true);
+  });
+
+  it('keeps tab 0, which is a real tab rather than an absent one', () => {
+    const frame = createEnvelope('session.unbind', { tabId: 0 }, { tabId: 0 });
+
+    expect(frame.tabId).toBe(0);
+    expect(JSON.parse(encodeMessage(frame))).toHaveProperty('tabId', 0);
+  });
+
+  it('omits the key when the option is absent or explicitly undefined', () => {
+    const absent = createEnvelope('telemetry.event', VALID_PAYLOADS['telemetry.event'], {
+      id: MESSAGE_ID,
+      ts: SENT_AT,
+    });
+    const undefinedTab = createEnvelope('telemetry.event', VALID_PAYLOADS['telemetry.event'], {
+      id: MESSAGE_ID,
+      ts: SENT_AT,
+      tabId: undefined,
+    });
+
+    expect('tabId' in absent).toBe(false);
+    expect('tabId' in undefinedTab).toBe(false);
+    expect(encodeMessage(undefinedTab)).toBe(encodeMessage(absent));
+    expect(encodeMessage(absent)).not.toContain('"tabId"');
+  });
+
+  it.each([
+    'agent.ready',
+    'session.bind',
+    'session.bound',
+    'tab.navigated',
+    'session.unbind',
+  ] as const)('never lifts the %s payload’s own tabId into the envelope', (type) => {
+    const frame = frameFor(type);
+
+    // The payload names a tab, and the frame is still byte-for-byte the
+    // tab-less shape: a service push such as `session.bound` is unchanged.
+    expect(VALID_PAYLOADS[type].tabId).toBe(TAB_ID);
+    expect('tabId' in frame).toBe(false);
+    expect(Object.keys(frame)).not.toContain('tabId');
+  });
+
+  it('accepts an option that restates the payload’s own tab', () => {
+    const frame = createEnvelope('agent.ready', VALID_PAYLOADS['agent.ready'], {
+      id: MESSAGE_ID,
+      ts: SENT_AT,
+      tabId: TAB_ID,
+    });
+
+    expect(frame.tabId).toBe(TAB_ID);
+    expect(parseMessage(frame).ok).toBe(true);
+  });
+
+  it.each([
+    'agent.ready',
+    'session.bind',
+    'session.bound',
+    'tab.navigated',
+    'session.unbind',
+  ] as const)(
+    'refuses an option that contradicts the %s payload’s tab, echoing neither',
+    (type) => {
+      const thrown = thrownBy(() =>
+        createEnvelope(type, VALID_PAYLOADS[type], {
+          id: MESSAGE_ID,
+          ts: SENT_AT,
+          tabId: OTHER_TAB,
+        }),
+      );
+
+      expect(thrown).toBeInstanceOf(DebuggenError);
+      if (!(thrown instanceof DebuggenError)) {
+        return;
+      }
+      expect(thrown.code).toBe('PROTOCOL_INVALID_MESSAGE');
+      expect(thrown.message).toBe(
+        'Cannot build a protocol frame: options.tabId names a different tab than the payload does',
+      );
+      expect(thrown.details).toStrictEqual({ type });
+      expectNoEcho(thrown, String(OTHER_TAB));
+    },
+  );
+
+  it.each([
+    ['chrome.tabs.TAB_ID_NONE', -1],
+    ['a fraction', 1.5],
+    ['NaN', Number.NaN],
+    ['an infinite value', Number.POSITIVE_INFINITY],
+    ['the first integer beyond the safe range', Number.MAX_SAFE_INTEGER + 1],
+    ['a string from untyped code', '7' as unknown as number],
+  ])('refuses %s as options.tabId, with a constant message', (_label, tabId) => {
+    const thrown = thrownBy(() =>
+      createEnvelope('telemetry.event', VALID_PAYLOADS['telemetry.event'], {
+        id: MESSAGE_ID,
+        ts: SENT_AT,
+        tabId,
+      }),
+    );
+
+    expect(thrown).toBeInstanceOf(DebuggenError);
+    if (!(thrown instanceof DebuggenError)) {
+      return;
+    }
+    expect(thrown.code).toBe('PROTOCOL_INVALID_MESSAGE');
+    expect(thrown.message).toBe(
+      'Cannot build a protocol frame: options.tabId is not a non-negative safe-integer Chrome tab id',
+    );
+    expect(thrown.details).toStrictEqual({ type: 'telemetry.event' });
+    expect(thrown.cause).toBeUndefined();
+  });
+
+  it('checks the tab id before the payload, so an invalid option never reaches the comparison', () => {
+    // `-1` contradicts the payload's tab 7 as well as failing the schema; the
+    // schema failure is the one reported, because it is the root mistake.
+    const thrown = thrownBy(() =>
+      createEnvelope('session.unbind', VALID_PAYLOADS['session.unbind'], { tabId: -1 }),
+    );
+
+    expect(thrown).toBeInstanceOf(DebuggenError);
+    if (!(thrown instanceof DebuggenError)) {
+      return;
+    }
+    expect(thrown.message).toContain('is not a non-negative safe-integer Chrome tab id');
   });
 });
 
@@ -1559,6 +2088,16 @@ describe('type-level guarantees', () => {
     expectTypeOf<MessagePayload<'panel.generated'>['panel']>().toExtend<PanelSpec>();
     expectTypeOf<MessageByType<'panel.generated'>['type']>().toEqualTypeOf<'panel.generated'>();
     expectTypeOf<ProtocolMessageMap['source.open']>().toEqualTypeOf<MessageByType<'source.open'>>();
+    // A payload that is itself a discriminated union keeps its members: the
+    // envelope does not flatten `source.result` into one object type, so a
+    // receiver narrows on `status` to reach a failure's `error`.
+    expectTypeOf<MessagePayload<'source.result'>>().toEqualTypeOf<SourceResultPayload>();
+    expectTypeOf<MessagePayload<'source.result'>['status']>().toEqualTypeOf<
+      'opened' | 'no-editor' | 'failed'
+    >();
+    expectTypeOf<
+      Extract<MessagePayload<'source.result'>, { status: 'failed' }>['error']['code']
+    >().toEqualTypeOf<(typeof DEBUGGEN_ERROR_CODES)[number]>();
     expectTypeOf<
       MessageTypeOf<MessageByType<'cleanup.completed'>>
     >().toEqualTypeOf<'cleanup.completed'>();
@@ -2056,11 +2595,12 @@ const UPSTREAM_PACKAGES: Readonly<Record<string, Readonly<Record<string, unknown
  * the same name bound to the same value.
  *
  * Name *and* identity, because each alone misjudges a legitimate case. Identity
- * alone would flag a protocol-owned name deliberately bound to an upstream
- * object — `panelDataRequestSchema` *is* panel-schema's `dataQuerySchema`, by
- * contract — and could not tell a borrowed primitive from an equal own
+ * alone would flag a protocol-owned name a module deliberately binds to an
+ * upstream object, and could not tell a borrowed primitive from an equal own
  * constant. A name alone would flag an own export that merely shares a
- * spelling with something upstream.
+ * spelling with something upstream. (`panelDataRequestSchema` is protocol-owned
+ * in both senses: it extends panel-schema's `dataQuerySchema` into a new
+ * object under a name no upstream package publishes, so it borrows nothing.)
  *
  * @param name The barrel export's name.
  * @param value The barrel export's value.

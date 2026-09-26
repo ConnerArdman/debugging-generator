@@ -40,6 +40,11 @@
  *    capture is still the one the transport stamps. That is what lets
  *    `../aggregate/requests.ts` show a request as *pending* rather than guess
  *    it from a missing status code.
+ * 6. **Samples the dev server's clock.** A same-origin response the server
+ *    produced just then carries its `Date`, which {@link sampleServerClock}
+ *    hands to `./transport.ts` for the document's informational
+ *    `clockOffsetMs` (AAP 0.2.3). Nothing about the request or its event
+ *    changes.
  *
  * ## The rules this module will not break
  *
@@ -51,9 +56,12 @@
  *
  * - **Never change application behaviour.** No body is read, nothing is
  *   cloned, no caller-owned object is mutated, no header other than
- *   `traceparent` is added, and no header value is ever read (a request's
- *   `Authorization` must not be observable through this module, so the only
- *   question asked of a header bag is whether it *has* a `traceparent`). A
+ *   `traceparent` is added, and no request header value is ever read (a
+ *   request's `Authorization` must not be observable through this module, so
+ *   the only question asked of a request's header bag is whether it *has* a
+ *   `traceparent`). Of a response, exactly two header values are read — `Date`
+ *   and `Age`, of a same-origin response only, for the clock sample of
+ *   {@link sampleServerClock} — and neither is recorded on an event. A
  *   fulfilled `fetch` resolves with the **same `Response` instance** the
  *   original produced, and a rejected one rejects with the **same** reason: the
  *   settle handlers return and rethrow rather than re-wrapping, so a caller
@@ -154,7 +162,13 @@ import {
 } from './continuation.js';
 import { formatTraceparent, newSpanId } from './ids.js';
 import { isTracedContext, resolveEventContext, type EventContext } from './interaction.js';
-import { emit, nowEpochMs, reportProducerFailure, type EventDraft } from './transport.js';
+import {
+  emit,
+  nowEpochMs,
+  observeServerClock,
+  reportProducerFailure,
+  type EventDraft,
+} from './transport.js';
 import type { FETCH_ATTRIBUTE_KEYS } from '../schema/attributes.js';
 import type { TelemetryKind, TelemetryStatus } from '../schema/kinds.js';
 
@@ -397,9 +411,20 @@ const AGENT_FRAME_FALLBACK = 3;
  * The non-greedy body with an anchored `:line:column` tail is what makes the
  * match stop at the source and not swallow the position, and what keeps
  * `http://host:3000/x.js:2:1` from being cut at the port.
+ *
+ * The body may contain parentheses, because a source may: webpack's
+ * development build names a module
+ * `webpack-internal:///(app-pages-browser)/./src/lib/x.ts`, and the same file
+ * compiled into another layer is `webpack-internal:///(pages-dir-browser)/…`.
+ * A body that stopped at a parenthesis would capture only the `/./src/lib/x.ts`
+ * tail, so two different modules would read as one source — and an agent source
+ * spelled that way would be matched as a substring of every frame sharing its
+ * tail. The body cannot cross whitespace, which confines the match to the
+ * frame's final location token: in `at fn (http://…/x.js:2:1)` the capture
+ * begins at the scheme, never at the `(` or in the function name.
  */
 const FRAME_SOURCE_PATTERN =
-  /((?:[A-Za-z][A-Za-z\d+.-]*:\/\/|\/|[A-Za-z]:[\\/])[^\s()]*?)(?::\d+){1,2}\)?\s*$/;
+  /((?:[A-Za-z][A-Za-z\d+.-]*:\/\/|\/|[A-Za-z]:[\\/])\S*?)(?::\d+){1,2}\)?\s*$/;
 
 /** A V8 (`    at fn (url:1:2)`) or SpiderMonkey/JavaScriptCore (`fn@url:1:2`) frame. */
 const V8_FRAME_PATTERN = /^\s*at\s/;
@@ -411,10 +436,56 @@ const V8_FRAME_PATTERN = /^\s*at\s/;
  *
  * The agent is minified, so the method is matched by the property it is called
  * through rather than by its own name: V8 writes `Object.kT [as span]` for a
- * renamed method and `Object.span` or `span` for an unrenamed one, and
- * SpiderMonkey/JavaScriptCore write `span@url:1:2`.
+ * renamed method (`async Object.kT [as span]` in an awaited stack) and
+ * `Object.span` or `span` for an unrenamed one, and SpiderMonkey/JavaScriptCore
+ * write `span@url:1:2`.
+ *
+ * A match only makes a run of agent frames *eligible* to take neighbours with
+ * it. The helper is a page global any script can reach, and a stack may be
+ * awaited or truncated at any frame, so the frames beside the run are dropped
+ * only when they prove themselves to be the patch's — see
+ * {@link PATCH_INNER_FRAME_PATTERN}, {@link PATCH_CALLBACK_FRAME_PATTERN} and
+ * {@link applicationFrames}.
  */
 const SPAN_HELPER_FRAME_PATTERN = /(?:\[as span\]|(?:^\s*at\s+|\.)span)\s+\(|(?:^|[./<])span@/;
+
+/**
+ * A frame of a function-timing patch's inner function — the developer's
+ * original body, moved by the patch into a function named `__orig`.
+ *
+ * The name is `__orig`, or `__orig_<N>` when the target already binds that
+ * name (`allocateIdentifier` in
+ * `packages/instrumentation/src/patch/function-timing.ts`). V8 writes it as
+ * `at __orig (…)`, optionally prefixed with `async ` and qualified with the
+ * receiver the patch forwards through `__orig.apply(this, …)` —
+ * `Store.__orig`, `Object.__orig`. SpiderMonkey/JavaScriptCore write
+ * `__orig@…`, `outer/__orig@…` or `Store.__orig@…`.
+ *
+ * The name must stand alone: `my__orig`, `__origin`, `__orig_x` and an aliased
+ * `__orig [as x]` are application names and never match. This frame is kept —
+ * it carries the original body's line — and is the first of the two frames
+ * that prove a callback is the patch's (see {@link applicationFrames}).
+ */
+const PATCH_INNER_FRAME_PATTERN =
+  /^\s*at\s+(?:async\s+)?(?:[^\s()]+\.)?__orig(?:_\d+)?\s+\(|^(?:[^@\s]*[./])?__orig(?:_\d+)?@/;
+
+/**
+ * A frame shaped like a function-timing patch's callback — the anonymous arrow
+ * `() => __orig.apply(…)` the patch hands to the span helper.
+ *
+ * V8 writes an anonymous function called without a receiver as a bare location,
+ * `    at <source>:line:column`, with no name and no parenthesised location; the
+ * location itself may contain parentheses, as a webpack
+ * `webpack-internal:///(app-pages-browser)/./src/…` module URL does, so the
+ * test is that nothing but the location follows `at`. SpiderMonkey writes an
+ * anonymous arrow after the function that encloses it, `outer/<@<source>`, and
+ * JavaScriptCore writes it with an empty name, `@<source>`.
+ *
+ * The shape alone proves nothing — the application writes anonymous callbacks
+ * too — so {@link applicationFrames} also requires a
+ * {@link PATCH_INNER_FRAME_PATTERN} frame in the same source directly inside it.
+ */
+const PATCH_CALLBACK_FRAME_PATTERN = /^\s*at\s+\S+:\d+:\d+\s*$|^(?:[^@\s]*\/<)?@/;
 
 /** Listener options for the XHR terminal listeners: fire once, never capture. */
 const ONCE_OPTIONS: AddEventListenerOptions = { once: true };
@@ -1282,13 +1353,15 @@ function isFrameLine(line: string): boolean {
  * format and maps it back to the developer's TypeScript, so any rewriting here
  * would be a second, divergent parser.
  *
- * The agent's own frames, and the frames a function-timing patch adds, are
- * dropped first (see {@link applicationFrames}), then at most
- * {@link MAX_INITIATOR_FRAMES} frames and {@link MAX_INITIATOR_CHARS}
- * characters are kept. `undefined` when the host produced no stack or nothing
- * survived the drop, because an empty `initiator` would be a claim of an
- * unknown call site rather than an absence of one — and
- * `../aggregate/requests.ts` reads a blank value as absent anyway.
+ * The agent's own frames are dropped first, and so are the two frames a
+ * function-timing patch adds — its callback and the patched function's own
+ * frame — but only where the stack proves them to be the patch's; an awaited,
+ * truncated or application-authored helper call keeps every application frame
+ * (see {@link applicationFrames}). Then at most {@link MAX_INITIATOR_FRAMES}
+ * frames and {@link MAX_INITIATOR_CHARS} characters are kept. `undefined` when
+ * the host produced no stack or nothing survived the drop, because an empty
+ * `initiator` would be a claim of an unknown call site rather than an absence
+ * of one — and `../aggregate/requests.ts` reads a blank value as absent anyway.
  */
 function captureInitiatorStack(): string | undefined {
   try {
@@ -1322,17 +1395,61 @@ function captureInitiatorStack(): string | undefined {
  *   helpers) are dropped; when `agentSource` is unknown, or names none of the
  *   leading frames, the first {@link AGENT_FRAME_FALLBACK} frames are dropped
  *   instead.
- * - A later run of frames naming `agentSource` is the span helper a
- *   function-timing patch called. The run is dropped together with its two
- *   neighbours, which exist only because of the patch: the template's callback
- *   (`() => __orig.apply(…)`) directly inside it, and the patched function's
- *   own frame, which did nothing but call the helper, directly outside it. The
- *   `__orig` frame stays, at the position the patched function held, and still
- *   carries the original body's line. Without this, two patched functions
- *   spend six of the {@link MAX_INITIATOR_FRAMES} frames on instrumentation,
- *   and the frames that tell two call sites apart are cut off.
- * - Any other later frame naming `agentSource` is dropped on its own, so a
- *   click-to-source chip never lands in the agent.
+ * - Every later run of frames naming `agentSource` is dropped, so a
+ *   click-to-source chip never lands in the agent. The frames beside a run are
+ *   kept, except where the run is the span helper
+ *   ({@link SPAN_HELPER_FRAME_PATTERN}) *and* the stack proves a neighbour is
+ *   a frame the function-timing patch added:
+ *   - The frame directly inside the run is dropped as the patch's callback
+ *     (`() => __orig.apply(…)`) only when it has the
+ *     {@link PATCH_CALLBACK_FRAME_PATTERN} shape, the frame directly inside
+ *     *it* is a {@link PATCH_INNER_FRAME_PATTERN} frame, both are still kept,
+ *     and both name the same source. The `__orig` frame stays, at the
+ *     position the patched function held, and still carries the original
+ *     body's line.
+ *   - The frame directly outside the run is dropped as the patched function's
+ *     own frame, which did nothing but call the helper, only when the
+ *     callback was proven and that frame names the callback's source — as the
+ *     function the callback is written in necessarily does.
+ *
+ *   Without a proof the neighbour is the application's and stays: a helper
+ *   called by any code other than the template (no `__orig` frame directly
+ *   inside its callback — including a function of the application's own that
+ *   happens to be named `__orig` and calls the helper itself, which puts it
+ *   *outside* the run), an awaited stack (V8 lists the helper's `async` frame
+ *   directly outside `__orig`, with no callback between them), a stack
+ *   truncated before the run (nothing proves the trailing callback-shaped
+ *   frame), and an outer frame in another source — compared as the complete
+ *   source, webpack layer segment included (see {@link FRAME_SOURCE_PATTERN}).
+ *   A kept patch frame costs one slot of the budget; a dropped caller costs the
+ *   source link. With the proven drops, two patched functions no longer spend
+ *   six of the {@link MAX_INITIATOR_FRAMES} frames on instrumentation and cut
+ *   off the frames that tell two call sites apart.
+ *
+ *   What the proof establishes is the template's exact call sequence — the
+ *   helper calling an anonymous arrow that calls the product-reserved `__orig`
+ *   name directly, all in one module — and the stack carries nothing else that
+ *   could say more: the agent is never told which symbols a plan patched. Code
+ *   that writes that same sequence out by hand is therefore read as a patch,
+ *   and the two frames dropped are the same ones the template adds: an arrow
+ *   that only forwards to `__orig`, and the function whose one act was to call
+ *   the helper. Every other frame of the stack stays.
+ *
+ * No frame naming `agentSource` is ever returned.
+ *
+ * @example
+ * // Innermost first: `/app.js` is a dev-server chunk, `/agent.js` the agent.
+ * applicationFrames(
+ *   [
+ *     '    at Object.qR (/agent.js:7:100)', //         the fetch patch: dropped
+ *     '    at __orig (/app.js:10:1)', //               the original body: kept
+ *     '    at /app.js:11:1', //                        the patch callback: dropped
+ *     '    at Object.kT [as span] (/agent.js:7:5)', // the span helper: dropped
+ *     '    at tally (/app.js:12:1)', //                the patched function: dropped
+ *     '    at onClick (/app.js:20:1)', //              its caller: kept
+ *   ],
+ *   '/agent.js',
+ * ); // → ['    at __orig (/app.js:10:1)', '    at onClick (/app.js:20:1)']
  *
  * @param frames The stack's frame lines, innermost first, without its header.
  * @param agentSource The agent's own script source, when it was detected.
@@ -1353,25 +1470,96 @@ export function applicationFrames(
     start = Math.min(AGENT_FRAME_FALLBACK, frames.length);
   }
 
-  const kept: string[] = [];
+  // Indices into `frames` rather than the lines themselves, so the proof can
+  // tell two frames that were adjacent in the captured stack from two that
+  // only became adjacent after an earlier drop.
+  const kept: number[] = [];
   let index = start;
   while (index < frames.length) {
     if (!isAgentFrame(index)) {
-      kept.push(frames[index] ?? '');
+      kept.push(index);
       index += 1;
       continue;
     }
+
+    const helperRunStart = index;
     let spanHelper = false;
     while (index < frames.length && isAgentFrame(index)) {
       spanHelper = spanHelper || SPAN_HELPER_FRAME_PATTERN.test(frames[index] ?? '');
       index += 1;
     }
-    if (spanHelper) {
-      kept.pop();
+    if (!spanHelper) {
+      continue;
+    }
+
+    const callbackSource = provenPatchCallbackSource(frames, kept, helperRunStart);
+    if (callbackSource === undefined) {
+      continue;
+    }
+    kept.pop();
+
+    // The run is maximal, so a frame at `index` is never an agent frame.
+    if (index < frames.length && frameSource(frames[index] ?? '') === callbackSource) {
       index += 1;
     }
   }
-  return kept;
+  return kept.map((keptIndex) => frames[keptIndex] ?? '');
+}
+
+/**
+ * The source of the function-timing patch callback directly inside a span
+ * helper run, when the stack proves that frame is the patch's callback.
+ *
+ * The proof is about the two frames directly inside the run, both still kept:
+ * the inner one is a {@link PATCH_INNER_FRAME_PATTERN} frame, the outer one has
+ * the {@link PATCH_CALLBACK_FRAME_PATTERN} shape, and both name the same
+ * source. The template writes the callback and `__orig` into one function, so
+ * they share a module and therefore a chunk; a callback-shaped frame in another
+ * source is the application's own.
+ *
+ * @param frames The stack's frame lines, innermost first.
+ * @param kept The indices into `frames` kept so far, in stack order.
+ * @param helperRunStart The index of the helper run's innermost frame.
+ * @returns The callback's source, or `undefined` when nothing is proven.
+ */
+function provenPatchCallbackSource(
+  frames: readonly string[],
+  kept: readonly number[],
+  helperRunStart: number,
+): string | undefined {
+  const callbackIndex = helperRunStart - 1;
+  const innerIndex = helperRunStart - 2;
+  if (kept.at(-1) !== callbackIndex || kept.at(-2) !== innerIndex) {
+    return undefined;
+  }
+
+  const callback = frames[callbackIndex] ?? '';
+  const inner = frames[innerIndex] ?? '';
+  if (!PATCH_CALLBACK_FRAME_PATTERN.test(callback) || !PATCH_INNER_FRAME_PATTERN.test(inner)) {
+    return undefined;
+  }
+
+  const source = frameSource(callback);
+  return source !== undefined && source === frameSource(inner) ? source : undefined;
+}
+
+/**
+ * The source a frame line names, as {@link FRAME_SOURCE_PATTERN} captures it:
+ * the complete source, so two modules differing only in a parenthesised
+ * webpack layer segment are two sources.
+ *
+ * A SpiderMonkey/JavaScriptCore frame is read after its first `@`, because the
+ * name before it may contain a `/` — `outer/<@…`, `outer/__orig@…` — that the
+ * pattern would otherwise take for the start of a path. A V8 frame is read
+ * whole; its location is the tail of the line either way.
+ *
+ * @param line A frame line.
+ * @returns The source, or `undefined` when none is recognisable.
+ */
+function frameSource(line: string): string | undefined {
+  const location = V8_FRAME_PATTERN.test(line) ? line : line.slice(line.indexOf('@') + 1);
+  const source = FRAME_SOURCE_PATTERN.exec(location)?.[1];
+  return source !== undefined && source !== '' ? source : undefined;
 }
 
 /**
@@ -1989,6 +2177,79 @@ function xhrOutcome(xhr: XMLHttpRequest, record: RequestRecord): RequestOutcome 
   };
 }
 
+/**
+ * Offer a settled response's `Date` header to the document's clock-offset
+ * estimate — `./transport.ts`'s `observeServerClock`, behind the informational
+ * per-producer `clockOffsetMs` of AAP 0.2.3.
+ *
+ * Only a response the dev server produced for this request, just now, says
+ * anything about the dev server's clock, so a sample is taken only when all of
+ * these hold:
+ *
+ * - **The exchange completed** (`status: 'ok'`). A rejected `fetch`, and an
+ *   XHR that errored, timed out or was aborted, has no server answer to read.
+ * - **The request and its response are both same-origin.** `record.sameOrigin`
+ *   judges the URL the application asked for; the response's own final URL is
+ *   judged too, because a redirect can answer a same-origin request from
+ *   another origin, whose `Date` is another server's clock — and reading a
+ *   header CORS did not expose on a cross-origin XHR logs an error into the
+ *   developer's console, which is a change this module must not make.
+ * - **The response carries no `Age`.** A cache adds `Age` to a response it
+ *   serves from storage, and that response's `Date` is the moment it was first
+ *   generated rather than now.
+ *
+ * The two instants are the record's `startedAt`, read by `planFetch` /
+ * `planXhr` before any planning and therefore strictly before the native call,
+ * and the outcome's `settledAt`; both come from `nowEpochMs`, the clock the
+ * request's own event is stamped with. That the first is read slightly early
+ * and the second slightly late — an XHR settles at `loadend`, after its body —
+ * only widens the sample's interval; it cannot make it exclude the true offset.
+ *
+ * Called **before** the record settles, so the request's own event is stamped
+ * with an estimate its response has already contributed to. The two header
+ * values go to the estimator and nowhere else; the event, the response and the
+ * request are untouched. A failure to read them costs the sample, and is
+ * counted and reported as every contained failure in this module is.
+ *
+ * @param record The request.
+ * @param outcome What its settle observed.
+ * @param response Readers for the response's final URL and one header value,
+ *   as the transport exposes them — `response.url` / `response.headers.get` for
+ *   `fetch`, `xhr.responseURL` / `xhr.getResponseHeader` for XHR.
+ */
+function sampleServerClock(
+  record: RequestRecord,
+  outcome: RequestOutcome,
+  response: { readonly url: () => unknown; readonly header: (name: string) => unknown },
+): void {
+  try {
+    if (!record.sameOrigin || outcome.status !== 'ok') {
+      return;
+    }
+
+    const finalUrl = response.url();
+    const resolved =
+      typeof finalUrl === 'string' && finalUrl !== '' ? resolveAbsolute(finalUrl) : undefined;
+    if (resolved === undefined || !isSameOrigin(resolved)) {
+      return;
+    }
+
+    const age = response.header('age');
+    if (age !== null && age !== undefined) {
+      return;
+    }
+
+    const date = response.header('date');
+    observeServerClock(typeof date === 'string' ? date : null, record.startedAt, outcome.settledAt);
+  } catch (error: unknown) {
+    // An exotic response object costs the clock sample and nothing else: the
+    // request still settles, with the same response, on the next line of the
+    // caller.
+    failureTotal += 1;
+    reportProducerFailure('fetch', 'clock-sample', error);
+  }
+}
+
 /*
  * ---------------------------------------------------------------------------
  * The `fetch` patch
@@ -2190,7 +2451,12 @@ function createFetchPatch(original: FetchFn, receiver: Window & typeof globalThi
 
     return pending.then(
       (response: Response): Response => {
-        settleRequest(record, responseOutcome(response));
+        const outcome = responseOutcome(response);
+        sampleServerClock(record, outcome, {
+          url: () => response.url,
+          header: (name) => response.headers.get(name),
+        });
+        settleRequest(record, outcome);
         return response;
       },
       (error: unknown): never => {
@@ -2361,7 +2627,12 @@ function observeXhr(xhr: XMLHttpRequest, record: RequestRecord): void {
     xhr.addEventListener(
       'loadend',
       (): void => {
-        settleRequest(record, xhrOutcome(xhr, record));
+        const outcome = xhrOutcome(xhr, record);
+        sampleServerClock(record, outcome, {
+          url: () => xhr.responseURL,
+          header: (name) => xhr.getResponseHeader(name),
+        });
+        settleRequest(record, outcome);
       },
       ONCE_OPTIONS,
     );

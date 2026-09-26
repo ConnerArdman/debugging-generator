@@ -18,23 +18,25 @@
  *                    launcher (`POST /dev-server/launch`), report the dev
  *                    server URL and pid it answers with, and stay in the
  *                    foreground so Ctrl-C stops that server again
- *                    (`POST /dev-server/stop`). This is the mode that yields
- *                    AUTHENTICATED server and database telemetry, because the
- *                    service is the only component that mints a server-agent
- *                    credential (see WHY THE CREDENTIAL MATTERS below).
+ *                    (`POST /dev-server/stop`). The service owns that process
+ *                    and the server-agent credential it mints for it, and
+ *                    revokes the credential when the process exits.
  *   --spawn-local    spawn the project's own `dev` script from this terminal
- *                    with the preload attached and no credential, which is the
- *                    unauthenticated shape. The preload needs a credential to
- *                    install anything, so without one it stays inert — no
- *                    tracer provider, no exporter, no ingest — and no server or
- *                    database spans are recorded
- *                    (`packages/telemetry/src/node/config.ts`). Nothing in this
- *                    mode ever contacts the service, so the mode needs no
- *                    running service: whether the address handed to the child
- *                    answers is reported and the dev server starts either way.
- *                    That is what makes it usable offline, and what makes it a
- *                    demonstration of exactly what an unauthenticated run
- *                    costs.
+ *                    with the preload attached and a server-agent credential
+ *                    the service minted for it: this command asks
+ *                    `POST /dev-server/credential` for one scoped to the
+ *                    project root, authorised by the editor credential, and
+ *                    hands it to the child as `DEBUGGEN_TOKEN` (AAP 0.5.6).
+ *                    The mode therefore needs the running service and
+ *                    `$DEBUGGEN_HOME/auth.json`, and any failure to obtain the
+ *                    credential stops the command before anything is spawned —
+ *                    without one the preload stays inert and records nothing
+ *                    (`packages/telemetry/src/node/config.ts`), so starting the
+ *                    server anyway would only look instrumented. The credential
+ *                    carries the expiry the service chose (`expiresAt`); the
+ *                    service has no revoke route, so it is not revoked when the
+ *                    child exits and stops working at that expiry, or earlier
+ *                    on `debuggen.rotateServiceToken`.
  *
  * `--detach` returns as soon as the service has reported the launch instead of
  * waiting for Ctrl-C, and `--stop` stops a dev server the service launched for
@@ -42,21 +44,26 @@
  * scripts and for a terminal that has since been closed.
  *
  * ROUTES — THE CONTRACT IS NOT NEGOTIABLE HERE: this file is a *caller*. The
- * routes it may use are the ones the protocol defines (AAP 0.4.2), and
+ * routes it may use are the ones the service defines, and
  * {@link SERVICE_ROUTES} is the whole list: `GET /health`,
- * `POST /dev-server/launch`, `POST /dev-server/stop`. There is deliberately no
- * route-name guessing, no probe list and no environment override that points at
- * a different path: a caller that invents an endpoint the service does not
- * define cannot work against the specified service, and an override would only
- * hide that. If a future protocol version adds a dedicated server-agent
- * credential route, add it to `packages/protocol/src/http.ts` first and then
- * name it here — in that order.
+ * `POST /dev-server/launch` and `POST /dev-server/stop` from the protocol's
+ * route table (AAP 0.4.2, `packages/protocol/src/http.ts`), and
+ * `POST /dev-server/credential`, which the service's launcher defines once
+ * (`DEV_SERVER_CREDENTIAL_PATH` in `apps/local-service/src/dev-server/launcher.ts`)
+ * and `apps/local-service/src/server/routes/dev-server.ts` registers. There is
+ * deliberately no route-name guessing, no probe list and no environment
+ * override that points at a different path: a caller that invents an endpoint
+ * the service does not define cannot work against the specified service, and
+ * an override would only hide that. A new route is added to its definer first
+ * and named here second — in that order.
  *
- * BOUNDARY — deliberately NOT implemented here, because the launcher owns it:
+ * BOUNDARY — deliberately NOT implemented here, because the service owns it:
  *   - detecting an already-running dev server, probing ports or URLs;
  *   - retry/backoff, health polling or waiting for the server to be listening;
  *   - session creation, tab binding or any session bookkeeping;
- *   - minting, hashing, storing or refreshing credentials of any kind;
+ *   - minting, hashing, storing, refreshing or revoking credentials — the
+ *     service mints the one `--spawn-local` asks for, and this script only
+ *     passes it to the child it spawns;
  *   - reading, parsing or forwarding `.env` files — the child does its own.
  * If you are about to add any of the above, add it to the launcher instead and
  * let this script keep being a thin wrapper.
@@ -70,19 +77,37 @@
  * environment in a way that looks like a bug in this tool.
  *
  * WHY THE CREDENTIAL MATTERS: the service accepts telemetry ingest only from a
- * server-agent credential scoped to one project root, and expires it when the
- * launched process exits (AAP 0.5.6). That credential is minted per dev-server
- * launch by the service itself, so the only way a caller obtains an
- * instrumented dev server with a valid credential is to let the launcher start
- * it — which is what the default mode does, authorised by the editor
- * credential the service wrote to `$DEBUGGEN_HOME/auth.json`. The launcher
- * passes `DEBUGGEN_TOKEN` and a matching `DEBUGGEN_PROJECT_ROOT` to the child
- * it starts; this script never handles a server-agent credential at all.
+ * server-agent credential scoped to one project root (AAP 0.5.6), and the
+ * preload installs nothing without one. The service is the only component that
+ * mints it, in one of two ways, both authorised by the editor credential it
+ * wrote to `$DEBUGGEN_HOME/auth.json`:
+ *   - the default mode lets the launcher start the project; the launcher mints
+ *     the credential, passes it to its own child and revokes it when that child
+ *     exits, so this script never sees it;
+ *   - `--spawn-local` asks `POST /dev-server/credential` for one scoped to the
+ *     project root. The answer is `{ token, expiresAt }`: a process this
+ *     command starts is not one the service can watch exit, so the credential
+ *     carries an explicit expiry instead of being tied to the child.
+ * Either way the child receives `DEBUGGEN_TOKEN` together with a matching
+ * `DEBUGGEN_PROJECT_ROOT` and the `DEBUGGEN_INGEST_URL` endpoint.
  *
  * SAFETY: the editor credential is sent only as a bearer token to the service
- * on loopback, is never printed, never logged and never written to disk, and is
- * redacted out of any service error this command echoes. This script writes
- * nothing anywhere: it only reads, requests and spawns.
+ * on loopback. The server-agent credential is held only in this process's
+ * memory and in the child's environment. This command never prints, logs or
+ * writes either: both are redacted out of every part of a service error it
+ * echoes (the status phrase included), a credential response is never echoed
+ * at all, and the banner describes the server-agent credential by its length
+ * only. This script writes nothing anywhere: it only reads, requests and
+ * spawns, and once the child has exited it sends nothing further.
+ *
+ * The child's own output is deliberately NOT filtered: it inherits this
+ * terminal (`stdio: 'inherit'`) so the dev server keeps its colours, its TTY
+ * detection and its keyboard shortcuts, exactly as a plain `pnpm dev` would.
+ * A dev script that prints its own environment therefore prints
+ * `DEBUGGEN_TOKEN` along with everything else in it, to the developer's own
+ * terminal — output the dev server owns, not this command. (The service's
+ * launcher scrubs child output because it copies that output into the service
+ * log, a file; nothing here copies it anywhere.)
  *
  * Usage: `node scripts/dev-instrumented.mjs [options]`, `pnpm demo:instrumented`,
  * or `--help`.
@@ -146,9 +171,9 @@ export const INGEST_PATH = '/telemetry/ingest';
 /**
  * The service's launcher route (AAP 0.4.2: `POST /dev-server/launch`,
  * `{ projectRoot, command? }` → `{ devServerUrl, pid }`). The default mode
- * calls exactly this route: it is the one place in the protocol where an
- * instrumented dev server is started and its project-scoped server-agent
- * credential is minted (AAP 0.5.6).
+ * calls exactly this route: the service starts an instrumented dev server,
+ * mints its project-scoped server-agent credential and revokes that credential
+ * when the process exits (AAP 0.5.6).
  */
 export const LAUNCH_PATH = '/dev-server/launch';
 
@@ -160,19 +185,37 @@ export const LAUNCH_PATH = '/dev-server/launch';
 export const STOP_PATH = '/dev-server/stop';
 
 /**
- * Every service route this command is permitted to call, and therefore the
- * complete list a service build must answer for it to work. All three are
- * defined by the protocol (AAP 0.4.2); a request to anything else is a bug in
- * this file, which is why the list is exported and asserted by
- * `scripts/dev-instrumented.test.mjs` against a stub service that implements
- * only these paths.
+ * The service's server-agent credential route: `POST /dev-server/credential`,
+ * `{ projectRoot }` → `{ token, expiresAt }`, editor credential required, for a
+ * dev server the caller starts itself (AAP 0.5.6). `--spawn-local` calls
+ * exactly this route and hands the answer's `token` to its child as
+ * `DEBUGGEN_TOKEN`.
+ *
+ * It is not a row of the protocol's route table: the service's launcher
+ * defines it once, as `DEV_SERVER_CREDENTIAL_PATH` in
+ * `apps/local-service/src/dev-server/launcher.ts` together with both strict
+ * body schemas, and `apps/local-service/src/server/routes/dev-server.ts`
+ * registers it behind the editor-only bearer check. The service answers 403
+ * when `projectRoot` is outside the workspace folders the connected editor
+ * announced, and there is no counterpart revoke route: a credential minted here
+ * stops working at its `expiresAt`, or when every credential is rotated.
  */
-export const SERVICE_ROUTES = Object.freeze([HEALTH_PATH, LAUNCH_PATH, STOP_PATH]);
+export const CREDENTIAL_PATH = '/dev-server/credential';
+
+/**
+ * Every service route this command is permitted to call, and therefore the
+ * complete list a service build must answer for it to work: the three the
+ * protocol defines (AAP 0.4.2) and the service's own credential route. A
+ * request to anything else is a bug in this file, which is why the list is
+ * exported and asserted by `scripts/dev-instrumented.test.mjs` against a stub
+ * service that implements only these paths.
+ */
+export const SERVICE_ROUTES = Object.freeze([HEALTH_PATH, LAUNCH_PATH, STOP_PATH, CREDENTIAL_PATH]);
 
 /** Timeout for the liveness pre-flight, per the plan's 2 s budget. */
 export const HEALTH_TIMEOUT_MS = 2_000;
 
-/** Timeout for the launch and stop requests. */
+/** Timeout for the launch, stop and credential requests. */
 export const REQUEST_TIMEOUT_MS = 5_000;
 
 /**
@@ -189,17 +232,18 @@ const EXIT_OK = 0;
 /**
  * A failure this command reports rather than a status it inherited: a bad flag,
  * a missing preload, a service that is not answering, a missing or invalid
- * `auth.json`, a launch or stop the service refused, an unusable target
- * project, or no package manager on `PATH`. Every message that uses this code
- * states whether anything was launched, so "2" is never ambiguous about the
- * state it leaves behind.
+ * `auth.json`, a launch, stop or credential request the service refused or
+ * answered off-contract, an unusable target project, or no package manager on
+ * `PATH`. Every message that uses this code states whether anything was
+ * launched or spawned, so "2" is never ambiguous about the state it leaves
+ * behind.
  */
 const EXIT_PREFLIGHT = 2;
 
 /**
  * Status codes that mean "this service build does not implement that route".
  * They are a hard failure, never a signal to try a different path: the routes
- * in {@link SERVICE_ROUTES} are the protocol's, so a 404 or 405 is a version
+ * in {@link SERVICE_ROUTES} are the service's own, so a 404 or 405 is a version
  * mismatch between this checkout and the running service.
  */
 const ROUTE_ABSENT_STATUSES = Object.freeze([404, 405]);
@@ -359,35 +403,51 @@ What it does (default mode)
      Ctrl-C (or SIGTERM) stops that server again through
      POST {service}${STOP_PATH}
 
-  The service's launcher attaches the preload and mints the server-agent
-  credential for the process it starts (it is the only component that can:
-  a credential is scoped to one project root and expires with the process).
-  That is why the default mode goes through it — it is the only way this
-  command produces authenticated server and database telemetry, and it keeps
-  one implementation of launching instead of two.
+  The service's launcher attaches the preload, mints the server-agent
+  credential for the process it starts and revokes it when that process
+  exits. The service owns that process and its credential end to end, which
+  is why the default mode goes through it, and it keeps one implementation of
+  launching instead of two.
 
   Server-tier spans (incoming requests, route handlers, outgoing fetch, Prisma
   and pg queries) exist only because the preload registers a tracer provider
   inside the dev-server process before the framework starts. Nothing in the
   target project's source is modified, and this script writes nothing to disk.
 
-  Every route it calls is defined by the protocol (AAP 0.4.2), and these three
-  are all of them: ${SERVICE_ROUTES.join(', ')}.
+  Every route it calls is defined by the service — three by the protocol's
+  route table (AAP 0.4.2), ${CREDENTIAL_PATH} by the service's
+  launcher — and these four are all of them:
+  ${SERVICE_ROUTES.join(', ')}.
 
 What it does (--spawn-local)
-  1. resolves the preload and the target project, as above
-  2. reports whether GET {service}${HEALTH_PATH} answers — and starts the dev
-     server whether it does or not, because this mode asks the service for
-     nothing
-  3. spawns the project's own "dev" script here, with the preload on
-     NODE_OPTIONS and DEBUGGEN_INGEST_URL set, and no credential
-  4. forwards SIGINT/SIGTERM to that child and exits with its status
+  1. resolves the preload and the target project, as above, and the command
+     that runs the project's own "dev" script
+  2. reads the editor credential from $DEBUGGEN_HOME/${AUTH_FILE_NAME}
+  3. checks GET {service}${HEALTH_PATH} answers
+  4. asks the service for a server-agent credential scoped to the project:
+     POST {service}${CREDENTIAL_PATH} with { projectRoot },
+     authorised by that editor credential; the service answers
+     { token, expiresAt }
+  5. spawns the "dev" script here, with the preload on NODE_OPTIONS and
+     DEBUGGEN_INGEST_URL, DEBUGGEN_PROJECT_ROOT and DEBUGGEN_TOKEN set
+  6. forwards SIGINT/SIGTERM to that child and exits with its status
 
-  It reads no credential and makes no authorised call, so it needs neither
-  ${AUTH_FILE_NAME} nor a running service. With no credential the preload stays
-  inert — it installs no tracer provider and posts nothing — so the dev server
-  serves normally and no server or database spans are recorded. Run without
-  --spawn-local for the authenticated path.
+  This is an AUTHENTICATED run: it needs a running service and ${AUTH_FILE_NAME},
+  and the service mints the credential only for a project under the
+  workspace folders VS Code announced to it. Any failure in steps 1-4 stops
+  the command before anything is spawned — a dev server without a credential
+  would only look instrumented, because the preload records nothing without
+  one.
+
+  The server-agent credential is held in this process's memory and in the
+  child's environment only; this command never prints, logs or writes it (the
+  banner shows its length). The dev server inherits this terminal unfiltered,
+  so a dev script that prints its own environment would show it there. It
+  expires at the time the banner shows, which
+  the service chose (12 hours after minting by default). The service has no
+  revoke route, so the credential is not revoked when the child exits: it
+  stops working at that expiry, or earlier when debuggen.rotateServiceToken
+  rotates every credential. Once the child has exited nothing further is sent.
 
 Options
   --project <dir>   project to launch; relative paths resolve against the
@@ -402,14 +462,15 @@ Options
                     for Ctrl-C. The dev server keeps running under the service;
                     stop it with --stop, or from VS Code by ending the session.
   --spawn-local     spawn the project's own "dev" script from this terminal
-                    with the preload and DEBUGGEN_INGEST_URL, and WITHOUT a
-                    credential. The preload installs nothing without one, so it
-                    stays inert and NO server or database spans are recorded.
-                    Because nothing in this mode contacts the service, it does
-                    not require one: whether {service}${HEALTH_PATH} answers is
-                    reported and the dev server starts either way, so the mode
-                    runs offline and shows what an unauthenticated run costs.
-                    Signals and the exit code are forwarded.
+                    with the preload, DEBUGGEN_INGEST_URL, DEBUGGEN_PROJECT_ROOT
+                    and a server-agent credential (DEBUGGEN_TOKEN) the service
+                    minted for this project through POST ${CREDENTIAL_PATH}.
+                    AUTHENTICATED: it needs the running service and
+                    ${AUTH_FILE_NAME}, and when the credential cannot be
+                    obtained nothing is spawned. The credential expires at the
+                    time the banner shows; the service has no revoke route, so
+                    it is not revoked when the child exits. Signals and the exit
+                    code are forwarded.
   --stop            stop a dev server the service launched for this project
                     (POST ${STOP_PATH}) and exit.
   --help, -h        print this text
@@ -427,10 +488,10 @@ Environment it sets on the child (--spawn-local only)
   DEBUGGEN_INGEST_URL   {service}${INGEST_PATH}
   DEBUGGEN_PROJECT_ROOT absolute path of the launched project; the preload
                         reports ingest under this root
-  DEBUGGEN_TOKEN        removed from the child's environment: only the
-                        service's launcher mints a server-agent credential, so
-                        a local spawn has none and an inherited value would be
-                        a stale credential for some other process
+  DEBUGGEN_TOKEN        the server-agent credential POST ${CREDENTIAL_PATH}
+                        minted for this project root; it replaces any inherited
+                        value, and this command never prints it (the banner
+                        shows only its length)
 
   Everything else is inherited as-is. DATABASE_URL and the rest of the
   project's configuration stay with the project's own .env handling; this
@@ -439,12 +500,11 @@ Environment it sets on the child (--spawn-local only)
 Exit codes
   0   --help, a reported launch, a stopped dev server, or a child that exited 0
   2   a failure this command reports: usage error, missing preload, unusable
-      project, or no package manager on PATH — and, in the modes that ask the
-      service for something (the default mode and --stop), a service that is
-      not answering, a missing or invalid ${AUTH_FILE_NAME}, or a launch or stop
-      the service refused. In --spawn-local a service that is not answering is
-      a note rather than a failure, because that mode asks it for nothing. The
-      message says whether anything was launched.
+      project, no package manager on PATH, a service that is not answering, a
+      missing or invalid ${AUTH_FILE_NAME}, or a launch, stop or credential
+      request the service refused or answered off-contract. The message says
+      whether anything was launched; in --spawn-local every such failure
+      happens before the spawn, and the message says nothing was spawned.
   n   whatever the --spawn-local child exited with; 128 + signal number when it
       was signalled`;
 }
@@ -452,7 +512,8 @@ Exit codes
 /**
  * @typedef {object} DevInstrumentedOptions
  * @property {boolean} help print usage and exit
- * @property {boolean} spawnLocal spawn the dev server here, without a credential
+ * @property {boolean} spawnLocal spawn the dev server here, with a server-agent
+ *   credential the service minted for it
  * @property {boolean} detach report the service's launch and exit immediately
  * @property {boolean} stop stop a dev server the service launched, then exit
  * @property {string | undefined} project raw `--project` value, if given
@@ -849,15 +910,13 @@ export async function readEditorCredential(home = resolveDebuggenHome()) {
       throw new DevInstrumentedError(`no editor credential at ${toPosix(file)}`, {
         hint: [
           'The service writes that file with mode 0600 the first time it starts,',
-          'and this command needs it to authorise the launch it asks the service',
-          'to perform.',
+          'and every mode of this command needs it to authorise what it asks the',
+          'service for: a launch, a stop, or the server-agent credential a',
+          '--spawn-local child runs with.',
           '',
           serviceStartHint(),
           '',
-          'Set DEBUGGEN_HOME if your session home is elsewhere, or pass',
-          '--spawn-local to start the dev server from this terminal without a',
-          'credential and without needing the service at all (the preload stays',
-          'inert without one, so no server or database spans are recorded).',
+          'Set DEBUGGEN_HOME if your session home is elsewhere.',
         ].join('\n'),
       });
     }
@@ -923,13 +982,9 @@ function extractToken(value, keys) {
 
 /**
  * Pre-flight the service with its unauthenticated liveness route. A failure
- * here is reported before anything happens, because every mode that calls this
- * directly goes on to make an authorised request the service must answer: a
- * launch, or a stop.
- *
- * `--spawn-local` is the one mode that does not, and it therefore does not
- * call this as a precondition — it asks {@link probeServiceReachability} and
- * carries on. See that function for why.
+ * here is reported before anything happens, because every mode goes on to make
+ * an authorised request the service must answer: a launch, a stop, or — for
+ * `--spawn-local` — the server-agent credential its child needs.
  *
  * @param {string} base service base URL
  * @returns {Promise<void>}
@@ -959,55 +1014,9 @@ export async function checkServiceHealth(base) {
   }
 
   if (!response.ok) {
-    throw new DevInstrumentedError(
-      `${url} answered ${response.status} ${response.statusText}`.trimEnd(),
-      { hint: serviceStartHint(base) },
-    );
-  }
-}
-
-/**
- * @typedef {object} ServiceReachability
- * @property {boolean} reachable whether {@link HEALTH_PATH} answered 2xx
- * @property {string} [detail] why it did not, in the same words the fatal
- *   pre-flight would have used
- */
-
-/**
- * Ask the same liveness question as {@link checkServiceHealth} and report the
- * answer instead of failing on it.
- *
- * This exists for `--spawn-local`, and the reason it is not a precondition
- * there is a property of the mode rather than a leniency: a local spawn carries
- * no credential, and the preload installs nothing at all without one — no
- * tracer provider, no exporter, no control socket, no timer
- * (`packages/telemetry/src/node/config.ts`, `loadPreloadConfig` → `inert`). The
- * child therefore never sends a request to the service, so a service that is
- * down changes nothing about the run: the dev server starts, serves, and
- * records no server or database spans, which is exactly what the mode is for.
- * Gating it on the service would deny the developer the one mode that needs
- * nothing running.
- *
- * The probe is still worth making, because "is the address the child was handed
- * answering?" is the difference between a deliberate offline run and a mistyped
- * `--service`, so the answer is reported in the banner
- * ({@link buildBanner}) rather than discarded.
- *
- * @param {string} base service base URL
- * @returns {Promise<ServiceReachability>} never rejects
- */
-export async function probeServiceReachability(base) {
-  try {
-    await checkServiceHealth(base);
-    return { reachable: true };
-  } catch (error) {
-    // The message, not the error: the caller reports this as a note, and the
-    // hint that belongs to a fatal pre-flight would overstate it.
-    const detail =
-      error instanceof DevInstrumentedError
-        ? error.message
-        : `${HEALTH_PATH}: ${describeCause(error)}`;
-    return { reachable: false, detail };
+    throw new DevInstrumentedError(`${url} answered ${statusLine(response)}`, {
+      hint: serviceStartHint(base),
+    });
   }
 }
 
@@ -1048,7 +1057,21 @@ async function postJson({ url, editorToken, body }) {
     throw new DevInstrumentedError(`request to ${url} failed: ${reason}`);
   }
 
-  const text = await response.text();
+  // The body is read under the same timeout signal as the request. A body that
+  // stalls or is cut off after the headers arrived is reported like any other
+  // transport failure, so a caller's diagnostic (and `--spawn-local`'s
+  // "nothing was spawned") is never replaced by a raw abort stack.
+  /** @type {string} */
+  let text;
+  try {
+    text = await response.text();
+  } catch (error) {
+    const timedOut = error instanceof Error && error.name === 'TimeoutError';
+    const reason = timedOut ? `no answer within ${REQUEST_TIMEOUT_MS} ms` : describeCause(error);
+    throw new DevInstrumentedError(
+      `request to ${url} failed while reading its ${String(response.status)} answer: ${reason}`,
+    );
+  }
   /** @type {unknown} */
   let json;
   try {
@@ -1060,9 +1083,69 @@ async function postJson({ url, editorToken, body }) {
   return { status: response.status, statusText: response.statusText, json, text };
 }
 
+/** The longest service-supplied reason a message carries, before the ellipsis. */
+const REASON_MAX_LENGTH = 200;
+
+/** The longest HTTP reason phrase a message carries, before the ellipsis. */
+const STATUS_TEXT_MAX_LENGTH = 80;
+
 /**
- * The single-line reason a service response carries, when it carries one.
- * Bounded so a large body cannot flood the terminal.
+ * Every run of characters that could break a message's single line or act on
+ * the terminal: whitespace (line and paragraph separators included), control
+ * characters (C0, DEL and C1, so no escape sequence survives) and invisible
+ * format characters (bidirectional overrides among them).
+ */
+const LINE_BREAKING_RUN = /[\s\p{Cc}\p{Cf}]+/gu;
+
+/** Whether a string has anything visible once {@link LINE_BREAKING_RUN} is collapsed. */
+const VISIBLE_CHARACTER = /[^\s\p{Cc}\p{Cf}]/u;
+
+/**
+ * Reduce service-supplied text to one bounded line for a message: every
+ * {@link LINE_BREAKING_RUN} becomes a single space, the ends are trimmed, and
+ * anything past `max` characters is cut and marked with `…`. A cut never
+ * splits a surrogate pair.
+ *
+ * Call it on text that has already been redacted ({@link redactSecrets}):
+ * bounding first could cut a credential in half, and half a credential no
+ * longer matches the value being redacted.
+ *
+ * @example boundedLine('line one\n\tline two') // → 'line one line two'
+ *
+ * @param {string} value
+ * @param {number} [max] longest result before the ellipsis
+ * @returns {string} `''` when nothing visible remains
+ */
+function boundedLine(value, max = REASON_MAX_LENGTH) {
+  const flat = value.replace(LINE_BREAKING_RUN, ' ').trim();
+  if (flat.length <= max) return flat;
+  let cut = flat.slice(0, max);
+  const last = cut.charCodeAt(cut.length - 1);
+  if (last >= 0xd800 && last <= 0xdbff) cut = cut.slice(0, -1);
+  return `${cut.trimEnd()}…`;
+}
+
+/**
+ * `<status> <reason phrase>` for a message about a response. The reason phrase
+ * is the service's own text, so it is treated like a body reason: every known
+ * credential is redacted out of it first, and only then is it reduced to one
+ * bounded line — bounding first could cut a credential in half, and half a
+ * credential no longer matches the value being redacted.
+ *
+ * @param {{ status: number, statusText: string }} response
+ * @param {readonly (string | undefined)[]} [secrets] credentials to redact
+ * @returns {string}
+ */
+function statusLine(response, secrets = []) {
+  const phrase = boundedLine(redactSecrets(response.statusText, secrets), STATUS_TEXT_MAX_LENGTH);
+  return `${response.status} ${phrase}`.trimEnd();
+}
+
+/**
+ * The reason a service response carries, raw: the first string with visible
+ * text among the body's `message`, `error.message` and `error`, else the whole
+ * response text. Raw on purpose — {@link withReason} redacts it and only then
+ * reduces it to one bounded line, whichever path it came from.
  *
  * @param {{ json: unknown, text: string }} response
  * @returns {string}
@@ -1076,19 +1159,17 @@ function responseReason({ json, text }) {
         ? /** @type {Record<string, unknown>} */ (error).message
         : undefined;
     for (const candidate of [record.message, nested, error]) {
-      if (typeof candidate === 'string' && candidate.trim() !== '') return candidate.trim();
+      if (typeof candidate === 'string' && VISIBLE_CHARACTER.test(candidate)) return candidate;
     }
   }
-  const flat = text.replace(/\s+/gu, ' ').trim();
-  if (flat === '') return '';
-  return flat.length > 200 ? `${flat.slice(0, 200)}…` : flat;
+  return text;
 }
 
 /**
  * Remove any credential this process knows about from text that is about to be
  * printed. A service is not expected to echo a bearer token back in an error
  * body, but a diagnostic that did would put a credential in a terminal and a
- * scrollback buffer, and this command prints service errors verbatim.
+ * scrollback buffer, and this command echoes the reason a service error gives.
  *
  * @param {string} text
  * @param {readonly (string | undefined)[]} secrets
@@ -1104,8 +1185,10 @@ function redactSecrets(text, secrets) {
 }
 
 /**
- * Append the service's reason to a message when there is one, with any known
- * credential redacted out of it.
+ * Append the service's reason to a message when there is one: any known
+ * credential is redacted out of it first, and the result is then reduced to a
+ * single line of at most {@link REASON_MAX_LENGTH} characters plus `…`, for a
+ * JSON field and a raw body alike.
  *
  * @param {string} message
  * @param {{ json: unknown, text: string }} response
@@ -1113,13 +1196,13 @@ function redactSecrets(text, secrets) {
  * @returns {string}
  */
 function withReason(message, response, secrets = []) {
-  const reason = redactSecrets(responseReason(response), secrets);
+  const reason = boundedLine(redactSecrets(responseReason(response), secrets));
   return reason === '' ? message : `${message}: ${reason}`;
 }
 
 /**
  * The recovery hint for "the service refused the editor credential". Shared by
- * both authorised calls so the two paths give identical advice.
+ * every authorised call so the paths give identical advice.
  *
  * @param {string} projectRoot project the call named
  * @returns {string}
@@ -1139,19 +1222,20 @@ function credentialRejectedHint(projectRoot) {
  * A 404 or 405 on one of {@link SERVICE_ROUTES} is a version mismatch, not an
  * invitation to look for the endpoint somewhere else.
  *
- * @param {string} route protocol route that answered 404/405
+ * @param {string} route service route that answered 404/405
  * @returns {string}
  */
 function routeAbsentHint(route) {
   return [
-    `${route} is part of the protocol (AAP 0.4.2), so a service that does not`,
-    'answer it is older or newer than this checkout. Rebuild and restart it:',
+    `${route} is one of the service routes this checkout defines, so a service`,
+    'that does not answer it is older or newer than this checkout. Rebuild and',
+    'restart it:',
     '',
     '  pnpm --filter @debuggen/local-service build',
     '',
     'then re-run this command. Do not point this command at a different path:',
-    "the routes it calls are the protocol's, and guessing one produces a launch",
-    'that no service actually performed.',
+    "the routes it calls are the service's own, and guessing one produces an",
+    'answer no service actually vouched for.',
   ].join('\n');
 }
 
@@ -1166,12 +1250,11 @@ function routeAbsentHint(route) {
  * `POST /dev-server/launch` with `{ projectRoot }`, authorised by the editor
  * credential (AAP 0.4.2).
  *
- * This is the whole of the credential story on this side. The service mints
- * the server-agent credential for the process it starts, scopes it to that
- * project root and expires it with the process (AAP 0.5.6), so a caller that
- * wants authenticated server telemetry asks the launcher to start the server —
- * there is no credential-minting route in the protocol for a caller to call,
- * and this file must never invent one.
+ * This mode never handles a server-agent credential. The service mints one for
+ * the process it starts, scopes it to that project root and revokes it when the
+ * process exits (AAP 0.5.6), passing it straight to its own child. The only
+ * route that hands a credential to this command is {@link CREDENTIAL_PATH},
+ * which `--spawn-local` alone calls (see {@link requestServerAgentCredential}).
  *
  * @param {object} request
  * @param {string} request.base service base URL, without a trailing slash
@@ -1201,9 +1284,7 @@ export async function launchDevServer({ base, editorToken, projectRoot }) {
   }
   if (response.status < 200 || response.status >= 300) {
     throw new DevInstrumentedError(
-      withReason(`${url} answered ${response.status} ${response.statusText}`.trimEnd(), response, [
-        editorToken,
-      ]),
+      withReason(`${url} answered ${statusLine(response, [editorToken])}`, response, [editorToken]),
       {
         hint:
           response.status === 409
@@ -1285,9 +1366,7 @@ export async function stopDevServer({ base, editorToken, projectRoot }) {
   }
   if (response.status < 200 || response.status >= 300) {
     throw new DevInstrumentedError(
-      withReason(`${url} answered ${response.status} ${response.statusText}`.trimEnd(), response, [
-        editorToken,
-      ]),
+      withReason(`${url} answered ${statusLine(response, [editorToken])}`, response, [editorToken]),
       {
         hint: [
           'The dev server may still be running under the service. Retry with',
@@ -1299,9 +1378,187 @@ export async function stopDevServer({ base, editorToken, projectRoot }) {
 }
 
 /**
+ * @typedef {object} ServerAgentCredential
+ * @property {string} token the server-agent credential; held in this process's
+ *   memory and in the child's environment only — this command never prints,
+ *   logs or writes it
+ * @property {number} expiresAt epoch milliseconds after which the service
+ *   refuses it
+ */
+
+/**
+ * The keys of a `POST /dev-server/credential` answer, exactly: the service's
+ * response schema (`devServerCredentialResponseSchema`) is strict, so any other
+ * key means the definer has drifted from the contract this caller consumes.
+ */
+const CREDENTIAL_RESPONSE_KEYS = Object.freeze(['token', 'expiresAt']);
+
+/**
+ * Characters a bearer credential can never contain. The preload presents the
+ * token as `Authorization: Bearer <token>` and in its `client.hello`, and an
+ * HTTP header value cannot carry a control character, so a token with one — or
+ * with whitespace, which would split the header's credential — is unusable.
+ */
+const TOKEN_FORBIDDEN_CHARACTERS = /[\s\p{Cc}]/u;
+
+/**
+ * The `token` field of a parsed response body, when it has a string one. Used
+ * only to add that value to the redaction list of a refusal: a service is not
+ * expected to put a credential in an error body, but one that did must not have
+ * it printed.
+ *
+ * @param {unknown} json parsed body
+ * @returns {string | undefined}
+ */
+function tokenField(json) {
+  if (typeof json !== 'object' || json === null) return undefined;
+  const token = /** @type {Record<string, unknown>} */ (json).token;
+  return typeof token === 'string' ? token : undefined;
+}
+
+/**
+ * Validate a 2xx `POST /dev-server/credential` body against the service's
+ * strict `{ token, expiresAt }` shape. A failure is described in words that
+ * never quote the body — not a value, not a key name — because the body carries
+ * a credential by definition.
+ *
+ * @param {unknown} json parsed body
+ * @param {number} now epoch milliseconds the expiry is judged against
+ * @returns {{ credential: ServerAgentCredential, problem?: undefined } | { credential?: undefined, problem: string }}
+ */
+function parseCredentialAnswer(json, now) {
+  if (typeof json !== 'object' || json === null || Array.isArray(json)) {
+    return { problem: 'the body is not a JSON object' };
+  }
+  const record = /** @type {Record<string, unknown>} */ (json);
+  const { token, expiresAt } = record;
+
+  if (typeof token !== 'string' || token === '') {
+    return { problem: 'it carries no non-empty string token' };
+  }
+  if (TOKEN_FORBIDDEN_CHARACTERS.test(token)) {
+    return { problem: 'its token contains whitespace or control characters' };
+  }
+  // A finite number is not enough: `Date` rejects anything beyond ±8.64e15 ms,
+  // and the banner renders the expiry as an ISO time.
+  if (
+    typeof expiresAt !== 'number' ||
+    !Number.isFinite(expiresAt) ||
+    Number.isNaN(new Date(expiresAt).getTime())
+  ) {
+    return { problem: 'its expiresAt is not an epoch-millisecond number' };
+  }
+  if (expiresAt <= now) {
+    return { problem: 'its expiresAt has already passed' };
+  }
+  if (Object.keys(record).some((key) => !CREDENTIAL_RESPONSE_KEYS.includes(key))) {
+    return { problem: 'it carries fields other than token and expiresAt' };
+  }
+  return { credential: { token, expiresAt } };
+}
+
+/**
+ * Ask the service for a server-agent credential scoped to one project root:
+ * `POST /dev-server/credential` with `{ projectRoot }`, authorised by the
+ * editor credential and answered with `{ token, expiresAt }` (the route and
+ * both strict body schemas are defined in
+ * `apps/local-service/src/dev-server/launcher.ts`).
+ *
+ * This is what makes `--spawn-local` an authenticated run (AAP 0.5.6): the
+ * token becomes the child's `DEBUGGEN_TOKEN`, and the preload presents it on
+ * ingest and in its `client.hello`, where the service accepts it only for this
+ * project root. The service mints one only for a project under the workspace
+ * folders the connected editor announced, and answers 403 otherwise.
+ *
+ * No answer is accepted on trust. A 2xx whose body is not exactly
+ * `{ token, expiresAt }` with a usable token and a future expiry is refused:
+ * handing the child an unusable credential would start a dev server that only
+ * looks instrumented. Nothing here retries or tries another path.
+ *
+ * No message ever carries a credential. The editor token — and any token a
+ * refusal's body happens to carry — is redacted from the reason that is
+ * echoed, and a 2xx body is never echoed at all. There is no revoke route, so
+ * the credential returned here stays valid until its `expiresAt` or the next
+ * rotation; it exists only in this process's memory and in the environment of
+ * the child it is handed to.
+ *
+ * @param {object} request
+ * @param {string} request.base service base URL, without a trailing slash
+ * @param {string} request.editorToken editor credential from auth.json
+ * @param {string} request.projectRoot absolute path of the target project
+ * @returns {Promise<ServerAgentCredential>} the minted credential and its expiry
+ * @throws {DevInstrumentedError} exit 2 when the service refuses, does not
+ *   implement the route, or answers off-contract
+ */
+export async function requestServerAgentCredential({ base, editorToken, projectRoot }) {
+  const url = `${base}${CREDENTIAL_PATH}`;
+  const response = await postJson({ url, editorToken, body: { projectRoot } });
+  const secrets = [editorToken, tokenField(response.json)];
+
+  if (response.status === 401 || response.status === 403) {
+    const hint = credentialRejectedHint(projectRoot);
+    throw new DevInstrumentedError(
+      withReason(
+        `the service rejected the editor credential at ${CREDENTIAL_PATH} with ${response.status}`,
+        response,
+        secrets,
+      ),
+      {
+        hint:
+          response.status === 403
+            ? [
+                hint,
+                '',
+                `A 403 can also mean that ${toPosix(projectRoot)} is outside the`,
+                'workspace folders VS Code announced to the service: it mints a',
+                'server-agent credential only for a project the connected editor has',
+                'open. Open the project in VS Code with the Debug Generator extension',
+                'connected, then re-run this command.',
+              ].join('\n')
+            : hint,
+      },
+    );
+  }
+  if (ROUTE_ABSENT_STATUSES.includes(response.status)) {
+    throw new DevInstrumentedError(
+      `the service answered ${response.status} for ${CREDENTIAL_PATH}; no server-agent credential was minted`,
+      { hint: routeAbsentHint(CREDENTIAL_PATH) },
+    );
+  }
+  if (response.status < 200 || response.status >= 300) {
+    throw new DevInstrumentedError(
+      withReason(`${url} answered ${statusLine(response, secrets)}`, response, secrets),
+      {
+        hint: 'No server-agent credential was minted. The service log has the detail behind that status.',
+      },
+    );
+  }
+
+  const answer = parseCredentialAnswer(response.json, Date.now());
+  if (answer.credential === undefined) {
+    throw new DevInstrumentedError(
+      `${url} answered ${response.status} off-contract: ${answer.problem}`,
+      {
+        hint: [
+          `${CREDENTIAL_PATH} answers exactly { token, expiresAt }: a non-empty`,
+          'credential and its expiry in epoch milliseconds. This service did not,',
+          'so it does not match the contract this command was built against. The',
+          'body is not shown because it may carry a credential. Rebuild and restart',
+          'the service:',
+          '',
+          '  pnpm --filter @debuggen/local-service build',
+        ].join('\n'),
+      },
+    );
+  }
+  return answer.credential;
+}
+
+/**
  * @typedef {object} ResolvedProject
  * @property {string} dir absolute path of the project directory
- * @property {string} label how the project is named in output
+ * @property {string} label how the project is named in output, with control
+ *   and format characters of its package name escaped visibly
  * @property {string | undefined} packageName the project's package name
  * @property {boolean} inRepo whether it lives inside this repository
  */
@@ -1375,9 +1632,15 @@ export async function resolveProject(options = {}) {
       ? /** @type {Record<string, unknown>} */ (record.scripts)
       : {};
 
+  // The name is the project's own text and reaches the terminal in every
+  // message and banner that names the project, so it is shown with control and
+  // format characters (bidirectional overrides included) escaped visibly. The
+  // raw value is kept only for `pnpm --filter`, which validates it first.
+  const shownName = packageName === undefined ? undefined : escapeInvisible(packageName);
+
   if (typeof scripts.dev !== 'string' || scripts.dev.trim() === '') {
     throw new DevInstrumentedError(
-      `${packageName ?? display(root, dir)} has no "dev" script to instrument`,
+      `${shownName ?? display(root, dir)} has no "dev" script to instrument`,
       {
         hint: [
           "This command attaches the preload to the project's own development",
@@ -1389,7 +1652,7 @@ export async function resolveProject(options = {}) {
   }
 
   const label =
-    packageName === undefined ? display(root, dir) : `${display(root, dir)} (${packageName})`;
+    shownName === undefined ? display(root, dir) : `${display(root, dir)} (${shownName})`;
   return { dir, label, packageName, inRepo };
 }
 
@@ -1400,14 +1663,17 @@ export async function resolveProject(options = {}) {
  *
  * @param {string} name bare command name
  * @param {NodeJS.ProcessEnv} [env]
+ * @param {NodeJS.Platform} [platform] selects the Windows `PATHEXT` rule;
+ *   injectable so the suite can exercise that rule on a POSIX host (directory
+ *   separators stay the host's)
  * @returns {string | undefined} absolute path, or `undefined` when not found
  */
-export function lookupExecutable(name, env = process.env) {
+export function lookupExecutable(name, env = process.env, platform = process.platform) {
   const rawPath = env.PATH ?? env.Path ?? '';
   if (rawPath === '') return undefined;
 
   const extensions =
-    process.platform === 'win32'
+    platform === 'win32'
       ? (env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD').split(';').filter((value) => value !== '')
       : [''];
 
@@ -1433,7 +1699,110 @@ export function lookupExecutable(name, env = process.env) {
  * @property {string[]} args argv for it
  * @property {string} cwd working directory for the child
  * @property {string} display human-readable form of the command
+ * @property {boolean} [windowsVerbatimArguments] pass `args` to the Windows
+ *   process verbatim instead of re-quoting them; set only by
+ *   {@link wrapForPlatform}, whose `cmd.exe` command line is already quoted and
+ *   escaped
  */
+
+/** The longest package name npm accepts. */
+const NPM_NAME_MAX_LENGTH = 214;
+
+/**
+ * npm's package-name alphabet: lowercase letters, digits, `-`, `.` and `_`,
+ * not starting with `.` or `_`, optionally under one `@scope/` — the pattern
+ * npm documents for `package.json` `name`, which also admits the legacy `~`
+ * and a scope's `*` that {@link NPM_NAME_SPECIAL_CHARACTERS} then refuses. None
+ * of cmd.exe's metacharacters (`& | < > ^ " % ! ( ) ; ,`, space) can match it.
+ */
+const NPM_NAME_PATTERN = /^(?:@[a-z0-9-*~][a-z0-9-*._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/u;
+
+/** Characters npm no longer accepts in a new package name, though the pattern admits two of them. */
+const NPM_NAME_SPECIAL_CHARACTERS = /[~'!()*]/u;
+
+/**
+ * Every character that could act on a terminal or disguise what a message
+ * says: control characters (C0, DEL, C1), the two Unicode line separators, and
+ * invisible format characters — bidirectional overrides and isolates
+ * (U+202A–U+202E, U+2066–U+2069), zero-width characters and the like — which
+ * can reorder or hide the text around them.
+ */
+const TERMINAL_UNSAFE_CHARACTER = /[\p{Cc}\p{Cf}\u2028\u2029]/gu;
+
+/**
+ * Replace every {@link TERMINAL_UNSAFE_CHARACTER} with a visible `\uXXXX`
+ * (or `\u{XXXXX}`) escape, leaving everything else as it is. Used on text read
+ * from a target project's `package.json` before it reaches any message.
+ *
+ * @example escapeInvisible('a\u202eb') // → 'a\\u202eb'
+ *
+ * @param {string} value
+ * @returns {string}
+ */
+function escapeInvisible(value) {
+  return value.replace(TERMINAL_UNSAFE_CHARACTER, (character) => {
+    const hex = (character.codePointAt(0) ?? 0).toString(16);
+    return hex.length > 4 ? `\\u{${hex}}` : `\\u${hex.padStart(4, '0')}`;
+  });
+}
+
+/**
+ * Render an untrusted string for a one-line message: JSON-quoted, with every
+ * {@link TERMINAL_UNSAFE_CHARACTER} that `JSON.stringify` leaves raw (C1
+ * controls, the line separators, bidirectional and other format characters)
+ * escaped visibly, and cut short so a pathological value cannot flood the
+ * output.
+ *
+ * @param {string} value
+ * @returns {string}
+ */
+function quoteUntrusted(value) {
+  const limit = 80;
+  const shortened = value.length > limit ? `${value.slice(0, limit)}…` : value;
+  return escapeInvisible(JSON.stringify(shortened));
+}
+
+/**
+ * Why a `package.json` `name` cannot be handed to `pnpm --filter`, or
+ * `undefined` when it can. The rules are npm's for a new package name, plus one
+ * of pnpm's: a trailing `...` would turn the filter into a "this package and
+ * its dependencies" selector and start more than one dev server.
+ *
+ * @param {string} name
+ * @returns {string | undefined}
+ */
+function packageNameProblem(name) {
+  if (name.length > NPM_NAME_MAX_LENGTH) {
+    return `is longer than the ${NPM_NAME_MAX_LENGTH} characters npm allows`;
+  }
+  if (NPM_NAME_SPECIAL_CHARACTERS.test(name)) {
+    return "contains one of ~ ' ! ( ) *, which npm does not allow in a package name";
+  }
+  if (!NPM_NAME_PATTERN.test(name)) {
+    return 'is not a valid npm package name: only lowercase a-z, 0-9, "-", "." and "_" are allowed, not first "." or "_", optionally under one "@scope/"';
+  }
+  if (name.endsWith('...')) {
+    return 'ends in "...", which pnpm --filter reads as a dependency selector';
+  }
+  return undefined;
+}
+
+/**
+ * The command interpreter to run a `.cmd`/`.bat` launcher through: `ComSpec`
+ * from the environment the child inherits, matched case-insensitively as
+ * Windows does, else `cmd.exe`.
+ *
+ * @param {NodeJS.ProcessEnv} env
+ * @returns {string}
+ */
+function commandInterpreter(env) {
+  for (const [key, value] of Object.entries(env)) {
+    if (key.toLowerCase() === 'comspec' && typeof value === 'string' && value.trim() !== '') {
+      return value.trim();
+    }
+  }
+  return 'cmd.exe';
+}
 
 /**
  * Build the command that runs the project's `dev` script.
@@ -1443,16 +1812,30 @@ export function lookupExecutable(name, env = process.env) {
  * Elsewhere — or when pnpm is not installed — the project's own package
  * manager script is run from the project directory.
  *
+ * The filter form puts the target's `package.json` `name` on the command line,
+ * which on Windows passes through `cmd.exe` (see {@link wrapForPlatform}). The
+ * name is therefore validated as an npm package name first, and one that is not
+ * is an error rather than a reason to fall back to another form: whatever wrote
+ * it, it is not a name pnpm could select.
+ *
  * @param {object} request
  * @param {ResolvedProject} request.project
  * @param {string} [request.root] repository root
- * @param {NodeJS.ProcessEnv} [request.env]
+ * @param {NodeJS.ProcessEnv} [request.env] environment to search and inherit
+ * @param {NodeJS.Platform} [request.platform] platform whose launch rules apply
  * @returns {LaunchCommand}
- * @throws {DevInstrumentedError} exit 2 when no package manager is on PATH
+ * @throws {DevInstrumentedError} exit 2 when no package manager is on PATH, or
+ *   when the project's package name is not a valid npm package name
  */
-export function buildLaunchCommand({ project, root = REPO_ROOT, env = process.env }) {
-  const pnpmPath = lookupExecutable('pnpm', env);
-  const npmPath = pnpmPath === undefined ? lookupExecutable('npm', env) : undefined;
+export function buildLaunchCommand({
+  project,
+  root = REPO_ROOT,
+  env = process.env,
+  platform = process.platform,
+}) {
+  const pnpmPath = lookupExecutable('pnpm', env, platform);
+  const npmPath = pnpmPath === undefined ? lookupExecutable('npm', env, platform) : undefined;
+  const wrapping = { platform, comSpec: commandInterpreter(env) };
 
   if (pnpmPath === undefined && npmPath === undefined) {
     throw new DevInstrumentedError('neither pnpm nor npm is on PATH', {
@@ -1465,42 +1848,162 @@ export function buildLaunchCommand({ project, root = REPO_ROOT, env = process.en
   }
 
   if (pnpmPath !== undefined && project.inRepo && project.packageName !== undefined) {
-    return wrapForPlatform({
-      file: pnpmPath,
-      args: ['--filter', project.packageName, 'dev'],
-      cwd: root,
-      display: `pnpm --filter ${project.packageName} dev`,
-    });
+    const problem = packageNameProblem(project.packageName);
+    if (problem !== undefined) {
+      throw new DevInstrumentedError(
+        `the package name ${quoteUntrusted(project.packageName)} in ${display(root, path.join(project.dir, 'package.json'))} ${problem}`,
+        {
+          hint: [
+            'For a project inside this repository this command runs',
+            '`pnpm --filter <name> dev`, so the name becomes a command-line argument',
+            '(on Windows, one that passes through cmd.exe). Only a valid npm package',
+            'name is accepted there: fix the "name" field of that package.json.',
+          ].join('\n'),
+        },
+      );
+    }
+    return wrapForPlatform(
+      {
+        file: pnpmPath,
+        args: ['--filter', project.packageName, 'dev'],
+        cwd: root,
+        display: `pnpm --filter ${project.packageName} dev`,
+      },
+      wrapping,
+    );
   }
 
   const manager = pnpmPath ?? /** @type {string} */ (npmPath);
   const managerName = pnpmPath === undefined ? 'npm' : 'pnpm';
-  return wrapForPlatform({
-    file: manager,
-    args: ['run', 'dev'],
-    cwd: project.dir,
-    display: `${managerName} run dev`,
-  });
+  return wrapForPlatform(
+    {
+      file: manager,
+      args: ['run', 'dev'],
+      cwd: project.dir,
+      display: `${managerName} run dev`,
+    },
+    wrapping,
+  );
 }
 
 /**
- * Keep `shell: false` on every platform. Windows cannot execute a `.cmd`
- * launcher directly, so it is run through the command interpreter explicitly
- * rather than by enabling a shell, which would expose the arguments to shell
- * interpolation.
+ * cmd.exe's metacharacters: every character its parser gives a meaning to
+ * (grouping, expansion, escaping, quoting, redirection, piping, command
+ * chaining, token delimiting, wildcards). The same set cross-spawn escapes.
+ * Global, so it is used only with `String.prototype.replace`.
+ */
+const CMD_METACHARACTERS = /([()\][%!^"`<>&|;, *?])/gu;
+
+/**
+ * Escape an executable path for the command token of a `cmd.exe /d /s /c`
+ * line: every metacharacter is caret-escaped, so cmd.exe's single parse of
+ * that token restores the path exactly — spaces, parentheses and `&`
+ * included — and `%` can never form a variable reference.
+ *
+ * @example escapeCmdCommand('C:\\Program Files (x86)\\pnpm.cmd')
+ * // → 'C:\\Program^ Files^ ^(x86^)\\pnpm.cmd'
+ *
+ * @param {string} file absolute path of the executable
+ * @returns {string}
+ */
+export function escapeCmdCommand(file) {
+  return file.replace(CMD_METACHARACTERS, '^$1');
+}
+
+/**
+ * Quote one argument the way the MSVCRT (`CommandLineToArgvW`) parser reads
+ * it back: wrapped in quotes, each `"` escaped as `\"` with the backslashes
+ * before it doubled, and trailing backslashes doubled because the closing quote
+ * follows them. Every other backslash is literal. Linear in the input, with no
+ * backtracking.
+ *
+ * @param {string} argument
+ * @returns {string}
+ */
+function quoteMsvcrtArgument(argument) {
+  let quoted = '"';
+  let backslashes = 0;
+  for (const character of argument) {
+    if (character === '\\') {
+      backslashes += 1;
+      continue;
+    }
+    quoted +=
+      character === '"'
+        ? `${'\\'.repeat(backslashes * 2 + 1)}"`
+        : `${'\\'.repeat(backslashes)}${character}`;
+    backslashes = 0;
+  }
+  return `${quoted}${'\\'.repeat(backslashes * 2)}"`;
+}
+
+/**
+ * Escape one argument for a `cmd.exe /d /s /c` line: MSVCRT-quote it, then
+ * caret-escape every cmd.exe metacharacter — the quotes included, so cmd.exe's
+ * quote state never toggles and nothing inside the argument is ever read as
+ * `&`, `|`, `<`, `>`, `(`, `)` or a `%variable%`.
+ *
+ * `doubleEscape` caret-escapes a second time, for a `.cmd`/`.bat` target: the
+ * batch file passes its arguments on as `%*`, and cmd.exe parses that
+ * expansion again, consuming a second layer of carets.
+ *
+ * @example escapeCmdArgument('a&b', { doubleEscape: true })
+ * // → '^^^"a^^^&b^^^"', which cmd.exe reads as '^"a^&b^"', then the batch
+ * //   file's `%*` as '"a&b"', and the program as the argument a&b
+ *
+ * @param {string} argument
+ * @param {{ doubleEscape?: boolean }} [options]
+ * @returns {string}
+ */
+export function escapeCmdArgument(argument, options = {}) {
+  const escaped = quoteMsvcrtArgument(argument).replace(CMD_METACHARACTERS, '^$1');
+  return options.doubleEscape === true ? escaped.replace(CMD_METACHARACTERS, '^$1') : escaped;
+}
+
+/**
+ * Keep `shell: false` on every platform. Windows cannot execute a `.cmd` or
+ * `.bat` launcher (how `pnpm` and `npm` are installed there) directly, so it is
+ * run through the command interpreter explicitly, in the form Node itself uses
+ * for `shell: true` — `<ComSpec> /d /s /c "<command line>"` with
+ * `windowsVerbatimArguments` — but with every part of that line escaped, as
+ * cross-spawn does: the path by {@link escapeCmdCommand} and each argument by
+ * {@link escapeCmdArgument} with the second escape a batch target needs.
+ * Handing cmd.exe unquoted arguments would let `&`, `|`, `<`, `>` or `%` in
+ * any of them run or redirect something.
+ *
+ * Any other executable, and every other platform, is returned unchanged.
  *
  * @param {LaunchCommand} command
+ * @param {{ platform?: NodeJS.Platform, comSpec?: string }} [options] the
+ *   platform whose rules apply (default this one) and the command interpreter
+ *   (default `cmd.exe`); injectable so the Windows form is testable anywhere
  * @returns {LaunchCommand}
  */
-function wrapForPlatform(command) {
-  if (process.platform !== 'win32') return command;
-  const extension = path.extname(command.file).toLowerCase();
+export function wrapForPlatform(command, options = {}) {
+  const platform = options.platform ?? process.platform;
+  if (platform !== 'win32') return command;
+  const extension = path.win32.extname(command.file).toLowerCase();
   if (extension !== '.cmd' && extension !== '.bat') return command;
-  const interpreter = process.env.ComSpec ?? 'cmd.exe';
+
+  // No escaping carries a line break or a NUL through cmd.exe: a line break
+  // ends the command there, and whatever follows it is a second command.
+  if ([command.file, ...command.args].some((part) => /[\0\r\n]/u.test(part))) {
+    throw new DevInstrumentedError(
+      `cannot run ${command.display} through cmd.exe: an argument contains a line break or a NUL`,
+    );
+  }
+
+  const line = [
+    escapeCmdCommand(command.file),
+    ...command.args.map((argument) => escapeCmdArgument(argument, { doubleEscape: true })),
+  ].join(' ');
   return {
     ...command,
-    file: interpreter,
-    args: ['/d', '/s', '/c', command.file, ...command.args],
+    file: options.comSpec ?? 'cmd.exe',
+    // `/d` skips AutoRun commands, `/s` strips exactly the outer quotes below,
+    // `/c` runs the line and exits.
+    args: ['/d', '/s', '/c', `"${line}"`],
+    windowsVerbatimArguments: true,
   };
 }
 
@@ -1525,16 +2028,20 @@ export function appendImportOption(inherited, preloadUrl) {
 }
 
 /**
- * Build the child's environment: the inherited environment plus the three
- * variables that turn a plain dev server into an instrumented one, and minus
- * any inherited `DEBUGGEN_TOKEN` when this run has no credential of its own.
+ * Build the child's environment: the inherited environment plus the four
+ * variables the preload reads (`NODE_OPTIONS` with `--import`,
+ * `DEBUGGEN_INGEST_URL`, `DEBUGGEN_PROJECT_ROOT`, `DEBUGGEN_TOKEN`). The
+ * credential the caller supplies replaces any inherited `DEBUGGEN_TOKEN`; with
+ * none, an inherited one is removed.
  *
- * Deleting rather than ignoring matters. Only the service's launcher mints a
- * server-agent credential, and one is scoped to a single project root and
- * expires with the process it was minted for (AAP 0.5.6), so a `DEBUGGEN_TOKEN`
- * lying around in the environment belongs to some other process: forwarding it
- * would make the child post ingest with a credential the service will reject,
- * and the run would look authenticated while recording nothing.
+ * Deleting rather than ignoring matters. A server-agent credential is minted
+ * by the service for one project root and one process, and expires (AAP
+ * 0.5.6), so a `DEBUGGEN_TOKEN` lying around in the environment belongs to
+ * some other process: forwarding it would make the child post ingest with a
+ * credential the service will reject, and the run would look authenticated
+ * while recording nothing. `--spawn-local` always supplies the credential
+ * {@link requestServerAgentCredential} obtained; the builder stays general so
+ * that property holds for any caller.
  *
  * @param {object} request
  * @param {string} request.preloadUrl `file://` URL of the preload
@@ -1554,7 +2061,7 @@ export function buildChildEnv({ preloadUrl, base, projectRoot, token, env = proc
   };
 
   if (token === undefined) {
-    // Never inherit another process's credential into an unauthenticated run.
+    // Never inherit another process's credential into a run that has none.
     delete childEnv.DEBUGGEN_TOKEN;
   } else {
     childEnv.DEBUGGEN_TOKEN = token;
@@ -1568,21 +2075,11 @@ export function buildChildEnv({ preloadUrl, base, projectRoot, token, env = proc
  * developer can tell "set" from "set to something implausible" without the
  * value ever reaching a terminal, a log file or a scrollback buffer.
  *
- * In `--spawn-local` the credential is always absent — only the service's
- * launcher mints one — so the description says what that costs rather than
- * leaving an empty field.
- *
  * @param {string | undefined} token
- * @returns {string}
+ * @returns {string} `<set, N bytes>`, or `<not set>` when there is none
  */
 export function describeToken(token) {
-  if (token === undefined) {
-    // What the preload actually does without one: it reports itself inert and
-    // installs nothing, so no ingest is attempted at all. Saying "the service
-    // rejects it" would describe a request that is never made — and would
-    // imply, wrongly, that this mode needs the service to be running.
-    return '<not set (--spawn-local): the preload stays inert without one, so no server or database spans will be recorded>';
-  }
+  if (token === undefined) return '<not set>';
   return `<set, ${Buffer.byteLength(token, 'utf8')} bytes>`;
 }
 
@@ -1590,8 +2087,9 @@ export function describeToken(token) {
  * The banner printed once, immediately before a `--spawn-local` child is
  * spawned. It names everything that makes this run different from a plain
  * `dev` — including the effective `NODE_OPTIONS`, so an inherited value is
- * visibly preserved rather than assumed — and the missing credential as a
- * description of what it costs.
+ * visibly preserved rather than assumed — describes the server-agent
+ * credential by its length only, and states when that credential expires and
+ * that nothing revokes it earlier.
  *
  * @param {object} request
  * @param {string} request.root repository root
@@ -1600,22 +2098,22 @@ export function describeToken(token) {
  * @param {ResolvedPreload} request.preload
  * @param {string} request.base
  * @param {NodeJS.ProcessEnv} request.childEnv
- * @param {ServiceReachability} [request.reachability] what the liveness probe
- *   found; an unreachable service is reported here as a note, because in this
- *   mode it costs the run nothing
+ * @param {number} request.expiresAt epoch milliseconds the service said the
+ *   child's credential expires at
  * @returns {string}
  */
-export function buildBanner({ root, project, command, preload, base, childEnv, reachability }) {
-  const unreachable = reachability !== undefined && !reachability.reachable;
+export function buildBanner({ root, project, command, preload, base, childEnv, expiresAt }) {
+  const expiry = new Date(expiresAt).toISOString();
   const rows = [
     ['project', project.label],
     ['command', `${command.display}  (cwd ${display(root, command.cwd)})`],
     ['preload', preload.relative],
-    ['service', unreachable ? `${base}  (not answering)` : base],
+    ['service', base],
     ['NODE_OPTIONS', childEnv.NODE_OPTIONS ?? ''],
     ['DEBUGGEN_INGEST_URL', childEnv.DEBUGGEN_INGEST_URL ?? ''],
     ['DEBUGGEN_PROJECT_ROOT', childEnv.DEBUGGEN_PROJECT_ROOT ?? ''],
     ['DEBUGGEN_TOKEN', describeToken(childEnv.DEBUGGEN_TOKEN)],
+    ['expires', expiry],
   ];
   const width = rows.reduce((longest, [label]) => Math.max(longest, (label ?? '').length), 0);
 
@@ -1626,23 +2124,17 @@ export function buildBanner({ root, project, command, preload, base, childEnv, r
     '  Stop it with Ctrl-C. Nothing in the project was modified, and no file',
     '  was written: the server-tier tracer lives in this child process only.',
     '',
-    '  This run is UNAUTHENTICATED: only the service mints the server-agent',
-    '  credential the preload needs, and without one the preload stays inert —',
-    '  it installs no tracer provider and posts nothing — so no server or',
-    '  database spans will be recorded. Run this command without --spawn-local',
-    '  to have the service launch the project instead, which is the path that',
-    '  produces authenticated server telemetry.',
-    ...(unreachable
-      ? [
-          '',
-          `  Note: ${reachability?.detail ?? `${base}${HEALTH_PATH} is not answering`}.`,
-          '  That does not stop this mode and nothing was skipped because of it:',
-          '  the child asks the service for nothing, so the dev server below is',
-          '  exactly the one a reachable service would have given you here. The',
-          '  address is only worth checking if you expected to be online — it',
-          '  comes from --service, or DEBUGGEN_HOST and DEBUGGEN_PORT.',
-        ]
-      : []),
+    '  This run is AUTHENTICATED: the service minted the server-agent credential',
+    `  above for this project root through POST ${CREDENTIAL_PATH}, so the`,
+    '  preload can post server and database spans for it while a session',
+    '  captures. The credential lives only in this process and in the dev',
+    '  server environment; this command never prints it, but the dev server',
+    '  writes to this terminal unfiltered, so a dev script that prints its own',
+    '  environment would show it.',
+    '',
+    '  The service has no revoke route, so the credential is not revoked when',
+    `  the dev server exits: it stops working at ${expiry}, or earlier`,
+    '  when debuggen.rotateServiceToken rotates every credential.',
   ].join('\n');
 }
 
@@ -1758,6 +2250,9 @@ export async function runDevServer(command, childEnv) {
     stdio: 'inherit',
     shell: false,
     windowsHide: true,
+    // A `cmd.exe` line from `wrapForPlatform` is already quoted and escaped;
+    // letting Node re-quote it would break that escaping. Ignored off Windows.
+    windowsVerbatimArguments: command.windowsVerbatimArguments === true,
   });
 
   /** @type {NodeJS.Signals[]} */
@@ -1809,6 +2304,82 @@ export async function runDevServer(command, childEnv) {
 }
 
 /**
+ * The sentence every pre-spawn failure of `--spawn-local` ends with, so exit
+ * code 2 is never ambiguous about whether a dev server is now running.
+ */
+const NOTHING_SPAWNED =
+  'Nothing was spawned: --spawn-local starts the dev server only once the service has minted its credential.';
+
+/**
+ * Restate a failure raised before the `--spawn-local` child exists with a hint
+ * that says nothing was spawned. Anything that is not a
+ * {@link DevInstrumentedError} is returned unchanged, so an unexpected failure
+ * keeps its stack.
+ *
+ * @param {unknown} error
+ * @returns {unknown}
+ */
+function beforeSpawn(error) {
+  if (!(error instanceof DevInstrumentedError)) return error;
+  return new DevInstrumentedError(error.message, {
+    hint: error.hint === undefined ? NOTHING_SPAWNED : `${error.hint}\n\n${NOTHING_SPAWNED}`,
+    showUsage: error.showUsage,
+  });
+}
+
+/**
+ * @typedef {object} LocalSpawnPlan
+ * @property {LaunchCommand} command what will be spawned
+ * @property {NodeJS.ProcessEnv} childEnv the child's environment, credential
+ *   included
+ * @property {number} expiresAt epoch milliseconds the credential expires at
+ */
+
+/**
+ * Everything `--spawn-local` does before it spawns, as a hard pre-flight:
+ * resolve the launch command (which validates the project's package name and
+ * finds the package manager), read the editor credential, confirm the service
+ * answers, and ask it for a server-agent credential scoped to the project.
+ *
+ * The credential is requested last, once everything local has been validated,
+ * so the service never mints one for a run that cannot start: with no revoke
+ * route, a minted credential would otherwise stay valid until its expiry with
+ * no process to use it. Every failure is raised with a hint that says nothing
+ * was spawned.
+ *
+ * @param {object} request
+ * @param {string} request.root repository root
+ * @param {ResolvedProject} request.project
+ * @param {ResolvedPreload} request.preload
+ * @param {string} request.base service base URL
+ * @param {NodeJS.ProcessEnv} request.env environment to read and to inherit
+ * @returns {Promise<LocalSpawnPlan>}
+ * @throws {DevInstrumentedError} exit 2, before anything is spawned
+ */
+async function prepareLocalSpawn({ root, project, preload, base, env }) {
+  try {
+    const command = buildLaunchCommand({ project, root, env });
+    const editorToken = await readEditorCredential(resolveDebuggenHome(env));
+    await checkServiceHealth(base);
+    const { token, expiresAt } = await requestServerAgentCredential({
+      base,
+      editorToken,
+      projectRoot: project.dir,
+    });
+    const childEnv = buildChildEnv({
+      preloadUrl: preload.url,
+      base,
+      projectRoot: project.dir,
+      token,
+      env,
+    });
+    return { command, childEnv, expiresAt };
+  } catch (error) {
+    throw beforeSpawn(error);
+  }
+}
+
+/**
  * Print a failure and return the exit code it maps to.
  *
  * @param {unknown} error
@@ -1849,10 +2420,10 @@ function reportFailure(error, stderr = process.stderr) {
  * the editor credential, confirm the service answers, and only then launch,
  * stop or spawn.
  *
- * `--spawn-local` reads no credential and confirms nothing, because it asks
- * the service for nothing: its liveness probe is a note on the banner rather
- * than a precondition, which is what lets that mode run with no service
- * running at all (see {@link probeServiceReachability}).
+ * `--spawn-local` runs the same pre-flight and one more step: it asks the
+ * service for the server-agent credential its child needs, after the launch
+ * command has been resolved and validated (see {@link prepareLocalSpawn}). Any
+ * failure there exits 2 before the child exists.
  *
  * The context parameter exists so the whole command can be driven against a
  * temporary tree and a stub service in `scripts/dev-instrumented.test.mjs`;
@@ -1905,29 +2476,22 @@ export async function main(argv = process.argv.slice(2), context = {}) {
     const preload = await resolvePreload(root);
 
     if (options.spawnLocal) {
-      // No editor credential is read: this mode makes no authorised call, and
-      // reading a credential it cannot use would be misleading.
-      //
-      // The service is asked whether it is answering, but the answer does not
-      // gate the spawn: this mode hands the child no credential, and without
-      // one the preload installs nothing and posts nothing, so the child never
-      // contacts the service. A service that is down costs this run nothing,
-      // and refusing to start because of it would break the one mode a
-      // developer can use with nothing else running.
-      const reachability = await probeServiceReachability(base);
-
-      const command = buildLaunchCommand({ project, root, env });
-      const childEnv = buildChildEnv({
-        preloadUrl: preload.url,
+      // The authenticated local spawn: the child starts only with a
+      // server-agent credential the service minted for this project root, so
+      // the preload it carries is armed rather than inert. The credential is
+      // held in `childEnv` and nowhere else; the banner describes it by length
+      // and expiry only, and once the child exits nothing further is sent.
+      const { command, childEnv, expiresAt } = await prepareLocalSpawn({
+        root,
+        project,
+        preload,
         base,
-        projectRoot: project.dir,
-        token: undefined,
         env,
       });
 
       writeLine(
         stdout,
-        buildBanner({ root, project, command, preload, base, childEnv, reachability }),
+        buildBanner({ root, project, command, preload, base, childEnv, expiresAt }),
       );
 
       return await runDevServer(command, childEnv);

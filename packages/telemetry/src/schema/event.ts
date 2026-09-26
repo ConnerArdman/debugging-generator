@@ -60,8 +60,18 @@
  * `performanceToEpochMs()` in the browser (`performance.timeOrigin +
  * entry.startTime`) and `hrTimeToEpochMs()` in the preload, called from
  * `../node/convert.ts`. Both producers run on the developer's own machine, so
- * no clock alignment is applied beyond an informational per-producer
- * `clockOffsetMs` that the service records elsewhere.
+ * no clock alignment is applied: the service stores `startTime` and `duration`
+ * exactly as the producer stamped them.
+ *
+ * What a producer does record is an informational estimate of its own clock's
+ * offset, the optional `clockOffsetMs` field below (AAP 0.2.3: the server's
+ * `Date` header against the local clock). `./clock-offset.ts` defines the
+ * estimator both producers run — the browser agent against the dev server's
+ * `Date` on the same-origin responses its fetch/XHR hook observes, the preload
+ * against the local service's `Date` on the answers to its ingest posts — and
+ * each producer stamps its current estimate once, when it creates an event.
+ * The service validates and persists the value (`telemetry_events.clock_offset_ms`)
+ * and never adds it to, or otherwise re-derives, an event's times.
  *
  * ## Ordering, and where it is implemented
  *
@@ -85,9 +95,10 @@
  *
  * ## Importing this module from the browser subtree
  *
- * `zod` is confined to this file within `src/schema/` — `./kinds.ts` and
- * `./attributes.ts` are dependency-free precisely so the page agent can share
- * their vocabularies, and `esbuild.agent.mjs` hard-fails the agent bundle if
+ * `zod` is confined to this file within `src/schema/` — `./kinds.ts`,
+ * `./attributes.ts` and `./clock-offset.ts` are dependency-free precisely so
+ * the page agent can share their vocabularies and the clock-offset estimator,
+ * and `esbuild.agent.mjs` hard-fails the agent bundle if
  * any input resolves to a schema library. Files under `src/browser/**`
  * therefore must import event types with a **top-level `import type`**:
  *
@@ -117,8 +128,10 @@
  * conversion belong to `@debuggen/shared`; `SourceLocation` belongs to
  * `@debuggen/shared` and is embedded here, never restated; the kind, tier and
  * status vocabularies and the kind/tier table belong to `./kinds.ts`; the
- * attribute-key catalog belongs to `./attributes.ts`; and the ordering
- * comparator belongs to `../correlation/correlator.ts`.
+ * attribute-key catalog belongs to `./attributes.ts`; the clock-offset bound,
+ * the HTTP `Date` parser and the offset estimator belong to
+ * `./clock-offset.ts`; and the ordering comparator belongs to
+ * `../correlation/correlator.ts`.
  *
  * @packageDocumentation
  */
@@ -135,6 +148,7 @@ import {
 } from '@debuggen/shared';
 import type { Result } from '@debuggen/shared';
 
+import { CLOCK_OFFSET_BOUND_MS } from './clock-offset.js';
 import {
   TELEMETRY_KINDS,
   TELEMETRY_STATUSES,
@@ -611,6 +625,33 @@ const telemetryEventCoreShape = {
   seq: z.int().nonnegative({
     error: 'expected a zero-based per-producer sequence number',
   }),
+
+  /**
+   * The producer's informational estimate of its clock offset when it created
+   * the event: server clock minus producer clock, in whole milliseconds, so a
+   * positive value means the server's clock is ahead (AAP 0.2.3).
+   *
+   * Set by the producer's transport — never by the code that describes the
+   * observation — from `./clock-offset.ts`'s `ClockOffsetEstimator`: the browser
+   * agent measures against the dev server's `Date` header, the preload against
+   * the local service's. It is stamped **once**, when the event is created, so
+   * an event re-sent after a reconnect is byte-identical to its first delivery.
+   * Absent until the producer's first usable sample.
+   *
+   * **Informational only.** It is never added to `startTime` or `duration`,
+   * here or anywhere downstream; it lets a reader judge whether two producers'
+   * timestamps can be compared at the precision a timeline draws them. The
+   * service persists it in `telemetry_events.clock_offset_ms`.
+   */
+  clockOffsetMs: z
+    .int({ error: 'expected a whole-millisecond clock offset' })
+    .min(-CLOCK_OFFSET_BOUND_MS, {
+      error: `expected a clock offset no more than ${String(CLOCK_OFFSET_BOUND_MS)} ms behind`,
+    })
+    .max(CLOCK_OFFSET_BOUND_MS, {
+      error: `expected a clock offset no more than ${String(CLOCK_OFFSET_BOUND_MS)} ms ahead`,
+    })
+    .optional(),
 
   /**
    * Where in the developer's project this event came from, when a resolver

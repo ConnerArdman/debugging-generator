@@ -18,8 +18,11 @@
  * sizes, counts and percentages; the singular/plural agreement of the words
  * printed beside a count; the code-point-safe truncation that keeps a
  * preview inside the capture's privacy bound; the one-line collapsing that
- * keeps a multi-line statement out of a table row's height; the compact path
- * and source-chip labels; and the readable labels for the closed telemetry
+ * keeps a multi-line statement out of a table row's height; the grapheme-safe
+ * fitting of an SVG label to a width in logical units ({@link fitTextToWidth},
+ * over a deterministic advance estimate, so no view measures a font or reads
+ * layout); the compact path and source-chip labels; and the readable labels
+ * for the closed telemetry
  * vocabularies (`./color` delegates those here explicitly, so a legend and a
  * table cannot drift apart).
  *
@@ -932,6 +935,231 @@ export function truncate(text: string, maxLength: number = MAX_PREVIEW_LENGTH): 
  */
 export function oneLinePreview(text: string, maxLength: number = MAX_PREVIEW_LENGTH): string {
   return truncate(collapseWhitespace(text), maxLength);
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * Label fitting in logical units
+ *
+ * The SVG views place labels in or beside bars, frames and boxes whose widths
+ * are data, so each must know whether a label fits before drawing it. They are
+ * laid out in a fixed logical coordinate space (`./scale`'s
+ * `CHART_VIEWBOX_WIDTH`, or a graph's own deterministic size) that CSS scales
+ * to its container, and a label set in the stylesheet's type role is exactly
+ * that many user units tall however the drawing is scaled — so a label's fit
+ * is decided once, in logical units, and holds at every panel width. Nothing
+ * here reads the DOM, measures a font or depends on layout: the advance of a
+ * string is the deterministic estimate below, which is what lets every chart
+ * render identically in a browser and under a layout-free test DOM.
+ *
+ * A character budget cannot answer the question — glyphs differ in advance (an
+ * emoji is roughly two columns wide in a monospace run), and a budget wrong by
+ * one glyph draws the ellipsis outside the frame it was meant to end — so the
+ * estimate works per grapheme, and {@link fitTextToWidth} never splits one.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * Measures a string's advance width in SVG user units, in one fixed font.
+ *
+ * A measure is expected to be monotonic in the text — appending a grapheme
+ * never makes a string narrower — which {@link fitTextToWidth} relies on to
+ * search for a fit rather than try every length.
+ */
+export type TextMeasure = (text: string) => number;
+
+/**
+ * The advance {@link estimateTextWidth} assumes for one narrow grapheme, as a
+ * fraction of the font size: 0.6 em, the advance of the common monospace faces
+ * and wider than the average glyph of a proportional UI face, so the estimate
+ * errs towards "does not fit".
+ */
+export const ESTIMATE_NARROW_ADVANCE_EM = 0.6;
+
+/**
+ * The advance {@link estimateTextWidth} assumes for one wide grapheme — an
+ * emoji, or an East Asian wide or fullwidth character: 1.25 em, a little more
+ * than a colour-emoji glyph or a CJK ideograph occupies.
+ */
+export const ESTIMATE_WIDE_ADVANCE_EM = 1.25;
+
+/**
+ * The font size, in SVG user units, an estimate assumes when none is given:
+ * 11, the size of the package's `monoSm` and `textXs` type roles, which chart
+ * labels are set in.
+ */
+export const DEFAULT_LABEL_FONT_SIZE = 11;
+
+/**
+ * A grapheme that occupies two columns: an emoji (Extended_Pictographic), or a
+ * character from the East Asian wide and fullwidth blocks.
+ */
+const WIDE_GRAPHEME =
+  /[\p{Extended_Pictographic}\u1100-\u115f\u2e80-\u303e\u3041-\u33ff\u3400-\u4dbf\u4e00-\u9fff\ua000-\ua4cf\uac00-\ud7a3\uf900-\ufaff\ufe30-\ufe4f\uff00-\uff60\uffe0-\uffe6\u{20000}-\u{3fffd}]/u;
+
+/**
+ * The grapheme segmenter, created on first use rather than on import so that
+ * importing this module still reads nothing. `null` records a platform without
+ * `Intl.Segmenter`. Grapheme boundaries (UAX #29) do not vary by locale, so
+ * this is not a locale-dependent formatter: it decides only where one
+ * user-perceived character ends and the next begins.
+ */
+let graphemeSegmenter: Intl.Segmenter | null | undefined;
+
+/** The shared grapheme segmenter, or `null` where the platform has none. */
+function segmenter(): Intl.Segmenter | null {
+  if (graphemeSegmenter === undefined) {
+    graphemeSegmenter =
+      typeof Intl === 'object' && typeof Intl.Segmenter === 'function'
+        ? new Intl.Segmenter(undefined, { granularity: 'grapheme' })
+        : null;
+  }
+  return graphemeSegmenter;
+}
+
+/**
+ * Splits `text` into graphemes — user-perceived characters — so a truncation
+ * never cuts an emoji's surrogate pair, a flag's regional-indicator pair or a
+ * letter from its combining accent.
+ *
+ * Uses `Intl.Segmenter` where available and falls back to code points, which
+ * still keeps surrogate pairs together.
+ */
+export function splitGraphemes(text: string): string[] {
+  const graphemes = segmenter();
+  if (graphemes !== null) {
+    return Array.from(graphemes.segment(text), (segment) => segment.segment);
+  }
+  return Array.from(text);
+}
+
+/** `value` when it is finite and strictly positive, otherwise `fallback`. */
+function positiveOr(value: number | undefined, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+/**
+ * The estimated advance width of `text` at `fontSize` user units:
+ * {@link ESTIMATE_NARROW_ADVANCE_EM} per grapheme and
+ * {@link ESTIMATE_WIDE_ADVANCE_EM} per wide grapheme.
+ *
+ * Deterministic and platform-free. A non-finite or non-positive `fontSize`
+ * uses {@link DEFAULT_LABEL_FONT_SIZE}.
+ *
+ * @example
+ * ```ts
+ * estimateTextWidth('abcd', 10); // 24 — four narrow graphemes at 0.6 em
+ * ```
+ */
+export function estimateTextWidth(text: string, fontSize: number): number {
+  const size = positiveOr(fontSize, DEFAULT_LABEL_FONT_SIZE);
+  let ems = 0;
+  for (const grapheme of splitGraphemes(text)) {
+    ems += WIDE_GRAPHEME.test(grapheme) ? ESTIMATE_WIDE_ADVANCE_EM : ESTIMATE_NARROW_ADVANCE_EM;
+  }
+  return ems * size;
+}
+
+/**
+ * A {@link TextMeasure} backed by {@link estimateTextWidth} at `fontSize`
+ * user units — the measure every SVG view fits its labels with.
+ */
+export function createEstimateMeasure(fontSize: number = DEFAULT_LABEL_FONT_SIZE): TextMeasure {
+  const size = positiveOr(fontSize, DEFAULT_LABEL_FONT_SIZE);
+  return (text) => estimateTextWidth(text, size);
+}
+
+/** A string that fits a width, as {@link fitTextToWidth} returns it. */
+export interface TextFit {
+  /** The text to draw: the input unchanged, or a prefix ending in {@link ELLIPSIS}. */
+  readonly text: string;
+  /** Its advance width in user units, never more than the width asked for. */
+  readonly width: number;
+  /** Whether the input was shortened. */
+  readonly truncated: boolean;
+}
+
+/** Options of {@link fitTextToWidth}. */
+export interface FitTextOptions {
+  /**
+   * The fewest graphemes of the input a truncated result may keep before its
+   * ellipsis; a width that cannot hold that many yields no fit at all. Defaults
+   * to `1`. A label of one letter and an ellipsis still identifies a frame in a
+   * sequence; a caller for whom it would not raises this.
+   */
+  readonly minGraphemes?: number;
+}
+
+/** A measure's answer made safe to compare: a non-finite or negative width never fits. */
+function measured(measure: TextMeasure, text: string): number {
+  const width = measure(text);
+  return typeof width === 'number' && Number.isFinite(width) && width >= 0
+    ? width
+    : Number.POSITIVE_INFINITY;
+}
+
+/**
+ * The longest form of `text` that fits `maxWidth` user units in the font
+ * `measure` measures in: the whole string when it fits, otherwise the longest
+ * grapheme prefix that fits with {@link ELLIPSIS} appended, otherwise
+ * `undefined`.
+ *
+ * Trailing whitespace is trimmed before the ellipsis, so a cut never draws
+ * "name …". The search is a binary search over prefix lengths, so fitting a
+ * long label costs a logarithmic number of measurements.
+ *
+ * `undefined` — draw nothing — is returned for empty text, for a `maxWidth`
+ * that is not finite and positive, and when not even `minGraphemes` graphemes
+ * and the ellipsis fit.
+ *
+ * @param text The label.
+ * @param maxWidth The room available, in user units.
+ * @param measure Measures a string in the label's font.
+ * @param options The shortest acceptable prefix.
+ */
+export function fitTextToWidth(
+  text: string,
+  maxWidth: number,
+  measure: TextMeasure,
+  options: FitTextOptions = {},
+): TextFit | undefined {
+  if (text.length === 0 || !(Number.isFinite(maxWidth) && maxWidth > 0)) {
+    return undefined;
+  }
+
+  const whole = measured(measure, text);
+  if (whole <= maxWidth) {
+    return { text, width: whole, truncated: false };
+  }
+
+  const graphemes = splitGraphemes(text);
+  const requested = options.minGraphemes;
+  const minimum =
+    typeof requested === 'number' && Number.isInteger(requested) && requested > 0 ? requested : 1;
+
+  let low = minimum;
+  let high = graphemes.length - 1;
+  let best: TextFit | undefined;
+
+  while (low <= high) {
+    const keep = Math.floor((low + high) / 2);
+    const prefix = graphemes.slice(0, keep).join('').trimEnd();
+    const candidate = prefix + ELLIPSIS;
+    const width = measured(measure, candidate);
+
+    if (width <= maxWidth) {
+      // A prefix of nothing but whitespace trims to a bare ellipsis, which
+      // names nothing; it is not a fit, but a longer prefix may still be.
+      if (prefix.length > 0) {
+        best = { text: candidate, width, truncated: true };
+      }
+      low = keep + 1;
+    } else {
+      high = keep - 1;
+    }
+  }
+
+  return best;
 }
 
 /*

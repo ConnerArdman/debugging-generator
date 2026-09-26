@@ -16,6 +16,16 @@
  *   disallowed kind all stay silent;
  * - a malformed frame is answered with protocol's `error` message on the same
  *   connection, which stays open, and the process keeps serving;
+ * - every refusal's `ref` — the frame's own id where it is readable and spelled
+ *   exactly as the product mints message ids (`msg_` and sixteen characters of
+ *   `[0-9a-z]`), a service-minted one otherwise — is the ref of the service's
+ *   own log records of it, so concurrent failures of one code stay apart on
+ *   the wire and in the log, and no id a client chose (a URL, a statement, an
+ *   upper-case or foreign-prefix id) is ever filed in a `server.ws` record; a
+ *   handler that throws is filed at `error` in the closed exception shape and
+ *   again, under the same ref, in a `debug` twin that alone carries the
+ *   redacted message (read through the harness's capturing logger, which
+ *   records at `debug`);
  * - a DevTools socket that drops mid-capture keeps its session, binding and
  *   capture, and a reconnect with the same credential carries the traffic
  *   again without a re-bind (the MV3 service-worker suspension of §0.5.5).
@@ -33,9 +43,10 @@
  * so a twenty-sixth message type fails this suite until it is classified. The
  * inbound set is `MESSAGE_TYPES` filtered through that table, and the final
  * describe block fails unless every inbound type was proved dispatched by a
- * live test and every service-only push was proved refused when a client sends
- * it. Each message name and client kind is written exactly once, in {@link T}
- * and {@link KIND}, compile-checked against protocol's vocabulary.
+ * live test and every service-only push — and the reply-only `error` — was
+ * proved refused when a client sends it. Each message name and client kind is
+ * written exactly once, in {@link T} and {@link KIND}, compile-checked against
+ * protocol's vocabulary.
  *
  * ## Rules ruling
  *
@@ -82,6 +93,8 @@ import type {
   ClientKind,
   ConnectionState,
   ErrorPayload,
+  HttpOperationId,
+  HttpResponseBody,
   MessageByType,
   MessagePayload,
   MessageType,
@@ -97,19 +110,22 @@ import type {
   TelemetryTier,
 } from '@debuggen/protocol';
 import {
+  ID_PREFIXES,
   isErr,
   newEventId,
   newId,
   newMessageId,
   newProducerId,
+  newSessionId,
   newSpanId,
   newTraceId,
 } from '@debuggen/shared';
-import type { DebuggenErrorCode, Result } from '@debuggen/shared';
+import type { DebuggenError, DebuggenErrorCode, Result } from '@debuggen/shared';
 
 import { MAX_WS_MESSAGE_BYTES } from '../../src/server/ws.js';
 import {
   HARNESS_TIMEOUTS,
+  createHarnessClock,
   createScriptedProvider,
   isUnauthorizedClose,
   randomSecretLike,
@@ -119,6 +135,7 @@ import {
   waitUntil,
 } from './harness.js';
 import type {
+  CapturedLogRecord,
   DevtoolsCredential,
   FixtureProjectCopy,
   Harness,
@@ -162,6 +179,7 @@ const T = Object.freeze({
   tail: 'telemetry.tail',
   panel: 'panel.generated',
   sourceOpen: 'source.open',
+  sourceResult: 'source.result',
   targetRequest: 'target.request',
   targetSelected: 'target.selected',
   cleanup: 'cleanup.completed',
@@ -234,11 +252,29 @@ const CODE = Object.freeze({
   invalidState: 'SESSION_INVALID_STATE',
   tabNotBound: 'TAB_NOT_BOUND',
   installFailed: 'INSTRUMENTATION_INSTALL_FAILED',
+  unauthorized: 'UNAUTHORIZED',
+  transportDisconnected: 'TRANSPORT_DISCONNECTED',
+  internal: 'INTERNAL',
 } as const satisfies Readonly<Record<string, DebuggenErrorCode>>);
 
-/** The HTTP statuses this suite reads: a healthy `GET /health`, and a refused capture. */
+/**
+ * The HTTP statuses this suite reads: a healthy `GET /health`, a refused body,
+ * a refused role, a refused capture or target request, and a bound tab whose
+ * connection is offline.
+ */
 const HTTP_OK = 200;
+const HTTP_BAD_REQUEST = 400;
+const HTTP_FORBIDDEN = 403;
 const HTTP_CONFLICT = 409;
+const HTTP_UNAVAILABLE = 503;
+
+/**
+ * The editor's HTTP operation that makes the service push `target.request` to
+ * a session's bound tab. Protocol names the HTTP leg after the push it
+ * produces; `satisfies` checks the literal against the route table's own
+ * operation vocabulary rather than the message vocabulary {@link T} holds.
+ */
+const TARGET_REQUEST_OPERATION = 'target.request' satisfies HttpOperationId;
 
 /** The client state a reconnected socket reaches once its hello is written and its queue drained. */
 const CONNECTION_OPEN = 'open' satisfies ConnectionState;
@@ -254,6 +290,31 @@ const SEND_QUEUED = 'queued' satisfies SendOutcome;
  * the suite tells "offline" from "gone".
  */
 const CLIENT_OFFLINE_LOG = 'Client marked offline; its sessions and bindings are kept';
+
+/**
+ * The `subsystem` binding of `src/server/ws.ts`'s records. Every refusal of a
+ * frame is filed there under the very `ref` its `error` reply carries, so a
+ * reply is matched to its diagnostic by `ref` alone — never by message text,
+ * which is the service's to reword.
+ */
+const WS_LOG_SUBSYSTEM = 'server.ws';
+
+/**
+ * Longer than protocol's `error.ref` bound (64) yet inside the envelope's own
+ * `id` bound (128): a frame carrying such an id decodes, but its reply cannot
+ * echo the id and must carry a service-minted ref instead.
+ */
+const OVER_REF_BOUND_ID_LENGTH = 100;
+
+/**
+ * The spelling of every message id the product mints — `newMessageId`'s
+ * contract in `packages/shared/src/ids.ts`: the `msg` prefix, one underscore
+ * and sixteen characters of `[0-9a-z]` (the module keeps the alphabet and the
+ * length private, so the pattern is written from its documented contract).
+ * Every ref the service files a frame failure under has this spelling, and a
+ * client id is echoed as the ref only when it has it too.
+ */
+const MINTED_MESSAGE_ID = new RegExp(`^${ID_PREFIXES.message}_[0-9a-z]{16}$`, 'u');
 
 /** The four keys of the envelope protocol builds every frame from, plus the discriminant and body. */
 const ENVELOPE_KEYS: ReadonlySet<string> = new Set([
@@ -279,9 +340,11 @@ interface MessageRoute {
   /**
    * The kinds that must receive it during the lifecycle drive of the topology
    * suite. A kind is absent when the drive cannot reach it there: the DevTools
-   * panel binds after `session.created`, `instrumentation.failed` needs a
-   * failed install (its own suite), and no service path emits `target.request`
-   * (its absence everywhere is still asserted).
+   * panel binds after `session.created`, and `instrumentation.failed` needs a
+   * failed install (its own suite). `target.request` must reach the bound
+   * DevTools tab, because the drive calls the editor's real
+   * `POST /sessions/:id/target/request`; the unbound tab's silence, and every
+   * other connection's, is still asserted.
    */
   readonly mustReach: readonly ClientKind[];
 }
@@ -334,7 +397,10 @@ const ROUTES = Object.freeze({
   [T.tail]: { inbound: false, pushedTo: [KIND.devtools], mustReach: [KIND.devtools] },
   [T.panel]: TO_INTERFACES,
   [T.sourceOpen]: { inbound: true, pushedTo: [KIND.editor], mustReach: [KIND.editor] },
-  [T.targetRequest]: { inbound: false, pushedTo: [KIND.devtools], mustReach: [] },
+  // Sent by the editor answering a forwarded `source.open`, and relayed by the
+  // service to the `source.open`'s sender alone, under that sender's own `ref`.
+  [T.sourceResult]: { inbound: true, pushedTo: 'sender', mustReach: [] },
+  [T.targetRequest]: { inbound: false, pushedTo: [KIND.devtools], mustReach: [KIND.devtools] },
   [T.targetSelected]: INBOUND_ONLY,
   [T.cleanup]: TO_INTERFACES,
   [T.error]: { inbound: false, pushedTo: 'sender', mustReach: [] },
@@ -381,7 +447,7 @@ const DISPATCHED = 'dispatched';
 const proved = {
   inbound: new Map<MessageType, Set<string>>(),
   refusedWhenSentByClient: new Set<MessageType>(),
-  clientErrorFrameDropped: false,
+  clientErrorFrameRefused: false,
 };
 
 /** Records that an inbound type's facet was proved by a live test. */
@@ -400,9 +466,11 @@ const TAB = Object.freeze({
   bound: 101,
   unbound: 102,
   absent: 201,
+  offline: 202,
   malformed: 301,
   reconnecting: 401,
   failedInstall: 501,
+  failureRefs: 601,
 });
 
 /** The question every session asks; the pipeline never branches on it (AAP §0.5.4). */
@@ -433,6 +501,21 @@ function messagesOf<K extends MessageType>(
   return client.received
     .slice(from)
     .filter((message): message is HarnessMessage<K> => isMessageOfType(message, type));
+}
+
+/**
+ * The `server.ws` records filed under `ref` at index `from` or later: the
+ * service's diagnostics of the failure an `error` reply carrying that `ref`
+ * answered. The harness captures at `debug`, where every frame refusal is
+ * logged, and a record is written before its reply is sent, so a reply that
+ * has arrived always has its records captured.
+ */
+function wsRecordsFor(h: Harness, ref: string, from = 0): readonly CapturedLogRecord[] {
+  return h.logger.records
+    .slice(from)
+    .filter(
+      (record) => record.fields['subsystem'] === WS_LOG_SUBSYSTEM && record.fields['ref'] === ref,
+    );
 }
 
 /**
@@ -472,6 +555,45 @@ async function fetchSession(harness: Harness, sessionId: string): Promise<Sessio
     await harness.http().request('session.get', { params: { id: sessionId } }),
     'reading the session',
   );
+}
+
+/**
+ * Calls the editor's real `POST /sessions/:id/target/request` through
+ * protocol's own HTTP client — with the editor credential, or with `presenting`
+ * from the extension origin it was issued to — and answers the client's
+ * verdict unchanged.
+ */
+function requestTarget(
+  harness: Harness,
+  sessionId: string,
+  presenting?: DevtoolsCredential,
+): Promise<Result<HttpResponseBody<typeof TARGET_REQUEST_OPERATION>, DebuggenError>> {
+  const client =
+    presenting === undefined
+      ? harness.http()
+      : harness.http(presenting.token, { origin: presenting.origin });
+  return client.request(TARGET_REQUEST_OPERATION, { params: { id: sessionId }, body: {} });
+}
+
+/**
+ * The one `target.request` frame with envelope `id` among the verbatim text a
+ * connection's socket delivered, parsed by protocol's `parseMessage` — proof
+ * of what the service wrote, independent of the transcript the client built.
+ */
+function wireFrameWithId(tap: WireTap, id: string): ProtocolMessage | undefined {
+  for (const frame of tap.frames) {
+    let value: unknown;
+    try {
+      value = JSON.parse(frame);
+    } catch {
+      continue;
+    }
+    const parsed = parseMessage(value);
+    if (!isErr(parsed) && parsed.value.id === id) {
+      return parsed.value;
+    }
+  }
+  return undefined;
 }
 
 /** The live dev server of a session, as the DevTools panel would see its inspected tab. */
@@ -704,7 +826,11 @@ interface ProbeContext {
   readonly marker: string;
   /** A credential-shaped value assembled at run time, which must not be echoed either. */
   readonly secret: string;
-  /** The envelope id the reply's `ref` must name, where the frame's id is readable. */
+  /**
+   * The envelope id the reply's `ref` must name, where the frame's id is
+   * readable. Minted with `newMessageId`, so it has the product's own spelling
+   * ({@link MINTED_MESSAGE_ID}) — the only spelling the service echoes.
+   */
   readonly id: string;
   /** A valid envelope timestamp. */
   readonly ts: number;
@@ -715,7 +841,10 @@ interface MalformedProbe {
   readonly name: string;
   /** Builds the frame — text by string concatenation or `JSON.stringify`, bytes as a `Uint8Array`. */
   readonly build: (context: ProbeContext) => string | Uint8Array;
-  /** Whether the frame's id is readable, so the reply must carry it as `ref`. */
+  /**
+   * Whether the frame's conforming id is readable, so the reply must carry it
+   * as `ref`; otherwise the reply carries a ref the service minted instead.
+   */
   readonly referenced: boolean;
 }
 
@@ -939,6 +1068,26 @@ describe('the protocol vocabulary this suite classifies', () => {
     ).toEqual([]);
   });
 
+  it('dispatches exactly the nine inbound kinds, so an error frame is never inbound', () => {
+    // The eight client-sent kinds of AAP §0.4.2, plus `source.result`: the
+    // editor's answer to a forwarded `source.open`, which the service relays to
+    // that `source.open`'s sender alone.
+    const specified: readonly MessageType[] = [
+      T.hello,
+      T.agentReady,
+      T.bind,
+      T.navigated,
+      T.unbind,
+      T.telemetry,
+      T.sourceOpen,
+      T.sourceResult,
+      T.targetSelected,
+    ];
+    expect(INBOUND_TYPES).toHaveLength(specified.length);
+    expect(new Set(INBOUND_TYPES)).toEqual(new Set(specified));
+    expect(INBOUND_TYPES).not.toContain(T.error);
+  });
+
   it('routes nothing to the page-agent kind and requires no kind a route may not reach', () => {
     // The agent owns no socket; its frames ride the bound tab's DevTools connection.
     expect(PUSHED_TYPES.filter((type) => allowedKinds(type).includes(KIND.agent))).toEqual([]);
@@ -1116,6 +1265,79 @@ describe('routing across a live multi-client topology', () => {
     proveInbound(T.targetSelected);
   });
 
+  it('pushes the editor’s target.request to the bound DevTools tab alone, as a frame the service built', async () => {
+    const h = harness();
+    const listeners = Object.freeze({
+      editor,
+      devtools,
+      idleDevtools,
+      serverAgent,
+      foreignEditor,
+      foreignServerAgent,
+    });
+    const labelled = Object.entries(listeners);
+    const from = new Map(
+      labelled.map(([, client]): [HarnessWsClient, number] => [client, client.received.length]),
+    );
+    const tap = wire.get(devtools)?.tap;
+    expect(tap, 'the bound DevTools connection is tapped').toBeDefined();
+
+    // Only the editor may ask: the bound tab's own credential is refused …
+    expect(refusalOf(await requestTarget(h, session.id, devtoolsCredential))).toEqual({
+      code: CODE.unauthorized,
+      status: HTTP_FORBIDDEN,
+    });
+    // … and so is a body that names a tab: the binding, not the caller, picks the recipient.
+    const namingATab = await h.rawFetch(
+      { operation: TARGET_REQUEST_OPERATION, params: { id: session.id } },
+      { body: { tabId: TAB.unbound } },
+    );
+    expect(namingATab.status).toBe(HTTP_BAD_REQUEST);
+    expect(namingATab.json).toMatchObject({ code: CODE.invalidMessage });
+
+    const reply = unwrap(await requestTarget(h, session.id), 'requesting a target');
+    expect(reply).toEqual({ sessionId: session.id, tabId: TAB.bound });
+
+    const pushed = await waitForSessionMessage(
+      devtools,
+      T.targetRequest,
+      session.id,
+      from.get(devtools),
+      () => true,
+      HARNESS_TIMEOUTS.message,
+    );
+    expect(pushed.sessionId).toBe(session.id);
+    expect(pushed.payload).toEqual({ sessionId: session.id });
+    expect(wireFrameWithId(tap!, pushed.id)).toEqual({
+      id: pushed.id,
+      type: T.targetRequest,
+      sessionId: session.id,
+      ts: pushed.ts,
+      payload: { sessionId: session.id },
+    });
+
+    // Every connection has drained what the service wrote before the reply:
+    // exactly one frame reached the bound tab, and none reached anyone else.
+    for (const [, client] of labelled) {
+      expect(await client.flush(), client.describe()).toBe(true);
+    }
+    expect(
+      Object.fromEntries(
+        labelled.map(([label, client]) => [
+          label,
+          messagesOf(client, T.targetRequest, from.get(client)).length,
+        ]),
+      ),
+    ).toEqual({
+      editor: 0,
+      devtools: 1,
+      idleDevtools: 0,
+      serverAgent: 0,
+      foreignEditor: 0,
+      foreignServerAgent: 0,
+    });
+  });
+
   it('forwards source.open from the bound DevTools tab to the project’s editor alone', async () => {
     const h = harness();
     const record = await fetchSession(h, session.id);
@@ -1139,6 +1361,29 @@ describe('routing across a live multi-client topology', () => {
       expect(messagesOf(other, T.sourceOpen), other.describe()).toEqual([]);
     }
     proveInbound(T.sourceOpen);
+
+    // The editor's answer to the forwarded frame reaches the sender alone, under
+    // the sender's own frame id.
+    const answer = editor.send(T.sourceResult, {
+      sessionId: session.id,
+      ref: forwarded.id,
+      status: 'opened',
+    });
+    expect(await editor.flush()).toBe(true);
+    expect(editor.errorsFor(answer.id)).toEqual([]);
+    const relayed = await waitForSessionMessage(
+      devtools,
+      T.sourceResult,
+      session.id,
+      0,
+      (message) => message.payload.ref === receipt.id,
+      HARNESS_TIMEOUTS.message,
+    );
+    expect(relayed.payload).toEqual({ sessionId: session.id, ref: receipt.id, status: 'opened' });
+    for (const other of [editor, idleDevtools, serverAgent, foreignEditor, foreignServerAgent]) {
+      expect(messagesOf(other, T.sourceResult), other.describe()).toEqual([]);
+    }
+    proveInbound(T.sourceResult);
   });
 
   it('keeps the binding across a same-origin tab.navigated and announces the new URL', async () => {
@@ -1329,6 +1574,8 @@ describe('routing across a live multi-client topology', () => {
 
     // Each push the drive delivered, echoed by the connection that received it
     // under a fresh id: valid by construction, so only its direction is wrong.
+    // That includes the `target.request` the editor's route made the service
+    // push to the bound tab: a panel may not put another panel into picker mode.
     const echoes = new Map<
       MessageType,
       { readonly client: HarnessWsClient; readonly frame: ProtocolMessage }
@@ -1340,13 +1587,9 @@ describe('routing across a live multi-client topology', () => {
         }
       }
     }
-    // No service path emits `target.request`, so the panel's side of it is built here.
-    echoes.set(T.targetRequest, {
-      client: devtools,
-      frame: createEnvelope(T.targetRequest, { sessionId: session.id }),
-    });
     // Everything but the failed install (its own suite below) was observed on the wire.
     expect(SERVICE_ONLY_TYPES.filter((type) => !echoes.has(type))).toEqual([T.failed]);
+    expect(echoes.get(T.targetRequest)?.client).toBe(devtools);
 
     const closesBefore = new Map(
       [editor, devtools, serverAgent].map((client): [HarnessWsClient, number] => [
@@ -1476,6 +1719,85 @@ describe('a single-recipient push whose recipient is absent', () => {
     expect((await fetchSession(h, session.id)).status).toBe(STATUS.ready);
     unwrap(await h.endSession(session.id), 'ending the session');
   });
+
+  it('refuses target.request with a named TAB_NOT_BOUND conflict when no tab is bound, sending nothing', async () => {
+    const h = harness();
+    const session = await h.createSession({ projectRoot: project.root, question: QUESTION });
+    const devtoolsFrom = devtools.received.length;
+
+    // The DevTools client is connected, but no tab is bound to this session.
+    expect(refusalOf(await requestTarget(h, session.id))).toEqual({
+      code: CODE.tabNotBound,
+      status: HTTP_CONFLICT,
+    });
+    expect(await devtools.flush()).toBe(true);
+    expect(messagesOf(devtools, T.targetRequest, devtoolsFrom)).toEqual([]);
+    expectNoErrors(devtools, devtoolsFrom);
+
+    // An ended session takes no element at all: its state is refused first.
+    unwrap(await h.endSession(session.id), 'ending the session');
+    expect(refusalOf(await requestTarget(h, session.id))).toEqual({
+      code: CODE.invalidState,
+      status: HTTP_CONFLICT,
+    });
+    expect(messagesOf(devtools, T.targetRequest, devtoolsFrom)).toEqual([]);
+  });
+
+  it('answers target.request with TRANSPORT_DISCONNECTED while the bound tab’s connection is offline, and pushes it once it is back', async () => {
+    const h = harness();
+    const session = await h.createSession({ projectRoot: project.root, question: QUESTION });
+    const offline = await h.connectDevtools({ tabId: TAB.offline });
+    const tab = tabOf(session);
+    unwrap(
+      await h.bindTab(offline.client, {
+        tabId: TAB.offline,
+        url: tab.url,
+        origin: tab.origin,
+        sessionId: session.id,
+      }),
+      'binding the tab',
+    );
+
+    const logFrom = h.logger.records.length;
+    await offline.client.close();
+    await waitUntil(
+      () =>
+        h.logger.records
+          .slice(logFrom)
+          .find(
+            (record) =>
+              record.message === CLIENT_OFFLINE_LOG && record.fields['tabId'] === TAB.offline,
+          ),
+      'the registry marking the closed DevTools connection offline',
+    );
+    expect(refusalOf(await requestTarget(h, session.id))).toEqual({
+      code: CODE.transportDisconnected,
+      status: HTTP_UNAVAILABLE,
+    });
+
+    // The binding belongs to the credential: its reconnected tab is the recipient again.
+    const back = (await h.connectDevtools({ tabId: TAB.offline, credential: offline.credential }))
+      .client;
+    const from = back.received.length;
+    expect(unwrap(await requestTarget(h, session.id), 'requesting a target')).toEqual({
+      sessionId: session.id,
+      tabId: TAB.offline,
+    });
+    const pushed = await waitForSessionMessage(
+      back,
+      T.targetRequest,
+      session.id,
+      from,
+      () => true,
+      HARNESS_TIMEOUTS.message,
+    );
+    expect(pushed.payload).toEqual({ sessionId: session.id });
+    expect(offline.client.received.filter((message) => message.id === pushed.id)).toEqual([]);
+    expect(messagesOf(devtools, T.targetRequest)).toEqual([]);
+
+    unwrap(await h.endSession(session.id), 'ending the session');
+    await back.close();
+  });
 });
 
 /* -------------------------------------------------------------------------------------------------
@@ -1512,6 +1834,7 @@ describe('malformed input on a live connection', () => {
       };
       const from = devtools.received.length;
       const closes = devtools.closes.length;
+      const logFrom = h.logger.records.length;
 
       devtools.sendRaw(probe.build(context));
       // The barrier behind the probe is a valid frame: its answer proves the
@@ -1526,10 +1849,24 @@ describe('malformed input on a live connection', () => {
       expect(errorPayloadSchema.safeParse(reply).success).toBe(true);
       expect(reply?.code).toBe(CODE.invalidMessage);
       expect(reply?.message.length).toBeGreaterThan(0);
-      expect(reply?.ref).toBe(probe.referenced ? context.id : undefined);
       const text = JSON.stringify(reply);
       expect(text).not.toContain(context.marker);
       expect(text).not.toContain(context.secret);
+
+      // Every reply carries a ref in the product's own message-id spelling:
+      // the frame's own (conforming) id where it was readable, and a ref the
+      // service minted where it was not — never nothing.
+      const ref = reply?.ref ?? '';
+      expect(ref, 'the reply carries a ref the service may file').toMatch(MINTED_MESSAGE_ID);
+      expect(ref === context.id, 'the ref is the frame’s id exactly when it was readable').toBe(
+        probe.referenced,
+      );
+      // That ref names the service's one record of this refusal, which quotes
+      // nothing the frame carried.
+      const records = wsRecordsFor(h, ref, logFrom);
+      expect(records.map((record) => record.fields['code'])).toEqual([reply?.code]);
+      expect(records[0]?.line).not.toContain(context.marker);
+      expect(records[0]?.line).not.toContain(context.secret);
 
       expect(devtools.closes).toHaveLength(closes);
       expect((await h.rawFetch('health')).status).toBe(HTTP_OK);
@@ -1541,15 +1878,125 @@ describe('malformed input on a live connection', () => {
     expectNoErrors(editor);
   });
 
-  it('drops an error frame a client sends instead of answering it', async () => {
-    const [received] = messagesOf(devtools, T.error);
-    expect(received).toBeDefined();
-    const frame = { ...received!, id: newMessageId() };
+  it('refuses an error frame a client sends with one error naming it, on a connection that stays open', async () => {
+    // A well-formed `error` frame built by protocol's own constructor and
+    // carrying a fresh marker: valid by construction, so only its direction is
+    // wrong — and independent of what any earlier case in this block sent.
+    const marker = newMarker();
+    const frame = createEnvelope(T.error, { code: CODE.invalidMessage, message: marker });
     const from = devtools.received.length;
+    const closes = devtools.closes.length;
+
     devtools.sendRaw(encodeMessage(frame));
-    expect(await devtools.flush()).toBe(true);
-    expect(messagesOf(devtools, T.error, from)).toEqual([]);
-    proved.clientErrorFrameDropped = true;
+    expect(await devtools.flush(), devtools.describe()).toBe(true);
+
+    const replies: readonly ErrorPayload[] = messagesOf(devtools, T.error, from).map(
+      (message) => message.payload,
+    );
+    expect(replies).toHaveLength(1);
+    const [reply] = replies;
+    expect(errorPayloadSchema.safeParse(reply).success).toBe(true);
+    expect(reply?.code).toBe(CODE.invalidMessage);
+    expect(reply?.ref).toBe(frame.id);
+    expect(JSON.stringify(reply)).not.toContain(marker);
+
+    // No cascade, and the connection is still served: a later barrier is
+    // answered with nothing further behind the one reply, and only the
+    // sender heard it.
+    expect(await devtools.flush(), devtools.describe()).toBe(true);
+    expect(messagesOf(devtools, T.error, from)).toHaveLength(1);
+    expect(devtools.closes).toHaveLength(closes);
+    expectNoErrors(editor);
+    proved.clientErrorFrameRefused = true;
+  });
+
+  it('files concurrent same-code failures under distinct refs, each shared by its reply and its log record', async () => {
+    const h = harness();
+    const from = devtools.received.length;
+    const closes = devtools.closes.length;
+    const logFrom = h.logger.records.length;
+
+    // Six refusals of one code, written back to back so they queue together
+    // on the connection: two service pushes a client may not send (readable
+    // ids in the product's own spelling, as `createEnvelope` mints them), one
+    // with an id the envelope accepts but protocol's `ref` bound does not, one
+    // with a readable, bounded id of another spelling (a URL carrying a
+    // marker), and two text frames that are not JSON (no readable id).
+    const pushes = [
+      createEnvelope(T.targetRequest, { sessionId: session.id }),
+      createEnvelope(T.targetRequest, { sessionId: session.id }),
+    ];
+    const overBound = createEnvelope(
+      T.targetRequest,
+      { sessionId: session.id },
+      { id: `msg_${'x'.repeat(OVER_REF_BOUND_ID_LENGTH)}` },
+    );
+    const foreignMarker = newMarker();
+    const foreignSpelling = createEnvelope(
+      T.targetRequest,
+      { sessionId: session.id },
+      { id: `/api/items?probe=${foreignMarker}` },
+    );
+    const unreadable = [newMarker(), newMarker()];
+    const markers = [foreignMarker, ...unreadable];
+    const envelopes = [...pushes, overBound, foreignSpelling];
+    for (const frame of envelopes) {
+      devtools.sendRaw(encodeMessage(frame));
+    }
+    for (const marker of unreadable) {
+      devtools.sendRaw(`{"id":"${marker}"`);
+    }
+    expect(await devtools.flush(), devtools.describe()).toBe(true);
+
+    // Frames are answered in arrival order, one reply each, all of one code.
+    const replies: readonly ErrorPayload[] = messagesOf(devtools, T.error, from).map(
+      (message) => message.payload,
+    );
+    expect(replies.map((reply) => reply.code)).toEqual(
+      Array.from({ length: envelopes.length + unreadable.length }, () => CODE.invalidMessage),
+    );
+    for (const reply of replies) {
+      expect(errorPayloadSchema.safeParse(reply).success, JSON.stringify(reply)).toBe(true);
+    }
+    const refs = replies.map((reply) => reply.ref ?? '');
+
+    // An id in the product's own spelling is echoed: each sender matches its
+    // own reply.
+    expect(refs.slice(0, 2)).toEqual(pushes.map((frame) => frame.id));
+    for (const frame of pushes) {
+      expect(devtools.errorsFor(frame.id).map((reply) => reply.code)).toEqual([
+        CODE.invalidMessage,
+      ]);
+    }
+    // Anything else — the over-long id and the readable id of another
+    // spelling included — is answered under a minted ref rather than none at
+    // all, and a minted ref quotes nothing the frame carried.
+    const minted = refs.slice(pushes.length);
+    expect(minted).not.toContain(overBound.id);
+    expect(minted).not.toContain(foreignSpelling.id);
+    expect(devtools.errorsFor(foreignSpelling.id)).toEqual([]);
+    for (const ref of minted) {
+      expect(ref).toMatch(MINTED_MESSAGE_ID);
+      for (const marker of markers) {
+        expect(ref).not.toContain(marker);
+      }
+    }
+    // No two failures share a ref, however alike their codes.
+    expect(new Set(refs).size).toBe(refs.length);
+
+    // Each ref names exactly one service record, of the code its reply
+    // answered with, and the record quotes nothing the frame carried.
+    for (const [index, reply] of replies.entries()) {
+      const records = wsRecordsFor(h, refs[index] ?? '', logFrom);
+      expect(
+        records.map((record) => [record.level, record.fields['code']]),
+        `the records filed under reply #${String(index)}'s ref`,
+      ).toEqual([['debug', reply.code]]);
+      for (const marker of markers) {
+        expect(records[0]?.line).not.toContain(marker);
+      }
+    }
+    expect(devtools.closes, devtools.describe()).toHaveLength(closes);
   });
 
   it('refuses a telemetry.event batch one event over protocol’s bound, persisting none of it', async () => {
@@ -1597,6 +2044,332 @@ describe('malformed input on a live connection', () => {
     expect(outcome.errors).toEqual([]);
     expect((await fetchSession(h, session.id)).status).toBe(STATUS.capturing);
     unwrap(await h.endSession(session.id), 'ending the session');
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * 4a. Failure refs a client cannot choose
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * A client frame `id` the envelope accepts — a non-empty string inside its
+ * bound — but not spelled as the product mints message ids, with the text in
+ * it no log record may hold.
+ */
+interface NonConformingId {
+  readonly name: string;
+  readonly id: string;
+  readonly sentinel: string;
+}
+
+/**
+ * Short, peer-chosen ids a logger's credential scrubbing would let through as
+ * ordinary text. Each fits protocol's `error.ref` bound, so only the id
+ * grammar keeps it out of the `ref` the service files and replies with.
+ */
+const NON_CONFORMING_IDS: readonly NonConformingId[] = [
+  {
+    name: 'a URL whose query carries a private value',
+    id: '/api/items?email=zz-private',
+    sentinel: 'zz-private',
+  },
+  { name: 'an inline SQL literal', id: "SELECT 'zz-sql-literal'", sentinel: 'zz-sql-literal' },
+  { name: 'an upper-case message id', id: 'msg_ZZPRIVATE0000000', sentinel: 'ZZPRIVATE' },
+  {
+    name: 'a message id with a seventeen-character suffix',
+    id: 'msg_zzseventeenchars0',
+    sentinel: 'zzseventeenchars',
+  },
+  {
+    name: 'an id with another kind’s prefix',
+    id: 'ses_0123456789abcdef',
+    sentinel: '0123456789abcdef',
+  },
+];
+
+/**
+ * The texts the handler fault's exception carries — a query value and an
+ * inline SQL literal, as a driver's error would quote them. Neither may reach
+ * a `server.ws` record at any level: the `error` record holds the closed
+ * exception shape only, and the `debug` twin holds the message after the
+ * service's diagnostic redaction.
+ */
+const THROWN_SENTINELS = Object.freeze({ query: 'zz-thrown-private', sql: 'zz-thrown-sql' });
+
+/** The message of the exception the handler fault throws. */
+const THROWN_FAULT_MESSAGE = `lookup failed for /api/orders?email=${THROWN_SENTINELS.query} while running SELECT * FROM orders WHERE note = '${THROWN_SENTINELS.sql}'`;
+
+/**
+ * The stack frame of the page-agent readiness ledger's `agentReady`
+ * (`src/main.ts`), which stamps the report it records with the injected clock
+ * before anything is stored or logged. The relayed `agent.ready` route awaits
+ * it without a guard of its own, so a clock read that throws there is a
+ * handler failure the WebSocket router itself must catch.
+ */
+const AGENT_READY_LEDGER_FRAME = /\bagentReady \([^)]*[\\/]src[\\/]main\.[cm]?[jt]s\b/u;
+
+/** The tab the page agent of the suite below reports from. */
+const FAILURE_REFS_TAB_URL = 'http://127.0.0.1/';
+
+/**
+ * The service clock of the suite below, able to make one frame's handler
+ * throw.
+ *
+ * No well-formed frame reaches the router's handler-failure path on a healthy
+ * service, so the fault is the clock the harness boots the service with: it
+ * throws once, only while armed, and only for a read whose direct caller is
+ * {@link AGENT_READY_LEDGER_FRAME}. Every other read — the client registry
+ * refreshing the connection as the frame arrives, the pipeline, the harness —
+ * is answered by an ordinary harness clock, so nothing else fails.
+ */
+interface HandlerFault {
+  /** The clock handed to the service. */
+  readonly now: () => number;
+  /** Makes the next matching read throw. */
+  readonly arm: () => void;
+  /** Cancels an armed fault that has not fired. */
+  readonly disarm: () => void;
+  /** How many times the fault has fired. */
+  readonly fired: () => number;
+}
+
+/**
+ * The direct caller's frame of `callee`, read without throwing: V8's
+ * `Error.captureStackTrace` omits `callee` and every frame above it, so the
+ * first frame left is the one that called it.
+ */
+function callerFrameOf(callee: () => number): string {
+  const probe: { stack?: string } = {};
+  Error.captureStackTrace(probe, callee);
+  return probe.stack?.split('\n')[1] ?? '';
+}
+
+/** Builds the {@link HandlerFault} clock over a fresh harness clock. */
+function createHandlerFault(): HandlerFault {
+  const clock = createHarnessClock();
+  let armed = false;
+  let fired = 0;
+  const now = (): number => {
+    if (armed && AGENT_READY_LEDGER_FRAME.test(callerFrameOf(now))) {
+      armed = false;
+      fired += 1;
+      throw new Error(THROWN_FAULT_MESSAGE);
+    }
+    return clock.now();
+  };
+  return Object.freeze({
+    now,
+    arm: () => {
+      armed = true;
+    },
+    disarm: () => {
+      armed = false;
+    },
+    fired: () => fired,
+  });
+}
+
+/** One way a frame fails after its id was read, and what the service files it as. */
+interface FailureKind {
+  readonly name: string;
+  /** Builds the frame under `id`, stamped `ts`. */
+  readonly build: (id: string, ts: number) => string;
+  /** Whether the frame is sent with the handler fault armed. */
+  readonly throws: boolean;
+  /** The code of the `error` reply. */
+  readonly code: DebuggenErrorCode;
+}
+
+/**
+ * The three failures that read a frame's id first: a handler that throws
+ * (filed at `error`, then as its `debug` twin, then as the `debug` refusal
+ * the `INTERNAL` reply answers), a route refusal (a service push sent by a
+ * client) and a decode refusal (a payload that fails its schema), each filed
+ * once at `debug`.
+ */
+const FAILURE_KINDS: readonly FailureKind[] = [
+  {
+    name: 'a handler that throws',
+    build: (id) =>
+      encodeMessage(
+        createEnvelope(T.agentReady, agentReadyFor(TAB.failureRefs, FAILURE_REFS_TAB_URL), { id }),
+      ),
+    throws: true,
+    code: CODE.internal,
+  },
+  {
+    name: 'a route refusal',
+    build: (id) =>
+      encodeMessage(createEnvelope(T.targetRequest, { sessionId: newSessionId() }, { id })),
+    throws: false,
+    code: CODE.invalidMessage,
+  },
+  {
+    name: 'a decode refusal',
+    build: (id, ts) =>
+      JSON.stringify({ id, type: T.navigated, ts, payload: { tabId: 'not-a-tab', url: 'x' } }),
+    throws: false,
+    code: CODE.invalidMessage,
+  },
+];
+
+/** A record field read as a plain object, or `undefined` when it is not one. */
+function recordField(
+  record: CapturedLogRecord | undefined,
+  key: string,
+): Readonly<Record<string, unknown>> | undefined {
+  const value = record?.fields[key];
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? (value as Readonly<Record<string, unknown>>)
+    : undefined;
+}
+
+describe('failure refs a client cannot choose', () => {
+  const fault = createHandlerFault();
+  const harness = useHarness({ now: fault.now, fixtureProject: false });
+
+  let devtools: HarnessWsClient;
+
+  beforeAll(async () => {
+    devtools = (await harness().connectDevtools({ tabId: TAB.failureRefs })).client;
+  });
+
+  afterAll(() => {
+    fault.disarm();
+  });
+
+  /** What one failing frame produced: its one reply, and the `server.ws` records since it was sent. */
+  interface FailedFrame {
+    readonly reply: ErrorPayload;
+    readonly wsRecords: readonly CapturedLogRecord[];
+    readonly logFrom: number;
+  }
+
+  /**
+   * Sends `kind`'s frame under `id` — with the handler fault armed when the
+   * kind throws — waits until the connection has provably handled it, and
+   * returns the one `error` reply it drew.
+   */
+  async function sendFailing(kind: FailureKind, id: string): Promise<FailedFrame> {
+    const h = harness();
+    const from = devtools.received.length;
+    const closes = devtools.closes.length;
+    const logFrom = h.logger.records.length;
+    const firedBefore = fault.fired();
+    const frame = kind.build(id, h.now());
+    if (kind.throws) {
+      fault.arm();
+    }
+    try {
+      devtools.sendRaw(frame);
+      expect(await devtools.flush(), devtools.describe()).toBe(true);
+    } finally {
+      fault.disarm();
+    }
+    expect(fault.fired() - firedBefore, 'the handler fault fired for this frame only').toBe(
+      kind.throws ? 1 : 0,
+    );
+    expect(devtools.closes, devtools.describe()).toHaveLength(closes);
+
+    const replies = messagesOf(devtools, T.error, from).map((message) => message.payload);
+    expect(replies.map((reply) => reply.code)).toEqual([kind.code]);
+    const [reply] = replies;
+    if (reply === undefined) {
+      throw new Error('An error reply was asserted and is missing.');
+    }
+    expect(errorPayloadSchema.safeParse(reply).success, JSON.stringify(reply)).toBe(true);
+    const wsRecords = h.logger.records
+      .slice(logFrom)
+      .filter((record) => record.fields['subsystem'] === WS_LOG_SUBSYSTEM);
+    return { reply, wsRecords, logFrom };
+  }
+
+  /**
+   * Asserts the records filed under the reply's ref are exactly the ones the
+   * kind's failure writes, and that none of them — nor the reply — quotes the
+   * handler fault's exception text.
+   */
+  function expectFiledUnderReplyRef(kind: FailureKind, failed: FailedFrame): void {
+    const ref = failed.reply.ref ?? '';
+    const records = wsRecordsFor(harness(), ref, failed.logFrom);
+    const text = [JSON.stringify(failed.reply), ...failed.wsRecords.map((record) => record.line)];
+    for (const sentinel of Object.values(THROWN_SENTINELS)) {
+      for (const line of text) {
+        expect(line).not.toContain(sentinel);
+      }
+    }
+
+    if (!kind.throws) {
+      expect(records.map((record) => [record.level, record.fields['code']])).toEqual([
+        ['debug', kind.code],
+      ]);
+      return;
+    }
+
+    // The failure at `error`, its `debug` twin, then the refusal the
+    // `INTERNAL` reply answers — all under the one ref the reply carries.
+    expect(records.map((record) => record.level)).toEqual(['error', 'debug', 'debug']);
+    const [failure, twin, refusal] = records;
+    expect(refusal?.fields['code']).toBe(kind.code);
+
+    // At `error` the exception is its closed shape only: a class from the
+    // fixed taxonomy, never a message or a stack.
+    expect(failure?.fields['errorClass']).toBe('Error');
+    const failureError = recordField(failure, 'err');
+    expect(failureError?.['type']).toBe('Error');
+    expect(failureError).not.toHaveProperty('message');
+    expect(failureError).not.toHaveProperty('stack');
+
+    // The `debug` twin carries the same classification under the same ref,
+    // plus the message the serializer adds only at a diagnostic level —
+    // redacted, as the sentinel loop above proves.
+    expect(twin?.fields['errorClass']).toBe(failure?.fields['errorClass']);
+    expect(twin?.fields['type']).toBe(T.agentReady);
+    const twinError = recordField(twin, 'err');
+    expect(twinError?.['type']).toBe('Error');
+    expect(typeof twinError?.['message']).toBe('string');
+    expect(String(twinError?.['message'])).toContain('lookup failed');
+  }
+
+  describe.each(FAILURE_KINDS)('$name', (kind) => {
+    it.each(NON_CONFORMING_IDS)(
+      'files a frame whose id is $name under a minted ref, never under the id',
+      async (candidate) => {
+        const failed = await sendFailing(kind, candidate.id);
+
+        // The reply's ref is one the service minted, not the client's id.
+        const ref = failed.reply.ref ?? '';
+        expect(ref).toMatch(MINTED_MESSAGE_ID);
+        expect(ref).not.toBe(candidate.id);
+        expect(ref).not.toContain(candidate.sentinel);
+        expect(devtools.errorsFor(candidate.id)).toEqual([]);
+
+        // That minted ref is the ref of the records of this failure, and no
+        // `server.ws` record written since the frame quotes the id.
+        expectFiledUnderReplyRef(kind, failed);
+        for (const record of failed.wsRecords) {
+          expect(record.line).not.toContain(candidate.sentinel);
+          expect(record.line).not.toContain(candidate.id);
+        }
+      },
+    );
+
+    it('echoes an id in the product’s own spelling and files the failure under it', async () => {
+      const id = newMessageId();
+      expect(id).toMatch(MINTED_MESSAGE_ID);
+      const failed = await sendFailing(kind, id);
+
+      expect(failed.reply.ref).toBe(id);
+      expect(devtools.errorsFor(id).map((reply) => reply.code)).toEqual([kind.code]);
+      expectFiledUnderReplyRef(kind, failed);
+    });
+  });
+
+  it('keeps serving the connection and the service after every failure', async () => {
+    expect(devtools.authenticated, devtools.describe()).toBe(true);
+    expect(await devtools.flush()).toBe(true);
+    expect((await harness().rawFetch('health')).status).toBe(HTTP_OK);
+    expect(fault.fired()).toBe(NON_CONFORMING_IDS.length + 1);
   });
 });
 
@@ -1862,7 +2635,7 @@ describe('coverage of the protocol surface', () => {
     );
   });
 
-  it('proved a client-sent error frame is dropped rather than answered', () => {
-    expect(proved.clientErrorFrameDropped).toBe(true);
+  it('proved a client-sent error frame is refused with an error that names it', () => {
+    expect(proved.clientErrorFrameRefused).toBe(true);
   });
 });

@@ -28,6 +28,12 @@
  *   event, a replacement socket and a refusal must each clear it and make the
  *   provider's late answer a no-op, so no timer outlives the attempt it was
  *   started for and no hello is written to a dead connection.
+ * - **"Connecting" is bounded.** Every socket carries an opening deadline
+ *   (`DEFAULT_WS_OPEN_TIMEOUT_MS` unless configured) from construction to its
+ *   `open` event. A socket that stalls past it is closed and retried on the
+ *   backoff curve; `open`, `close()`, the socket's own close event and a
+ *   replacement each clear it. Cases that count pending timers while a socket
+ *   is still opening therefore see that deadline, and say so.
  * - **The backoff curve is the documented one.** 500 → 10 000 ms with equal
  *   jitter (AAP 0.5.5), sanitised overrides, a counter that resets after a
  *   successful hello, and exactly one reconnect per failure however the
@@ -62,6 +68,7 @@ import {
   CONNECTION_STATES,
   DEFAULT_MAX_QUEUED_MESSAGES,
   DEFAULT_WS_BACKOFF,
+  DEFAULT_WS_OPEN_TIMEOUT_MS,
   ReconnectingWsClient,
   resolveWsUrl,
 } from '../client/ws-client.js';
@@ -166,6 +173,24 @@ const INVALID_HELLO_REASON = 'this client could not assemble a valid handshake';
 /** Reported when `connect()` meets a refused service URL. */
 const CONFIGURATION_REFUSED_REASON =
   'the configured service URL is not a loopback address of the local service';
+
+/** Reported for a socket that did not reach `open` within its opening deadline. */
+const OPEN_TIMEOUT_REASON = 'the socket did not open in time';
+
+/** The failure message reported with it. */
+const OPEN_TIMEOUT_MESSAGE = 'The connection to the local service did not open in time';
+
+/** The close reason of a socket retired because the configured URL changed. */
+const ENDPOINT_CHANGED_REASON = 'the configured service URL changed';
+
+/** A second service instance's base URL: another loopback port. */
+const OTHER_SERVICE_URL = 'http://127.0.0.1:20150';
+
+/** The canonical socket URL {@link OTHER_SERVICE_URL} resolves to. */
+const OTHER_SOCKET_URL = `ws://127.0.0.1:20150${WS_PATH}`;
+
+/** The reason an owner restarts a socket its liveness probe found dead. */
+const RESTART_REASON = 'the local service stopped answering';
 
 // ---------------------------------------------------------------------------
 // The fake transport
@@ -496,6 +521,7 @@ interface HarnessOptions {
   readonly protocols?: string | string[];
   readonly backoff?: WsBackoffOptions;
   readonly maxQueuedMessages?: number;
+  readonly openTimeoutMs?: number;
   readonly random?: () => number;
   /** Runs after the harness has recorded the call. */
   readonly onStateChange?: (
@@ -554,6 +580,7 @@ function createHarness(options: HarnessOptions = {}): Harness {
     protocols: options.protocols,
     backoff: options.backoff,
     maxQueuedMessages: options.maxQueuedMessages,
+    openTimeoutMs: options.openTimeoutMs,
     logger,
     timers,
     random: options.random ?? (() => 1),
@@ -1159,7 +1186,9 @@ describe('the credential deadline of an asynchronous provider', () => {
     expect(replacement).not.toBe(overtaken);
     expect(deadline.status).toBe('cleared');
     expect(harness.timers.clearedHandles).toContain(deadline.handle);
-    expect(harness.timers.pending()).toEqual([]);
+    // Nothing of the overtaken attempt is pending; the one timer that is, is
+    // the replacement's own opening deadline, armed as it was constructed.
+    expect(harness.timers.pending().map((timer) => timer.ms)).toEqual([DEFAULT_WS_OPEN_TIMEOUT_MS]);
     expect(overtaken.listenerCount()).toBe(0);
     expect(overtaken.closeCalls).toEqual([{ code: NORMAL_CLOSURE, reason: undefined }]);
     expect(harness.events.logs.map((record) => record.message)).toContain('websocket close failed');
@@ -1245,7 +1274,12 @@ describe('a WS_CLOSE_UNAUTHORIZED close', () => {
       state: 'closed',
       detail: { code: WS_CLOSE_UNAUTHORIZED, reason: 'credential expired' },
     });
-    expect(harness.timers.scheduled).toEqual([]);
+    // The only timer this client ever scheduled is the socket's opening
+    // deadline, cleared by its `open` event: no reconnect was ever scheduled.
+    expect(harness.timers.scheduled.map(({ ms, status }) => ({ ms, status }))).toEqual([
+      { ms: DEFAULT_WS_OPEN_TIMEOUT_MS, status: 'cleared' },
+    ]);
+    expect(harness.timers.pending()).toEqual([]);
     expect(socket.listenerCount()).toBe(0);
   });
 
@@ -1821,6 +1855,594 @@ describe('races and the socket life cycle', () => {
       state: 'closed',
       detail: { code: 4_000, reason: 'panel disposed' },
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The opening deadline (INT-F39)
+// ---------------------------------------------------------------------------
+
+/** The one pending timer, asserted to be the opening deadline of `ms`. */
+function pendingOpenDeadline(harness: Harness, ms = DEFAULT_WS_OPEN_TIMEOUT_MS): ScheduledTimer {
+  const deadline = harness.timers.onlyPending();
+  expect(deadline.ms).toBe(ms);
+  return deadline;
+}
+
+describe('the opening deadline of a socket that has not opened', () => {
+  it('is five seconds by default, and none of the other delays this client schedules', () => {
+    expect(DEFAULT_WS_OPEN_TIMEOUT_MS).toBe(5_000);
+    expect(NOMINAL_CURVE).not.toContain(DEFAULT_WS_OPEN_TIMEOUT_MS);
+    expect(DEFAULT_WS_OPEN_TIMEOUT_MS).not.toBe(CLIENT_HELLO_TIMEOUT_MS);
+
+    const harness = createHarness();
+    harness.client.connect();
+
+    // Armed as the socket is constructed, and the only timer running.
+    pendingOpenDeadline(harness);
+    expect(harness.client.state).toBe('connecting');
+  });
+
+  it('retires a socket that never opens, reports it without the URL, and retries on the curve', () => {
+    const harness = createHarness();
+    harness.client.connect();
+    const stalled = latestSocket(harness.transport);
+
+    harness.timers.fire(pendingOpenDeadline(harness));
+
+    // The stalled socket is let go of and closed with a constant reason.
+    expect(stalled.closeCalls).toEqual([{ code: NORMAL_CLOSURE, reason: OPEN_TIMEOUT_REASON }]);
+    expect(stalled.listenerCount()).toBe(0);
+    expect(stalled.sent).toEqual([]);
+
+    // One failure, naming the deadline and nothing else.
+    expect(harness.events.errors).toHaveLength(1);
+    const [failure] = harness.events.errors;
+    expect(failure?.code).toBe('TRANSPORT_DISCONNECTED');
+    expect(failure?.message).toBe(OPEN_TIMEOUT_MESSAGE);
+    expect(failure?.details).toEqual({ timeoutMs: DEFAULT_WS_OPEN_TIMEOUT_MS });
+    expect(reportedText(harness)).not.toContain(SOCKET_URL);
+    expect(reportedText(harness)).not.toContain(TOKEN);
+    expect(harness.events.unauthorized).toEqual([]);
+
+    // A failed attempt, not a terminal one: the first delay of the curve.
+    expect(harness.client.state).toBe('reconnecting');
+    expect(harness.events.states.at(-1)).toEqual({
+      state: 'reconnecting',
+      detail: { attempt: 1, delayMs: NOMINAL_CURVE[0], reason: OPEN_TIMEOUT_REASON },
+    });
+    const reconnect = harness.timers.onlyPending();
+    expect(reconnect.ms).toBe(NOMINAL_CURVE[0]);
+
+    // Late events of the retired socket change nothing.
+    const statesBefore = harness.events.states.length;
+    stalled.open();
+    stalled.drop(ABNORMAL_CLOSURE);
+    expect(stalled.sent).toEqual([]);
+    expect(harness.events.states).toHaveLength(statesBefore);
+    expect(harness.timers.onlyPending()).toBe(reconnect);
+
+    // The retry opens a new socket with its own deadline, and succeeds.
+    harness.timers.fire(reconnect);
+    expect(harness.transport.sockets).toHaveLength(2);
+    const retry = latestSocket(harness.transport);
+    expect(retry).not.toBe(stalled);
+    pendingOpenDeadline(harness);
+    retry.open();
+    expect(sentTypes(retry)).toEqual(['client.hello']);
+    expect(harness.client.state).toBe('open');
+    expect(harness.timers.pending()).toEqual([]);
+  });
+
+  it('walks the backoff curve when every attempt stalls, and resets it once one opens', () => {
+    const harness = createHarness();
+    harness.client.connect();
+    const delays: number[] = [];
+
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      harness.timers.fire(pendingOpenDeadline(harness));
+      const reconnect = harness.timers.onlyPending();
+      delays.push(reconnect.ms);
+      harness.timers.fire(reconnect);
+    }
+
+    expect(delays).toEqual(NOMINAL_CURVE.slice(0, 4));
+    expect(harness.transport.sockets).toHaveLength(5);
+    expect(harness.events.errors.map((error) => error.code)).toEqual(
+      Array.from({ length: 4 }, () => 'TRANSPORT_DISCONNECTED'),
+    );
+
+    latestSocket(harness.transport).open();
+    latestSocket(harness.transport).drop(ABNORMAL_CLOSURE);
+    expect(harness.timers.onlyPending().ms).toBe(NOMINAL_CURVE[0]);
+  });
+
+  it('is cleared when the socket opens in time', () => {
+    const harness = createHarness();
+    harness.client.connect();
+    const deadline = pendingOpenDeadline(harness);
+
+    latestSocket(harness.transport).open();
+
+    expect(deadline.status).toBe('cleared');
+    expect(harness.timers.clearedHandles).toContain(deadline.handle);
+    expect(harness.timers.pending()).toEqual([]);
+    expect(harness.client.state).toBe('open');
+  });
+
+  it('is cleared by close() while connecting, and nothing is retried', () => {
+    const harness = createHarness();
+    harness.client.connect();
+    const socket = latestSocket(harness.transport);
+    const deadline = pendingOpenDeadline(harness);
+
+    harness.client.close();
+
+    expect(deadline.status).toBe('cleared');
+    expect(harness.timers.pending()).toEqual([]);
+    expect(socket.closeCalls).toEqual([{ code: NORMAL_CLOSURE, reason: undefined }]);
+    expect(harness.client.state).toBe('closed');
+    expect(harness.events.errors).toEqual([]);
+  });
+
+  it('is cleared when the socket closes before it opens, leaving only the reconnect delay', () => {
+    const harness = createHarness();
+    harness.client.connect();
+    const deadline = pendingOpenDeadline(harness);
+
+    latestSocket(harness.transport).drop(ABNORMAL_CLOSURE, 'connection refused');
+
+    expect(deadline.status).toBe('cleared');
+    expect(harness.timers.onlyPending().ms).toBe(NOMINAL_CURVE[0]);
+    expect(harness.events.errors).toEqual([]);
+  });
+
+  it('is cleared when a refused credential closes the socket before it opens', () => {
+    const harness = createHarness();
+    harness.client.connect();
+    const deadline = pendingOpenDeadline(harness);
+
+    latestSocket(harness.transport).drop(WS_CLOSE_UNAUTHORIZED, 'not paired');
+
+    expect(deadline.status).toBe('cleared');
+    expect(harness.timers.pending()).toEqual([]);
+    expect(harness.client.state).toBe('closed');
+  });
+
+  it('is replaced, never duplicated, when connect() overtakes an attempt in flight', () => {
+    const harness = createHarness();
+    connectAndOpen(harness).drop(ABNORMAL_CLOSURE);
+    harness.timers.fire(harness.timers.onlyPending());
+    const overtaken = latestSocket(harness.transport);
+    const overtakenDeadline = pendingOpenDeadline(harness);
+
+    harness.client.connect();
+
+    expect(overtakenDeadline.status).toBe('cleared');
+    expect(overtaken.closeCalls).toEqual([{ code: NORMAL_CLOSURE, reason: undefined }]);
+    const replacementDeadline = pendingOpenDeadline(harness);
+    expect(replacementDeadline).not.toBe(overtakenDeadline);
+
+    harness.timers.fire(replacementDeadline);
+    // The retired socket is not closed a second time by the replacement's expiry.
+    expect(overtaken.closeCalls).toHaveLength(1);
+    expect(latestSocket(harness.transport).closeCalls).toEqual([
+      { code: NORMAL_CLOSURE, reason: OPEN_TIMEOUT_REASON },
+    ]);
+    expect(harness.client.state).toBe('reconnecting');
+  });
+
+  it('survives a stalled socket whose close throws', () => {
+    const harness = createHarness();
+    harness.client.connect();
+    latestSocket(harness.transport).throwOnClose = true;
+
+    expect(() => {
+      harness.timers.fire(pendingOpenDeadline(harness));
+    }).not.toThrow();
+
+    expect(harness.client.state).toBe('reconnecting');
+    expect(harness.events.logs.map((record) => record.message)).toContain('websocket close failed');
+    expect(harness.timers.onlyPending().ms).toBe(NOMINAL_CURVE[0]);
+  });
+
+  it('ignores a late open from a timed-out socket whose listeners the runtime kept', () => {
+    const provider = vi.fn(() => TOKEN);
+    const harness = createHarness({ token: provider });
+    harness.client.connect();
+    const stalled = latestSocket(harness.transport);
+    stalled.throwOnRemove = true;
+
+    harness.timers.fire(pendingOpenDeadline(harness));
+    expect(stalled.listenerCount()).toBe(4);
+    const statesBefore = harness.events.states.length;
+
+    stalled.open();
+
+    // No handshake on a socket the client let go of: no credential read, no
+    // frame, no state change, and still only the reconnect delay pending.
+    expect(provider).not.toHaveBeenCalled();
+    expect(stalled.sent).toEqual([]);
+    expect(harness.events.states).toHaveLength(statesBefore);
+    expect(harness.timers.onlyPending().ms).toBe(NOMINAL_CURVE[0]);
+  });
+
+  it('ignores a late 4401 and a late frame from a timed-out socket whose listeners the runtime kept', () => {
+    const harness = createHarness();
+    harness.client.connect();
+    const stalled = latestSocket(harness.transport);
+    stalled.throwOnRemove = true;
+
+    harness.timers.fire(pendingOpenDeadline(harness));
+    expect(stalled.listenerCount()).toBe(4);
+    const statesBefore = harness.events.states.length;
+
+    stalled.receive(progressFrame());
+    stalled.drop(WS_CLOSE_UNAUTHORIZED, 'late refusal from a retired socket');
+
+    // The retired socket speaks for nothing: no dispatch, no unauthorized
+    // signal, no terminal state — the scheduled retry stands and runs.
+    expect(harness.events.messages).toEqual([]);
+    expect(harness.events.unauthorized).toEqual([]);
+    expect(harness.events.states).toHaveLength(statesBefore);
+    expect(harness.client.state).toBe('reconnecting');
+    const retry = harness.timers.onlyPending();
+    expect(retry.ms).toBe(NOMINAL_CURVE[0]);
+
+    harness.timers.fire(retry);
+    expect(harness.transport.sockets).toHaveLength(2);
+    expect(latestSocket(harness.transport)).not.toBe(stalled);
+  });
+
+  it('ignores a late 4401 from a socket retired by restart() whose listeners the runtime kept', () => {
+    const harness = createHarness();
+    const socket = connectAndOpen(harness);
+    socket.throwOnRemove = true;
+
+    harness.client.restart('the owner found the peer unresponsive');
+    socket.drop(WS_CLOSE_UNAUTHORIZED, 'late refusal from a retired socket');
+
+    expect(harness.events.unauthorized).toEqual([]);
+    expect(harness.client.state).toBe('reconnecting');
+    expect(harness.timers.onlyPending().ms).toBe(NOMINAL_CURVE[0]);
+  });
+
+  it('honours a configured openTimeoutMs', () => {
+    const harness = createHarness({ openTimeoutMs: 1_234 });
+    harness.client.connect();
+
+    harness.timers.fire(pendingOpenDeadline(harness, 1_234));
+
+    expect(harness.events.errors[0]?.details).toEqual({ timeoutMs: 1_234 });
+    expect(harness.client.state).toBe('reconnecting');
+  });
+
+  it.each([0, -1, Number.NaN, Number.POSITIVE_INFINITY])(
+    'falls back to the default for an unusable openTimeoutMs of %s',
+    (configured) => {
+      const harness = createHarness({ openTimeoutMs: configured });
+      harness.client.connect();
+
+      pendingOpenDeadline(harness);
+    },
+  );
+
+  it('runs on the platform timers when none are injected, and dies with close()', () => {
+    vi.useFakeTimers();
+
+    try {
+      const transport = createTransport();
+      const errors: DebuggenError[] = [];
+      const client = new ReconnectingWsClient({
+        url: SERVICE_URL,
+        webSocketConstructor: transport.webSocketConstructor,
+        identity: DEVTOOLS_IDENTITY,
+        token: TOKEN,
+        random: () => 1,
+        onProtocolError: (error) => {
+          errors.push(error);
+        },
+      });
+
+      client.connect();
+      expect(vi.getTimerCount()).toBe(1);
+
+      vi.advanceTimersByTime(DEFAULT_WS_OPEN_TIMEOUT_MS - 1);
+      expect(latestSocket(transport).closeCalls).toEqual([]);
+      vi.advanceTimersByTime(1);
+      expect(latestSocket(transport).closeCalls).toEqual([
+        { code: NORMAL_CLOSURE, reason: OPEN_TIMEOUT_REASON },
+      ]);
+      expect(errors.map((error) => error.code)).toEqual(['TRANSPORT_DISCONNECTED']);
+      expect(client.state).toBe('reconnecting');
+
+      vi.advanceTimersByTime(DEFAULT_WS_BACKOFF.initialMs);
+      expect(transport.sockets).toHaveLength(2);
+      expect(vi.getTimerCount()).toBe(1);
+
+      client.close();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Moving to another endpoint, and an owner-driven restart
+// ---------------------------------------------------------------------------
+
+describe('setUrl: moving a client to another service endpoint', () => {
+  it('changes nothing when the value canonicalises to the current endpoint', () => {
+    const harness = createHarness();
+    harness.client.connect();
+    harness.client.send('session.unbind', { tabId: 1 });
+    const socket = latestSocket(harness.transport);
+    const deadline = pendingOpenDeadline(harness);
+    const statesBefore = harness.events.states.length;
+
+    expect(harness.client.setUrl(`  ${SOCKET_URL}  `)).toEqual({ ok: true, value: SOCKET_URL });
+
+    expect(harness.transport.sockets).toEqual([socket]);
+    expect(socket.closeCalls).toEqual([]);
+    expect(harness.client.queuedCount).toBe(1);
+    expect(harness.events.drops).toEqual([]);
+    expect(harness.events.states).toHaveLength(statesBefore);
+    expect(harness.timers.onlyPending()).toBe(deadline);
+  });
+
+  it('moves a connecting client at once, dropping the frames queued for the old endpoint', () => {
+    const harness = createHarness();
+    harness.client.connect();
+    harness.client.send('session.unbind', { tabId: 1 });
+    harness.client.send('session.unbind', { tabId: 2 });
+    const previous = latestSocket(harness.transport);
+    const previousDeadline = pendingOpenDeadline(harness);
+
+    expect(harness.client.setUrl(OTHER_SERVICE_URL)).toEqual({
+      ok: true,
+      value: OTHER_SOCKET_URL,
+    });
+
+    expect(harness.client.url).toBe(OTHER_SOCKET_URL);
+    expect(harness.client.configurationError).toBeUndefined();
+    // The old socket is retired with a constant reason, its deadline with it.
+    expect(previous.closeCalls).toEqual([
+      { code: NORMAL_CLOSURE, reason: ENDPOINT_CHANGED_REASON },
+    ]);
+    expect(previous.listenerCount()).toBe(0);
+    expect(previousDeadline.status).toBe('cleared');
+    // Every queued frame is reported, oldest first, counting down to zero.
+    expect(harness.events.drops).toEqual([
+      { type: 'session.unbind', queued: 1 },
+      { type: 'session.unbind', queued: 0 },
+    ]);
+    expect(harness.client.queuedCount).toBe(0);
+    // A socket against the new endpoint exists already, with its own deadline.
+    const moved = latestSocket(harness.transport);
+    expect(moved).not.toBe(previous);
+    expect(moved.url).toBe(OTHER_SOCKET_URL);
+    expect(harness.client.state).toBe('connecting');
+    pendingOpenDeadline(harness);
+
+    moved.open();
+    expect(sentTypes(moved)).toEqual(['client.hello']);
+    expect(harness.client.state).toBe('open');
+    expect(reportedText(harness)).not.toContain(TOKEN);
+  });
+
+  it('moves an open client, and its late events are ignored', () => {
+    const harness = createHarness();
+    const previous = connectAndOpen(harness);
+
+    harness.client.setUrl(OTHER_SERVICE_URL);
+    const moved = latestSocket(harness.transport);
+    const statesBefore = harness.events.states.length;
+
+    previous.drop(ABNORMAL_CLOSURE);
+    previous.receive(progressFrame());
+
+    expect(previous.closeCalls).toEqual([
+      { code: NORMAL_CLOSURE, reason: ENDPOINT_CHANGED_REASON },
+    ]);
+    expect(harness.events.states).toHaveLength(statesBefore);
+    expect(harness.events.messages).toEqual([]);
+    expect(moved.url).toBe(OTHER_SOCKET_URL);
+    moved.open();
+    expect(harness.client.state).toBe('open');
+  });
+
+  it('cancels a pending reconnect and starts the curve over at the new endpoint', () => {
+    const harness = createHarness();
+    failConsecutiveAttempts(harness, 3);
+    latestSocket(harness.transport).drop(ABNORMAL_CLOSURE);
+    const reconnect = harness.timers.onlyPending();
+    expect(reconnect.ms).toBe(NOMINAL_CURVE[3]);
+
+    harness.client.setUrl(OTHER_SERVICE_URL);
+
+    expect(reconnect.status).toBe('cleared');
+    expect(latestSocket(harness.transport).url).toBe(OTHER_SOCKET_URL);
+    expect(harness.client.state).toBe('connecting');
+
+    latestSocket(harness.transport).drop(ABNORMAL_CLOSURE);
+    expect(harness.timers.onlyPending().ms).toBe(NOMINAL_CURVE[0]);
+  });
+
+  it('stops a connected client on a refused endpoint, reporting the rule and never the value', () => {
+    const marker = 'setUrlLeakMarker';
+    const harness = createHarness();
+    const socket = connectAndOpen(harness);
+
+    const refused = harness.client.setUrl(`http://${marker}.example.com:43117`);
+
+    expect(refused.ok).toBe(false);
+    expect(harness.client.url).toBeUndefined();
+    expect(harness.client.configurationError?.code).toBe('CONFIG_INVALID');
+    expect(harness.client.configurationError?.details).toEqual({ rule: 'not-loopback' });
+    expect(socket.closeCalls).toEqual([{ code: NORMAL_CLOSURE, reason: ENDPOINT_CHANGED_REASON }]);
+    expect(harness.client.state).toBe('closed');
+    expect(harness.events.states.at(-1)).toEqual({
+      state: 'closed',
+      detail: { reason: CONFIGURATION_REFUSED_REASON },
+    });
+    expect(harness.events.errors.map((error) => error.code)).toEqual(['CONFIG_INVALID']);
+    expect(harness.timers.pending()).toEqual([]);
+
+    // Nothing can be opened against it, and nothing quotes it.
+    harness.client.connect();
+    expect(harness.transport.sockets).toHaveLength(1);
+    expect(reportedText(harness)).not.toContain(marker);
+    if (!refused.ok) {
+      expect(describeError(refused.error)).not.toContain(marker);
+    }
+  });
+
+  it('only records the endpoint on a closed client, which the next connect() uses', () => {
+    const harness = createHarness();
+
+    expect(harness.client.setUrl(OTHER_SERVICE_URL).ok).toBe(true);
+
+    expect(harness.transport.constructions()).toBe(0);
+    expect(harness.events.states).toEqual([]);
+    expect(harness.timers.scheduled).toEqual([]);
+
+    harness.client.connect();
+    expect(latestSocket(harness.transport).url).toBe(OTHER_SOCKET_URL);
+  });
+
+  it('drops the frames a refused credential kept, once the endpoint changes', () => {
+    const harness = createHarness();
+    harness.client.connect();
+    harness.client.send('session.unbind', { tabId: 1 });
+    latestSocket(harness.transport).drop(WS_CLOSE_UNAUTHORIZED, 'not paired');
+    expect(harness.client.queuedCount).toBe(1);
+
+    harness.client.setUrl(OTHER_SERVICE_URL);
+
+    expect(harness.events.drops).toEqual([{ type: 'session.unbind', queued: 0 }]);
+    expect(harness.client.queuedCount).toBe(0);
+    expect(harness.transport.sockets).toHaveLength(1);
+    expect(harness.client.state).toBe('closed');
+  });
+
+  it('refuses silently on a closed client; the next connect() reports the refusal', () => {
+    const harness = createHarness();
+
+    const refused = harness.client.setUrl('wss://service.example.com/ws');
+
+    expect(refused.ok).toBe(false);
+    expect(harness.events.errors).toEqual([]);
+    expect(harness.events.states).toEqual([]);
+
+    harness.client.connect();
+    expect(harness.transport.constructions()).toBe(0);
+    expect(harness.events.errors.map((error) => error.code)).toEqual(['CONFIG_INVALID']);
+  });
+
+  it('lets a client built with a refused URL recover once a loopback one is supplied', () => {
+    const harness = createHarness({ url: 'wss://service.example.com/ws' });
+    harness.client.connect();
+    expect(harness.transport.constructions()).toBe(0);
+
+    expect(harness.client.setUrl(SERVICE_URL)).toEqual({ ok: true, value: SOCKET_URL });
+    expect(harness.client.configurationError).toBeUndefined();
+
+    const socket = connectAndOpen(harness);
+    expect(socket.url).toBe(SOCKET_URL);
+    expect(sentTypes(socket)).toEqual(['client.hello']);
+    expect(harness.client.state).toBe('open');
+  });
+});
+
+describe('restart: the owner retires a socket it found dead', () => {
+  it('retires an open socket onto the backoff curve and reconnects', () => {
+    const harness = createHarness();
+    const dead = connectAndOpen(harness);
+
+    harness.client.restart(RESTART_REASON);
+
+    expect(dead.closeCalls).toEqual([{ code: NORMAL_CLOSURE, reason: RESTART_REASON }]);
+    expect(dead.listenerCount()).toBe(0);
+    expect(harness.client.state).toBe('reconnecting');
+    expect(harness.events.states.at(-1)).toEqual({
+      state: 'reconnecting',
+      detail: { attempt: 1, delayMs: NOMINAL_CURVE[0], reason: RESTART_REASON },
+    });
+    const reconnect = harness.timers.onlyPending();
+    expect(reconnect.ms).toBe(NOMINAL_CURVE[0]);
+
+    // A late close of the retired socket schedules nothing further.
+    dead.drop(ABNORMAL_CLOSURE);
+    expect(harness.timers.onlyPending()).toBe(reconnect);
+
+    harness.timers.fire(reconnect);
+    latestSocket(harness.transport).open();
+    expect(harness.client.state).toBe('open');
+    expect(harness.transport.sockets).toHaveLength(2);
+  });
+
+  it('keeps the queued frames and delivers them after the next hello', () => {
+    const harness = createHarness();
+    harness.client.connect();
+    harness.client.send('session.unbind', { tabId: 1 });
+    harness.client.send('session.unbind', { tabId: 2 });
+    const deadline = pendingOpenDeadline(harness);
+
+    harness.client.restart(RESTART_REASON);
+
+    expect(deadline.status).toBe('cleared');
+    expect(harness.client.queuedCount).toBe(2);
+    expect(harness.events.drops).toEqual([]);
+
+    harness.timers.fire(harness.timers.onlyPending());
+    const next = latestSocket(harness.transport);
+    next.open();
+    expect(sentTypes(next)).toEqual(['client.hello', 'session.unbind', 'session.unbind']);
+    expect(sentUnbindTabIds(next)).toEqual([1, 2]);
+  });
+
+  it('cancels a credential read in flight', async () => {
+    const read = deferred<string | undefined>();
+    const harness = createHarness({ token: () => read.promise });
+    const socket = connectAndOpen(harness);
+    const credentialDeadline = harness.timers.onlyPending();
+
+    harness.client.restart(RESTART_REASON);
+    expect(credentialDeadline.status).toBe('cleared');
+
+    read.resolve(TOKEN);
+    await flushMicrotasks();
+    expect(socket.sent).toEqual([]);
+    expect(harness.client.state).toBe('reconnecting');
+    expect(harness.timers.onlyPending().ms).toBe(NOMINAL_CURVE[0]);
+  });
+
+  it('leaves a reconnecting client to its curve, and a closed one alone', () => {
+    const idle = createHarness();
+    idle.client.restart(RESTART_REASON);
+    expect(idle.events.states).toEqual([]);
+    expect(idle.timers.scheduled).toEqual([]);
+
+    const harness = createHarness();
+    connectAndOpen(harness).drop(ABNORMAL_CLOSURE);
+    const reconnect = harness.timers.onlyPending();
+    const statesBefore = harness.events.states.length;
+
+    harness.client.restart(RESTART_REASON);
+    expect(harness.timers.onlyPending()).toBe(reconnect);
+    expect(harness.events.states).toHaveLength(statesBefore);
+
+    harness.client.close();
+    harness.client.restart(RESTART_REASON);
+    expect(harness.timers.pending()).toEqual([]);
+    expect(harness.client.state).toBe('closed');
+
+    const refused = createHarness();
+    connectAndOpen(refused).drop(WS_CLOSE_UNAUTHORIZED, 'revoked');
+    refused.client.restart(RESTART_REASON);
+    expect(refused.client.state).toBe('closed');
+    expect(refused.timers.pending()).toEqual([]);
   });
 });
 

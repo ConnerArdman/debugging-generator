@@ -24,19 +24,42 @@
  *
  * ## What it deliberately does not do
  *
- * It performs no HTTP call, holds no copy of server state and never mutates the
- * session-scoped fields of `src/state.ts`: commands validate preconditions, run
- * one operation through `ServiceClient` and let the WebSocket broadcast update
- * the store. It renders no UI and imports no renderer package — this is the
- * extension-host project (Node + `vscode` types, no DOM).
+ * It performs no HTTP call and holds no copy of server state: commands validate
+ * preconditions, run their operations through `ServiceClient` and let the
+ * WebSocket broadcast update the store. Four commands also write a service
+ * answer into the session-scoped fields of `src/state.ts`, exactly as the
+ * service gave it: `debuggen.startSession` adopts the `POST /sessions` record
+ * through a creation window, `debuggen.reopenSession` adopts the
+ * `GET /sessions/:id` record, `debuggen.endSession` (with the shared
+ * `endBeforeReplacing` gate the other two pass first) records the
+ * `session.end` answer through `applySessionEnded` — followed, for a
+ * `partial` or `conflict` verdict, by the owner's `GET /sessions/:id` record
+ * and modification journal (`applySessionRecord`, `applyModificationJournal`),
+ * so the conflicted files and their backups reach the view without the socket
+ * — and `debuggen.showModifications` records the journal it fetches through
+ * `applyModificationJournal`. That is what keeps the
+ * editor tracking at most one live session, owned by the service endpoint that
+ * answered it, which `deactivate()` ends there. Once `deactivate()` has begun a
+ * shutdown, neither `debuggen.startSession` nor `debuggen.reopenSession`
+ * creates or adopts anything, and a create already in flight is tracked in the
+ * store's create ledger so the shutdown routine ends what it produced. It
+ * renders no UI and imports no renderer package — this is the extension-host
+ * project (Node + `vscode` types, no DOM).
  *
  * ## Module graph
  *
  * The twelve command modules import **types only** from this file; everything
- * they need at runtime arrives on {@link CommandContext}. The only runtime edge
- * is therefore this barrel → each module, which keeps the folder acyclic. The
- * folder has no helpers module, so every runtime helper shared by the commands
- * (message formatting, the guards) lives behind the ports defined here.
+ * they need at runtime arrives on {@link CommandContext}. The runtime edges
+ * are therefore this barrel → each module, plus `./start-session` and
+ * `./reopen-session` → `./end-session` for `endBeforeReplacing` and
+ * `captureServiceEndpoint` (and, from `./start-session`, its
+ * `SESSION_CREATE_TIMEOUT_MS` request budget);
+ * `./end-session` imports nothing from either — so the folder stays acyclic.
+ * From outside the folder, `src/extension.ts` imports
+ * `endSessionsForShutdown` from `./end-session` directly: it is what
+ * `deactivate()` runs, and it needs no {@link CommandContext}. Every other
+ * runtime helper shared by the commands (message formatting, the guards)
+ * lives behind the ports defined here.
  *
  * @example
  * ```ts

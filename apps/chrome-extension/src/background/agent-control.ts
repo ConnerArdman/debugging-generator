@@ -30,12 +30,16 @@
  *   memoised per tab with its `documentId`, and the desired configuration is
  *   re-sent — which is how a mid-capture reload continues the **same**
  *   `captureId` (AAP §0.5.5, "the same `captureId` continues").
- * - **The consented reload** ({@link AgentControl.requestConsentedReload}).
- *   When the last report says the React hook arrived after React
- *   (`installedBeforeReact === false`, a page that was open before the
- *   extension), the only remedy is one reload. It happens here, only here, and
- *   only as the answer to an explicit developer action; the wait for the new
- *   document's `agent.ready` is bounded by {@link PENDING_READY_TIMEOUT_MS}.
+ * - **The consented reload** ({@link AgentControl.requestConsentedReload},
+ *   offered through {@link AgentControl.getReloadOffer}). Two states of a page
+ *   that was open before the extension have one remedy, a reload: the last
+ *   report says the React hook arrived after React
+ *   (`installedBeforeReact === false`), or no agent runs in the tab at all —
+ *   no report and no content-script bridge, because Chrome injects the
+ *   manifest's `document_start` scripts only into documents that load after
+ *   the extension is enabled. The reload happens here, only here, and only as
+ *   the answer to the panel's explicit `page.reload` request; the wait for the
+ *   new document's `agent.ready` is bounded by {@link PENDING_READY_TIMEOUT_MS}.
  * - **Dormancy** ({@link AgentControl.disarm}). An all-false hook set is the
  *   instruction that detaches every listener, restores the `fetch`/XHR patch and
  *   unsubscribes the fiber-hook handlers (AAP §0.4.2, §0.5.1) — hooks are
@@ -60,9 +64,12 @@
  *   constructs it with fakes for every dependency.
  * - **No expected condition throws.** A missing bridge, an unbound session, a
  *   stale report, a failed or timed-out reload — each is a typed outcome.
- * - **Privacy.** Logs carry `tabId`, `sessionId`, `captureId`, `documentId` and
- *   decisions only: never a page URL, a hook value, event contents or a
- *   credential (AAP §0.5.2).
+ * - **Privacy.** Logs carry `tabId`, `sessionId`, `captureId`, document
+ *   fingerprints and decisions only: never a page URL, a hook value, event
+ *   contents or a credential (AAP §0.5.2). A document id is page-supplied, so
+ *   it is logged only as its `fingerprintPageId` digest — with, where a report
+ *   is first seen, whether it has the canonical shape — and kept raw only in
+ *   state and in the relayed `agent.ready`.
  *
  * Governed by AAP §0.5.5 ("Application reloads mid-session"), §0.7.1 Group 2
  * (`instrumentation/readiness.ts`: readiness for the bound tab's current
@@ -80,9 +87,17 @@ import { noopLogger, nowEpochMs } from '@debuggen/shared';
 import type {
   BridgeDownstreamMessage,
   PageAgentReadyPayload,
+  PanelReloadReason,
+  PanelReloadState,
   PortBindingPush,
 } from '../shared/messages';
-import { EXTENSION_CHANNEL, PORT_PROTOCOL_VERSION } from '../shared/messages';
+import {
+  EXTENSION_CHANNEL,
+  fingerprintPageId,
+  isPageDocumentId,
+  PANEL_RELOAD_NOT_NEEDED,
+  PORT_PROTOCOL_VERSION,
+} from '../shared/messages';
 import type {
   AgentReadinessState,
   BridgeSend,
@@ -127,6 +142,12 @@ type EpochMs = ReturnType<typeof nowEpochMs>;
  * never stops. Tests assert against this constant, never a copied number.
  */
 export const PENDING_READY_TIMEOUT_MS = 20_000;
+
+/**
+ * The `reloading` reload state, frozen: what {@link AgentControl.getReloadOffer}
+ * answers while a consented reload awaits the new document's `agent.ready`.
+ */
+const RELOAD_IN_FLIGHT: PanelReloadState = Object.freeze({ kind: 'reloading' });
 
 /*
  * ===========================================================================
@@ -267,7 +288,8 @@ export type AgentReadyOutcome =
  * Why a reload request was refused because it answers no outstanding offer.
  *
  * - `no-agent-report` — no `agent.ready` has been recorded for the tab's
- *   current document, so there is no evidence a reload would help.
+ *   current document, but its content-script bridge is attached: the agent is
+ *   present and still loading, and its report will say whether a reload helps.
  * - `hook-installed-before-react` — the current document's agent was in place
  *   before React; a reload would change nothing.
  */
@@ -415,7 +437,11 @@ export type AgentControlChange =
   | {
       readonly kind: 'reload-started';
       readonly tabId: TabId;
-      readonly previousDocumentId: DocumentId;
+      /**
+       * The document the reload replaces; `undefined` when no agent had
+       * reported for the tab (a page loaded before the extension was enabled).
+       */
+      readonly previousDocumentId: DocumentId | undefined;
     }
   | {
       readonly kind: 'reload-settled';
@@ -457,6 +483,19 @@ export interface AgentControlDeps {
   readonly tabs: AgentTabsApi;
   /** One-shot timers for the bounded wait after a consented reload. */
   readonly timers: WorkerTimerApi;
+  /**
+   * Whether a content-script bridge is attached for a tab — the port hub's
+   * `hasBridge`. Read only by the consent rule, to tell a tab whose agent has
+   * simply not reported yet (a bridge is attached: nothing to offer) from a
+   * tab with no agent at all (no bridge: a page loaded before the extension
+   * was enabled, which only a reload can give an agent).
+   *
+   * Defaults to `() => true`, the conservative reading: without the fact, a
+   * tab with no report is assumed to have an agent on its way, so a reload is
+   * never offered on the strength of a missing report alone. A lookup that
+   * throws is read the same way.
+   */
+  readonly hasBridge?: ((tabId: TabId) => boolean) | undefined;
   /** The epoch-millisecond clock stamping `receivedAt`; defaults to `nowEpochMs`. */
   readonly now?: WorkerClock['now'] | undefined;
   /**
@@ -501,20 +540,39 @@ export interface AgentControl {
   handleNavigationDecision(decision: AgentNavigationDecision): NavigationOutcome;
 
   /**
-   * Reload a tab whose agent arrived after React, then wait — at most
+   * Reload a tab whose agent cannot observe its page, then wait — at most
    * {@link PENDING_READY_TIMEOUT_MS} — for the new document's `agent.ready`.
    *
    * **Calling this is the developer's consent.** `service-worker.ts` is its
-   * only caller and invokes it solely from the developer's explicit action on
-   * the one-click reload the readiness progress offers — never from a timer, a
-   * readiness report or a navigation. Coordination point: `../shared/messages`
-   * declares no panel or devtools frame that carries this action, so the
-   * worker binds its own handler for that action to this method. The request
-   * must also answer a standing offer — the tab's last report said
-   * `installedBeforeReact === false` — or nothing is reloaded. A second request
-   * while one is in flight shares the first one's outcome.
+   * only caller and invokes it solely from the panel's `page.reload` request
+   * (declared in `../shared/messages`), which the panel sends only from the
+   * developer's click on the one-click reload action — never from a timer, a
+   * readiness report or a navigation. The request must also answer a standing
+   * offer, by the one rule {@link getReloadOffer} states — the tab's last
+   * report said `installedBeforeReact === false`, or the tab has neither a
+   * report nor a bridge — or nothing is reloaded (`not-consented`). With no
+   * report the reload settles on the first `agent.ready` that arrives. A
+   * second request while one is in flight shares the first one's outcome.
    */
   requestConsentedReload(tabId: TabId): Promise<ReloadOutcome>;
+
+  /**
+   * Whether the one-click reload is offered for a tab, by the same rule
+   * {@link requestConsentedReload} applies — so the panel is offered exactly
+   * the reloads the worker would perform:
+   *
+   * - a consented reload in flight → `reloading`;
+   * - the current document's agent reported → `offered` for
+   *   `hook-after-react` when the hook arrived after React, otherwise
+   *   `not-needed`;
+   * - no report → `not-needed` while a content-script bridge is attached (the
+   *   agent is present and will report), otherwise `offered` for
+   *   `agent-missing` (a page loaded before the extension was enabled).
+   *
+   * Pure: nothing is sent, scheduled or reloaded. Whether the tab is bound is
+   * the caller's question — an unbound tab is never offered a reload.
+   */
+  getReloadOffer(tabId: TabId): PanelReloadState;
 
   /**
    * Return a tab's agent to dormant with an all-false configuration derived
@@ -559,10 +617,17 @@ export interface AgentControl {
 
 /** A consented reload awaiting the new document's `agent.ready`. */
 interface PendingReload {
-  /** The document the reload replaces; its reports are stale from now on. */
-  readonly previousDocumentId: DocumentId;
-  /** The readiness memo the reload cleared, restored if Chrome refuses the reload. */
-  readonly previousReadiness: AgentReadinessState;
+  /**
+   * The document the reload replaces; its reports are stale from now on.
+   * `undefined` when no agent had reported for the tab, in which case the
+   * first `agent.ready` that arrives settles the reload.
+   */
+  readonly previousDocumentId: DocumentId | undefined;
+  /**
+   * The readiness memo the reload cleared, restored if Chrome refuses the
+   * reload; `undefined` when there was none, and then nothing is restored.
+   */
+  readonly previousReadiness: AgentReadinessState | undefined;
   /** The report the reload cleared, restored alongside {@link previousReadiness}. */
   readonly previousReport: AgentReadyPayload | undefined;
   /** Shared by every request for this reload. */
@@ -608,6 +673,29 @@ interface TabState {
   /** The consented reload in flight, if any. */
   reload: PendingReload | undefined;
 }
+
+/**
+ * The consent rule's verdict for one tab — the single decision behind both
+ * {@link AgentControl.getReloadOffer} and
+ * {@link AgentControl.requestConsentedReload}, so the offer the panel shows
+ * and the reload the worker performs can never disagree.
+ */
+type ConsentVerdict =
+  | {
+      /** A consented reload is in flight; a new request shares it. */
+      readonly kind: 'in-flight';
+      readonly pending: PendingReload;
+    }
+  | {
+      /** A reload would help, for `reason`. */
+      readonly kind: 'offered';
+      readonly reason: PanelReloadReason;
+    }
+  | {
+      /** A reload would not help; a request is refused for `reason`. */
+      readonly kind: 'not-needed';
+      readonly reason: ReloadRefusalReason;
+    };
 
 /** Whether every hook of a configuration is off — the dormancy instruction. */
 function isDormantConfig(config: AgentConfigPayload): boolean {
@@ -656,6 +744,32 @@ function errorName(cause: unknown): string {
   return cause instanceof Error ? cause.name : typeof cause;
 }
 
+/** How a log line names a page document without carrying its page-supplied id. */
+interface DocumentLogFields {
+  /** The id's {@link fingerprintPageId} digest. */
+  readonly document: string;
+  /** Whether the id has the agent's canonical `doc_…` shape. */
+  readonly documentIdCanonical: boolean;
+}
+
+/**
+ * The log fields for a document the page reported.
+ *
+ * `documentId` arrives in the page-originated `agent.ready`, so a page script
+ * can put any bounded text there (CWE-532). A log line therefore carries its
+ * fingerprint and a shape verdict only; the raw id stays in the readiness memo
+ * and the relayed report, where the stale-report check and the service's
+ * readiness gate need it.
+ *
+ * @param documentId The document id as the page reported it.
+ */
+function documentLogFields(documentId: DocumentId): DocumentLogFields {
+  return {
+    document: fingerprintPageId(documentId),
+    documentIdCanonical: isPageDocumentId(documentId),
+  };
+}
+
 /** Whether a disarm reason means the tab no longer holds the session's binding. */
 function endsBinding(reason: DisarmReason): boolean {
   switch (reason) {
@@ -690,10 +804,15 @@ function endsBinding(reason: DisarmReason): boolean {
  *   resolveBinding: lookupBoundTab,
  *   tabs: chrome.tabs,
  *   timers: { setTimeout: (fn, ms) => setTimeout(fn, ms), clearTimeout: (h) => clearTimeout(h) },
+ *   hasBridge: ports.hasBridge,
  *   pushStatus: ports.pushToTab,
  *   logger,
  * });
  * subscribe('agent.config', (message) => void agents.applyConfig(message.payload));
+ * // The panel's `page.reload` request — the developer's consent — and nothing else:
+ * if (agents.getReloadOffer(tabId).kind !== 'not-needed') {
+ *   const outcome = await agents.requestConsentedReload(tabId);
+ * }
  * ```
  */
 export function createAgentControl(deps: AgentControlDeps): AgentControl {
@@ -765,6 +884,23 @@ export function createAgentControl(deps: AgentControlDeps): AgentControl {
     }
   }
 
+  /**
+   * Whether a content-script bridge is attached for the tab, read through the
+   * injected lookup; absent or throwing, the conservative `true` (see
+   * {@link AgentControlDeps.hasBridge}).
+   */
+  function bridgeAttached(tabId: TabId): boolean {
+    if (deps.hasBridge === undefined) {
+      return true;
+    }
+    try {
+      return deps.hasBridge(tabId);
+    } catch (cause) {
+      log.warn('bridge lookup threw', { tabId, error: errorName(cause) });
+      return true;
+    }
+  }
+
   /** Refresh the tab's binding line after its current document was re-armed. */
   function pushBound(tabId: TabId, sessionId: SessionId, url: string): void {
     if (deps.pushStatus === undefined) {
@@ -820,7 +956,7 @@ export function createAgentControl(deps: AgentControlDeps): AgentControl {
       if (!outcome.ok) {
         log.warn('agent.ready not relayed', {
           tabId: report.tabId,
-          documentId: report.documentId,
+          ...documentLogFields(report.documentId),
           code: outcome.error.code,
         });
         return false;
@@ -829,7 +965,7 @@ export function createAgentControl(deps: AgentControlDeps): AgentControl {
     } catch (cause) {
       log.warn('agent.ready relay threw', {
         tabId: report.tabId,
-        documentId: report.documentId,
+        ...documentLogFields(report.documentId),
         error: errorName(cause),
       });
       return false;
@@ -894,8 +1030,12 @@ export function createAgentControl(deps: AgentControlDeps): AgentControl {
   // The consented reload's wait
   // -------------------------------------------------------------------------
 
+  /**
+   * The wait for a reload of the document `previousReadiness` describes, or —
+   * `undefined` — of a document no agent reported for.
+   */
   function createPendingReload(
-    previousReadiness: AgentReadinessState,
+    previousReadiness: AgentReadinessState | undefined,
     previousReport: AgentReadyPayload | undefined,
   ): PendingReload {
     let resolveOutcome: ((outcome: ReloadOutcome) => void) | undefined;
@@ -903,7 +1043,7 @@ export function createAgentControl(deps: AgentControlDeps): AgentControl {
       resolveOutcome = resolve;
     });
     return {
-      previousDocumentId: previousReadiness.documentId,
+      previousDocumentId: previousReadiness?.documentId,
       previousReadiness,
       previousReport,
       promise,
@@ -928,12 +1068,17 @@ export function createAgentControl(deps: AgentControlDeps): AgentControl {
     const state = tabs.get(tabId);
     if (state !== undefined && state.reload === pending) {
       state.reload = undefined;
+      // A reload of a tab no agent had reported for may have been all that
+      // was held for it; an entry exists only while something is held.
+      pruneIfEmpty(tabId, state);
     }
     log.info('consented reload settled', {
       tabId,
-      previousDocumentId: pending.previousDocumentId,
+      previousDocument: fingerprintPageId(pending.previousDocumentId),
       outcome: outcome.kind,
-      ...(outcome.kind === 'ready' ? { documentId: outcome.readiness.documentId } : {}),
+      ...(outcome.kind === 'ready'
+        ? { document: fingerprintPageId(outcome.readiness.documentId) }
+        : {}),
     });
     pending.resolve(outcome);
     emit({ kind: 'reload-settled', tabId, outcome });
@@ -941,7 +1086,9 @@ export function createAgentControl(deps: AgentControlDeps): AgentControl {
 
   /**
    * Chrome refused the reload, so the document was never replaced: restore
-   * its memo (unless a newer report already arrived) and settle as `no-tab`.
+   * its memo — when there was one, and unless a newer report already arrived —
+   * and settle as `no-tab`. A reload of a tab no agent had reported for
+   * restores nothing, so no readiness is ever invented.
    */
   function failReload(tabId: TabId, pending: PendingReload, cause: unknown): void {
     if (pending.settled) {
@@ -949,16 +1096,17 @@ export function createAgentControl(deps: AgentControlDeps): AgentControl {
     }
     log.warn('consented reload refused by Chrome', {
       tabId,
-      previousDocumentId: pending.previousDocumentId,
+      previousDocument: fingerprintPageId(pending.previousDocumentId),
       error: errorName(cause),
     });
     const state = tabs.get(tabId);
-    if (state !== undefined && state.reload === pending) {
-      if (state.retiredDocumentId === pending.previousDocumentId) {
+    const previousReadiness = pending.previousReadiness;
+    if (state !== undefined && state.reload === pending && previousReadiness !== undefined) {
+      if (state.retiredDocumentId === previousReadiness.documentId) {
         state.retiredDocumentId = undefined;
       }
       if (state.readiness === undefined) {
-        state.readiness = pending.previousReadiness;
+        state.readiness = previousReadiness;
         state.lastReport = pending.previousReport;
         state.documentOrigin =
           pending.previousReport === undefined ? undefined : originOf(pending.previousReport.url);
@@ -1112,7 +1260,7 @@ export function createAgentControl(deps: AgentControlDeps): AgentControl {
   function handleAgentReady(tabId: TabId, payload: PageAgentReadyPayload): AgentReadyOutcome {
     const existing = tabs.get(tabId);
     if (existing !== undefined && existing.retiredDocumentId === payload.documentId) {
-      log.debug('stale agent.ready dropped', { tabId, documentId: payload.documentId });
+      log.debug('stale agent.ready dropped', { tabId, ...documentLogFields(payload.documentId) });
       return { kind: 'stale', tabId, documentId: payload.documentId };
     }
 
@@ -1153,7 +1301,7 @@ export function createAgentControl(deps: AgentControlDeps): AgentControl {
     }
     log.debug('agent.ready recorded', {
       tabId,
-      documentId: report.documentId,
+      ...documentLogFields(report.documentId),
       installedBeforeReact: report.installedBeforeReact,
       reactDetected: report.reactDetected,
       relayed,
@@ -1164,6 +1312,8 @@ export function createAgentControl(deps: AgentControlDeps): AgentControl {
     });
     emit({ kind: 'agent-ready', tabId, readiness, reloadOffered });
 
+    // A reload of a tab no agent had reported for (`previousDocumentId`
+    // undefined) settles on this, the first report to arrive.
     const pending = state.reload;
     if (pending !== undefined && pending.previousDocumentId !== report.documentId) {
       settleReload(tabId, pending, { kind: 'ready', tabId, readiness });
@@ -1176,40 +1326,83 @@ export function createAgentControl(deps: AgentControlDeps): AgentControl {
   // The consented reload
   // -------------------------------------------------------------------------
 
-  function requestConsentedReload(tabId: TabId): Promise<ReloadOutcome> {
+  /**
+   * The consent rule, stated once (see {@link AgentControl.getReloadOffer}):
+   * a reload in flight is shared; a recorded report offers a reload only when
+   * the hook arrived after React; with no report, an attached bridge means the
+   * agent is present and will report, and no bridge means no agent runs in
+   * the tab at all.
+   */
+  function consentFor(tabId: TabId): ConsentVerdict {
     const state = tabs.get(tabId);
-    const inFlight = state?.reload;
-    if (inFlight !== undefined) {
-      log.debug('consented reload already in flight', {
-        tabId,
-        previousDocumentId: inFlight.previousDocumentId,
-      });
-      return inFlight.promise;
+    const pending = state?.reload;
+    if (pending !== undefined) {
+      return { kind: 'in-flight', pending };
     }
-
     const readiness = state?.readiness;
-    if (state === undefined || readiness === undefined) {
-      log.info('reload refused: no agent report for the current document', { tabId });
-      return Promise.resolve({ kind: 'not-consented', tabId, reason: 'no-agent-report' });
+    if (readiness !== undefined) {
+      return readiness.installedBeforeReact
+        ? { kind: 'not-needed', reason: 'hook-installed-before-react' }
+        : { kind: 'offered', reason: 'hook-after-react' };
     }
-    if (readiness.installedBeforeReact) {
-      log.info('reload refused: the hook was installed before React', {
-        tabId,
-        documentId: readiness.documentId,
-      });
-      return Promise.resolve({
-        kind: 'not-consented',
-        tabId,
-        reason: 'hook-installed-before-react',
-      });
-    }
+    return bridgeAttached(tabId)
+      ? { kind: 'not-needed', reason: 'no-agent-report' }
+      : { kind: 'offered', reason: 'agent-missing' };
+  }
 
+  function getReloadOffer(tabId: TabId): PanelReloadState {
+    const verdict = consentFor(tabId);
+    switch (verdict.kind) {
+      case 'in-flight':
+        return RELOAD_IN_FLIGHT;
+      case 'offered':
+        return { kind: 'offered', reason: verdict.reason };
+      case 'not-needed':
+        return PANEL_RELOAD_NOT_NEEDED;
+    }
+  }
+
+  function requestConsentedReload(tabId: TabId): Promise<ReloadOutcome> {
+    const verdict = consentFor(tabId);
+    switch (verdict.kind) {
+      case 'in-flight':
+        log.debug('consented reload already in flight', {
+          tabId,
+          previousDocument: fingerprintPageId(verdict.pending.previousDocumentId),
+        });
+        return verdict.pending.promise;
+      case 'not-needed': {
+        const documentId = tabs.get(tabId)?.readiness?.documentId;
+        log.info('reload refused: no reload is offered for the tab', {
+          tabId,
+          reason: verdict.reason,
+          ...(documentId === undefined ? {} : documentLogFields(documentId)),
+        });
+        return Promise.resolve({ kind: 'not-consented', tabId, reason: verdict.reason });
+      }
+      case 'offered':
+        return startReload(tabId, verdict.reason);
+    }
+  }
+
+  /**
+   * Perform the reload `consentFor` offered: retire the current document's
+   * memo (when an agent reported one), bound the wait for the next
+   * `agent.ready`, and ask Chrome to reload the tab — exactly once.
+   */
+  function startReload(tabId: TabId, reason: PanelReloadReason): Promise<ReloadOutcome> {
+    // `agent-missing` is a tab nothing was held for yet: the wait needs an entry.
+    const state = stateFor(tabId);
+    const readiness = state.readiness;
     const pending = createPendingReload(readiness, state.lastReport);
     state.reload = pending;
     // The old document is about to go: its memo no longer describes the tab,
     // and anything it still says is stale. The desired configuration stays,
-    // so the new document is re-armed by its own `agent.ready`.
-    state.retiredDocumentId = readiness.documentId;
+    // so the new document is re-armed by its own `agent.ready`. A tab no agent
+    // reported for has no document to retire.
+    if (readiness !== undefined) {
+      state.retiredDocumentId = readiness.documentId;
+    }
     state.readiness = undefined;
     state.lastReport = undefined;
     state.documentOrigin = undefined;
@@ -1221,8 +1414,12 @@ export function createAgentControl(deps: AgentControlDeps): AgentControl {
       });
     }, PENDING_READY_TIMEOUT_MS);
 
-    log.info('consented reload started', { tabId, previousDocumentId: readiness.documentId });
-    emit({ kind: 'reload-started', tabId, previousDocumentId: readiness.documentId });
+    log.info('consented reload started', {
+      tabId,
+      reason,
+      previousDocument: fingerprintPageId(pending.previousDocumentId),
+    });
+    emit({ kind: 'reload-started', tabId, previousDocumentId: pending.previousDocumentId });
 
     let reloading: Promise<void>;
     try {
@@ -1398,6 +1595,7 @@ export function createAgentControl(deps: AgentControlDeps): AgentControl {
     handleAgentReady,
     handleNavigationDecision,
     requestConsentedReload,
+    getReloadOffer,
     disarm,
     reannounce,
     getReadiness,

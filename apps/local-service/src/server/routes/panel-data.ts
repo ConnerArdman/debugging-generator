@@ -4,8 +4,9 @@
  *
  * Every visualization node of a generated panel except the `sourceLink` leaf
  * carries a `DataQuery`. `PanelHost`'s `DataProvider` posts that query, byte for
- * byte, to this route — from the DevTools panel through its service worker, and
- * from the VS Code webview through the extension host — and renders the
+ * byte, to this route — with the id of the rendered panel it belongs to when
+ * the node is part of one — from the DevTools panel through its service worker,
+ * and from the VS Code webview through the extension host — and renders the
  * `DataResult` member it gets back. The response envelope is therefore a hot
  * contract: whatever this route answers is exactly what a component draws.
  *
@@ -19,9 +20,13 @@
  *    reaches a session route;
  * 2. the `:id` path parameter, named by protocol's route table, must have the
  *    shape of a session id;
- * 3. a `devtools` principal must act through the tab binding its own credential
- *    made (`requireBoundSession`), checked **before** the store is read so a
- *    DevTools client learns nothing about sessions it is not bound to;
+ * 3. a `devtools` principal must name the inspected tab it acts for (the
+ *    acting-tab header, verified by the auth middleware as
+ *    `c.get('actingTabId')`) and that tab must be the session's live bound
+ *    tab, bound by its own credential (`requireBoundSession`) — one paired
+ *    credential serves every inspected tab, so the credential alone never
+ *    proves which tab asks — checked **before** the store is read so a
+ *    DevTools tab learns nothing about sessions it is not bound to;
  * 4. the session must exist, and the whole per-session access matrix must allow
  *    the principal (`requireSessionAccess`: an editor by its announced workspace
  *    scope, a DevTools client by its binding);
@@ -36,12 +41,17 @@
  * aggregates, the stable `id` tie-breaker every sort ends in, the page defaults
  * (`DATA_QUERY_DEFAULT_LIMIT`, `DATA_QUERY_DEFAULT_OFFSET`), the clamp at
  * `DATA_QUERY_MAX_LIMIT`, the `total` counted before paging and the
- * `nextOffset` echo. So is the choice of capture: `DataQuery` names none, and
- * the resolver's documented rule — the session's open capture, else its most
- * recent one — is applied by the resolver alone, so the context handed to it
- * carries the session and nothing else. Re-deriving any of that here would be a
- * second implementation of the property the multi-page walk exists to prove:
- * that paging neither duplicates nor skips a row.
+ * `nextOffset` echo. So is the choice of capture. The body may name the rendered
+ * panel the query was sent for (`panelId`, protocol's `PanelDataRequest`); the
+ * route lifts it off the query into the resolver's context — the session and
+ * that panel, nothing else — and hands the resolver the `DataQuery` alone. The
+ * resolver's documented rule then binds a panel's reads to the capture that
+ * panel was generated from, and reads live evidence — the session's open
+ * capture, else its most recent one — when no panel is named, so a panel still
+ * on screen after a newer capture started keeps drawing its own evidence.
+ * Re-deriving any of that here would be a second implementation of the property
+ * the multi-page walk exists to prove: that paging neither duplicates nor skips
+ * a row.
  *
  * The three single-value sources (`trace`, `componentTree`, `graph`) carry no
  * page and the array-valued ones always do; the route passes either shape
@@ -64,10 +74,12 @@
  * | malformed or unknown session id | `404` | `SESSION_NOT_FOUND` |
  * | DevTools client not bound to this session | `403` | `TAB_NOT_BOUND` |
  * | editor credential outside its announced workspace | `403` | `PATH_OUTSIDE_PROJECT` |
- * | body larger than {@link MAX_PANEL_DATA_REQUEST_BODY_BYTES} | `413` | `PROTOCOL_INVALID_MESSAGE` |
+ * | body larger than {@link MAX_PANEL_DATA_REQUEST_BODY_BYTES}, declared or as it arrives | `413` | `PROTOCOL_INVALID_MESSAGE` |
+ * | body that did not arrive within `../http.ts`'s time ceiling | `408` | `PROTOCOL_INVALID_MESSAGE` |
  * | unreadable, non-JSON or off-schema body | `400` | `PROTOCOL_INVALID_MESSAGE` |
  * | paging value refused by the resolver | `400` | `PANEL_INVALID` |
- * | capture not determinable for the session | `409` | `SESSION_INVALID_STATE` |
+ * | aggregate over more events than the resolver's ceiling | `400` | `PANEL_INVALID` |
+ * | panel not held by the session, capture not the session's or not the panel's | `409` | `SESSION_INVALID_STATE` |
  * | store failure, resolver defect, response drift | `500` | the failure's own code, fixed message |
  *
  * The body schema bounds `limit` at `DATA_QUERY_MAX_LIMIT` (panel-schema: "a
@@ -106,6 +118,7 @@ import {
   parseHttpResponse,
   toErrorPayload,
 } from '@debuggen/protocol';
+import type { DataQuery } from '@debuggen/panel-schema';
 import type { DataResult, HttpErrorResponse, PanelDataRequest } from '@debuggen/protocol';
 import { DebuggenError, ID_PREFIXES, err, isErr, noopLogger, ok } from '@debuggen/shared';
 import type { DebuggenErrorCode, Logger, Result, SessionId } from '@debuggen/shared';
@@ -332,7 +345,7 @@ export type PanelDataRouteHandler = Handler<ServerEnv>;
 export type PanelDataRoutes = Readonly<Record<PanelDataOperation, PanelDataRouteHandler>>;
 
 /** Every status this route answers a failure with. */
-export type PanelDataFailureStatus = 400 | 401 | 403 | 404 | 409 | 413 | 429 | 500;
+export type PanelDataFailureStatus = 400 | 401 | 403 | 404 | 408 | 409 | 413 | 429 | 500;
 
 /* -------------------------------------------------------------------------------------------------
  * Failure vocabulary
@@ -484,10 +497,45 @@ export function isWellFormedSessionId(value: string | undefined): value is Sessi
 
 /** Why a request body was refused before it reached the resolver. */
 interface BodyRejection {
-  /** `413` for an oversized body, `400` for one that is unreadable, not JSON or off-schema. */
-  readonly status: 400 | 413;
+  /**
+   * `413` for an oversized body, `408` for one that did not arrive in time,
+   * `400` for one that is unreadable, not JSON or off-schema.
+   */
+  readonly status: 400 | 408 | 413;
   /** The refusal; its message never quotes the body. */
   readonly error: DebuggenError;
+}
+
+/**
+ * The `details.reason` values of the refusal `../http.ts`'s request-body guard
+ * errors a body stream with — what `c.req.text()` rejects with when the body
+ * crosses this operation's byte ceiling while it is read, or does not arrive
+ * within the time ceiling. Stated here because a route module never imports
+ * `../http.ts` (which imports it); they must equal that module's
+ * `REQUEST_BODY_REFUSAL_REASONS`, and `../http-body-guard.test.ts` holds them to it.
+ */
+const GUARD_BODY_TOO_LARGE_REASON = 'body-too-large';
+
+/** See {@link GUARD_BODY_TOO_LARGE_REASON}. */
+const GUARD_BODY_READ_TIMEOUT_REASON = 'body-read-timeout';
+
+/**
+ * Which ceiling `../http.ts`'s request-body guard refused a body at, read
+ * from what a body read rejected with.
+ *
+ * @param caught The rejection of `c.req.text()`.
+ * @returns The guard's reason, or `undefined` for any other read failure.
+ */
+function guardRefusalOf(
+  caught: unknown,
+): typeof GUARD_BODY_TOO_LARGE_REASON | typeof GUARD_BODY_READ_TIMEOUT_REASON | undefined {
+  if (!DebuggenError.is(caught)) {
+    return undefined;
+  }
+  const reason = caught.details?.[REASON_DETAIL_KEY];
+  return reason === GUARD_BODY_TOO_LARGE_REASON || reason === GUARD_BODY_READ_TIMEOUT_REASON
+    ? reason
+    : undefined;
 }
 
 /** The refusal of a body larger than {@link MAX_PANEL_DATA_REQUEST_BODY_BYTES}. */
@@ -504,6 +552,21 @@ function bodyTooLarge(): BodyRejection {
           reason: 'body-too-large',
           maxBytes: MAX_PANEL_DATA_REQUEST_BODY_BYTES,
         },
+      },
+    ),
+  };
+}
+
+/** The refusal of a body that did not arrive within `../http.ts`'s time ceiling. */
+function bodyReadTimedOut(): BodyRejection {
+  return {
+    status: 408,
+    error: new DebuggenError(
+      'PROTOCOL_INVALID_MESSAGE',
+      `The ${PANEL_DATA_OPERATION} request body did not arrive in time.`,
+      {
+        hint: 'Send the whole data query at once, then wait for the reply.',
+        details: { operation: PANEL_DATA_OPERATION, reason: GUARD_BODY_READ_TIMEOUT_REASON },
       },
     ),
   };
@@ -529,12 +592,17 @@ function bodyNotJson(problem: 'body-unreadable' | 'body-not-json'): BodyRejectio
  * {@link MAX_PANEL_DATA_REQUEST_BODY_BYTES}.
  *
  * A declared `Content-Length` above the bound is refused before anything is
- * read; the text actually read is measured again, which covers a chunked body
- * that declared no length. The text is read through hono's cached accessor, so
- * a body a middleware already consumed is still available here. An empty body
- * reads as `undefined`, which the request schema then refuses (a query without
- * a `source` has nothing to draw). `JSON.parse`'s own error is discarded,
- * because its message quotes the offending input.
+ * read. A body that declares no length (a chunked upload) is bounded while it
+ * is read: `../http.ts`'s request-body guard errors the stream at the same
+ * bound — and at its time ceiling — so `c.req.text()` rejects with the guard's
+ * refusal instead of buffering an unbounded body, and that rejection is
+ * answered `413` or `408` here. The text read is measured once more, which
+ * keeps the bound for a handler composed without the guard. The text is read
+ * through hono's cached accessor, so a body a middleware already consumed is
+ * still available here. An empty body reads as `undefined`, which the request
+ * schema then refuses (a query without a `source` has nothing to draw).
+ * `JSON.parse`'s own error is discarded, because its message quotes the
+ * offending input.
  *
  * @param c The request context.
  * @returns The parsed value, or the refusal.
@@ -551,7 +619,14 @@ async function readJsonBody(c: Context<ServerEnv>): Promise<Result<unknown, Body
   let text: string;
   try {
     text = await c.req.text();
-  } catch {
+  } catch (caught) {
+    const refusal = guardRefusalOf(caught);
+    if (refusal === GUARD_BODY_TOO_LARGE_REASON) {
+      return err(bodyTooLarge());
+    }
+    if (refusal === GUARD_BODY_READ_TIMEOUT_REASON) {
+      return err(bodyReadTimedOut());
+    }
     return err(bodyNotJson('body-unreadable'));
   }
   if (Buffer.byteLength(text, 'utf8') > MAX_PANEL_DATA_REQUEST_BODY_BYTES) {
@@ -573,7 +648,7 @@ async function readJsonBody(c: Context<ServerEnv>): Promise<Result<unknown, Body
  * Reads and validates the body against protocol's route table — the same
  * `parseHttpRequest` the client SDK validates its outbound body with, so the
  * service accepts exactly the `DataQuery` a client can send and a panel node
- * can carry. The rejection message is built by `describeZodIssues` from issue
+ * can carry, with the optional id of the panel it belongs to. The rejection message is built by `describeZodIssues` from issue
  * paths and codes: a filter value, a trace id or a component name never
  * reaches it.
  *
@@ -798,14 +873,14 @@ function loadSession(
  * thrown value is not kept: its message could quote captured data.
  *
  * @param resolver The panel-data resolver.
- * @param context The session the query reads.
- * @param query The validated query.
+ * @param context The session, and the rendered panel when one was named.
+ * @param query The validated query, without the panel id.
  * @returns The resolver's own result, or an `INTERNAL` failure.
  */
 async function resolveQuery(
   resolver: PanelDataRoutesDeps['resolver'],
   context: PanelDataContext,
-  query: PanelDataRequest,
+  query: DataQuery,
 ): Promise<Result<DataResult, DebuggenError>> {
   try {
     return await resolver.resolve(context, query);
@@ -877,16 +952,19 @@ export function createPanelDataRoutes(deps: PanelDataRoutesDeps): PanelDataRoute
     }
     const sessionLog = sessionLogger(log, sessionId);
 
-    // A DevTools client acts only through the binding its own credential made,
-    // and that is checked before the store is read: a client that is not bound
-    // to this session cannot tell an existing session from an absent one.
+    // A DevTools client acts only for the tab it names (the acting-tab header
+    // the auth middleware verified) through the binding its own credential
+    // made for that tab, and that is checked before the store is read: a tab
+    // that is not bound to this session cannot tell an existing session from
+    // an absent one.
+    const actingTabId = c.get('actingTabId');
     let binding: TabBinding | undefined;
     if (principal.value.role === 'devtools') {
       const looked = lookupBinding(bindings, sessionId);
       if (isErr(looked)) {
         return answerFailure(c, looked.error, { log: sessionLog });
       }
-      const bound = requireBoundSession(principal.value, sessionId, looked.value);
+      const bound = requireBoundSession(principal.value, sessionId, looked.value, actingTabId);
       if (isErr(bound)) {
         return answerFailure(c, bound.error, { log: sessionLog });
       }
@@ -897,7 +975,7 @@ export function createPanelDataRoutes(deps: PanelDataRoutesDeps): PanelDataRoute
     if (isErr(session)) {
       return answerFailure(c, session.error, { log: sessionLog });
     }
-    const access = requireSessionAccess(principal.value, session.value, binding);
+    const access = requireSessionAccess(principal.value, session.value, binding, actingTabId);
     if (isErr(access)) {
       return answerFailure(c, access.error, { log: sessionLog });
     }
@@ -909,9 +987,13 @@ export function createPanelDataRoutes(deps: PanelDataRoutesDeps): PanelDataRoute
     const source = query.value.source;
     const queried: FailureContext = { log: sessionLog, source };
 
-    // The context names the session only: `DataQuery` names no capture, and
-    // which capture a read uses is the resolver's rule, applied by it alone.
-    const resolved = await resolveQuery(resolver, { sessionId }, query.value);
+    // The panel id is the read's scope, not part of the query: it moves into
+    // the context, and which capture a read uses is the resolver's rule,
+    // applied by it alone — the rendered panel's, else the live one.
+    const { panelId, ...dataQuery } = query.value;
+    const context: PanelDataContext =
+      panelId === undefined ? { sessionId } : { sessionId, panelId };
+    const resolved = await resolveQuery(resolver, context, dataQuery);
     if (isErr(resolved)) {
       return answerFailure(c, resolved.error, queried);
     }

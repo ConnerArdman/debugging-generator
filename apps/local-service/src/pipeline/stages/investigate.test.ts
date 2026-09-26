@@ -6,8 +6,9 @@
  *
  * The `CodeInvestigation` artifact has no upstream schema, so the stage module
  * owns a total type guard (`isCodeInvestigation`) and the opaque schema built
- * on it (`codeInvestigationSchema`). The folder's no-zod rule makes pinning
- * that guard with accept **and** reject cases this suite's first mandate: one
+ * on it (`codeInvestigationSchema`). The stage module imports no validation
+ * library (the static self-scan below pins it), which makes pinning that
+ * guard with accept **and** reject cases this suite's first mandate: one
  * test per checked condition, so a regression names the exact field that
  * stopped being validated, plus conformance against the imported
  * `relevantFileSchema` — the orchestrator persists the list verbatim as
@@ -34,7 +35,9 @@
  * Deliberately not repeated here: `../tools/code-tools.test.ts` pins the
  * executor (clamping, rejection codes, excerpt refusals, catalog stability),
  * `packages/model-provider/src/structured.test.ts` pins the repair loop's
- * internals (only its observed call counts are asserted below), and
+ * internals (only its observed call counts are asserted below),
+ * `./reply-schemas.test.ts` pins how the reply schema renders for a real
+ * provider and where it draws the structure/value line, and
  * `test/integration/pipeline-deterministic.test.ts` owns the end-to-end
  * assertion over a real fixture graph.
  *
@@ -240,7 +243,15 @@ const SEEDED_UNDERSTANDING: ProblemUnderstanding = {
   searchHints: ['orbit'],
 };
 
-/** The investigation most successful runs end with. */
+/**
+ * The investigation most successful runs end with. Every file, symbol and
+ * flow step in it is one a {@link resolvingScript} result names, and its flow
+ * is the path that script's `pathBetween` answer returns, so a run that finds
+ * the chart and traces the flow ({@link TRACE_FLOW}) returns it unchanged by
+ * grounding; a run that only finds the steps by name keeps its shortlist and
+ * loses the flow, whose steps no executed relationship joined; a run whose
+ * queries find nothing returns it grounded down to nothing.
+ */
 const VALID_INVESTIGATION: CodeInvestigation = {
   relevantFiles: [
     {
@@ -252,7 +263,7 @@ const VALID_INVESTIGATION: CodeInvestigation = {
     { file: SERVICE_FILE, reason: 'Serves the plot request.', score: 0 },
     { file: MATH_FILE, symbol: MATH_SYMBOL, reason: 'Computes every plotted point.', score: 1 },
   ],
-  flows: [`${CHART_COMPONENT} press → plot request → plot-service → ${MATH_SYMBOL}`],
+  flows: [`${CHART_COMPONENT} → onPlotPress → GET ${ROUTE_PATH} → ${MATH_SYMBOL}`],
 };
 
 /** One valid proposal per catalogued tool, in catalog order. */
@@ -679,9 +690,31 @@ const findNothing: ToolScript = (request) => ok(emptyResult(request));
 
 /** One graph node a scripted `findByName` result names. */
 interface ScriptedNode {
-  readonly kind: 'component' | 'handler' | 'api-route' | 'db-call';
+  readonly kind: 'component' | 'handler' | 'api-route' | 'db-call' | 'symbol';
   readonly name: string;
   readonly file: string;
+}
+
+/** The `nodeId` the scripted results give `node`. */
+function scriptedNodeId(node: ScriptedNode): string {
+  return `${node.kind}:${node.file}#${node.name}`;
+}
+
+/** The code match a scripted result reports for `node`, located at the top of its file. */
+function scriptedMatch(node: ScriptedNode) {
+  return {
+    nodeId: scriptedNodeId(node),
+    kind: node.kind,
+    name: node.name,
+    file: node.file,
+    location: {
+      file: node.file,
+      line: 1,
+      column: 1,
+      resolvedBy: 'code-graph' as const,
+      confidence: 1,
+    },
+  };
 }
 
 /** A `findByName` result naming `nodes`; any other request finds nothing. */
@@ -697,14 +730,42 @@ function matchesOutcome(request: CodeToolRequest, nodes: readonly ScriptedNode[]
     returned: nodes.length,
     truncated: false,
     clamped: [],
-    payload: nodes.map((node) => ({
-      nodeId: `${node.kind}:${node.file}#${node.name}`,
-      kind: node.kind,
-      name: node.name,
-      file: node.file,
-      location: { file: node.file, line: 1, column: 1, resolvedBy: 'code-graph', confidence: 1 },
-      score: 1,
-    })),
+    payload: nodes.map((node) => ({ ...scriptedMatch(node), score: 1 })),
+  };
+  return ok(result);
+}
+
+/**
+ * A `pathBetween` result whose path visits `nodes` in order — the shape the
+ * real engine returns for a downstream search: `edges[i]` joins `nodes[i]` to
+ * `nodes[i + 1]` in its own direction, and `depth` is the hop count. Any other
+ * request finds nothing.
+ */
+function pathOutcome(request: CodeToolRequest, nodes: readonly ScriptedNode[]): CodeToolOutcome {
+  if (request.tool !== 'pathBetween') {
+    return ok(emptyResult(request));
+  }
+  const edges = nodes.slice(1).map((node, index) => ({
+    kind: 'calls' as const,
+    from: scriptedNodeId(at(nodes, index)),
+    to: scriptedNodeId(node),
+    traversedAgainstDirection: false,
+  }));
+  const result: CodeToolResult = {
+    tool: request.tool,
+    request,
+    found: true,
+    total: 1,
+    returned: 1,
+    truncated: false,
+    clamped: [],
+    payload: {
+      nodes: nodes.map(scriptedMatch),
+      edges,
+      depth: edges.length,
+      undirected: false,
+      truncated: false,
+    },
   };
   return ok(result);
 }
@@ -1608,7 +1669,7 @@ describe('the harness', () => {
   });
 });
 
-describe('the CodeInvestigation guard (the no-zod rule: pinned with accept and reject cases)', () => {
+describe('the CodeInvestigation guard (no validation library in the stage: pinned with accept and reject cases)', () => {
   describe('accepts a valid artifact', () => {
     it.each(ACCEPTED)('%s', (_label, value) => {
       expect(isCodeInvestigation(value)).toBe(true);
@@ -1882,14 +1943,40 @@ const RESOLVED_NODES: readonly ScriptedNode[] = [
   { kind: 'handler', name: 'onPlotPress', file: CHART_FILE },
   { kind: 'api-route', name: ROUTE_PATH, file: SERVICE_FILE },
   { kind: 'db-call', name: 'readingStore.query', file: SERVICE_FILE },
+  { kind: 'symbol', name: MATH_SYMBOL, file: MATH_FILE },
 ];
 
-/** A script that answers `findByName` with {@link RESOLVED_NODES} and an excerpt with `text`. */
+/**
+ * The path a scripted `pathBetween` result returns: the steps of
+ * {@link VALID_INVESTIGATION}'s flow, in its order, each one of
+ * {@link RESOLVED_NODES}. Executing {@link TRACE_FLOW} is what links the flow's
+ * consecutive steps; finding each step by name alone does not.
+ */
+const VALID_FLOW_PATH: readonly ScriptedNode[] = [
+  { kind: 'component', name: CHART_COMPONENT, file: CHART_FILE },
+  { kind: 'handler', name: 'onPlotPress', file: CHART_FILE },
+  { kind: 'api-route', name: ROUTE_PATH, file: SERVICE_FILE },
+  { kind: 'symbol', name: MATH_SYMBOL, file: MATH_FILE },
+];
+
+/** The proposal that traces {@link VALID_FLOW_PATH}: the chart component to the math symbol. */
+const TRACE_FLOW: unknown = VALID_PROPOSALS.pathBetween;
+
+/**
+ * A script that answers `findByName` with {@link RESOLVED_NODES}, `pathBetween`
+ * with {@link VALID_FLOW_PATH} and an excerpt with `text`.
+ */
 function resolvingScript(text: string): ToolScript {
-  return (request) =>
-    request.tool === 'excerpt'
-      ? excerptOutcome(request, text)
-      : matchesOutcome(request, RESOLVED_NODES);
+  return (request) => {
+    switch (request.tool) {
+      case 'excerpt':
+        return excerptOutcome(request, text);
+      case 'pathBetween':
+        return pathOutcome(request, VALID_FLOW_PATH);
+      default:
+        return matchesOutcome(request, RESOLVED_NODES);
+    }
+  };
 }
 
 /** The parser-normalised form of a valid proposal, or a test failure. */
@@ -1909,13 +1996,21 @@ function repeated(outcome: ScriptedOutcome, count: number): readonly ScriptedOut
 /** A reply the reply schema refuses: neither a batch nor an investigation. */
 const SHAPELESS_REPLY = answer({ notes: 'I would rather describe the code in prose.' });
 
+/**
+ * A proposal the reply schema admits — a well-typed call of a catalogued tool —
+ * whose value the parser refuses: the name is blank once trimmed. Structural
+ * defects are the reply schema's and are repaired; value defects like this one
+ * are the parser's, and become evidence charged to the query budget.
+ */
+const BLANK_NAME_PROPOSAL = { tool: 'findByName', name: '   ' };
+
 describe('the propose→execute loop', () => {
   describe('the happy path', () => {
     it('turns a scripted sequence of proposals into a validated investigation', async () => {
       const excerptText = `export function ${CHART_COMPONENT}() { return null; }`;
       const fixture = harness({
         respond: queued(
-          answer(batch(FIND_CHART)),
+          answer(batch(FIND_CHART, TRACE_FLOW)),
           answer(batch(VALID_PROPOSALS.excerpt)),
           answer(VALID_INVESTIGATION),
         ),
@@ -1932,12 +2027,16 @@ describe('the propose→execute loop', () => {
 
       expect(result.toolRuns.map((run) => run.request?.tool)).toStrictEqual([
         'findByName',
+        'pathBetween',
         'excerpt',
       ]);
       expect(at(result.toolRuns, 0).outcome).toStrictEqual(
         matchesOutcome(expectRequest(FIND_CHART), RESOLVED_NODES),
       );
       expect(at(result.toolRuns, 1).outcome).toStrictEqual(
+        pathOutcome(expectRequest(TRACE_FLOW), VALID_FLOW_PATH),
+      );
+      expect(at(result.toolRuns, 2).outcome).toStrictEqual(
         excerptOutcome(expectRequest(VALID_PROPOSALS.excerpt), excerptText),
       );
 
@@ -1946,7 +2045,7 @@ describe('the propose→execute loop', () => {
         true,
       );
       expect(fixture.builder.investigateCalls).toHaveLength(3);
-      expect(fixture.tools.executedTools).toStrictEqual(['findByName', 'excerpt']);
+      expect(fixture.tools.executedTools).toStrictEqual(['findByName', 'pathBetween', 'excerpt']);
       expect(fixture.tools.unparsed).toStrictEqual([]);
       expect(probe.codeReads).toStrictEqual([]);
     });
@@ -2058,30 +2157,65 @@ describe('the propose→execute loop', () => {
   });
 
   describe('validation before execution', () => {
-    it('parses every proposal first and executes neither a malformed request nor an unknown tool', async () => {
-      const malformed = { tool: 'findByName' };
-      const unknownTool = { tool: 'listRepository', path: '.' };
-      const notAnObject = `findByName ${CHART_COMPONENT}`;
+    it('parses every proposal first and executes none whose values the parser refuses', async () => {
+      // Each is a well-typed call of a catalogued tool, so the reply schema admits it;
+      // what is wrong is a value, which only the parser judges.
+      const blankName = { tool: 'findByName', name: '   ' };
+      const unsafePath = { tool: 'findSymbol', file: `../${MATH_FILE}`, symbol: MATH_SYMBOL };
+      const emptySelector = { tool: 'pathBetween', from: {}, to: { name: MATH_SYMBOL } };
       const untidy = { tool: 'findByName', name: `  ${CHART_COMPONENT}  `, verbose: true };
       const fixture = harness({
         respond: queued(
-          answer(batch(malformed, unknownTool, notAnObject, untidy)),
+          answer(batch(blankName, unsafePath, emptySelector, untidy)),
           answer(VALID_INVESTIGATION),
         ),
       });
       const result = expectOk(await fixture.run(stageContext().context));
       const limits = resolveCodeToolLimits();
 
+      expect(result.repairs).toBe(0);
       expect(fixture.tools.executed).toStrictEqual([expectRequest(untidy)]);
       expect(fixture.tools.unparsed).toStrictEqual([]);
       expect(result.toolRuns).toHaveLength(4);
-      for (const [index, proposal] of [malformed, unknownTool, notAnObject].entries()) {
+      for (const [index, proposal] of [blankName, unsafePath, emptySelector].entries()) {
         const run = at(result.toolRuns, index);
         expect(run.index).toBe(index);
         expect(run.request).toBeUndefined();
+        expect(run.outcome.ok).toBe(false);
         expect(run.outcome).toStrictEqual(parseCodeToolRequest(proposal, limits));
       }
+      // The undeclared key is dropped and the name trimmed: the parser's normalised request.
       expect(at(result.toolRuns, 3).request).toStrictEqual(expectRequest(untidy));
+    });
+
+    it('refuses a structurally malformed proposal at the reply schema: the repair turn names each path, and nothing runs or is charged', async () => {
+      const missingArgument = { tool: 'findByName' };
+      const unknownTool = { tool: 'listRepository', path: '.' };
+      const notAnObject = `findByName ${CHART_COMPONENT}`;
+      const wrongType = { tool: 'findSymbol', file: MATH_FILE, symbol: 7 };
+      const fixture = harness({
+        respond: queued(
+          answer(batch(missingArgument, unknownTool, notAnObject, wrongType)),
+          answer(batch(FIND_CHART)),
+          answer(VALID_INVESTIGATION),
+        ),
+      });
+      const result = expectOk(await fixture.run(stageContext().context));
+      const allowance = resolveCodeToolLimits().maxCallsPerStage;
+
+      // One repair inside the first turn, then the build of the second turn.
+      expect(result.repairs).toBe(1);
+      expect(fixture.provider.structuredCalls).toHaveLength(3);
+      expect(fixture.builder.investigateCalls).toHaveLength(2);
+      const correction = last(at(fixture.provider.structuredCalls, 1).request.messages ?? []);
+      for (const path of ['[0].name', '[1].tool', '[2]', '[3].symbol']) {
+        expect(correction.content).toContain(`${INVESTIGATE_QUERY_BATCH_FIELD}${path}`);
+      }
+
+      // The refused batch never reached the parser or the executor, and cost no query.
+      expect(fixture.tools.executed).toStrictEqual([expectRequest(FIND_CHART)]);
+      expect(result.toolRuns.map((run) => run.request)).toStrictEqual([expectRequest(FIND_CHART)]);
+      expect(turnInput(fixture, 2).remainingQueries).toBe(allowance - 1);
     });
 
     it('executes only parser-normalised requests whose tool is catalogued', async () => {
@@ -2112,7 +2246,7 @@ describe('the propose→execute loop', () => {
         },
         respond: queued(
           answer(batch(VALID_PROPOSALS.excerpt)),
-          answer(batch({ tool: 'findByName' })),
+          answer(batch(BLANK_NAME_PROPOSAL)),
           answer(VALID_INVESTIGATION),
         ),
       });
@@ -2135,7 +2269,7 @@ describe('the propose→execute loop', () => {
       const third = turnInput(fixture, 3);
       expect(third.queryResults).toHaveLength(2);
       expect(third.remainingQueries).toBe(allowance - 2);
-      const parserRejection = parseCodeToolRequest({ tool: 'findByName' });
+      const parserRejection = parseCodeToolRequest(BLANK_NAME_PROPOSAL);
       expect(parserRejection.ok).toBe(false);
       if (!parserRejection.ok) {
         expect(turnPlaceholders(fixture, 3)['queryResults']).toContain(
@@ -2153,7 +2287,7 @@ describe('the propose→execute loop', () => {
       { timeout: 10_000 },
       async () => {
         const allowance = resolveCodeToolLimits().maxCallsPerStage;
-        const fixture = harness({ respond: always(answer(batch({ tool: 'findByName' }))) });
+        const fixture = harness({ respond: always(answer(batch(BLANK_NAME_PROPOSAL))) });
         const error = expectErr(await fixture.run(stageContext().context));
         expect(reasonOf(error)).toBe('query-budget-exhausted');
         expect(fixture.tools.executed).toHaveLength(0);
@@ -2603,6 +2737,548 @@ describe('the outbound guard', () => {
   });
 });
 
+describe('grounding: the investigation keeps only what executed queries returned (AAP §0.4.2)', () => {
+  /** A file, symbol and flow step no scripted result ever names. */
+  const INVENTED_FILE = 'src/lib/invented-orbit-cache.ts';
+  const INVENTED_SYMBOL = 'InventedOrbitCache';
+  const INVENTED_STEP = 'inventedOrbitCache.warm';
+
+  /** The completion record of a run, or a test failure. */
+  function completionOf(fixture: Harness): LogRecord {
+    const records = fixture.log.records.filter(
+      (record) => record.message === 'Investigate stage produced a validated code investigation.',
+    );
+    expect(records).toHaveLength(1);
+    return at(records, 0);
+  }
+
+  /**
+   * Runs one batch of `queries` — by default, finding the chart by name and
+   * tracing {@link VALID_FLOW_PATH} — against `script`, then answers with `reply`.
+   */
+  async function groundedRun(
+    reply: unknown,
+    script: ToolScript = resolvingScript(''),
+    queries: readonly unknown[] = [FIND_CHART, TRACE_FLOW],
+  ): Promise<{ readonly fixture: Harness; readonly result: InvestigateStageResult }> {
+    const fixture = harness({
+      respond: queued(answer(batch(...queries)), answer(reply)),
+      tools: { script },
+    });
+    const result = expectOk(await fixture.run(stageContext().context));
+    return { fixture, result };
+  }
+
+  it('removes a syntactically valid file that no executed query returned', async () => {
+    const invented = {
+      file: INVENTED_FILE,
+      symbol: INVENTED_SYMBOL,
+      reason: 'Caches every projected orbit.',
+      score: 0.95,
+    };
+    const reply = {
+      ...VALID_INVESTIGATION,
+      relevantFiles: [invented, ...VALID_INVESTIGATION.relevantFiles],
+    };
+    // Well-formed: the guard and every relevant-file rule accept it.
+    expect(isCodeInvestigation(reply)).toBe(true);
+    expect(relevantFileSchema.safeParse(invented).success).toBe(true);
+
+    const { fixture, result } = await groundedRun(reply);
+
+    expect(result.investigation).toStrictEqual(VALID_INVESTIGATION);
+    expect(completionOf(fixture).fields).toMatchObject({
+      relevantFileCount: VALID_INVESTIGATION.relevantFiles.length,
+      removedFileCount: 1,
+      strippedSymbolCount: 0,
+      removedFlowCount: 0,
+    });
+    // The findings the progress rows are built from list the grounded shortlist only.
+    expect(at(fixture.progress.calls, 1).findings?.relevantFiles).toStrictEqual(
+      VALID_INVESTIGATION.relevantFiles,
+    );
+  });
+
+  it('strips a symbol no result placed in a grounded file, keeping the file, its reason and its score', async () => {
+    const reply = withFirstEntry({ symbol: INVENTED_SYMBOL });
+    const { fixture, result } = await groundedRun(reply);
+
+    const [first, ...rest] = VALID_INVESTIGATION.relevantFiles;
+    expect(result.investigation.relevantFiles).toStrictEqual([
+      { file: CHART_FILE, reason: first?.reason, score: first?.score },
+      ...rest,
+    ]);
+    expect(Object.keys(at(result.investigation.relevantFiles, 0))).not.toContain('symbol');
+    expect(completionOf(fixture).fields).toMatchObject({
+      removedFileCount: 0,
+      strippedSymbolCount: 1,
+    });
+  });
+
+  it('removes a prose, invented or unconnected flow and keeps every flow whose steps were returned and linked', async () => {
+    const grounded = [
+      // The traced path itself, with its route step method-qualified.
+      ...VALID_INVESTIGATION.flows,
+      // A file and a declaration the path placed in it, in the ASCII arrow spelling.
+      `${CHART_FILE} -> ${CHART_COMPONENT}`,
+      // A method-qualified route step is linked as its route path.
+      `GET ${ROUTE_PATH} -> ${MATH_SYMBOL}`,
+      // A link has no direction: one hop of the path, written against it.
+      `${MATH_SYMBOL} → ${ROUTE_PATH}`,
+      // A single step asserts no connection; being returned is enough.
+      CHART_COMPONENT,
+      SERVICE_FILE,
+    ];
+    const ungrounded = [
+      `${CHART_COMPONENT} press → plot request → plot-service → ${MATH_SYMBOL}`,
+      `${CHART_COMPONENT} → ${INVENTED_STEP}`,
+      `POST /observatory/invented → ${MATH_SYMBOL}`,
+      `FETCH ${ROUTE_PATH} → ${MATH_SYMBOL}`,
+      `${CHART_COMPONENT} → → ${MATH_SYMBOL}`,
+      `${CHART_COMPONENT} →`,
+      // Every step below was returned, but no executed relationship joins the pair.
+      `${CHART_FILE} -> ${SERVICE_FILE}`,
+      `${ROUTE_PATH} → readingStore.query`,
+      `${UNRELATED_COMPONENT} → ${MATH_SYMBOL}`,
+      // Both ends are on the path, but not adjacent: the step between them is skipped.
+      `${CHART_COMPONENT} → ${MATH_SYMBOL}`,
+    ];
+    const reply = { ...VALID_INVESTIGATION, flows: [...ungrounded, ...grounded] };
+    expect(isCodeInvestigation(reply)).toBe(true);
+
+    const { fixture, result } = await groundedRun(reply);
+
+    expect(result.investigation.flows).toStrictEqual(grounded);
+    expect(result.investigation.relevantFiles).toStrictEqual(VALID_INVESTIGATION.relevantFiles);
+    expect(completionOf(fixture).fields).toMatchObject({
+      flowCount: grounded.length,
+      removedFlowCount: ungrounded.length,
+    });
+  });
+
+  /** The route handler the handler-centred scripts report, declared in the service file. */
+  const HANDLER_SYMBOL = 'readReadings';
+
+  /** A source location in `file`, as the code graph reports one. */
+  const locationIn = (file: string) =>
+    ({ file, line: 3, column: 1, resolvedBy: 'code-graph', confidence: 1 }) as const;
+
+  /** The counts of a found, uncut result carrying one item. */
+  const FOUND_ONE = { found: true, total: 1, returned: 1, truncated: false, clamped: [] } as const;
+
+  /**
+   * Answers `findSymbol` with the math symbol's declaration, `handlersFor` with
+   * a `GET` handler {@link HANDLER_SYMBOL} located in the service file, and
+   * `whoCalls` with {@link HANDLER_SYMBOL} calling the requested symbol; any
+   * other request finds nothing.
+   */
+  const handlerScript: ToolScript = (request) => {
+    switch (request.tool) {
+      case 'findSymbol': {
+        const result: CodeToolResult = {
+          ...FOUND_ONE,
+          tool: request.tool,
+          request,
+          payload: {
+            nodeId: `symbol:${MATH_FILE}#${MATH_SYMBOL}`,
+            kind: 'symbol',
+            name: MATH_SYMBOL,
+            file: MATH_FILE,
+            location: locationIn(MATH_FILE),
+            symbol: MATH_SYMBOL,
+            exported: true,
+          },
+        };
+        return ok(result);
+      }
+      case 'handlersFor': {
+        const result: CodeToolResult = {
+          ...FOUND_ONE,
+          tool: request.tool,
+          request,
+          payload: [{ method: 'GET', symbol: HANDLER_SYMBOL, location: locationIn(SERVICE_FILE) }],
+        };
+        return ok(result);
+      }
+      case 'whoCalls': {
+        const result: CodeToolResult = {
+          ...FOUND_ONE,
+          tool: request.tool,
+          request,
+          payload: [
+            {
+              caller: {
+                nodeId: `symbol:${SERVICE_FILE}#${HANDLER_SYMBOL}`,
+                kind: 'symbol',
+                name: HANDLER_SYMBOL,
+                file: SERVICE_FILE,
+                location: locationIn(SERVICE_FILE),
+              },
+              via: 'edge',
+              location: locationIn(SERVICE_FILE),
+            },
+          ],
+        };
+        return ok(result);
+      }
+      default:
+        return ok(emptyResult(request));
+    }
+  };
+
+  /** A shortlist of the math symbol and the route handler, both of which {@link handlerScript} places. */
+  const HANDLER_SHORTLIST: readonly RelevantFile[] = [
+    { file: MATH_FILE, symbol: MATH_SYMBOL, reason: 'Computes the points.', score: 1 },
+    { file: SERVICE_FILE, symbol: HANDLER_SYMBOL, reason: 'Serves the readings.', score: 0.5 },
+  ];
+
+  it('grounds a symbol a findSymbol match or a route handler reports for its file', async () => {
+    const reply: CodeInvestigation = {
+      relevantFiles: [...HANDLER_SHORTLIST],
+      flows: [HANDLER_SYMBOL, MATH_SYMBOL],
+    };
+    const { fixture, result } = await groundedRun(reply, handlerScript, [
+      VALID_PROPOSALS.findSymbol,
+      VALID_PROPOSALS.handlersFor,
+    ]);
+    expect(result.investigation).toStrictEqual(reply);
+    expect(completionOf(fixture).fields).toMatchObject({
+      removedFileCount: 0,
+      strippedSymbolCount: 0,
+      removedFlowCount: 0,
+    });
+  });
+
+  it('removes a flow between two names that separate lookups found but no executed query related', async () => {
+    // Both components and the symbol are findByName hits; nothing relates them.
+    const reply: CodeInvestigation = {
+      relevantFiles: [...VALID_INVESTIGATION.relevantFiles],
+      flows: [`${UNRELATED_COMPONENT} → ${MATH_SYMBOL}`, UNRELATED_COMPONENT, MATH_SYMBOL],
+    };
+    const { fixture, result } = await groundedRun(reply, resolvingScript(''), [FIND_CHART]);
+    expect(result.investigation.flows).toStrictEqual([UNRELATED_COMPONENT, MATH_SYMBOL]);
+    expect(result.investigation.relevantFiles).toStrictEqual(VALID_INVESTIGATION.relevantFiles);
+    expect(completionOf(fixture).fields).toMatchObject({ flowCount: 2, removedFlowCount: 1 });
+  });
+
+  it('keeps the same flow once an executed pathBetween result joins the two names', async () => {
+    const joined: readonly ScriptedNode[] = [
+      { kind: 'component', name: UNRELATED_COMPONENT, file: UNRELATED_FILE },
+      { kind: 'symbol', name: MATH_SYMBOL, file: MATH_FILE },
+    ];
+    const script: ToolScript = (request) =>
+      request.tool === 'pathBetween'
+        ? pathOutcome(request, joined)
+        : matchesOutcome(request, RESOLVED_NODES);
+    const traceUnrelated = {
+      tool: 'pathBetween',
+      from: { name: UNRELATED_COMPONENT },
+      to: { name: MATH_SYMBOL },
+    };
+    const reply: CodeInvestigation = {
+      relevantFiles: [...VALID_INVESTIGATION.relevantFiles],
+      flows: [`${UNRELATED_COMPONENT} → ${MATH_SYMBOL}`],
+    };
+    const { fixture, result } = await groundedRun(reply, script, [FIND_CHART, traceUnrelated]);
+    expect(result.investigation).toStrictEqual(reply);
+    expect(completionOf(fixture).fields).toMatchObject({ flowCount: 1, removedFlowCount: 0 });
+  });
+
+  it('links a caller to the symbol an executed whoCalls request named, and a route handler to nothing', async () => {
+    const reply: CodeInvestigation = {
+      relevantFiles: [...HANDLER_SHORTLIST],
+      flows: [`${HANDLER_SYMBOL} → ${MATH_SYMBOL}`],
+    };
+
+    // A handler's symbol and a separately resolved declaration: each is evidenced,
+    // but handlersFor names no relationship between them, so the flow goes.
+    const unlinked = await groundedRun(reply, handlerScript, [
+      VALID_PROPOSALS.findSymbol,
+      VALID_PROPOSALS.handlersFor,
+    ]);
+    expect(unlinked.result.investigation).toStrictEqual({ ...reply, flows: [] });
+    expect(completionOf(unlinked.fixture).fields).toMatchObject({
+      removedFileCount: 0,
+      strippedSymbolCount: 0,
+      removedFlowCount: 1,
+    });
+
+    // The executed whoCalls request named the math symbol, and its result names
+    // the handler as a caller: that relationship keeps the flow.
+    const linked = await groundedRun(reply, handlerScript, [
+      VALID_PROPOSALS.findSymbol,
+      VALID_PROPOSALS.whoCalls,
+    ]);
+    expect(linked.result.investigation).toStrictEqual(reply);
+    expect(completionOf(linked.fixture).fields).toMatchObject({ removedFlowCount: 0 });
+  });
+
+  it('links a rendering parent to the component an executed componentsRendering request named', async () => {
+    const script: ToolScript = (request) => {
+      if (request.tool !== 'componentsRendering') {
+        return matchesOutcome(request, RESOLVED_NODES);
+      }
+      const parent: ScriptedNode = {
+        kind: 'component',
+        name: UNRELATED_COMPONENT,
+        file: UNRELATED_FILE,
+      };
+      const result: CodeToolResult = {
+        ...FOUND_ONE,
+        tool: request.tool,
+        request,
+        payload: [{ component: scriptedMatch(parent), location: locationIn(UNRELATED_FILE) }],
+      };
+      return ok(result);
+    };
+    const reply: CodeInvestigation = {
+      relevantFiles: [...VALID_INVESTIGATION.relevantFiles],
+      flows: [
+        `${UNRELATED_COMPONENT} → ${CHART_COMPONENT}`,
+        `${UNRELATED_COMPONENT} → onPlotPress`,
+      ],
+    };
+    const { fixture, result } = await groundedRun(reply, script, [
+      FIND_CHART,
+      VALID_PROPOSALS.componentsRendering,
+    ]);
+    // The parent renders the chart component the request named — not its handler.
+    expect(result.investigation.flows).toStrictEqual([
+      `${UNRELATED_COMPONENT} → ${CHART_COMPONENT}`,
+    ]);
+    expect(completionOf(fixture).fields).toMatchObject({ removedFlowCount: 1 });
+  });
+
+  it('links a resolved route path to its route node and to its module file', async () => {
+    const routeNode: ScriptedNode = { kind: 'api-route', name: ROUTE_PATH, file: SERVICE_FILE };
+    const routeLocation = { ...locationIn(SERVICE_FILE), resolvedBy: 'route-map' } as const;
+    const script: ToolScript = (request) => {
+      if (request.tool !== 'routeForUrl') {
+        return matchesOutcome(request, RESOLVED_NODES);
+      }
+      const result: CodeToolResult = {
+        ...FOUND_ONE,
+        tool: request.tool,
+        request,
+        payload: {
+          match: {
+            entry: {
+              routePath: ROUTE_PATH,
+              router: 'app',
+              kind: 'route-handler',
+              file: SERVICE_FILE,
+              segments: [],
+              dynamicParams: [],
+              isCatchAll: false,
+              isOptionalCatchAll: false,
+              methods: ['GET'],
+              location: routeLocation,
+            },
+            params: {},
+            pathname: ROUTE_PATH,
+          },
+          routePath: ROUTE_PATH,
+          router: 'app',
+          kind: 'route-handler',
+          methods: ['GET'],
+          params: {},
+          file: SERVICE_FILE,
+          location: routeLocation,
+          node: scriptedMatch(routeNode),
+        },
+      };
+      return ok(result);
+    };
+    const reply: CodeInvestigation = {
+      relevantFiles: [...VALID_INVESTIGATION.relevantFiles],
+      flows: [`GET ${ROUTE_PATH} → ${SERVICE_FILE}`, `${ROUTE_PATH} → ${MATH_FILE}`],
+    };
+    const { fixture, result } = await groundedRun(reply, script, [
+      FIND_CHART,
+      VALID_PROPOSALS.routeForUrl,
+    ]);
+    expect(result.investigation.flows).toStrictEqual([`GET ${ROUTE_PATH} → ${SERVICE_FILE}`]);
+    expect(completionOf(fixture).fields).toMatchObject({ removedFlowCount: 1 });
+  });
+
+  it('removes a flow whose middle pair is unlinked although both outer pairs are linked', async () => {
+    // File → component and symbol → file are containments the path showed; the
+    // component and the math symbol are two hops apart on it, so not linked.
+    const reply: CodeInvestigation = {
+      relevantFiles: [...VALID_INVESTIGATION.relevantFiles],
+      flows: [
+        `${CHART_FILE} → ${CHART_COMPONENT} → ${MATH_SYMBOL} → ${MATH_FILE}`,
+        `${CHART_FILE} → ${CHART_COMPONENT} → onPlotPress → GET ${ROUTE_PATH} → ${MATH_SYMBOL} → ${MATH_FILE}`,
+      ],
+    };
+    const { fixture, result } = await groundedRun(reply);
+    expect(result.investigation.flows).toStrictEqual([at(reply.flows, 1)]);
+    expect(completionOf(fixture).fields).toMatchObject({ flowCount: 1, removedFlowCount: 1 });
+  });
+
+  it('does not join the neighbours of a missing or malformed path node', async () => {
+    // Index 1 is a hole and index 3 a node without a file: neither is evidence,
+    // and neither may be skipped over to join the nodes either side of it.
+    const nodes = [scriptedMatch(at(VALID_FLOW_PATH, 0))];
+    nodes[2] = scriptedMatch(at(VALID_FLOW_PATH, 2));
+    nodes[3] = { ...scriptedMatch(at(VALID_FLOW_PATH, 1)), file: '' };
+    nodes[4] = scriptedMatch(at(VALID_FLOW_PATH, 3));
+    nodes[5] = scriptedMatch({
+      kind: 'component',
+      name: UNRELATED_COMPONENT,
+      file: UNRELATED_FILE,
+    });
+    expect(1 in nodes).toBe(false);
+    const script: ToolScript = (request) => {
+      if (request.tool !== 'pathBetween') {
+        return matchesOutcome(request, RESOLVED_NODES);
+      }
+      const result: CodeToolResult = {
+        ...FOUND_ONE,
+        tool: request.tool,
+        request,
+        payload: { nodes, edges: [], depth: 5, undirected: false, truncated: false },
+      };
+      return ok(result);
+    };
+    const reply: CodeInvestigation = {
+      relevantFiles: [...VALID_INVESTIGATION.relevantFiles],
+      flows: [
+        // Across the hole.
+        `${CHART_COMPONENT} → ${ROUTE_PATH}`,
+        // Across the malformed node.
+        `${ROUTE_PATH} → ${MATH_SYMBOL}`,
+        // Two well-formed neighbours: the path is still read.
+        `${MATH_SYMBOL} → ${UNRELATED_COMPONENT}`,
+      ],
+    };
+    const { fixture, result } = await groundedRun(reply, script);
+    expect(result.investigation.flows).toStrictEqual([`${MATH_SYMBOL} → ${UNRELATED_COMPONENT}`]);
+    expect(completionOf(fixture).fields).toMatchObject({ removedFlowCount: 2 });
+  });
+
+  it('grounds a declaration a result locates, and a flow of a path’s node names joined by arrows', async () => {
+    // The shape the real code graph returns: a route node whose location names the exported
+    // handler declaration (`GET`) that serves it, and the rules provider's flow label for the path.
+    const node = (
+      kind: 'component' | 'api-route' | 'symbol',
+      name: string,
+      file: string,
+      symbol: string,
+    ) => ({
+      nodeId: `${kind}:${file}#${name}`,
+      kind,
+      name,
+      file,
+      location: {
+        file,
+        line: 2,
+        column: 1,
+        symbol,
+        resolvedBy: 'code-graph' as const,
+        confidence: 0.85,
+      },
+    });
+    const nodes = [
+      node('component', CHART_COMPONENT, CHART_FILE, CHART_COMPONENT),
+      node('api-route', ROUTE_PATH, SERVICE_FILE, 'GET'),
+      node('symbol', MATH_SYMBOL, MATH_FILE, MATH_SYMBOL),
+    ] as const;
+    const script: ToolScript = (request) => {
+      if (request.tool !== 'pathBetween') {
+        return ok(emptyResult(request));
+      }
+      const result: CodeToolResult = {
+        tool: request.tool,
+        request,
+        found: true,
+        total: 1,
+        returned: 1,
+        truncated: false,
+        clamped: [],
+        payload: { nodes, edges: [], depth: 2, undirected: false, truncated: false },
+      };
+      return ok(result);
+    };
+    const reply: CodeInvestigation = {
+      relevantFiles: [
+        { file: SERVICE_FILE, symbol: 'GET', reason: 'Serves the readings.', score: 0.7 },
+        { file: MATH_FILE, symbol: MATH_SYMBOL, reason: 'Computes the points.', score: 0.6 },
+      ],
+      flows: [nodes.map((entry) => entry.name).join(' → ')],
+    };
+    const fixture = harness({
+      respond: queued(answer(batch(VALID_PROPOSALS.pathBetween)), answer(reply)),
+      tools: { script },
+    });
+    const result = expectOk(await fixture.run(stageContext().context));
+    expect(result.investigation).toStrictEqual(reply);
+    expect(completionOf(fixture).fields).toMatchObject({
+      removedFileCount: 0,
+      strippedSymbolCount: 0,
+      removedFlowCount: 0,
+    });
+  });
+
+  it('keeps an evidenced file written in a cosmetic spelling, under its normal spelling', async () => {
+    const reply = withFirstEntry({ file: `./${CHART_FILE}` });
+    expect(isCodeInvestigation(reply)).toBe(true);
+    const { result } = await groundedRun(reply);
+    expect(result.investigation).toStrictEqual(VALID_INVESTIGATION);
+  });
+
+  it('grounds nothing from a rejection or an empty result: an unevidenced investigation is an empty, valid result', async () => {
+    const fixture = harness({
+      respond: queued(
+        answer(batch(VALID_PROPOSALS.excerpt, FIND_CHART)),
+        answer(VALID_INVESTIGATION),
+      ),
+      tools: {
+        script: (request, call) =>
+          request.tool === 'excerpt' ? err(PATH_REJECTION) : findNothing(request, call),
+      },
+    });
+    const result = expectOk(await fixture.run(stageContext().context));
+
+    expect(result.investigation).toStrictEqual({ relevantFiles: [], flows: [] });
+    expect(Object.isFrozen(result.investigation)).toBe(true);
+    // No second loop, no retry, no substitute: the model was asked exactly twice.
+    expect(fixture.provider.structuredCalls).toHaveLength(2);
+    expect(result.repairs).toBe(0);
+    expect(completionOf(fixture).fields).toMatchObject({
+      relevantFileCount: 0,
+      flowCount: 0,
+      removedFileCount: VALID_INVESTIGATION.relevantFiles.length,
+      removedFlowCount: VALID_INVESTIGATION.flows.length,
+    });
+    expect(at(fixture.progress.calls, 1).findings?.relevantFiles).toStrictEqual([]);
+  });
+
+  it('logs what grounding removed as counts, never as a path, a symbol or a flow', async () => {
+    const reply = {
+      relevantFiles: [
+        { file: INVENTED_FILE, reason: 'Invented.', score: 0.4 },
+        { file: CHART_FILE, symbol: INVENTED_SYMBOL, reason: 'Renders the chart.', score: 0.9 },
+      ],
+      flows: [`${CHART_COMPONENT} → ${INVENTED_STEP}`],
+    };
+    const { fixture } = await groundedRun(reply);
+    const fields = completionOf(fixture).fields;
+    expect(fields).toMatchObject({
+      removedFileCount: 1,
+      strippedSymbolCount: 1,
+      removedFlowCount: 1,
+    });
+    for (const value of Object.values(fields)) {
+      expect(['number', 'string']).toContain(typeof value);
+    }
+    const logged = fixture.log.records.map(serializeRecord).join('\n');
+    for (const fragment of [INVENTED_FILE, INVENTED_SYMBOL, INVENTED_STEP, CHART_FILE]) {
+      expect(logged).not.toContain(fragment);
+    }
+  });
+});
+
 describe('progress rows', () => {
   it('emits the investigate header, the findings and the closing row, authoring none of their text', async () => {
     const fixture = harness({
@@ -2664,7 +3340,8 @@ describe('progress rows', () => {
     async (behaviour) => {
       const fixture = harness({
         progress: behaviour,
-        respond: queued(answer(batch(FIND_CHART)), answer(VALID_INVESTIGATION)),
+        respond: queued(answer(batch(FIND_CHART, TRACE_FLOW)), answer(VALID_INVESTIGATION)),
+        tools: { script: resolvingScript('') },
       });
       const result = expectOk(await fixture.run(stageContext().context));
       expect(result.investigation).toStrictEqual(VALID_INVESTIGATION);
@@ -2817,7 +3494,21 @@ describe('privacy of log records and errors (AAP §0.5.2)', () => {
     });
     const probe = stageContext({ question: SENTINEL_QUESTION });
     const result = expectOk(await fixture.run(probe.context));
-    expect(result.investigation).toStrictEqual(investigation);
+    // Only the excerpt returned anything: its file is kept without the symbol no result placed
+    // there, the unreturned service file is removed, and the prose flow is removed.
+    expect(result.investigation).toStrictEqual({
+      relevantFiles: [{ file: CHART_FILE, reason: `Plots the ${SENTINEL} series.`, score: 0.8 }],
+      flows: [],
+    });
+    const completed = fixture.log.records.filter(
+      (record) => record.message === 'Investigate stage produced a validated code investigation.',
+    );
+    expect(completed).toHaveLength(1);
+    expect(completed[0]?.fields).toMatchObject({
+      removedFileCount: 1,
+      strippedSymbolCount: 1,
+      removedFlowCount: 1,
+    });
     expectCleanLogs(fixture, probe);
   });
 
@@ -2833,11 +3524,36 @@ describe('privacy of log records and errors (AAP §0.5.2)', () => {
     expectCleanLogs(fixture, probe);
   });
 
+  it('a proposal the reply schema refuses leaks nothing of it into the error or the logs', async () => {
+    const fixture = harness({
+      respond: always(
+        answer(batch({ tool: SENTINEL, name: SENTINEL }, { tool: 'findSymbol', symbol: SENTINEL })),
+      ),
+    });
+    const probe = stageContext({ question: SENTINEL_QUESTION });
+    const error = expectErr(await fixture.run(probe.context));
+    expect(reasonOf(error)).toBe('schema');
+    expect(fixture.tools.executed).toHaveLength(0);
+    for (const content of FORBIDDEN_CONTENT) {
+      expect(serializeError(error).includes(content), content).toBe(false);
+    }
+    // The repair turns name paths and rules, never the refused values.
+    for (const call of fixture.provider.structuredCalls.slice(1)) {
+      expect(last(call.request.messages ?? []).content).not.toContain(SENTINEL);
+    }
+    expectCleanLogs(fixture, probe);
+  });
+
   it('an exhausted budget leaks no proposal into the error or the logs', async () => {
     const fixture = harness({
       limits: { maxCallsPerStage: 2 },
       respond: always(
-        answer(batch({ tool: SENTINEL, name: SENTINEL }, { tool: 'excerpt', file: CHART_FILE })),
+        answer(
+          batch(
+            { tool: 'findSymbol', file: `../${SENTINEL}.ts`, symbol: SENTINEL },
+            { tool: 'excerpt', file: CHART_FILE },
+          ),
+        ),
       ),
       tools: { script: (request) => excerptOutcome(request, excerptText) },
     });

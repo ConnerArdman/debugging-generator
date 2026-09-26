@@ -73,8 +73,10 @@
  *
  * The replay is bounded: at most {@link MAX_REPLAYED_PROGRESS_ROWS} progress
  * rows, the most recent ones, because broadcasting tens of thousands of frames
- * into a freshly connected panel would stall it. The truncation is logged and
- * reported as {@link ReopenedSession.truncatedProgress}.
+ * into a freshly connected panel would stall it. The bound is applied when the
+ * rows are read (`SessionsRepo.listProgressTail`), so the older rows are never
+ * loaded at all. The truncation is logged and reported as
+ * {@link ReopenedSession.truncatedProgress}.
  *
  * Delivery is synchronous and in call order (`../server/clients.ts`), so each
  * recipient sees the frames in the table's order. A broadcaster that throws is
@@ -90,8 +92,8 @@
  *   shape protocol's `HTTP_ROUTES` fixes for `session.get`. A missing session
  *   is an `Err` with `SESSION_NOT_FOUND`, which that route answers `404`; a
  *   session purged by retention is simply absent and is never reconstructed.
- *   `GET /sessions` reads the repository's `list()` projection through the
- *   manager, not this module.
+ *   `GET /sessions` reads one page of list rows from the repository's
+ *   `listWithinFolders()` projection, not this module.
  * - `../server/routes/binding.ts` calls
  *   `reopen(sessionId, { kinds: ['devtools'] })` after a `session.bind`
  *   succeeds, so a DevTools panel that attaches to an existing session
@@ -145,7 +147,7 @@ import {
   type SessionId,
 } from '@debuggen/shared';
 
-import { sessionLogger, subsystemLogger } from '../logging.js';
+import { describeException, guardLogger, sessionLogger, subsystemLogger } from '../logging.js';
 import type { PanelsRepo } from '../store/panels-repo.js';
 import type { ProgressEntry, SessionsRepo } from '../store/sessions-repo.js';
 import type { SessionBroadcaster } from './manager.js';
@@ -219,8 +221,11 @@ const SESSION_UNREADABLE_HINT =
  * `appendProgress`, an insert, or the request-key secret accessor.
  */
 export interface SessionReopenerDeps {
-  /** The session record and its persisted progress history. */
-  readonly sessions: Pick<SessionsRepo, 'get' | 'listProgress'>;
+  /**
+   * The session record and the most recent lines of its persisted progress
+   * history, read with the stored total so the replay bound is applied in SQL.
+   */
+  readonly sessions: Pick<SessionsRepo, 'get' | 'listProgressTail'>;
   /** The latest panel and the latest analysis of the session. */
   readonly panels: Pick<PanelsRepo, 'getLatestPanel' | 'getLatestAnalysis'>;
   /** Where replayed frames go; the client registry in production. */
@@ -489,7 +494,9 @@ function describe(
 export function createSessionReopener(deps: SessionReopenerDeps): SessionReopener {
   const { sessions, panels, broadcaster } = deps;
   const clock = deps.now ?? nowEpochMs;
-  const log = subsystemLogger(deps.logger ?? noopLogger, LOG_SUBSYSTEM);
+  // Guarded before the child is derived, so no record written here — the
+  // clock fallback's included — can throw into a replay.
+  const log = subsystemLogger(guardLogger(deps.logger ?? noopLogger), LOG_SUBSYSTEM);
 
   /**
    * The injected clock's reading, for the frames that are stamped when sent.
@@ -503,9 +510,14 @@ export function createSessionReopener(deps: SessionReopenerDeps): SessionReopene
       if (isEpochMs(value)) {
         return value;
       }
-    } catch {
-      // Fall through: an injected clock is a test seam, and its failure must
-      // not cost the developer the reopened session.
+    } catch (thrown) {
+      // An injected clock is a test seam, and its failure must not cost the
+      // developer the reopened session: the wall clock stamps the frame
+      // instead, and the substitution is recorded by the thrown value's closed
+      // class only.
+      log.debug('the injected clock threw; the wall clock stamps this replayed frame', {
+        ...describeException(thrown),
+      });
     }
 
     return nowEpochMs();
@@ -552,13 +564,18 @@ export function createSessionReopener(deps: SessionReopenerDeps): SessionReopene
   }
 
   /**
-   * Reads the progress history in stored order, keeps the most recent
-   * {@link MAX_REPLAYED_PROGRESS_ROWS} rows, and validates each one as a
-   * `session.progress` payload. A row that fails is skipped on its own; a
-   * history that cannot be read at all is skipped as a whole.
+   * Reads the most recent {@link MAX_REPLAYED_PROGRESS_ROWS} rows of the
+   * progress history, in stored order, and validates each one as a
+   * `session.progress` payload. The bound is applied by the store — only the
+   * tail is read, newest first on the `(session_id, id)` index, together with
+   * the stored total — so a long history never costs a reopen more than the
+   * rows it replays. A row that fails is skipped on its own; a history that
+   * cannot be read at all is skipped as a whole.
    */
   function readProgress(sessionId: SessionId, scoped: Logger): ProgressRead {
-    const listed = guardedRead(() => sessions.listProgress(sessionId));
+    const listed = guardedRead(() =>
+      sessions.listProgressTail(sessionId, MAX_REPLAYED_PROGRESS_ROWS),
+    );
 
     if (isErr(listed)) {
       scoped.warn('the stored progress history could not be read and is not replayed', {
@@ -568,14 +585,13 @@ export function createSessionReopener(deps: SessionReopenerDeps): SessionReopene
       return { frames: [], truncated: 0, skipped: true };
     }
 
-    const rows = listed.value;
-    const truncated = Math.max(0, rows.length - MAX_REPLAYED_PROGRESS_ROWS);
-    const retained = truncated === 0 ? rows : rows.slice(truncated);
+    const { entries: retained, total } = listed.value;
+    const truncated = Math.max(0, total - retained.length);
 
     if (truncated > 0) {
       scoped.info('the progress history exceeds the replay bound; the most recent rows replay', {
         artifact: 'progress',
-        stored: rows.length,
+        stored: total,
         retained: retained.length,
         truncated,
       });
@@ -833,8 +849,9 @@ export function createSessionReopener(deps: SessionReopenerDeps): SessionReopene
 
   /**
    * Runs one operation at the method boundary, so a fault nobody anticipated —
-   * a logger that throws, say — becomes an `Err` rather than a rejected
-   * promise in the route that awaited it.
+   * a collaborator that throws where no guard expected it, say — becomes an
+   * `Err` rather than a rejected promise in the route that awaited it. (The
+   * logger is not such a fault: it is guarded and cannot throw.)
    */
   function settle(
     operation: () => Result<ReopenedSession, DebuggenError>,

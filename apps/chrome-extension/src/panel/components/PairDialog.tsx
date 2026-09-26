@@ -24,9 +24,21 @@
  *   port request (`../../shared/messages`), whose success payload is
  *   `{ paired: true }` — no credential ever travels back to the panel, so this
  *   component cannot render, log or keep one. It opens no socket, performs no
- *   `fetch`, touches no `chrome.*` API and reads or writes no storage, which is
- *   also why it renders unchanged when the panel page is opened directly with
- *   `chrome.devtools` undefined.
+ *   `fetch`, never reads or writes the credential, and touches no `chrome.*`
+ *   API but one, described next — which is also why it renders unchanged when
+ *   the panel page is opened directly with `chrome.devtools` undefined.
+ * - It reads and writes exactly one setting, which is not a secret: the local
+ *   service's address, through a {@link ServiceEndpointAccessor}
+ *   ({@link PairDialogProps.serviceEndpoint}). By default that accessor is the
+ *   pure helper pair of `../../background/auth` over `chrome.storage.local`,
+ *   resolved when the dialog opens — never at import — and absent where
+ *   `chrome.storage` is not available, in which case the field is not
+ *   rendered. The value is validated and saved **before** the code is
+ *   submitted, so the worker redeems the code at the address the developer
+ *   entered; a refused or unsaved address is shown on the field and the code
+ *   is not submitted. A refusal never quotes the value (it may be a paste that
+ *   carries anything); the field's own controlled `value` is the only place
+ *   the text appears.
  * - The code lives in component state for exactly as long as the dialog is
  *   open. `PairDialog` renders nothing while closed, so closing unmounts the
  *   body and discards the typed text; a successful pairing clears it before
@@ -35,25 +47,50 @@
  *   codes are single-use and the service rate-limits the route (five failures,
  *   then a lockout), so a silent retry loop would burn attempts the developer
  *   needs. The retry control re-submits only on an explicit click.
- * - No client-side format or length rule is applied. The worker and the
- *   service validate the code; a rule invented here would reject a valid code
- *   the day the format changes upstream. Surrounding whitespace is trimmed and
- *   an empty value keeps the submit control disabled — nothing more.
+ * - Only a well-formed code is ever submitted. The value is checked by
+ *   `checkPairingCode` (`../../shared/pairing-code`), which mirrors the
+ *   service's rule — eight characters of the service's 32-symbol alphabet,
+ *   after trimming and upper-casing — and a value that breaks it is refused
+ *   here, with the reason on the field, before it can cost one of the five
+ *   attempts the rate limit allows. What is submitted is the normalised code
+ *   (trimmed, upper-cased), which is exactly what the service redeems. The
+ *   check is a pre-flight filter only: the worker keeps its own length check,
+ *   and the service alone decides whether a well-formed code is genuine,
+ *   unexpired and unused.
  * - The code is never written into an error message, a log line or any
- *   attribute other than the field's own controlled `value`.
+ *   attribute other than the field's own controlled `value`; a validation
+ *   message names the rule and, for a wrong length, the length — never a
+ *   character of the value.
  *
  * ## States (AAP 0.6.2, 0.5.5)
  *
- * - **idle** — the field and both actions are enabled; "Pair" is disabled
- *   while the trimmed value is empty.
- * - **submitting** — the field and "Pair" are disabled (natively, so they are
+ * - **idle** — the fields and both actions are enabled. The service address
+ *   field is prefilled with the saved address, shows the default as its
+ *   placeholder when none is saved, and shows why a saved address is unusable
+ *   when it is. "Pair" stays enabled whatever the code field holds, so
+ *   pressing it — or `Enter` in a field — always answers: a well-formed code
+ *   is submitted, anything else is refused with the reason shown on the code
+ *   field and focus moved to it.
+ * - **invalid** (within idle) — the code field carries the renderer `Input`'s
+ *   `invalid` state and its `errorMessage`. A value that can no longer become
+ *   valid by typing on — a disallowed character, or more than eight
+ *   characters — is flagged as it is typed; an empty or still-too-short value
+ *   is flagged only once a submit was attempted, so the field does not
+ *   complain while the developer is midway through the code. After a submit
+ *   attempt the message follows every edit, and it disappears as soon as the
+ *   value is well-formed.
+ * - **submitting** — the fields and "Pair" are disabled (natively, so they are
  *   genuinely inert), "Pair" reads "Pairing…" and the dialog carries
- *   `aria-busy`. `LoadingState` is deliberately not used: it owns a
+ *   `aria-busy`. An edited service address is saved first; a refusal returns
+ *   the dialog to idle with the reason on the address field (`invalid` plus
+ *   its error message) and focus on it, and the code is not submitted.
+ *   `LoadingState` is deliberately not used: it owns a
  *   `role="status"` live region that would compete with the error alert, and
  *   the busy button already shows that work is in progress.
  * - **failed** — the renderer's `ErrorState` (`role="alert"`, so the failure
  *   is announced) shows the service's message, its hint and its error code,
- *   with a "Try again" action that re-submits the current value. A failure is
+ *   with a "Try again" action that re-submits the current value, offered while
+ *   that value is well-formed. A failure is
  *   never presented as success, and success is never inferred from anything
  *   but the resolved `submitCode` promise.
  *
@@ -62,19 +99,42 @@
  * - `role="dialog"` with `aria-modal="true"`, named by its level-2 `Heading`
  *   through `aria-labelledby` and described by the instruction through
  *   `aria-describedby`.
- * - Focus moves to the code field on open and returns to the element that had
- *   it before the dialog opened when the dialog closes — provided focus is
- *   still inside the dialog (or was dropped to the document body), so a close
- *   never steals focus the developer already moved elsewhere. The mount effect
- *   is symmetric, so React StrictMode's mount → unmount → mount replay ends in
- *   the same place as a single mount.
+ * - The modality is real, not only declared. The owner makes everything
+ *   behind the dialog `inert` while it is open (the panel's `App` does so for
+ *   the header, the body, the drawer and the live tail), so the background can
+ *   be neither focused, clicked nor reached by assistive technology. The
+ *   dialog adds containment of its own on top: a document-level `focusin`
+ *   listener (capture phase) returns focus that lands anywhere outside the
+ *   dialog — moved there by script, say — to the code field, or to the dialog
+ *   element while the field is disabled. That listener and the document-level
+ *   `Escape` listener described below are added and removed by one symmetric
+ *   effect, so a StrictMode replay leaves exactly one of each.
+ * - Focus moves to the code field on open and, when the dialog is removed,
+ *   returns to the element that held it before the dialog opened (never the
+ *   document body) — provided focus is still inside the dialog or was dropped
+ *   to the body with its node, so a close never steals focus the developer
+ *   already moved elsewhere. The opener is kept across React StrictMode's
+ *   mount → unmount → mount replay, which removes no node and therefore moves
+ *   no focus: the replay ends where a single mount does, even though the
+ *   opener is inert — and so cannot take focus — for as long as the dialog is
+ *   open.
  * - `Escape` closes from anywhere inside the dialog, including while a submit
- *   is in flight. Tab and Shift+Tab cycle between the dialog's first and last
+ *   is in flight, and also while focus has fallen to the document body (a
+ *   click on an empty stretch of the page), because the key is then observed
+ *   on the document. An `Escape` that ends an IME composition is left to the
+ *   composition. Tab and Shift+Tab cycle between the dialog's first and last
  *   enabled controls; because `Escape` always exits, the cycle is not a
  *   keyboard trap.
- * - `Enter` in the field submits through native implicit form submission, and
- *   a disabled submit button makes implicit submission a no-op, which is the
- *   "empty value cannot be submitted" rule enforced by the platform itself.
+ * - `Enter` in the field submits through native implicit form submission. The
+ *   submit button is disabled only while a submit is in flight — a disabled
+ *   default button would turn implicit submission into a silent no-op — so an
+ *   ill-formed value always reaches the check and always produces a visible
+ *   reason.
+ * - A validation error is the `Input` primitive's own: `aria-invalid` on the
+ *   control and the message linked through `aria-describedby`, after the
+ *   field's hint. It is deliberately not a live region, which would interrupt
+ *   on every keystroke; a refused submit instead moves focus to the field, so
+ *   the message is read with it.
  * - Every control is a renderer primitive, so every keyboard focus shows the
  *   token ring `--dg-focus-ring` from the renderer's global `:focus-visible`
  *   rule.
@@ -93,8 +153,10 @@
  * positioning primitive, and fixed positioning cannot be expressed through a
  * `--dg-*` token, so the dialog renders in document flow as a token-styled
  * card rather than floating over a scrim. Where it appears is the composition
- * root's decision (it renders the dialog in place of the panel body while the
- * panel is not paired); the modal semantics above hold regardless of
+ * root's decision (the panel renders it directly under its header while the
+ * panel is not paired). Without a scrim, modality is enforced by the owner's
+ * inert background together with this dialog's focus containment and
+ * `Escape` handling, so the modal semantics above hold regardless of
  * placement.
  *
  * @module apps/chrome-extension/src/panel/components/PairDialog
@@ -109,7 +171,8 @@ import {
   Stack,
   Text,
 } from '@debuggen/panel-renderer';
-import { DebuggenError } from '@debuggen/shared';
+import type { Result } from '@debuggen/shared';
+import { DebuggenError, err, isErr } from '@debuggen/shared';
 import type {
   KeyboardEvent as ReactKeyboardEvent,
   ReactElement,
@@ -117,7 +180,12 @@ import type {
 } from 'react';
 import { useEffect, useId, useRef, useState } from 'react';
 
+import type { ServiceEndpointAccessor } from '../../background/auth';
+import { createServiceEndpointAccessor } from '../../background/auth';
 import type { PortRequestPayloads } from '../../shared/messages';
+import { DEFAULT_SERVICE_BASE_URL } from '../../shared/messages';
+import { PAIRING_CODE_LENGTH, checkPairingCode } from '../../shared/pairing-code';
+import type { PairingCodeCheck } from '../../shared/pairing-code';
 
 /*
  * ===========================================================================
@@ -139,8 +207,21 @@ const PAIR_DIALOG_INSTRUCTION =
 /** The field's visible label. */
 const PAIRING_FIELD_LABEL = 'Pairing code';
 
-/** Help text below the field. */
-const PAIRING_FIELD_HINT = 'Type or paste the code exactly as VS Code shows it.';
+/**
+ * Help text below the field. States the length up front, so the rule a refused
+ * submit reports is never a surprise; the length is the shared constant, so the
+ * hint and the check cannot disagree.
+ */
+const PAIRING_FIELD_HINT = `Type or paste the ${String(PAIRING_CODE_LENGTH)}-character code exactly as VS Code shows it.`;
+
+/** The service address field's visible label. */
+const SERVICE_ADDRESS_FIELD_LABEL = 'Service address';
+
+/** Help text below the service address field. */
+const SERVICE_ADDRESS_FIELD_HINT = `The loopback address the local service listens on. Leave it blank for the default, ${DEFAULT_SERVICE_BASE_URL}.`;
+
+/** The field's message when the address could not be validated or saved and carried no text. */
+const SERVICE_ADDRESS_FALLBACK_MESSAGE = 'The service address could not be saved.';
 
 /** The primary action at rest. */
 const PAIR_ACTION_LABEL = 'Pair';
@@ -202,17 +283,28 @@ export interface PairDialogProps {
   onClose: () => void;
 
   /**
-   * Submits one trimmed, non-empty code to the service worker and settles when
-   * the worker answers. The composition root binds it to the `pair.complete`
-   * port request; resolve on `{ paired: true }` and reject with the failure —
-   * ideally the `DebuggenError` the panel connection produces, whose message,
-   * hint and code are shown as they are. Called only on an explicit submit or
-   * retry, never on a timer.
+   * Submits one well-formed code — normalised by `checkPairingCode`: trimmed,
+   * upper-cased, eight characters of the service's alphabet — to the service
+   * worker and settles when the worker answers. An ill-formed value is refused
+   * in the dialog and never reaches this callback. The composition root binds
+   * it to the `pair.complete` port request; resolve on `{ paired: true }` and
+   * reject with the failure — ideally the `DebuggenError` the panel connection
+   * produces, whose message, hint and code are shown as they are. Called only
+   * on an explicit submit or retry, never on a timer.
    */
   submitCode: (code: PairingCodeValue) => Promise<void>;
 
   /** Raised after `submitCode` resolved, immediately before `onClose`. */
   onPaired?: (() => void) | undefined;
+
+  /**
+   * Where the service address setting is read from and saved to. Omitted, the
+   * dialog uses `chrome.storage.local` through `../../background/auth`'s
+   * helpers when this document has it, and renders no address field when it
+   * does not. `write` validates (`parseServiceEndpoint`) before it stores; a
+   * blank value restores the default.
+   */
+  serviceEndpoint?: ServiceEndpointAccessor | undefined;
 
   /**
    * Extra classes for the dialog element. Composition only: any class named
@@ -253,6 +345,75 @@ const SUBMITTING_PHASE: PairPhase = { kind: 'submitting' };
 /** `value` when it holds visible text, otherwise `fallback`. */
 function textOr(value: string | undefined, fallback: string): string {
   return value !== undefined && value.trim() !== '' ? value : fallback;
+}
+
+/**
+ * The default {@link ServiceEndpointAccessor}: one over this document's
+ * `chrome.storage.local`, or `undefined` where there is none (the panel page
+ * opened outside the extension, a unit test's document). Read when called —
+ * once per open — never at import.
+ */
+function platformServiceEndpoint(): ServiceEndpointAccessor | undefined {
+  if (typeof chrome === 'undefined') {
+    return undefined;
+  }
+  const namespace: Partial<typeof chrome> = chrome;
+  const local = namespace.storage?.local;
+  return local === undefined ? undefined : createServiceEndpointAccessor(local);
+}
+
+/**
+ * The sentence shown on the address field for a refused or unsaved address:
+ * the refusal's message and its hint. Both are constants of the validator or
+ * of the storage wrapper, never built from the value.
+ */
+function describeAddressFailure(error: DebuggenError): string {
+  const message = textOr(error.message, SERVICE_ADDRESS_FALLBACK_MESSAGE);
+  return error.hint === undefined || error.hint.trim() === ''
+    ? message
+    : `${message} ${error.hint}`;
+}
+
+/**
+ * Settle an accessor call into a `Result`, whatever it does: an injected
+ * accessor is not bound by the helpers' never-rejects contract.
+ */
+async function settleAccessor<T>(
+  run: () => Promise<Result<T, DebuggenError>>,
+): Promise<Result<T, DebuggenError>> {
+  try {
+    return await run();
+  } catch (thrown: unknown) {
+    return err(DebuggenError.from(thrown, 'STORE_ERROR'));
+  }
+}
+
+/**
+ * The validation message the field shows for the current value, or `undefined`
+ * while it shows none.
+ *
+ * A well-formed value never shows one. A value that typing on cannot repair —
+ * a disallowed character, or more than {@link PAIRING_CODE_LENGTH} characters —
+ * shows its message at once. An empty or still-too-short value is a code being
+ * typed, so its message waits until a submit was attempted; from then on every
+ * message follows the value as it is edited.
+ *
+ * @param check The current value's {@link checkPairingCode} result.
+ * @param submitAttempted Whether a submit of this dialog's value was attempted.
+ * @returns The message to render through `Input`'s `errorMessage`, or
+ * `undefined`.
+ */
+function visibleValidationMessage(
+  check: PairingCodeCheck,
+  submitAttempted: boolean,
+): string | undefined {
+  if (check.valid) {
+    return undefined;
+  }
+  const beyondRepairByTyping =
+    check.problem === 'characters' ||
+    (check.problem === 'length' && check.receivedLength > PAIRING_CODE_LENGTH);
+  return submitAttempted || beyondRepairByTyping ? check.message : undefined;
 }
 
 /**
@@ -349,6 +510,23 @@ function focusField(doc: Document, fieldId: string): void {
 }
 
 /**
+ * Return focus to the dialog after it landed outside: on the code field when it
+ * is enabled, otherwise on the dialog element itself — where a submit parks
+ * focus while the field is disabled — so `Escape` keeps reaching the dialog's
+ * key handler.
+ *
+ * @param dialog The dialog element.
+ * @param fieldId The id passed to the field.
+ */
+function returnFocusInside(dialog: HTMLElement, fieldId: string): void {
+  const doc = dialog.ownerDocument;
+  focusField(doc, fieldId);
+  if (!dialog.contains(doc.activeElement)) {
+    dialog.focus();
+  }
+}
+
+/**
  * Keep Tab and Shift+Tab inside the dialog by cycling between its first and
  * last tabbable controls.
  *
@@ -409,15 +587,42 @@ type PairDialogBodyProps = Omit<PairDialogProps, 'open'>;
  * @returns The dialog.
  */
 function PairDialogBody(props: PairDialogBodyProps): ReactElement {
-  const { onClose, submitCode, onPaired, className } = props;
+  const { onClose, submitCode, onPaired, className, serviceEndpoint } = props;
 
   const baseId = useId();
   const headingId = `${baseId}-title`;
   const descriptionId = `${baseId}-description`;
   const fieldId = `${baseId}-code`;
+  const addressFieldId = `${baseId}-service-address`;
 
   const [code, setCode] = useState('');
   const [phase, setPhase] = useState<PairPhase>(IDLE_PHASE);
+  /**
+   * Whether a submit of this dialog's value was attempted, which is what lets
+   * an empty or still-too-short value show its validation message (see
+   * {@link visibleValidationMessage}).
+   */
+  const [submitAttempted, setSubmitAttempted] = useState(false);
+
+  /**
+   * The platform's address setting, resolved once when the dialog opens and
+   * only when the caller supplied none.
+   */
+  const [platformEndpoint] = useState(() =>
+    serviceEndpoint === undefined ? platformServiceEndpoint() : undefined,
+  );
+  /** The setting this open works with; without one, no address field is rendered. */
+  const endpointAccessor = serviceEndpoint ?? platformEndpoint;
+  const [address, setAddress] = useState('');
+  /** Why the address shown is unusable or could not be saved, when it is. */
+  const [addressError, setAddressError] = useState<string | undefined>(undefined);
+  /**
+   * Whether the address must be saved before the code is submitted: the
+   * developer edited it, or the saved one is unusable. An untouched, valid
+   * address is left alone, so a slow read can never be overwritten by a field
+   * that had not been prefilled yet.
+   */
+  const addressNeedsSaveRef = useRef(false);
 
   const dialogRef = useRef<HTMLDivElement>(null);
   /**
@@ -432,13 +637,69 @@ function PairDialogBody(props: PairDialogBodyProps): ReactElement {
    * connection pill learns that from the worker's own push.
    */
   const mountedRef = useRef(false);
+  /**
+   * The element that held focus when the dialog opened, returned focus to when
+   * the dialog is removed. A ref rather than an effect-local, so StrictMode's
+   * replayed mount — which finds focus already on the field — keeps the opener
+   * the first mount recorded.
+   */
+  const openerRef = useRef<HTMLElement | null>(null);
+
+  // Containment: while the dialog is mounted, focus that lands anywhere outside
+  // it is returned inside, and an `Escape` whose target is outside it (focus
+  // fell to the document body) still closes it. Both listeners sit on the
+  // document in the capture phase, so they observe every focus move and key
+  // before any handler of the page can act on it. Declared before the focus
+  // effect below so that on unmount the listeners are gone before the opener
+  // takes focus back; one effect adds both and removes both, so a StrictMode
+  // replay leaves exactly one of each.
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (dialog === null) {
+      return undefined;
+    }
+    const doc = dialog.ownerDocument;
+
+    const containFocus = (event: FocusEvent): void => {
+      const target = event.target;
+      if (!dialog.isConnected || (target instanceof Node && dialog.contains(target))) {
+        return;
+      }
+      returnFocusInside(dialog, fieldId);
+    };
+
+    const closeOnEscapeOutside = (event: KeyboardEvent): void => {
+      if (event.key !== 'Escape' || event.isComposing || event.defaultPrevented) {
+        return;
+      }
+      const target = event.target;
+      if (target instanceof Node && dialog.contains(target)) {
+        // Inside the dialog: its own key handler takes the key.
+        return;
+      }
+      event.preventDefault();
+      // Consumed for the same reason the dialog's own handler consumes it: an
+      // unhandled Escape can be forwarded to the DevTools front end.
+      event.stopPropagation();
+      onClose();
+    };
+
+    doc.addEventListener('focusin', containFocus, true);
+    doc.addEventListener('keydown', closeOnEscapeOutside, true);
+    return () => {
+      doc.removeEventListener('focusin', containFocus, true);
+      doc.removeEventListener('keydown', closeOnEscapeOutside, true);
+    };
+  }, [fieldId, onClose]);
 
   // Focus in on open; focus back out on close. The opener is read before the
-  // field is focused, and restored only while focus is still inside the dialog
-  // (or was dropped to the body when the dialog's node was removed), so a
-  // close never takes focus from wherever the developer moved it. The effect
-  // is symmetric — StrictMode's replayed mount restores the opener, then reads
-  // it again and refocuses the field — so a double invocation is harmless.
+  // field is focused — never the document body, which is not a destination —
+  // and restored only when the dialog's node has actually been removed and
+  // focus is still inside the dialog or was dropped to the body with it, so a
+  // close never takes focus from wherever the developer moved it. StrictMode's
+  // replay removes no node, so it moves no focus: the field keeps it, and the
+  // opener — inert behind the modal, so unable to take focus anyway — stays
+  // recorded for the real close.
   useEffect(() => {
     const dialog = dialogRef.current;
     if (dialog === null) {
@@ -446,13 +707,20 @@ function PairDialogBody(props: PairDialogBodyProps): ReactElement {
     }
     const doc = dialog.ownerDocument;
     const previous = doc.activeElement;
-    const opener = previous instanceof HTMLElement && !dialog.contains(previous) ? previous : null;
+    if (previous instanceof HTMLElement && previous !== doc.body && !dialog.contains(previous)) {
+      openerRef.current = previous;
+    }
 
     mountedRef.current = true;
     focusField(doc, fieldId);
 
     return () => {
       mountedRef.current = false;
+      if (dialog.isConnected) {
+        return;
+      }
+      const opener = openerRef.current;
+      openerRef.current = null;
       const current = doc.activeElement;
       const focusWasInside = current === null || current === doc.body || dialog.contains(current);
       if (opener !== null && opener.isConnected && focusWasInside) {
@@ -480,9 +748,56 @@ function PairDialogBody(props: PairDialogBodyProps): ReactElement {
     }
   }, [phase, fieldId]);
 
-  const trimmedCode = code.trim();
+  // Prefill the address field with the saved address, or say why the saved
+  // one is unusable. An answer that arrives after the developer started
+  // typing, or after the dialog closed, is dropped.
+  useEffect(() => {
+    if (endpointAccessor === undefined) {
+      return undefined;
+    }
+    let current = true;
+    void settleAccessor(() => endpointAccessor.read()).then((stored) => {
+      if (!current || addressNeedsSaveRef.current) {
+        return;
+      }
+      if (isErr(stored)) {
+        addressNeedsSaveRef.current = stored.error.code !== 'STORE_ERROR';
+        setAddressError(describeAddressFailure(stored.error));
+        return;
+      }
+      setAddress(stored.value ?? '');
+    });
+    return () => {
+      current = false;
+    };
+  }, [endpointAccessor]);
+
+  // After a refused address the field is enabled again: move focus to it —
+  // only from where the submit parked it, as for a failed code.
+  useEffect(() => {
+    if (addressError === undefined || phase.kind !== 'idle') {
+      return;
+    }
+    const dialog = dialogRef.current;
+    if (dialog === null) {
+      return;
+    }
+    const doc = dialog.ownerDocument;
+    const active = doc.activeElement;
+    if (active === null || active === dialog || active === doc.body) {
+      focusField(doc, addressFieldId);
+    }
+  }, [addressError, phase, addressFieldId]);
+
+  const check = checkPairingCode(code);
   const submitting = phase.kind === 'submitting';
-  const canSubmit = trimmedCode !== '' && !submitting;
+  const validationMessage = visibleValidationMessage(check, submitAttempted);
+  // `Input` declares `invalid` and `errorMessage` without `| undefined`
+  // (`exactOptionalPropertyTypes`), so the pair is present together or not at
+  // all — which is also the primitive's own contract: no message without the
+  // invalid state, and no invalid state without a message.
+  const validationProps =
+    validationMessage === undefined ? {} : { invalid: true, errorMessage: validationMessage };
   const failure = phase.kind === 'failed' ? phase.failure : undefined;
 
   /**
@@ -492,7 +807,28 @@ function PairDialogBody(props: PairDialogBodyProps): ReactElement {
    * or `onClose` can never be reported as a refused code — a success is
    * never shown as a failure, just as a failure is never shown as a success.
    */
-  async function redeem(candidate: PairingCodeValue): Promise<void> {
+  async function redeem(candidate: PairingCodeValue, enteredAddress: string): Promise<void> {
+    if (endpointAccessor !== undefined && addressNeedsSaveRef.current) {
+      // Saved first, so the worker — which re-reads the setting before it
+      // redeems — sends the code to the address the developer entered.
+      const saved = await settleAccessor(() => endpointAccessor.write(enteredAddress));
+      if (isErr(saved)) {
+        inFlightRef.current = false;
+        if (mountedRef.current) {
+          setAddressError(describeAddressFailure(saved.error));
+          setPhase(IDLE_PHASE);
+        }
+        return;
+      }
+      addressNeedsSaveRef.current = false;
+      if (!mountedRef.current) {
+        // Closed while saving: the developer cancelled, so no code is sent.
+        inFlightRef.current = false;
+        return;
+      }
+      setAddress(saved.value ?? '');
+    }
+
     try {
       await submitCode(candidate);
     } catch (error: unknown) {
@@ -507,26 +843,51 @@ function PairDialogBody(props: PairDialogBodyProps): ReactElement {
     if (!mountedRef.current) {
       return;
     }
-    // Drop the capability before anything else happens.
+    // Drop the capability before anything else happens. The attempt flag goes
+    // with it, so a dialog its owner keeps open starts over without flagging
+    // the now-empty field.
     setCode('');
+    setSubmitAttempted(false);
     setPhase(IDLE_PHASE);
     onPaired?.();
     onClose();
   }
 
-  /** Submit the current value once, from an explicit submit or retry. */
+  /**
+   * Submit the current value once, from an explicit submit or retry — but only
+   * a well-formed one. An ill-formed value never reaches `submitCode`: the
+   * attempt reveals the field's validation message and moves focus to the
+   * field, so the reason is read with it and the developer can correct it in
+   * place.
+   */
   function submit(): void {
-    const candidate = code.trim();
-    if (candidate === '' || inFlightRef.current) {
+    if (inFlightRef.current) {
       return;
     }
+    setSubmitAttempted(true);
+    const checked = checkPairingCode(code);
+    if (!checked.valid) {
+      const dialog = dialogRef.current;
+      if (dialog !== null) {
+        focusField(dialog.ownerDocument, fieldId);
+      }
+      return;
+    }
+    const candidate: PairingCodeValue = checked.code;
     inFlightRef.current = true;
     // Park focus on the dialog element before the field and the submit
     // control become disabled: a disabled element drops focus to the document
     // body, where `Escape` would no longer reach the dialog's key handler.
     dialogRef.current?.focus();
     setPhase(SUBMITTING_PHASE);
-    void redeem(candidate);
+    void redeem(candidate, address);
+  }
+
+  /** The developer edited the address: it is saved on the next submit. */
+  function handleAddressChange(next: string): void {
+    addressNeedsSaveRef.current = true;
+    setAddress(next);
+    setAddressError(undefined);
   }
 
   function handleSubmit(event: ReactSubmitEvent<HTMLFormElement>): void {
@@ -589,15 +950,37 @@ function PairDialogBody(props: PairDialogBodyProps): ReactElement {
               autoCapitalize="off"
               autoCorrect="off"
               spellCheck={false}
+              {...validationProps}
             />
 
+            {endpointAccessor === undefined ? null : (
+              <Input
+                id={addressFieldId}
+                label={SERVICE_ADDRESS_FIELD_LABEL}
+                hint={SERVICE_ADDRESS_FIELD_HINT}
+                placeholder={DEFAULT_SERVICE_BASE_URL}
+                value={address}
+                onValueChange={handleAddressChange}
+                disabled={submitting}
+                invalid={addressError !== undefined}
+                {...(addressError === undefined ? {} : { errorMessage: addressError })}
+                fullWidth
+                autoCapitalize="off"
+                autoCorrect="off"
+                spellCheck={false}
+              />
+            )}
+
+            {/* The retry re-submits the current value, so it is offered only
+                while that value is well-formed; an edited, ill-formed value
+                shows its own reason on the field instead. */}
             {failure === undefined ? null : (
               <ErrorState
                 title={FAILURE_TITLE}
                 message={failure.message}
                 hint={failure.hint}
                 code={failure.errorCode}
-                onRetry={trimmedCode === '' ? undefined : submit}
+                onRetry={check.valid ? submit : undefined}
                 retryLabel={RETRY_ACTION_LABEL}
               />
             )}
@@ -610,7 +993,11 @@ function PairDialogBody(props: PairDialogBodyProps): ReactElement {
                 <Button variant="secondary" onClick={onClose}>
                   {CANCEL_ACTION_LABEL}
                 </Button>
-                <Button variant="primary" type="submit" disabled={!canSubmit}>
+                {/* Disabled only while a submit is in flight: an ill-formed
+                    value must still reach `submit`, which says why it is
+                    refused, and a disabled default button would make `Enter`
+                    in the field silently do nothing. */}
+                <Button variant="primary" type="submit" disabled={submitting}>
                   {submitting ? PAIR_ACTION_BUSY_LABEL : PAIR_ACTION_LABEL}
                 </Button>
               </Stack>

@@ -5,8 +5,10 @@
  *
  * ## What it renders
  *
- * The payload is the `SelectedTarget` that `target.selected` carries (AAP
- * 0.4.2): `selector`, `tagName`, an optional visible `text` label, the React
+ * The payload is a `SelectedTarget` (AAP 0.4.2) — the shape the DevTools panel
+ * sends the service in `target.selected`, which reaches the editor as the
+ * session record's `target` in `session.created`/`session.updated`:
+ * `selector`, `tagName`, an optional visible `text` label, the React
  * `componentChain` above the element and the document `url`. Every value on
  * screen comes from that object and nothing else — this file holds no example
  * selector, component name or route (AAP 0.5.4).
@@ -25,7 +27,8 @@
  *     React, a node React never rendered, a production build), so it renders
  *     as a sentence saying so rather than as an empty list.
  *   - `url` as monospace `Code`, exactly as received.
- *   - A control that asks the DevTools panel to enter picker mode again.
+ *   - A control that asks the DevTools panel bound to the session to enter
+ *     picker mode again.
  *
  * ## States (AAP 0.5.5 — never a blank area)
  *
@@ -35,8 +38,9 @@
  *
  *   1. `error` (non-blank) — `ErrorState` with that message, announced as an
  *      alert by the primitive, with a retry that requests a new pick.
- *   2. `pending` — `LoadingState` while a pick is requested and awaited; the
- *      primitive owns `role="status"` and `aria-busy`.
+ *   2. `pending` — `LoadingState` while the pick request is on its way to the
+ *      bound DevTools panel and the host has not answered yet; the primitive
+ *      owns `role="status"` and `aria-busy`.
  *   3. no `target` — the explicit "No target" `EmptyState`, whose action is the
  *      pick `Button`. `EmptyState` ships no copy of its own, so the wording is
  *      this component's, and it is deliberately generic.
@@ -50,9 +54,11 @@
  *
  * Props in, one callback out: `onRequestTarget()` is invoked with no
  * arguments in both the no-target and target-present cases (pick versus
- * re-pick) and from the error state's retry. The parent relays it through the
- * host to the service, which sends `target.request` to the DevTools panel
- * bound to the session; this component opens no socket, posts nothing to
+ * re-pick) and from the error state's retry. The parent relays it to the host,
+ * which calls the service's `target.request` operation; the service pushes
+ * `target.request` to the DevTools panel bound to the session, and the host
+ * answers with a notice saying the panel was asked to enter picker mode or why
+ * it could not be asked. This component opens no socket, posts nothing to
  * the host and performs no request (the webview talks to the host only through
  * the typed union in `src/webview-messages.ts`, which `App` owns).
  *
@@ -109,7 +115,7 @@ const NO_TARGET_TITLE = 'No target';
  * own surfaces and nothing about any application under investigation.
  */
 const NO_TARGET_MESSAGE =
-  'No element is selected, so questions are investigated from the current page. Pick an element in the Debug Generator panel in Chrome DevTools to focus on it.';
+  'No element is selected, so questions are investigated from the current page. "Pick element" puts the Debug Generator panel in Chrome DevTools into picker mode, so you can click the element to focus on.';
 
 /** Accessible name and label of the pick control when no target exists. */
 const PICK_LABEL = 'Pick element';
@@ -117,8 +123,12 @@ const PICK_LABEL = 'Pick element';
 /** Accessible name and label of the pick control when a target is shown. */
 const REPICK_LABEL = 'Pick another element';
 
-/** Announced by `LoadingState` while a pick is awaited (it appends the ellipsis). */
-const PENDING_LABEL = 'Waiting for an element to be picked in Chrome DevTools';
+/**
+ * Announced by `LoadingState` while the pick request is being sent (it appends
+ * the ellipsis). The request only switches the panel into picker mode, so the
+ * label never claims an element is being picked.
+ */
+const PENDING_LABEL = 'Asking Chrome DevTools to enter picker mode';
 
 /** Skeleton rows while pending: one for the element line, one for the chain. */
 const PENDING_ROWS = 2;
@@ -148,23 +158,24 @@ const URL_LABEL = 'Page';
  */
 export interface TargetBadgeProps {
   /**
-   * The element selected in the DevTools panel, as `target.selected` delivered
-   * it. Absent when nothing has been picked, which renders the "No target"
-   * state.
+   * The element selected in the DevTools panel, as the session record's
+   * `target` carries it in `session.created`/`session.updated`. Absent when
+   * nothing has been picked, which renders the "No target" state.
    */
   target?: SelectedTarget | undefined;
 
   /**
-   * Asks for a new pick — relayed until the service sends `target.request` and
-   * the DevTools panel enters picker mode. Called with no arguments, from the
-   * no-target action,
-   * the re-pick control and the error state's retry.
+   * Asks for a new pick: the host calls the service's `target.request`
+   * operation, and the service pushes `target.request` to the DevTools panel
+   * bound to the session, which enters picker mode. Called with no arguments,
+   * from the no-target action, the re-pick control and the error state's retry.
    */
   onRequestTarget: () => void;
 
   /**
-   * A pick has been requested and its result is awaited. Takes precedence over
-   * `target` and the no-target state, and yields to `error`.
+   * The pick request has been sent and the host has not answered it yet.
+   * Takes precedence over `target` and the no-target state, and yields to
+   * `error`.
    *
    * @default false
    */

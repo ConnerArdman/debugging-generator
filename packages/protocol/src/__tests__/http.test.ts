@@ -12,7 +12,7 @@
  *
  * The cases group into what can actually go wrong:
  *
- * - **The table itself.** All seventeen `(operation, method, pattern)` triples
+ * - **The table itself.** All twenty-one `(operation, method, pattern)` triples
  *   are written out literally below and compared against `HTTP_ROUTES`, so that
  *   adding, renaming or re-pathing a route is a deliberate edit in two places
  *   rather than an accident in one. A duplicated `(method, pattern)` pair is
@@ -31,8 +31,16 @@
  *   together, the cases here assert the agreement from both directions at run
  *   time as well, because a widened exemption is the one defect in this file
  *   that is a security bug rather than a bug.
- * - **Identity, not similarity.** The panel-data body must be
- *   `@debuggen/panel-schema`'s `dataQuerySchema` *itself*, and the session and
+ * - **The acting-tab header.** One paired DevTools credential serves every
+ *   inspected tab, so `x-debuggen-tab` is what lets the service hold a DevTools
+ *   request to the session bound to its tab (AAP §0.5.6). The cases pin its
+ *   lowercase name, accept only one tab id in canonical decimal — refusing an
+ *   empty value, a sign, a leading zero, whitespace, a joined duplicate and the
+ *   first unsafe integer, each without quoting it — and prove the formatter
+ *   writes exactly what the parser reads back.
+ * - **Identity, not similarity.** Every query field of the panel-data body must
+ *   be `@debuggen/panel-schema`'s own `dataQuerySchema` field schema *itself*,
+ *   beside the one protocol-owned `panelId`, and the session and
  *   capture bodies must be the very schema objects `../messages/session.ts` and
  *   `../messages/capture.ts` declare. The modification journal's element schema
  *   must be `@debuggen/instrumentation`'s `modificationRecordSchema` as both of
@@ -53,6 +61,13 @@
  *   unclassified. Metrics page by the same rule as the rest: a walk that follows
  *   `nextOffset` reassembles the complete set, and a page that ignores its
  *   window — every value whatever the limit — is refused.
+ * - **The administrative operations.** `devServer.credential`,
+ *   `credentials.rotate` and `session.purge` are table rows like any other, so
+ *   no process registers or calls a route this module does not declare. Their
+ *   bodies are checked at their bounds: the credential request names one
+ *   project and nothing else, the two report bodies refuse a negative count,
+ *   and the purge report's retained-session list must be the truncation of its
+ *   total at `SESSION_PURGE_MAX_REPORTED_SESSIONS`.
  * - **The shared error body.** A non-2xx reply carries `./messages/error.ts`'s
  *   payload unchanged — a code from the closed vocabulary, a message, an
  *   optional `ref`, and no `hint` — so one renderer serves a failed request and
@@ -102,12 +117,14 @@ import {
 import type { TelemetryEvent, TelemetryEventIngress } from '@debuggen/telemetry';
 
 import {
+  ACTING_TAB_HEADER,
   AUTH_EXEMPT_OPERATIONS,
   AUTHORIZATION_HEADER,
   CAPTURE_CONFLICT_ERROR_CODE,
   HTTP_METHODS,
   HTTP_OPERATIONS,
   HTTP_ROUTES,
+  SESSION_PURGE_MAX_REPORTED_SESSIONS,
   WS_PATH,
   buildPath,
   captureStartConflictResponseSchema,
@@ -117,10 +134,18 @@ import {
   captureStopResponseSchema,
   captureStartPath,
   captureStopPath,
+  credentialsRotatePath,
+  credentialsRotateRequestSchema,
+  credentialsRotateResponseSchema,
   dataPageSchema,
   dataResultSchema,
+  devServerCredentialPath,
+  devServerCredentialRequestSchema,
+  devServerCredentialResponseSchema,
   devServerLaunchPath,
   devServerStopPath,
+  devServerStopRequestSchema,
+  formatActingTabHeader,
   formatBearer,
   healthPath,
   healthResponseSchema,
@@ -137,6 +162,7 @@ import {
   panelDataRequestSchema,
   panelPath,
   panelResponseSchema,
+  parseActingTabHeader,
   parseDataResult,
   parseHttpRequest,
   parseHttpResponse,
@@ -144,9 +170,15 @@ import {
   sessionEndPath,
   sessionEndRequestSchema,
   sessionPath,
+  sessionPurgePath,
+  sessionPurgeRequestSchema,
+  sessionPurgeResponseSchema,
   sessionQuestionPath,
   sessionQuestionRequestSchema,
   sessionsPath,
+  targetRequestPath,
+  targetRequestRequestSchema,
+  targetRequestResponseSchema,
   telemetryIngestPath,
   telemetryIngestRequestSchema,
 } from '../http.js';
@@ -164,8 +196,28 @@ import type {
   HttpOperation as BarrelHttpOperation,
   HttpOperationId as BarrelHttpOperationId,
 } from '../index.js';
+import { sessionBindPayloadSchema } from '../messages/binding.js';
 import { CLEANUP_STATUSES } from '../session-record.js';
 import { PROTOCOL_VERSION } from '../version.js';
+// The paged listings' contract, Section C.1 of `../http.ts`.
+import {
+  LIST_PAGE_MAX_LIMITS,
+  LIST_PAGE_MAX_OFFSET,
+  LIST_PAGE_OPERATIONS,
+  MODIFICATION_DIFF_MAX_BYTES,
+  MODIFICATIONS_PAGE_DEFAULT_LIMIT,
+  MODIFICATIONS_PAGE_DIFF_BUDGET,
+  MODIFICATIONS_PAGE_MAX_LIMIT,
+  SESSION_LIST_DEFAULT_LIMIT,
+  SESSION_LIST_MAX_LIMIT,
+  formatListPageQuery,
+  isListPageOperation,
+  modificationsDiffBytes,
+  parseListPageQuery,
+  sessionListItemSchema,
+  toSessionListItem,
+  utf8ByteLength,
+} from '../http.js';
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -209,6 +261,9 @@ const SOURCE_FILE = 'src/lib/thing.ts';
 
 /** The dev server the fixture session is bound to. */
 const DEV_SERVER_URL = 'http://localhost:3000';
+
+/** The Chrome tab the fixture session is bound to, as `chrome.tabs.Tab.id` reports it. */
+const TAB_ID = 7;
 
 /** A fixed point in time, so no assertion depends on the clock. */
 const START_TIME = 1_758_000_000_000;
@@ -396,6 +451,24 @@ const MODIFICATION: HttpResponseBody<'modifications.list'>['modifications'][numb
   diff: `--- a/${SOURCE_FILE}\n+++ b/${SOURCE_FILE}\n`,
 };
 
+/** An empty first page of the session list: nothing stored, nothing to follow. */
+const EMPTY_SESSION_PAGE: HttpResponseBody<'session.list'> = {
+  sessions: [],
+  total: 0,
+  limit: SESSION_LIST_DEFAULT_LIMIT,
+  offset: 0,
+  nextOffset: null,
+};
+
+/** An empty first page of the modification journal. */
+const EMPTY_JOURNAL_PAGE: HttpResponseBody<'modifications.list'> = {
+  modifications: [],
+  total: 0,
+  limit: MODIFICATIONS_PAGE_DEFAULT_LIMIT,
+  offset: 0,
+  nextOffset: null,
+};
+
 /** A validated panel specification, as `panel.get` and `panel.getById` return one. */
 const PANEL_SPEC: HttpResponseBody<'panel.getById'>['panel'] = {
   version: 1,
@@ -413,6 +486,48 @@ const CAPTURE_SUMMARY = computeCaptureSummary(EVENTS, {
   sessionId: SESSION_ID,
 });
 
+/** One day, in milliseconds: the unit `DEBUGGEN_RETENTION_DAYS` is counted in. */
+const MS_PER_DAY = 86_400_000;
+
+/** An aged session an unresolved conflict kept past the retention window. */
+const CONFLICTED_SESSION_ID = 'ses_9w3e5r7t1y2u4i6o';
+
+/** The server-agent credential `devServer.credential` hands over; low-entropy on purpose. */
+const SERVER_AGENT_TOKEN = 'server-agent-credential-placeholder';
+
+/**
+ * Distinct session ids of the product's shape, for the purge report's bound.
+ *
+ * Zero-padded counters rather than random text, for the reason the fixture
+ * note above gives: they satisfy the schema and stay low-entropy.
+ *
+ * @param count How many ids to build.
+ * @returns `count` distinct twenty-character session ids, sorted.
+ */
+function retainedSessionIds(count: number): string[] {
+  return Array.from({ length: count }, (_, index) => `ses_${String(index).padStart(16, '0')}`);
+}
+
+/**
+ * A purge report from a sweep over the default thirty-day window: two sessions
+ * and what they held removed, one kept for a conflict, nothing stepped over.
+ */
+const SESSION_PURGE_REPORT: HttpResponseBody<'session.purge'> = {
+  cutoff: START_TIME - 30 * MS_PER_DAY,
+  sessionsDeleted: 2,
+  telemetryEventsDeleted: EVENTS.length,
+  panelsDeleted: 1,
+  analysesDeleted: 1,
+  modificationsDeleted: 1,
+  backupDirsDeleted: 2,
+  orphanBackupsDeleted: 0,
+  indexCachesDeleted: 1,
+  sessionsRetainedForConflicts: [CONFLICTED_SESSION_ID],
+  sessionsRetainedForConflictsTotal: 1,
+  issueCount: 0,
+  durationMs: 42.5,
+};
+
 /**
  * A valid request body for every operation, keyed by operation.
  *
@@ -426,8 +541,10 @@ const VALID_REQUESTS: { readonly [O in HttpOperationId]: HttpRequestBody<O> } = 
   'session.get': undefined,
   'session.question': { question: 'Why did that step run twice?' },
   'session.end': {},
+  'session.purge': {},
   'capture.start': {},
   'capture.stop': {},
+  'target.request': {},
   'panel.data': { source: 'spans', sort: 'duration_desc', limit: 25, offset: 0 },
   'panel.get': undefined,
   'panel.getById': undefined,
@@ -435,9 +552,11 @@ const VALID_REQUESTS: { readonly [O in HttpOperationId]: HttpRequestBody<O> } = 
   'telemetry.event': { projectRoot: PROJECT_ROOT, events: [INGRESS_EVENT] },
   'devServer.launch': { projectRoot: PROJECT_ROOT },
   'devServer.stop': { projectRoot: PROJECT_ROOT },
+  'devServer.credential': { projectRoot: PROJECT_ROOT },
   health: undefined,
   'pair.start': {},
   'pair.complete': { code: 'PAIR2X7Q' },
+  'credentials.rotate': {},
 };
 
 /**
@@ -449,12 +568,20 @@ const VALID_REQUESTS: { readonly [O in HttpOperationId]: HttpRequestBody<O> } = 
  */
 const VALID_RESPONSES: { readonly [O in HttpOperationId]: HttpResponseBody<O> } = {
   'session.create': SESSION_RECORD,
-  'session.list': { sessions: [SESSION_RECORD] },
+  'session.list': {
+    sessions: [toSessionListItem(SESSION_RECORD)],
+    total: 1,
+    limit: SESSION_LIST_DEFAULT_LIMIT,
+    offset: 0,
+    nextOffset: null,
+  },
   'session.get': SESSION_RECORD,
   'session.question': SESSION_RECORD,
   'session.end': { cleanup: 'clean' },
+  'session.purge': SESSION_PURGE_REPORT,
   'capture.start': { captureId: CAPTURE_ID },
   'capture.stop': { summary: CAPTURE_SUMMARY },
+  'target.request': { sessionId: SESSION_ID, tabId: TAB_ID },
   'panel.data': {
     source: 'spans',
     spans: [...EVENTS],
@@ -465,13 +592,21 @@ const VALID_RESPONSES: { readonly [O in HttpOperationId]: HttpResponseBody<O> } 
   },
   'panel.get': { panel: PANEL_SPEC },
   'panel.getById': { panel: PANEL_SPEC },
-  'modifications.list': { modifications: [MODIFICATION] },
+  'modifications.list': {
+    modifications: [MODIFICATION],
+    total: 1,
+    limit: MODIFICATIONS_PAGE_DEFAULT_LIMIT,
+    offset: 0,
+    nextOffset: null,
+  },
   'telemetry.event': { accepted: 1 },
   'devServer.launch': { devServerUrl: DEV_SERVER_URL, pid: 4242 },
   'devServer.stop': { stopped: true },
+  'devServer.credential': { token: SERVER_AGENT_TOKEN, expiresAt: START_TIME + 43_200_000 },
   health: { version: '0.1.0', protocolVersion: '1.0.0', pairingAvailable: true },
   'pair.start': { code: 'PAIR2X7Q', expiresAt: START_TIME + 300_000 },
   'pair.complete': { token: 'devtools-credential-placeholder' },
+  'credentials.rotate': { credentialsDeleted: 3, socketsClosed: 2 },
 };
 
 /**
@@ -625,7 +760,7 @@ function withoutPagingEcho(result: DataResult): Record<string, unknown> {
 // The route table
 // ---------------------------------------------------------------------------
 
-describe('HTTP_ROUTES — the seventeen routes, pinned', () => {
+describe('HTTP_ROUTES — the twenty-one routes, pinned', () => {
   /**
    * The expected table, written out literally.
    *
@@ -639,8 +774,10 @@ describe('HTTP_ROUTES — the seventeen routes, pinned', () => {
     ['session.get', 'GET', '/sessions/:id'],
     ['session.question', 'POST', '/sessions/:id/question'],
     ['session.end', 'POST', '/sessions/:id/end'],
+    ['session.purge', 'POST', '/sessions/purge'],
     ['capture.start', 'POST', '/sessions/:id/capture/start'],
     ['capture.stop', 'POST', '/sessions/:id/capture/stop'],
+    ['target.request', 'POST', '/sessions/:id/target/request'],
     ['panel.data', 'POST', '/sessions/:id/panel-data'],
     ['panel.get', 'GET', '/sessions/:id/panel'],
     ['panel.getById', 'GET', '/sessions/:id/panels/:panelId'],
@@ -648,12 +785,14 @@ describe('HTTP_ROUTES — the seventeen routes, pinned', () => {
     ['telemetry.event', 'POST', '/telemetry/ingest'],
     ['devServer.launch', 'POST', '/dev-server/launch'],
     ['devServer.stop', 'POST', '/dev-server/stop'],
+    ['devServer.credential', 'POST', '/dev-server/credential'],
     ['health', 'GET', '/health'],
     ['pair.start', 'POST', '/pair/start'],
     ['pair.complete', 'POST', '/pair/complete'],
+    ['credentials.rotate', 'POST', '/credentials/rotate'],
   ];
 
-  it('holds exactly those seventeen operations, with those methods and paths', () => {
+  it('holds exactly those twenty-one operations, with those methods and paths', () => {
     expect(
       Object.entries(HTTP_ROUTES).map(([operation, route]) => [
         operation,
@@ -661,12 +800,12 @@ describe('HTTP_ROUTES — the seventeen routes, pinned', () => {
         route.pattern,
       ]),
     ).toEqual(EXPECTED.map((triple) => [...triple]));
-    expect(Object.keys(HTTP_ROUTES)).toHaveLength(17);
+    expect(Object.keys(HTTP_ROUTES)).toHaveLength(21);
   });
 
   it('lists every route in HTTP_OPERATIONS, once, in the table’s order', () => {
     expect([...HTTP_OPERATIONS]).toEqual(Object.keys(HTTP_ROUTES));
-    expect(new Set(HTTP_OPERATIONS).size).toBe(17);
+    expect(new Set(HTTP_OPERATIONS).size).toBe(21);
   });
 
   it('registers no method and path twice', () => {
@@ -765,8 +904,10 @@ describe('HttpOperationId — the canonical operation-id type', () => {
       'session.get': 'GET',
       'session.question': 'POST',
       'session.end': 'POST',
+      'session.purge': 'POST',
       'capture.start': 'POST',
       'capture.stop': 'POST',
+      'target.request': 'POST',
       'panel.data': 'POST',
       'panel.get': 'GET',
       'panel.getById': 'GET',
@@ -774,9 +915,11 @@ describe('HttpOperationId — the canonical operation-id type', () => {
       'telemetry.event': 'POST',
       'devServer.launch': 'POST',
       'devServer.stop': 'POST',
+      'devServer.credential': 'POST',
       health: 'GET',
       'pair.start': 'POST',
       'pair.complete': 'POST',
+      'credentials.rotate': 'POST',
     };
 
     for (const operation of HTTP_OPERATIONS) {
@@ -823,7 +966,7 @@ describe('AUTH_EXEMPT_OPERATIONS — exactly GET /health and POST /pair/complete
     ).toEqual(['GET /health', 'POST /pair/complete']);
   });
 
-  it('answers isAuthExemptOperation from the route flag for all seventeen', () => {
+  it('answers isAuthExemptOperation from the route flag for all twenty-one', () => {
     for (const operation of HTTP_OPERATIONS) {
       expect(isAuthExemptOperation(operation)).toBe(HTTP_ROUTES[operation].authExempt);
     }
@@ -835,6 +978,27 @@ describe('AUTH_EXEMPT_OPERATIONS — exactly GET /health and POST /pair/complete
     expect(isAuthExemptOperation('pair.start')).toBe(false);
     expect(isAuthExemptOperation('session.create')).toBe(false);
     expect(isAuthExemptOperation('telemetry.event')).toBe(false);
+    // Asking a panel to pick is a state change on a bound tab, so it carries
+    // the editor credential like every other session route.
+    expect(isAuthExemptOperation('target.request')).toBe(false);
+    expect(HTTP_OPERATIONS.filter((operation) => !isAuthExemptOperation(operation))).toHaveLength(
+      19,
+    );
+  });
+
+  it('requires a credential on the three administrative operations', () => {
+    // Minting a server-agent credential, revoking every credential and purging
+    // the store are the most consequential calls in the table; an exemption on
+    // any of them would hand a local web page the machine's debugging state.
+    for (const operation of [
+      'devServer.credential',
+      'credentials.rotate',
+      'session.purge',
+    ] as const) {
+      expect(isAuthExemptOperation(operation)).toBe(false);
+      expect(HTTP_ROUTES[operation].authExempt).toBe(false);
+      expect(AUTH_EXEMPT_OPERATIONS).not.toContain(operation);
+    }
   });
 });
 
@@ -850,14 +1014,156 @@ describe('the Authorization header', () => {
   });
 });
 
+// One paired DevTools credential is presented for every inspected tab, so a
+// DevTools request says which tab it acts for in this header, and the service
+// verifies it against its live binding table (AAP §0.5.6). The value is
+// unvalidated data from another process until it parses, so no rejection may
+// quote it (AAP §0.5.2).
+describe('the acting-tab header', () => {
+  /**
+   * The strings of a rejection that could carry a value: message, hint,
+   * details and the wire payload.
+   *
+   * @param error The rejection.
+   * @returns Those surfaces as one string.
+   */
+  function surfacesOf(error: DebuggenError): string {
+    return JSON.stringify({
+      message: error.message,
+      hint: error.hint,
+      details: error.details,
+      payload: error.toPayload(),
+    });
+  }
+
+  it('is named in lowercase, matching Headers normalisation', () => {
+    expect(ACTING_TAB_HEADER).toBe('x-debuggen-tab');
+    expect(ACTING_TAB_HEADER).toBe(ACTING_TAB_HEADER.toLowerCase());
+  });
+
+  it.each([
+    ['0', 0],
+    ['7', 7],
+    ['42', 42],
+    ['1234567', 1_234_567],
+    ['9007199254740991', Number.MAX_SAFE_INTEGER],
+  ])('parses %s as one tab id', (value, expected) => {
+    const parsed = parseActingTabHeader(value);
+
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) {
+      expect(parsed.value).toBe(expected);
+    }
+  });
+
+  it.each([null, undefined])('answers an absent header (%s) as no tab, not a failure', (value) => {
+    const parsed = parseActingTabHeader(value);
+
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) {
+      expect(parsed.value).toBeUndefined();
+    }
+  });
+
+  it.each([
+    ['an empty value', ''],
+    ['a negative id', '-1'],
+    ['a leading zero', '01'],
+    ['a fraction', '1.5'],
+    ['an explicit sign', '+3'],
+    ['leading whitespace', ' 4'],
+    ['trailing whitespace', '4 '],
+    ['a duplicated header, as Headers.get joins it', '4, 5'],
+    ['the first integer beyond the safe range', '9007199254740992'],
+    ['sixteen nines', '9999999999999999'],
+    ['seventeen digits', '12345678901234567'],
+    ['an exponent', '1e3'],
+    ['a hexadecimal literal', '0x4'],
+    ['a word', 'abc'],
+    ['a planted value', 'do-not-echo-this-tab-value'],
+  ])('refuses %s without quoting it', (_label, value) => {
+    const parsed = parseActingTabHeader(value);
+
+    expect(parsed.ok).toBe(false);
+    if (parsed.ok) {
+      return;
+    }
+    expect(parsed.error).toBeInstanceOf(DebuggenError);
+    expect(parsed.error.code).toBe('PROTOCOL_INVALID_MESSAGE');
+    expect(parsed.error.message).toBe(
+      'Invalid x-debuggen-tab header: expected the decimal id of exactly one Chrome tab',
+    );
+    expect(parsed.error.hint).toContain('canonical decimal');
+    expect(parsed.error.details).toStrictEqual({ header: ACTING_TAB_HEADER });
+    expect(parsed.error.cause).toBeUndefined();
+    // A constant message for every refusal is the leak-freedom guarantee; the
+    // literal search below adds nothing for the empty value, which every string
+    // contains.
+    if (value !== '') {
+      expect(surfacesOf(parsed.error)).not.toContain(value);
+    }
+  });
+
+  it.each([
+    [0, '0'],
+    [42, '42'],
+    [Number.MAX_SAFE_INTEGER, '9007199254740991'],
+  ])('formats tab %s as %s, which parses back to the same tab', (tabId, expected) => {
+    const formatted = formatActingTabHeader(tabId);
+
+    expect(formatted.ok).toBe(true);
+    if (!formatted.ok) {
+      return;
+    }
+    expect(formatted.value).toBe(expected);
+
+    const parsed = parseActingTabHeader(formatted.value);
+
+    expect(parsed.ok && parsed.value).toBe(tabId);
+  });
+
+  it.each([
+    ['chrome.tabs.TAB_ID_NONE', -1],
+    ['a fraction', 1.5],
+    ['NaN', Number.NaN],
+    ['an infinite value', Number.POSITIVE_INFINITY],
+    ['the first integer beyond the safe range', Number.MAX_SAFE_INTEGER + 1],
+    ['a string from untyped code', '7' as unknown as number],
+  ])('refuses to format %s', (_label, tabId) => {
+    const formatted = formatActingTabHeader(tabId);
+
+    expect(formatted.ok).toBe(false);
+    if (formatted.ok) {
+      return;
+    }
+    expect(formatted.error.code).toBe('PROTOCOL_INVALID_MESSAGE');
+    expect(formatted.error.message).toBe(
+      'Cannot send the x-debuggen-tab header: the value is not a non-negative safe-integer Chrome tab id',
+    );
+    expect(formatted.error.details).toStrictEqual({ header: ACTING_TAB_HEADER });
+    expect(formatted.error.cause).toBeUndefined();
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Identity of the imported schemas
 // ---------------------------------------------------------------------------
 
 describe('the route table binds imported schemas by identity, never by copy', () => {
-  it('uses panel-schema’s dataQuerySchema itself as the panel-data body', () => {
-    expect(HTTP_ROUTES['panel.data'].request).toBe(dataQuerySchema);
-    expect(panelDataRequestSchema).toBe(dataQuerySchema);
+  it('builds the panel-data body from panel-schema’s own query field schemas, plus panelId', () => {
+    expect(HTTP_ROUTES['panel.data'].request).toBe(panelDataRequestSchema);
+
+    const queryShape: Readonly<Record<string, unknown>> = dataQuerySchema.shape;
+    const bodyShape: Readonly<Record<string, unknown>> = panelDataRequestSchema.shape;
+    const queryKeys = Object.keys(queryShape);
+
+    // Each query field is the upstream schema object itself, never a copy.
+    expect(queryKeys.length).toBeGreaterThan(0);
+    for (const key of queryKeys) {
+      expect(bodyShape[key], key).toBe(queryShape[key]);
+    }
+    // The body adds exactly one field of its own: the panel's identity.
+    expect(Object.keys(bodyShape).filter((key) => !queryKeys.includes(key))).toEqual(['panelId']);
   });
 
   it('uses the session message module’s three request schemas', () => {
@@ -871,6 +1177,14 @@ describe('the route table binds imported schemas by identity, never by copy', ()
     expect(HTTP_ROUTES['capture.start'].response).toBe(captureStartResponseSchema);
     expect(HTTP_ROUTES['capture.stop'].request).toBe(captureStopRequestSchema);
     expect(HTTP_ROUTES['capture.stop'].response).toBe(captureStopResponseSchema);
+  });
+
+  it('binds the target-request bodies and takes the reply’s tab id from the binding messages', () => {
+    expect(HTTP_ROUTES['target.request'].request).toBe(targetRequestRequestSchema);
+    expect(HTTP_ROUTES['target.request'].response).toBe(targetRequestResponseSchema);
+    // The tab-id rule is `../messages/binding.ts`'s own schema, so a tab the
+    // binding messages refuse (`-1`, a fraction, a string) is refused here too.
+    expect(targetRequestResponseSchema.shape.tabId).toBe(sessionBindPayloadSchema.shape.tabId);
   });
 
   it('uses instrumentation’s modificationRecordSchema itself as the journal element, from either entry', () => {
@@ -993,6 +1307,37 @@ describe('the session bodies', () => {
   it('refuses a session.question body with no question', () => {
     expect(sessionQuestionRequestSchema.safeParse({}).success).toBe(false);
     expect(sessionQuestionRequestSchema.safeParse({ question: '' }).success).toBe(false);
+    expect(
+      sessionQuestionRequestSchema.safeParse({ attemptId: 'fua_4k2p9dq7m1zx0c3v' }).success,
+    ).toBe(false);
+  });
+
+  it('accepts a session.question body with or without the attempt id that keys its idempotency', () => {
+    const question = 'Why did that step run twice?';
+    const attemptId = 'fua_4k2p9dq7m1zx0c3v';
+
+    expect(parseHttpRequest('session.question', { question }).ok).toBe(true);
+    const keyed = parseHttpRequest('session.question', {
+      question,
+      attemptId,
+    } satisfies HttpRequestBody<'session.question'>);
+    expect(keyed.ok).toBe(true);
+    if (keyed.ok) {
+      // Byte-faithful: the id the client sent is the id the service reads.
+      expect(keyed.value).toEqual({ question, attemptId });
+    }
+  });
+
+  it('refuses a malformed attempt id, and a null standing in for an absent one', () => {
+    const question = 'Why did that step run twice?';
+
+    for (const attemptId of ['', ' ', 'fua_\u0007bell', 'x'.repeat(65), 42, null]) {
+      expect(
+        sessionQuestionRequestSchema.safeParse({ question, attemptId }).success,
+        JSON.stringify(attemptId),
+      ).toBe(false);
+    }
+    expect(sessionQuestionRequestSchema.safeParse({ question, retry: true }).success).toBe(false);
   });
 
   it('accepts an empty session.end body and refuses an unknown key in it', () => {
@@ -1029,8 +1374,191 @@ describe('the session bodies', () => {
   });
 
   it('answers the session list as an object, never as a bare array', () => {
-    expect(parseHttpResponse('session.list', { sessions: [] }).ok).toBe(true);
+    expect(parseHttpResponse('session.list', EMPTY_SESSION_PAGE).ok).toBe(true);
     expect(parseHttpResponse('session.list', [SESSION_RECORD]).ok).toBe(false);
+  });
+});
+
+describe('the session.purge bodies — the on-demand retention sweep', () => {
+  /** Every count field of the report, each a non-negative integer. */
+  const COUNT_FIELDS = [
+    'sessionsDeleted',
+    'telemetryEventsDeleted',
+    'panelsDeleted',
+    'analysesDeleted',
+    'modificationsDeleted',
+    'backupDirsDeleted',
+    'orphanBackupsDeleted',
+    'indexCachesDeleted',
+    'sessionsRetainedForConflictsTotal',
+    'issueCount',
+  ] as const satisfies readonly (keyof HttpResponseBody<'session.purge'>)[];
+
+  /**
+   * The report with its conflict list and total replaced together.
+   *
+   * @param listed The retained-session ids the report lists.
+   * @param total The count the report claims.
+   * @returns A report that differs from the fixture only in those two fields.
+   */
+  function reportRetaining(listed: readonly string[], total: number): Record<string, unknown> {
+    return {
+      ...SESSION_PURGE_REPORT,
+      sessionsRetainedForConflicts: [...listed],
+      sessionsRetainedForConflictsTotal: total,
+    };
+  }
+
+  it('binds the route to its own two schemas, bodiless of any caller choice', () => {
+    expect(HTTP_ROUTES['session.purge'].request).toBe(sessionPurgeRequestSchema);
+    expect(HTTP_ROUTES['session.purge'].response).toBe(sessionPurgeResponseSchema);
+    expect(sessionPurgePath()).toBe('/sessions/purge');
+  });
+
+  it('accepts an empty request and refuses a key or a missing body', () => {
+    expect(parseHttpRequest('session.purge', {}).ok).toBe(true);
+    // The window is the developer's configuration, never the caller's.
+    expect(parseHttpRequest('session.purge', { retentionDays: 0 }).ok).toBe(false);
+    expect(parseHttpRequest('session.purge', { dryRun: true }).ok).toBe(false);
+    expect(parseHttpRequest('session.purge', undefined).ok).toBe(false);
+  });
+
+  it('round-trips a report through JSON unchanged', () => {
+    const parsed = parseHttpResponse('session.purge', throughJson(SESSION_PURGE_REPORT));
+
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) {
+      expect(parsed.value).toEqual(SESSION_PURGE_REPORT);
+    }
+
+    const request = parseHttpRequest('session.purge', throughJson({}));
+    expect(request.ok).toBe(true);
+    if (request.ok) {
+      expect(request.value).toEqual({});
+    }
+  });
+
+  it.each(COUNT_FIELDS)('refuses a negative, fractional or missing %s', (field) => {
+    const { [field]: omitted, ...without } = SESSION_PURGE_REPORT;
+
+    expect(omitted).toBeGreaterThanOrEqual(0);
+    expect(parseHttpResponse('session.purge', without).ok).toBe(false);
+    expect(parseHttpResponse('session.purge', { ...SESSION_PURGE_REPORT, [field]: -1 }).ok).toBe(
+      false,
+    );
+    expect(parseHttpResponse('session.purge', { ...SESSION_PURGE_REPORT, [field]: 1.5 }).ok).toBe(
+      false,
+    );
+    expect(parseHttpResponse('session.purge', { ...SESSION_PURGE_REPORT, [field]: '1' }).ok).toBe(
+      false,
+    );
+  });
+
+  it('accepts a fractional duration and refuses a negative or non-finite one', () => {
+    expect(parseHttpResponse('session.purge', { ...SESSION_PURGE_REPORT, durationMs: 0 }).ok).toBe(
+      true,
+    );
+    for (const durationMs of [-0.5, Number.POSITIVE_INFINITY, Number.NaN]) {
+      expect(parseHttpResponse('session.purge', { ...SESSION_PURGE_REPORT, durationMs }).ok).toBe(
+        false,
+      );
+    }
+  });
+
+  it('accepts a cutoff a window of years puts before 2020, and refuses a non-finite or mis-scaled one', () => {
+    // `DEBUGGEN_RETENTION_DAYS` is any whole number of days, so a developer who
+    // keeps sessions for ten years — or effectively forever — gets a cutoff an
+    // event-timestamp bound would refuse. The sweep still ran, and its report
+    // must still parse.
+    for (const days of [0, 30, 3_650, 1_000_000]) {
+      const cutoff = START_TIME - days * MS_PER_DAY;
+
+      expect(parseHttpResponse('session.purge', { ...SESSION_PURGE_REPORT, cutoff }).ok).toBe(true);
+    }
+
+    for (const cutoff of [
+      Number.POSITIVE_INFINITY,
+      Number.NEGATIVE_INFINITY,
+      Number.NaN,
+      START_TIME * 1_000,
+      '2025-01-01',
+    ]) {
+      expect(parseHttpResponse('session.purge', { ...SESSION_PURGE_REPORT, cutoff }).ok).toBe(
+        false,
+      );
+    }
+  });
+
+  it('lists at most SESSION_PURGE_MAX_REPORTED_SESSIONS ids and carries the true count beside them', () => {
+    expect(SESSION_PURGE_MAX_REPORTED_SESSIONS).toBe(100);
+
+    const bounded = retainedSessionIds(SESSION_PURGE_MAX_REPORTED_SESSIONS);
+    expect(parseHttpResponse('session.purge', reportRetaining(bounded, bounded.length)).ok).toBe(
+      true,
+    );
+    // Truncated: a hundred listed, the real two hundred and fifty counted.
+    expect(parseHttpResponse('session.purge', reportRetaining(bounded, 250)).ok).toBe(true);
+
+    const overBound = retainedSessionIds(SESSION_PURGE_MAX_REPORTED_SESSIONS + 1);
+    expect(
+      parseHttpResponse('session.purge', reportRetaining(overBound, overBound.length)).ok,
+    ).toBe(false);
+  });
+
+  it('refuses a list that is not the truncation of its total', () => {
+    const [first, second] = retainedSessionIds(2);
+    const listedOne = [first ?? CONFLICTED_SESSION_ID];
+    const listedTwo = [first ?? CONFLICTED_SESSION_ID, second ?? SESSION_ID];
+
+    expect(parseHttpResponse('session.purge', reportRetaining([], 0)).ok).toBe(true);
+    // Partial below the bound: the report claims two and names one.
+    expect(parseHttpResponse('session.purge', reportRetaining(listedOne, 2)).ok).toBe(false);
+    // More names than the count admits.
+    expect(parseHttpResponse('session.purge', reportRetaining(listedTwo, 1)).ok).toBe(false);
+    // Short of the bound while the total is past it.
+    expect(
+      parseHttpResponse(
+        'session.purge',
+        reportRetaining(retainedSessionIds(SESSION_PURGE_MAX_REPORTED_SESSIONS - 1), 250),
+      ).ok,
+    ).toBe(false);
+
+    const rejected = parseHttpResponse('session.purge', reportRetaining(listedOne, 2));
+    expect(rejected.ok).toBe(false);
+    if (!rejected.ok) {
+      expect(rejected.error.code).toBe('PROTOCOL_INVALID_MESSAGE');
+      expect(rejected.error.message).toContain('sessionsRetainedForConflicts');
+      expect(rejected.error.message).not.toContain(listedOne[0]);
+    }
+  });
+
+  it('refuses a list that names one session twice, at the repeating index', () => {
+    const rejected = parseHttpResponse(
+      'session.purge',
+      reportRetaining([CONFLICTED_SESSION_ID, CONFLICTED_SESSION_ID], 2),
+    );
+
+    expect(rejected.ok).toBe(false);
+    if (!rejected.ok) {
+      expect(rejected.error.message).toContain('sessionsRetainedForConflicts[1]');
+      expect(rejected.error.message).not.toContain(CONFLICTED_SESSION_ID);
+    }
+  });
+
+  it('refuses a malformed retained id and a key the report does not declare', () => {
+    expect(parseHttpResponse('session.purge', reportRetaining([''], 1)).ok).toBe(false);
+    expect(parseHttpResponse('session.purge', reportRetaining(['s'.repeat(65)], 1)).ok).toBe(false);
+    // No path and no message rides along: the report is counts, not a listing
+    // of the developer's file layout.
+    expect(
+      parseHttpResponse('session.purge', {
+        ...SESSION_PURGE_REPORT,
+        errors: [{ scope: 'backup', target: 'backups/x', message: 'x' }],
+      }).ok,
+    ).toBe(false);
+    expect(
+      parseHttpResponse('session.purge', { ...SESSION_PURGE_REPORT, sessionIdsDeleted: [] }).ok,
+    ).toBe(false);
   });
 });
 
@@ -1074,6 +1602,97 @@ describe('the capture bodies', () => {
   });
 });
 
+describe('the target-request bodies', () => {
+  it('is a POST to the session’s own target/request path that requires a credential', () => {
+    const route = HTTP_ROUTES['target.request'];
+
+    expect({
+      operation: route.operation,
+      method: route.method,
+      pattern: route.pattern,
+      params: [...route.params],
+      authExempt: route.authExempt,
+    }).toEqual({
+      operation: 'target.request',
+      method: 'POST',
+      pattern: '/sessions/:id/target/request',
+      params: ['id'],
+      authExempt: false,
+    });
+  });
+
+  it('accepts an empty request body and refuses any key in it', () => {
+    expect(parseHttpRequest('target.request', {}).ok).toBe(true);
+    expect(targetRequestRequestSchema.safeParse({}).success).toBe(true);
+
+    // The binding, not the caller, decides which tab enters picker mode, and
+    // picker policy is the panel's: a caller that names a tab, restates the
+    // session or attaches a mode has misread the contract.
+    for (const body of [{ tabId: TAB_ID }, { sessionId: SESSION_ID }, { mode: 'picker' }]) {
+      const refused = parseHttpRequest('target.request', body);
+
+      expect(refused.ok).toBe(false);
+      if (!refused.ok) {
+        expect(refused.error.code).toBe('PROTOCOL_INVALID_MESSAGE');
+        expect(refused.error.message).toContain('target.request');
+      }
+    }
+
+    expect(parseHttpRequest('target.request', undefined).ok).toBe(false);
+    expect(parseHttpRequest('target.request', null).ok).toBe(false);
+  });
+
+  it('answers with the session and the bound tab the push was handed to', () => {
+    const parsed = parseHttpResponse('target.request', { sessionId: SESSION_ID, tabId: TAB_ID });
+
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) {
+      expect(parsed.value).toEqual({ sessionId: SESSION_ID, tabId: TAB_ID });
+    }
+    expect(parseHttpResponse('target.request', { sessionId: SESSION_ID, tabId: 0 }).ok).toBe(true);
+  });
+
+  it('refuses a reply without the tab, without the session, or with anything more', () => {
+    expect(parseHttpResponse('target.request', { sessionId: SESSION_ID }).ok).toBe(false);
+    expect(parseHttpResponse('target.request', { tabId: TAB_ID }).ok).toBe(false);
+    expect(parseHttpResponse('target.request', {}).ok).toBe(false);
+    expect(
+      parseHttpResponse('target.request', {
+        sessionId: SESSION_ID,
+        tabId: TAB_ID,
+        url: DEV_SERVER_URL,
+      }).ok,
+    ).toBe(false);
+    expect(parseHttpResponse('target.request', { sessionId: '', tabId: TAB_ID }).ok).toBe(false);
+  });
+
+  it('refuses a tab id the binding messages refuse', () => {
+    // `-1` is `chrome.tabs.TAB_ID_NONE`, not a tab; a fraction and a string
+    // are producer bugs, and nothing in this package coerces.
+    for (const tabId of [-1, 1.5, '7', Number.MAX_SAFE_INTEGER + 1, null]) {
+      expect(parseHttpResponse('target.request', { sessionId: SESSION_ID, tabId }).ok).toBe(false);
+    }
+  });
+
+  it('keeps the success reply apart from the error contract the service answers with', () => {
+    // Each failure the route documents is the shared error body, with a code
+    // from the closed vocabulary — and none of them parses as a success.
+    for (const code of [
+      'SESSION_NOT_FOUND',
+      'SESSION_INVALID_STATE',
+      'TAB_NOT_BOUND',
+      'TRANSPORT_DISCONNECTED',
+      'UNAUTHORIZED',
+    ] as const) {
+      const failure = { code, message: 'The panel could not be asked to pick an element.' };
+
+      expect(DEBUGGEN_ERROR_CODES).toContain(code);
+      expect(httpErrorResponseSchema.safeParse(failure).success).toBe(true);
+      expect(parseHttpResponse('target.request', failure).ok).toBe(false);
+    }
+  });
+});
+
 describe('the panel bodies', () => {
   it('lets panel.get answer null and refuses null from panel.getById', () => {
     expect(panelResponseSchema.safeParse({ panel: null }).success).toBe(true);
@@ -1096,8 +1715,304 @@ describe('the panel bodies', () => {
   });
 
   it('answers the modification journal as an object of records', () => {
-    expect(parseHttpResponse('modifications.list', { modifications: [] }).ok).toBe(true);
-    expect(parseHttpResponse('modifications.list', { modifications: [{}] }).ok).toBe(false);
+    expect(parseHttpResponse('modifications.list', EMPTY_JOURNAL_PAGE).ok).toBe(true);
+    expect(
+      parseHttpResponse('modifications.list', { ...EMPTY_JOURNAL_PAGE, modifications: [{}] }).ok,
+    ).toBe(false);
+  });
+});
+
+describe('the paged listings: GET /sessions and GET /sessions/:id/modifications', () => {
+  /** A journal record carrying `diff`. */
+  function recordWithDiff(index: number, diff: string): typeof MODIFICATION {
+    return {
+      ...MODIFICATION,
+      id: `mod_${String(index).padStart(16, '0')}`,
+      diff,
+    };
+  }
+
+  /** The largest diff the journal accepts, in UTF-16 code units. */
+  const MAX_DIFF_UNITS = MODIFICATION_DIFF_MAX_BYTES / 3;
+
+  it('lists rows, never whole records: a record-only member is refused', () => {
+    const row = toSessionListItem(SESSION_RECORD);
+
+    expect(sessionListItemSchema.safeParse(row).success).toBe(true);
+    expect(Object.keys(row).sort()).toEqual([
+      'cleanup',
+      'createdAt',
+      'id',
+      'projectName',
+      'projectRoot',
+      'question',
+      'status',
+      'updatedAt',
+    ]);
+    expect(sessionListItemSchema.safeParse(SESSION_RECORD).success).toBe(false);
+    expect(
+      parseHttpResponse('session.list', {
+        ...EMPTY_SESSION_PAGE,
+        sessions: [SESSION_RECORD],
+        total: 1,
+      }).ok,
+    ).toBe(false);
+  });
+
+  it('summarises cleanup as a count, so no conflict diff reaches a row', () => {
+    const conflicted: typeof SESSION_RECORD = {
+      ...SESSION_RECORD,
+      cleanup: {
+        status: 'conflict',
+        completedAt: START_TIME + 119_000,
+        conflicts: [
+          {
+            recordId: MODIFICATION_ID,
+            sessionId: SESSION_ID,
+            file: SOURCE_FILE,
+            reason: 'content-changed',
+            expectedHash: hashFixture('2b'),
+            actualHash: hashFixture('3c'),
+            backupPath: MODIFICATION.backupPath,
+            detectedAt: START_TIME + 118_000,
+            message: 'The file was edited while instrumented; the original is kept.',
+            diffs: { instrumentedToCurrent: '@@ -1 +1 @@\n-a\n+b\n' },
+          },
+        ],
+      },
+    };
+    const row = toSessionListItem(conflicted);
+
+    expect(row.cleanup).toEqual({
+      status: 'conflict',
+      completedAt: START_TIME + 119_000,
+      conflictCount: 1,
+    });
+    expect(sessionListItemSchema.safeParse(row).success).toBe(true);
+    expect(JSON.stringify(row)).not.toContain('@@');
+    expect(sessionListItemSchema.safeParse({ ...row, cleanup: conflicted.cleanup }).success).toBe(
+      false,
+    );
+  });
+
+  it('lets nextOffset move past what a page consumed, never back or beyond its window', () => {
+    const row = toSessionListItem(SESSION_RECORD);
+    const firstOfTwo = { sessions: [row], total: 2, limit: 1, offset: 0, nextOffset: 1 };
+
+    expect(parseHttpResponse('session.list', firstOfTwo).ok).toBe(true);
+    // A full page with sessions beyond its window is not the last page.
+    expect(parseHttpResponse('session.list', { ...firstOfTwo, nextOffset: null }).ok).toBe(false);
+    // Past the listing's end, back onto the page, and beyond the window are refused.
+    expect(parseHttpResponse('session.list', { ...firstOfTwo, nextOffset: 2 }).ok).toBe(false);
+    expect(parseHttpResponse('session.list', { ...firstOfTwo, nextOffset: 0 }).ok).toBe(false);
+    expect(
+      parseHttpResponse('session.list', { ...firstOfTwo, total: 5, limit: 2, nextOffset: 3 }).ok,
+    ).toBe(false);
+    // A page that consumed an unreadable row moves past it: fewer rows, same window.
+    expect(
+      parseHttpResponse('session.list', {
+        sessions: [row],
+        total: 3,
+        limit: 2,
+        offset: 0,
+        nextOffset: 2,
+      }).ok,
+    ).toBe(true);
+    expect(
+      parseHttpResponse('session.list', {
+        ...EMPTY_SESSION_PAGE,
+        total: 3,
+        limit: 2,
+        nextOffset: 2,
+      }).ok,
+    ).toBe(true);
+    // A count-only page is always the last.
+    expect(
+      parseHttpResponse('session.list', {
+        ...EMPTY_SESSION_PAGE,
+        total: 5,
+        limit: 0,
+        nextOffset: 0,
+      }).ok,
+    ).toBe(false);
+    // The last page, and a count-only page, both end the loop.
+    expect(
+      parseHttpResponse('session.list', { ...firstOfTwo, offset: 1, nextOffset: null }).ok,
+    ).toBe(true);
+    expect(
+      parseHttpResponse('session.list', { ...EMPTY_SESSION_PAGE, total: 5, limit: 0 }).ok,
+    ).toBe(true);
+    // A page longer than its limit, or than what remains, is refused.
+    expect(
+      parseHttpResponse('session.list', {
+        sessions: [row, row],
+        total: 2,
+        limit: 1,
+        offset: 0,
+        nextOffset: null,
+      }).ok,
+    ).toBe(false);
+    expect(
+      parseHttpResponse('session.list', {
+        sessions: [row],
+        total: 1,
+        limit: 5,
+        offset: 1,
+        nextOffset: null,
+      }).ok,
+    ).toBe(false);
+    expect(
+      parseHttpResponse('session.list', {
+        ...EMPTY_SESSION_PAGE,
+        limit: SESSION_LIST_MAX_LIMIT + 1,
+      }).ok,
+    ).toBe(false);
+  });
+
+  it('bounds a journal page by its diff budget in UTF-8 bytes, and lets a page end early', () => {
+    // Three ASCII diffs at the per-diff cap: 6 MiB of UTF-8, exactly the budget.
+    const ascii = [1, 2, 3].map((index) => recordWithDiff(index, 'x'.repeat(MAX_DIFF_UNITS)));
+    // One diff of three-byte characters at the same cap fills the budget alone.
+    const wide = recordWithDiff(4, '\u20ac'.repeat(MAX_DIFF_UNITS));
+    const page = (modifications: readonly (typeof MODIFICATION)[], nextOffset: number | null) =>
+      parseHttpResponse('modifications.list', {
+        modifications,
+        total: 5,
+        limit: MODIFICATIONS_PAGE_DEFAULT_LIMIT,
+        offset: 0,
+        nextOffset,
+      }).ok;
+
+    expect(MODIFICATIONS_PAGE_DIFF_BUDGET).toBe(MODIFICATION_DIFF_MAX_BYTES);
+    expect(modificationsDiffBytes(ascii)).toBe(MODIFICATIONS_PAGE_DIFF_BUDGET);
+    expect(modificationsDiffBytes([wide])).toBe(MODIFICATIONS_PAGE_DIFF_BUDGET);
+    expect(page(ascii, 3)).toBe(true);
+    expect(page([wide], 1)).toBe(true);
+    // Measured in bytes, not characters: one more ASCII byte past a full page is refused,
+    // although the page holds far fewer characters than the old character budget.
+    expect(page([wide, recordWithDiff(5, 'x')], null)).toBe(false);
+    expect(page([...ascii, recordWithDiff(5, 'x')], null)).toBe(false);
+    expect(MODIFICATIONS_PAGE_DEFAULT_LIMIT).toBe(MODIFICATIONS_PAGE_MAX_LIMIT);
+  });
+
+  it('counts UTF-8 bytes exactly as an encoder would, without encoding', () => {
+    const encoder = new TextEncoder();
+    const samples = [
+      '',
+      'plain ascii',
+      'caf\u00e9',
+      '\u20ac and \u4e2d\u6587',
+      'emoji \ud83d\ude00 pair',
+      'lone high \ud800 surrogate',
+      'lone low \udc00 surrogate',
+      'trailing high \ud83d',
+      '+  const __dbg = globalThis.__DEBUGGEN__;\n-  return total;\n',
+    ];
+
+    for (const sample of samples) {
+      expect(utf8ByteLength(sample), JSON.stringify(sample)).toBe(encoder.encode(sample).length);
+    }
+    expect(utf8ByteLength('\u20ac'.repeat(MAX_DIFF_UNITS))).toBe(MODIFICATION_DIFF_MAX_BYTES);
+  });
+
+  it('encodes a page window as exactly the query string the service parses', () => {
+    expect(LIST_PAGE_OPERATIONS).toEqual(['session.list', 'modifications.list']);
+    expect(LIST_PAGE_MAX_LIMITS).toEqual({
+      'session.list': SESSION_LIST_MAX_LIMIT,
+      'modifications.list': MODIFICATIONS_PAGE_MAX_LIMIT,
+    });
+    expect(isListPageOperation('session.list')).toBe(true);
+    expect(isListPageOperation('session.get')).toBe(false);
+
+    expect(formatListPageQuery('session.list', {})).toEqual({ ok: true, value: '' });
+    expect(formatListPageQuery('session.list', { limit: undefined, offset: undefined })).toEqual({
+      ok: true,
+      value: '',
+    });
+    expect(formatListPageQuery('modifications.list', { limit: 0 })).toEqual({
+      ok: true,
+      value: '?limit=0',
+    });
+    expect(formatListPageQuery('session.list', { offset: 40 })).toEqual({
+      ok: true,
+      value: '?offset=40',
+    });
+
+    for (const operation of LIST_PAGE_OPERATIONS) {
+      const window = { limit: LIST_PAGE_MAX_LIMITS[operation], offset: LIST_PAGE_MAX_OFFSET };
+      const encoded = formatListPageQuery(operation, window);
+      expect(encoded.ok).toBe(true);
+      if (!encoded.ok) {
+        continue;
+      }
+      expect(encoded.value).toBe(
+        `?limit=${String(window.limit)}&offset=${String(LIST_PAGE_MAX_OFFSET)}`,
+      );
+      // The round trip: what a client sends is what the service accepts, unchanged.
+      const query = Object.fromEntries(new URLSearchParams(encoded.value));
+      expect(parseListPageQuery(query, { maxLimit: LIST_PAGE_MAX_LIMITS[operation] })).toEqual({
+        ok: true,
+        value: window,
+      });
+    }
+  });
+
+  it('refuses a window the service would refuse, naming the parameter and never its value', () => {
+    const refusals: readonly [Parameters<typeof formatListPageQuery>[0], object][] = [
+      ['session.list', { limit: SESSION_LIST_MAX_LIMIT + 1 }],
+      ['modifications.list', { limit: MODIFICATIONS_PAGE_MAX_LIMIT + 1 }],
+      ['session.list', { limit: -1 }],
+      ['session.list', { limit: 1.5 }],
+      ['session.list', { limit: Number.NaN }],
+      ['session.list', { offset: -1 }],
+      ['session.list', { offset: LIST_PAGE_MAX_OFFSET + 2 }],
+      ['session.list', { offset: Number.POSITIVE_INFINITY }],
+      ['session.list', { limit: 987654321 }],
+      ['session.get', { limit: 1 }],
+      ['panel.data', { offset: 0 }],
+    ];
+
+    for (const [operation, window] of refusals) {
+      const encoded = formatListPageQuery(operation, window);
+      expect(encoded.ok, `${operation} ${JSON.stringify(window)}`).toBe(false);
+      if (!encoded.ok) {
+        expect(encoded.error.code).toBe('PROTOCOL_INVALID_MESSAGE');
+        expect(encoded.error.message).not.toContain('987654321');
+        expect(JSON.stringify(encoded.error.toPayload())).not.toContain('987654321');
+      }
+    }
+  });
+
+  it('parses a page window from the query string and refuses anything else', () => {
+    const bounds = { maxLimit: SESSION_LIST_MAX_LIMIT };
+
+    expect(parseListPageQuery({}, bounds)).toEqual({ ok: true, value: {} });
+    expect(parseListPageQuery({ limit: '0', offset: '40' }, bounds)).toEqual({
+      ok: true,
+      value: { limit: 0, offset: 40 },
+    });
+    expect(parseListPageQuery({ limit: String(SESSION_LIST_MAX_LIMIT) }, bounds).ok).toBe(true);
+
+    for (const refused of [
+      { limit: String(SESSION_LIST_MAX_LIMIT + 1) },
+      { limit: '-1' },
+      { limit: '05' },
+      { limit: '1e3' },
+      { limit: ' 5' },
+      { offset: String(LIST_PAGE_MAX_OFFSET + 1) },
+      { offset: '9999999999999999' },
+      { page: '2' },
+      { limit: 'SENTINEL-LEAK' },
+    ]) {
+      const parsed = parseListPageQuery(refused, bounds);
+      expect(parsed.ok, JSON.stringify(refused)).toBe(false);
+      if (!parsed.ok) {
+        expect(parsed.error.code).toBe('PROTOCOL_INVALID_MESSAGE');
+        // Paths and codes only: the rejected text never reaches the error.
+        expect(JSON.stringify(parsed.error.toPayload())).not.toContain('SENTINEL');
+        expect(parsed.error.message).not.toContain('SENTINEL');
+      }
+    }
   });
 });
 
@@ -1250,6 +2165,192 @@ describe('the dev-server, health and pairing bodies', () => {
         role: 'devtools',
       }).success,
     ).toBe(false);
+  });
+});
+
+describe('the devServer.credential bodies — a project-scoped server-agent credential', () => {
+  /** The longest project root the transport admits, matching every other path field. */
+  const LONGEST_PROJECT_ROOT = `/${'p'.repeat(4095)}`;
+
+  /** A valid reply: the credential and an expiry twelve hours after the fixture instant. */
+  const CREDENTIAL_REPLY = VALID_RESPONSES['devServer.credential'];
+
+  it('binds the route to its own two schemas, behind a credential', () => {
+    expect(HTTP_ROUTES['devServer.credential'].request).toBe(devServerCredentialRequestSchema);
+    expect(HTTP_ROUTES['devServer.credential'].response).toBe(devServerCredentialResponseSchema);
+    expect(devServerCredentialPath()).toBe('/dev-server/credential');
+    // Declared by the table, so the collision a folder-owned literal could hide
+    // — two owners of one path — cannot exist: exactly one row claims it.
+    expect(
+      HTTP_OPERATIONS.filter(
+        (operation) => HTTP_ROUTES[operation].pattern === '/dev-server/credential',
+      ),
+    ).toEqual(['devServer.credential']);
+  });
+
+  it('accepts a project root, checked exactly as devServer.stop checks one', () => {
+    expect(parseHttpRequest('devServer.credential', { projectRoot: PROJECT_ROOT }).ok).toBe(true);
+    expect(parseHttpRequest('devServer.credential', { projectRoot: LONGEST_PROJECT_ROOT }).ok).toBe(
+      true,
+    );
+    // Shape only, like every path field here: whether the root is absolute and
+    // inside an announced workspace folder is the service's question, answered
+    // where a real path can be resolved.
+    expect(parseHttpRequest('devServer.credential', { projectRoot: 'relative/site' }).ok).toBe(
+      true,
+    );
+
+    for (const body of [
+      { projectRoot: PROJECT_ROOT },
+      { projectRoot: '' },
+      { projectRoot: `${LONGEST_PROJECT_ROOT}x` },
+    ]) {
+      expect(devServerCredentialRequestSchema.safeParse(body).success).toBe(
+        devServerStopRequestSchema.safeParse(body).success,
+      );
+    }
+  });
+
+  it('refuses an extra key, an empty or over-long project root, and a missing one', () => {
+    // A role or a TTL named here would be the caller choosing what it is granted.
+    expect(
+      parseHttpRequest('devServer.credential', { projectRoot: PROJECT_ROOT, role: 'vscode' }).ok,
+    ).toBe(false);
+    expect(
+      parseHttpRequest('devServer.credential', { projectRoot: PROJECT_ROOT, ttlMs: 1_000 }).ok,
+    ).toBe(false);
+    expect(parseHttpRequest('devServer.credential', { projectRoot: '' }).ok).toBe(false);
+    expect(
+      parseHttpRequest('devServer.credential', { projectRoot: `${LONGEST_PROJECT_ROOT}x` }).ok,
+    ).toBe(false);
+    expect(parseHttpRequest('devServer.credential', {}).ok).toBe(false);
+    expect(parseHttpRequest('devServer.credential', undefined).ok).toBe(false);
+  });
+
+  it('answers with the credential and its expiry, and nothing else', () => {
+    expect(parseHttpResponse('devServer.credential', CREDENTIAL_REPLY).ok).toBe(true);
+    expect(
+      parseHttpResponse('devServer.credential', { ...CREDENTIAL_REPLY, token: 't'.repeat(512) }).ok,
+    ).toBe(true);
+
+    expect(parseHttpResponse('devServer.credential', { token: SERVER_AGENT_TOKEN }).ok).toBe(false);
+    expect(
+      parseHttpResponse('devServer.credential', { expiresAt: CREDENTIAL_REPLY.expiresAt }).ok,
+    ).toBe(false);
+    expect(parseHttpResponse('devServer.credential', { ...CREDENTIAL_REPLY, token: '' }).ok).toBe(
+      false,
+    );
+    expect(
+      parseHttpResponse('devServer.credential', { ...CREDENTIAL_REPLY, token: 't'.repeat(513) }).ok,
+    ).toBe(false);
+    // A seconds-precision expiry is a unit mistake, refused like any timestamp.
+    expect(
+      parseHttpResponse('devServer.credential', {
+        ...CREDENTIAL_REPLY,
+        expiresAt: Math.floor(CREDENTIAL_REPLY.expiresAt / 1_000),
+      }).ok,
+    ).toBe(false);
+    expect(
+      parseHttpResponse('devServer.credential', {
+        ...CREDENTIAL_REPLY,
+        scope: PROJECT_ROOT,
+      }).ok,
+    ).toBe(false);
+  });
+
+  it('round-trips both bodies through JSON unchanged', () => {
+    const request = parseHttpRequest(
+      'devServer.credential',
+      throughJson({ projectRoot: PROJECT_ROOT }),
+    );
+    expect(request.ok).toBe(true);
+    if (request.ok) {
+      expect(request.value).toEqual({ projectRoot: PROJECT_ROOT });
+    }
+
+    const response = parseHttpResponse('devServer.credential', throughJson(CREDENTIAL_REPLY));
+    expect(response.ok).toBe(true);
+    if (response.ok) {
+      expect(response.value).toEqual(CREDENTIAL_REPLY);
+    }
+  });
+
+  it('never echoes a rejected credential', () => {
+    const rejected = parseHttpResponse('devServer.credential', {
+      token: SERVER_AGENT_TOKEN,
+      expiresAt: SERVER_AGENT_TOKEN,
+    });
+
+    expect(rejected.ok).toBe(false);
+    if (!rejected.ok) {
+      expect(rejected.error.message).toContain('expiresAt');
+      expect(
+        JSON.stringify({ message: rejected.error.message, details: rejected.error.details }),
+      ).not.toContain(SERVER_AGENT_TOKEN);
+      expect(JSON.stringify(rejected.error.toPayload())).not.toContain(SERVER_AGENT_TOKEN);
+    }
+  });
+});
+
+describe('the credentials.rotate bodies — revoke everything, name nothing', () => {
+  it('binds the route to its own two schemas, behind a credential', () => {
+    expect(HTTP_ROUTES['credentials.rotate'].request).toBe(credentialsRotateRequestSchema);
+    expect(HTTP_ROUTES['credentials.rotate'].response).toBe(credentialsRotateResponseSchema);
+    expect(credentialsRotatePath()).toBe('/credentials/rotate');
+  });
+
+  it('accepts an empty request and refuses any key or a missing body', () => {
+    expect(parseHttpRequest('credentials.rotate', {}).ok).toBe(true);
+    // All or nothing: a body that could spare one credential would defeat it.
+    expect(parseHttpRequest('credentials.rotate', { keep: ['vscode'] }).ok).toBe(false);
+    expect(parseHttpRequest('credentials.rotate', { role: 'vscode' }).ok).toBe(false);
+    expect(parseHttpRequest('credentials.rotate', undefined).ok).toBe(false);
+  });
+
+  it('answers with two counts, zero included', () => {
+    expect(
+      parseHttpResponse('credentials.rotate', { credentialsDeleted: 0, socketsClosed: 0 }).ok,
+    ).toBe(true);
+    expect(parseHttpResponse('credentials.rotate', VALID_RESPONSES['credentials.rotate']).ok).toBe(
+      true,
+    );
+  });
+
+  it.each(['credentialsDeleted', 'socketsClosed'] as const)(
+    'refuses a negative, fractional or missing %s',
+    (field) => {
+      const reply = VALID_RESPONSES['credentials.rotate'];
+      const { [field]: omitted, ...without } = reply;
+
+      expect(omitted).toBeGreaterThan(0);
+      expect(parseHttpResponse('credentials.rotate', without).ok).toBe(false);
+      expect(parseHttpResponse('credentials.rotate', { ...reply, [field]: -1 }).ok).toBe(false);
+      expect(parseHttpResponse('credentials.rotate', { ...reply, [field]: 0.5 }).ok).toBe(false);
+    },
+  );
+
+  it('carries no credential on the wire: the new editor token lives in auth.json only', () => {
+    expect(
+      parseHttpResponse('credentials.rotate', {
+        ...VALID_RESPONSES['credentials.rotate'],
+        token: 'editor-credential-placeholder',
+      }).ok,
+    ).toBe(false);
+  });
+
+  it('round-trips both bodies through JSON unchanged', () => {
+    const request = parseHttpRequest('credentials.rotate', throughJson({}));
+    expect(request.ok).toBe(true);
+    if (request.ok) {
+      expect(request.value).toEqual({});
+    }
+
+    const reply = VALID_RESPONSES['credentials.rotate'];
+    const response = parseHttpResponse('credentials.rotate', throughJson(reply));
+    expect(response.ok).toBe(true);
+    if (response.ok) {
+      expect(response.value).toEqual(reply);
+    }
   });
 });
 
@@ -1789,8 +2890,10 @@ describe('buildPath — substitution, encoding and a loud failure', () => {
       `/sessions/${SESSION_ID}`,
       `/sessions/${SESSION_ID}/question`,
       `/sessions/${SESSION_ID}/end`,
+      '/sessions/purge',
       `/sessions/${SESSION_ID}/capture/start`,
       `/sessions/${SESSION_ID}/capture/stop`,
+      `/sessions/${SESSION_ID}/target/request`,
       `/sessions/${SESSION_ID}/panel-data`,
       `/sessions/${SESSION_ID}/panel`,
       `/sessions/${SESSION_ID}/panels/${PANEL_ID}`,
@@ -1798,9 +2901,11 @@ describe('buildPath — substitution, encoding and a loud failure', () => {
       '/telemetry/ingest',
       '/dev-server/launch',
       '/dev-server/stop',
+      '/dev-server/credential',
       '/health',
       '/pair/start',
       '/pair/complete',
+      '/credentials/rotate',
     ]);
   });
 
@@ -1854,8 +2959,12 @@ describe('buildPath — substitution, encoding and a loud failure', () => {
     expect(sessionPath(SESSION_ID)).toBe(buildPath('session.get', { id: SESSION_ID }));
     expect(sessionQuestionPath(SESSION_ID)).toBe(buildPath('session.question', { id: SESSION_ID }));
     expect(sessionEndPath(SESSION_ID)).toBe(buildPath('session.end', { id: SESSION_ID }));
+    expect(sessionPurgePath()).toBe('/sessions/purge');
+    expect(sessionPurgePath()).toBe(buildPath('session.purge'));
     expect(captureStartPath(SESSION_ID)).toBe(buildPath('capture.start', { id: SESSION_ID }));
     expect(captureStopPath(SESSION_ID)).toBe(buildPath('capture.stop', { id: SESSION_ID }));
+    expect(targetRequestPath(SESSION_ID)).toBe(buildPath('target.request', { id: SESSION_ID }));
+    expect(targetRequestPath(SESSION_ID)).toBe(`/sessions/${SESSION_ID}/target/request`);
     expect(panelDataPath(SESSION_ID)).toBe(buildPath('panel.data', { id: SESSION_ID }));
     expect(panelPath(SESSION_ID)).toBe(buildPath('panel.get', { id: SESSION_ID }));
     expect(panelByIdPath(SESSION_ID, PANEL_ID)).toBe(
@@ -1865,9 +2974,13 @@ describe('buildPath — substitution, encoding and a loud failure', () => {
     expect(telemetryIngestPath()).toBe('/telemetry/ingest');
     expect(devServerLaunchPath()).toBe('/dev-server/launch');
     expect(devServerStopPath()).toBe('/dev-server/stop');
+    expect(devServerCredentialPath()).toBe('/dev-server/credential');
+    expect(devServerCredentialPath()).toBe(buildPath('devServer.credential'));
     expect(healthPath()).toBe('/health');
     expect(pairStartPath()).toBe('/pair/start');
     expect(pairCompletePath()).toBe('/pair/complete');
+    expect(credentialsRotatePath()).toBe('/credentials/rotate');
+    expect(credentialsRotatePath()).toBe(buildPath('credentials.rotate'));
   });
 
   it('publishes the WebSocket path beside the routes', () => {
@@ -2019,6 +3132,23 @@ describe('a rejected body never becomes a leak', () => {
     if (!rejected.ok) {
       expect(exposedText(rejected.error)).not.toContain(SENTINEL);
       expect(DEBUGGEN_ERROR_CODES).toContain(rejected.error.code);
+    }
+  });
+
+  it('reports a target-request body or reply that names too much without echoing it', () => {
+    const request = parseHttpRequest('target.request', { selector: SENTINEL });
+    const response = parseHttpResponse('target.request', {
+      sessionId: SESSION_ID,
+      tabId: SENTINEL,
+    });
+
+    expect(request.ok).toBe(false);
+    expect(response.ok).toBe(false);
+    for (const rejected of [request, response]) {
+      if (!rejected.ok) {
+        expect(exposedText(rejected.error)).not.toContain(SENTINEL);
+        expect(rejected.error.code).toBe('PROTOCOL_INVALID_MESSAGE');
+      }
     }
   });
 });

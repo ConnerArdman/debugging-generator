@@ -46,31 +46,29 @@
  *   parent never arrived at all", which is a different statement, and
  *   conflating the two would invent evidence.
  *
- * ## The canvas is laid out in CSS pixels
+ * ## The canvas is a fixed logical coordinate space
  *
- * `../utils/measure`'s `useChartCanvas` reports the inner width of the scroll
- * viewport the canvas is drawn into, kept current as the panel is resized, and
- * the canvas is drawn exactly that wide with a `viewBox` of the same size
- * (`resolveCanvasWidth` in `../utils/scale`): one user unit is one CSS pixel,
- * so the 11 px label roles render at 11 px at every panel width, the canvas
- * declares no height it does not draw into, and the time axis spans the whole
- * section however wide it is. A viewport narrower than `MIN_CANVAS_WIDTH`
- * scrolls the canvas horizontally instead of squeezing it. This file reads no
- * layout itself: the hook takes its first measurement while the viewport's ref
- * attaches, before the first paint, and follows every resize after it.
+ * The canvas is laid out in a `viewBox` exactly `CHART_VIEWBOX_WIDTH` (1 000)
+ * user units wide — `../utils/scale`'s fixed logical width for the time charts
+ * — and as tall as the lanes it draws. The element itself declares
+ * `width="100%"`, so CSS sizes it to its container, and
+ * `preserveAspectRatio="xMinYMin meet"` scales the drawing uniformly into that
+ * box from its top-left corner, so a glyph is never stretched sideways at any
+ * panel width. Nothing here depends on measured pixels: this file reads no
+ * element's size, observes no resize and measures no rendered font, so the
+ * drawing is a pure function of the data — identical in a browser, in a
+ * DevTools panel of any width and in the layout-free DOM every component suite
+ * runs under.
  *
- * A bar's label is measured in the label font before it is placed, so it is
- * drawn only where it fits — after the bar, before it, inside it, or shortened
- * to an ellipsis — and never across the lane labels, past the canvas edge or
- * over another bar or label (see "Bar labels" below).
- *
- * Where nothing can be measured — an environment with no layout, which is
- * every component suite — the canvas lays out at `DEFAULT_CANVAS_WIDTH` user
- * units, declares `width="100%"` and scales that drawing uniformly to its
- * container (`preserveAspectRatio="xMinYMin meet"`, so glyphs are never
- * stretched sideways), and labels are measured by the hook's deterministic
- * estimate. The drawing is then a pure function of the data, which is what the
- * layout-free suite asserts against.
+ * A bar's label is fitted in the same logical units before it is placed, with
+ * `../utils/format`'s deterministic advance estimate at the label role's size
+ * (`fitTextToWidth` over `createEstimateMeasure(DEFAULT_LABEL_FONT_SIZE)`; the
+ * label is set in `--dg-mono-sm`, 11 units tall however the drawing is
+ * scaled), so it is drawn only where it fits — after the bar, before it, inside
+ * it, or shortened to an ellipsis — and never across the lane labels, past the
+ * canvas edge or over another bar or label (see "Bar labels" below). The
+ * estimate errs towards "does not fit", so a label it places is not clipped by
+ * the face the stylesheet renders it in.
  *
  * Every coordinate comes from `../utils/scale` and every colour from
  * `../utils/color`; this file performs no interval arithmetic of its own and
@@ -141,14 +139,19 @@
  * - A **partial** result says so: a `spans` result reports how much of it is
  *   on screen and, for as long as the service names a next offset, offers the
  *   next page — appended after the rows already drawn, which stay on screen
- *   while it loads and if it fails. A `trace` arrives whole, so a walk stopped
- *   at its row bound (`../utils/scale`'s `DEFAULT_MAX_TRACE_ROWS`) states "N of
- *   M spans shown", M being the trace's own node count, and offers "Show more
- *   spans", which raises the bound by one step without asking the provider for
- *   anything; the bound returns to its default when the node's query changes.
- *   A trace the correlator itself bounded says so and gives the refine route —
- *   narrowing the query or capturing a shorter interaction — since nothing more
- *   of it is in memory.
+ *   while it loads and if it fails. A `trace` arrives whole. A trace the
+ *   correlator itself bounded says so and gives the refine route — narrowing
+ *   the query or capturing a shorter interaction — since nothing more of it is
+ *   in memory.
+ * - **The canvas draws at most `MAX_DRAWN_ROWS` bars, absolutely.** A walk —
+ *   a trace's, or every span page loaded so far — longer than that budget is
+ *   drawn one window at a time (see "The drawn-row window" below): the footer
+ *   states which rows are drawn and how many precede and follow them undrawn,
+ *   and "Previous spans" and "Next spans" MOVE the window over the walk without
+ *   asking the provider for anything; nothing the reader does grows it. The
+ *   table below the canvas lists exactly the rows the window draws, a span
+ *   selected elsewhere in the panel pages the window to it, and the window
+ *   returns to the walk's first row when the node's query changes.
  * - URLs, statements and attribute values arrive redacted and truncated
  *   (AAP 0.5.2). They are rendered exactly as given: nothing here reconstructs
  *   a URL, expands a statement or dumps an attribute bag.
@@ -245,11 +248,12 @@ import { matchesPanelSelection, usePanelActions, useViewSelection } from '../hos
 import type { PanelEventRef, PanelSelection } from '../host/PanelActions';
 import { queryFailureProps, unsupportedQueryProps, useQuery } from '../host/useQuery';
 import { kindColorVar, tierColorVar } from '../utils/color';
-import { fitTextToWidth, useChartCanvas } from '../utils/measure';
-import type { TextMeasure } from '../utils/measure';
 import {
+  DEFAULT_LABEL_FONT_SIZE,
   NOT_AVAILABLE_LABEL,
   collapseWhitespace,
+  createEstimateMeasure,
+  fitTextToWidth,
   formatCount,
   formatDuration,
   formatDurationCompact,
@@ -258,22 +262,34 @@ import {
   formatStatusLabel,
   formatTierLabel,
 } from '../utils/format';
+import type { TextMeasure } from '../utils/format';
 import {
+  CHART_VIEWBOX_WIDTH,
   DEFAULT_MAX_TRACE_ROWS,
   DEFAULT_ROW_HEIGHT,
+  MAX_DRAWN_ROWS,
   alignHairline,
   clamp,
   createTimeScale,
   flattenTraceRows,
   generateAxisTicks,
-  isMeasuredWidth,
   layoutDepth,
   layoutLaneStack,
+  nextWindowStart,
   placeSpanDuration,
+  previousWindowStart,
   rankLaneDepths,
-  resolveCanvasWidth,
+  windowContains,
+  windowRows,
+  windowStartFor,
 } from '../utils/scale';
-import type { AxisTick, FlatTraceRow, TimeScale, TraceLayoutOptions } from '../utils/scale';
+import type {
+  AxisTick,
+  FlatTraceRow,
+  RowWindow,
+  TimeScale,
+  TraceLayoutOptions,
+} from '../utils/scale';
 import { SourceLink } from './SourceLink';
 
 /*
@@ -313,13 +329,32 @@ const TIER_LANE_ORDER: readonly TelemetryTier[] = Object.freeze([
  *
  * Unitless SVG user units, which is what `../utils/scale` speaks and what the
  * stylesheet deliberately does not: every rule there sets paint and text only,
- * so a coordinate has exactly one owner. A measured canvas draws one user unit
- * per CSS pixel, so these are pixel sizes there; an unmeasured one scales its
- * `DEFAULT_CANVAS_WIDTH` units to its container (see this module's header).
- * None of these is a CSS value — no `px`, no `rem`, no colour. The canvas's
- * WIDTH is not among them: it is the viewport's, resolved per render.
+ * so a coordinate has exactly one owner. They are positions in the canvas's
+ * fixed logical space, `CHART_VIEWBOX_WIDTH` units wide, which the drawing
+ * scales uniformly to its container (see this module's header), so each is a
+ * fixed share of the canvas's width at every panel width. None of these is a
+ * CSS value — no `px`, no `rem`, no colour.
  * ---------------------------------------------------------------------------
  */
+
+/**
+ * The measure every bar label is fitted with: `../utils/format`'s
+ * deterministic advance estimate at the label role's size — `--dg-mono-sm`,
+ * 11 units, which is `DEFAULT_LABEL_FONT_SIZE`. Created once, since it depends
+ * on nothing but that size, so the geometry below is a pure function of the
+ * model.
+ */
+const BAR_LABEL_MEASURE: TextMeasure = createEstimateMeasure(DEFAULT_LABEL_FONT_SIZE);
+
+/**
+ * The canvas every model is drawn on: the fixed logical width and the label
+ * measure. One frozen value, so no render can lay a model out differently from
+ * another.
+ */
+const CANVAS_FRAME: CanvasFrame = Object.freeze({
+  width: CHART_VIEWBOX_WIDTH,
+  measureText: BAR_LABEL_MEASURE,
+});
 
 /**
  * The leading gutter the tier labels occupy, before the time axis begins.
@@ -392,8 +427,11 @@ const BAR_LABEL_SEPARATOR = ' · ';
  * ---------------------------------------------------------------------------
  */
 
-/** One span, ready to draw: its identity, its place in the tree and its flags. */
-interface TimelineBar {
+/**
+ * One span as its payload's walk produced it: its identity, its place in the
+ * tree and its flags — everything a drawn row carries except where it is drawn.
+ */
+interface SpanBar {
   /** The event's own id — what a selection and an evidence citation name. */
   readonly eventId: string;
   /** The span id, which is what a parent → child edge is resolved through. */
@@ -414,8 +452,6 @@ interface TimelineBar {
   readonly durationMs: number;
   /** Distance from the drawn tree's root; `0` at a root. */
   readonly depth: number;
-  /** Which lane this row belongs to, as an index into the model's `tiers`. */
-  readonly laneIndex: number;
   /** The reported status: unset, ok or error. */
   readonly status: TelemetryStatus;
   /** Where in the project this span resolved to, when it resolved at all. */
@@ -443,25 +479,57 @@ interface TimelineBar {
   readonly parentNotLoaded: boolean;
 }
 
+/**
+ * One drawn span: the span itself, the lane it is drawn in, and where it sits
+ * in the whole walk the drawn window was cut from (see "The drawn-row window"
+ * below).
+ */
+interface TimelineBar extends SpanBar {
+  /** Which lane this row belongs to, as an index into the model's `tiers`. */
+  readonly laneIndex: number;
+  /** The row's position in the whole walk, counting from `0`. */
+  readonly walkIndex: number;
+  /**
+   * The walk position of the row its connector joins: the first row of the
+   * whole walk carrying the span this row names as its parent, inside its own
+   * trace. `undefined` when it names none, or when no row of the walk carries
+   * it (a flat page's "Parent not loaded").
+   */
+  readonly parentWalkIndex: number | undefined;
+  /**
+   * Whether that row is drawn in the same window as this one. A connector is
+   * drawn only then: a parent outside the window has no bar to join, and a
+   * line to another row would assert a relationship that is not there.
+   */
+  readonly parentDrawn: boolean;
+}
+
 /** The rows of one payload, the window they occupy and what was left out. */
 interface TimelineModel {
-  /** Every row, in the order the payload established. */
+  /** The drawn rows — the window's, never more than `MAX_DRAWN_ROWS` — in walk order. */
   readonly rows: readonly TimelineBar[];
-  /** The tiers present, in lane order — the index `TimelineBar.laneIndex` names. */
+  /** The tiers the drawn rows occupy, in lane order — the index `TimelineBar.laneIndex` names. */
   readonly tiers: readonly TelemetryTier[];
-  /** The window's start, in epoch milliseconds: the origin every offset reads from. */
+  /** Which rows of the whole walk are drawn, and how many precede and follow them. */
+  readonly window: RowWindow;
+  /**
+   * The start of the WHOLE walk's time window, in epoch milliseconds: the
+   * origin every offset reads from. Every window of one walk shares it, so an
+   * offset means the same thing on every page of the walk.
+   */
   readonly startTime: number;
-  /** The window's end, in epoch milliseconds. */
+  /** The end of the whole walk's time window, in epoch milliseconds. */
   readonly endTime: number;
   /**
-   * Whether rows exist that this model does not hold, for any reason: the
-   * walk's row bound, its depth bound, or the correlator's own truncation. It
-   * is what marks the summary as a partial result.
+   * Whether the walk itself left rows out, for any reason: its row ceiling,
+   * its depth bound, or the correlator's own truncation. Rows the walk holds
+   * but the window does not draw are {@link window}'s to state, not this flag's.
    */
   readonly truncated: boolean;
   /**
-   * Whether the trace walk stopped at its ROW bound with more of the tree in
-   * memory — the one reduction "Show more spans" lifts. Only a trace sets it.
+   * Whether the trace walk stopped at its row ceiling — the trace's own node
+   * count — with more of the tree still unvisited: a tree that holds more
+   * nodes than it reports. Only a trace sets it.
    */
   readonly walkBounded: boolean;
   /**
@@ -471,13 +539,13 @@ interface TimelineModel {
    */
   readonly correlatorTruncated: boolean;
   /**
-   * Whether the walk's DEPTH bound left children out. A larger row bound does
-   * not lift it, so the footer states it apart from the row bound.
+   * Whether the walk's DEPTH bound left children out. Paging the window does
+   * not reach them, so the footer states it apart from the window.
    */
   readonly depthClamped: boolean;
   /**
-   * The trace's own node count — the `M` of "N of M spans shown" — or
-   * `undefined` for span pages, whose total the service reports instead.
+   * The trace's own node count, or `undefined` for span pages, whose total
+   * the service reports instead.
    */
   readonly nodeCount: number | undefined;
 }
@@ -572,19 +640,41 @@ function isUsableInstant(value: number): boolean {
   return Number.isFinite(value) && value > 0;
 }
 
-/** The window the rows themselves occupy: the earliest start to the latest end. */
-function boundsOfBars(bars: readonly UnassignedBar[]): { start: number; end: number } {
+/** A time window, in epoch milliseconds. */
+interface TimeBounds {
+  readonly start: number;
+  readonly end: number;
+}
+
+/**
+ * The window a run of spans occupies: the earliest start to the latest end,
+ * or `0`–`0` when no span has a finite start.
+ *
+ * Generic over the row type, so the whole trace walk is bounded straight off
+ * the borrowed events without building a bar for every row first.
+ *
+ * @param items The spans, in any order.
+ * @param startOf Reads a span's start, in epoch milliseconds.
+ * @param durationOf Reads a span's duration, in milliseconds; a non-finite or
+ *   negative one counts as `0`.
+ */
+function boundsOfSpans<T>(
+  items: readonly T[],
+  startOf: (item: T) => number,
+  durationOf: (item: T) => number,
+): TimeBounds {
   let start = Number.POSITIVE_INFINITY;
   let end = Number.NEGATIVE_INFINITY;
 
-  for (const bar of bars) {
-    if (!Number.isFinite(bar.startTime)) {
+  for (const item of items) {
+    const itemStart = startOf(item);
+    if (!Number.isFinite(itemStart)) {
       continue;
     }
-    const barEnd =
-      bar.startTime + (Number.isFinite(bar.durationMs) ? Math.max(bar.durationMs, 0) : 0);
-    start = Math.min(start, bar.startTime);
-    end = Math.max(end, barEnd);
+    const duration = durationOf(item);
+    const itemEnd = itemStart + (Number.isFinite(duration) ? Math.max(duration, 0) : 0);
+    start = Math.min(start, itemStart);
+    end = Math.max(end, itemEnd);
   }
 
   return Number.isFinite(start) && Number.isFinite(end) ? { start, end } : { start: 0, end: 0 };
@@ -626,7 +716,7 @@ function assignLanes(bars: readonly UnassignedBar[]): {
 }
 
 /** One trace-walk row, borrowed read-only, as a bar. */
-function barFromTraceRow(row: FlatTraceRow): UnassignedBar {
+function barFromTraceRow(row: FlatTraceRow): SpanBar {
   const { event } = row.node;
   const attributes = event.attributes;
 
@@ -667,11 +757,7 @@ function barFromTraceRow(row: FlatTraceRow): UnassignedBar {
  * @param depth Its depth in the walk of the loaded forest; `0` at a root.
  * @param parentNotLoaded Whether it names a parent no loaded row carries.
  */
-function barFromEvent(
-  event: TelemetryEvent,
-  depth: number,
-  parentNotLoaded: boolean,
-): UnassignedBar {
+function barFromEvent(event: TelemetryEvent, depth: number, parentNotLoaded: boolean): SpanBar {
   const attributes = event.attributes;
 
   return {
@@ -823,9 +909,9 @@ interface SpanWalkStep {
  * Two records of one trace can carry one span id (a trace reports them as
  * `duplicateSpanIds`). That span's children expand under the FIRST-VISITED
  * record carrying it — it claims the span, and a later record of the same span
- * expands nothing — which is exactly the record `buildGeometry`'s
- * first-bar-per-span lookup resolves, so every connector joins the record its
- * child is drawn beneath. A set of visited event ids — the identity the pages
+ * expands nothing — which is exactly the record the walk's first-row-per-span
+ * lookup (`TimelineWalk.firstRowBySpan`) resolves, so every connector joins the
+ * record its child is drawn beneath. A set of visited event ids — the identity the pages
  * were de-duplicated on — emits each record once.
  *
  * A parent cycle among the loaded rows (`A` names `B`, `B` names `A`), which a
@@ -843,7 +929,7 @@ interface SpanWalkStep {
  * @param events Every row loaded so far, de-duplicated by event id, in any order.
  * @returns One bar per row, parents before their children.
  */
-function flattenParentFirst(events: readonly TelemetryEvent[]): readonly UnassignedBar[] {
+function flattenParentFirst(events: readonly TelemetryEvent[]): readonly SpanBar[] {
   const ordered = [...events].sort(compareSpans);
 
   // The key of the span a row names as its parent, inside the row's own trace,
@@ -888,7 +974,7 @@ function flattenParentFirst(events: readonly TelemetryEvent[]): readonly Unassig
     }
   }
 
-  const bars: UnassignedBar[] = [];
+  const bars: SpanBar[] = [];
   const visitedEventIds = new Set<string>();
   const claimedKeys = new Set<string>();
   const stack: SpanWalkStep[] = [];
@@ -965,49 +1051,157 @@ function flattenParentFirst(events: readonly TelemetryEvent[]): readonly Unassig
   return bars;
 }
 
+/*
+ * ---------------------------------------------------------------------------
+ * The drawn-row window
+ *
+ * A capture can hold far more spans than one SVG can carry: a correlated trace
+ * of tens of thousands of nodes is as many bars, labels and pointer handlers,
+ * and a DevTools panel that mounts them freezes. So this view never draws more
+ * than `MAX_DRAWN_ROWS` rows at once, however often the reader asks for more.
+ *
+ * Each payload is first WALKED whole — a trace children-only by
+ * `flattenTraceRows`, a span forest parent-first by `flattenParentFirst` — into
+ * a {@link TimelineWalk}: every row in walk order, the time window the whole
+ * walk occupies, and the walk position of the first row carrying each span. A
+ * walk is plain data and costs no DOM, and it is computed once per payload.
+ * The MODEL is then one window of at most `MAX_DRAWN_ROWS` rows cut from it
+ * (`windowRows` in `../utils/scale`); only those rows become bars, lanes,
+ * labels, connectors and table rows. "Previous spans" and "Next spans" move
+ * the window over the walk rather than growing it, and what lies before and
+ * after the window is counted and stated in the footer, never silently dropped.
+ *
+ * The whole walk is kept, not only the window's rows, because three questions
+ * need all of it: which window holds a span selected in another view of the
+ * panel (so the window can be paged to it), which row a connector's parent is
+ * (a parent may sit in another window, where drawing a connector to anything
+ * on screen would join the wrong row), and what time window every page of the
+ * walk shares (so an offset reads from one origin on every page). Holding the
+ * walk costs one borrowed row per span, bounded by the trace's own node count;
+ * holding its geometry would cost a bar, a label and a handler per span, which
+ * is what the budget exists to prevent.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * One payload's rows, in walk order, exactly as its walk produced them: the
+ * trace walk's rows are BORROWED (see `FlatTraceRow`) and become bars only when
+ * a window draws them, while a span forest arrives as bars already, since
+ * linking a flat page into a forest builds them anyway.
+ */
+type WalkRows =
+  | { readonly source: 'trace'; readonly rows: readonly FlatTraceRow[] }
+  | { readonly source: 'spans'; readonly bars: readonly SpanBar[] };
+
+/** Every row one payload walks to, before a window is cut from it. */
+interface TimelineWalk {
+  /** The rows, in walk order. */
+  readonly rows: WalkRows;
+  /** How many rows the walk holds. */
+  readonly total: number;
+  /**
+   * For each span — a span id inside its own trace, the key `traceSpanKey`
+   * builds — the walk position of the first row carrying it: the row a
+   * connector naming that span as its parent joins (see `flattenParentFirst`
+   * on the first-claim rule this mirrors).
+   */
+  readonly firstRowBySpan: ReadonlyMap<string, number>;
+  /** The whole walk's window start, in epoch milliseconds. */
+  readonly startTime: number;
+  /** The whole walk's window end, in epoch milliseconds. */
+  readonly endTime: number;
+  /** See {@link TimelineModel.walkBounded}. */
+  readonly walkBounded: boolean;
+  /** See {@link TimelineModel.correlatorTruncated}. */
+  readonly correlatorTruncated: boolean;
+  /** See {@link TimelineModel.depthClamped}. */
+  readonly depthClamped: boolean;
+  /** See {@link TimelineModel.nodeCount}. */
+  readonly nodeCount: number | undefined;
+}
+
+/**
+ * The most rows a trace walk visits: the trace's own node count, or
+ * `DEFAULT_MAX_TRACE_ROWS` when that count is smaller or unusable.
+ *
+ * Every node the correlator reports is reachable by paging, so the ceiling is
+ * never below the count; it exists only so that a tree which holds more nodes
+ * than it reports — a store round-trip gone wrong, or an object graph that
+ * shares a node — still ends its walk.
+ */
+function traceWalkCeiling(tree: TraceTree): number {
+  const count = tree.nodeCount;
+
+  return Number.isSafeInteger(count) && count > DEFAULT_MAX_TRACE_ROWS
+    ? count
+    : DEFAULT_MAX_TRACE_ROWS;
+}
+
 /**
  * The bounds the trace walk runs under.
  *
- * The walk visits ONE span past `maxRows` and keeps only the first `maxRows`
+ * The walk visits ONE span past `ceiling` and keeps only the first `ceiling`
  * rows (its `visibleRows` window): whether it produced that extra span is the
- * exact answer to "does the trace hold more than this view shows", which the
+ * exact answer to "does the tree hold more than this walk visited", which the
  * layout's `truncated` flag cannot give because the depth bound sets it too.
  *
  * @param tree The resolved trace.
- * @param maxRows The most spans this view shows.
+ * @param ceiling The most spans the walk keeps.
  * @returns The layout options.
  */
-function traceWalkOptions(tree: TraceTree, maxRows: number): TraceLayoutOptions {
+function traceWalkOptions(tree: TraceTree, ceiling: number): TraceLayoutOptions {
   // The tree's own greatest depth bounds the walk. It is honoured only when it
   // is a usable positive integer: a stored tree reporting `0` while its roots
   // carry children would otherwise have every child left unvisited, and hiding
   // captured work is the one thing this walk may not do. Absent, the walk uses
   // the layout module's own bound.
-  const rows = { maxRows: maxRows + 1, visibleRows: maxRows };
+  const rows = { maxRows: ceiling + 1, visibleRows: ceiling };
   return Number.isInteger(tree.maxDepth) && tree.maxDepth > 0
     ? { ...rows, maxDepth: tree.maxDepth }
     : rows;
 }
 
 /**
- * A correlated trace as rows: the children-only walk, in tree order.
+ * Records, for each span of a walk, the position of the first row carrying it.
+ *
+ * @param count How many rows the walk holds.
+ * @param keyAt The span key of row `index`.
+ */
+function indexFirstRows(count: number, keyAt: (index: number) => string): Map<string, number> {
+  const firstRowBySpan = new Map<string, number>();
+  for (let index = 0; index < count; index += 1) {
+    const key = keyAt(index);
+    if (!firstRowBySpan.has(key)) {
+      firstRowBySpan.set(key, index);
+    }
+  }
+
+  return firstRowBySpan;
+}
+
+/**
+ * A correlated trace, walked whole: the children-only walk, in tree order.
  *
  * @param tree The resolved trace.
- * @param maxRows The row bound in force — the default, or as raised by "Show
- * more spans".
- * @returns The model, with what the walk and the correlator left out.
+ * @returns The walk, with what it and the correlator left out.
  */
-function modelFromTrace(tree: TraceTree, maxRows: number): TimelineModel {
-  const layout = flattenTraceRows(tree, traceWalkOptions(tree, maxRows));
-  const bars = layout.rows.map(barFromTraceRow);
-  const { rows, tiers } = assignLanes(bars);
+function walkFromTrace(tree: TraceTree): TimelineWalk {
+  const ceiling = traceWalkCeiling(tree);
+  const layout = flattenTraceRows(tree, traceWalkOptions(tree, ceiling));
+  const rows = layout.rows;
 
   // The tree publishes its own window, and the rows' own bounds WIDEN it rather
   // than replace it: an async continuation that settled after the root closed is
   // real captured work, and an axis that ended at the root's end would clip it.
-  const derived = boundsOfBars(bars);
+  // Every row of the walk is counted, not only a window's, so each window of
+  // the walk is drawn on the same axis.
+  const derived = boundsOfSpans(
+    rows,
+    (row) => row.node.event.startTime,
+    (row) => row.node.event.duration,
+  );
   const startTime =
-    bars.length === 0
+    rows.length === 0
       ? isUsableInstant(tree.startTime)
         ? tree.startTime
         : 0
@@ -1015,7 +1209,7 @@ function modelFromTrace(tree: TraceTree, maxRows: number): TimelineModel {
         ? Math.min(tree.startTime, derived.start)
         : derived.start;
   const endTime =
-    bars.length === 0
+    rows.length === 0
       ? isUsableInstant(tree.endTime)
         ? tree.endTime
         : 0
@@ -1023,30 +1217,27 @@ function modelFromTrace(tree: TraceTree, maxRows: number): TimelineModel {
         ? Math.max(tree.endTime, derived.end)
         : derived.end;
 
-  // The lookahead span was produced only when more of the tree lies within the
-  // depth bound than the row bound shows.
-  const walkBounded = layout.totalRowCount > maxRows;
-  const depthClamped = layout.rows.some((row) => row.childrenTruncated);
-
   return {
-    rows,
-    tiers,
+    rows: { source: 'trace', rows },
+    total: rows.length,
+    firstRowBySpan: indexFirstRows(rows.length, (index) => {
+      const event = rows[index]?.node.event;
+      return event === undefined ? '' : traceSpanKey(event.traceId, event.spanId);
+    }),
     startTime,
     endTime,
-    // Every truncation matters and they are different statements: the
-    // correlator may have dropped nodes before this view saw the tree, and this
-    // walk may have stopped at its row bound or its depth bound.
-    truncated: tree.truncated || walkBounded || depthClamped,
-    walkBounded,
+    // The lookahead span was produced only when the tree holds more within the
+    // depth bound than the ceiling let the walk keep.
+    walkBounded: layout.totalRowCount > ceiling,
     correlatorTruncated: tree.truncated,
-    depthClamped,
+    depthClamped: rows.some((row) => row.childrenTruncated),
     nodeCount: tree.nodeCount,
   };
 }
 
 /**
  * The loaded rows of a flat span list — every page loaded so far, already
- * de-duplicated — as rows, parent before child.
+ * de-duplicated — walked parent before child.
  *
  * The order is {@link flattenParentFirst}'s: the loaded rows linked into a
  * parent/child forest and walked depth-first, with {@link compareSpans}
@@ -1054,19 +1245,25 @@ function modelFromTrace(tree: TraceTree, maxRows: number): TimelineModel {
  * settles, so a page that brings a parent re-links the children already on
  * screen beneath it, and clears their "Parent not loaded" mark.
  */
-function modelFromSpans(events: readonly TelemetryEvent[]): TimelineModel {
+function walkFromSpans(events: readonly TelemetryEvent[]): TimelineWalk {
   const bars = flattenParentFirst(events);
-  const { rows, tiers } = assignLanes(bars);
-  const window = boundsOfBars(bars);
+  const window = boundsOfSpans(
+    bars,
+    (bar) => bar.startTime,
+    (bar) => bar.durationMs,
+  );
 
   return {
-    rows,
-    tiers,
+    rows: { source: 'spans', bars },
+    total: bars.length,
+    firstRowBySpan: indexFirstRows(bars.length, (index) => {
+      const bar = bars[index];
+      return bar === undefined ? '' : traceSpanKey(bar.traceId, bar.spanId);
+    }),
     startTime: window.start,
     endTime: window.end,
     // A page is not a truncated result: how much of the result it holds is what
     // `total` reports, and the footer states it exactly rather than as a flag.
-    truncated: false,
     walkBounded: false,
     correlatorTruncated: false,
     depthClamped: false,
@@ -1074,17 +1271,129 @@ function modelFromSpans(events: readonly TelemetryEvent[]): TimelineModel {
   };
 }
 
+/** Row `index` of a walk as a span bar, or `undefined` past its end. */
+function walkBarAt(walk: TimelineWalk, index: number): SpanBar | undefined {
+  const { rows } = walk;
+  if (rows.source === 'spans') {
+    return rows.bars[index];
+  }
+
+  const row = rows.rows[index];
+  return row === undefined ? undefined : barFromTraceRow(row);
+}
+
+/**
+ * The walk position of the row the panel's selection stands for, or
+ * `undefined` when no row of the walk does.
+ *
+ * The same precedence as the drawn rows' own lookup (`rowForSelection`): the
+ * row carrying the selected event id wins, and failing that the first row
+ * naming the same trace **and** the same span. One pass over the walk, run
+ * only when the selection or the walk changes.
+ *
+ * @param walk The whole walk.
+ * @param selection The panel's selection.
+ */
+function walkIndexOfSelection(walk: TimelineWalk, selection: PanelSelection): number | undefined {
+  const { rows } = walk;
+  let spanMatch: number | undefined;
+
+  for (let index = 0; index < walk.total; index += 1) {
+    const ref = walkRefAt(rows, index);
+    if (ref === undefined) {
+      continue;
+    }
+    if (ref.eventId === selection.eventId) {
+      return index;
+    }
+    if (spanMatch === undefined && matchesPanelSelection(selection, ref)) {
+      spanMatch = index;
+    }
+  }
+
+  return spanMatch;
+}
+
+/**
+ * Row `index` of a walk as the pointer a selection is matched against: a span
+ * bar already is one, and a borrowed trace row names its event's three
+ * coordinates.
+ */
+function walkRefAt(rows: WalkRows, index: number): PanelEventRef | undefined {
+  if (rows.source === 'spans') {
+    return rows.bars[index];
+  }
+
+  const event = rows.rows[index]?.node.event;
+  return event === undefined
+    ? undefined
+    : { eventId: event.id, traceId: event.traceId, spanId: event.spanId };
+}
+
+/**
+ * The model one window of a walk draws: at most `MAX_DRAWN_ROWS` rows from
+ * `start`, laid out in lanes of their own, on the whole walk's time window.
+ *
+ * Only the window's rows become bars; a start at or past the end of the walk
+ * shows its last window (see `windowRows`). Each drawn row carries where its
+ * connector's parent sits in the whole walk, and whether that parent is drawn
+ * in this window too.
+ *
+ * @param walk The whole walk.
+ * @param start The first row to draw.
+ * @returns The model of that window.
+ */
+function modelFromWalk(walk: TimelineWalk, start: number): TimelineModel {
+  const window = windowRows(walk.total, start, MAX_DRAWN_ROWS);
+  const bars: UnassignedBar[] = [];
+
+  for (let index = window.start; index < window.end; index += 1) {
+    const bar = walkBarAt(walk, index);
+    if (bar === undefined) {
+      continue;
+    }
+    const parentWalkIndex =
+      bar.parentSpanId === undefined
+        ? undefined
+        : walk.firstRowBySpan.get(traceSpanKey(bar.traceId, bar.parentSpanId));
+    bars.push({
+      ...bar,
+      walkIndex: index,
+      parentWalkIndex,
+      parentDrawn: parentWalkIndex !== undefined && windowContains(window, parentWalkIndex),
+    });
+  }
+
+  const { rows, tiers } = assignLanes(bars);
+
+  return {
+    rows,
+    tiers,
+    window,
+    startTime: walk.startTime,
+    endTime: walk.endTime,
+    // Every truncation matters and they are different statements: the
+    // correlator may have dropped nodes before this view saw the tree, and the
+    // walk may have stopped at its ceiling or its depth bound.
+    truncated: walk.correlatorTruncated || walk.walkBounded || walk.depthClamped,
+    walkBounded: walk.walkBounded,
+    correlatorTruncated: walk.correlatorTruncated,
+    depthClamped: walk.depthClamped,
+    nodeCount: walk.nodeCount,
+  };
+}
+
 /*
  * ---------------------------------------------------------------------------
  * Geometry
  *
- * One pure function of the model and the canvas it is drawn on — the canvas's
- * width and a measure of the label font — so the same three inputs always draw
- * the same picture, and no layout is read here. Every number below comes out
- * of `../utils/scale`: the time-to-pixel map, a bar's offset and width with its
- * minimum visible width and its edge clipping, the lane stack, the depth
- * rhythm and the axis ticks. Re-deriving any of that here would give the
- * product two timelines that disagree slightly.
+ * One pure function of the model and the fixed canvas it is drawn on — the
+ * logical width and the label estimate of {@link CANVAS_FRAME} — so the same
+ * model always draws the same picture, and no layout is read. Every number
+ * below comes out of `../utils/scale`: the time-to-coordinate map, a bar's
+ * offset and width with its minimum visible width and its edge clipping, the
+ * lane stack, the depth rhythm and the axis ticks. Re-deriving any of that
+ * here would give the product two timelines that disagree slightly.
  * ---------------------------------------------------------------------------
  */
 
@@ -1113,7 +1422,7 @@ interface LaneGeometry {
  */
 type BarLabelPlacement = 'after' | 'before' | 'inside';
 
-/** A bar's label, measured and placed (see "Bar labels" below). */
+/** A bar's label, fitted and placed (see "Bar labels" below). */
 interface BarLabelGeometry {
   /**
    * The text drawn: the span's name and compact duration, or — where that does
@@ -1129,7 +1438,7 @@ interface BarLabelGeometry {
   readonly placement: BarLabelPlacement;
   /** The text's left edge, whichever way it is anchored. */
   readonly start: number;
-  /** The text's measured advance width, in user units. */
+  /** The text's estimated advance width, in user units. */
   readonly width: number;
 }
 
@@ -1182,7 +1491,7 @@ interface EdgeGeometry {
 
 /** Everything the canvas needs, computed once per model. */
 interface TimelineGeometry {
-  /** The time-to-pixel map the bars and the axis share. */
+  /** The time-to-coordinate map the bars and the axis share, in user units. */
   readonly scale: TimeScale;
   /** The lane bands, in lane order. */
   readonly lanes: readonly LaneGeometry[];
@@ -1205,15 +1514,13 @@ function usableDepth(depth: number): number {
 
 /**
  * The canvas a model is drawn on: what {@link buildGeometry} needs beyond the
- * data, and all of what it knows about the page.
+ * data. It knows nothing about the page — every render passes the one
+ * {@link CANVAS_FRAME}.
  */
 interface CanvasFrame {
-  /**
-   * The canvas's width in user units, from `resolveCanvasWidth`: the viewport's
-   * measured inner width in CSS pixels, or the unmeasured fallback width.
-   */
+  /** The canvas's fixed logical width in user units: `CHART_VIEWBOX_WIDTH`. */
   readonly width: number;
-  /** Measures a string in the bar-label font, in the same user units. */
+  /** Estimates a string's advance in the bar-label role, in the same user units. */
   readonly measureText: TextMeasure;
 }
 
@@ -1221,7 +1528,8 @@ interface CanvasFrame {
  * Bar labels
  *
  * A bar's label is its span's name and compact duration ("name · 12 ms"),
- * measured in the label font and drawn in the first place it fits whole:
+ * fitted in logical units with the frame's advance estimate and drawn in the
+ * first place it fits whole:
  *
  *   1. after the bar — start-anchored `BAR_LABEL_GAP` past its end;
  *   2. before the bar — end-anchored `BAR_LABEL_GAP` before its start;
@@ -1250,9 +1558,8 @@ interface CanvasFrame {
  *
  * Bars are labelled in the model's row order, so a parent, drawn first, claims
  * its room before the siblings that follow it. The result is a pure function of
- * the bar geometry and the measure: identical on every render, and in the
- * unmeasured mode (with the measure's deterministic estimate) identical in an
- * environment with no layout.
+ * the bar geometry and the deterministic estimate: identical on every render
+ * and in every environment, with or without layout.
  */
 
 /** A horizontal run of one row, in user units, from `start` to `end`. */
@@ -1476,8 +1783,9 @@ function shortenBarLabel(
 
   const beside = fitTextToWidth(name, room - measure(suffix), measure, options);
   if (beside !== undefined) {
-    // Measured as drawn rather than summed, so no kerning across the join can
-    // carry the label past its room.
+    // Estimated for the text as drawn rather than summed from its parts, so a
+    // measure that is not additive across the join cannot carry the label past
+    // its room.
     const text = `${beside.text}${suffix}`;
     const width = measure(text);
     if (width <= room) {
@@ -1490,7 +1798,7 @@ function shortenBarLabel(
   return alone === undefined ? undefined : { text: alone.text, width: alone.width };
 }
 
-/** A label of `text`, measured `width` wide, drawn in `slot`. */
+/** A label of `text`, `width` user units wide, drawn in `slot`. */
 function labelInSlot(slot: LabelSlot, text: string, width: number): BarLabelGeometry {
   return {
     text,
@@ -1661,34 +1969,34 @@ function buildGeometry(model: TimelineModel, frame: CanvasFrame): TimelineGeomet
   // of the bars that come after it on its row as well as those before it.
   const bars = labelBars(unlabelled, frame);
 
-  // The first bar carrying a span — a span id inside its own trace, the key
-  // `traceSpanKey` builds — answers a parent lookup, so a colliding span id in
-  // another trace on the same page never receives a connector. The bars are in
-  // the model's row order, and on a flat page that is the parent-first walk's
-  // order, in which the first record carrying a span is the one that claimed it
-  // and had that span's children expanded beneath it. So every connector joins
-  // the record its child is drawn under, and a capture holding two records of
-  // one span cannot make a connector ambiguous.
-  const barsBySpan = new Map<string, BarGeometry>();
+  // A connector joins the row its parent resolved to in the WHOLE walk: the
+  // first row carrying that span — a span id inside its own trace, the key
+  // `traceSpanKey` builds — so a colliding span id in another trace on the
+  // same page never receives a connector. On a flat page the walk's order is
+  // the parent-first order, in which the first record carrying a span is the
+  // one that claimed it and had that span's children expanded beneath it. So
+  // every connector joins the record its child is drawn under, a capture
+  // holding two records of one span cannot make a connector ambiguous, and a
+  // parent outside the drawn window is never stood in for by a later record of
+  // the same span that happens to be drawn.
+  const barsByWalkIndex = new Map<number, BarGeometry>();
   for (const bar of bars) {
-    const key = traceSpanKey(bar.row.traceId, bar.row.spanId);
-    if (!barsBySpan.has(key)) {
-      barsBySpan.set(key, bar);
-    }
+    barsByWalkIndex.set(bar.row.walkIndex, bar);
   }
 
   const edges: EdgeGeometry[] = [];
   for (const bar of bars) {
-    const parentSpanId = bar.row.parentSpanId;
-    if (parentSpanId === undefined) {
-      continue;
-    }
-
-    const parent = barsBySpan.get(traceSpanKey(bar.row.traceId, parentSpanId));
-    if (parent === undefined || parent === bar) {
-      // The parent is not on screen — not on this page, or above the walk's
-      // bound. The row is still drawn; only the connector is absent, because a
-      // line to nowhere would assert a relationship the reader cannot check.
+    const { parentWalkIndex, parentDrawn, walkIndex } = bar.row;
+    const parent =
+      parentWalkIndex === undefined || !parentDrawn || parentWalkIndex === walkIndex
+        ? undefined
+        : barsByWalkIndex.get(parentWalkIndex);
+    if (parent === undefined) {
+      // The parent is not drawn — not on a loaded page, outside the drawn
+      // window, or the row itself. The row is still drawn; only the connector
+      // is absent, because a line to nowhere, or to another row, would assert a
+      // relationship the reader cannot check. The row's description says where
+      // a parent outside the window is (see `lineageNoteFor`).
       continue;
     }
 
@@ -1804,9 +2112,11 @@ function candidateText(row: TimelineBar, candidateSpanId: string, spanNames: Spa
  *
  * The dashed edge, the orphan mark and the "Parent not loaded" flag are visual
  * signals, and a visual signal is never the only signal: everything they mean
- * is also stated here, in the row's description and its detail strip. The
- * other candidates of an ambiguous attribution are named through `spanNames`
- * (see {@link candidateText}).
+ * is also stated here, in the row's description and its detail strip. So is
+ * the absence of a connector to a parent that lies outside the drawn window:
+ * the note names the parent's span id and its position in the whole walk, so
+ * the reader can page to it. The other candidates of an ambiguous attribution
+ * are named through `spanNames` (see {@link candidateText}).
  */
 function lineageNoteFor(row: TimelineBar, spanNames: SpanNames): string | undefined {
   const notes: string[] = [];
@@ -1821,6 +2131,18 @@ function lineageNoteFor(row: TimelineBar, spanNames: SpanNames): string | undefi
   if (row.parentNotLoaded && row.parentSpanId !== undefined) {
     notes.push(
       `Its parent span ${row.parentSpanId} is not among the spans loaded here — it may be on a page not yet loaded or outside this query — so this span is drawn at the top level.`,
+    );
+  }
+  if (
+    row.parentSpanId !== undefined &&
+    row.parentWalkIndex !== undefined &&
+    row.parentWalkIndex !== row.walkIndex &&
+    !row.parentDrawn
+  ) {
+    notes.push(
+      `Its parent span ${row.parentSpanId} is span ${formatCount(
+        row.parentWalkIndex + 1,
+      )} of this view, outside the spans drawn now, so no connector is drawn to it.`,
     );
   }
   if (row.lineage !== undefined) {
@@ -1884,14 +2206,8 @@ type CssVariableStyle = CSSProperties & Record<`--${string}`, string>;
 
 /** What {@link TimelineCanvas} draws. */
 interface TimelineCanvasProps {
-  /** The positioned lanes, bars, edges and ticks. */
+  /** The positioned lanes, bars, edges and ticks, in the fixed logical space. */
   readonly geometry: TimelineGeometry;
-  /**
-   * Whether the geometry was laid out at the viewport's measured width, in
-   * which case the canvas is drawn at that size in CSS pixels; otherwise it is
-   * the unmeasured fallback, scaled to its container.
-   */
-  readonly measured: boolean;
   /** The window the offsets in the bars' descriptions are measured from. */
   readonly origin: number;
   /** The names of the spans on screen, so a description can name its candidates. */
@@ -1931,25 +2247,26 @@ interface TimelineCanvasProps {
  * exactly these rows is the table the parent renders below it.
  */
 function TimelineCanvas(props: TimelineCanvasProps): ReactElement {
-  const { geometry, measured, origin, spanNames, selectedEventId, onSelect, onHover, label } =
-    props;
+  const { geometry, origin, spanNames, selectedEventId, onSelect, onHover, label } = props;
   const gridlineEnd = geometry.height - CANVAS_BOTTOM_PADDING;
   const tickCount = geometry.ticks.length;
 
   return (
-    // Measured, the canvas is `geometry.width` CSS pixels wide with a viewBox
-    // of the same size: one user unit per pixel, nothing scaled, and the
-    // default `preserveAspectRatio` has no ratio to reconcile. Unmeasured (no
-    // layout), the fallback width is scaled uniformly to the container — see
-    // this module's header.
+    // A fixed logical coordinate space — `CHART_VIEWBOX_WIDTH` units wide and
+    // as tall as the lanes — that CSS sizes to its container (`width="100%"`)
+    // and that is scaled uniformly into that box from its top-left corner, so
+    // no glyph is ever stretched and nothing depends on measured pixels.
+    // `height` is the drawing's logical height, the other half of its aspect
+    // ratio; at any width `meet` scales the drawing uniformly inside the
+    // element rather than stretching it. See this module's header.
     <svg
       className="dg-timeline__canvas"
       role="img"
       aria-label={label}
-      width={measured ? geometry.width : '100%'}
+      width="100%"
       height={geometry.height}
       viewBox={`0 0 ${String(geometry.width)} ${String(geometry.height)}`}
-      preserveAspectRatio={measured ? undefined : 'xMinYMin meet'}
+      preserveAspectRatio="xMinYMin meet"
     >
       <g className="dg-timeline__lanes">
         {geometry.lanes.map((lane) => {
@@ -2380,12 +2697,17 @@ function TimelineOperationName({
  * roving stop, and the keyboard reads the description while the row itself
  * holds focus instead (see this module's header).
  *
- * Every column has a readable MINIMUM in `ch` of the table's type - the widest
- * kind chip ("Outgoing request"), tier, status, offset and duration figure plus
- * the cell's padding - and a share of the spare width. The table primitive sums
- * those minimums into its floor, so in a narrow panel the equivalent scrolls
- * horizontally instead of squeezing a column to its padding (see
- * `../primitives/DataTable`, `DataTableColumn.width`).
+ * Every column declares its width ROLE, never a size (`DataTableColumnWidth`
+ * in `../primitives/DataTable`, AAP 0.6.4), and the table resolves each role
+ * to a track built from the design system's column floor and share tokens -
+ * the same track every other table gives content of that kind. The operation
+ * and its source chip are `name`, the identifier role; the kind chip is
+ * `label`, whose floor holds a kind label such as "Outgoing request"; the
+ * tier and the reported status are `status` chips; the offset and the duration
+ * are `quantity` figures. Every role has a readable minimum, and the table
+ * primitive sums those minimums into its floor, so in a narrow panel the
+ * equivalent scrolls horizontally instead of squeezing a column to its padding
+ * (see `DataTableColumn.width`).
  *
  * @param origin The window start every offset in the table is measured from.
  * @param revealedEventId The row whose description is revealed for keyboard
@@ -2403,7 +2725,7 @@ function timelineColumns(
       key: 'name',
       header: 'Operation',
       rowHeader: true,
-      width: 'minmax(28ch, 3fr)',
+      width: 'name',
       cell: (row) => (
         <Stack direction="horizontal" gap={1} align="center" wrap>
           <TimelineOperationName
@@ -2435,7 +2757,7 @@ function timelineColumns(
     {
       key: 'kind',
       header: 'Kind',
-      width: 'minmax(18ch, 1fr)',
+      width: 'label',
       cell: (row) => (
         <Badge variant="soft" color={kindColorVar(row.kind)}>
           {formatKindLabel(row.kind)}
@@ -2445,7 +2767,7 @@ function timelineColumns(
     {
       key: 'tier',
       header: 'Tier',
-      width: 'minmax(11ch, 1fr)',
+      width: 'status',
       cell: (row) => (
         <Badge variant="outline" color={tierColorVar(row.tier)}>
           {formatTierLabel(row.tier)}
@@ -2455,7 +2777,7 @@ function timelineColumns(
     {
       key: 'status',
       header: 'Reported',
-      width: 'minmax(12ch, 1fr)',
+      width: 'status',
       cell: (row) => (
         <Badge variant="soft" tone={statusToneFor(row.status)}>
           {formatStatusLabel(row.status)}
@@ -2466,7 +2788,7 @@ function timelineColumns(
       key: 'offset',
       header: 'Offset',
       align: 'end',
-      width: 'minmax(12ch, 1fr)',
+      width: 'quantity',
       cell: (row) => (
         <Text size="sm" tone="secondary" numeric>
           {formatOffset(row.startTime, origin)}
@@ -2477,13 +2799,13 @@ function timelineColumns(
       key: 'duration',
       header: 'Duration',
       align: 'end',
-      width: 'minmax(13ch, 1fr)',
+      width: 'quantity',
       cell: (row) => <DurationCell ms={row.durationMs} severity="auto" size="sm" />,
     },
     {
       key: 'source',
       header: 'Source',
-      width: 'minmax(24ch, 2fr)',
+      width: 'name',
       cell: (row) =>
         row.source === undefined ? (
           <Text size="sm" tone="muted">
@@ -2590,8 +2912,13 @@ function rowForSelection(
  * ---------------------------------------------------------------------------
  * Paging
  *
- * Only the `spans` source is paged. A `trace` is one correlated tree, drawn
- * whole, and reports its own truncation instead of offering more.
+ * Only the `spans` source is paged from the provider. A `trace` is one
+ * correlated tree, in memory whole, and reports its own truncation instead of
+ * offering more. Paging the PROVIDER is a separate matter from paging the
+ * drawn-row window (see "The drawn-row window" above): the window moves over
+ * whatever the walk holds, which for a span result is every page loaded so far,
+ * and a further page only lengthens the walk — it never grows what one window
+ * draws.
  *
  * A span result is walked page by page, exactly as the service pages it. Every
  * request asks for the SAME page size — the authored limit, held inside the
@@ -2662,12 +2989,14 @@ const LOAD_MORE_LABEL = 'Load more spans';
 /** The same control while that page is in flight: the appending indicator. */
 const LOADING_MORE_LABEL = 'Loading more spans…';
 
-/**
- * The footer control that raises a trace walk's row bound by one step. A trace
- * arrives whole, so this shows more of what is already in memory rather than
- * asking the provider for another page.
- */
-const SHOW_MORE_SPANS_LABEL = 'Show more spans';
+/** The footer control that moves the drawn window back by one window. */
+const PREVIOUS_SPANS_LABEL = 'Previous spans';
+
+/** The footer control that moves the drawn window on by one window. */
+const NEXT_SPANS_LABEL = 'Next spans';
+
+/** Which way a paging control moves the drawn window. */
+type PagingDirection = 'previous' | 'next';
 
 /**
  * The refine route for a trace the correlator bounded, in the words the flame
@@ -2675,19 +3004,42 @@ const SHOW_MORE_SPANS_LABEL = 'Show more spans';
  */
 const REFINE_TRUNCATED_TRACE = 'Narrow the query or capture a shorter interaction to see the rest.';
 
+/** Whether a window leaves any row of its walk undrawn. */
+function isPartialWindow(window: RowWindow): boolean {
+  return window.count < window.total;
+}
+
+/** The 1-based range of rows a window draws, as the footer and the labels write it. */
+function windowRange(window: RowWindow): string {
+  return `${formatCount(window.start + 1)}–${formatCount(window.end)}`;
+}
+
 /**
- * The row bound after one "Show more spans": one default step higher, capped
- * at the trace's own node count when that count is larger than the bound in
- * force. A trace whose count cannot be believed still moves by one step, so
- * the control always reveals something the walk left out.
+ * The footer's statement of which rows a partial window draws, and how many
+ * of the walk's rows lie before and after it undrawn — for example "Spans
+ * 2,001–4,000 of 9,500 are drawn; 2,000 before them and 5,500 after them are
+ * not." A window that draws the whole walk has nothing to state here.
  *
- * @param maxRows The row bound in force.
- * @param nodeCount The trace's own node count.
- * @returns The next row bound.
+ * @param window The drawn window.
+ * @returns The sentence, or `undefined` when the window draws every row.
  */
-function nextTraceRowBound(maxRows: number, nodeCount: number): number {
-  const stepped = maxRows + DEFAULT_MAX_TRACE_ROWS;
-  return nodeCount > maxRows ? Math.min(stepped, nodeCount) : stepped;
+function windowStatement(window: RowWindow): string | undefined {
+  if (!isPartialWindow(window)) {
+    return undefined;
+  }
+
+  const undrawn: string[] = [];
+  if (window.before > 0) {
+    undrawn.push(`${formatCount(window.before)} before them`);
+  }
+  if (window.after > 0) {
+    undrawn.push(`${formatCount(window.after)} after them`);
+  }
+  const verb = window.before + window.after === 1 ? 'is' : 'are';
+
+  return `Spans ${windowRange(window)} of ${formatCount(window.total)} are drawn; ${undrawn.join(
+    ' and ',
+  )} ${verb} not.`;
 }
 
 /**
@@ -2695,32 +3047,25 @@ function nextTraceRowBound(maxRows: number, nodeCount: number): number {
  * reported no total for, which read as a bare count — the counterpart of a
  * span page's "Showing N of M spans.".
  *
- * A walk stopped at its row bound states N of M, where M is the trace's own
- * node count — or, for a trace whose count cannot be believed, only that these
- * are the first N. A trace the correlator bounded, or whose depth the walk
- * clamped, says that more was captured than this view holds, and the
- * correlator's case adds the refine route.
+ * A walk that fits one window states its count. A longer one states which of
+ * its rows the window draws and how many it leaves before and after (see
+ * {@link windowStatement}), M being the whole walk. A trace the correlator
+ * bounded, whose depth the walk clamped, or that held more nodes than the walk
+ * could visit says that more was captured than this view holds — paging the
+ * window reaches none of that — and the correlator's case adds the refine
+ * route.
  *
  * @param model The payload's model.
  * @returns The footer text.
  */
 function traceFooterText(model: TimelineModel): string {
-  const loaded = model.rows.length;
-  const total = model.nodeCount ?? 0;
-  const sentences: string[] = [];
+  const sentences: string[] = [
+    windowStatement(model.window) ?? `${formatCount(model.window.count)} spans shown.`,
+  ];
 
-  if (!model.walkBounded) {
-    sentences.push(`${formatCount(loaded)} spans shown.`);
-  } else if (total > loaded) {
-    sentences.push(`${formatCount(loaded)} of ${formatCount(total)} spans shown.`);
-  } else {
-    sentences.push(`The first ${formatCount(loaded)} spans of this trace are shown.`);
-  }
-
-  // Neither the correlator's bound nor the depth bound is lifted by a larger
-  // row bound, so each is stated on its own, and the correlator's with the one
-  // route that does reach the rest.
-  if (model.correlatorTruncated || model.depthClamped) {
+  // None of these is reached by paging the window, so each is stated on its
+  // own, and the correlator's with the one route that does reach the rest.
+  if (model.correlatorTruncated || model.depthClamped || model.walkBounded) {
     sentences.push('More were captured than this view holds.');
   }
   if (model.correlatorTruncated) {
@@ -3002,6 +3347,47 @@ function useProviderGeneration(): number {
 }
 
 /**
+ * Where the drawn window of one query's walk starts, and the selection that
+ * start already accounts for.
+ *
+ * Written by the paging controls and by a selection made elsewhere in the
+ * panel that names a row outside the window; never from an effect. The query
+ * identity tags it exactly as it tags the page accumulator, so a changed query
+ * reads no state at all and draws from its first row.
+ */
+interface WindowState {
+  /** The query identity the window was paged for. */
+  readonly identity: string;
+  /** The first row to draw; `windowRows` pulls a start past the walk's end back. */
+  readonly start: number;
+  /**
+   * The selection this start was chosen with. The window follows the panel's
+   * selection only when it CHANGES — a span selected in another view is paged
+   * to once — so a reader who then pages away from it is not pulled back.
+   */
+  readonly followed: PanelSelection | undefined;
+}
+
+/**
+ * Whether two selections name the same event through the same coordinates.
+ *
+ * By value rather than by reference, so a host that re-creates an equal
+ * selection object is not taken for a new selection the window must follow.
+ */
+function sameSelection(
+  left: PanelSelection | undefined,
+  right: PanelSelection | undefined,
+): boolean {
+  if (left === undefined || right === undefined) {
+    return left === right;
+  }
+
+  return (
+    left.eventId === right.eventId && left.traceId === right.traceId && left.spanId === right.spanId
+  );
+}
+
+/**
  * The stateful body of {@link Timeline}: one provider's pages, hover and focus
  * for one node, marking the panel's shared selection.
  *
@@ -3022,12 +3408,10 @@ function TimelineView(props: TimelineProps): ReactElement {
   const { selection, markSelected } = useViewSelection();
 
   const [pages, setPages] = useState<PageAccumulator | undefined>(undefined);
-  // A trace walk's row bound as raised by "Show more spans", tagged with the
-  // query it was raised for, like the page accumulator: a changed query reads
-  // the default bound again on the render that shows it.
-  const [raisedTraceBound, setRaisedTraceBound] = useState<
-    { readonly identity: string; readonly maxRows: number } | undefined
-  >(undefined);
+  // The drawn window's start, tagged with the query it was paged for, like the
+  // page accumulator: a changed query starts at its first row again on the
+  // render that shows it (see `WindowState`).
+  const [windowState, setWindowState] = useState<WindowState | undefined>(undefined);
   // The bar the pointer last entered, previewed in the detail strip until the
   // pointer leaves the canvas-and-strip region or Escape dismisses it.
   const [hoveredEventId, setHoveredEventId] = useState<string | undefined>(undefined);
@@ -3051,8 +3435,8 @@ function TimelineView(props: TimelineProps): ReactElement {
   // The block, the canvas's scroll container and the detail strip: the one
   // region a hover preview survives the pointer crossing, and the document the
   // view is mounted in, which is where an Escape pressed while the pointer
-  // rests on a bar arrives. The block is also where a focus handoff after
-  // "Show more spans" finds the table's tab stop.
+  // rests on a bar arrives. The block is also where a focus handoff after a
+  // paging control disappears finds the table's tab stop.
   const blockRef = useRef<HTMLDivElement | null>(null);
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const stripRef = useRef<HTMLDivElement | null>(null);
@@ -3078,10 +3462,6 @@ function TimelineView(props: TimelineProps): ReactElement {
   // not even for one frame, and it returns to its first page by derivation.
   const activePages = pages !== undefined && pages.identity === queryIdentity ? pages : undefined;
   const carriedRows = activePages?.rows ?? NO_EVENTS;
-  const maxTraceRows =
-    raisedTraceBound !== undefined && raisedTraceBound.identity === queryIdentity
-      ? raisedTraceBound.maxRows
-      : DEFAULT_MAX_TRACE_ROWS;
 
   // One page size for every request, held inside the contract's bounds and
   // never grown; the walk advances by offset instead (see "Paging"). The floor
@@ -3115,60 +3495,69 @@ function TimelineView(props: TimelineProps): ReactElement {
     [carriedRows, spansPage],
   );
 
-  const model = useMemo<TimelineModel | undefined>(() => {
+  // The whole walk of the payload, once per payload: paging the drawn window
+  // re-cuts the model from it and walks nothing again (see "The drawn-row
+  // window").
+  const walk = useMemo<TimelineWalk | undefined>(() => {
     // `undefined` while the trace query is unsettled, failed or inactive, and
     // `null` when it settled with no matching trace — the service's own answer
     // for a capture that collected nothing correlated. Neither is a tree to
-    // walk: the model stays undefined, and a settled `null` renders the empty
+    // walk: the walk stays undefined, and a settled `null` renders the empty
     // state below, never an error.
     const tree = traceResult.data;
     if (tree !== undefined && tree !== null) {
-      return modelFromTrace(tree, maxTraceRows);
+      return walkFromTrace(tree);
     }
 
     // Every row loaded so far. While a further page is in flight, or after it
     // failed, that is the rows already on screen, which stay there; before the
-    // first page settles there is nothing to model and the loading state shows.
+    // first page settles there is nothing to walk and the loading state shows.
     if (spansPage !== undefined || spanRows.length > 0) {
-      return modelFromSpans(spanRows);
+      return walkFromSpans(spanRows);
     }
 
     return undefined;
-  }, [traceResult.data, spansPage, spanRows, maxTraceRows]);
+  }, [traceResult.data, spansPage, spanRows]);
 
-  // The canvas's viewport, observed: its inner width in CSS pixels once it has
-  // been laid out (`undefined` before that and wherever there is no layout),
-  // and a measure of the bar-label font — `.dg-timeline__bar-label` is set in
-  // `--dg-mono-sm`. Called unconditionally, as a hook must be; its ref attaches
-  // only when the viewport renders, which is the settled state below.
-  const {
-    ref: measureViewportRef,
-    width: viewportWidth,
-    measureText,
-  } = useChartCanvas<HTMLDivElement>({ font: 'monoSm' });
-  const measured = isMeasuredWidth(viewportWidth);
-  const canvasWidth = resolveCanvasWidth(viewportWidth);
+  // The drawn window's start: the one this query was last paged to, or its
+  // first row. Discarded by comparison for a changed query, like the pages.
+  const activeWindow =
+    windowState !== undefined && windowState.identity === queryIdentity ? windowState : undefined;
+  let windowStart = activeWindow?.start ?? 0;
 
-  // One element, two readers: the measure above observes the viewport's width,
-  // and `viewportRef` is how the hover handlers below ask whether the pointer
-  // is still inside it. The callback ref attaches both and detaches both.
-  const attachViewport = useCallback(
-    (element: HTMLDivElement | null) => {
-      viewportRef.current = element;
-      const release = measureViewportRef(element);
+  // A selection made anywhere in the panel that names a row outside the drawn
+  // window pages the window to the aligned window holding that row
+  // (`windowStartFor`), so the selected span is drawn and marked rather than
+  // silently off screen. Only a CHANGED selection is followed, and the state is
+  // adjusted during render — the pattern `useProviderGeneration` uses — so the
+  // frame that would have drawn the old window is discarded before commit. The
+  // walk is scanned once per change of selection or walk, never per render,
+  // and nothing is followed until there is a walk to page.
+  if (walk !== undefined && !sameSelection(activeWindow?.followed, selection)) {
+    const selectedIndex =
+      selection === undefined ? undefined : walkIndexOfSelection(walk, selection);
+    const current = windowRows(walk.total, windowStart, MAX_DRAWN_ROWS);
+    const followedStart =
+      selectedIndex === undefined || windowContains(current, selectedIndex)
+        ? windowStart
+        : windowStartFor(selectedIndex, MAX_DRAWN_ROWS);
+    setWindowState({ identity: queryIdentity, start: followedStart, followed: selection });
+    windowStart = followedStart;
+  }
 
-      return () => {
-        viewportRef.current = null;
-        release?.();
-      };
-    },
-    [measureViewportRef],
+  // The drawn window of the walk: never more than `MAX_DRAWN_ROWS` rows,
+  // however long the walk and however often the reader pages.
+  const model = useMemo<TimelineModel | undefined>(
+    () => (walk === undefined ? undefined : modelFromWalk(walk, windowStart)),
+    [walk, windowStart],
   );
 
+  // The drawing of the window, in the fixed logical canvas: a pure function of
+  // the model alone, since the frame is one module constant (see "Canvas
+  // structure"), so it is recomputed only when the drawn rows change.
   const geometry = useMemo<TimelineGeometry | undefined>(
-    () =>
-      model === undefined ? undefined : buildGeometry(model, { width: canvasWidth, measureText }),
-    [model, canvasWidth, measureText],
+    () => (model === undefined ? undefined : buildGeometry(model, CANVAS_FRAME)),
+    [model],
   );
 
   // The names every description draws candidate parents from: one lookup per
@@ -3445,31 +3834,53 @@ function TimelineView(props: TimelineProps): ReactElement {
     });
   }, [nextPageOffset, queryIdentity, spanRows, knownTotal]);
 
-  /**
-   * Set when "Show more spans" was activated, and read once the rows it asked
-   * for have rendered: when the bound now covers the whole trace, the control
-   * that held focus has gone, and focus moves to the table's tab stop rather
-   * than falling back to the document.
-   */
-  const focusAfterShowMore = useRef(false);
+  // The two paging controls, so focus can be handed from one to the other when
+  // the window reaches either end of the walk and the activated one goes away.
+  const previousSpansRef = useRef<HTMLButtonElement | null>(null);
+  const nextSpansRef = useRef<HTMLButtonElement | null>(null);
 
-  const traceNodeCount = model?.nodeCount;
-  const handleShowMoreSpans = useCallback((): void => {
-    if (traceNodeCount === undefined) {
-      return;
-    }
-    focusAfterShowMore.current = true;
-    setRaisedTraceBound({
-      identity: queryIdentity,
-      maxRows: nextTraceRowBound(maxTraceRows, traceNodeCount),
-    });
-  }, [maxTraceRows, queryIdentity, traceNodeCount]);
+  /**
+   * The paging control last activated, read once the window it asked for has
+   * rendered: at the first or the last window that control has gone, and focus
+   * moves to the control that pages back the other way — or, should neither
+   * remain, to the table's tab stop — rather than falling back to the document.
+   */
+  const focusAfterPaging = useRef<PagingDirection | undefined>(undefined);
+
+  // Moves the drawn window by one window. The window never grows: the next
+  // window starts where this one ends, the previous one a whole budget
+  // earlier, and neither passes the ends of the walk (see `../utils/scale`).
+  // The selection already followed is carried over, so paging away from a
+  // selected span is not undone by following it again.
+  const modelWindow = model?.window;
+  const moveDrawnWindow = useCallback(
+    (direction: PagingDirection): void => {
+      if (modelWindow === undefined) {
+        return;
+      }
+      focusAfterPaging.current = direction;
+      setWindowState({
+        identity: queryIdentity,
+        start:
+          direction === 'next' ? nextWindowStart(modelWindow) : previousWindowStart(modelWindow),
+        followed: selection,
+      });
+    },
+    [modelWindow, queryIdentity, selection],
+  );
+  const handlePreviousSpans = useCallback((): void => {
+    moveDrawnWindow('previous');
+  }, [moveDrawnWindow]);
+  const handleNextSpans = useCallback((): void => {
+    moveDrawnWindow('next');
+  }, [moveDrawnWindow]);
 
   useEffect(() => {
-    if (!focusAfterShowMore.current) {
+    const direction = focusAfterPaging.current;
+    if (direction === undefined) {
       return;
     }
-    focusAfterShowMore.current = false;
+    focusAfterPaging.current = undefined;
     const block = blockRef.current;
     const active = block?.ownerDocument.activeElement;
     // Only a focus that was lost is handed on: while the control remains, it
@@ -3480,7 +3891,10 @@ function TimelineView(props: TimelineProps): ReactElement {
     ) {
       return;
     }
-    block.querySelector<HTMLElement>('.dg-timeline__equivalent [tabindex="0"]')?.focus();
+    const counterpart = direction === 'next' ? previousSpansRef.current : nextSpansRef.current;
+    (
+      counterpart ?? block.querySelector<HTMLElement>('.dg-timeline__equivalent [tabindex="0"]')
+    )?.focus();
   }, [model]);
 
   const activeResult = source === 'trace' ? traceResult : spansResult;
@@ -3581,7 +3995,14 @@ function TimelineView(props: TimelineProps): ReactElement {
     );
   } else {
     const windowMs = model.endTime - model.startTime;
-    const loaded = model.rows.length;
+    const { window } = model;
+    // What is drawn — the window's rows — and what the walk holds in all: for a
+    // span result, every row loaded so far.
+    const drawn = model.rows.length;
+    const loaded = window.total;
+    // Whether the walk holds rows this window does not draw, which the footer
+    // states and the paging controls reach.
+    const windowed = isPartialWindow(window);
     // Only a span result reports a total; a trace states its own truncation.
     const total = source === 'spans' ? knownTotal : undefined;
     // Offered only while the service names a next page. A total larger than
@@ -3590,6 +4011,7 @@ function TimelineView(props: TimelineProps): ReactElement {
     const canLoadMore = nextPageOffset !== undefined;
     const partial =
       model.truncated ||
+      windowed ||
       canLoadMore ||
       appending ||
       pageFailed ||
@@ -3601,23 +4023,34 @@ function TimelineView(props: TimelineProps): ReactElement {
     const detailRow = hoveredRow ?? focusedRow ?? selectedRow;
     const previewing = detailRow !== undefined && detailRow !== selectedRow;
 
-    // A walk stopped at its row bound says so in the picture's own words, as the
-    // flame chart's does: the subset and the trace it was drawn from.
-    const traceTotal = model.walkBounded ? model.nodeCount : undefined;
-    const drawnCount =
-      traceTotal !== undefined && traceTotal > loaded
-        ? `${formatCount(loaded)} of ${formatCount(traceTotal)}`
-        : formatCount(loaded);
-    const canvasLabel = `${CATALOG_ENTRY.label}: ${drawnCount} spans in ${formatCount(
+    // A window that draws part of the walk says so in the picture's own words,
+    // as the flame chart's does: the subset, which rows it is, and the walk it
+    // was cut from. The table below holds exactly the rows the canvas draws.
+    const drawnCount = windowed
+      ? `${formatCount(drawn)} of ${formatCount(loaded)} spans (spans ${windowRange(window)})`
+      : `${formatCount(drawn)} spans`;
+    const canvasLabel = `${CATALOG_ENTRY.label}: ${drawnCount} in ${formatCount(
       model.tiers.length,
-    )} tier lanes over ${formatDuration(
-      windowMs,
-    )}. The table below lists every span with its kind, tier, offset and duration.`;
+    )} tier lanes over ${formatDuration(windowMs)}. ${
+      windowed
+        ? 'The table below lists the same spans with their kind, tier, offset and duration.'
+        : 'The table below lists every span with its kind, tier, offset and duration.'
+    }`;
+    const tableCaption = windowed
+      ? `${node.title ?? CATALOG_ENTRY.label}: spans ${windowRange(window)} of the ${formatCount(
+          loaded,
+        )} captured spans of this interaction, with their kind, tier, offset and duration.`
+      : `${node.title ?? CATALOG_ENTRY.label}: every captured span of this interaction, with its kind, tier, offset and duration.`;
 
+    // A span result states the service's total first; the window's own
+    // statement follows whenever the window leaves loaded rows undrawn.
+    const spansWindowText = windowStatement(window);
     const footerText =
       total === undefined
         ? traceFooterText(model)
-        : `Showing ${formatCount(loaded)} of ${formatCount(total)} spans.`;
+        : `Showing ${formatCount(loaded)} of ${formatCount(total)} spans.${
+            spansWindowText === undefined ? '' : ` ${spansWindowText}`
+          }`;
 
     content = (
       <>
@@ -3627,7 +4060,7 @@ function TimelineView(props: TimelineProps): ReactElement {
           compact
           wrap
           status={[
-            { label: `${formatCount(loaded)} spans`, variant: 'soft' },
+            { label: `${formatCount(drawn)} spans`, variant: 'soft' },
             { label: `${formatCount(model.tiers.length)} tiers`, variant: 'soft' },
             { label: `${formatDuration(windowMs)} elapsed`, variant: 'soft' },
             ...(partial
@@ -3636,10 +4069,9 @@ function TimelineView(props: TimelineProps): ReactElement {
           ]}
         />
 
-        <div ref={attachViewport} className="dg-timeline__viewport">
+        <div ref={viewportRef} className="dg-timeline__viewport">
           <TimelineCanvas
             geometry={geometry}
-            measured={measured}
             origin={model.startTime}
             spanNames={spanNames}
             selectedEventId={selectedRow?.eventId}
@@ -3669,7 +4101,7 @@ function TimelineView(props: TimelineProps): ReactElement {
         >
           <DataTable<TimelineBar>
             id={`${node.id}-rows`}
-            caption={`${node.title ?? CATALOG_ENTRY.label}: every captured span of this interaction, with its kind, tier, offset and duration.`}
+            caption={tableCaption}
             rows={model.rows}
             columns={timelineColumns(model.startTime, revealedEventId, spanNames)}
             rowKey={rowKeyOf}
@@ -3680,18 +4112,35 @@ function TimelineView(props: TimelineProps): ReactElement {
         </div>
 
         <Stack direction="horizontal" gap={2} align="center" justify="between" wrap>
-          {/* Polite and live, so the count a further page or a larger bound
+          {/* Polite and live, so the count a further page or another window
               reveals is announced; never `role="status"`, which is the
               loading placeholder's. */}
           <Text size="xs" tone="muted" aria-live="polite">
             {footerText}
           </Text>
-          {model.walkBounded ? (
-            // A trace is in memory whole, so this raises the walk's row bound
-            // by one step instead of asking the provider for a page.
-            <Button variant="secondary" size="sm" onClick={handleShowMoreSpans}>
-              {SHOW_MORE_SPANS_LABEL}
-            </Button>
+          {windowed ? (
+            // The walk is in memory whole, so these move the drawn window over
+            // it instead of asking the provider for anything. Each is present
+            // only while there are rows on its side of the window; the slot of
+            // an absent one is kept, so the other is never remounted and never
+            // loses focus when the window reaches an end.
+            <Stack direction="horizontal" gap={2} align="center" wrap>
+              {window.before > 0 ? (
+                <Button
+                  ref={previousSpansRef}
+                  variant="secondary"
+                  size="sm"
+                  onClick={handlePreviousSpans}
+                >
+                  {PREVIOUS_SPANS_LABEL}
+                </Button>
+              ) : null}
+              {window.after > 0 ? (
+                <Button ref={nextSpansRef} variant="secondary" size="sm" onClick={handleNextSpans}>
+                  {NEXT_SPANS_LABEL}
+                </Button>
+              ) : null}
+            </Stack>
           ) : null}
           {canLoadMore || appending ? (
             // Kept in place while the page it asked for is in flight — disabled

@@ -19,7 +19,10 @@
  * 3. **The authoritative parse** of the attempt's raw output against the
  *    caller's authoring schema — performed **even when the provider already
  *    parsed it**. See {@link classifyAttempt} for why that re-parse is the real
- *    gate rather than a belt-and-braces duplicate.
+ *    gate rather than a belt-and-braces duplicate. A parse that **throws** —
+ *    output shaped so the caller's schema cannot even read it — is an invalid
+ *    attempt like any other, reported with a fixed, content-free issue line
+ *    ({@link UNVALIDATABLE_ISSUE_MESSAGE}); the thrown value is never read.
  * 4. **A schema failure earns a bounded repair.** The validation issues — paths
  *    and the schema's own messages, never the rejected values — go back as a
  *    new turn, at most {@link DEFAULT_MAX_REPAIRS} times. That figure is a
@@ -38,7 +41,16 @@
  *    bug, logged with the input, never retried against the model"* (AAP
  *    §0.5.3): the normaliser received input the authoring schema had already
  *    accepted, so a second identical answer would fail identically and hide a
- *    deterministic defect.
+ *    deterministic defect. It is logged once, at error level, and "with the
+ *    input" means with the input's **identity** — the stage, prompt version,
+ *    session, schema name and attempt that produced it, plus the thrown
+ *    error's closed code and failure class — never with its **content**. The
+ *    parsed input is model prose (a panel's title, summary and labels) that can
+ *    echo developer source or personal data, a thrown message can quote it,
+ *    and a log record passes no redaction checkpoint (AAP §0.5.2 places them at
+ *    telemetry ingest and on the outbound prompt), so writing either would be
+ *    CWE-532. The thrown value itself travels on, in-process only, as the
+ *    rejection's `cause`, which `DebuggenError.toPayload` never serialises.
  * 7. **Cancellation is honoured before every call**, so an abandoned session
  *    never spends a request.
  *
@@ -168,6 +180,23 @@ export const NON_JSON_ISSUE_MESSAGE =
   'the response was not valid JSON, so it could not be validated; reply with a single JSON value and no surrounding prose';
 
 /**
+ * What an attempt reports when the caller's schema **threw** while validating
+ * it, rather than answering with issues.
+ *
+ * A total schema never throws, but a schema reads the output it is handed, and
+ * output shaped so it cannot be read — a value whose property read throws, a
+ * structure deep enough to exhaust the stack — can make even a well-written one
+ * throw. The attempt is then invalid for the same reason a badly shaped one is,
+ * so it takes the same bounded repair route, and it is described by this fixed
+ * line. The thrown value is deliberately **never read**: its message is
+ * whatever the failing read produced, which can be the output itself, and it
+ * would otherwise reach an outbound repair turn, a log record and a persisted
+ * rejection (CWE-532).
+ */
+export const UNVALIDATABLE_ISSUE_MESSAGE =
+  'the output could not be validated against the schema; reply with a single JSON value that satisfies it and no surrounding prose';
+
+/**
  * What {@link formatZodIssues} reports for a rejection that carries no issues
  * at all.
  *
@@ -202,6 +231,28 @@ const REPLACEMENT_CHARACTER = '\uFFFD';
 
 /** A property name that can be written after a dot without quoting. */
 const IDENTIFIER_PATTERN = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+
+/**
+ * The `details` key under which a caller's normaliser records its own failure
+ * class on the `DebuggenError` it throws.
+ *
+ * Read so the normaliser-failure record can name the class the caller will
+ * branch on — `apps/local-service/src/panels/validate.ts` records `normalize`
+ * or `internal-schema` there, and reads it back off the rejection's `cause` —
+ * without this module knowing that vocabulary.
+ */
+const FAILURE_CLASS_DETAIL_KEY = 'failureClass';
+
+/**
+ * The shape a failure class must have to be logged: a lower-case, hyphenated
+ * token, which every class a caller defines is. Prose — a space, punctuation,
+ * a capital — fails it and the value is dropped, so a details value set by
+ * whoever threw cannot carry a sentence of model output into a log record.
+ */
+const FAILURE_CLASS_PATTERN = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/;
+
+/** The longest failure class logged. A longer token is dropped, never truncated. */
+const MAX_FAILURE_CLASS_LENGTH = 64;
 
 // ---------------------------------------------------------------------------
 // Public result shape
@@ -436,6 +487,17 @@ function nonJsonIssueSummary(): IssueSummary {
 }
 
 /**
+ * The summary an attempt reports when the schema threw while validating it, in
+ * the shape a schema failure reports: one fixed root line
+ * ({@link UNVALIDATABLE_ISSUE_MESSAGE}) and nothing derived from the thrown
+ * value or the output.
+ */
+function unvalidatableIssueSummary(): IssueSummary {
+  const line = reportableLine(`${ISSUE_ROOT_MARKER}: ${UNVALIDATABLE_ISSUE_MESSAGE}`);
+  return { lines: [line], paths: [ISSUE_ROOT_MARKER], text: line, total: 1 };
+}
+
+/**
  * Formats a Zod rejection as compact, model-readable feedback.
  *
  * One `path: message` line per issue, ordered deterministically, bounded in
@@ -454,11 +516,15 @@ function nonJsonIssueSummary(): IssueSummary {
  * not a positive integer, which is a programmer error rather than a runtime
  * condition.
  *
+ * The text is feedback for a model, not a log field: a Zod message can quote an
+ * unrecognised key the model wrote, so a log record gets the issue paths and
+ * count only, as every record of {@link generateStructuredWithRepair} does.
+ *
  * @example
  * ```ts
  * const parsed = schema.safeParse(raw);
  * if (!parsed.success) {
- *   logger.debug('output rejected', { issues: formatZodIssues(parsed.error) });
+ *   const retry = buildRepairRequest(request, formatZodIssues(parsed.error), 1);
  * }
  * ```
  */
@@ -557,11 +623,35 @@ export function buildRepairRequest(
 // Attempt classification
 // ---------------------------------------------------------------------------
 
-/** What one attempt turned out to be, once the schema has had its say. */
+/**
+ * What one attempt turned out to be, once the schema has had its say. An
+ * invalid attempt records whether the schema threw rather than answered, so the
+ * loop can log that defect signal for the attempt; it is repaired and rejected
+ * exactly as any other invalid attempt.
+ */
 type AttemptClassification<T> =
   | { readonly kind: 'valid'; readonly parsed: T }
-  | { readonly kind: 'invalid'; readonly issues: IssueSummary }
+  | { readonly kind: 'invalid'; readonly issues: IssueSummary; readonly schemaThrew: boolean }
   | { readonly kind: 'empty' };
+
+/**
+ * `schema.safeParse(raw)`, or `undefined` when the parse threw.
+ *
+ * A bare `try`/`catch` whose binding is never taken, on purpose: converting the
+ * thrown value into an error (as `tryCatch` does) reads its message and other
+ * properties, which is exactly the content that must not travel, and a hostile
+ * thrown object could throw again from those reads.
+ */
+function safeParseOrUndefined<T>(
+  schema: ZodType<T>,
+  raw: unknown,
+): ReturnType<ZodType<T>['safeParse']> | undefined {
+  try {
+    return schema.safeParse(raw);
+  } catch {
+    return undefined;
+  }
+}
 
 /**
  * Parses one attempt against the caller's schema and says which of three
@@ -593,6 +683,18 @@ type AttemptClassification<T> =
  * `safeParse`, because a schema that happened to accept `undefined` would turn
  * "the model said nothing" into a valid artifact.
  *
+ * ## A schema that throws is an invalid attempt, never an exception
+ *
+ * `safeParse` reports a failure as data, but it still reads the output it is
+ * handed, and output whose reads throw — an accessor, a proxy, a structure
+ * deep enough to exhaust the stack — can make it throw instead. Left
+ * uncaught, that exception would escape this loop past its bounded repair
+ * route, and its message could carry the output. So a throwing parse is
+ * classified as `invalid` with {@link unvalidatableIssueSummary}'s fixed line,
+ * the thrown value is discarded unread, and the loop repairs within its budget
+ * and then rejects with reason `'schema'`, exactly as for any answer that
+ * failed validation. The rejection vocabulary is unchanged.
+ *
  * @typeParam T The caller's authoring type.
  * @param schema The authoring schema, the only arbiter of validity here.
  * @param attempt The provider's unvalidated attempt.
@@ -608,15 +710,22 @@ function classifyAttempt<T>(
     if (attempt.text === undefined) {
       return { kind: 'empty' };
     }
-    return { kind: 'invalid', issues: nonJsonIssueSummary() };
+    return { kind: 'invalid', issues: nonJsonIssueSummary(), schemaThrew: false };
   }
 
-  const parsed = schema.safeParse(attempt.raw);
+  const parsed = safeParseOrUndefined(schema, attempt.raw);
+  if (parsed === undefined) {
+    return { kind: 'invalid', issues: unvalidatableIssueSummary(), schemaThrew: true };
+  }
   if (parsed.success) {
     return { kind: 'valid', parsed: parsed.data };
   }
 
-  return { kind: 'invalid', issues: summarizeZodIssues(parsed.error, maxIssues) };
+  return {
+    kind: 'invalid',
+    issues: summarizeZodIssues(parsed.error, maxIssues),
+    schemaThrew: false,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -665,8 +774,9 @@ interface AttemptCounts {
  * The issue list appears in **both** an array (`issues`) and a joined string
  * (`issueSummary`) form. That is deliberate rather than redundant: a JSON
  * round-trip through the protocol and the store keeps an array a list, which is
- * what a user interface iterates, while a single string is what a log line and
- * a message quote.
+ * what a user interface iterates, while a single string is what a message
+ * quotes. Neither is what this module logs: its records carry the issue paths
+ * and count only (see {@link logFields}).
  */
 function rejectionDetails(
   reason: StructuredRejectionReason,
@@ -704,10 +814,10 @@ function rejectionDetails(
  *
  * Built from the same inputs as {@link rejectionDetails} and subject to the
  * same rule — a logger redacts nothing, so what is safe to persist is the
- * measure of what is safe to log. The one record that deliberately carries a
- * value is the normaliser failure, which attaches the parsed input because
- * whoever has to fix that defect needs the input that provoked it; that field
- * is added at the call site rather than here, so it cannot arrive by accident.
+ * measure of what is safe to log. There is no exception to it: no record from
+ * this loop carries the model's output, parsed or raw, nor a prompt, a Zod
+ * message or a thrown message. The normaliser failure adds closed classifiers
+ * only, through {@link normalizeFailureLogFields}.
  */
 function logFields(
   reason: StructuredRejectionReason,
@@ -735,6 +845,53 @@ function logFields(
     // logging rule for this loop names the paths and nothing else.
     fields.issuePaths = issues.paths;
     fields.issueCount = issues.total;
+  }
+
+  return fields;
+}
+
+/**
+ * The fields of the one record a normaliser failure is logged with: those of
+ * {@link logFields} for reason `'normalize'`, the thrown error's closed `code`
+ * and, when it recorded one, its `failureClass`. Nothing else about the thrown
+ * value is read.
+ *
+ * `failure` is what `tryCatch` made of the thrown value: that value itself
+ * when it was a `DebuggenError`, so a code the caller chose is kept, and
+ * otherwise a wrapper coded `INTERNAL`. Either way the code is a member of the
+ * closed `DEBUGGEN_ERROR_CODES` vocabulary — `DebuggenError.from` keeps the
+ * thrown value only when `DebuggenError.is` accepts it, code included, and
+ * otherwise rebuilds or wraps it — so it can carry nothing a model wrote.
+ *
+ * `details.failureClass` is the one details value read, because it is the one
+ * a caller's classifier branches on. This module does not know the caller's
+ * vocabulary, so the value is logged only when it is shaped like a class token
+ * ({@link FAILURE_CLASS_PATTERN}, at most {@link MAX_FAILURE_CLASS_LENGTH}
+ * characters) and dropped otherwise. The read is guarded, because details are
+ * whatever the thrower attached and a throwing getter must not turn a typed
+ * rejection into an exception out of this loop.
+ *
+ * Never read: the message, the hint, any other details value and the cause.
+ * Each can quote the input the normaliser was handed, which is model prose that
+ * can echo developer source or personal data (CWE-532).
+ */
+function normalizeFailureLogFields(
+  counts: AttemptCounts,
+  request: ModelRequest,
+  schemaName: string | undefined,
+  failure: DebuggenError,
+): LogFields {
+  const fields = logFields('normalize', counts, request, schemaName, undefined);
+  fields.code = failure.code;
+
+  const declared = tryCatch(() => failure.details?.[FAILURE_CLASS_DETAIL_KEY]);
+  if (
+    declared.ok &&
+    typeof declared.value === 'string' &&
+    declared.value.length <= MAX_FAILURE_CLASS_LENGTH &&
+    FAILURE_CLASS_PATTERN.test(declared.value)
+  ) {
+    fields.failureClass = declared.value;
   }
 
   return fields;
@@ -904,6 +1061,15 @@ const NORMALIZE_REJECTION_HINT =
  * panel flagged `meta.fallback` and rendered under a visible banner — so that a
  * developer is never shown a model's conclusion that no model reached.
  *
+ * It never writes content to `options.logger`. Every record — the schema
+ * failures at `debug` and `warn`, the empty answer, the provider failure, the
+ * cancellation and the normaliser failure at `error` — carries identifiers,
+ * counts, issue paths and closed codes only: never the model's answer, parsed
+ * or raw, never a Zod message and never a thrown message. The service passes
+ * its own logger here, and a log record passes no redaction checkpoint, so an
+ * answer echoing developer source or personal data would otherwise land in the
+ * service log (CWE-532).
+ *
  * It also does not validate the **normalised** value against the artifact's
  * internal schema: this module has no internal schema, only the caller does.
  * AAP §0.5.3 requires that failure to be treated as a rejection too, so a
@@ -1062,6 +1228,17 @@ export async function generateStructuredWithRepair<TInput, TOutput = TInput>(
       const issues = classification.issues;
       const counts: AttemptCounts = { attempts, repairs };
 
+      if (classification.schemaThrew) {
+        // A schema that throws instead of answering is a defect signal worth
+        // one record of its own, but not a different outcome: the attempt is
+        // repaired and rejected below like any invalid answer. Provenance,
+        // counts and the fixed root path only — the thrown value was never read.
+        logger.warn(
+          'The authoring schema threw while validating an attempt; treating the attempt as invalid',
+          logFields('schema', counts, request, schemaName, issues),
+        );
+      }
+
       // --- Step 4: a schema failure earns a repair, while the budget lasts. --
       if (repairs < maxRepairs) {
         logger.debug(
@@ -1113,16 +1290,22 @@ export async function generateStructuredWithRepair<TInput, TOutput = TInput>(
       // accepted by the authoring schema, so the defect is in the normaliser or
       // in that schema, and an identical second answer would fail identically —
       // re-prompting would spend a developer's time to hide a deterministic
-      // defect. Hence: logged at error level with the offending input, rejected
-      // immediately, and no further call.
-      logger.error('The structured output normaliser threw; rejecting without a repair', {
-        ...logFields('normalize', counts, request, schemaName, undefined),
-        // The one value this loop ever logs. Whoever fixes the normaliser needs
-        // the input that provoked it, and that input is an artifact the caller
-        // assembled from an already-redacted payload.
-        input: parsed,
-        error: normalized.error.message,
-      });
+      // defect. Hence: logged at error level, rejected immediately, and no
+      // further call.
+      //
+      // The record identifies the input — stage, prompt version, session,
+      // schema and attempt — and classifies the defect by closed code and
+      // class; it never carries the input or the thrown message. The parsed
+      // answer is model prose that no redaction checkpoint has examined (the
+      // outbound guard vets requests, not answers), and a thrown message can
+      // quote it: either would put developer source or personal data in the
+      // service log (CWE-532). The thrown value stays attached as the
+      // rejection's `cause` below, in-process only, for the caller that reads
+      // its failure class back.
+      logger.error(
+        'The structured output normaliser threw; rejecting without a repair',
+        normalizeFailureLogFields(counts, request, schemaName, normalized.error),
+      );
       return err(
         rejection(
           'INTERNAL',

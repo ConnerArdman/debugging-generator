@@ -234,6 +234,7 @@ import { Code } from '../primitives/Code';
 import { DataTable } from '../primitives/DataTable';
 import type {
   DataTableColumn,
+  DataTableColumnWidth,
   DataTableSort,
   DataTableSortDirection,
 } from '../primitives/DataTable';
@@ -449,57 +450,57 @@ const COLUMN_TOOLTIPS = Object.freeze({
 });
 
 /**
- * The grid track of each column: `minmax(<floor>ch, <share>fr)`, never a
- * `minmax(0, …)`.
+ * The width ROLE of each column, keyed like {@link COLUMN_KEYS}.
  *
- * The FLOOR is what the column can never be narrower than, and it is sized to
- * the wider of two things in `ch` of the table's own type: the column's header
- * — with room for the sort indicator on the two sortable columns — and the
- * content a row typically holds there, plus the cell's inline padding. The
- * primitive sums every floor into the grid's own minimum width
- * (`--dgc-min-inline`, see `../primitives/DataTable`), so a panel narrower than
- * the sum scrolls the table horizontally with every column still readable,
- * instead of squeezing a column to its padding and painting one cell's content
- * over the next. The SHARE is how spare width is divided once every floor is
- * met: the name, the trigger histogram and the changed-prop list are the
- * columns that grow, and a figure column barely does.
+ * A role names what a column holds, never how wide it is: the primitive
+ * resolves each one through `DATA_TABLE_COLUMN_TRACKS` (see
+ * `../primitives/DataTable`) to a grid track built from the
+ * `--dg-column-min-*` floor and `--dg-column-share-*` share tokens, so this
+ * table agrees with every other table on both extension surfaces about how wide
+ * a count or a duration is, and no length is chosen here (AAP 0.6.4). Each
+ * column takes the smallest role whose floor keeps its content readable, in the
+ * vocabulary every table shares:
  *
- * The floors, and what each is sized for:
+ *   component     text      the identity column: the disclosure toggle, the
+ *                           source glyph and the component name, which
+ *                           ellipsizes inside the column and never past it. It
+ *                           takes `text` rather than the smaller `name` role so
+ *                           that it is never narrower than the trigger and
+ *                           changed-prop lists: it is what names the row and
+ *                           links it to its declaration
+ *   renderCount   count     an integer tally with its outlier glyph, sortable
+ *   durations     quantity  a formatted duration with its unit (`999.99 ms`)
+ *   triggers      text      the trigger histogram: five chips that wrap onto
+ *                           as many lines as the column's width needs
+ *   unchanged     count     an integer tally
+ *   unknown       count     an integer tally — the same role as `unchanged`,
+ *                           so the two figure columns read as a pair
+ *   changedProps  text      the changed-prop names, which wrap, so the list is
+ *                           as tall as the histogram beside it
+ *   phases        label     one short phase chip per line
  *
- *   component       26ch   the disclosure toggle, the source glyph and a
- *                          component name of about twenty characters; a longer
- *                          name ellipsizes inside the column, never past it
- *   renderCount     10ch   the `Renders` header with its sort indicator, which
- *                          is wider than any count and its outlier glyph
- *   durations       11ch   a formatted duration with its unit (`999.99 ms`)
- *   triggers        26ch   two trigger chips side by side (`unchanged 12`
- *                          beside `context 4`); the five wrap onto more lines
- *   unchanged       14ch   the `Stable inputs` header, whole, as a tab stop
- *   unknown         14ch   the `Unclassified` header, whole — the two figure
- *                          columns share one floor so they read as a pair
- *   changedProps    22ch   the `Changed props` header, and two prop names of
- *                          about ten characters side by side; further names
- *                          wrap, so the list is as tall as the histogram
- *   phases          16ch   the `Phases` header and one phase chip per line
- *
- * Their sum (161ch) keeps the table within a typical desktop panel without
- * scrolling. A ratio and a `ch` floor resolve identically in the header row and
- * in every data row, which is what keeps each column under its own heading (see
- * `../primitives/DataTable` on why an intrinsic track does not), and neither is
- * a hardcoded length (AAP 0.6.4).
+ * Every role has a non-zero floor, and the primitive sums the floors into the
+ * grid's own minimum width (`--dgc-min-inline`), so a panel narrower than the
+ * sum scrolls the table horizontally with every column still readable, instead
+ * of squeezing a column to its padding and painting one cell's content over the
+ * next. Once every floor is met, spare width goes mostly to the name, the
+ * histogram and the prop list, and barely to a figure column. A token floor and
+ * a ratio resolve identically in the header row and in every data row, which is
+ * what keeps each column under its own heading (see `../primitives/DataTable`
+ * on why an intrinsic track does not).
  */
-const COLUMN_TRACKS = Object.freeze({
-  component: 'minmax(26ch, 3fr)',
-  renderCount: 'minmax(10ch, 0.5fr)',
-  totalDuration: 'minmax(11ch, 0.6fr)',
-  averageDuration: 'minmax(11ch, 0.6fr)',
-  maxDuration: 'minmax(11ch, 0.6fr)',
-  triggers: 'minmax(26ch, 3fr)',
-  unchanged: 'minmax(14ch, 0.8fr)',
-  unknown: 'minmax(14ch, 0.8fr)',
-  changedProps: 'minmax(22ch, 2fr)',
-  phases: 'minmax(16ch, 1fr)',
-});
+const COLUMN_WIDTHS = Object.freeze({
+  component: 'text',
+  renderCount: 'count',
+  totalDuration: 'quantity',
+  averageDuration: 'quantity',
+  maxDuration: 'quantity',
+  triggers: 'text',
+  unchanged: 'count',
+  unknown: 'count',
+  changedProps: 'text',
+  phases: 'label',
+} satisfies Record<keyof typeof COLUMN_KEYS, DataTableColumnWidth>);
 
 /*
  * ---------------------------------------------------------------------------
@@ -1711,10 +1712,11 @@ interface ColumnContext {
  * combines them, and the histogram beside them prints all five buckets — zeros
  * included — so a bucket can never be inferred from the absence of a chip.
  *
- * Every track is one of {@link COLUMN_TRACKS}: a `ch` floor sized to the
- * column's header and content, and a ratio for the spare width. No column can
- * be squeezed below its floor, so a narrow panel scrolls the table
- * horizontally rather than collapsing a column and overprinting its neighbour.
+ * Every column's width is its role in {@link COLUMN_WIDTHS}, which the
+ * primitive resolves to a token-built track: a floor that keeps the column's
+ * content readable, and a ratio for the spare width. No column can be squeezed
+ * below its floor, so a narrow panel scrolls the table horizontally rather than
+ * collapsing a column and overprinting its neighbour.
  *
  * The component name IS the row's link to its declaration (AAP 0.6.2,
  * "component name → `onOpenSource`"): when the row resolved to a location the
@@ -1754,7 +1756,7 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<RenderSt
       key: COLUMN_KEYS.component,
       header: COLUMN_HEADERS.component,
       rowHeader: true,
-      width: COLUMN_TRACKS.component,
+      width: COLUMN_WIDTHS.component,
       cell: (stat, _rowIndex, meta) => {
         // The grid's own record of this row's disclosure, rather than a second
         // lookup of the expansion set: `meta.expanded` is the state the grid
@@ -1833,7 +1835,7 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<RenderSt
       key: COLUMN_KEYS.renderCount,
       header: COLUMN_HEADERS.renderCount,
       align: 'end',
-      width: COLUMN_TRACKS.renderCount,
+      width: COLUMN_WIDTHS.renderCount,
       sortable: true,
       defaultSortDirection: 'desc',
       cell: (stat) => {
@@ -1880,7 +1882,7 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<RenderSt
       key: COLUMN_KEYS.totalDuration,
       header: COLUMN_HEADERS.totalDuration,
       align: 'end',
-      width: COLUMN_TRACKS.totalDuration,
+      width: COLUMN_WIDTHS.totalDuration,
       sortable: true,
       defaultSortDirection: 'desc',
       cell: (stat) => <DurationCell ms={stat.totalDurationMs} severity="auto" size="sm" />,
@@ -1889,14 +1891,14 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<RenderSt
       key: COLUMN_KEYS.averageDuration,
       header: COLUMN_HEADERS.averageDuration,
       align: 'end',
-      width: COLUMN_TRACKS.averageDuration,
+      width: COLUMN_WIDTHS.averageDuration,
       cell: (stat) => <DurationCell ms={stat.averageDurationMs} severity="auto" size="sm" />,
     },
     {
       key: COLUMN_KEYS.maxDuration,
       header: COLUMN_HEADERS.maxDuration,
       align: 'end',
-      width: COLUMN_TRACKS.maxDuration,
+      width: COLUMN_WIDTHS.maxDuration,
       cell: (stat) => <DurationCell ms={stat.maxDurationMs} severity="auto" size="sm" />,
     },
     {
@@ -1909,7 +1911,7 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<RenderSt
         />
       ),
       headerLabel: COLUMN_HEADERS.triggers,
-      width: COLUMN_TRACKS.triggers,
+      width: COLUMN_WIDTHS.triggers,
       cell: (stat) => (
         <Stack direction="horizontal" gap={1} align="center" wrap>
           {TRIGGER_DISPLAY_ORDER.map((trigger) => (
@@ -1933,7 +1935,7 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<RenderSt
       ),
       headerLabel: COLUMN_HEADERS.unchanged,
       align: 'end',
-      width: COLUMN_TRACKS.unchanged,
+      width: COLUMN_WIDTHS.unchanged,
       cell: (stat) => (
         <Text as="span" size="sm" numeric className="dg-render-table__count-cell">
           {formatCount(stat.unchangedRenderCount)}
@@ -1951,7 +1953,7 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<RenderSt
       ),
       headerLabel: COLUMN_HEADERS.unknown,
       align: 'end',
-      width: COLUMN_TRACKS.unknown,
+      width: COLUMN_WIDTHS.unknown,
       cell: (stat) => (
         <Text as="span" size="sm" numeric className="dg-render-table__count-cell">
           {formatCount(stat.unknownTriggerCount)}
@@ -1968,7 +1970,7 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<RenderSt
         />
       ),
       headerLabel: COLUMN_HEADERS.changedProps,
-      width: COLUMN_TRACKS.changedProps,
+      width: COLUMN_WIDTHS.changedProps,
       cell: (stat) => {
         const keys = stat.changedPropKeys;
 
@@ -2018,7 +2020,7 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<RenderSt
         />
       ),
       headerLabel: COLUMN_HEADERS.phases,
-      width: COLUMN_TRACKS.phases,
+      width: COLUMN_WIDTHS.phases,
       cell: (stat) => (
         <Stack direction="horizontal" gap={1} align="center" wrap>
           {PHASE_DISPLAY_ORDER.map((phase) => (

@@ -10,7 +10,9 @@
  *   child it spawns gets {@link hermeticEnv} (no provider credential, the
  *   deterministic provider, the run's throwaway `DEBUGGEN_HOME`); every HTTP
  *   probe is loopback-only and refuses the product's default service port; the
- *   VS Code CLI only ever runs against a throwaway profile.
+ *   VS Code CLI, and the isolated editor window the packaged-VSIX suite starts
+ *   from {@link resolveVsCodeExecutable}, only ever run against a throwaway
+ *   profile.
  * - **No residue.** Scratch directories, cleanup callbacks and child processes
  *   are registered as they are created and removed by one call,
  *   {@link cleanupScratch}, which every suite awaits in `after`. Nothing here
@@ -1196,15 +1198,17 @@ export async function waitForHttpOk(
 // ---------------------------------------------------------------------------
 
 /**
- * The Node executable the suites spawn Node programs (the embedded service)
- * with: `DEBUGGEN_TEST_NODE` when set, else `node` from `PATH`.
+ * The Node executable a suite spawns a Node program of its own with:
+ * `DEBUGGEN_TEST_NODE` when set, else `node` from `PATH`.
  *
  * Never `process.execPath`: inside the extension host that is Electron, whose
- * bundled Node is older than the repository's pinned runtime
- * (`>=24.21.0 <25`), and the embedded service depends on the built-in
- * `node:sqlite` module — running it through `ELECTRON_RUN_AS_NODE` would fail
- * or behave differently from production. `.vscode-test.mjs` sets
- * `DEBUGGEN_TEST_NODE` to the Node that runs the test CLI.
+ * bundled Node is not the repository's pinned runtime (`>=24.21.0 <25`), so a
+ * program run through `ELECTRON_RUN_AS_NODE` would not run on the Node the
+ * repository tests against. `.vscode-test.mjs` sets `DEBUGGEN_TEST_NODE` to
+ * the Node that runs the test CLI. The embedded service is deliberately not
+ * started this way: the packaged-VSIX suite has the installed extension start
+ * it, on the runtime `src/service/process.ts` chooses, because that is the
+ * path a user's editor takes.
  */
 export function resolveNodeExecutable(): string {
   const configured = process.env['DEBUGGEN_TEST_NODE']?.trim();
@@ -1394,6 +1398,62 @@ function groupHasLiveMembers(pgid: number): boolean {
   }
   // The group exists; on Linux, exclude zombies awaiting their reaper.
   return process.platform === 'linux' ? liveLinuxGroupMembers(pgid).length > 0 : true;
+}
+
+/**
+ * The one-letter scheduler state of a Linux process from `/proc/<pid>/stat`
+ * (`R`, `S`, `Z`, …), or `undefined` when the process no longer exists.
+ */
+function linuxProcessState(pid: number): string | undefined {
+  let stat: string;
+  try {
+    stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+  } catch (error) {
+    const code = errnoCode(error);
+    if (code === 'ENOENT' || code === 'ESRCH') {
+      return undefined;
+    }
+    throw error;
+  }
+  // "pid (comm) state …" — comm may contain spaces and parentheses.
+  return stat.slice(stat.lastIndexOf(')') + 2).split(' ')[0];
+}
+
+/**
+ * Whether the process `pid` — any process, not only a tracked child — is
+ * still running.
+ *
+ * Signal 0 alone is not enough: a process that exits after its parent did is
+ * re-parented to PID 1, and a container whose PID 1 does not reap (this
+ * repository's CI and build hosts among them) keeps it as a zombie that
+ * `kill(pid, 0)` still reports. On Linux a zombie (`Z`) or dead (`X`) entry in
+ * `/proc` therefore counts as not alive. `EPERM` means the process exists
+ * under another account, which counts as alive.
+ *
+ * @param pid a positive process id
+ * @throws RangeError when `pid` is not a positive integer — `0` and negative
+ *   values address process groups, which is never what a caller means here
+ */
+export function isProcessAlive(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 0) {
+    throw new RangeError(`isProcessAlive: ${pid} is not a positive process id.`);
+  }
+  try {
+    process.kill(pid, 0);
+  } catch (error) {
+    const code = errnoCode(error);
+    if (code === 'ESRCH') {
+      return false;
+    }
+    if (code !== 'EPERM') {
+      throw error;
+    }
+  }
+  if (process.platform !== 'linux') {
+    return true;
+  }
+  const state = linuxProcessState(pid);
+  return state !== undefined && state !== 'Z' && state !== 'X';
 }
 
 async function pollUntil(predicate: () => boolean, budgetMs: number): Promise<boolean> {
@@ -1750,6 +1810,54 @@ export function resolveVsCodeCliArgs(): readonly string[] {
     );
   }
   return Object.freeze([cli, ...leading]);
+}
+
+/**
+ * The editor binary itself — never the `bin/code` CLI script
+ * {@link resolveVsCodeCliArgs} returns — for a suite that launches a second,
+ * isolated window (the packaged-VSIX suite, which loads the installed VSIX
+ * that way). The CLI script would hand the launch to a running instance or
+ * run the binary as Node; the binary started with its own `--user-data-dir`
+ * is a separate editor.
+ *
+ * Resolved from `VSCODE_TEST_EXECUTABLE_PATH` (set by `.vscode-test.mjs` when
+ * it knows the binary) or else `process.execPath`. On Linux and Windows the
+ * extension host's `process.execPath` is that binary. On macOS it is a helper
+ * inside `<App>.app/Contents/Frameworks/`, so the application's main
+ * executable is derived instead: `Contents/MacOS/<CFBundleExecutable>` from
+ * the bundle's `Info.plist`, `Contents/MacOS/Electron` when the plist does not
+ * name one.
+ *
+ * @throws Error when the resolved path is not an existing file
+ */
+export function resolveVsCodeExecutable(): string {
+  const configured = process.env['VSCODE_TEST_EXECUTABLE_PATH']?.trim();
+  let executable = configured === undefined || configured === '' ? process.execPath : configured;
+  if (process.platform === 'darwin') {
+    const marker = `.app${path.sep}Contents${path.sep}Frameworks${path.sep}`;
+    const at = executable.indexOf(marker);
+    if (at !== -1) {
+      const contents = path.join(executable.slice(0, at + '.app'.length), 'Contents');
+      const plist = path.join(contents, 'Info.plist');
+      const declared = isFile(plist)
+        ? /<key>CFBundleExecutable<\/key>\s*<string>([^<]+)<\/string>/
+            .exec(fs.readFileSync(plist, 'utf8'))?.[1]
+            ?.trim()
+        : undefined;
+      executable = path.join(
+        contents,
+        'MacOS',
+        declared === undefined || declared === '' ? 'Electron' : declared,
+      );
+    }
+  }
+  if (!isFile(executable)) {
+    throw new Error(
+      `The VS Code executable resolved from ${configured === undefined || configured === '' ? 'process.execPath' : 'VSCODE_TEST_EXECUTABLE_PATH'} ` +
+        `(${executable}) is not an existing file; set VSCODE_TEST_EXECUTABLE_PATH to the editor binary the tests run in.`,
+    );
+  }
+  return executable;
 }
 
 /**

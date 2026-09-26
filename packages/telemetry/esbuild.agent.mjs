@@ -521,7 +521,7 @@ export const FORBIDDEN_INPUTS = [
     directories: ['packages/protocol'],
     reason:
       'protocol sits above telemetry in the package graph (AAP 0.2.2). The ' +
-      'agent emits raw event batches over window.postMessage; the Chrome ' +
+      'agent emits raw event batches on its private page channel; the Chrome ' +
       'service worker is what wraps them in protocol envelopes.',
   },
   {

@@ -58,12 +58,41 @@
  * type, fails validation (including a `telemetry.event` batch above protocol's
  * per-batch bound, which the batch schema enforces), is not permitted for the
  * connection's principal, or fails in its handler is answered with protocol's
- * `error` message — `{ code, message, ref? }`, where `ref` is the offending
- * frame's `id` whenever one could be read — **and the connection stays open**.
- * One bad frame never closes a socket and never takes the process down. The
- * single exception is an inbound `error` frame, which is logged and dropped
- * rather than answered, so that two peers that each answer errors with errors
- * cannot loop.
+ * `error` message — `{ code, message, ref }` — **and the connection stays open**.
+ * Every such reply carries a `ref`: the offending frame's `id` when it can be
+ * read and is spelled exactly as this product mints message ids — `msg_`
+ * followed by sixteen characters of `[0-9a-z]`, `@debuggen/shared`'s
+ * `newMessageId` contract, which is how every product client builds its
+ * envelopes — and otherwise (a binary frame, text that is not JSON, a missing
+ * `id`, or any `id` of another spelling) an id the service minted. Either way
+ * it is the very ref the service's log records of that failure carry, so a
+ * client — or a developer holding its reply — can find the diagnostic, and two
+ * concurrent failures of the same code stay apart. The grammar is what keeps
+ * a peer-chosen string out of the log: a conforming id can hold nothing but
+ * sixteen lower-case alphanumerics, never a URL, a query, a statement or a
+ * path, so a client that spells its ids otherwise matches its replies by the
+ * minted ref rather than by its own id.
+ * One bad frame never closes a socket and never takes the process down.
+ *
+ * `error` travels from the service to clients only (AAP §0.4.2), so an inbound
+ * `error` frame is refused exactly like a spoofed service push: it is answered
+ * with one `error` whose `ref` names it by the rule above, and the connection
+ * stays open. The reply cannot start a loop between product peers, because
+ * none of them ever sends an `error` frame — protocol's reconnecting client,
+ * the Chrome service worker, the VS Code service client and the Node preload's
+ * control channel only consume them. A peer that answered errors with errors
+ * would itself be breaking the protocol, and each reply's `ref` names the frame
+ * that provoked it.
+ *
+ * **Source navigation is answered.** A `source.open` the handler refuses is
+ * answered with `error`, like any other refused frame. One it accepts is
+ * answered exactly once with protocol's `source.result`, sent to the sender
+ * alone with `ref` set to the sender's own frame `id`: `no-editor` at once when
+ * no VS Code window of the project is connected (the sender's cue for the
+ * `vscode://` URI fallback), otherwise `opened` or `failed` once an editor has
+ * answered the forwarded frame or the protocol's editor deadline has passed.
+ * The wait never blocks the sender's frame queue: the answer is relayed when it
+ * settles, while later frames on the connection are processed as usual.
  *
  * **Liveness.** The service pings every authenticated connection on an
  * interval (15 s by default — well inside the 30 s heartbeat staleness window
@@ -82,7 +111,13 @@
  * because the MV3 service worker suspends after about 30 s of idleness and
  * reconnects with backoff (AAP §0.5.5). A reconnect presenting the same
  * credential registers a new, online connection that carries the binding's
- * traffic again without a re-bind. Ordinary disconnects are logged at debug.
+ * traffic again without a re-bind. An editor connection's announced workspace
+ * is likewise kept for the same grace period, as a lease bounded by
+ * `./auth.ts`'s `MAX_WORKSPACE_ANNOUNCEMENT_LEASE_MS`, so the editor's HTTP
+ * requests — VS Code's `deactivate()` ending its sessions, a request racing a
+ * reconnect — are not refused for a project it announced moments earlier; a
+ * zero grace period or a closing server withdraws it at once. Ordinary
+ * disconnects are logged at debug.
  *
  * ## Authority comes from the principal, never from the frame
  *
@@ -90,23 +125,63 @@
  * resolved from the stored credential. The hello's `client`, `projectRoot` and
  * `tabId` are kept only as facts about the connection. The rules of AAP §0.5.6
  * are applied through `./auth.ts`'s `requireRole` and `requireBoundSession`,
- * never re-derived:
+ * never re-derived.
+ *
+ * A DevTools credential is shared by every tab the paired extension inspects,
+ * and the MV3 service worker multiplexes all of them over one connection, so a
+ * DevTools frame acting on a session states its **acting tab**: the envelope's
+ * `tabId`, or — on a single-tab connection that announced a `tabId` in its
+ * hello — that tab (a frame naming a different one is refused). The acting tab
+ * must be the session's live bound tab, bound by this credential; a frame that
+ * names no tab is refused rather than attributed to one. A frame about the one
+ * tab its payload names acts for that tab, and a single-tab connection speaks
+ * for its hello's tab only, so a payload naming another tab is refused
+ * (`TAB_NOT_BOUND`) before its handler runs. The rows above the last name
+ * nine message types, which are the whole inbound vocabulary; the last row
+ * covers every other type:
  *
  * | Inbound message | Who may send it | Routed to |
  * | --- | --- | --- |
  * | `client.hello` | the first frame of every connection; a second one is refused | `AuthService.authorizeHello` |
- * | `session.bind`, `tab.navigated`, `session.unbind` | `devtools` | `./routes/binding.ts`, which owns the binding rules |
- * | `telemetry.event` | `devtools` (the service worker relaying the page agent) | `./routes/telemetry.ts`, which owns the relayed-tab rule |
- * | `agent.ready` | `devtools`, for a tab no other credential has bound | the injected {@link AgentReadinessPort} |
- * | `target.selected` | `devtools`, for the session bound to its tab | the injected {@link TargetSelectionPort} |
- * | `source.open` | `devtools` for the session bound to its tab; `vscode` within its announced workspace | the injected {@link SourceOpenPort}, which contains the path and forwards it to the session's editors |
- * | every service push (`session.updated`, `agent.config`, `server-agent.config`, `panel.generated`, …) | nobody — a client cannot spoof a service push | refused with `error` |
+ * | `session.bind`, `tab.navigated`, `session.unbind` | `devtools`, each for the tab its payload names — on a single-tab connection only its hello's tab | `./routes/binding.ts`, which owns the binding rules |
+ * | `telemetry.event` | `devtools` (the service worker relaying the page agent), for its acting tab's live binding | `./routes/telemetry.ts`, which owns the relayed-tab rule |
+ * | `agent.ready` | `devtools`, for the tab its payload names — on a single-tab connection only its hello's tab — when no other credential has bound it | the injected {@link AgentReadinessPort} |
+ * | `target.selected` | `devtools`, for the session bound to its acting tab, and only for an element of the document that tab currently shows | the injected {@link TargetSelectionPort} |
+ * | `source.open` | `devtools` for the session bound to its acting tab; `vscode` within its announced workspace | the injected {@link SourceOpenPort}, which contains the path and forwards it to the session's editors; the sender is answered with `source.result` |
+ * | `source.result` | `vscode`, answering a `source.open` the service forwarded to it, within its announced workspace | {@link SourceOpenPort.acceptEditorResult}, which settles the forward; the outcome is relayed to the original sender as `source.result` |
+ * | every service push (`session.updated`, `agent.config`, `server-agent.config`, `panel.generated`, `target.request`, …) and the reply-only `error` | nobody — a client cannot spoof a service push or send an `error` | refused with `error` |
+ *
+ * `target.request` is one of those pushes, and this module never emits it.
+ * The service sends it in answer to the editor's
+ * `POST /sessions/:id/target/request` (`./routes/sessions.ts`), through the
+ * registry's `sendToBoundTab`, to the connection of that session's bound tab
+ * alone; a `target.request` a client sends — to put some other panel into
+ * picker mode — is refused here like every other service push.
+ *
+ * A `target.selected` descriptor is assembled in the page, a document that
+ * may have interfered with it, so being sent by the bound tab's credential is
+ * not enough: its `url` must name the document the binding says the tab shows
+ * now (protocol's `compareSelectionDocument`: same origin, same path), compared
+ * in the redacted form the binding stores it in. A
+ * selection left over from a document the tab has since navigated away from,
+ * or one forged to name another origin, is refused with `TAB_NOT_BOUND` — the
+ * `error` whose `ref` is the refused frame's id, which is how the sending panel
+ * retracts the selection it showed as pending — and never reaches the session.
  *
  * A `server-agent` connection sends nothing after its hello: it posts telemetry
  * over HTTP and only receives `server-agent.config`, so every frame it sends is
  * refused by the role guards above. The page agent owns no socket; its
  * `agent.ready` and telemetry batches arrive on the tab's `devtools` connection
  * and are attributed to that connection's principal.
+ *
+ * **Replay on connect.** A producer connection — `server-agent`, or the
+ * `devtools` connection that relays the page agent — is announced to the
+ * injected {@link ProducerConnectionPort} as soon as it registers, with the
+ * registry's own facts about it (the credential-scoped project, the
+ * credential-bound sessions). Its first frames may therefore be the
+ * `server-agent.config` or `agent.config` its producer is owed: the armed
+ * configuration of an open capture, or a dormant one that could not be
+ * delivered while it was away.
  *
  * ## Protocol discipline and privacy
  *
@@ -122,7 +197,18 @@
  * close reason, and no plaintext credential is held once the hello has been
  * resolved — the registry keeps the principal, which carries only a digest.
  * Close reasons and refusal messages are constant sentences; log records carry
- * connection ids, client kinds, message types, close codes and error codes.
+ * connection ids, client kinds, message types, close codes, error codes and
+ * refs. A caught exception is logged one way only (`exceptionFields`): a ref,
+ * `../logging.ts`'s closed `describeException` classification, and the value
+ * itself solely under `LOG_ERROR_FIELD_KEY`, whose serializer decides what of
+ * its message or stack a record may hold — never its `name`, `message` or
+ * string form in a field of its own. That serializer adds the redacted
+ * message and stack only to a record written at `debug` or `trace`, so every
+ * `warn`/`error` record of an exception is followed by a `debug` twin carrying
+ * the same fields and the same ref under the constant
+ * `EXCEPTION_DIAGNOSTIC_MESSAGE`: the operating levels hold the closed
+ * classification, and a developer who opts into `debug` finds the redacted
+ * detail under the ref the client's reply named.
  *
  * ## Lifetime
  *
@@ -133,7 +219,10 @@
  * in-flight frame handlers to settle, and unregisters every connection still
  * retained offline — so `startService(...).close()` leaves no open socket, no
  * live timer and no registration of this server's between integration suites.
- * Every timer this module starts is `unref()`ed as well.
+ * Before any socket is closed it closes the {@link SourceOpenPort}, which
+ * settles every forward still awaiting an editor, and gives those answers the
+ * same grace period to reach their senders, so no editor deadline outlives the
+ * server. Every timer this module starts is `unref()`ed as well.
  *
  * @example Wiring in `main.ts`
  * ```ts
@@ -159,14 +248,18 @@ import { WebSocketServer, type RawData, type WebSocket } from 'ws';
 
 import {
   CLIENT_HELLO_TIMEOUT_MS,
+  MESSAGE_TYPE,
   PROTOCOL_VERSION,
   WS_CLOSE_UNAUTHORIZED,
   WS_PATH,
+  compareSelectionDocument,
   createEnvelope,
   decodeMessage,
   errorPayloadSchema,
   isMessageOfType,
   isPlainRecord,
+  parseMessage,
+  parseSourceResultPayload,
   toErrorPayload,
 } from '@debuggen/protocol';
 import type {
@@ -174,14 +267,30 @@ import type {
   ClientKind,
   ErrorPayload,
   MessageByType,
-  MessageType,
   ProtocolMessage,
   SelectedTarget,
+  SelectionDocumentVerdict,
+  SourceResultPayload,
 } from '@debuggen/protocol';
-import { DebuggenError, assertNever, err, isErr, noopLogger, ok } from '@debuggen/shared';
+import {
+  DebuggenError,
+  ID_PREFIXES,
+  assertNever,
+  err,
+  isErr,
+  newMessageId,
+  noopLogger,
+  ok,
+} from '@debuggen/shared';
 import type { DebuggenErrorCode, LogFields, Logger, Result, SessionId } from '@debuggen/shared';
 
-import { LOG_BINDING_KEYS, LOG_ERROR_FIELD_KEY, subsystemLogger } from '../logging.js';
+import {
+  LOG_BINDING_KEYS,
+  LOG_ERROR_FIELD_KEY,
+  describeException,
+  guardLogger,
+  subsystemLogger,
+} from '../logging.js';
 import { authFailureReasonOf, isAllowedOrigin, requireBoundSession, requireRole } from './auth.js';
 import type {
   AuthFailureReason,
@@ -197,6 +306,7 @@ import {
   WS_CLOSE_TRY_AGAIN_LATER,
 } from './clients.js';
 import type { ClientRegistry, RegisteredClient, TabBindingView } from './clients.js';
+import { redactBoundUrl, serializedOriginOf } from './routes/binding.js';
 import type { BindingRoutes } from './routes/binding.js';
 import {
   MAX_TELEMETRY_INGEST_REQUEST_BODY_BYTES,
@@ -257,17 +367,37 @@ export const MAX_WS_MESSAGE_BYTES = MAX_TELEMETRY_INGEST_REQUEST_BODY_BYTES;
 const LOG_SUBSYSTEM = 'server.ws';
 
 /*
- * The two message types this module names outside its exhaustive switch, and
- * the two roles it names. `satisfies` checks each literal against protocol's
- * closed vocabulary (`MessageType`, derived from `MESSAGE_TYPES`) and against
- * `./auth.ts`'s role vocabulary, so a rename upstream is a compile error here
- * rather than a silent mismatch on the wire; the `const` keeps each literal
- * type, which is what lets `isMessageOfType` and `createEnvelope` narrow.
+ * The three message types this module names outside its exhaustive switch
+ * (the hello, the `error` reply and the `source.result` answer), and the three
+ * roles it names. The message types are protocol's own `MESSAGE_TYPE`
+ * constants — the one place each wire name is spelled, and the same constants
+ * the switch in `route` is labelled with — which keep their literal types, so
+ * `isMessageOfType` and `createEnvelope` still narrow. The roles are literals
+ * checked by `satisfies` against `./auth.ts`'s role vocabulary. Either way a
+ * rename upstream is a compile error here rather than a silent mismatch on the
+ * wire.
  */
-const HELLO_TYPE = 'client.hello' satisfies MessageType;
-const ERROR_REPLY_TYPE = 'error' satisfies MessageType;
+const HELLO_TYPE = MESSAGE_TYPE.CLIENT_HELLO;
+const ERROR_REPLY_TYPE = MESSAGE_TYPE.ERROR;
+const SOURCE_RESULT_TYPE = MESSAGE_TYPE.SOURCE_RESULT;
 const DEVTOOLS_ROLE = 'devtools' satisfies PrincipalRole;
 const EDITOR_ROLE = 'vscode' satisfies PrincipalRole;
+const SERVER_AGENT_ROLE = 'server-agent' satisfies PrincipalRole;
+
+/**
+ * The roles whose connections carry a telemetry producer — the Node preload,
+ * and the service worker that relays the page agent — and are therefore told
+ * to the {@link ProducerConnectionPort} when they register.
+ */
+const PRODUCER_ROLES: readonly PrincipalRole[] = Object.freeze([DEVTOOLS_ROLE, SERVER_AGENT_ROLE]);
+
+/**
+ * The one answer of protocol's `compareSelectionDocument` under which a
+ * `target.selected` descriptor is recorded: the element is of the document
+ * the bound tab currently shows. Checked against protocol's closed verdict
+ * vocabulary, so a renamed verdict is a compile error here.
+ */
+const SAME_DOCUMENT_VERDICT = 'same-document' satisfies SelectionDocumentVerdict;
 
 /** The roles that may send the three binding messages: only the DevTools connection binds a tab. */
 const BINDING_ROLES: readonly PrincipalRole[] = Object.freeze([DEVTOOLS_ROLE]);
@@ -277,6 +407,9 @@ const AGENT_RELAY_ROLES: readonly PrincipalRole[] = Object.freeze([DEVTOOLS_ROLE
 
 /** The roles that may ask for a source location to be opened in the editor. */
 const SOURCE_OPEN_ROLES: readonly PrincipalRole[] = Object.freeze([EDITOR_ROLE, DEVTOOLS_ROLE]);
+
+/** The roles that may answer a forwarded `source.open`: only the editor it was forwarded to. */
+const SOURCE_RESULT_ROLES: readonly PrincipalRole[] = Object.freeze([EDITOR_ROLE]);
 
 /** A close code and the constant reason sent with it. */
 interface CloseDirective {
@@ -358,6 +491,9 @@ const HELLO_REFUSAL_DIRECTIVES = Object.freeze({
   'hello-claim-mismatch': 'claimsRefused',
   'project-out-of-scope': 'claimsRefused',
   'session-not-bound': 'claimsRefused',
+  'acting-tab-required': 'claimsRefused',
+  'acting-tab-invalid': 'claimsRefused',
+  'acting-tab-not-permitted': 'claimsRefused',
   'pairing-origin-required': 'credentialRefused',
   'pairing-invalid': 'credentialRefused',
   'pairing-used': 'credentialRefused',
@@ -373,22 +509,70 @@ const SECOND_HELLO_MESSAGE =
   'This connection is already authenticated; a second hello frame is not a re-authentication.';
 const SERVICE_PUSH_MESSAGE =
   'This message is sent by the Debug Generator service only; a client may not send it.';
+const CLIENT_ERROR_FRAME_MESSAGE =
+  'Error frames travel from the Debug Generator service to its clients only; a client may not send one.';
 const BINARY_FRAME_MESSAGE =
   'Binary WebSocket frames are not part of the Debug Generator protocol; send JSON text frames.';
-const AGENT_SESSION_TAB_MESSAGE =
-  'The session this frame names is bound to a different tab than the one the page agent reported.';
 const MISSING_BINDING_MESSAGE =
   'This DevTools client may act only on the session its inspected tab is bound to.';
+const SELECTION_DOCUMENT_MESSAGE =
+  'The selected element is not from the document the bound tab currently shows; select it again in that page.';
+const ACTING_TAB_CONFLICT_MESSAGE =
+  'This connection announced one inspected tab in its hello and may act only for that tab; the frame named another.';
 const SOURCE_OPEN_ROLE_MESSAGE =
   'Only a VS Code or DevTools connection may ask for a source location to be opened.';
-const NO_EDITOR_MESSAGE =
-  'No VS Code window is connected for this project, so the location could not be opened there; use the editor link fallback or open the project in VS Code.';
+const SOURCE_RESULT_ROLE_MESSAGE =
+  'Only the VS Code connection a source location was forwarded to may answer it.';
+const SOURCE_OPEN_REFUSED_MESSAGE =
+  'The Debug Generator local service refused to open this source location. Its log holds the reason.';
+const SOURCE_OPEN_UNANSWERABLE_MESSAGE =
+  'The source.open frame id is longer than its source.result answer can reference, so the location was not opened. Send the request under a protocol message id.';
 const HANDLER_FAILURE_MESSAGE =
-  'The Debug Generator local service failed unexpectedly while handling this frame. Its log holds the reason.';
+  'The Debug Generator local service failed unexpectedly while handling this frame. Its log holds the reason under this ref.';
 const UNREPORTABLE_FAILURE_MESSAGE =
-  'The Debug Generator local service could not describe this failure. Its log holds the reason.';
+  'The Debug Generator local service could not describe this failure. Its log holds the reason under this ref.';
 const SERVER_CLOSED_MESSAGE = 'The WebSocket server is closed.';
 const ALREADY_ATTACHED_MESSAGE = 'The WebSocket server is already attached to this HTTP server.';
+
+/**
+ * The record message of each socket or timer callback {@link createWsServer}
+ * runs through its `guarded` wrapper, by the callback it names.
+ *
+ * A record's message is free text that no serializer governs, so the wrapper
+ * takes a *key* of this table rather than a string: a caller cannot hand it an
+ * interpolated sentence carrying a frame, a path or an exception's words, and
+ * a new callback needs its constant sentence here before it compiles.
+ */
+const GUARDED_ACTION_MESSAGES = Object.freeze({
+  accept: 'accepting a WebSocket connection failed unexpectedly',
+  frame: 'handling a WebSocket frame failed unexpectedly',
+  pong: 'handling a heartbeat pong failed unexpectedly',
+  socketError: 'handling a WebSocket error failed unexpectedly',
+  close: 'handling a WebSocket close failed unexpectedly',
+  helloDeadline: 'the hello deadline failed unexpectedly',
+  retire: 'retiring an offline connection failed unexpectedly',
+  heartbeat: 'the heartbeat failed unexpectedly',
+  sourceResult: 'relaying a source.result answer failed unexpectedly',
+  sourceClose: 'closing source navigation failed unexpectedly',
+} as const satisfies Readonly<Record<string, string>>);
+
+/** One callback of {@link GUARDED_ACTION_MESSAGES}. */
+type GuardedAction = keyof typeof GUARDED_ACTION_MESSAGES;
+
+/**
+ * The message of the `debug` twin that follows every `warn` or `error` record
+ * of a caught exception (see `logException` in {@link createWsServer}).
+ *
+ * Constant like every record message of this module: the twin is found by its
+ * `ref`, which is the ref of the record it follows and of the `error` reply
+ * that answered the failure, and what it adds — the exception's message and
+ * stack after `../logging.ts`'s diagnostic redaction — sits under
+ * `LOG_ERROR_FIELD_KEY`, never in the message.
+ */
+const EXCEPTION_DIAGNOSTIC_MESSAGE = 'diagnostic detail of the failure filed under this ref';
+
+/** The levels a caught exception is filed at before its `debug` twin. */
+type ExceptionLevel = 'warn' | 'error';
 
 /* -------------------------------------------------------------------------------------------------
  * Injected ports
@@ -432,7 +616,8 @@ export interface AgentReadinessPort {
  * stage reads it).
  *
  * Called only after the sending DevTools connection has been proved to hold
- * the session's tab binding. Must not throw; a failure is an `Err`.
+ * the session's tab binding, and the descriptor proved to be of the document
+ * that tab currently shows. Must not throw; a failure is an `Err`.
  */
 export interface TargetSelectionPort {
   selected(
@@ -457,23 +642,51 @@ export interface SourceOpenCaller {
   readonly tabId?: number | undefined;
   /** The session that binding names. */
   readonly sessionId?: string | undefined;
+  /**
+   * The registry's id for the connection. Not an authority: the handler uses it
+   * only to count one editor's repeated answers once.
+   */
+  readonly connectionId?: string | undefined;
 }
 
+/** Each member of a `source.result` payload union, without its per-hop `sessionId` and `ref`. */
+type WithoutCorrelation<T> = T extends unknown ? Omit<T, 'sessionId' | 'ref'> : never;
+
 /**
- * The outcome of a `source.open` as this module needs to see it: whether an
- * editor received the location. `false` means the location passed every check
- * but no VS Code window was connected, which is answered to the sender so it
- * can fall back to the editor's URI handler.
+ * How the editors answered a delivered `source.open`: `opened`, or `failed`
+ * with its `{ code, message, hint? }`. Derived from protocol's
+ * `SourceResultPayload` — the `no-editor` member excluded, since this module
+ * answers that one itself — so the relayed frame is the protocol's shape by
+ * construction once the sender's `sessionId` and `ref` are added back.
  */
-export interface SourceOpenDelivery {
-  readonly delivered: boolean;
-}
+export type SourceOpenEditorOutcome = WithoutCorrelation<
+  Exclude<SourceResultPayload, { readonly status: 'no-editor' }>
+>;
 
 /**
- * Where a `source.open` goes: `src/source/open.ts`'s handler, which re-validates
- * the frame, looks up the session's project root, authorizes the caller,
- * contains the path lexically and on the filesystem, and forwards the location
- * to the session's editor clients through the client registry.
+ * The outcome of a `source.open` as this module needs to see it.
+ *
+ * - `delivered: false` — the location passed every check but no VS Code window
+ *   was connected; the sender is answered `source.result` `no-editor` at once,
+ *   its cue for the editor's URI-handler fallback.
+ * - `delivered: true` — an editor received the forwarded frame; `editorResult`
+ *   settles, and never rejects, with what the editors answered (or `failed`
+ *   when none answered in time), which is relayed to the sender.
+ */
+export type SourceOpenDelivery =
+  | { readonly delivered: false }
+  | {
+      readonly delivered: true;
+      readonly editorResult: Promise<SourceOpenEditorOutcome>;
+    };
+
+/**
+ * Where source navigation goes: `src/source/open.ts`'s handler. `handle`
+ * re-validates a `source.open`, looks up the session's project root, authorizes
+ * the caller, contains the path lexically and on the filesystem, and forwards
+ * the location to the session's editor clients through the client registry;
+ * `acceptEditorResult` settles a forward with an editor's `source.result`; and
+ * `close` settles every forward still waiting when this server shuts down.
  *
  * Satisfied structurally by `createSourceOpenHandler(...)`. Must not throw.
  */
@@ -482,6 +695,46 @@ export interface SourceOpenPort {
     message: MessageByType<'source.open'>,
     caller: SourceOpenCaller,
   ): MaybePromise<Result<SourceOpenDelivery, DebuggenError>>;
+  acceptEditorResult(
+    message: MessageByType<'source.result'>,
+    caller: SourceOpenCaller,
+  ): MaybePromise<Result<unknown, DebuggenError>>;
+  close(): void;
+}
+
+/** What {@link ProducerConnectionPort.producerConnected} is told about a registered producer connection. */
+export interface ProducerConnectionFacts {
+  /** The connection's kind: the credential's role, `server-agent` or `devtools`. */
+  readonly kind: ClientKind;
+  /** A `server-agent` connection's project root: its credential's scope, as the registry recorded it. */
+  readonly projectRoot?: string | undefined;
+  /** The sessions whose tab bindings a `devtools` connection's credential carries. */
+  readonly sessionIds?: readonly string[] | undefined;
+  /**
+   * When the connection's credential was issued, from the resolved principal:
+   * a producer whose credential predates the service may hold what an earlier
+   * process configured.
+   */
+  readonly credentialIssuedAt?: number | undefined;
+}
+
+/**
+ * Told about every producer connection — the Node preload's `server-agent`
+ * connection and the Chrome service worker's `devtools` connection, which
+ * relays the page agent — right after it registers, so the configuration its
+ * producer is owed is replayed to it: the armed configuration of an open
+ * capture, or the dormant one a disarm could not deliver while the producer
+ * was away (a suspended MV3 service worker, a restarting service). AAP §0.4.2
+ * has no frame a producer could ask for it with, so the service offers it.
+ *
+ * Satisfied structurally by the instrumentation service's
+ * `ProducerReconciler.producerConnected`. Called after the connection is
+ * authenticated and registered, so a frame it sends reaches the new
+ * connection. Must not throw; what it replays, and whether it was delivered,
+ * it logs itself.
+ */
+export interface ProducerConnectionPort {
+  producerConnected(connection: ProducerConnectionFacts): unknown;
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -529,8 +782,13 @@ export interface WsServerDeps {
   readonly readiness: AgentReadinessPort;
   /** Receives `target.selected` descriptors. */
   readonly targets: TargetSelectionPort;
-  /** Handles `source.open` requests. */
+  /** Handles `source.open` requests and the editors' `source.result` answers. */
   readonly sourceOpen: SourceOpenPort;
+  /**
+   * Told about each producer connection as it registers, so what its producer
+   * is owed is replayed. Omitted, nothing is replayed on connect.
+   */
+  readonly producers?: ProducerConnectionPort | undefined;
   /** The service logger; this module binds `subsystem: "server.ws"`. Defaults to silence. */
   readonly logger?: Logger | undefined;
   /**
@@ -637,7 +895,7 @@ interface ConnectionState {
   clientId: string | undefined;
   /** The registered kind, for log records. */
   kind: ClientKind | undefined;
-  /** An editor connection's workspace announcement, released on close. */
+  /** An editor connection's workspace announcement, released (or leased for the offline grace) on close. */
   announcement: WorkspaceAnnouncement | undefined;
   /** The tail of this connection's frame queue. */
   tail: Promise<void>;
@@ -663,6 +921,74 @@ function refusal(code: DebuggenErrorCode, message: string): Result<never, Debugg
 /** Collapses a handler's outcome to success or its error; success values are the handler's business. */
 function settled(outcome: Result<unknown, DebuggenError>): Result<void, DebuggenError> {
   return isErr(outcome) ? outcome : ok(undefined);
+}
+
+/**
+ * The inspected tab a DevTools frame acts for — the tab
+ * `./auth.ts`'s `requireBoundSession` checks against the session's live
+ * binding, because the connection's credential is shared by every tab the
+ * paired extension inspects and so cannot say which one is acting.
+ *
+ * - The envelope's `tabId` is the frame's own statement of its tab: the MV3
+ *   service worker multiplexes every tab over one connection and names the
+ *   tab on each frame, from Chrome's port metadata.
+ * - A connection that announced a `tabId` in its `client.hello` is a
+ *   single-tab connection and acts only for that tab: a frame naming another
+ *   tab is refused (`TAB_NOT_BOUND`), never re-attributed to either.
+ * - Otherwise the envelope's tab, else the hello's; `undefined` when neither
+ *   names one, which the guard refuses for any action on a session.
+ *
+ * A frame whose payload names its own tab is held to the same single-tab rule
+ * by {@link requireAnnouncedTab}.
+ *
+ * @param client The connection the frame arrived on.
+ * @param message The parsed frame.
+ * @returns The acting tab, `undefined` when none is named, or the refusal.
+ */
+function actingTabOf(
+  client: Pick<RegisteredClient, 'tabId'>,
+  message: Pick<ProtocolMessage, 'tabId'>,
+): Result<number | undefined, DebuggenError> {
+  const named = message.tabId;
+  const announced = client.tabId;
+  if (named !== undefined && announced !== undefined && named !== announced) {
+    return refusal('TAB_NOT_BOUND', ACTING_TAB_CONFLICT_MESSAGE);
+  }
+  return ok(named ?? announced);
+}
+
+/**
+ * The single-tab rule for a frame about the one tab its payload names —
+ * `session.bind`, `tab.navigated`, `session.unbind` and `agent.ready` — whose
+ * handlers take that payload tab as the acting tab.
+ *
+ * - A connection that announced a `tabId` in its `client.hello` is a
+ *   single-tab connection and speaks for that tab only, so a payload naming
+ *   any other tab is refused (`TAB_NOT_BOUND`) before a handler runs. Without
+ *   this, the DevTools credential — shared by every tab the paired extension
+ *   inspects — would let a connection for tab A bind, navigate or unbind tab
+ *   B, or report tab B's page agent ready.
+ * - A connection whose hello named no tab (the MV3 service worker, which
+ *   multiplexes every inspected tab) is unaffected: protocol already refuses a
+ *   frame whose envelope `tabId` contradicts its payload's, so the payload's
+ *   tab is that frame's acting tab.
+ *
+ * The same rule {@link actingTabOf} applies to an envelope `tabId`, with the
+ * same constant refusal.
+ *
+ * @param client The connection the frame arrived on.
+ * @param payloadTab The tab the frame's payload names.
+ * @returns `ok`, or the `TAB_NOT_BOUND` refusal.
+ */
+function requireAnnouncedTab(
+  client: Pick<RegisteredClient, 'tabId'>,
+  payloadTab: number,
+): Result<void, DebuggenError> {
+  const announced = client.tabId;
+  if (announced !== undefined && payloadTab !== announced) {
+    return refusal('TAB_NOT_BOUND', ACTING_TAB_CONFLICT_MESSAGE);
+  }
+  return ok(undefined);
 }
 
 /**
@@ -705,16 +1031,59 @@ function clampCloseReason(reason: string): string {
   return clamped;
 }
 
-/** A decoded frame, and the reference an `error` reply to it should carry. */
+/**
+ * The fields every record of a caught exception carries in this module.
+ *
+ * - `ref` — the record's correlation reference: a failed frame's reply ref,
+ *   so the `error` its sender received names this very record, or a fresh
+ *   message id for a socket- or server-level failure that answers no frame.
+ * - `errorClass` / `errorCode` — `../logging.ts`'s closed
+ *   {@link describeException} classification, safe at every level: a label
+ *   from a fixed taxonomy and a closed-vocabulary code, never the value's own
+ *   `name`, `message` or string form (a transport error's message can quote a
+ *   peer address; a handler's can quote a path or a statement).
+ * - `LOG_ERROR_FIELD_KEY` — the value itself, and nowhere else, so the
+ *   service serializer alone decides what of its message or stack a record
+ *   may hold.
+ *
+ * A `debug` record spreads these fields directly; a `warn` or `error` one goes
+ * through `logException` inside {@link createWsServer}, which adds the `debug`
+ * twin that alone can carry the redacted message and stack.
+ *
+ * Total: {@link describeException} never throws, whatever it is handed.
+ *
+ * @param cause Whatever was thrown, rejected or emitted as `error`.
+ * @param ref The reference the record is filed under.
+ * @returns A fresh field bag, to spread after the connection's own fields.
+ *
+ * @example
+ * ```ts
+ * log.debug('a heartbeat ping could not be sent', {
+ *   ...fieldsOf(state),
+ *   ...exceptionFields(cause, newMessageId()),
+ * });
+ * ```
+ */
+function exceptionFields(cause: unknown, ref: string): LogFields {
+  return { ref, ...describeException(cause), [LOG_ERROR_FIELD_KEY]: cause };
+}
+
+/** A decoded frame, and the client id its failure reference is resolved from. */
 interface DecodedFrame {
   readonly result: Result<ProtocolMessage, DebuggenError>;
-  /** The frame's own `id`, whenever one could be read — even from a frame that failed validation. */
-  readonly ref: string | undefined;
+  /**
+   * The frame's own `id`, whenever one could be read — even from a frame that
+   * failed validation. Peer-chosen text, and a *candidate* for the reply's
+   * `ref` only: {@link failureRefFor} decides whether it is usable as one, and
+   * nothing logs it before that decision.
+   */
+  readonly frameId: string | undefined;
 }
 
 /**
  * Decodes one text frame with protocol's `decodeMessage`, keeping the frame's
- * `id` for the reply's `ref` even when the frame fails validation.
+ * `id` as the candidate for the reply's `ref` even when the frame fails
+ * validation.
  *
  * The JSON is parsed once here and the parsed value handed to `decodeMessage`,
  * which validates it; only text that is not JSON at all is handed to
@@ -726,33 +1095,132 @@ function decodeFrame(text: string): DecodedFrame {
   try {
     value = JSON.parse(text);
   } catch {
-    return { result: decodeMessage(text), ref: undefined };
+    return { result: decodeMessage(text), frameId: undefined };
   }
   const result = decodeMessage(value);
   if (result.ok) {
-    return { result, ref: result.value.id };
+    return { result, frameId: result.value.id };
   }
   const candidate = isPlainRecord(value) ? value['id'] : undefined;
-  return { result, ref: typeof candidate === 'string' ? candidate : undefined };
+  return { result, frameId: typeof candidate === 'string' ? candidate : undefined };
+}
+
+/**
+ * Protocol's own rule for an `error` payload's `ref` (non-empty, bounded):
+ * the same field schema the reply is verified against, so the decision of
+ * which ref a failure is filed under can never disagree with what the reply
+ * may carry.
+ */
+const ERROR_REF_SCHEMA = errorPayloadSchema.shape.ref;
+
+/**
+ * How many characters of `[0-9a-z]` follow the prefix and underscore of every
+ * id this product mints. `packages/shared/src/ids.ts` keeps its `ID_ALPHABET`
+ * and `ID_RANDOM_LENGTH` module-private, so the number is restated here from
+ * the contract that module documents for `newId`: every id is 3 + 1 + 16 = 20
+ * characters and matches `/^[a-z]{3}_[0-9a-z]{16}$/`. A change to that
+ * contract is a change to this constant.
+ */
+const MINTED_ID_SUFFIX_LENGTH = 16;
+
+/**
+ * The exact spelling of a message id `newMessageId` mints: `ID_PREFIXES.message`
+ * (`msg`), one underscore, then {@link MINTED_ID_SUFFIX_LENGTH} characters of
+ * `[0-9a-z]`, anchored at both ends. The prefix is read from
+ * `@debuggen/shared` rather than written out, so it cannot drift from the
+ * generator.
+ *
+ * Only a client `id` of this spelling is reused as a failure reference. It is
+ * the whole of what a conforming id can say: lower-case letters and digits,
+ * twenty characters in all — no `/`, `?`, `=`, quote, space or dot, so no URL,
+ * query value, SQL literal or path a peer chose can reach a log record through
+ * the `ref` field, which the logger treats as an ordinary field and scrubs for
+ * credential shapes only.
+ */
+const MINTED_MESSAGE_ID_PATTERN = new RegExp(
+  `^${ID_PREFIXES.message}_[0-9a-z]{${String(MINTED_ID_SUFFIX_LENGTH)}}$`,
+  'u',
+);
+
+/**
+ * The one reference a failed frame is reported under — in every log record
+ * about it and in the `error` reply its sender receives alike — so a developer
+ * holding the reply finds the record, and two concurrent failures of the same
+ * code are never confused.
+ *
+ * - The client's own frame `id`, when it matches
+ *   {@link MINTED_MESSAGE_ID_PATTERN} — the product's own message-id grammar,
+ *   which every product client satisfies because it builds envelopes with
+ *   `createEnvelope`/`newMessageId` — and protocol's `error` payload accepts
+ *   it as `ref`: the sender can then match the reply to the frame it sent.
+ * - Otherwise a service-minted message id, used as is on the log records and
+ *   the reply alike. That covers a binary frame, text that is not JSON, an
+ *   `id` that is absent or not a string, and every `id` the envelope accepts
+ *   but the grammar does not — an upper-case, over-long or foreign-prefix id,
+ *   a URL, a statement — so no peer-chosen text is ever filed as a ref.
+ *
+ * @param frameId The frame's readable `id`, if any.
+ * @returns A reference `errorPayloadSchema` accepts as `ref`.
+ *
+ * @example
+ * ```ts
+ * failureRefFor('msg_0123456789abcdef'); // → 'msg_0123456789abcdef' (echoed)
+ * failureRefFor("SELECT 'x'");           // → a fresh 'msg_…' id
+ * failureRefFor('msg_0123456789ABCDEF'); // → a fresh 'msg_…' id
+ * ```
+ */
+function failureRefFor(frameId: string | undefined): string {
+  return frameId !== undefined &&
+    MINTED_MESSAGE_ID_PATTERN.test(frameId) &&
+    ERROR_REF_SCHEMA.safeParse(frameId).success
+    ? frameId
+    : newMessageId();
+}
+
+/**
+ * The failure reference of one queued frame, resolved at most once.
+ *
+ * Created empty by `enqueueFrame` for every frame and filled by the first
+ * failure `processFrame` reports, so every later record about the same frame —
+ * the refusal after a handler threw, the queue's last-resort sink — carries the
+ * ref its reply already carried, instead of each minting its own.
+ */
+interface FrameFailure {
+  ref: string | undefined;
+}
+
+/**
+ * The reference `failure` is reported under: the one already resolved for the
+ * frame, or — the first time — {@link failureRefFor}'s choice, recorded so
+ * every later record about the frame reuses it.
+ */
+function resolveFailureRef(failure: FrameFailure, frameId: string | undefined): string {
+  const ref = failure.ref ?? failureRefFor(frameId);
+  failure.ref = ref;
+  return ref;
 }
 
 /**
  * The payload of an `error` reply: protocol's `toErrorPayload` (the code, the
- * message and, when given, the reference), verified against the `error`
- * payload schema before it is sent. A reference the schema refuses (a client
- * `id` out of bounds) is dropped rather than the reply; a message the schema
- * refuses is replaced by a constant, so a reply is always well-formed.
+ * message and the reference), verified against the `error` payload schema
+ * before it is sent.
+ *
+ * The reference is always kept. It comes from {@link failureRefFor}, so the
+ * schema accepts it by construction, and it is the ref the failure was logged
+ * under — dropping it would sever the reply from its record. A message the
+ * schema refuses (empty or over-long) is replaced by a constant under the
+ * same ref, so a reply is always well-formed and always correlated.
+ *
+ * @param error The failure to report.
+ * @param ref The frame's failure reference, from {@link resolveFailureRef}.
+ * @returns A payload `errorPayloadSchema` accepts, carrying `ref`.
  */
-function errorReplyPayload(error: DebuggenError, ref: string | undefined): ErrorPayload {
-  const withRef = toErrorPayload(error, ref);
-  if (errorPayloadSchema.safeParse(withRef).success) {
-    return withRef;
+function errorReplyPayload(error: DebuggenError, ref: string): ErrorPayload {
+  const payload = toErrorPayload(error, ref);
+  if (errorPayloadSchema.safeParse(payload).success) {
+    return payload;
   }
-  const withoutRef = toErrorPayload(error);
-  if (errorPayloadSchema.safeParse(withoutRef).success) {
-    return withoutRef;
-  }
-  return toErrorPayload(new DebuggenError('INTERNAL', UNREPORTABLE_FAILURE_MESSAGE));
+  return toErrorPayload(new DebuggenError('INTERNAL', UNREPORTABLE_FAILURE_MESSAGE), ref);
 }
 
 /**
@@ -892,7 +1360,11 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
   const offlineGraceMs = graceOption.value;
 
   const { auth, clients, binding, telemetry, readiness, targets, sourceOpen } = deps;
-  const log = subsystemLogger(deps.logger ?? noopLogger, LOG_SUBSYSTEM);
+  // Guarded before the child is derived, so no record this module writes —
+  // the `debug` twin of a failure included — can throw into the catch block
+  // that is answering the failure (`guardLogger` is idempotent, so the
+  // service's already-guarded root passes through unchanged).
+  const log = subsystemLogger(guardLogger(deps.logger ?? noopLogger), LOG_SUBSYSTEM);
 
   // `clientTracking: false` because this module tracks its own sockets (with
   // their handshake state); `ws` keeping a second set would only be a second
@@ -904,13 +1376,20 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
     maxPayload: MAX_WS_MESSAGE_BYTES,
   });
   wss.on('error', (cause) => {
-    log.error('the WebSocket server reported an error', { [LOG_ERROR_FIELD_KEY]: cause });
+    logException('error', 'the WebSocket server reported an error', {}, cause, newMessageId());
   });
 
   const connections = new Map<WebSocket, ConnectionState>();
   /** Closed connections kept registered (offline) until their grace period ends, by client id. */
   const retained = new Map<string, TimerHandle>();
   const attached = new Set<UpgradeSource>();
+  /**
+   * The relays of delivered `source.open` answers still waiting for the
+   * editors: each settles when its `source.result` has been handed to the
+   * sender (or could not be). {@link WsServer.close} waits for them, within the
+   * closing grace period, after closing the {@link SourceOpenPort}.
+   */
+  const sourceRelays = new Set<Promise<void>>();
   let closed = false;
   let closePromise: Promise<void> | undefined;
   let heartbeat: ReturnType<typeof setInterval> | undefined;
@@ -930,22 +1409,67 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
   }
 
   /**
+   * Files a caught exception at `level` under `ref`, then writes its `debug`
+   * twin: the same fields, the same ref and the same value under
+   * `LOG_ERROR_FIELD_KEY`, with the constant
+   * {@link EXCEPTION_DIAGNOSTIC_MESSAGE}.
+   *
+   * The two records split what may be said at each level. At `warn`/`error`
+   * the service serializer reduces the value to its closed shape — class,
+   * closed-vocabulary code, cause chain — because a record at those levels is
+   * written by default; only at `debug`/`trace` does it add the message and
+   * stack, after its URL, SQL and source-excerpt redaction. The twin is
+   * therefore where a developer who opted into `debug` reads why the failure
+   * happened, found by the ref the primary record and the client's reply
+   * carry. Below the `debug` threshold the twin costs one level comparison.
+   *
+   * @param level The level the failure itself is filed at.
+   * @param message The primary record's constant message.
+   * @param fields The context fields both records carry (connection, type).
+   * @param cause Whatever was thrown, rejected or emitted as `error`.
+   * @param ref The reference both records are filed under.
+   *
+   * @example
+   * ```ts
+   * logException('error', 'a WebSocket frame handler failed unexpectedly',
+   *   { ...fieldsOf(state), type: message.type }, cause, ref);
+   * // error: {"ref":"msg_…","errorClass":"Error","err":{"type":"Error"}, …}
+   * // debug: {"ref":"msg_…","errorClass":"Error","err":{"type":"Error","message":"…","stack":"…"}, …}
+   * ```
+   */
+  function logException(
+    level: ExceptionLevel,
+    message: string,
+    fields: LogFields,
+    cause: unknown,
+    ref: string,
+  ): void {
+    log[level](message, { ...fields, ...exceptionFields(cause, ref) });
+    log.debug(EXCEPTION_DIAGNOSTIC_MESSAGE, { ...fields, ...exceptionFields(cause, ref) });
+  }
+
+  /**
    * Runs a socket or timer callback so that nothing it throws escapes into
-   * `ws` or the event loop: an unexpected failure is logged, and a connection
-   * still in its handshake is closed rather than left without a deadline.
+   * `ws` or the event loop: an unexpected failure is logged under the
+   * callback's constant sentence from {@link GUARDED_ACTION_MESSAGES}, and a
+   * connection still in its handshake is closed rather than left without a
+   * deadline.
    */
   function guarded(
-    description: string,
+    name: GuardedAction,
     state: ConnectionState | undefined,
     action: () => void,
   ): void {
     try {
       action();
     } catch (cause) {
-      log.error(description, {
-        ...(state === undefined ? {} : fieldsOf(state)),
-        [LOG_ERROR_FIELD_KEY]: cause,
-      });
+      logException(
+        'error',
+        GUARDED_ACTION_MESSAGES[name],
+        state === undefined ? {} : fieldsOf(state),
+        cause,
+        newMessageId(),
+      );
       if (state?.phase === 'awaiting-hello') {
         closeConnection(state, CLOSE_DIRECTIVES.authUnavailable);
       }
@@ -957,7 +1481,10 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
   /** Answers a refused upgrade with a bare HTTP status and destroys the TCP socket. */
   function rejectUpgrade(socket: Duplex, status: number): void {
     socket.on('error', (cause) => {
-      log.debug('a refused upgrade socket failed while closing', { [LOG_ERROR_FIELD_KEY]: cause });
+      log.debug(
+        'a refused upgrade socket failed while closing',
+        exceptionFields(cause, newMessageId()),
+      );
     });
     if (!socket.writable) {
       socket.destroy();
@@ -991,12 +1518,12 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
         return;
       }
       wss.handleUpgrade(request, socket, head, (ws) => {
-        guarded('accepting a WebSocket connection failed unexpectedly', undefined, () => {
+        guarded('accept', undefined, () => {
           accept(ws, origin);
         });
       });
     } catch (cause) {
-      log.warn('a WebSocket upgrade failed unexpectedly', { [LOG_ERROR_FIELD_KEY]: cause });
+      logException('warn', 'a WebSocket upgrade failed unexpectedly', {}, cause, newMessageId());
       socket.destroy();
     }
   }
@@ -1027,22 +1554,22 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
     connections.set(socket, state);
 
     socket.on('message', (data: RawData, isBinary: boolean) => {
-      guarded('handling a WebSocket frame failed unexpectedly', state, () => {
+      guarded('frame', state, () => {
         onMessage(state, data, isBinary);
       });
     });
     socket.on('pong', () => {
-      guarded('handling a heartbeat pong failed unexpectedly', state, () => {
+      guarded('pong', state, () => {
         onPong(state);
       });
     });
     socket.on('error', (cause: Error) => {
-      guarded('handling a WebSocket error failed unexpectedly', state, () => {
+      guarded('socketError', state, () => {
         onSocketError(state, cause);
       });
     });
     socket.once('close', (code: number) => {
-      guarded('handling a WebSocket close failed unexpectedly', state, () => {
+      guarded('close', state, () => {
         onClose(state, code);
       });
     });
@@ -1052,7 +1579,7 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
       return;
     }
     const timer = setTimeout(() => {
-      guarded('the hello deadline failed unexpectedly', state, () => {
+      guarded('helloDeadline', state, () => {
         onHelloTimeout(state);
       });
     }, helloTimeoutMs);
@@ -1089,7 +1616,7 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
     } catch (cause) {
       log.debug('a socket refused to close; terminating it', {
         ...fieldsOf(state),
-        [LOG_ERROR_FIELD_KEY]: cause,
+        ...exceptionFields(cause, newMessageId()),
       });
       state.socket.terminate();
       return;
@@ -1126,7 +1653,7 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
   function onSocketError(state: ConnectionState, cause: Error): void {
     log.debug('a WebSocket connection failed', {
       ...fieldsOf(state),
-      [LOG_ERROR_FIELD_KEY]: cause,
+      ...exceptionFields(cause, newMessageId()),
     });
     if (state.clientId !== undefined) {
       clients.markOffline(state.clientId);
@@ -1137,6 +1664,15 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
    * Releases everything a socket held. The session, its tab binding and any
    * open capture are deliberately untouched (AAP §0.5.5): the binding belongs
    * to the credential, and a reconnect with the same credential carries it.
+   *
+   * An editor's workspace announcement is released on the same terms as its
+   * registration is retired: kept for the offline grace period as a bounded
+   * lease — so the editor's HTTP requests still act on its project while the
+   * socket is away (VS Code's `deactivate()` ends its sessions over HTTP after
+   * the socket has gone, and a reconnect takes a moment) — and withdrawn at
+   * once when the grace period is zero or the server is closing. A rotation
+   * that closed the socket has already cleared every announcement, and a lease
+   * on a cleared announcement is a no-op.
    */
   function onClose(state: ConnectionState, code: number): void {
     if (state.phase === 'closed') {
@@ -1148,7 +1684,13 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
     connections.delete(state.socket);
     const announcement = state.announcement;
     state.announcement = undefined;
-    announcement?.release();
+    if (announcement !== undefined) {
+      if (closed || offlineGraceMs === 0) {
+        announcement.release();
+      } else {
+        announcement.releaseAfter(offlineGraceMs);
+      }
+    }
     if (state.clientId !== undefined) {
       retire(state.clientId);
     }
@@ -1170,7 +1712,7 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
       return;
     }
     const timer = setTimeout(() => {
-      guarded('retiring an offline connection failed unexpectedly', undefined, () => {
+      guarded('retire', undefined, () => {
         retained.delete(clientId);
         clients.unregister(clientId);
       });
@@ -1196,7 +1738,7 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
       } catch (cause) {
         log.debug('a heartbeat ping could not be sent', {
           ...fieldsOf(state),
-          [LOG_ERROR_FIELD_KEY]: cause,
+          ...exceptionFields(cause, newMessageId()),
         });
       }
     }
@@ -1261,7 +1803,8 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
     const principal = decision.value;
 
     // An editor's announced workspace is what lets its HTTP requests act on a
-    // project; the announcement lives exactly as long as this connection.
+    // project; the announcement lives as long as this connection, plus the
+    // offline-grace lease `onClose` grants when the connection drops.
     let announcement: WorkspaceAnnouncement | undefined;
     if (principal.role === EDITOR_ROLE) {
       const announced = auth.announceWorkspace(principal);
@@ -1300,6 +1843,37 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
     state.kind = registered.value.kind;
     state.announcement = announcement;
     log.debug('authenticated a WebSocket connection', fieldsOf(state));
+
+    if (PRODUCER_ROLES.includes(principal.role)) {
+      replayToProducer(state, registered.value);
+    }
+  }
+
+  /**
+   * Tells the producer port about a producer connection that has just
+   * registered, from the registry's own record of it: a server agent's
+   * credential-scoped project, a DevTools connection's credential-bound
+   * sessions. Contained: a port that throws is logged and the connection stays
+   * open, since nothing it would have replayed is the connection's fault.
+   */
+  function replayToProducer(state: ConnectionState, registered: RegisteredClient): void {
+    const producers = deps.producers;
+    if (producers === undefined) {
+      return;
+    }
+    try {
+      producers.producerConnected({
+        kind: registered.kind,
+        ...(registered.projectRoot === undefined ? {} : { projectRoot: registered.projectRoot }),
+        sessionIds: [...registered.sessionIds],
+        credentialIssuedAt: registered.principal.issuedAt,
+      });
+    } catch (cause) {
+      log.error('replaying the configuration owed to a producer connection threw', {
+        ...fieldsOf(state),
+        [LOG_ERROR_FIELD_KEY]: cause,
+      });
+    }
   }
 
   /* ---- the frame pipeline ---- */
@@ -1323,13 +1897,21 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
       return;
     }
     state.pending += 1;
+    const failure: FrameFailure = { ref: undefined };
     state.tail = state.tail
-      .then(() => processFrame(state, text))
+      .then(() => processFrame(state, text, failure))
       .catch((cause: unknown) => {
-        log.error('a WebSocket frame could not be processed', {
-          ...fieldsOf(state),
-          [LOG_ERROR_FIELD_KEY]: cause,
-        });
+        // The last-resort sink: `processFrame` never rejects by design, so a
+        // rejection here is a defect. It is filed under the ref the frame's
+        // reply already carried when one was resolved, and under a fresh one
+        // when the failure came before any.
+        logException(
+          'error',
+          'a WebSocket frame could not be processed',
+          fieldsOf(state),
+          cause,
+          failure.ref ?? newMessageId(),
+        );
       })
       .finally(() => {
         state.pending -= 1;
@@ -1340,8 +1922,23 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
    * Decodes, authorizes and routes one frame, answering every failure with
    * protocol's `error` message on the same connection, which stays open.
    * Never rejects.
+   *
+   * Every failure resolves **one** reference first, through
+   * {@link resolveFailureRef} — the frame's own `id` where it is spelled as
+   * this product mints message ids ({@link MINTED_MESSAGE_ID_PATTERN}), a
+   * service-minted id otherwise — and files every record about the failure
+   * under it before sending the reply that carries it, so the ref a client
+   * receives always names the service's record of it and no record carries a
+   * peer-chosen string.
+   *
+   * @param failure The frame's failure reference holder, shared with the
+   * queue's last-resort sink in {@link enqueueFrame}.
    */
-  async function processFrame(state: ConnectionState, text: string | undefined): Promise<void> {
+  async function processFrame(
+    state: ConnectionState,
+    text: string | undefined,
+    failure: FrameFailure,
+  ): Promise<void> {
     if (state.phase !== 'authenticated' || state.clientId === undefined) {
       return;
     }
@@ -1353,19 +1950,21 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
       return;
     }
     if (text === undefined) {
-      replyError(
-        state,
-        new DebuggenError('PROTOCOL_INVALID_MESSAGE', BINARY_FRAME_MESSAGE),
-        undefined,
-      );
+      // A binary frame's bytes are never decoded, so it has no readable id.
+      const refused = new DebuggenError('PROTOCOL_INVALID_MESSAGE', BINARY_FRAME_MESSAGE);
+      const ref = resolveFailureRef(failure, undefined);
+      log.debug('refused a binary frame', { ...fieldsOf(state), code: refused.code, ref });
+      replyError(state, refused, ref);
       return;
     }
 
-    const { result, ref } = decodeFrame(text);
+    const { result, frameId } = decodeFrame(text);
     if (isErr(result)) {
+      const ref = resolveFailureRef(failure, frameId);
       log.debug('refused a frame that failed validation', {
         ...fieldsOf(state),
         code: result.error.code,
+        ref,
       });
       replyError(state, result.error, ref);
       return;
@@ -1376,20 +1975,27 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
     try {
       outcome = await route(client, message);
     } catch (cause) {
-      log.error('a WebSocket frame handler failed unexpectedly', {
-        ...fieldsOf(state),
-        type: message.type,
-        [LOG_ERROR_FIELD_KEY]: cause,
-      });
+      // Filed at `error` in the closed shape, then — for a developer at
+      // `debug` — with the redacted message and stack under the same ref the
+      // `INTERNAL` reply below carries.
+      logException(
+        'error',
+        'a WebSocket frame handler failed unexpectedly',
+        { ...fieldsOf(state), type: message.type },
+        cause,
+        resolveFailureRef(failure, message.id),
+      );
       outcome = refusal('INTERNAL', HANDLER_FAILURE_MESSAGE);
     }
     if (isErr(outcome)) {
+      const ref = resolveFailureRef(failure, message.id);
       log.debug('refused a frame', {
         ...fieldsOf(state),
         type: message.type,
         code: outcome.error.code,
+        ref,
       });
-      replyError(state, outcome.error, message.id);
+      replyError(state, outcome.error, ref);
     }
   }
 
@@ -1397,8 +2003,11 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
    * Sends protocol's `error` message to the connection that sent the frame,
    * through the registry's single-recipient path. The frame is session-less,
    * so the registry's principal filter always lets it through to its sender.
+   *
+   * @param ref The frame's failure reference, from {@link resolveFailureRef}:
+   * the reply carries exactly the ref the failure was logged under.
    */
-  function replyError(state: ConnectionState, error: DebuggenError, ref: string | undefined): void {
+  function replyError(state: ConnectionState, error: DebuggenError, ref: string): void {
     if (state.clientId === undefined) {
       return;
     }
@@ -1408,6 +2017,7 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
       log.debug('an error reply could not be delivered', {
         ...fieldsOf(state),
         code: receipt.error.code,
+        ref,
       });
     }
   }
@@ -1418,7 +2028,9 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
    * The exhaustive inbound dispatch. The switch runs over the parsed union's
    * discriminant, so each branch receives its own `MessageByType` and a message
    * type added to protocol without a branch here reaches `assertNever` with a
-   * real type and fails `tsc -b` rather than being dropped at run time.
+   * real type and fails `tsc -b` rather than being dropped at run time. Every
+   * label is protocol's `MESSAGE_TYPE` constant rather than a restated wire
+   * name; each keeps its literal type, so the narrowing is unchanged.
    */
   async function route(
     client: RegisteredClient,
@@ -1426,43 +2038,55 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
   ): Promise<Result<void, DebuggenError>> {
     const { principal } = client;
     switch (message.type) {
-      case 'client.hello':
+      case MESSAGE_TYPE.CLIENT_HELLO:
         return refusal('PROTOCOL_INVALID_MESSAGE', SECOND_HELLO_MESSAGE);
 
-      case 'agent.ready':
+      case MESSAGE_TYPE.AGENT_READY:
         return routeAgentReady(client, message);
 
-      case 'session.bind': {
+      case MESSAGE_TYPE.SESSION_BIND: {
         const allowed = requireRole(principal, ...BINDING_ROLES);
         if (isErr(allowed)) {
           return allowed;
+        }
+        const ownTab = requireAnnouncedTab(client, message.payload.tabId);
+        if (isErr(ownTab)) {
+          return ownTab;
         }
         return settled(
           await binding.handleSessionBind(message.payload, { principal, clientId: client.id }),
         );
       }
 
-      case 'tab.navigated': {
+      case MESSAGE_TYPE.TAB_NAVIGATED: {
         const allowed = requireRole(principal, ...BINDING_ROLES);
         if (isErr(allowed)) {
           return allowed;
+        }
+        const ownTab = requireAnnouncedTab(client, message.payload.tabId);
+        if (isErr(ownTab)) {
+          return ownTab;
         }
         return settled(
           await binding.handleTabNavigated(message.payload, { principal, clientId: client.id }),
         );
       }
 
-      case 'session.unbind': {
+      case MESSAGE_TYPE.SESSION_UNBIND: {
         const allowed = requireRole(principal, ...BINDING_ROLES);
         if (isErr(allowed)) {
           return allowed;
+        }
+        const ownTab = requireAnnouncedTab(client, message.payload.tabId);
+        if (isErr(ownTab)) {
+          return ownTab;
         }
         return settled(
           await binding.handleSessionUnbind(message.payload, { principal, clientId: client.id }),
         );
       }
 
-      case 'telemetry.event': {
+      case MESSAGE_TYPE.TELEMETRY_EVENT: {
         const allowed = requireRole(principal, ...TELEMETRY_FRAME_ROLES);
         if (isErr(allowed)) {
           return allowed;
@@ -1470,38 +2094,37 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
         return settled(await telemetry.handleTelemetryEventFrame({ message, client }));
       }
 
-      case 'source.open':
+      case MESSAGE_TYPE.SOURCE_OPEN:
         return routeSourceOpen(client, message);
 
-      case 'target.selected':
+      case MESSAGE_TYPE.SOURCE_RESULT:
+        return routeSourceResult(client, message);
+
+      case MESSAGE_TYPE.TARGET_SELECTED:
         return routeTargetSelected(client, message);
 
-      case 'error':
-        // Logged and dropped rather than answered: two peers that each answer
-        // an `error` with an `error` would loop forever.
-        log.debug('ignored an error frame sent by a client', {
-          clientId: client.id,
-          [LOG_BINDING_KEYS.client]: client.kind,
-          code: message.payload.code,
-        });
-        return ok(undefined);
+      case MESSAGE_TYPE.ERROR:
+        // Service → client only (AAP §0.4.2): refused like a spoofed push, and
+        // answered through `processFrame`'s reply with `ref` naming this frame.
+        // No product client ever sends one, so the reply cannot loop.
+        return refusal('PROTOCOL_INVALID_MESSAGE', CLIENT_ERROR_FRAME_MESSAGE);
 
-      case 'agent.config':
-      case 'server-agent.config':
-      case 'session.bound':
-      case 'session.created':
-      case 'session.updated':
-      case 'session.progress':
-      case 'analysis.completed':
-      case 'capture.started':
-      case 'capture.stopped':
-      case 'instrumentation.plan':
-      case 'instrumentation.ready':
-      case 'instrumentation.failed':
-      case 'telemetry.tail':
-      case 'panel.generated':
-      case 'target.request':
-      case 'cleanup.completed':
+      case MESSAGE_TYPE.AGENT_CONFIG:
+      case MESSAGE_TYPE.SERVER_AGENT_CONFIG:
+      case MESSAGE_TYPE.SESSION_BOUND:
+      case MESSAGE_TYPE.SESSION_CREATED:
+      case MESSAGE_TYPE.SESSION_UPDATED:
+      case MESSAGE_TYPE.SESSION_PROGRESS:
+      case MESSAGE_TYPE.ANALYSIS_COMPLETED:
+      case MESSAGE_TYPE.CAPTURE_STARTED:
+      case MESSAGE_TYPE.CAPTURE_STOPPED:
+      case MESSAGE_TYPE.INSTRUMENTATION_PLAN:
+      case MESSAGE_TYPE.INSTRUMENTATION_READY:
+      case MESSAGE_TYPE.INSTRUMENTATION_FAILED:
+      case MESSAGE_TYPE.TELEMETRY_TAIL:
+      case MESSAGE_TYPE.PANEL_GENERATED:
+      case MESSAGE_TYPE.TARGET_REQUEST:
+      case MESSAGE_TYPE.CLEANUP_COMPLETED:
         return refusal('PROTOCOL_INVALID_MESSAGE', SERVICE_PUSH_MESSAGE);
 
       default:
@@ -1510,16 +2133,22 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
   }
 
   /**
-   * The live binding of `sessionId`, provided the principal's own credential
-   * made it (`requireBoundSession`): the gate every DevTools action on a
-   * session passes through.
+   * The live binding of `sessionId`, provided it binds the acting tab and the
+   * principal's own credential made it (`requireBoundSession`): the gate every
+   * DevTools action on a session passes through.
+   *
+   * @param principal The connection's principal.
+   * @param sessionId The session the frame acts on.
+   * @param actingTab The tab the frame acts for ({@link actingTabOf}, or a
+   * payload's own `tabId`); `undefined` is refused.
    */
   function boundBindingFor(
     principal: Principal,
     sessionId: SessionId,
+    actingTab: number | undefined,
   ): Result<TabBindingView, DebuggenError> {
     const view = clients.bindingForSession(sessionId);
-    const bound = requireBoundSession(principal, sessionId, view);
+    const bound = requireBoundSession(principal, sessionId, view, actingTab);
     if (isErr(bound)) {
       return bound;
     }
@@ -1527,11 +2156,30 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
   }
 
   /**
+   * The live binding of the session a DevTools frame names, for the tab the
+   * frame acts for ({@link actingTabOf}).
+   */
+  function boundBindingOfFrame(
+    client: RegisteredClient,
+    message: ProtocolMessage,
+    sessionId: SessionId,
+  ): Result<TabBindingView, DebuggenError> {
+    const actingTab = actingTabOf(client, message);
+    if (isErr(actingTab)) {
+      return actingTab;
+    }
+    return boundBindingFor(client.principal, sessionId, actingTab.value);
+  }
+
+  /**
    * `agent.ready`, relayed by the service worker for a page agent. The report
-   * is accepted for a tab this connection's credential bound or one nobody has
-   * bound yet (the page may load before its panel binds it), never for a tab
-   * another credential holds; when the envelope names a session, that session
-   * must be bound by this credential to the very tab the report names.
+   * is about the tab its payload names, so that tab is the acting tab of every
+   * check: a single-tab connection may report only the tab its hello announced
+   * ({@link requireAnnouncedTab}); the report is accepted for a tab this
+   * connection's credential bound or one nobody has bound yet (the page may
+   * load before its panel binds it), never for a tab another credential holds;
+   * when the envelope names a session, that session's live binding must be
+   * this credential's binding of the very tab the report names.
    */
   async function routeAgentReady(
     client: RegisteredClient,
@@ -1543,46 +2191,95 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
       return allowed;
     }
     const { payload } = message;
+    const ownTab = requireAnnouncedTab(client, payload.tabId);
+    if (isErr(ownTab)) {
+      return ownTab;
+    }
     const tabBinding = clients.bindingForTab(payload.tabId);
     if (tabBinding !== undefined) {
-      const own = requireBoundSession(principal, tabBinding.sessionId, tabBinding);
+      const own = requireBoundSession(principal, tabBinding.sessionId, tabBinding, payload.tabId);
       if (isErr(own)) {
         return own;
       }
     }
     if (message.sessionId !== undefined) {
-      const bound = boundBindingFor(principal, message.sessionId);
+      const bound = boundBindingFor(principal, message.sessionId, payload.tabId);
       if (isErr(bound)) {
         return bound;
-      }
-      if (bound.value.tabId !== payload.tabId) {
-        return refusal('TAB_NOT_BOUND', AGENT_SESSION_TAB_MESSAGE);
       }
     }
     return settled(await readiness.agentReady(payload, client));
   }
 
-  /** `target.selected`: only for the session bound to the sender's tab. */
+  /**
+   * `target.selected`: only for the session bound to the frame's acting tab,
+   * and only for an element of the document that tab currently shows.
+   *
+   * The descriptor was assembled in the page, so its `url` is compared with
+   * the live binding's — refreshed on every committed navigation — through
+   * protocol's `compareSelectionDocument`, the same judgement the panel reads
+   * the verdict with. Anything but the same origin and path (a stale selection
+   * from a document the tab has left, a forged other origin, an unreadable
+   * URL) is refused `TAB_NOT_BOUND` before the session is touched; the query
+   * and the fragment are deliberately not compared.
+   *
+   * The binding holds its URL only in the form `./routes/binding.ts`'s
+   * `redactBoundUrl` gives it — query values masked, and the path
+   * pattern-scrubbed, so a secret-shaped path segment (a JWT, a key) is stored
+   * as `[redacted]`. The descriptor's URL is therefore put through the same
+   * redaction before the comparison: comparing the page's raw path with the
+   * stored, scrubbed one would refuse every selection of such a document as
+   * another document. Redaction is deterministic, so two raw URLs of one
+   * document still compare equal, and it keeps the origin, so another origin
+   * is still refused. Two paths that differ only in a scrubbed segment are one
+   * document here, as they are in every record the service keeps: the raw
+   * segment is never held. The log names the verdict, never a URL.
+   */
   async function routeTargetSelected(
     client: RegisteredClient,
     message: MessageByType<'target.selected'>,
   ): Promise<Result<void, DebuggenError>> {
     const { sessionId, target } = message.payload;
-    const bound = boundBindingFor(client.principal, sessionId);
+    const bound = boundBindingOfFrame(client, message, sessionId);
     if (isErr(bound)) {
       return bound;
+    }
+    const verdict = compareSelectionDocument(
+      redactBoundUrl(target.url, serializedOriginOf(target.url)),
+      bound.value.url,
+    );
+    if (verdict !== SAME_DOCUMENT_VERDICT) {
+      log.info('refused a target selection that is not of the bound tab’s current document', {
+        clientId: client.id,
+        [LOG_BINDING_KEYS.client]: client.kind,
+        [LOG_BINDING_KEYS.sessionId]: sessionId,
+        tabId: bound.value.tabId,
+        verdict,
+      });
+      return refusal('TAB_NOT_BOUND', SELECTION_DOCUMENT_MESSAGE);
     }
     return settled(await targets.selected(sessionId, target));
   }
 
   /**
-   * `source.open`: a DevTools connection only for the session bound to its tab,
-   * an editor connection within the workspace folders it announced (which the
-   * handler checks against the session's stored project root). The caller
-   * handed to the handler is composed from the principal and the live binding,
-   * never from the frame. A location that passed every check but reached no
-   * editor is answered `TRANSPORT_DISCONNECTED`, the sender's cue for the
-   * editor-link fallback.
+   * `source.open`: a DevTools connection only for the session bound to the
+   * frame's acting tab, an editor connection within the workspace folders it
+   * announced (which the handler checks against the session's stored project
+   * root). The caller handed to the handler is composed from the principal and
+   * the live binding, never from the frame.
+   *
+   * A frame refused before the handler runs — the sender's role, its tab's
+   * binding, or an `id` too long for a `source.result` `ref` (refused before
+   * anything is forwarded, so no location is ever opened without an answer) —
+   * is answered with `error`, whose sentence quotes nothing from the request.
+   * Every other request is answered with `source.result`, `ref` = this frame's
+   * `id`: `failed` when the handler refused it (see
+   * {@link answerRefusedSourceOpen}), `no-editor` at once when the
+   * location passed every check but reached no editor — the sender's cue for the
+   * editor-link fallback, and not an error — and otherwise the editors' answer
+   * once it settles. That wait is not awaited here: frames are processed
+   * strictly in order per connection, so blocking on an editor would stall
+   * every later frame of the sender, its telemetry included.
    */
   async function routeSourceOpen(
     client: RegisteredClient,
@@ -1593,27 +2290,193 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
     if (isErr(allowed)) {
       return allowed;
     }
+    // Every accepted request is answered by a `source.result` whose `ref` is
+    // this frame's id. An envelope id may be longer than a `ref` may be, and
+    // such a request could be opened but never answered — so it is refused
+    // before anything is forwarded, rather than left to its sender's deadline.
+    const answerable = parseSourceResultPayload({
+      sessionId: message.payload.sessionId,
+      ref: message.id,
+      status: 'no-editor',
+    });
+    if (isErr(answerable)) {
+      return refusal('PROTOCOL_INVALID_MESSAGE', SOURCE_OPEN_UNANSWERABLE_MESSAGE);
+    }
 
     let caller: SourceOpenCaller;
     if (principal.role === DEVTOOLS_ROLE) {
-      const bound = boundBindingFor(principal, message.payload.sessionId);
+      const bound = boundBindingOfFrame(client, message, message.payload.sessionId);
       if (isErr(bound)) {
         return bound;
       }
-      caller = { client: client.kind, tabId: bound.value.tabId, sessionId: bound.value.sessionId };
+      caller = {
+        client: client.kind,
+        tabId: bound.value.tabId,
+        sessionId: bound.value.sessionId,
+        connectionId: client.id,
+      };
     } else if (principal.role === EDITOR_ROLE) {
-      caller = { client: client.kind, projectRoots: principal.scope.workspaceFolders };
+      caller = {
+        client: client.kind,
+        projectRoots: principal.scope.workspaceFolders,
+        connectionId: client.id,
+      };
     } else {
       return refusal('UNAUTHORIZED', SOURCE_OPEN_ROLE_MESSAGE);
     }
 
     const outcome = await sourceOpen.handle(message, caller);
     if (isErr(outcome)) {
-      return outcome;
+      return answerRefusedSourceOpen(client.id, message, outcome.error);
     }
-    return outcome.value.delivered
-      ? ok(undefined)
-      : refusal('TRANSPORT_DISCONNECTED', NO_EDITOR_MESSAGE);
+    const delivery = outcome.value;
+    if (delivery.delivered) {
+      relayEditorResult(client.id, message, delivery.editorResult);
+    } else {
+      answerSourceOpen(client.id, {
+        sessionId: message.payload.sessionId,
+        ref: message.id,
+        status: 'no-editor',
+      });
+    }
+    return ok(undefined);
+  }
+
+  /**
+   * `source.result`: an editor's answer to a `source.open` the service forwarded
+   * to it. Only an editor may send one; the handler then checks that the answer
+   * names the forward's session and that this editor's announced workspace
+   * covers that session's project root. An answer for a forward that is no
+   * longer pending — a late one, after the deadline — is accepted and ignored,
+   * not refused, so the editor surfaces no notice for it.
+   */
+  async function routeSourceResult(
+    client: RegisteredClient,
+    message: MessageByType<'source.result'>,
+  ): Promise<Result<void, DebuggenError>> {
+    const { principal } = client;
+    const allowed = requireRole(principal, ...SOURCE_RESULT_ROLES);
+    if (isErr(allowed)) {
+      return allowed;
+    }
+    if (principal.role !== EDITOR_ROLE) {
+      return refusal('UNAUTHORIZED', SOURCE_RESULT_ROLE_MESSAGE);
+    }
+    const caller: SourceOpenCaller = {
+      client: client.kind,
+      projectRoots: principal.scope.workspaceFolders,
+      connectionId: client.id,
+    };
+    return settled(await sourceOpen.acceptEditorResult(message, caller));
+  }
+
+  /**
+   * Sends one `source.result` to the connection whose `source.open` it answers,
+   * through the registry's single-recipient path, whose principal filter admits
+   * it for a DevTools connection whose own credential bound the session and for
+   * an editor whose workspace covers it — exactly the senders `source.open`
+   * accepts. The frame is validated before it leaves, so a sender whose frame id
+   * is too long to be a `ref` is left to its own deadline rather than sent a
+   * frame it would refuse. Never throws; a frame that could not be built or
+   * delivered (the sender went offline meanwhile) is logged at debug.
+   *
+   * @returns Whether the answer was handed to the sender's connection.
+   */
+  function answerSourceOpen(clientId: string, payload: SourceResultPayload): boolean {
+    const fields: LogFields = { clientId, type: SOURCE_RESULT_TYPE, status: payload.status };
+    let frame: ProtocolMessage;
+    try {
+      frame = createEnvelope(SOURCE_RESULT_TYPE, payload);
+    } catch (cause) {
+      log.debug('a source.result answer could not be built', {
+        ...fields,
+        [LOG_ERROR_FIELD_KEY]: cause,
+      });
+      return false;
+    }
+    const verified = parseMessage(frame);
+    if (isErr(verified)) {
+      log.debug('a source.result answer did not validate, so it was not sent', {
+        ...fields,
+        code: verified.error.code,
+      });
+      return false;
+    }
+    const receipt = clients.sendToClient(clientId, frame);
+    if (isErr(receipt)) {
+      log.debug('a source.result answer could not be delivered', {
+        ...fields,
+        code: receipt.error.code,
+      });
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * A `source.open` the handler refused — containment, a missing file, the
+   * session's store, the editor's workspace — answered as a `failed`
+   * `source.result` under the sender's own `ref`, never as an `error` frame.
+   *
+   * The handler's sentence may quote the project-relative file the sender asked
+   * for. An `error` reply is session-less, and a Chrome service worker relays
+   * session-less frames to every panel it serves, so a refusal sent that way
+   * could surface one tab's location in another tab's panel. A `source.result`
+   * is relayed to no panel: only the request waiting on its `ref` reads it, and
+   * the panel shows fixed copy for its code. When the answer cannot be built or
+   * delivered, the refusal falls back to an `error` reply that keeps the code
+   * under a fixed sentence quoting nothing from the request.
+   */
+  function answerRefusedSourceOpen(
+    clientId: string,
+    message: MessageByType<'source.open'>,
+    error: DebuggenError,
+  ): Result<void, DebuggenError> {
+    const answered = answerSourceOpen(clientId, {
+      sessionId: message.payload.sessionId,
+      ref: message.id,
+      status: 'failed',
+      error: error.toPayload(),
+    });
+    log.debug('refused a source.open', {
+      clientId,
+      type: message.type,
+      code: error.code,
+      answeredBy: answered ? SOURCE_RESULT_TYPE : ERROR_REPLY_TYPE,
+    });
+    return answered ? ok(undefined) : refusal(error.code, SOURCE_OPEN_REFUSED_MESSAGE);
+  }
+
+  /**
+   * Relays a delivered `source.open`'s editor result to its sender once it
+   * settles, as `source.result` with the sender's own `sessionId` and `ref`.
+   * The relay is tracked until it has run, so {@link WsServer.close} can let the
+   * shutdown answers reach their senders before the sockets close.
+   */
+  function relayEditorResult(
+    clientId: string,
+    message: MessageByType<'source.open'>,
+    editorResult: Promise<SourceOpenEditorOutcome>,
+  ): void {
+    const sessionId = message.payload.sessionId;
+    const ref = message.id;
+    const relay = Promise.resolve(editorResult).then(
+      (outcome) => {
+        guarded('sourceResult', undefined, () => {
+          answerSourceOpen(clientId, { ...outcome, sessionId, ref });
+        });
+      },
+      (cause: unknown) => {
+        log.error('a source.open editor result rejected, which its port promises never to do', {
+          clientId,
+          [LOG_ERROR_FIELD_KEY]: cause,
+        });
+      },
+    );
+    sourceRelays.add(relay);
+    void relay.finally(() => {
+      sourceRelays.delete(relay);
+    });
   }
 
   /* ---- the public surface ---- */
@@ -1664,6 +2527,14 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
     }
     attached.clear();
 
+    // Every forward still awaiting an editor is settled before any socket
+    // closes, so each sender is told the service is shutting down rather than
+    // left to its own deadline, and no editor deadline outlives the server.
+    guarded('sourceClose', undefined, () => {
+      sourceOpen.close();
+    });
+    await settleWithin(Promise.all([...sourceRelays]), CLOSE_HANDSHAKE_GRACE_MS);
+
     // `ws` refuses any handshake still in flight once its server is closing.
     const serverClosed = new Promise<void>((resolve) => {
       wss.close(() => {
@@ -1701,7 +2572,7 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
 
   if (heartbeatIntervalMs > 0) {
     heartbeat = setInterval(() => {
-      guarded('the heartbeat failed unexpectedly', undefined, beat);
+      guarded('heartbeat', undefined, beat);
     }, heartbeatIntervalMs);
     heartbeat.unref();
   }

@@ -311,10 +311,16 @@ export default defineConfig<DebuggenTestOptions>({
     timeout: 60_000,
     stdout: 'pipe',
     stderr: 'pipe',
-    // SIGTERM rather than SIGKILL: the service reverts instrumentation and closes the
-    // session store on shutdown (AAP 0.5.1), and a killed service would leave patched
-    // files behind for the next run's reconciliation to clean up.
-    gracefulShutdown: { signal: 'SIGTERM', timeout: 10_000 },
+    // SIGTERM rather than SIGKILL: on SIGTERM the service ends every live session -
+    // restoring its patched files, disarming the page agent and the dev-server preload -
+    // stops the dev servers it launched, revokes their credentials and closes the session
+    // store (AAP 0.5.1); a killed service would leave patched files behind for the next
+    // run's reconciliation. The grace must outlast that whole sequence: the service bounds
+    // it to `SHUTDOWN_BUDGET.totalMs` (8 s) plus its `EXIT_BACKSTOP_MS` (0.5 s), both in
+    // apps/local-service/src/main.ts, and 12 s leaves headroom for a loaded CI runner.
+    // apps/local-service/src/main.test.ts reads this value and fails if it drops to or
+    // below the service's bound.
+    gracefulShutdown: { signal: 'SIGTERM', timeout: 12_000 },
     env: serviceEnv,
   },
 });

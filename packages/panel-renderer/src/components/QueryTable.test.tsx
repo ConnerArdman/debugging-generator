@@ -97,7 +97,11 @@ import { DataProviderContext, PanelSessionContext, createDataProvider } from '..
 import type { DataProvider, DataQueryResolver, DataQueryResponse } from '../host/DataProvider';
 import { PanelActionsContext, PanelSelectionContext } from '../host/PanelActions';
 import type { PanelActions, PanelEventRef, PanelSelection } from '../host/PanelActions';
+import { DATA_TABLE_COLUMN_TRACKS } from '../primitives/DataTable';
+import type { DataTableColumnWidth } from '../primitives/DataTable';
 import { FOCUS_KEY_ATTRIBUTE } from '../primitives/ErrorState';
+import { DESIGN_TOKENS, cssVar } from '../tokens/tokens';
+import type { TokenKey, TokenValues } from '../tokens/tokens';
 import {
   NOT_AVAILABLE_LABEL,
   formatCompactPath,
@@ -1687,68 +1691,58 @@ describe('QueryTable callers', () => {
  * Column layout
  *
  * happy-dom performs no layout, so these cases pin the INPUTS the browser lays
- * the grid out from: the track template the component hands `DataTable`, the
- * floor `DataTable` derives from it, and the `Stack` variants the caller cell is
- * built from. Every one of them was a cause of the caller chips spilling out
- * of their column over the Rows and Executions values in a real browser.
+ * the grid out from: the width role of each column the component hands
+ * `DataTable`, the token-built track template and floor `DataTable` derives
+ * from them, and the `Stack` variants the caller cell is built from. Every one
+ * of them was a cause of the caller chips spilling out of their column over the
+ * Rows and Executions values in a real browser.
  * ---------------------------------------------------------------------------
  */
 
 /**
- * The eight tracks the component declares, left to right: a `ch` floor under
- * each column's share of the spare width. See `COLUMN_TRACK` in `./QueryTable`
- * for how each floor was sized.
+ * The width role of each of the eight columns, left to right. See
+ * `COLUMN_WIDTH` in `./QueryTable` for why each column takes its role.
  */
-const COLUMN_TRACKS: readonly string[] = [
-  'minmax(32ch, 3fr)',
-  'minmax(17ch, 0.9fr)',
-  'minmax(12ch, 0.7fr)',
-  'minmax(13ch, 0.8fr)',
-  'minmax(13ch, 0.8fr)',
-  'minmax(13ch, 0.8fr)',
-  'minmax(9ch, 0.7fr)',
-  'minmax(30ch, 2fr)',
+const COLUMN_WIDTHS: readonly DataTableColumnWidth[] = [
+  'text',
+  'label',
+  'count',
+  'quantity',
+  'quantity',
+  'quantity',
+  'count',
+  'name',
 ];
 
 /**
- * A track with a positive `ch` floor and a flexible share, capturing the floor.
- * `ch` is the only unit a floor here is written in (a `px` or `rem` one would be
- * a hardcoded value, AAP 0.6.4).
+ * A reference to one of the column-geometry tokens a role track is built from.
+ * Removing every such reference from a track template must leave nothing but
+ * the `minmax()` frames and the spaces between tracks: no number and no unit is
+ * the component's own (AAP 0.6.4).
  */
-const FLOORED_TRACK_PATTERN = /^minmax\((\d+(?:\.\d+)?ch), (\d+(?:\.\d+)?)fr\)$/u;
+const COLUMN_TOKEN_REFERENCE = /var\(--dg-column-(?:min|share)-[a-z]+\)/gu;
+
+/** Every theme's token set, each of which must give every column a floor. */
+const THEMES: readonly TokenValues[] = [
+  DESIGN_TOKENS.dark,
+  DESIGN_TOKENS.light,
+  DESIGN_TOKENS.highContrast,
+];
 
 /**
- * Splits a grid track template at its top-level spaces, so the space after the
- * comma inside `minmax(12ch, 1fr)` stays inside the track it belongs to.
+ * The magnitude, in `ch`, that a role's floor token resolves to in one theme.
  *
- * @param template The value of `--dgc-columns`.
- * @returns One string per track.
+ * @param width The column's width role.
+ * @param theme The token set to resolve against.
+ * @returns The floor in `ch`, or `undefined` when the floor is no `ch` token.
  */
-function splitTracks(template: string): string[] {
-  const tracks: string[] = [];
-  let depth = 0;
-  let current = '';
+function floorChOf(width: DataTableColumnWidth, theme: TokenValues): number | undefined {
+  const { minimum } = DATA_TABLE_COLUMN_TRACKS[width];
+  const keys = Object.keys(theme) as TokenKey[];
+  const key = keys.find((candidate) => cssVar(candidate) === minimum);
+  const magnitude = key === undefined ? undefined : /^(\d+(?:\.\d+)?)ch$/u.exec(theme[key])?.[1];
 
-  for (const character of template.trim()) {
-    if (character === ' ' && depth === 0) {
-      if (current !== '') {
-        tracks.push(current);
-      }
-      current = '';
-      continue;
-    }
-    if (character === '(') {
-      depth += 1;
-    } else if (character === ')') {
-      depth -= 1;
-    }
-    current += character;
-  }
-  if (current !== '') {
-    tracks.push(current);
-  }
-
-  return tracks;
+  return magnitude === undefined ? undefined : Number(magnitude);
 }
 
 describe('QueryTable column layout', () => {
@@ -1758,31 +1752,39 @@ describe('QueryTable column layout', () => {
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
 
     const grid = await screen.findByRole('grid');
-    const tracks = splitTracks(grid.style.getPropertyValue('--dgc-columns'));
+    const template = grid.style.getPropertyValue('--dgc-columns');
 
-    // One track per column, and not one of them the floorless `minmax(0, …)` that
-    // let every column collapse to its padding and a caller chip paint over the
-    // Rows and Executions values beside it.
-    expect(tracks).toHaveLength(HEADERS.length);
-    for (const track of tracks) {
-      expect(track.startsWith('minmax(0')).toBe(false);
-      expect(track).toMatch(FLOORED_TRACK_PATTERN);
+    // One role per column, resolved to the design system's track for that role
+    // and to nothing the component sized itself.
+    expect(COLUMN_WIDTHS).toHaveLength(HEADERS.length);
+    expect(template).toBe(
+      COLUMN_WIDTHS.map((width) => DATA_TABLE_COLUMN_TRACKS[width].track).join(' '),
+    );
+    expect(template.replace(COLUMN_TOKEN_REFERENCE, '')).toMatch(/^(?:minmax\(, \)| )+$/u);
+
+    // Not one track is the floorless `minmax(0, …)` that let every column
+    // collapse to its padding and a caller chip paint over the Rows and
+    // Executions values beside it: each role's floor is a positive length in
+    // every theme.
+    expect(template).not.toContain('minmax(0');
+    for (const theme of THEMES) {
+      for (const width of COLUMN_WIDTHS) {
+        expect(floorChOf(width, theme) ?? 0, `the ${width} floor`).toBeGreaterThan(0);
+      }
     }
 
-    // The measured floors and the shares a wide panel lays out with, exactly.
-    expect(tracks).toEqual([...COLUMN_TRACKS]);
-
-    // Every floor reaches the grid's own minimum inline size, which is what
-    // turns a panel narrower than the columns need into a horizontal scroll.
-    const floors = tracks.map((track) => FLOORED_TRACK_PATTERN.exec(track)?.[1]);
-    expect(grid.style.getPropertyValue('--dgc-min-inline')).toBe(`calc(${floors.join(' + ')})`);
+    // Every column's floor reaches the grid's own minimum inline size, which is
+    // what turns a panel narrower than the columns need into a horizontal scroll.
+    expect(grid.style.getPropertyValue('--dgc-min-inline')).toBe(
+      `calc(${COLUMN_WIDTHS.map((width) => DATA_TABLE_COLUMN_TRACKS[width].minimum).join(' + ')})`,
+    );
     expect(grid.style.getPropertyValue('--dgc-column-count')).toBe(String(HEADERS.length));
 
     // The header row and every data row inherit the one template, so each
     // column sits under its own header whatever its content.
-    expect(screen.getAllByRole('columnheader')).toHaveLength(tracks.length);
+    expect(screen.getAllByRole('columnheader')).toHaveLength(COLUMN_WIDTHS.length);
     for (const row of dataRows()) {
-      expect(within(row).getAllByRole('gridcell').length + 1).toBe(tracks.length);
+      expect(within(row).getAllByRole('gridcell').length + 1).toBe(COLUMN_WIDTHS.length);
     }
   });
 

@@ -9,77 +9,153 @@
  * matched to the local app origins. Entry #1 is the prebuilt page agent
  * (`public/agent.iife.js`, `world: "MAIN"`), and Chrome injects the two in
  * declaration order, so the agent has already installed the React DevTools hook
- * and opened its inbound channel when this script is evaluated. At
- * `document_start` there is no `document.body`; nothing here touches the DOM
- * tree, creates an element or adds a style.
+ * and created its channel node when this script is evaluated — and no page
+ * script has run yet. At `document_start` there is no `document.body`; nothing
+ * here touches the DOM tree, creates an element or adds a style.
  *
  * ## The two channels it joins
  *
  * ```text
- * page agent (MAIN) --window.postMessage({source:'debuggen-agent', version, type, payload}, '/')--> bridge
- * page agent (MAIN) <--window.postMessage({source:'debuggen-bridge', version, type, token, payload}, '/')-- bridge
+ * handshake (once, on window):
+ *   bridge  --CustomEvent(PAGE_HANDSHAKE_REQUEST_EVENT)-->  agent
+ *   bridge  <--MouseEvent(PAGE_HANDSHAKE_OFFER_EVENT, { relatedTarget: node })--  agent
+ * frames (only on the agent's detached node, detail = JSON string, cancelable):
+ *   agent   --CustomEvent(PAGE_AGENT_FRAME_EVENT)-->   bridge   (preventDefault = custody taken)
+ *   agent   <--CustomEvent(PAGE_BRIDGE_FRAME_EVENT)--  bridge
  * bridge --chrome.runtime.connect({ name: PORT_CONTENT_BRIDGE })--> service worker
  *        upstream:   agent.ready · telemetry.batch · target.described · agent.error
  *        downstream: agent.config · agent.snapshot · target.request
  * ```
  *
- * Both hops carry **raw** payloads. The bridge forwards each payload by
- * reference and never reshapes, counts, redacts or schema-validates telemetry:
- * the service worker adds `tabId` from the port's `sender` and wraps event
- * batches into `@debuggen/protocol` envelopes (AAP §0.4.2), and the service
- * validates and redacts at ingest (AAP §0.5.2). The frame shapes, tags, the
- * channel version and the size cap are all imported from `../shared/messages`,
- * which mirrors `packages/telemetry/src/browser/transport.ts` — the owner of the
- * page channel — so nothing about the channel is restated here.
+ * Both hops carry **raw** payloads. The bridge parses each agent frame's JSON,
+ * validates it and forwards the parsed payload without reshaping or redacting
+ * telemetry — the one field it may raise is a batch's `droppedCount`, by the
+ * events its own rate budget refused, and the one telemetry frame it composes
+ * itself is an event-less batch reporting that loss when no agent batch will
+ * (see below): the service worker adds `tabId` from the port's `sender` and
+ * wraps event batches into `@debuggen/protocol` envelopes (AAP §0.4.2), and
+ * the service validates and redacts at ingest (AAP §0.5.2). The frame shapes,
+ * tags, event names, the channel version and the size cap are all imported
+ * from `../shared/messages`, which mirrors
+ * `packages/telemetry/src/browser/transport.ts` — the owner of the page
+ * channel — so nothing about the channel is restated here.
  *
- * ## The handshake
+ * ## Why the page hop is a private node and not `window.postMessage`
  *
- * Page channel version 2 requires every bridge → page frame to carry the
- * document's handshake token, which the agent mints and discloses over a
- * `CustomEvent`. This bridge performs its half exactly once per document:
- * register a {@link PAGE_HANDSHAKE_OFFER_EVENT} listener, then dispatch one
- * {@link PAGE_HANDSHAKE_REQUEST_EVENT}; the agent answers synchronously inside
- * that dispatch. The token lives only in this module's closure. Until one is
- * held, downstream frames cannot be delivered (the agent would drop them), so
- * they are counted and discarded instead of being posted where any page script
- * could read them.
+ * Anything posted on the page's `window` is readable by every script on the
+ * page, so a token carried on window frames stops being a secret the moment
+ * the first frame is posted, and anyone holding it can post an all-false
+ * `agent.config` that disarms a capture. Page channel version 3 therefore
+ * carries **no token and nothing on `window` after the handshake**: the agent
+ * creates a node it never inserts into the document and hands it over once,
+ * as the `relatedTarget` of its answer to this bridge's one request, while no
+ * page script has yet run. The bridge keeps the first acceptable node — an
+ * event target that is not connected to the document and is not the window —
+ * and removes its offer listener as soon as the request's dispatch returns,
+ * so a later offer is never even heard. Every frame in either direction is
+ * then a `CustomEvent` dispatched on that node, which page scripts cannot
+ * reach: they can neither observe the bridge's frames nor inject their own.
  *
- * ## Recovery, without a buffer
+ * ## What the node proves, and what it does not
  *
- * The page agent owns the only buffer (5 000 events, drop-oldest) and decides
- * whether to post or to hold from two signals this bridge sends it:
- * `bridge.ready` whenever the port becomes usable and `bridge.gone` whenever it
- * dies. A Manifest V3 worker suspends after roughly 30 s of idleness, which
+ * A frame on the node was dispatched by code that holds the node: the agent,
+ * or code that ran in the page's realm before the agent and subverted it (for
+ * example another extension's MAIN-world script). The node does not make the
+ * agent's measurements trustworthy — the page shapes what the agent observes —
+ * so the bridge still treats every frame as untrusted input:
+ * {@link shouldAcceptAgentFrame} bounds and parses it, requires the product's
+ * own vocabularies (canonical opaque ids, the closed `agent.error` codes),
+ * pins the document's `documentId` and `producerId` from the first accepted
+ * `agent.ready` and refuses any later frame that names another, and refuses a
+ * `batchSeq` that does not strictly increase within one capture. The worker
+ * re-applies the shape checks on the port and the service validates, bounds
+ * and redacts at ingest (AAP §0.5.2, §0.5.6).
+ *
+ * ## A per-document event-rate budget
+ *
+ * Every event this bridge relays reaches the service under the tab's paired
+ * credential, and the page decides how many there are: a page script calling
+ * `globalThis.__DEBUGGEN__.span` in a tight loop while a capture is armed
+ * produces genuine, well-formed batches as fast as the agent can build them.
+ * The per-frame cap bounds one frame, not a stream, so the bridge also meters
+ * `telemetry.batch` frames by the **events** they carry with a token bucket —
+ * one per bridge, which is one per document ({@link BRIDGE_EVENT_BUDGET_CAPACITY},
+ * {@link BRIDGE_EVENT_BUDGET_REFILL_PER_SECOND}, on an injectable monotonic
+ * clock). A batch that does not fit the tokens available is refused as
+ * `rate-limited` — after every structural and provenance check, so a malformed
+ * or forged frame is still reported as what it is — and acknowledged, because
+ * an unacknowledged batch parks the agent until the next `bridge.ready`.
+ * Tokens are spent only by a batch that was accepted **and** posted on the
+ * port; a refused frame, or one left in the agent's custody, spends none.
+ *
+ * The loss is reported, never hidden: the refused batch's events — and the
+ * agent's own `droppedCount` it carried, which the agent clears on that
+ * acknowledgement — are held as an unreported count, added to the
+ * `droppedCount` of the next batch actually posted, and cleared only once that
+ * post succeeded. When no later batch comes to carry it — the burst ended, or
+ * the document is going away — the bridge reports it on its own, as a
+ * loss-only `telemetry.batch`: no events, the held count as its
+ * `droppedCount`, the pinned document and producer, and the last relayed
+ * batch's position repeated rather than advanced, so it spends no budget and
+ * never puts the agent's next batch out of sequence. That report is posted
+ * {@link BRIDGE_LOSS_REPORT_DELAY_MS} after the first unreported refusal
+ * unless a batch carried the loss first; at once on a trusted `pagehide`
+ * (`isTrusted` cannot be forged by a page script's synthetic event); and at
+ * once for every refusal after that `pagehide`, until a trusted `pageshow`.
+ * With no usable port the loss stays held, and a new port re-arms the report
+ * once it has sent `bridge.ready`. The worker re-validates `droppedCount` as a
+ * safe non-negative integer, so the sum is clamped to
+ * `Number.MAX_SAFE_INTEGER`.
+ *
+ * ## Custody, without a buffer
+ *
+ * The page agent owns the only buffer (5 000 events, drop-oldest). The bridge
+ * tells it, per frame, whether custody passed: it calls `preventDefault()` on
+ * an agent frame — making the agent's `dispatchEvent` return `false` — when
+ * it posted the frame on the port, or when it refused the frame for good
+ * (retrying a frame that fails validation can only fail again). With no open
+ * port, or when `port.postMessage` throws, it does **not** acknowledge: the
+ * frame stays with the agent, which sends it again after the next
+ * `bridge.ready`. A throwing post also marks the port lost exactly as a
+ * disconnect would — except that `bridge.gone` is only ever sent from the
+ * port's `onDisconnect`, `stop()` and termination, never re-entrantly from
+ * inside the agent's own dispatch; the unacknowledged frame is the agent's
+ * signal there.
+ *
+ * ## Recovery
+ *
+ * A Manifest V3 worker suspends after roughly 30 s of idleness, which
  * disconnects this port; the bridge then reconnects with a short, bounded,
- * jittered backoff — connecting is what wakes the worker — and on every new
- * port re-announces the last `agent.ready` it relayed, so
+ * jittered backoff — connecting is what wakes the worker. On every new port it
+ * first re-announces the last accepted `agent.ready` upstream, so
  * `background/agent-control.ts` can re-send `agent.config` and the same
- * `captureId` continues. No heartbeat is ever sent over a live port: keeping
- * the worker alive is `background/ws-bridge.ts`'s job (`chrome.alarms`, AAP
- * §0.5.5), and a content-script heartbeat would defeat worker suspension on
- * every localhost tab. When the extension is reloaded or updated,
- * `chrome.runtime.id` disappears; the bridge then stops for good rather than
- * retrying into "Extension context invalidated" errors on every tab.
+ * `captureId` continues, and then dispatches `bridge.ready` to the agent. The
+ * connection state is complete before that dispatch, because the agent drains
+ * its buffer and re-announces itself synchronously inside it and every frame
+ * it sends re-enters this bridge. No heartbeat is ever sent over a live port:
+ * keeping the worker alive is `background/ws-bridge.ts`'s job
+ * (`chrome.alarms`, AAP §0.5.5), and a content-script heartbeat would defeat
+ * worker suspension on every localhost tab. When the extension is reloaded or
+ * updated, `chrome.runtime.id` disappears; the bridge then stops for good
+ * rather than retrying into "Extension context invalidated" errors on every
+ * tab.
  *
- * ## What the page-side checks are, and are not
+ * ## What is logged
  *
- * `event.source === window`, the document's own origin, the agent's source tag
- * and the exact channel version reject accidental cross-talk (iframes, other
- * windows, unrelated `postMessage` traffic, a stale agent left in a cached
- * page). They are **not** a security boundary against a hostile page: any page
- * script can post a frame tagged as the agent's. The real boundaries are the
- * worker's authenticated socket and the service's schema validation and
- * redaction at ingest (AAP §0.5.2, §0.5.6). Rejections are silent — no page
- * data is ever logged or echoed — and are visible only as counters in
- * {@link BridgeStats}.
+ * Nothing. The bridge writes no console output at all — no identifier, code,
+ * message or URL a page could have shaped — and its only observable state is
+ * the counters and closed reason names of {@link BridgeStats}.
  *
  * ## Testability
  *
  * Importing this module has no side effect except one environment-guarded
  * call at the very end ({@link bootstrapContentBridge}), which does nothing
  * outside a real content-script realm. `apps/chrome-extension/test/bridge.test.ts`
- * drives {@link shouldAcceptPageMessage} directly and {@link createContentBridge}
- * through injected `chrome.runtime`, `window`, timer, `random` and clock fakes.
+ * drives {@link shouldAcceptAgentFrame} and the pure budget arithmetic
+ * ({@link refillEventBudget}, {@link consumeEventBudget}) directly, and
+ * {@link createContentBridge} through injected `chrome.runtime`, `window`,
+ * timer, `random` and clock fakes, with a fake MAIN-world agent performing the
+ * agent's half of the handshake.
  *
  * @module apps/chrome-extension/src/content/bridge
  */
@@ -89,18 +165,18 @@ import {
   AGENT_SOURCE_TAG,
   BRIDGE_SOURCE_TAG,
   EXTENSION_CHANNEL,
-  MAX_PAGE_MESSAGE_BYTES,
+  MAX_PAGE_FRAME_LENGTH,
+  PAGE_AGENT_FRAME_EVENT,
+  PAGE_BRIDGE_FRAME_EVENT,
   PAGE_CHANNEL_VERSION,
   PAGE_HANDSHAKE_OFFER_EVENT,
   PAGE_HANDSHAKE_REQUEST_EVENT,
-  PAGE_MESSAGE_TARGET_ORIGIN,
   PORT_CONTENT_BRIDGE,
   PORT_PROTOCOL_VERSION,
-  approximatePageMessageBytes,
+  exceedsPageFrameCap,
   isAgentChannelMessage,
-  isBridgeChannelMessage,
   isBridgeDownstreamMessage,
-  isPageHandshakeToken,
+  renderPageFrame,
 } from '../shared/messages';
 import type {
   AgentChannelMessage,
@@ -109,17 +185,18 @@ import type {
   BridgeDownstreamMessage,
   BridgeUpstreamMessage,
   PageAgentReadyPayload,
+  PageTelemetryBatchPayload,
 } from '../shared/messages';
 
 /*
  * ===========================================================================
  * Structural surfaces
  *
- * The narrow slices of `chrome.runtime`, `chrome.runtime.Port` and `window`
- * this module touches. They are local on purpose — not a cross-process
- * contract — and are written so the real globals satisfy them structurally
- * (`createContentBridge({ chrome: chrome.runtime, window })` type-checks in
- * the bootstrap) while a test can pass plain fakes.
+ * The narrow slices of `chrome.runtime`, `chrome.runtime.Port`, `window` and
+ * the agent's channel node this module touches. They are local on purpose —
+ * not a cross-process contract — and are written so the real globals satisfy
+ * them structurally (`createContentBridge({ chrome: chrome.runtime, window })`
+ * type-checks in the bootstrap) while a test can pass plain fakes.
  * ===========================================================================
  */
 
@@ -163,81 +240,283 @@ export interface ChromeRuntimeLike {
   connect(connectInfo: { name: string }): PortLike;
 }
 
-/** The members of the page `window` the bridge uses. */
-export interface WindowLike {
-  /** The document's location; only `origin` is read. */
-  readonly location: { readonly origin: string };
-  /**
-   * Register an event listener. The listener receives whatever the window
-   * dispatches and narrows it structurally, which is why its parameter is
-   * `unknown` rather than `Event`.
-   */
+/**
+ * The event-target members the bridge uses on the page `window` and on the
+ * agent's channel node. Listeners receive whatever is dispatched and narrow it
+ * structurally, which is why their parameter is `unknown` rather than `Event`.
+ */
+export interface EventTargetLike {
+  /** Register an event listener. */
   addEventListener(type: string, listener: (event: unknown) => void): void;
   /** Unregister a listener registered with {@link addEventListener}. */
   removeEventListener(type: string, listener: (event: unknown) => void): void;
-  /** Post a message to this window; the bridge always targets its own origin. */
-  postMessage(message: unknown, targetOrigin: string): void;
-  /** Dispatch a DOM event on the window — used once, for the handshake request. */
+  /** Dispatch a DOM event; `false` when a listener called `preventDefault()`. */
   dispatchEvent(event: Event): boolean;
+}
+
+/**
+ * The members of the page `window` the bridge uses: the one handshake request,
+ * the offer listener around it, and the `pageshow` and `pagehide` listeners.
+ * Nothing is ever posted on it.
+ */
+export type WindowLike = EventTargetLike;
+
+/**
+ * The agent's private channel node, as the bridge holds it: an event target,
+ * never connected to the document.
+ */
+export interface ChannelNodeLike extends EventTargetLike {
+  /** `false` for a detached DOM node; absent for a non-node event target. */
+  readonly isConnected?: boolean | undefined;
+}
+
+/**
+ * Whether a handshake offer's `relatedTarget` can serve as the channel node:
+ * an event target with the three methods the bridge calls, and **not**
+ * connected to the document — a connected node is one any page script can
+ * find with a query, so frames on it would not be private. Pure; never throws
+ * for a value an event can carry.
+ *
+ * @param value The offer's `relatedTarget`.
+ */
+export function isChannelNodeCandidate(value: unknown): value is ChannelNodeLike {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    'addEventListener' in value &&
+    typeof value.addEventListener === 'function' &&
+    'removeEventListener' in value &&
+    typeof value.removeEventListener === 'function' &&
+    'dispatchEvent' in value &&
+    typeof value.dispatchEvent === 'function' &&
+    !('isConnected' in value && value.isConnected === true)
+  );
 }
 
 /*
  * ===========================================================================
- * The page → bridge filter (pure)
+ * The event-rate budget (pure)
+ *
+ * A token bucket over telemetry events, one per bridge and so one per
+ * document. The arithmetic is pure and takes the clock reading as an argument,
+ * so a test exercises refill and spending without timers; the bridge owns the
+ * single mutable level and the clock.
  * ===========================================================================
  */
 
 /**
- * Every reason the bridge drops a page `message` event, in the order the checks
- * run — cheapest first, each one short-circuiting the rest.
+ * The most events one document may relay in a burst: the bucket's capacity,
+ * and its level when the document's bridge is created.
  *
- * `malformed-payload` extends the eight reasons of the original brief: the
- * shared contract's {@link isAgentChannelMessage} checks each frame type's
- * payload fields, and the worker applies the same check again on the port, so a
- * frame that fails it is dropped here rather than relayed only to be dropped
- * there. Tests should iterate this tuple rather than a copied list.
+ * Two full agent buffers — the agent holds at most 5 000 events
+ * (`MAX_BUFFERED_EVENTS` in `packages/telemetry/src/browser/transport.ts`).
+ * The largest genuine burst is the agent draining a full buffer after the
+ * worker was suspended while the page kept producing, followed by the next
+ * buffer's worth before the bucket has refilled; both travel whole.
  */
-export const BRIDGE_DROP_REASONS = [
-  'not-window-source',
-  'origin-mismatch',
+export const BRIDGE_EVENT_BUDGET_CAPACITY = 10_000;
+
+/**
+ * The events one document may relay per second once its burst is spent: the
+ * bucket's refill rate.
+ *
+ * The demo's worst genuine sustained rate is about 200 render events per
+ * second — its 48 memoised product cards (the default catalog page) re-render
+ * on every 250 ms dispatch tick — and even its largest page (96 cards) stays
+ * under 400. 2 000 per second is ten times the default case, so a real
+ * capture never meets the limit, while a page calling
+ * `globalThis.__DEBUGGEN__.span` in a tight loop is held to a bounded rate
+ * and its loss is reported.
+ */
+export const BRIDGE_EVENT_BUDGET_REFILL_PER_SECOND = 2_000;
+
+/**
+ * How long, in milliseconds, loss held from a `rate-limited` refusal waits for
+ * a later batch to carry it before the bridge reports it on its own, as a
+ * loss-only `telemetry.batch`.
+ *
+ * Riding on the next batch costs no extra frame, and an agent still producing
+ * sends one every `FLUSH_INTERVAL_MS` (250 ms, in
+ * `packages/telemetry/src/browser/transport.ts`), so four flush intervals give
+ * it every chance to. A burst that ends with a refusal has no next batch; the
+ * timer bounds how long its loss can stay unreported. It starts at the first
+ * unreported refusal and later refusals do not push it back, so while a port
+ * is open no refused event waits longer than this for its report, even in a
+ * sustained over-budget stream. The document's end does not wait for it: a
+ * trusted `pagehide` reports at once.
+ */
+export const BRIDGE_LOSS_REPORT_DELAY_MS = 1_000;
+
+/** The bucket's level at one instant. */
+export interface EventBudget {
+  /**
+   * The events that may be relayed now: from 0 to
+   * {@link BRIDGE_EVENT_BUDGET_CAPACITY}, fractional between whole refills.
+   */
+  readonly availableEvents: number;
+  /**
+   * The monotonic clock reading, in milliseconds, the level was measured at;
+   * `undefined` until the first reading, which anchors the refill.
+   */
+  readonly measuredAt: number | undefined;
+}
+
+/** A level within `[0, capacity]`; anything non-finite counts as empty. */
+function clampBudgetLevel(level: number): number {
+  return Number.isFinite(level) ? Math.min(Math.max(level, 0), BRIDGE_EVENT_BUDGET_CAPACITY) : 0;
+}
+
+/**
+ * A full bucket not yet anchored to the clock: every document starts with its
+ * whole burst.
+ */
+export function fullEventBudget(): EventBudget {
+  return { availableEvents: BRIDGE_EVENT_BUDGET_CAPACITY, measuredAt: undefined };
+}
+
+/**
+ * The bucket's level at clock reading `at`: the events earned since it was
+ * last measured, at {@link BRIDGE_EVENT_BUDGET_REFILL_PER_SECOND}, capped at
+ * {@link BRIDGE_EVENT_BUDGET_CAPACITY}. Pure.
+ *
+ * Only forward time earns events. The first reading anchors without earning;
+ * a reading earlier than the anchor — the `Date.now` fallback stepping back —
+ * earns nothing and re-anchors, so the refill resumes from the new reading
+ * instead of waiting for the clock to catch up; a non-finite reading earns
+ * nothing and keeps the anchor.
+ *
+ * @param budget The level as last measured.
+ * @param at The monotonic clock reading, in milliseconds.
+ * @returns The level at `at`.
+ */
+export function refillEventBudget(budget: EventBudget, at: number): EventBudget {
+  const level = clampBudgetLevel(budget.availableEvents);
+  if (!Number.isFinite(at)) {
+    return { availableEvents: level, measuredAt: budget.measuredAt };
+  }
+  const elapsedMs = budget.measuredAt === undefined ? 0 : at - budget.measuredAt;
+  const earned = elapsedMs > 0 ? (elapsedMs * BRIDGE_EVENT_BUDGET_REFILL_PER_SECOND) / 1_000 : 0;
+  return { availableEvents: clampBudgetLevel(level + earned), measuredAt: at };
+}
+
+/**
+ * The bucket's level after `events` events were relayed: that many fewer,
+ * never below zero. Pure; a non-finite or negative count spends nothing.
+ *
+ * @param budget The level the batch was judged against.
+ * @param events How many events the relayed batch carried.
+ * @returns The level after spending.
+ */
+export function consumeEventBudget(budget: EventBudget, events: number): EventBudget {
+  const spent = Number.isFinite(events) && events > 0 ? events : 0;
+  return {
+    availableEvents: clampBudgetLevel(clampBudgetLevel(budget.availableEvents) - spent),
+    measuredAt: budget.measuredAt,
+  };
+}
+
+/**
+ * `a + b` for two event counts, clamped to `Number.MAX_SAFE_INTEGER` — the
+ * bound the worker's `droppedCount` guard (`isCount` in `../shared/messages`)
+ * enforces, so a sum the bridge sends upward is never refused there.
+ */
+function addEventCounts(a: number, b: number): number {
+  return Math.min(Number.MAX_SAFE_INTEGER, a + b);
+}
+
+/*
+ * ===========================================================================
+ * The agent → bridge filter (pure)
+ * ===========================================================================
+ */
+
+/**
+ * Every reason the bridge refuses an agent frame, in the order the checks run —
+ * cheapest first, each one short-circuiting the rest. A refused frame is
+ * acknowledged to the agent (it would fail again), counted, and never relayed.
+ * Tests should iterate this tuple rather than a copied list.
+ */
+export const BRIDGE_REFUSAL_REASONS = [
+  'not-string',
+  'oversize',
+  'unparseable',
   'not-object',
   'wrong-tag',
   'version-mismatch',
   'unknown-type',
   'malformed-payload',
-  'unserializable',
-  'oversize',
+  'provenance-unknown',
+  'provenance-mismatch',
+  'sequence-regression',
+  // Last: only a batch that passed every structural and provenance check is
+  // metered, so a malformed or forged frame is reported as what it is.
+  'rate-limited',
 ] as const;
 
-/** One of {@link BRIDGE_DROP_REASONS}. */
-export type BridgeDropReason = (typeof BRIDGE_DROP_REASONS)[number];
+/** One of {@link BRIDGE_REFUSAL_REASONS}. */
+export type BridgeRefusalReason = (typeof BRIDGE_REFUSAL_REASONS)[number];
 
-/** The three `MessageEvent` fields the filter reads. */
-export interface PageMessageEventLike {
-  /** The window that posted the message. */
-  readonly source: unknown;
-  /** The poster's origin, as the browser reports it. */
-  readonly origin: string;
-  /** The posted value, already structured-cloned into this world. */
-  readonly data: unknown;
+/** Every refusal reason whose verdict carries nothing but the reason. */
+type PlainRefusalReason = Exclude<BridgeRefusalReason, 'rate-limited'>;
+
+/** The document identity pinned from the first accepted `agent.ready`. */
+export interface AgentProvenance {
+  /** The agent's per-document id. */
+  readonly documentId: PageAgentReadyPayload['documentId'];
+  /** The agent's producer id, which every event of the document carries. */
+  readonly producerId: PageAgentReadyPayload['producerId'];
 }
 
-/** What the filter compares an event against. */
-export interface PageMessageContext {
-  /** The window the bridge serves: the only acceptable `event.source`. */
-  readonly window: WindowLike;
+/** The last relayed batch's position: its capture and its `batchSeq`. */
+export interface BatchSequencePosition {
+  /** The capture the batch was labelled with, or `undefined` for none. */
+  readonly captureId: PageTelemetryBatchPayload['captureId'];
+  /** The batch's sequence number within that capture. */
+  readonly batchSeq: number;
+}
+
+/** What the filter judges a frame against: the bridge's provenance and budget state. */
+export interface AgentFrameContext {
+  /** The pinned document identity; `undefined` until an `agent.ready` was accepted. */
+  readonly provenance?: AgentProvenance | undefined;
+  /** The last relayed batch's position; `undefined` until one was relayed. */
+  readonly sequence?: BatchSequencePosition | undefined;
   /**
-   * The size cap, in the agent's own unit (JSON code-unit length). Defaults to
-   * {@link MAX_PAGE_MESSAGE_BYTES}; exposed so a test can exercise the cap
-   * without building a half-megabyte frame.
+   * The size cap, in the agent's own unit (code units of the `detail` string).
+   * Defaults to {@link MAX_PAGE_FRAME_LENGTH}; exposed so a test can exercise
+   * the cap without building a half-megabyte frame.
    */
-  readonly maxBytes?: number | undefined;
+  readonly maxLength?: number | undefined;
+  /**
+   * The event-rate budget available now, already refilled to the present. A
+   * `telemetry.batch` carrying more events than `availableEvents` is refused
+   * as `rate-limited`. `undefined` judges without a budget; the bridge always
+   * passes one.
+   */
+  readonly budget?: Pick<EventBudget, 'availableEvents'> | undefined;
 }
 
-/** The filter's verdict: the accepted agent frame, or why it was dropped. */
-export type PageMessageDecision =
+/**
+ * The verdict on a batch refused for the event-rate budget: the loss the
+ * refusal causes, as counts only, so the bridge can report it upward.
+ */
+export interface RateLimitedDecision {
+  readonly accepted: false;
+  readonly reason: 'rate-limited';
+  /** The events the refused batch carried; none of them is relayed. */
+  readonly events: number;
+  /**
+   * The agent's own `droppedCount` on the refused batch. The agent clears it
+   * when the refusal is acknowledged, so the bridge must report it instead.
+   */
+  readonly droppedCount: number;
+}
+
+/** The filter's verdict: the parsed agent frame, or why it was refused. */
+export type AgentFrameDecision =
   | { readonly accepted: true; readonly message: AgentChannelMessage }
-  | { readonly accepted: false; readonly reason: BridgeDropReason };
+  | { readonly accepted: false; readonly reason: PlainRefusalReason }
+  | RateLimitedDecision;
 
 /** A plain object: not `null`, not an array. */
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -249,79 +528,175 @@ function isAgentOutboundType(value: unknown): value is AgentOutboundType {
   return typeof value === 'string' && AGENT_OUTBOUND_TYPES.some((type) => type === value);
 }
 
-/** A rejection verdict. */
-function reject(reason: BridgeDropReason): PageMessageDecision {
+/** A refusal verdict that carries only its reason. */
+function refuse(reason: PlainRefusalReason): AgentFrameDecision {
   return { accepted: false, reason };
 }
 
+/** Whether a payload names exactly the pinned document and producer. */
+function matchesProvenance(
+  pinned: AgentProvenance,
+  payload: { readonly documentId: unknown; readonly producerId: unknown },
+): boolean {
+  return payload.documentId === pinned.documentId && payload.producerId === pinned.producerId;
+}
+
 /**
- * Decide whether a page `message` event is a frame from the page agent that
- * the bridge should relay. Pure: no side effects, no logging, no `chrome`
- * access, and no exception for any input a `message` event can carry.
+ * The provenance and sequence checks for a frame that already passed the
+ * shape checks, or `undefined` when it passes them too.
+ *
+ * - `agent.ready` pins the document when nothing is pinned yet; afterwards it
+ *   must name the pinned document and producer (`provenance-mismatch`).
+ * - `telemetry.batch` needs a pinned document (`provenance-unknown`); its
+ *   `documentId`, its `producerId` and every event's `producerId` must match
+ *   it (`provenance-mismatch`); and within one `captureId` its `batchSeq` must
+ *   be strictly greater than the last relayed batch's (`sequence-regression`).
+ *   A different `captureId` — the agent restarts `batchSeq` at 0 on every
+ *   capture change — starts the sequence afresh.
+ * - `target.described` and `agent.error` carry no identity; the node they
+ *   arrived on is their provenance, and the shape checks their content.
+ */
+function provenanceRefusal(
+  message: AgentChannelMessage,
+  context: AgentFrameContext,
+): PlainRefusalReason | undefined {
+  const pinned = context.provenance;
+  switch (message.type) {
+    case 'agent.ready':
+      return pinned === undefined || matchesProvenance(pinned, message.payload)
+        ? undefined
+        : 'provenance-mismatch';
+    case 'telemetry.batch': {
+      if (pinned === undefined) {
+        return 'provenance-unknown';
+      }
+      const payload = message.payload;
+      if (
+        !matchesProvenance(pinned, payload) ||
+        payload.events.some((event) => event.producerId !== pinned.producerId)
+      ) {
+        return 'provenance-mismatch';
+      }
+      const last = context.sequence;
+      if (
+        last !== undefined &&
+        last.captureId === payload.captureId &&
+        payload.batchSeq <= last.batchSeq
+      ) {
+        return 'sequence-regression';
+      }
+      return undefined;
+    }
+    case 'target.described':
+    case 'agent.error':
+      return undefined;
+  }
+}
+
+/**
+ * The event-rate check for a frame that passed every other check, or
+ * `undefined` when it passes this one too.
+ *
+ * Only `telemetry.batch` is metered, by the events it carries: that is the
+ * volume a page can drive. `agent.ready`, `target.described` and `agent.error`
+ * are the agent's control traffic and pass unmetered. Without a budget in the
+ * context nothing is metered.
+ */
+function budgetRefusal(
+  message: AgentChannelMessage,
+  context: AgentFrameContext,
+): RateLimitedDecision | undefined {
+  const budget = context.budget;
+  if (budget === undefined || message.type !== 'telemetry.batch') {
+    return undefined;
+  }
+  const events = message.payload.events.length;
+  // Written as "fits" so that a non-finite level refuses rather than admits.
+  if (events <= budget.availableEvents) {
+    return undefined;
+  }
+  return {
+    accepted: false,
+    reason: 'rate-limited',
+    events,
+    droppedCount: message.payload.droppedCount,
+  };
+}
+
+/**
+ * Decide whether an agent frame's `detail` is a frame the bridge should relay.
+ * Pure: no side effects, no logging, no `chrome` or DOM access, and no
+ * exception for any value an event can carry.
  *
  * The checks run cheapest first and stop at the first failure:
  *
- * 1. `event.source` is the bridge's own window — rejects iframes, openers and
- *    other windows (`not-window-source`);
- * 2. `event.origin` is the document's own origin, read from the window rather
- *    than written here (`origin-mismatch`);
- * 3. the data is a non-null, non-array object (`not-object`);
- * 4. its `source` is {@link AGENT_SOURCE_TAG} — the bridge's own
- *    {@link BRIDGE_SOURCE_TAG} frames, which this window also receives, are
- *    rejected here and never loop back (`wrong-tag`);
- * 5. its `version` is exactly {@link PAGE_CHANNEL_VERSION}, so a stale agent
- *    left in a cached page is ignored rather than misread (`version-mismatch`);
- * 6. its `type` is one of {@link AGENT_OUTBOUND_TYPES} (`unknown-type`);
- * 7. its payload has that type's fields, per the shared
+ * 1. the `detail` is a string — every frame travels as JSON text
+ *    (`not-string`);
+ * 2. its length is within the cap, measured in the agent's own unit so a
+ *    frame the agent was willing to send is never refused here, and checked
+ *    before parsing so the cap also bounds the parse (`oversize`);
+ * 3. it parses as JSON (`unparseable`);
+ * 4. the value is a non-null, non-array object (`not-object`);
+ * 5. its `source` is {@link AGENT_SOURCE_TAG} (`wrong-tag`);
+ * 6. its `version` is exactly {@link PAGE_CHANNEL_VERSION}, so a stale agent
+ *    left in a cached page is ignored rather than misread
+ *    (`version-mismatch`);
+ * 7. its `type` is one of {@link AGENT_OUTBOUND_TYPES} (`unknown-type`);
+ * 8. its payload has that type's fields, canonical identifiers and, for
+ *    `agent.error`, a recognised code or loss reason, per the shared
  *    {@link isAgentChannelMessage} (`malformed-payload`);
- * 8. it can be rendered as JSON at all (`unserializable`);
- * 9. its rendering is within the cap, measured with the agent's own
- *    {@link approximatePageMessageBytes} so a frame the agent was willing to
- *    post is never refused here (`oversize`). An oversize frame is an anomaly
- *    — batch sizing is the agent's — and is dropped, never split.
+ * 9. it is consistent with the document's pinned provenance and batch
+ *    sequence (`provenance-unknown`, `provenance-mismatch`,
+ *    `sequence-regression`; see the context's fields);
+ * 10. a `telemetry.batch` carries no more events than the context's budget
+ *    holds (`rate-limited`, whose verdict also carries the batch's event
+ *    count and `droppedCount` — the loss the refusal causes).
  *
- * @param event The `message` event's `source`, `origin` and `data`.
- * @param context The bridge's window and, optionally, a smaller size cap.
- * @returns The accepted frame (the same object, by reference), or the reason
- * it was dropped.
+ * @param detail The frame event's `detail`, exactly as dispatched.
+ * @param context The pinned provenance, the last batch position, the
+ * available event budget and, optionally, a smaller size cap.
+ * @returns The parsed frame — a fresh object in this world, never a page
+ * object — or the reason it was refused.
  */
-export function shouldAcceptPageMessage(
-  event: PageMessageEventLike,
-  context: PageMessageContext,
-): PageMessageDecision {
-  if (event.source !== context.window) {
-    return reject('not-window-source');
+export function shouldAcceptAgentFrame(
+  detail: unknown,
+  context: AgentFrameContext = {},
+): AgentFrameDecision {
+  if (typeof detail !== 'string') {
+    return refuse('not-string');
   }
-  if (event.origin !== context.window.location.origin) {
-    return reject('origin-mismatch');
+  if (exceedsPageFrameCap(detail, context.maxLength ?? MAX_PAGE_FRAME_LENGTH)) {
+    return refuse('oversize');
   }
 
-  const data = event.data;
+  let data: unknown;
+  try {
+    data = JSON.parse(detail);
+  } catch {
+    return refuse('unparseable');
+  }
+
   if (!isRecord(data)) {
-    return reject('not-object');
+    return refuse('not-object');
   }
   if (data.source !== AGENT_SOURCE_TAG) {
-    return reject('wrong-tag');
+    return refuse('wrong-tag');
   }
   if (data.version !== PAGE_CHANNEL_VERSION) {
-    return reject('version-mismatch');
+    return refuse('version-mismatch');
   }
   if (!isAgentOutboundType(data.type)) {
-    return reject('unknown-type');
+    return refuse('unknown-type');
   }
   if (!isAgentChannelMessage(data)) {
-    return reject('malformed-payload');
+    return refuse('malformed-payload');
   }
 
-  const size = approximatePageMessageBytes(data);
-  if (!Number.isFinite(size)) {
-    return reject('unserializable');
+  const reason = provenanceRefusal(data, context);
+  if (reason !== undefined) {
+    return refuse(reason);
   }
-  if (size > (context.maxBytes ?? MAX_PAGE_MESSAGE_BYTES)) {
-    return reject('oversize');
-  }
-
-  return { accepted: true, message: data };
+  return budgetRefusal(data, context) ?? { accepted: true, message: data };
 }
 
 /*
@@ -402,8 +777,8 @@ export interface ContentBridgeDeps {
   /** The page `window`, or a fake with the same members. */
   readonly window: WindowLike;
   /**
-   * Schedules the reconnect timer. Defaults to `globalThis.setTimeout`, looked
-   * up at call time so test fake timers apply.
+   * Schedules the reconnect timer and the loss-report timer. Defaults to
+   * `globalThis.setTimeout`, looked up at call time so test fake timers apply.
    */
   readonly setTimeout?: ((callback: () => void, delayMs: number) => unknown) | undefined;
   /** Cancels a handle returned by {@link setTimeout}. Defaults to `globalThis.clearTimeout`. */
@@ -412,50 +787,91 @@ export interface ContentBridgeDeps {
   readonly random?: (() => number) | undefined;
   /** Clock in milliseconds, for port-stability decisions. Defaults to `Date.now`. */
   readonly now?: (() => number) | undefined;
+  /**
+   * Monotonic clock in milliseconds, for the event-rate budget's refill.
+   * Defaults to `performance.now` where the realm has it, else `Date.now`,
+   * looked up at call time. Kept apart from {@link now} so a test can hold the
+   * budget's time still while reconnect timers run, and so the budget never
+   * follows a wall clock that steps.
+   */
+  readonly monotonicNow?: (() => number) | undefined;
 }
 
-/** A snapshot of the bridge's counters and state; no page data appears in it. */
+/**
+ * A snapshot of the bridge's counters and state. Only numbers, booleans and
+ * the closed reason names of {@link BRIDGE_REFUSAL_REASONS} appear in it —
+ * never an identifier, code, message or URL from the page.
+ */
 export interface BridgeStats {
   /** Whether a port to the worker is currently open. */
   readonly connected: boolean;
-  /** Whether this document's handshake token is held. */
+  /** Whether this document's channel node is held. */
   readonly handshakeComplete: boolean;
   /** Whether the bridge stopped for good because the extension context was invalidated. */
   readonly terminated: boolean;
-  /** Agent frames posted on the port (re-announced `agent.ready` frames included). */
-  readonly forwardedUp: number;
-  /** Worker frames posted to the page. */
+  /** Agent frames posted on the port and acknowledged to the agent. */
+  readonly relayed: number;
+  /** `agent.ready` re-announcements the bridge itself posted on a new port. */
+  readonly reannounced: number;
+  /** Agent frames refused by {@link shouldAcceptAgentFrame}, per reason (each acknowledged). */
+  readonly refused: Readonly<Record<BridgeRefusalReason, number>>;
+  /**
+   * Accepted agent frames left in the agent's custody — not acknowledged —
+   * because no port was usable; the agent sends them again after `bridge.ready`.
+   */
+  readonly unclaimed: number;
+  /** Worker frames dispatched to the agent on the channel node. */
   readonly forwardedDown: number;
+  /** Of {@link forwardedDown}, the frames the agent claimed with `preventDefault()`. */
+  readonly acknowledgedDown: number;
   /** Ports opened after the first one. */
   readonly reconnects: number;
-  /** Page `message` events rejected by {@link shouldAcceptPageMessage}, per reason. */
-  readonly dropped: Readonly<Record<BridgeDropReason, number>>;
-  /** Accepted agent frames discarded because no port was open (the agent buffers instead). */
-  readonly droppedWhileDisconnected: number;
+  /** Handshake offers not taken: a node that did not qualify, or any offer after the first. */
+  readonly offersRejected: number;
   /** Port messages that were not well-formed worker → bridge frames. */
   readonly droppedDownUnrecognised: number;
-  /** Worker frames discarded because no handshake token was held to sign them with. */
-  readonly droppedDownNoHandshake: number;
-  /** The bridge's own page frames seen again by its `message` listener (not drops). */
-  readonly echoesIgnored: number;
+  /** Worker frames discarded because no channel node was held to send them on. */
+  readonly droppedDownNoChannel: number;
+  /** Worker frames discarded because they could not be rendered within the cap. */
+  readonly droppedDownUnrenderable: number;
   /** Port closures that carried a `chrome.runtime.lastError`. */
   readonly disconnectErrors: number;
   /** Unexpected exceptions caught so that none reaches the page or its console. */
   readonly faults: number;
+  /**
+   * Events in the batches refused as `rate-limited`, over the bridge's
+   * lifetime ({@link refused} counts those batches).
+   */
+  readonly rateLimitedEvents: number;
+  /**
+   * Loss not yet reported upward: the events of `rate-limited` batches plus
+   * the agent's own `droppedCount` they carried. Added to the `droppedCount`
+   * of the next batch posted on the port — or, when none comes in time or the
+   * document is hiding, posted as a loss-only batch — then zero.
+   */
+  readonly pendingDroppedCount: number;
+  /**
+   * Loss-only `telemetry.batch` frames the bridge itself posted to report held
+   * loss that no agent batch carried (see {@link BRIDGE_LOSS_REPORT_DELAY_MS}).
+   */
+  readonly lossReports: number;
+  /** Whole events the event-rate budget held when it was last measured or spent. */
+  readonly budgetAvailableEvents: number;
 }
 
 /** The handle {@link createContentBridge} returns. */
 export interface ContentBridge {
   /**
-   * Attach the page listeners, perform the handshake (once per document) and
-   * open the port. Idempotent; a no-op after {@link stop} has been followed by
-   * termination.
+   * Attach the listeners, perform the handshake (once per document) and open
+   * the port. Idempotent; a no-op after termination.
    */
   start(): void;
   /**
-   * Remove every listener, cancel any pending reconnect, disconnect the port
-   * and tell the page `bridge.gone`. Idempotent. The handshake token is kept,
-   * because the agent answers only one request per document.
+   * Remove every listener, cancel any pending reconnect and loss report,
+   * disconnect the port and tell the agent `bridge.gone`. Idempotent. The
+   * channel node is kept, because the agent answers only one handshake
+   * request per document; so is any held loss, which the next port's
+   * `bridge.ready` re-arms the report for after a restart.
    */
   stop(): void;
   /** Whether a port to the worker is currently open. */
@@ -471,36 +887,49 @@ export interface ContentBridge {
  */
 
 /** The mutable counters behind {@link BridgeStats}. */
-type MutableStats = { -readonly [Key in keyof Omit<BridgeStats, 'dropped'>]: BridgeStats[Key] } & {
-  dropped: Record<BridgeDropReason, number>;
+type MutableStats = { -readonly [Key in keyof Omit<BridgeStats, 'refused'>]: BridgeStats[Key] } & {
+  refused: Record<BridgeRefusalReason, number>;
 };
 
-/** A zeroed counter set. Written out so adding a reason without a slot fails to compile. */
+/**
+ * A fresh counter set: every counter zero, the budget full. Written out so
+ * adding a reason without a slot fails to compile.
+ */
 function emptyStats(): MutableStats {
   return {
     connected: false,
     handshakeComplete: false,
     terminated: false,
-    forwardedUp: 0,
-    forwardedDown: 0,
-    reconnects: 0,
-    dropped: {
-      'not-window-source': 0,
-      'origin-mismatch': 0,
+    relayed: 0,
+    reannounced: 0,
+    refused: {
+      'not-string': 0,
+      oversize: 0,
+      unparseable: 0,
       'not-object': 0,
       'wrong-tag': 0,
       'version-mismatch': 0,
       'unknown-type': 0,
       'malformed-payload': 0,
-      unserializable: 0,
-      oversize: 0,
+      'provenance-unknown': 0,
+      'provenance-mismatch': 0,
+      'sequence-regression': 0,
+      'rate-limited': 0,
     },
-    droppedWhileDisconnected: 0,
+    unclaimed: 0,
+    forwardedDown: 0,
+    acknowledgedDown: 0,
+    reconnects: 0,
+    offersRejected: 0,
     droppedDownUnrecognised: 0,
-    droppedDownNoHandshake: 0,
-    echoesIgnored: 0,
+    droppedDownNoChannel: 0,
+    droppedDownUnrenderable: 0,
     disconnectErrors: 0,
     faults: 0,
+    rateLimitedEvents: 0,
+    pendingDroppedCount: 0,
+    lossReports: 0,
+    budgetAvailableEvents: BRIDGE_EVENT_BUDGET_CAPACITY,
   };
 }
 
@@ -512,7 +941,7 @@ function defaultSetTimeout(callback: () => void, delayMs: number): unknown {
 /**
  * The default cancellation. Browser timer handles are numbers; any other handle
  * is left to fire, which is harmless because a stale timer callback is ignored
- * (see `scheduleReconnect`).
+ * (see `scheduleReconnect` and `scheduleLossReport`).
  */
 function defaultClearTimeout(handle: unknown): void {
   if (typeof handle === 'number') {
@@ -520,16 +949,16 @@ function defaultClearTimeout(handle: unknown): void {
   }
 }
 
-/** Read a `message` event's three fields structurally; absent fields read as nothing. */
-function readPageMessageEvent(event: unknown): PageMessageEventLike {
-  if (typeof event !== 'object' || event === null) {
-    return { source: undefined, origin: '', data: undefined };
+/**
+ * The default budget clock: `performance.now()` — monotonic, unaffected by
+ * wall-clock changes — resolved at call time, or `Date.now()` in a realm
+ * without it. Either way the budget only ever measures differences.
+ */
+function defaultMonotonicNow(): number {
+  if (typeof performance === 'object' && typeof performance.now === 'function') {
+    return performance.now();
   }
-  return {
-    source: 'source' in event ? event.source : undefined,
-    origin: 'origin' in event && typeof event.origin === 'string' ? event.origin : '',
-    data: 'data' in event ? event.data : undefined,
-  };
+  return Date.now();
 }
 
 /** A `CustomEvent`'s `detail`, read structurally. */
@@ -539,11 +968,65 @@ function readEventDetail(event: unknown): unknown {
     : undefined;
 }
 
+/** A `MouseEvent`'s `relatedTarget`, read structurally. */
+function readRelatedTarget(event: unknown): unknown {
+  return typeof event === 'object' && event !== null && 'relatedTarget' in event
+    ? event.relatedTarget
+    : undefined;
+}
+
+/** The one member of a cancelable event the bridge calls. */
+interface CancelableEventLike {
+  preventDefault(): void;
+}
+
+/** Whether an event exposes `preventDefault`, read structurally. */
+function isCancelableEvent(event: unknown): event is CancelableEventLike {
+  return (
+    typeof event === 'object' &&
+    event !== null &&
+    'preventDefault' in event &&
+    typeof event.preventDefault === 'function'
+  );
+}
+
+/**
+ * Take custody of an agent frame: `preventDefault()` makes the agent's
+ * `dispatchEvent` return `false`, which is its acknowledgement.
+ */
+function acknowledge(event: unknown): void {
+  if (isCancelableEvent(event)) {
+    event.preventDefault();
+  }
+}
+
 /** Whether a `pageshow` event reports a restore from the back/forward cache. */
 function isPersistedPageShow(event: unknown): boolean {
   return (
     typeof event === 'object' && event !== null && 'persisted' in event && event.persisted === true
   );
+}
+
+/**
+ * Whether an event was dispatched by the browser itself rather than by a
+ * script: `isTrusted` is exactly `true`. A page script can dispatch its own
+ * `pagehide` or `pageshow` on `window`, but the event it builds always has
+ * `isTrusted` `false` — the property is unforgeable, and anything a page
+ * script sets on the event object stays in the MAIN world, invisible to this
+ * isolated world. Read structurally and defensively: anything else, or a
+ * read that throws, counts as untrusted.
+ */
+function isTrustedEvent(event: unknown): boolean {
+  try {
+    return (
+      typeof event === 'object' &&
+      event !== null &&
+      'isTrusted' in event &&
+      event.isTrusted === true
+    );
+  } catch {
+    return false;
+  }
 }
 
 /** The framing fields of every upstream port frame. */
@@ -554,8 +1037,9 @@ const UPSTREAM_FRAMING = {
 } as const;
 
 /**
- * Wrap an accepted agent frame for the port: same `type`, same payload object.
- * One case per type so each payload keeps its exact type without a cast.
+ * Wrap an accepted agent frame for the port: same `type`, same (parsed)
+ * payload object. One case per type so each payload keeps its exact type
+ * without a cast.
  */
 function toUpstreamFrame(message: AgentChannelMessage): BridgeUpstreamMessage {
   switch (message.type) {
@@ -570,37 +1054,56 @@ function toUpstreamFrame(message: AgentChannelMessage): BridgeUpstreamMessage {
   }
 }
 
+/**
+ * An accepted frame with `loss` more events in its `droppedCount`: how the
+ * bridge reports what its rate budget refused, on the next batch that
+ * travels. The sum is clamped to the bound the worker's guard enforces. Any
+ * other frame, and a batch with no loss to add, is returned unchanged.
+ */
+function withReportedLoss(message: AgentChannelMessage, loss: number): AgentChannelMessage {
+  if (message.type !== 'telemetry.batch' || loss <= 0) {
+    return message;
+  }
+  return {
+    ...message,
+    payload: {
+      ...message.payload,
+      droppedCount: addEventCounts(message.payload.droppedCount, loss),
+    },
+  };
+}
+
 /** The upstream frame that re-announces a cached `agent.ready` payload. */
 function readyFrame(payload: PageAgentReadyPayload): BridgeUpstreamMessage {
   return { ...UPSTREAM_FRAMING, type: 'agent.ready', payload };
 }
 
-/** The framing fields of every bridge → page frame. */
+/** The framing fields of every bridge → agent frame. No token: the node is the privacy. */
 const PAGE_FRAMING = {
   source: BRIDGE_SOURCE_TAG,
   version: PAGE_CHANNEL_VERSION,
 } as const;
 
 /**
- * Build the page frame for a worker frame: the bridge's tag, the channel
- * version, the document's token, and the worker's payload object unchanged.
+ * Build the bridge → agent frame for a worker frame: the bridge's tag, the
+ * channel version and the worker's payload object unchanged.
  */
-function toPageFrame(message: BridgeDownstreamMessage, token: string): BridgeChannelMessage {
+function toPageFrame(message: BridgeDownstreamMessage): BridgeChannelMessage {
   switch (message.type) {
     case 'agent.config':
-      return { ...PAGE_FRAMING, type: message.type, token, payload: message.payload };
+      return { ...PAGE_FRAMING, type: message.type, payload: message.payload };
     case 'agent.snapshot':
-      return { ...PAGE_FRAMING, type: message.type, token, payload: message.payload };
+      return { ...PAGE_FRAMING, type: message.type, payload: message.payload };
     case 'target.request':
-      return { ...PAGE_FRAMING, type: message.type, token, payload: message.payload };
+      return { ...PAGE_FRAMING, type: message.type, payload: message.payload };
   }
 }
 
 /** A `bridge.ready` or `bridge.gone` signal frame; the payload is always `{}`. */
-function signalFrame(type: 'bridge.ready' | 'bridge.gone', token: string): BridgeChannelMessage {
+function signalFrame(type: 'bridge.ready' | 'bridge.gone'): BridgeChannelMessage {
   return type === 'bridge.ready'
-    ? { ...PAGE_FRAMING, type: 'bridge.ready', token, payload: {} }
-    : { ...PAGE_FRAMING, type: 'bridge.gone', token, payload: {} };
+    ? { ...PAGE_FRAMING, type: 'bridge.ready', payload: {} }
+    : { ...PAGE_FRAMING, type: 'bridge.gone', payload: {} };
 }
 
 /*
@@ -626,8 +1129,35 @@ interface PendingReconnect {
   handle: unknown;
 }
 
+/**
+ * A scheduled report of held loss. Its identity is what marks a timer
+ * callback as current, as for {@link PendingReconnect}.
+ */
+interface PendingLossReport {
+  handle: unknown;
+}
+
 /** What the page agent was last told about the port. */
 type PageSignal = 'none' | 'ready' | 'gone';
+
+/**
+ * What became of one bridge → agent frame: `claimed` (the agent called
+ * `preventDefault()`), `delivered` (dispatched, not claimed), or why it was
+ * not dispatched at all.
+ */
+type DownstreamOutcome = 'claimed' | 'delivered' | 'no-channel' | 'unrenderable' | 'failed';
+
+/** How a lost port is handled. */
+interface LossOptions {
+  /** Close the port from this side too (it has not reported its own closure). */
+  readonly closePort: boolean;
+  /**
+   * Send `bridge.gone` now. `false` inside the agent's own frame dispatch,
+   * where the unacknowledged frame already tells the agent and a re-entrant
+   * dispatch back to it must not happen.
+   */
+  readonly tellAgent: boolean;
+}
 
 /**
  * Create the relay between the page agent and the service worker. Constructing
@@ -635,41 +1165,63 @@ type PageSignal = 'none' | 'ready' | 'gone';
  *
  * Lifecycle of one document:
  *
- * - `start()` attaches the page `message` and `pageshow` listeners, performs
- *   the handshake (offer listener first, then one request — the agent answers
- *   synchronously), opens the port, posts `bridge.ready` to the page and, if an
- *   `agent.ready` was already relayed, re-announces it upstream.
- * - An accepted agent frame is posted on the port as the matching upstream
- *   frame, payload by reference. With no port open it is counted and discarded
- *   — never queued — the page is told `bridge.gone` if it has not been, and a
- *   reconnect is requested.
- * - A well-formed worker frame is posted to the page with the bridge's tag,
- *   {@link PAGE_CHANNEL_VERSION}, the document's token and the worker's
- *   payload, targeted at {@link PAGE_MESSAGE_TARGET_ORIGIN}.
+ * - `start()` attaches the `pageshow` and `pagehide` listeners, performs the
+ *   handshake (offer listener, one request — the agent answers synchronously
+ *   — offer listener removed), attaches the agent-frame listener to the node
+ *   it received, opens the port, re-announces the last accepted `agent.ready`
+ *   upstream if there is one, dispatches `bridge.ready` to the agent and, if
+ *   loss is still held once the agent has drained, arms its report.
+ * - An agent frame on the node is judged by {@link shouldAcceptAgentFrame},
+ *   against the document's provenance and its event-rate budget refilled to
+ *   the present. A refused frame is counted and acknowledged; a
+ *   `rate-limited` batch's loss is also held for the next batch posted, and a
+ *   loss-only report of it is armed for {@link BRIDGE_LOSS_REPORT_DELAY_MS}
+ *   later (or posted at once while the document is hiding). An accepted frame
+ *   is posted on the port as the matching upstream frame — a batch with any
+ *   held loss added to its `droppedCount` — and acknowledged, and only then
+ *   does a batch spend budget and clear the held loss, which also disarms the
+ *   report; with no port open, or when the post throws, it is left
+ *   unacknowledged in the agent's custody, spending nothing, a throwing port
+ *   is treated as lost, and a reconnect is scheduled — never opened inline,
+ *   because opening dispatches `bridge.ready` and this runs inside the
+ *   agent's own dispatch.
+ * - The armed report, when it fires, posts the held loss as an event-less
+ *   `telemetry.batch` of the pinned document at the last relayed position,
+ *   leaving that position, the budget and the agent's custody untouched. With
+ *   no usable port the loss stays held; the next port's `bridge.ready` re-arms
+ *   the report.
+ * - A well-formed worker frame is dispatched to the agent on the node with
+ *   the bridge's tag, {@link PAGE_CHANNEL_VERSION} and the worker's payload.
  * - When the port closes (the worker suspended, crashed or refused the
- *   connection) or a post on it throws, `chrome.runtime.lastError` is read and
- *   discarded, the page is told `bridge.gone`, and a reconnect is scheduled
- *   with {@link computeReconnectDelay}. The attempt counter resets only for a
- *   port that stayed open {@link BRIDGE_PORT_STABLE_MS} or delivered a worker
- *   frame.
- * - A `pageshow` restore from the back/forward cache opens a fresh port, since
- *   Chrome closes extension ports when it freezes a document.
+ *   connection), `chrome.runtime.lastError` is read and discarded, the agent
+ *   is told `bridge.gone`, and a reconnect is scheduled with
+ *   {@link computeReconnectDelay}. The attempt counter resets only for a port
+ *   that stayed open {@link BRIDGE_PORT_STABLE_MS} or delivered a worker frame.
+ * - A trusted `pagehide` — one the browser dispatched, never a page script's
+ *   synthetic event — marks the document as hiding and reports any held loss
+ *   at once, because no timer may fire after it; from then on every
+ *   `rate-limited` refusal is reported at once too. The agent's own
+ *   `pagehide` listener, registered before this bridge existed, flushes its
+ *   tail first, so what the budget refuses of that tail is in the report. The
+ *   port is neither closed nor released: frames the agent sends after this
+ *   listener ran must still travel, and Chrome closes the port itself when
+ *   the document goes away.
+ * - A trusted `pageshow` ends the hiding state. A `pageshow` restore from the
+ *   back/forward cache also opens a fresh port, since Chrome closes extension
+ *   ports when it freezes a document.
  * - Once `chrome.runtime.id` is gone the extension context is invalidated: the
- *   bridge tells the page `bridge.gone`, removes every listener and never
+ *   bridge tells the agent `bridge.gone` (unless it is inside the agent's own
+ *   dispatch), removes every listener, cancels its timers and never
  *   reconnects.
  *
- * `pagehide` is deliberately not handled: the agent flushes its tail on
- * `pagehide`, and a port closed at that moment would discard exactly those
- * frames. Chrome closes the port itself when the document goes away.
+ * A test harness's fake agent must answer the handshake the way the agent
+ * does: when the window dispatches {@link PAGE_HANDSHAKE_REQUEST_EVENT},
+ * dispatch {@link PAGE_HANDSHAKE_OFFER_EVENT} on the window with a
+ * `relatedTarget` that is a detached event target, then send and receive
+ * frames only on that target. Until a node is held, nothing is sent to the
+ * page.
  *
- * A test harness's fake window must answer the handshake the way the agent
- * does: when `dispatchEvent` receives an event of type
- * {@link PAGE_HANDSHAKE_REQUEST_EVENT}, call the listener registered for
- * {@link PAGE_HANDSHAKE_OFFER_EVENT} with `{ detail: token }`, where `token` is
- * 64 lowercase hexadecimal characters. Until a token is held, nothing is posted
- * to the page.
- *
- * @param deps The runtime, window, timers, jitter source and clock to use.
+ * @param deps The runtime, window, timers, jitter source and clocks to use.
  * @returns The bridge's control surface.
  */
 export function createContentBridge(deps: ContentBridgeDeps): ContentBridge {
@@ -679,8 +1231,22 @@ export function createContentBridge(deps: ContentBridgeDeps): ContentBridge {
   const clearTimer = deps.clearTimeout ?? defaultClearTimeout;
   const random = deps.random ?? ((): number => Math.random());
   const now = deps.now ?? ((): number => Date.now());
+  const monotonicNow = deps.monotonicNow ?? defaultMonotonicNow;
 
   const stats = emptyStats();
+
+  // The document's event-rate budget and the loss it caused that no posted
+  // batch has reported yet. Per bridge, so per document; kept across
+  // stop()/start() like the provenance pin.
+  let budget: EventBudget = fullEventBudget();
+  let pendingDroppedCount = 0;
+  // The one armed loss-only report of that held loss, if any.
+  let pendingLossReport: PendingLossReport | undefined;
+  // Set by a trusted `pagehide`, cleared by a trusted `pageshow`: while the
+  // document is hiding no timer can be relied on, so held loss is reported at
+  // once. Document state, so kept across stop()/start() — a stale `true` only
+  // reports sooner, never loses a count.
+  let pageHiding = false;
 
   let started = false;
   let terminated = false;
@@ -690,14 +1256,22 @@ export function createContentBridge(deps: ContentBridgeDeps): ContentBridge {
   let attempt = 0;
   let pageSignal: PageSignal = 'none';
 
-  // The handshake token: this document's secret for bridge → page frames. Held
-  // only here, never logged, never sent upstream, kept across stop()/start().
-  let token: string | undefined;
+  // The private channel: the agent's detached node. Held only here, never
+  // exposed, kept across stop()/start() because the agent answers one
+  // handshake request per document.
+  let channel: ChannelNodeLike | undefined;
   let handshakeRequested = false;
-  let offerListenerAttached = false;
+  let channelListenerAttached = false;
 
-  // The last relayed `agent.ready` payload — the only page data this module
-  // retains, and only so a new port can re-announce the document.
+  // Provenance state: the document identity pinned from the first accepted
+  // `agent.ready`, and the last relayed batch's position. Updated only after
+  // a frame is accepted (the pin) or taken into custody (the sequence), so a
+  // frame the agent must re-send is never refused as a replay of itself.
+  let provenance: AgentProvenance | undefined;
+  let sequence: BatchSequencePosition | undefined;
+
+  // The last accepted `agent.ready` payload — the only page data this module
+  // retains, in memory only, so a new port can re-announce the document.
   let lastReady: PageAgentReadyPayload | undefined;
 
   /** Whether the extension context is still alive (not reloaded, updated or removed). */
@@ -710,124 +1284,337 @@ export function createContentBridge(deps: ContentBridgeDeps): ContentBridge {
     }
   }
 
-  /* ----------------------------- page side ------------------------------ */
+  /* ----------------------------- rate budget ----------------------------- */
 
-  /** Post one frame to the page; `false` if the window refused it. */
-  function postToPage(frame: BridgeChannelMessage): boolean {
+  /** Mirror the budget's level and the held loss into the counters. */
+  function syncBudgetStats(): void {
+    stats.budgetAvailableEvents = Math.floor(budget.availableEvents);
+    stats.pendingDroppedCount = pendingDroppedCount;
+  }
+
+  /**
+   * Bring the budget to the present before a frame is judged. Committed
+   * whatever the frame's fate: refilling only moves the level to now, and
+   * spending waits for a posted batch. A clock that throws is a fault and
+   * earns nothing, so the frame is still judged — never left parked in the
+   * agent's custody by a broken clock.
+   */
+  function refillBudget(): void {
+    let at: number;
     try {
-      page.postMessage(frame, PAGE_MESSAGE_TARGET_ORIGIN);
-      return true;
+      at = monotonicNow();
     } catch {
       stats.faults += 1;
-      return false;
+      at = Number.NaN;
+    }
+    budget = refillEventBudget(budget, at);
+    syncBudgetStats();
+  }
+
+  /** Hold a `rate-limited` batch's loss until a batch is posted to report it. */
+  function holdRateLimitedLoss(decision: RateLimitedDecision): void {
+    stats.rateLimitedEvents = addEventCounts(stats.rateLimitedEvents, decision.events);
+    pendingDroppedCount = addEventCounts(
+      pendingDroppedCount,
+      addEventCounts(decision.events, decision.droppedCount),
+    );
+    syncBudgetStats();
+  }
+
+  /**
+   * Post the held loss on its own, as a loss-only upstream `telemetry.batch`:
+   * no events, the held count as its `droppedCount`, the pinned `producerId`
+   * and `documentId`, and the last relayed batch's `batchSeq` (0 before any)
+   * and `captureId` (omitted when it had none). No `sessionId`: the worker
+   * attributes by the tab's binding, and the bridge invents no page context.
+   *
+   * It is the bridge's own report, not an agent batch: it leaves `sequence`
+   * where it is, so the agent's next batch (`batchSeq` n + 1) is still in
+   * order, and carries no events, so it spends no budget. Nothing is
+   * acknowledged or taken from the agent's custody.
+   *
+   * Does nothing with no loss held, or with no document pinned — which cannot
+   * hold loss, because a batch is refused for provenance before it is ever
+   * metered. On success the loss is cleared, counted in
+   * {@link BridgeStats.lossReports} and the armed report disarmed. With no
+   * port, or a post that throws, the loss stays held: `postUp` has already
+   * arranged the reconnect, and the next port's `bridge.ready` re-arms the
+   * report.
+   */
+  function reportHeldLoss(): void {
+    const pinned = provenance;
+    const loss = pendingDroppedCount;
+    if (loss <= 0 || pinned === undefined) {
+      return;
+    }
+    const position = sequence;
+    const payload: PageTelemetryBatchPayload = {
+      events: [],
+      producerId: pinned.producerId,
+      documentId: pinned.documentId,
+      batchSeq: position?.batchSeq ?? 0,
+      droppedCount: loss,
+      ...(position?.captureId === undefined ? {} : { captureId: position.captureId }),
+    };
+    if (!postUp({ ...UPSTREAM_FRAMING, type: 'telemetry.batch', payload })) {
+      return;
+    }
+    pendingDroppedCount -= loss;
+    stats.lossReports += 1;
+    syncBudgetStats();
+    cancelLossReport();
+  }
+
+  /**
+   * Arm the one loss-only report of the held loss, to fire
+   * {@link BRIDGE_LOSS_REPORT_DELAY_MS} from now — unless one is already
+   * armed (a later refusal never postpones the report), nothing is held, or
+   * the bridge is not running.
+   */
+  function scheduleLossReport(): void {
+    if (!started || terminated || pendingLossReport !== undefined || pendingDroppedCount <= 0) {
+      return;
+    }
+    const pending: PendingLossReport = { handle: undefined };
+    pendingLossReport = pending;
+    try {
+      pending.handle = setTimer(() => {
+        // A cancelled or superseded timer that fires anyway does nothing.
+        if (pendingLossReport !== pending) {
+          return;
+        }
+        pendingLossReport = undefined;
+        try {
+          reportHeldLoss();
+        } catch {
+          stats.faults += 1;
+        }
+      }, BRIDGE_LOSS_REPORT_DELAY_MS);
+    } catch {
+      if (pendingLossReport === pending) {
+        pendingLossReport = undefined;
+      }
+      stats.faults += 1;
     }
   }
 
-  /** Tell the agent the port is usable, so it flushes and re-announces. */
-  function signalReady(): void {
-    if (token === undefined || connection === undefined) {
+  /** Disarm the armed loss-only report, if any. */
+  function cancelLossReport(): void {
+    const pending = pendingLossReport;
+    if (pending === undefined) {
       return;
     }
-    if (postToPage(signalFrame('bridge.ready', token))) {
-      pageSignal = 'ready';
+    pendingLossReport = undefined;
+    try {
+      clearTimer(pending.handle);
+    } catch {
+      stats.faults += 1;
     }
   }
 
   /**
+   * See that held loss gets reported: at once while the document is hiding,
+   * when no timer can be relied on to fire; otherwise — or when that post
+   * found no usable port — by the armed report, which a document restored
+   * from the back/forward cache still fires.
+   */
+  function arrangeLossReport(): void {
+    if (pageHiding) {
+      reportHeldLoss();
+    }
+    scheduleLossReport();
+  }
+
+  /* ------------------------------ agent side ----------------------------- */
+
+  /** Dispatch one frame to the agent on the channel node. */
+  function sendToAgent(frame: BridgeChannelMessage): DownstreamOutcome {
+    const node = channel;
+    if (node === undefined) {
+      return 'no-channel';
+    }
+    const detail = renderPageFrame(frame);
+    if (detail === undefined) {
+      return 'unrenderable';
+    }
+    try {
+      if (typeof CustomEvent !== 'function') {
+        stats.faults += 1;
+        return 'failed';
+      }
+      const unclaimed = node.dispatchEvent(
+        new CustomEvent(PAGE_BRIDGE_FRAME_EVENT, { detail, cancelable: true }),
+      );
+      return unclaimed ? 'delivered' : 'claimed';
+    } catch {
+      stats.faults += 1;
+      return 'failed';
+    }
+  }
+
+  /**
+   * Tell the agent the port is usable, so it drains and re-announces. The
+   * signal state is written before the dispatch: the agent answers inside it,
+   * and every frame it sends re-enters {@link onAgentFrame} against a
+   * connection that is already complete.
+   */
+  function signalReady(): void {
+    if (channel === undefined || connection === undefined) {
+      return;
+    }
+    pageSignal = 'ready';
+    sendToAgent(signalFrame('bridge.ready'));
+  }
+
+  /**
    * Tell the agent the port is gone, so it buffers. Sent once per absence;
-   * without a token nothing can be sent, and the agent is buffering already.
+   * without a node nothing can be sent, and the agent is buffering already.
    */
   function signalGone(): void {
     if (pageSignal === 'gone') {
       return;
     }
     pageSignal = 'gone';
-    if (token !== undefined) {
-      postToPage(signalFrame('bridge.gone', token));
-    }
+    sendToAgent(signalFrame('bridge.gone'));
   }
 
-  /** Keep the first well-formed token the agent offers; ignore every later offer. */
+  /**
+   * The offer listener, alive only for the duration of the one request
+   * dispatch. Keeps the first qualifying node; everything else is counted.
+   */
   function onHandshakeOffer(event: unknown): void {
     try {
-      const detail = readEventDetail(event);
-      if (token !== undefined || !isPageHandshakeToken(detail)) {
+      const candidate = readRelatedTarget(event);
+      if (channel !== undefined || candidate === page || !isChannelNodeCandidate(candidate)) {
+        stats.offersRejected += 1;
         return;
       }
-      token = detail;
+      channel = candidate;
       stats.handshakeComplete = true;
-      detachOfferListener();
-      // An agent evaluated after this bridge discloses its token unsolicited;
-      // if the port is already open, the agent learns about it now.
-      signalReady();
     } catch {
       stats.faults += 1;
     }
   }
 
-  function attachOfferListener(): void {
-    if (offerListenerAttached || token !== undefined) {
-      return;
-    }
-    page.addEventListener(PAGE_HANDSHAKE_OFFER_EVENT, onHandshakeOffer);
-    offerListenerAttached = true;
-  }
-
-  function detachOfferListener(): void {
-    if (!offerListenerAttached) {
-      return;
-    }
-    offerListenerAttached = false;
-    page.removeEventListener(PAGE_HANDSHAKE_OFFER_EVENT, onHandshakeOffer);
-  }
-
   /**
-   * The bridge's half of the handshake. The offer listener must exist before
-   * the request is dispatched, because the agent answers inside the dispatch.
-   * The request is made once per document: the agent answers only the first.
+   * The bridge's half of the handshake, once per document: the offer listener
+   * exists only around the request dispatch, because the agent answers inside
+   * it and nothing that arrives later may be believed.
    */
-  function requestHandshake(): void {
-    attachOfferListener();
-    if (handshakeRequested || token !== undefined) {
+  function performHandshake(): void {
+    if (handshakeRequested || channel !== undefined) {
       return;
     }
     handshakeRequested = true;
     if (typeof CustomEvent !== 'function') {
       return;
     }
-    page.dispatchEvent(new CustomEvent(PAGE_HANDSHAKE_REQUEST_EVENT));
-  }
-
-  /** Whether a rejected event is one of this bridge's own frames seen again. */
-  function isOwnEcho(data: unknown): boolean {
-    return token !== undefined && isBridgeChannelMessage(data) && data.token === token;
-  }
-
-  /** The page `message` listener: filter, then relay or count. */
-  function onPageMessage(event: unknown): void {
+    page.addEventListener(PAGE_HANDSHAKE_OFFER_EVENT, onHandshakeOffer);
     try {
-      const pageEvent = readPageMessageEvent(event);
-      const decision = shouldAcceptPageMessage(pageEvent, { window: page });
-      if (decision.accepted) {
-        relayUp(decision.message);
+      page.dispatchEvent(new CustomEvent(PAGE_HANDSHAKE_REQUEST_EVENT));
+    } finally {
+      page.removeEventListener(PAGE_HANDSHAKE_OFFER_EVENT, onHandshakeOffer);
+    }
+  }
+
+  /**
+   * The agent-frame listener on the channel node: judge, then relay and
+   * acknowledge, refuse and acknowledge, or leave in the agent's custody.
+   * Re-entrant by design — it runs inside `bridge.ready` and every other
+   * frame the bridge dispatches — so it reads the connection afresh each time
+   * and commits provenance state only for frames it accepted, and budget
+   * spending and loss reporting only for batches the port took.
+   */
+  function onAgentFrame(event: unknown): void {
+    try {
+      if (!started || terminated) {
+        stats.unclaimed += 1;
         return;
       }
-      // A window receives what it posts, so every frame this bridge sends the
-      // agent comes back here. That is not a drop, and is not counted as one.
-      if (decision.reason === 'wrong-tag' && isOwnEcho(pageEvent.data)) {
-        stats.echoesIgnored += 1;
+      refillBudget();
+      const decision = shouldAcceptAgentFrame(readEventDetail(event), {
+        provenance,
+        sequence,
+        budget,
+      });
+      if (!decision.accepted) {
+        stats.refused[decision.reason] += 1;
+        if (decision.reason === 'rate-limited') {
+          // Acknowledged like every refusal: an unacknowledged batch would
+          // park the agent until the next `bridge.ready`. Its loss is held for
+          // the next batch, and reported on its own if none carries it.
+          holdRateLimitedLoss(decision);
+          arrangeLossReport();
+        }
+        acknowledge(event);
         return;
       }
-      stats.dropped[decision.reason] += 1;
+
+      const message = decision.message;
+      if (message.type === 'agent.ready') {
+        provenance ??= {
+          documentId: message.payload.documentId,
+          producerId: message.payload.producerId,
+        };
+        lastReady = message.payload;
+      }
+
+      // Held loss rides on the next batch, and is cleared only once the port
+      // took it: a batch left with the agent reports nothing and loses nothing.
+      const reportedLoss = message.type === 'telemetry.batch' ? pendingDroppedCount : 0;
+      if (!postUp(toUpstreamFrame(withReportedLoss(message, reportedLoss)))) {
+        stats.unclaimed += 1;
+        return;
+      }
+      if (message.type === 'telemetry.batch') {
+        sequence = { captureId: message.payload.captureId, batchSeq: message.payload.batchSeq };
+        budget = consumeEventBudget(budget, message.payload.events.length);
+        pendingDroppedCount -= reportedLoss;
+        syncBudgetStats();
+        if (pendingDroppedCount === 0) {
+          // This batch carried everything held: no separate report is due.
+          cancelLossReport();
+        }
+      }
+      stats.relayed += 1;
+      acknowledge(event);
     } catch {
       stats.faults += 1;
     }
   }
 
-  /** The `pageshow` listener: a back/forward-cache restore needs a fresh port. */
+  function attachChannelListener(): void {
+    const node = channel;
+    if (node === undefined || channelListenerAttached) {
+      return;
+    }
+    node.addEventListener(PAGE_AGENT_FRAME_EVENT, onAgentFrame);
+    channelListenerAttached = true;
+  }
+
+  function detachChannelListener(): void {
+    const node = channel;
+    if (node === undefined || !channelListenerAttached) {
+      return;
+    }
+    channelListenerAttached = false;
+    node.removeEventListener(PAGE_AGENT_FRAME_EVENT, onAgentFrame);
+  }
+
+  /**
+   * The `pageshow` listener: a trusted one means the document is showing, so
+   * held loss waits for its timer again; a back/forward-cache restore also
+   * needs a fresh port.
+   */
   function onPageShow(event: unknown): void {
     try {
-      if (!started || terminated || !isPersistedPageShow(event)) {
+      if (!started || terminated) {
+        return;
+      }
+      if (isTrustedEvent(event)) {
+        pageHiding = false;
+      }
+      if (!isPersistedPageShow(event)) {
         return;
       }
       const frozen = connection;
@@ -842,54 +1629,68 @@ export function createContentBridge(deps: ContentBridgeDeps): ContentBridge {
     }
   }
 
-  function attachPageListeners(): void {
-    page.addEventListener('message', onPageMessage);
-    page.addEventListener('pageshow', onPageShow);
-  }
-
-  function detachPageListeners(): void {
+  /**
+   * The `pagehide` listener: the document is going away (or into the
+   * back/forward cache), and no timer may fire after this, so held loss is
+   * reported now and every later refusal at once. Only a trusted event
+   * counts: a page script's synthetic `pagehide` could otherwise switch the
+   * bridge into posting a frame per refusal. The port is left open — the
+   * agent may still send frames after this listener ran.
+   */
+  function onPageHide(event: unknown): void {
     try {
-      page.removeEventListener('message', onPageMessage);
-      page.removeEventListener('pageshow', onPageShow);
-      detachOfferListener();
+      if (!started || terminated || !isTrustedEvent(event)) {
+        return;
+      }
+      pageHiding = true;
+      arrangeLossReport();
     } catch {
       stats.faults += 1;
     }
   }
 
-  /* ---------------------------- worker side ----------------------------- */
-
-  /** Relay an accepted agent frame upstream, remembering the latest `agent.ready`. */
-  function relayUp(message: AgentChannelMessage): void {
-    if (message.type === 'agent.ready') {
-      lastReady = message.payload;
+  function detachListeners(): void {
+    try {
+      page.removeEventListener('pageshow', onPageShow);
+      page.removeEventListener('pagehide', onPageHide);
+      page.removeEventListener(PAGE_HANDSHAKE_OFFER_EVENT, onHandshakeOffer);
+    } catch {
+      stats.faults += 1;
     }
-    postUp(toUpstreamFrame(message));
+    try {
+      detachChannelListener();
+    } catch {
+      stats.faults += 1;
+    }
   }
 
-  /** Post one frame on the port, or count it as lost if there is no usable port. */
-  function postUp(frame: BridgeUpstreamMessage): void {
+  /* ----------------------------- worker side ----------------------------- */
+
+  /**
+   * Post one frame on the port. `false` — the frame is not in the bridge's
+   * custody — when there is no port or the post throws; a throwing port is
+   * lost from here on, without a re-entrant `bridge.gone`.
+   */
+  function postUp(frame: BridgeUpstreamMessage): boolean {
     const current = connection;
     if (current === undefined) {
-      stats.droppedWhileDisconnected += 1;
-      signalGone();
-      if (pendingReconnect === undefined) {
-        openPort();
-      }
-      return;
+      // A reconnect is already pending after any loss; this only re-arms one
+      // if scheduling failed. Never opened inline (see onAgentFrame).
+      scheduleReconnect();
+      return false;
     }
     try {
       current.port.postMessage(frame);
-      stats.forwardedUp += 1;
+      return true;
     } catch {
       // "Attempting to use a disconnected port object": the same as a
       // disconnect that has not been reported yet.
-      stats.droppedWhileDisconnected += 1;
-      loseConnection(current, true);
+      loseConnection(current, { closePort: true, tellAgent: false });
+      return false;
     }
   }
 
-  /** Deliver a worker frame to the page, if it is one and the page can verify it. */
+  /** Deliver a worker frame to the agent, if it is one and a channel node is held. */
   function handlePortMessage(source: Connection, message: unknown): void {
     try {
       if (connection !== source) {
@@ -901,12 +1702,24 @@ export function createContentBridge(deps: ContentBridgeDeps): ContentBridge {
       }
       // The worker answered, so it is reachable: the backoff starts over.
       attempt = 0;
-      if (token === undefined) {
-        stats.droppedDownNoHandshake += 1;
-        return;
-      }
-      if (postToPage(toPageFrame(message, token))) {
-        stats.forwardedDown += 1;
+      const outcome = sendToAgent(toPageFrame(message));
+      switch (outcome) {
+        case 'claimed':
+          stats.forwardedDown += 1;
+          stats.acknowledgedDown += 1;
+          break;
+        case 'delivered':
+          stats.forwardedDown += 1;
+          break;
+        case 'no-channel':
+          stats.droppedDownNoChannel += 1;
+          break;
+        case 'unrenderable':
+          stats.droppedDownUnrenderable += 1;
+          break;
+        case 'failed':
+          // Already counted as a fault where it happened.
+          break;
       }
     } catch {
       stats.faults += 1;
@@ -926,7 +1739,7 @@ export function createContentBridge(deps: ContentBridgeDeps): ContentBridge {
     } catch {
       stats.faults += 1;
     }
-    loseConnection(lost, false);
+    loseConnection(lost, { closePort: false, tellAgent: true });
   }
 
   /** Forget a connection: remove its listeners and, if asked, close the port. */
@@ -951,19 +1764,24 @@ export function createContentBridge(deps: ContentBridgeDeps): ContentBridge {
     }
   }
 
-  /** The current port died: tell the page, then reconnect or terminate. */
-  function loseConnection(lost: Connection, closePort: boolean): void {
+  /** The current port died: tell the agent if allowed, then reconnect or terminate. */
+  function loseConnection(lost: Connection, options: LossOptions): void {
     if (connection !== lost) {
       return;
     }
-    releaseConnection(lost, closePort);
+    releaseConnection(lost, options.closePort);
     if (!isContextAlive()) {
-      terminate();
+      terminate(options.tellAgent);
       return;
     }
-    signalGone();
+    // The backoff decision precedes the signal: the agent may answer
+    // `bridge.gone` with frames, and an unclaimed frame re-arms the reconnect
+    // with whatever attempt count is current at that moment.
     if (now() - lost.openedAt >= BRIDGE_PORT_STABLE_MS) {
       attempt = 0;
+    }
+    if (options.tellAgent) {
+      signalGone();
     }
     scheduleReconnect();
   }
@@ -975,7 +1793,7 @@ export function createContentBridge(deps: ContentBridgeDeps): ContentBridge {
     }
     cancelReconnect();
     if (!isContextAlive()) {
-      terminate();
+      terminate(true);
       return;
     }
 
@@ -987,7 +1805,7 @@ export function createContentBridge(deps: ContentBridgeDeps): ContentBridge {
       if (isContextAlive()) {
         scheduleReconnect();
       } else {
-        terminate();
+        terminate(true);
       }
       return;
     }
@@ -1020,13 +1838,23 @@ export function createContentBridge(deps: ContentBridgeDeps): ContentBridge {
     }
     everConnected = true;
 
-    signalReady();
-    // Re-announce the document on the new port, so the worker can re-send the
-    // live `agent.config` and the same capture continues (AAP §0.5.5). The
-    // worker deduplicates by `documentId` and `producerId`.
-    if (lastReady !== undefined) {
-      postUp(readyFrame(lastReady));
+    // Re-announce the document on the new port before the agent drains, so
+    // the worker knows the document ahead of its batches and can re-send the
+    // live `agent.config`; the same capture continues (AAP §0.5.5). The
+    // worker deduplicates by `documentId` and `producerId`, so the agent's own
+    // re-announcement inside `bridge.ready` is harmless.
+    const ready = lastReady;
+    if (ready !== undefined) {
+      if (!postUp(readyFrame(ready))) {
+        // The port died at once; postUp marked it lost and a retry is scheduled.
+        return;
+      }
+      stats.reannounced += 1;
     }
+    signalReady();
+    // The agent has drained inside `bridge.ready`; loss that no batch of its
+    // carried — held while no port was usable — is not stranded.
+    arrangeLossReport();
   }
 
   /** Schedule one reconnect with backoff, unless one is pending or pointless. */
@@ -1069,38 +1897,60 @@ export function createContentBridge(deps: ContentBridgeDeps): ContentBridge {
     }
   }
 
-  /** Stop for good: the extension context is gone and can never come back. */
-  function terminate(): void {
+  /**
+   * Stop for good: the extension context is gone and can never come back.
+   *
+   * @param tellAgent Whether `bridge.gone` may be dispatched now — `false`
+   * inside the agent's own frame dispatch.
+   */
+  function terminate(tellAgent: boolean): void {
     if (terminated) {
       return;
     }
     terminated = true;
     stats.terminated = true;
     cancelReconnect();
+    cancelLossReport();
     const current = connection;
     if (current !== undefined) {
       releaseConnection(current, true);
     }
-    signalGone();
-    detachPageListeners();
+    if (tellAgent) {
+      signalGone();
+    }
+    detachListeners();
     started = false;
   }
 
-  /* ---------------------------- control surface ------------------------- */
+  /* ---------------------------- control surface -------------------------- */
 
   function start(): void {
     if (started || terminated) {
       return;
     }
     if (!isContextAlive()) {
-      terminate();
+      terminate(true);
       return;
     }
     started = true;
     attempt = 0;
     try {
-      attachPageListeners();
-      requestHandshake();
+      page.addEventListener('pageshow', onPageShow);
+    } catch {
+      stats.faults += 1;
+    }
+    try {
+      page.addEventListener('pagehide', onPageHide);
+    } catch {
+      stats.faults += 1;
+    }
+    try {
+      performHandshake();
+    } catch {
+      stats.faults += 1;
+    }
+    try {
+      attachChannelListener();
     } catch {
       stats.faults += 1;
     }
@@ -1113,19 +1963,20 @@ export function createContentBridge(deps: ContentBridgeDeps): ContentBridge {
     }
     started = false;
     cancelReconnect();
+    cancelLossReport();
     const current = connection;
     if (current !== undefined) {
       releaseConnection(current, true);
     }
     signalGone();
-    detachPageListeners();
+    detachListeners();
   }
 
   return {
     start,
     stop,
     isConnected: (): boolean => connection !== undefined,
-    getStats: (): BridgeStats => ({ ...stats, dropped: { ...stats.dropped } }),
+    getStats: (): BridgeStats => ({ ...stats, refused: { ...stats.refused } }),
   };
 }
 

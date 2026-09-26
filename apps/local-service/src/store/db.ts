@@ -39,8 +39,12 @@
  *
  * 1. an inline string the caller hands in ({@link LoadSchemaSqlOptions.inlineDdl}),
  *    which is the packaged-extension path: `apps/vscode-extension/esbuild.mjs`
- *    inlines the DDL at build time, so the installed bundle performs **no
- *    filesystem read at all**;
+ *    substitutes the text of `./schema.sql` for the build-time identifier
+ *    `__DEBUGGEN_EMBEDDED_SCHEMA_SQL__` (esbuild `define`), {@link embeddedSchemaSql}
+ *    returns that string, and `src/main.ts` `main()` hands it over as
+ *    `startService({ inlineSchemaSql })` → `openStore({ inlineDdl })`. The
+ *    installed bundle therefore performs **no filesystem read at all** for its
+ *    DDL, and the extension ships no `.sql` file;
  * 2. `new URL('./schema.sql', import.meta.url)` — the development path, where
  *    this module's URL is `src/store/db.ts` and the DDL sits beside it;
  * 3. `new URL('./store/schema.sql', import.meta.url)` — the bundled path, where
@@ -52,7 +56,10 @@
  * `__dirname`, `require.resolve` or a bundler-specific asset import, none of
  * which survives all three layouts — and their relative specifiers are exported
  * as {@link SCHEMA_SQL_CANDIDATES} so a suite can assert the probe order
- * without restating the strings.
+ * without restating the strings. Every run that is not the extension's bundle
+ * — `tsx`, Vitest, this workspace's own tsup build — leaves the build-time
+ * identifier undeclared, so {@link embeddedSchemaSql} answers `undefined` and
+ * the filesystem probe runs.
  *
  * ## The pragmas, and why each one is here
  *
@@ -252,12 +259,13 @@ export const STORE_PRAGMAS: readonly string[] = Object.freeze([
  * The relative specifiers {@link loadSchemaSql} probes, in probe order, each
  * resolved against `import.meta.url`.
  *
- * Exported for the suites and the packaged-extension smoke test, which assert
- * the order rather than duplicating the strings:
- * `'./schema.sql'` is the development layout (this module is
+ * Exported for the suites, which assert the order rather than duplicating the
+ * strings: `'./schema.sql'` is the development layout (this module is
  * `src/store/db.ts`), `'./store/schema.sql'` is the bundled layout (this module
  * has become `dist/main.js`, beside the copy `tsup.config.ts` places at
- * `dist/store/schema.sql`).
+ * `dist/store/schema.sql`). The packaged editor extension probes neither — its
+ * DDL is inlined ({@link embeddedSchemaSql}) — so no packaged-extension test
+ * relies on these paths.
  */
 export const SCHEMA_SQL_CANDIDATES: readonly string[] = Object.freeze([
   './schema.sql',
@@ -461,15 +469,53 @@ function isInMemory(path: string): boolean {
  * The DDL loader
  * ---------------------------------------------------------------------------------------------- */
 
+/**
+ * The store's DDL, substituted at build time by the editor extension's bundler.
+ *
+ * A contract with `apps/vscode-extension/esbuild.mjs` (its
+ * `EMBEDDED_SCHEMA_SQL_IDENTIFIER`): that build `define`s this identifier as
+ * the JSON string literal of `./schema.sql`, so inside
+ * `dist/service/main.js` every reference is the DDL text itself and the
+ * `typeof` guard in {@link embeddedSchemaSql} folds to `true`. Nothing declares
+ * it at run time anywhere else — not `tsx`, not Vitest, not this workspace's
+ * own tsup build — so there the identifier is undeclared, `typeof` answers
+ * `'undefined'` without throwing, and the filesystem probe runs. Renaming it
+ * means renaming it in both files; the extension's build fails when the
+ * identifier survives in its bundle.
+ */
+declare const __DEBUGGEN_EMBEDDED_SCHEMA_SQL__: string | undefined;
+
+/**
+ * The DDL the editor extension's bundler embedded in this build, if any.
+ *
+ * `src/main.ts` passes the answer to `startService({ inlineSchemaSql })`,
+ * which forwards it to {@link openStore} as `inlineDdl`, so the packaged
+ * service migrates from the embedded text and never looks for a file.
+ *
+ * @returns The embedded DDL in the extension's service bundle; `undefined` in
+ * every other build, where {@link loadSchemaSql} probes the filesystem.
+ *
+ * @example
+ * ```ts
+ * const store = openStore({ config, logger, inlineDdl: embeddedSchemaSql() });
+ * ```
+ */
+export function embeddedSchemaSql(): string | undefined {
+  return typeof __DEBUGGEN_EMBEDDED_SCHEMA_SQL__ === 'string'
+    ? __DEBUGGEN_EMBEDDED_SCHEMA_SQL__
+    : undefined;
+}
+
 /** Inputs to {@link loadSchemaSql}. */
 export interface LoadSchemaSqlOptions {
   /**
    * The DDL text, supplied directly by a caller that already has it.
    *
    * This is the packaged-extension route: the editor extension's bundler inlines
-   * `./schema.sql` at build time and hands the string over, so the installed
-   * service reads no file and needs no asset beside its bundle. Supplying it
-   * short-circuits the filesystem probe entirely.
+   * `./schema.sql` at build time ({@link embeddedSchemaSql}) and `src/main.ts`
+   * hands the string over, so the installed service reads no file and needs no
+   * asset beside its bundle. Supplying it short-circuits the filesystem probe
+   * entirely.
    *
    * Declared `| undefined` explicitly so a caller assembling options from its
    * own optional configuration can pass the property straight through — this
@@ -508,7 +554,7 @@ export interface LoadSchemaSqlOptions {
  *
  * @example The packaged editor extension, which reads no file
  * ```ts
- * const ddl = loadSchemaSql({ inlineDdl: INLINED_SCHEMA_SQL });
+ * const ddl = loadSchemaSql({ inlineDdl: embeddedSchemaSql() });
  * ```
  */
 export function loadSchemaSql(options: LoadSchemaSqlOptions = {}): Result<string, DebuggenError> {

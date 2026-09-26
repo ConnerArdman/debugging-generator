@@ -51,7 +51,9 @@
  * - `schema` — `kinds` (the closed `kind`, `tier` and `status` vocabularies and
  *   the kind→tier rule), `attributes` (the kind-specific attribute keys, the
  *   render phase and trigger vocabularies, the metric ids and units, the
- *   preview/size bounds for captured props and state) and `event` (the
+ *   preview/size bounds for captured props and state), `clock-offset` (the
+ *   bound, HTTP `Date` parser and interval estimator behind each producer's
+ *   informational `clockOffsetMs`) and `event` (the
  *   `TelemetryEventIngress` schema every producer sends and the persisted
  *   `TelemetryEvent` schema the store assigns `sessionId`, `captureId` and
  *   `ingestSeq` to, with their parsers and guards).
@@ -94,6 +96,7 @@
 // ---------------------------------------------------------------------------
 export * from './schema/kinds.js';
 export * from './schema/attributes.js';
+export * from './schema/clock-offset.js';
 export * from './schema/event.js';
 
 // ---------------------------------------------------------------------------

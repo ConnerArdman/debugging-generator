@@ -135,9 +135,9 @@
  * style" that this file was first written against, and it is kept as narrow as the problem: the
  * coordinates are two UNITLESS `--dgc-*` numbers written on the bubble's own style - the same
  * sanctioned channel `./DataTable` uses for its geometry, consumed by `../styles/components.css`
- * through the unit bridge - and nothing else is. No colour, length, gap or stacking value is
- * written here: the gap to the trigger is the placement variant's margin in the stylesheet, which
- * this file reads back rather than restates.
+ * through the unit bridge, which takes the unit from the `--dg-pixel-unit` token - and nothing
+ * else is. No colour, length, gap or stacking value is written here: the gap to the trigger is the
+ * placement variant's margin in the stylesheet, which this file reads back rather than restates.
  *
  * ## The styling contract this file declares for ../styles/components.css
  *
@@ -157,9 +157,11 @@
  *                            `hidden` attribute (and `dg-visually-hidden`) instead
  *
  *   --dgc-tooltip-block      the open bubble's block-start offset from the viewport, UNITLESS
- *   --dgc-tooltip-inline     its inline-start offset from the viewport, UNITLESS; both consumed as
- *                            `calc(var(--dgc-tooltip-…, 0) * 1px)` and already corrected for the
- *                            placement margin, so the border box lands where it was computed
+ *   --dgc-tooltip-inline     its inline-start offset from the viewport, UNITLESS; both measured in
+ *                            CSS pixels, consumed as
+ *                            `calc(var(--dgc-tooltip-…, 0) * var(--dg-pixel-unit))` and already
+ *                            corrected for the placement margin, so the border box lands where it
+ *                            was computed
  *
  * A placement variant is written on the wrapper for the component's whole life and on the bubble
  * for as long as it is mounted, so an offset rule may hang off the wrapper or off the bubble -

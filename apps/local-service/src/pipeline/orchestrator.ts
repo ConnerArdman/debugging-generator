@@ -20,7 +20,10 @@
  * by every stage of a run, the prompt versions recorded on the session, and the
  * rule of AAP §0.5.5 that **a failure is never presented as a successful
  * analysis**: the session reaches `generated` only through the state machine's
- * guarded edge, with the validated analysis and the validated panel in hand.
+ * guarded edge, with the validated analysis and the validated panel in hand and
+ * both mirrored onto the session record (`analyses`, `panelIds`), which is what
+ * both user interfaces render and a reopened session replays. A mirror that
+ * cannot be stored is a failure of the stage that produced the artifact.
  *
  * ## Operations and status choreography
  *
@@ -43,6 +46,19 @@
  * transition, so the stages are handed a progress view whose `stageFailed`
  * records the failure instead of sending it, and installs are asked not to
  * report their own failure row (`reportStageFailure: false`).
+ *
+ * ## Code-index handle lifetime
+ *
+ * An operation that needs the project's code loads its handles through the
+ * {@link CodeIndexPort} once and shares them with every stage it runs. The
+ * session then **holds** them, so its later operations — a capture's analysis,
+ * a follow-up — reuse the same ts-morph program instead of parsing the project
+ * again. A project's handles are invalidated as soon as nothing uses them: when
+ * the last session holding them is released through
+ * {@link PipelineOrchestrator.releaseSession} (the `session.end` route calls it
+ * once the session has ended) and no operation in flight still reads them. A
+ * cancelled operation drops its session's hold the same way, and
+ * {@link PipelineOrchestrator.dispose} releases everything still loaded.
  *
  * ## What is deliberately not repeated here
  *
@@ -108,12 +124,14 @@ import type {
   ReadinessVerdict,
 } from '../instrumentation/readiness.js';
 import type {
+  ArmCaptureOutcome,
   InstallRequest,
   InstrumentationOutcome,
   InstrumentationService,
 } from '../instrumentation/service.js';
 import { sessionLogger, subsystemLogger } from '../logging.js';
 import type { PanelGenerator } from '../panels/generate.js';
+import { placeFollowUpAttempt } from '../sessions/manager.js';
 import type { SessionBroadcaster, SessionManager, SessionPatch } from '../sessions/manager.js';
 import { PROGRESS_STAGE_TITLES } from '../sessions/progress.js';
 import type { SessionProgress } from '../sessions/progress.js';
@@ -528,6 +546,13 @@ export interface FollowUpRequest {
   readonly sessionId: string;
   /** The follow-up question, verbatim; passed to the follow-up stage untouched. */
   readonly question: string;
+  /**
+   * The identity of this ask (protocol's `followUpAttemptIdSchema`): a fresh
+   * id for a new follow-up, the failed attempt's own id to retry it in place.
+   * An id naming an answered follow-up, or one a later follow-up followed, is
+   * refused before anything runs (`SessionManager`'s `placeFollowUpAttempt`).
+   */
+  readonly attemptId: string;
   /** Cancels the follow-up. */
   readonly signal?: AbortSignal | undefined;
 }
@@ -579,7 +604,10 @@ export interface PipelineOrchestrator {
   /**
    * Closes the capture window, then — when it holds evidence — analyses it and
    * generates the panel, ending at `generated`. Also resumes a session left at
-   * `analyzing` or `failed` after its capture was stopped.
+   * `analyzing` or `failed` after its capture was stopped. A completion that
+   * fails while the window stays open — the store refused the stop, and the
+   * move to `failed` with it — arms the window's producers again, so the
+   * capture keeps collecting until it is stopped.
    */
   completeCapture(
     request: CaptureCompleteRequest,
@@ -612,9 +640,35 @@ export interface PipelineOrchestrator {
   activeRun(sessionId: string): PipelineStageKey | undefined;
 
   /**
+   * Releases what the orchestrator keeps for a session between its
+   * operations: its hold on the project's code-index handles, its remembered
+   * readiness verdict, a pending re-gate and a recorded stage failure. The
+   * handles — the ts-morph program above all — are invalidated once no other
+   * live session holds them and no operation in flight reads them; an
+   * operation of this session still in flight keeps them until it settles,
+   * and releases them itself then.
+   *
+   * Called once the session has ended (the `session.end` route), so an idle
+   * service keeps no ts-morph program for a session nobody can act on.
+   * Idempotent; an unknown id is a no-op, and so is a call after
+   * {@link dispose}.
+   *
+   * @param sessionId The ended session.
+   *
+   * @example
+   * ```ts
+   * const ended = await manager.end(sessionId);
+   * if (ended.ok) {
+   *   pipeline.releaseSession(sessionId);
+   * }
+   * ```
+   */
+  releaseSession(sessionId: string): void;
+
+  /**
    * Aborts every in-flight operation, waits for each to settle, and releases
-   * the code-index handles loaded for them. Idempotent; later calls to the
-   * four operations are refused.
+   * every code-index handle still loaded. Idempotent; later calls to the
+   * operations are refused.
    */
   dispose(): Promise<void>;
 }
@@ -643,7 +697,10 @@ const INDEX_FAILED_LOG = 'Code index could not be loaded for a pipeline run.';
  * The handles of up to `maxProjects` projects stay in memory, least recently
  * used evicted first, so the capture and follow-up operations of a session
  * reuse the program its run loaded instead of parsing the project again.
- * `invalidate` drops a project's handles; nothing else holds them.
+ * `invalidate` drops a project's handles; nothing else holds them. The
+ * orchestrator invalidates a project once no live session holds it
+ * ({@link PipelineOrchestrator.releaseSession}), so the bound caps what stays
+ * resident while sessions are live, not what lingers after they end.
  *
  * @param options The configuration, logger and memory bound.
  * @returns The loader.
@@ -986,9 +1043,18 @@ const FAIL_TRANSITION_LOG =
 /** Warn record of a progress row that could not be sent. Fields: stage, error code. */
 const PROGRESS_ROW_LOG = 'A pipeline progress row could not be sent; the operation continues.';
 
-/** Warn record of a record mirror that could not be stored. Fields: field, error code. */
+/**
+ * Warn record of a record mirror that could not be stored. Fields: field, error
+ * code. An `analyses` or `panelIds` mirror failure is then filed as a failure
+ * of its stage (a `STAGE_FAILED_LOG` record follows); a `modifications` one is
+ * not, because the modification journal is what cleanup restores from.
+ */
 const MIRROR_FAILED_LOG =
-  'A pipeline artifact could not be mirrored onto the session record; its own store holds it.';
+  'A pipeline artifact could not be mirrored onto the session record; its own store still holds it.';
+
+/** Warn record of an index port whose `invalidate` threw. Fields: error code. */
+const CODE_RELEASE_FAILED_LOG =
+  'The code-index handles of a project could not be released; the loader keeps them until it evicts them.';
 
 /** Warn record of prompt versions that could not be stored or read. Fields: error code. */
 const PROMPT_VERSIONS_LOG = 'The prompt versions of a pipeline run could not be recorded.';
@@ -1000,6 +1066,20 @@ const OBSERVE_READINESS_LOG =
 /** Warn record of a readiness re-evaluation that failed. Fields: error code. */
 const REEVALUATE_READINESS_LOG =
   'Readiness could not be re-evaluated at capture time; the install verdict is used.';
+
+/**
+ * Info record of a capture window whose completion failed while it stayed open,
+ * and whose producers were armed again. Fields: capture id, preload delivery.
+ */
+const CAPTURE_REARMED_LOG =
+  'The capture could not be completed and its window is still open; its producers were armed again.';
+
+/**
+ * Warn record of a capture window left open by a failed completion whose
+ * producers could not be armed again. Fields: capture id, error code.
+ */
+const CAPTURE_REARM_FAILED_LOG =
+  'The capture could not be completed and its window is still open, but its producers could not be armed again.';
 
 /** Info record of a finished operation. Fields: operation, status, timing. */
 const OPERATION_COMPLETED_LOG = 'Pipeline operation completed.';
@@ -1019,6 +1099,9 @@ const INSTRUMENTING_STATUS = statusOrThrow(INSTRUMENT_STAGE);
 
 /** The status analysis and panel generation run under, from the state machine's table. */
 const ANALYZING_STATUS = statusOrThrow(ANALYZE_STAGE);
+
+/** The status an open capture window runs under, from the state machine's table. */
+const CAPTURING_STATUS = statusOrThrow(CAPTURE_STAGE);
 
 /** The stage each follow-up path enters first; checked exhaustive over `FollowUpPath`. */
 const FOLLOW_UP_PATH_STAGE = Object.freeze({
@@ -1042,6 +1125,13 @@ interface ActiveOperation {
   readonly startedAt: number;
   /** The project whose code handles the operation loaded, if it loaded any. */
   projectRoot: string | undefined;
+  /**
+   * Whether {@link PipelineOrchestrator.releaseSession} released the session
+   * while this operation was in flight. The operation then drops the session's
+   * hold on the handles it loaded, and the session's remaining state, when it
+   * settles.
+   */
+  sessionReleased: boolean;
   /**
    * Whether the operation has moved the session's status. Before it has, a
    * refusal is returned unchanged and nothing is filed as a failure.
@@ -1078,7 +1168,7 @@ interface RecordedPromptVersions {
  * const planned = await pipeline.run({ sessionId });
  * const armed = await pipeline.beginCapture({ sessionId });
  * const analysed = await pipeline.completeCapture({ sessionId });
- * const answered = await pipeline.followUp({ sessionId, question });
+ * const answered = await pipeline.followUp({ sessionId, question, attemptId });
  * ```
  */
 export function createPipelineOrchestrator(deps: PipelineOrchestratorDeps): PipelineOrchestrator {
@@ -1101,6 +1191,13 @@ export function createPipelineOrchestrator(deps: PipelineOrchestratorDeps): Pipe
   const verdicts = new Map<string, ReadinessVerdict>();
   /** The project roots whose code handles an operation loaded. */
   const loadedRoots = new Set<string>();
+  /**
+   * The project root whose code handles each live session holds between its
+   * operations: recorded when one of its operations loads them, dropped by
+   * {@link releaseSession}, by a cancellation and by {@link dispose}. A root
+   * that no session holds and no operation in flight uses is invalidated.
+   */
+  const holders = new Map<string, string>();
   let disposed = false;
   let disposing: Promise<void> | undefined;
 
@@ -1141,13 +1238,17 @@ export function createPipelineOrchestrator(deps: PipelineOrchestratorDeps): Pipe
   /**
    * The installer the plan and follow-up stages are handed: the service's own,
    * asked not to emit the instrument stage's `failed` row, because the session
-   * manager emits it when the failure moves the session to `failed`.
+   * manager emits it when the failure moves the session to `failed`. Its
+   * `restoreArming` is the follow-up stage's compensation seam: an installed
+   * delta that cannot be kept returns the arming state to the previous version.
    */
-  const quietInstaller: Pick<InstrumentationService, 'buildContext' | 'install'> = Object.freeze({
-    buildContext: (input) => instrumentation.buildContext(input),
-    install: (request: InstallRequest) =>
-      instrumentation.install({ ...request, reportStageFailure: false }),
-  } satisfies Pick<InstrumentationService, 'buildContext' | 'install'>);
+  const quietInstaller: Pick<InstrumentationService, 'buildContext' | 'install' | 'restoreArming'> =
+    Object.freeze({
+      buildContext: (input) => instrumentation.buildContext(input),
+      install: (request: InstallRequest) =>
+        instrumentation.install({ ...request, reportStageFailure: false }),
+      restoreArming: (input) => instrumentation.restoreArming(input),
+    } satisfies Pick<InstrumentationService, 'buildContext' | 'install' | 'restoreArming'>);
 
   /** The default stages, built on first use. */
   const built: { -readonly [K in keyof PipelineStages]?: PipelineStages[K] } = {};
@@ -1221,7 +1322,6 @@ export function createPipelineOrchestrator(deps: PipelineOrchestratorDeps): Pipe
         contextBuilder: deps.contextBuilder,
         provider: deps.provider,
         summarizer: deps.summarizer,
-        facts: deps.facts,
         // The existing-evidence path's analysis emits its own `analyze` group:
         // the follow-up stage emits none for that step.
         analysisRegeneration: createAnalyzeStage({
@@ -1376,7 +1476,13 @@ export function createPipelineOrchestrator(deps: PipelineOrchestratorDeps): Pipe
     return failStage(op, stage, error);
   }
 
-  /** Loads the project's code handles through the index port, for the whole operation. */
+  /**
+   * Loads the project's code handles through the index port, for the whole
+   * operation, and records the session's hold on them so its next operation
+   * reuses them. A hold recorded for a session released while this operation
+   * was in flight is dropped again when the operation settles (see
+   * {@link execute}).
+   */
   async function loadCode(
     op: ActiveOperation,
     projectRoot: string,
@@ -1388,19 +1494,43 @@ export function createPipelineOrchestrator(deps: PipelineOrchestratorDeps): Pipe
     );
     if (loadedCode.ok) {
       loadedRoots.add(op.projectRoot);
+      holders.set(op.sessionId, op.projectRoot);
     }
     return loadedCode;
   }
 
-  /** Releases a project's code handles unless another operation in flight still uses them. */
+  /**
+   * Releases a project's code handles unless something still uses them: an
+   * operation in flight that loaded them, or a live session that holds them.
+   */
   function releaseCode(projectRoot: string): void {
     for (const other of active.values()) {
       if (other.projectRoot === projectRoot) {
         return;
       }
     }
+    for (const held of holders.values()) {
+      if (held === projectRoot) {
+        return;
+      }
+    }
+    invalidateCode(projectRoot);
+  }
+
+  /**
+   * Drops a project's handles from the index port. The port is contracted not
+   * to throw; one that does is logged by code and never fails the operation
+   * settling, the session route or the shutdown that asked.
+   */
+  function invalidateCode(projectRoot: string): void {
     loadedRoots.delete(projectRoot);
-    codeIndex.invalidate?.(projectRoot);
+    try {
+      codeIndex.invalidate?.(projectRoot);
+    } catch (thrown) {
+      log.warn(CODE_RELEASE_FAILED_LOG, {
+        code: DebuggenError.from(thrown, 'CODE_INDEX_FAILED').code,
+      });
+    }
   }
 
   /**
@@ -1461,6 +1591,58 @@ export function createPipelineOrchestrator(deps: PipelineOrchestratorDeps): Pipe
     };
   }
 
+  /**
+   * Arms both producers again for a capture window that a failed completion
+   * left open.
+   *
+   * The capture stage returns the page agent and the preload to dormant
+   * *before* the session manager closes the window, because the window must
+   * still be live while they disarm. The manager commits that closure and the
+   * session's next status together, so a stop the store refuses — followed by
+   * a move to `failed` it refuses too — leaves the session `capturing`, its
+   * window open and its project still owned by it, with nothing collecting the
+   * evidence that window exists for. It is still the session's live capture,
+   * so its producers are armed again for the same capture id, and the
+   * developer can keep reproducing and stop again.
+   *
+   * Nothing is armed once the session has left `capturing` — its window closed
+   * with that move — or when the record shows no open window. Arming edits no
+   * file; the instrumentation service refuses a window the project's owner
+   * does not hold. The outcome is logged by capture id and code only and never
+   * changes the failure the operation reports.
+   */
+  function rearmOpenWindow(op: ActiveOperation): void {
+    const current = readSession(op.sessionId);
+    if (!current.ok || current.value.status !== CAPTURING_STATUS) {
+      return;
+    }
+    const session = current.value;
+    const open = session.captures.findLast((capture) => capture.stoppedAt === undefined);
+    if (open === undefined) {
+      return;
+    }
+    const plan = session.plans.find((candidate) => candidate.planVersion === open.planVersion);
+    let armed: Result<ArmCaptureOutcome, DebuggenError>;
+    try {
+      armed = instrumentation.armCapture({
+        sessionId: session.id,
+        captureId: open.id,
+        projectRoot: normalizePosix(session.projectRoot),
+        ...(plan !== undefined ? { plan } : {}),
+      });
+    } catch (thrown) {
+      armed = err(DebuggenError.from(thrown, 'INTERNAL'));
+    }
+    if (armed.ok) {
+      op.log.info(CAPTURE_REARMED_LOG, {
+        captureId: open.id,
+        serverAgent: armed.value.serverAgent,
+      });
+    } else {
+      op.log.warn(CAPTURE_REARM_FAILED_LOG, { captureId: open.id, code: armed.error.code });
+    }
+  }
+
   /** Whether the session still has instrumentation installed: arming state here, or an open record. */
   function hasLiveInstrumentation(session: SessionRecord): boolean {
     return (
@@ -1496,51 +1678,82 @@ export function createPipelineOrchestrator(deps: PipelineOrchestratorDeps): Pipe
 
   /**
    * Mirrors an artifact onto the session record (`modifications`, `analyses`,
-   * `panelIds`), which both user interfaces render. The artifact's own store
-   * is authoritative, so a mirror that cannot be written is logged, not fatal.
+   * `panelIds`), which both user interfaces render and a reopened session is
+   * replayed from.
+   *
+   * @returns `Ok` once the record holds the artifact — including when it
+   * already did, so a resumed operation mirrors nothing twice — or the
+   * store's `Err` when the record could not be read or patched. Either failure
+   * is logged with the field and the error code only; what it means for the
+   * operation is the caller's decision (see {@link mirrorAnalysis},
+   * {@link mirrorPanel} and {@link mirrorModifications}).
    */
   async function mirror(
     op: ActiveOperation,
     field: keyof SessionPatch,
     build: (session: SessionRecord) => SessionPatch | undefined,
-  ): Promise<void> {
+  ): Promise<Result<void, DebuggenError>> {
     const session = readSession(op.sessionId);
     if (!session.ok) {
       op.log.warn(MIRROR_FAILED_LOG, { field, code: session.error.code });
-      return;
+      return err(session.error);
     }
     const patch = build(session.value);
     if (patch === undefined) {
-      return;
+      return ok(undefined);
     }
     const patched = await settle(() => sessions.patch(op.sessionId, patch));
     if (!patched.ok) {
       op.log.warn(MIRROR_FAILED_LOG, { field, code: patched.error.code });
+      return err(patched.error);
     }
+    return ok(undefined);
   }
 
-  /** Mirrors the records an install applied onto `session.modifications`. */
-  function mirrorModifications(
+  /**
+   * Mirrors the records an install applied onto `session.modifications`.
+   * **Best-effort**: the modification journal (`../store/modifications-repo.ts`)
+   * is authoritative — cleanup and start-up reconciliation restore from it,
+   * never from this mirror — so a mirror that cannot be written is logged by
+   * {@link mirror} and the operation continues.
+   */
+  async function mirrorModifications(
     op: ActiveOperation,
     applied: readonly ModificationRecord[],
   ): Promise<void> {
-    return mirror(op, 'modifications', (session) =>
+    await mirror(op, 'modifications', (session) =>
       applied.length === 0
         ? undefined
         : { modifications: mergeModifications(session.modifications, applied) },
     );
   }
 
-  /** Mirrors a stored analysis onto `session.analyses`. */
-  function mirrorAnalysis(op: ActiveOperation, analysis: AnalysisResult): Promise<void> {
+  /**
+   * Mirrors a stored analysis onto `session.analyses`. **Required** before the
+   * session may reach `generated`: a record claiming `generated` without its
+   * analysis would be replayed on reopen as a result it does not hold (AAP
+   * §0.5.5), so the caller files an `Err` as a failure of the analyze stage.
+   */
+  function mirrorAnalysis(
+    op: ActiveOperation,
+    analysis: AnalysisResult,
+  ): Promise<Result<void, DebuggenError>> {
     return mirror(op, 'analyses', (session) => {
       const analyses = appendUnique(session.analyses, analysis, (item) => item.id);
       return analyses === session.analyses ? undefined : { analyses };
     });
   }
 
-  /** Mirrors a stored panel's id onto `session.panelIds`. */
-  function mirrorPanel(op: ActiveOperation, panel: Pick<PanelSpec, 'id'>): Promise<void> {
+  /**
+   * Mirrors a stored panel's id onto `session.panelIds`. **Required** before
+   * the session may reach `generated`, for the same reason as
+   * {@link mirrorAnalysis}; the caller files an `Err` as a failure of the
+   * generate-panel stage.
+   */
+  function mirrorPanel(
+    op: ActiveOperation,
+    panel: Pick<PanelSpec, 'id'>,
+  ): Promise<Result<void, DebuggenError>> {
     return mirror(op, 'panelIds', (session) => {
       const panelIds = appendUnique(session.panelIds, panel.id, (item) => item);
       return panelIds === session.panelIds ? undefined : { panelIds };
@@ -1665,6 +1878,7 @@ export function createPipelineOrchestrator(deps: PipelineOrchestratorDeps): Pipe
       log: sessionLogger(log, sessionId),
       startedAt: clock(),
       projectRoot: undefined,
+      sessionReleased: false,
       statusChanged: false,
       reported: {},
     };
@@ -1691,7 +1905,12 @@ export function createPipelineOrchestrator(deps: PipelineOrchestratorDeps): Pipe
           active.delete(sessionId);
         }
         recordedFailures.delete(sessionId);
-        if (pendingRegates.delete(sessionId) && !disposed) {
+        if (op.sessionReleased) {
+          // The session was released (it ended) while this operation ran:
+          // nothing more is kept for it, and no re-gate is owed.
+          verdicts.delete(sessionId);
+          pendingRegates.delete(sessionId);
+        } else if (pendingRegates.delete(sessionId) && !disposed) {
           // After this operation has fully released the session.
           queueMicrotask(() => {
             void regate({ sessionId }).then((outcome) => {
@@ -1701,8 +1920,15 @@ export function createPipelineOrchestrator(deps: PipelineOrchestratorDeps): Pipe
             });
           });
         }
-        if (controller.signal.aborted && op.projectRoot !== undefined) {
-          releaseCode(op.projectRoot);
+        // A live session keeps the handles for its next operation. A cancelled
+        // operation, or one whose session was released while it ran, drops the
+        // session's hold instead; the handles go once nothing else uses them.
+        const root = op.projectRoot;
+        if (root !== undefined && (controller.signal.aborted || op.sessionReleased)) {
+          if (holders.get(sessionId) === root) {
+            holders.delete(sessionId);
+          }
+          releaseCode(root);
         }
       }
     })();
@@ -2029,7 +2255,10 @@ export function createPipelineOrchestrator(deps: PipelineOrchestratorDeps): Pipe
           if (after.ok && after.value.status !== session.status) {
             op.statusChanged = true;
           }
-          return refuseOrFail(op, CAPTURE_STAGE, completed.error);
+          const refused = await refuseOrFail(op, CAPTURE_STAGE, completed.error);
+          // A window the failure left open is still the session's live capture.
+          rearmOpenWindow(op);
+          return refused;
         }
         op.statusChanged = true;
         const { captureId, summary, emptiness } = completed.value;
@@ -2079,7 +2308,12 @@ export function createPipelineOrchestrator(deps: PipelineOrchestratorDeps): Pipe
         sendRow(op, ANALYZE_STAGE, () => progress.stageCompleted(sessionId, ANALYZE_STAGE));
         const { analysis } = analysed.value;
         op.reported.analyze = analysed.value.promptVersion;
-        await mirrorAnalysis(op, analysis);
+        // The record must hold the analysis before anything is presented from
+        // it: a mirror that cannot be stored fails the stage (AAP §0.5.5).
+        const analysisMirrored = await mirrorAnalysis(op, analysis);
+        if (!analysisMirrored.ok) {
+          return failStage(op, ANALYZE_STAGE, analysisMirrored.error);
+        }
 
         // Stage 6 — panel generation, delegated to `../panels/generate.ts`, which
         // validates, falls back, stores and broadcasts `panel.generated` itself.
@@ -2101,10 +2335,14 @@ export function createPipelineOrchestrator(deps: PipelineOrchestratorDeps): Pipe
         );
         const { panel } = generated.value;
         op.reported['generate-panel'] = generated.value.promptVersion;
-        await mirrorPanel(op, panel);
+        const panelMirrored = await mirrorPanel(op, panel);
+        if (!panelMirrored.ok) {
+          return failStage(op, GENERATE_PANEL_STAGE, panelMirrored.error);
+        }
 
-        // The guarded edge: both validated artifacts in hand. A fallback panel is
-        // a validated panel, so it satisfies the guard; its flag travels on.
+        // The guarded edge: both validated artifacts in hand and on the record.
+        // A fallback panel is a validated panel, so it satisfies the guard; its
+        // flag travels on.
         const done = await reachGenerated(op, analysis, panel);
         if (!done.ok) {
           return done;
@@ -2180,6 +2418,15 @@ export function createPipelineOrchestrator(deps: PipelineOrchestratorDeps): Pipe
             return refusal;
           }
         }
+        // The idempotency gate of `session.question`: an attempt that was
+        // answered, or that a later follow-up followed, is refused here —
+        // inside this session's single flight, before any stage, progress row
+        // or status change — so a duplicate runs nothing and files no failure.
+        const placement = placeFollowUpAttempt(sessionId, session.followUps, request.attemptId);
+        if (!placement.ok) {
+          op.log.info(REFUSED_LOG, { operation: op.operation, code: placement.error.code });
+          return placement;
+        }
 
         op.stage = FOLLOW_UP_STAGE;
         op.log.info(STAGE_STARTED_LOG, { stage: FOLLOW_UP_STAGE });
@@ -2198,6 +2445,7 @@ export function createPipelineOrchestrator(deps: PipelineOrchestratorDeps): Pipe
           (context) =>
             stages.followUp().run(context, {
               followUpQuestion: request.question,
+              attemptId: request.attemptId,
               ...(readiness !== undefined ? { readiness } : {}),
               onPathChosen: (path) => enterStage(op, FOLLOW_UP_PATH_STAGE[path]),
               beforeInstall: () => enterStage(op, INSTRUMENT_STAGE),
@@ -2211,11 +2459,18 @@ export function createPipelineOrchestrator(deps: PipelineOrchestratorDeps): Pipe
 
         if (outcome.path === 'existing-evidence') {
           // `generated → analyzing → generated`: both artifacts are new versions
-          // drawn from the stored capture; no file was touched.
+          // drawn from the stored capture; no file was touched. Both must be on
+          // the record before the guarded edge, exactly as after a capture.
           op.reported.analyze = outcome.analysisPromptVersion;
           op.reported['generate-panel'] = outcome.panelPromptVersion;
-          await mirrorAnalysis(op, outcome.analysis);
-          await mirrorPanel(op, outcome.panel);
+          const analysisMirrored = await mirrorAnalysis(op, outcome.analysis);
+          if (!analysisMirrored.ok) {
+            return failStage(op, ANALYZE_STAGE, analysisMirrored.error);
+          }
+          const panelMirrored = await mirrorPanel(op, outcome.panel);
+          if (!panelMirrored.ok) {
+            return failStage(op, GENERATE_PANEL_STAGE, panelMirrored.error);
+          }
           const done = await reachGenerated(op, outcome.analysis, outcome.panel);
           if (!done.ok) {
             return done;
@@ -2278,6 +2533,24 @@ export function createPipelineOrchestrator(deps: PipelineOrchestratorDeps): Pipe
     return active.get(sessionId)?.stage;
   }
 
+  function releaseSession(sessionId: string): void {
+    const inFlight = active.get(sessionId);
+    if (inFlight === undefined) {
+      verdicts.delete(sessionId);
+      pendingRegates.delete(sessionId);
+      recordedFailures.delete(sessionId);
+    } else {
+      // The operation still reads this state; it clears it, and releases the
+      // handles it loaded, when it settles (see `execute`).
+      inFlight.sessionReleased = true;
+    }
+    const root = holders.get(sessionId);
+    if (root !== undefined) {
+      holders.delete(sessionId);
+      releaseCode(root);
+    }
+  }
+
   function dispose(): Promise<void> {
     if (disposing !== undefined) {
       return disposing;
@@ -2288,8 +2561,9 @@ export function createPipelineOrchestrator(deps: PipelineOrchestratorDeps): Pipe
     }
     disposing = (async () => {
       await Promise.allSettled([...settling]);
-      for (const root of loadedRoots) {
-        codeIndex.invalidate?.(root);
+      holders.clear();
+      for (const root of [...loadedRoots]) {
+        invalidateCode(root);
       }
       loadedRoots.clear();
       verdicts.clear();
@@ -2306,6 +2580,7 @@ export function createPipelineOrchestrator(deps: PipelineOrchestratorDeps): Pipe
     regate,
     cancel,
     activeRun,
+    releaseSession,
     dispose,
   });
 }

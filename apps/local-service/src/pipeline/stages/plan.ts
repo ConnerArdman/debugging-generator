@@ -21,10 +21,14 @@
  *
  * Step 1 is `generateStructuredWithRepair`, the one repair loop in the product.
  * Steps 2–4 are {@link gateInstrumentationPlan}. A failure in step 2 or 3 is a
- * **product defect, never the model's fault**: it is logged at `error` with the
- * parsed input (the single record AAP §0.5.3 sanctions carrying a value) and the
- * plan is rejected without a re-prompt. This file adds no second repair loop, no
- * retry and no fallback beyond the one below.
+ * **product defect, never the model's fault**: it is logged at `error` and the
+ * plan is rejected without a re-prompt. The record describes the parsed input
+ * by its closed shape ({@link authoredPlanShape}: counts and action types) plus
+ * the failing field path and issue paths — never the input itself, whose
+ * objective, hypotheses and rationales are free model prose that may carry
+ * private source or personal data no key-based log scrub recognises (CWE-532).
+ * This file adds no second repair loop, no retry and no fallback beyond the one
+ * below.
  *
  * ## The one sanctioned fallback (AAP §0.5.3)
  *
@@ -77,9 +81,11 @@
  * ## Privacy
  *
  * Log records carry stage, status, plan version, action counts by type and
- * mode, feasibility rejection codes and error codes — never the question, the
- * prompt, a file's contents, a URL, a statement or a token. Errors composed here
- * name field paths and codes, never values.
+ * mode, an authored plan's closed shape, field paths, feasibility rejection
+ * codes and error codes — never the question, the prompt, the authored plan's
+ * objective, capture phrases, hypotheses or rationales, a file's contents, a
+ * URL, a statement or a token. Errors composed here name field paths and
+ * codes, never values.
  *
  * @module
  */
@@ -469,9 +475,13 @@ const FALLBACK_LOG =
 
 /**
  * Error record of a normaliser or internal-validation failure — a product
- * defect (AAP §0.5.3). The one record in this module that carries a value: the
- * parsed authoring input, which whoever fixes the defect needs, routed through
- * the service logger's redaction layers.
+ * defect (AAP §0.5.3). Fields: stage, step, error code, plan version, the
+ * input's closed shape ({@link authoredPlanShape}), and the failing field path
+ * (normaliser) or the issue paths and codes (internal validation). Like every
+ * other record here it carries no content: the authored input is model prose
+ * the key-based redaction of the service logger cannot recognise, so whoever
+ * fixes the defect reproduces it from the session's stored artifacts, located
+ * by the paths this record names.
  */
 const PRODUCT_DEFECT_LOG =
   'An authored instrumentation plan passed its schema but failed deterministic normalisation or internal validation; it was rejected without a re-prompt.';
@@ -591,6 +601,91 @@ function countsByTypeAndMode(actions: readonly InstrumentationAction[]): Record<
     sorted[key] = counts.get(key) ?? 0;
   }
   return sorted;
+}
+
+/**
+ * The closed shape of an authored plan: what a log record may say about a plan
+ * the gate refused, in place of the plan itself.
+ *
+ * Every field is a count or a member of a closed vocabulary. The authoring
+ * input is otherwise model prose — the objective, the capture phrases, the
+ * hypotheses and every target's rationale — and prose is what a key-based log
+ * scrub cannot recognise, so none of it is reachable from here (CWE-532).
+ */
+export interface AuthoredPlanShape {
+  /** How many capture phrases the plan authored. */
+  readonly captureCount: number;
+  /** How many instrumentation targets the plan authored, duplicates included. */
+  readonly targetCount: number;
+  /** How many hypotheses the plan authored; `0` when it authored none. */
+  readonly hypothesisCount: number;
+  /**
+   * Target counts keyed by action type, keys sorted. Only members of
+   * `INSTRUMENTATION_ACTION_TYPES` can become keys, so no authored string does.
+   */
+  readonly targetTypes: Readonly<Record<string, number>>;
+}
+
+/**
+ * Describes an authored plan by its {@link AuthoredPlanShape}. Exported so the
+ * follow-up stage, which holds its next plan to {@link gateInstrumentationPlan},
+ * describes a refused plan the same way. Pure; reads only lengths and types.
+ *
+ * @example
+ * ```ts
+ * log.error(PRODUCT_DEFECT_LOG, { step: 'normalize', ...authoredPlanShape(input) });
+ * // { step, captureCount: 2, targetCount: 3, hypothesisCount: 1,
+ * //   targetTypes: { 'fetch-tracking': 1, 'function-timing': 2 } }
+ * ```
+ *
+ * @param input A validated authoring input.
+ * @returns Its counts and action-type histogram, frozen.
+ */
+export function authoredPlanShape(input: InstrumentationPlanInput): AuthoredPlanShape {
+  const counts = new Map<string, number>();
+  for (const target of input.instrumentationTargets) {
+    counts.set(target.type, (counts.get(target.type) ?? 0) + 1);
+  }
+  const targetTypes: Record<string, number> = {};
+  for (const type of [...INSTRUMENTATION_ACTION_TYPES].sort(compareCodeUnits)) {
+    const count = counts.get(type);
+    if (count !== undefined) {
+      targetTypes[type] = count;
+    }
+  }
+  return Object.freeze({
+    captureCount: input.capture.length,
+    targetCount: input.instrumentationTargets.length,
+    hypothesisCount: input.hypotheses?.length ?? 0,
+    targetTypes: Object.freeze(targetTypes),
+  });
+}
+
+/**
+ * A structural field path: dot-separated identifiers and indices, as the
+ * normaliser names the field it refused (`instrumentationTargets.2.file`).
+ */
+const STRUCTURAL_FIELD_PATH = /^[A-Za-z][A-Za-z0-9]*(?:\.(?:\d+|[A-Za-z][A-Za-z0-9]*))*$/u;
+
+/** The longest field path a defect record carries. */
+const MAX_FIELD_PATH_CHARS = 120;
+
+/**
+ * The field a normaliser refusal names, when it names one as a structural
+ * path. Anything else — a value, a sentence, an over-long string — is dropped,
+ * so the record can carry the location of a defect without ever carrying its
+ * content. Exported for the follow-up stage's own normaliser record.
+ *
+ * @param error The normaliser's refusal.
+ * @returns Its `details.field`, when that is a structural path; else `undefined`.
+ */
+export function refusedFieldPath(error: DebuggenError): string | undefined {
+  const field = error.details?.['field'];
+  return typeof field === 'string' &&
+    field.length <= MAX_FIELD_PATH_CHARS &&
+    STRUCTURAL_FIELD_PATH.test(field)
+    ? field
+    : undefined;
 }
 
 /** The distinct rejection codes of a report, in the vocabulary's order. */
@@ -914,9 +1009,12 @@ function infeasibleError(feasibility: FeasibilityReport): DebuggenError {
  *   asking the context-bound registry, reuses `previousActions` ids through
  *   `actionIdentityKey`, and keeps order and duplicates.
  * - **Internal validation** re-parses the result with `instrumentationPlanSchema`.
- * - A failure of either is a **product defect**: it is logged at `error` with
- *   the parsed input and the plan is rejected. This function never talks to a
- *   model, so nothing here can re-prompt.
+ * - A failure of either is a **product defect**: it is logged at `error` and
+ *   the plan is rejected. The record carries the input's closed shape
+ *   ({@link authoredPlanShape}) and where the defect is — the normaliser's
+ *   structural field path, or the internal issues' paths and codes — never the
+ *   input's prose. This function never talks to a model, so nothing here can
+ *   re-prompt.
  * - **Feasibility** (`checkPlanFeasibility`) returns its refusals as data. A
  *   plan with at least one feasible action is `accepted` with its infeasible
  *   actions left in place (the installer reports them as unavailable signals);
@@ -943,12 +1041,14 @@ export function gateInstrumentationPlan(
     newActionId: options.newActionId,
   });
   if (!normalized.ok) {
+    const field = refusedFieldPath(normalized.error);
     log.error(PRODUCT_DEFECT_LOG, {
       stage: PLAN_STAGE,
       step: 'normalize',
       code: normalized.error.code,
       planVersion: context.planVersion,
-      input,
+      ...(field !== undefined ? { field } : {}),
+      ...authoredPlanShape(input),
     });
     return {
       kind: 'rejected',
@@ -967,7 +1067,8 @@ export function gateInstrumentationPlan(
       code: 'PLAN_INVALID',
       planVersion: context.planVersion,
       issues,
-      input,
+      issueCount: internal.error.issues.length,
+      ...authoredPlanShape(input),
     });
     return {
       kind: 'rejected',

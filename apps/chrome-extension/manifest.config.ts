@@ -110,6 +110,14 @@ export default defineManifest({
   // so nothing in this extension registers or injects a script dynamically.
   // `test/manifest.test.ts` asserts that absence on its own.
   permissions: ['storage', 'alarms', 'tabs'],
+  // The same two patterns are also what lets the service worker reach the local
+  // service. A match pattern without a port matches EVERY port on its host, so
+  // a service on whatever loopback port the developer configured
+  // (`DEBUGGEN_PORT`, entered as the service address in the pairing dialog) is
+  // reachable without widening this list. That is also why the address must
+  // name `127.0.0.1` or `localhost` over `http:` - the rule
+  // `src/background/auth.ts` (`parseServiceEndpoint`) enforces - since no other
+  // host or scheme is granted.
   host_permissions: [...LOCAL_APP_ORIGINS],
 
   // Two static entries, and the ORDER IS THE CONTRACT: Chrome injects the

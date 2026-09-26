@@ -1,6 +1,8 @@
 /**
  * The service worker's devtools credential: where it is kept, how it is
- * obtained, and when it is given up — and nothing else.
+ * obtained, and when it is given up — and, beside it in `chrome.storage.local`,
+ * the one non-secret setting the developer may change: the local service's
+ * address ({@link SERVICE_ENDPOINT_STORAGE_KEY}, Section F). Nothing else.
  *
  * ## What this module is
  *
@@ -29,6 +31,19 @@
  * credential. It opens no socket, calls no `fetch` and registers no
  * `chrome.tabs` or `chrome.alarms` listener: the one network exchange it
  * performs goes through the injected {@link HttpClient}.
+ *
+ * ## The service address
+ *
+ * The service listens on a port the developer chooses (`DEBUGGEN_PORT`), so
+ * the extension cannot assume `DEFAULT_SERVICE_BASE_URL`. The address is kept
+ * under {@link SERVICE_ENDPOINT_STORAGE_KEY}, entered in the pairing dialog
+ * (it must be right before a code can be redeemed), and applied by
+ * `service-worker.ts` to both the socket and every HTTP call.
+ * {@link parseServiceEndpoint} is the one validator: the protocol's
+ * loopback-only policy, narrowed to the two hosts the manifest's
+ * `host_permissions` let the worker reach. The helpers are pure functions over
+ * an injected storage area, so the panel's dialog and the worker share them
+ * without sharing any state.
  *
  * ## Worker lifetime
  *
@@ -99,12 +114,14 @@ import type {
 import {
   isPlainRecord,
   pairCompleteResponseSchema,
+  parseServiceOrigin,
   WS_CLOSE_UNAUTHORIZED,
 } from '@debuggen/protocol';
 import type { DebuggenError, DebuggenErrorCode, LogFields, Logger, Result } from '@debuggen/shared';
-import { err, fromPromise, noopLogger, ok, tryCatch } from '@debuggen/shared';
+import { err, fromPromise, isErr, noopLogger, ok, tryCatch } from '@debuggen/shared';
 
 import type { PANEL_CONNECTION_STATUSES } from '../shared/messages';
+import { DEFAULT_SERVICE_BASE_URL } from '../shared/messages';
 import type { WorkerStatusSnapshot } from './messages';
 import { workerError } from './messages';
 
@@ -1109,7 +1126,251 @@ export function createDevtoolsCredentialStore(
 
 /*
  * ===========================================================================
- * Section F — compile-time contract proofs
+ * Section F — the service endpoint setting
+ *
+ * Pure functions over an injected storage area: no closure state, no
+ * listener, nothing at import. The value is not a secret, but a value that was
+ * *refused* may be anything a developer pasted — a URL carrying a credential,
+ * for instance — so no message, hint, `details` field or log line built here
+ * contains it. Refusals carry the rule that was broken and nothing else.
+ * ===========================================================================
+ */
+
+/**
+ * The `chrome.storage.local` key the configured service address is kept
+ * under: its canonical origin (`http://127.0.0.1:<port>`), and only when it
+ * differs from `DEFAULT_SERVICE_BASE_URL` — an absent key means "the default".
+ *
+ * `chrome.storage.local`, beside the credential, because the address belongs
+ * to the same pairing and must survive a browser restart; the pairing dialog
+ * writes it and the worker reads it and follows its changes.
+ */
+export const SERVICE_ENDPOINT_STORAGE_KEY = 'debuggen.serviceEndpoint';
+
+/**
+ * The hosts a configured service address may name: `127.0.0.1` and
+ * `localhost`.
+ *
+ * The protocol's policy accepts every loopback host, but the worker can reach
+ * only the origins its manifest grants: `host_permissions` holds
+ * `http://127.0.0.1/*` and `http://localhost/*` — match patterns without a
+ * port, which match **every** port, and which is what lets a service on any
+ * port the developer chose answer the worker. Another loopback spelling
+ * (`127.0.0.2`, `[::1]`) or `https:` is outside those grants, and is refused
+ * here with a rule rather than left to fail at the first request.
+ */
+export const SERVICE_ENDPOINT_HOSTNAMES: readonly string[] = Object.freeze([
+  '127.0.0.1',
+  'localhost',
+]);
+
+/**
+ * How the developer corrects a refused address. Constant, and names only the
+ * accepted shapes and the default — never the value that was refused.
+ */
+const SERVICE_ENDPOINT_HINT = `Enter the address the local service listens on as http://127.0.0.1:<port> or http://localhost:<port>, the only hosts this extension may reach (the default is ${DEFAULT_SERVICE_BASE_URL}); leave it blank to use the default.`;
+
+/** The code every refused service address is reported with. */
+const SERVICE_ENDPOINT_REFUSED_CODE = 'CONFIG_INVALID' satisfies DebuggenErrorCode;
+
+/** Fields attached to every log record about the setting: the key's name, never its value. */
+const ENDPOINT_KEY_FIELDS = Object.freeze({ key: SERVICE_ENDPOINT_STORAGE_KEY });
+
+/**
+ * One refusal of {@link parseServiceEndpoint}: `CONFIG_INVALID`, a constant
+ * message, {@link SERVICE_ENDPOINT_HINT}, and the broken rule as the only
+ * detail — the shape the protocol's own `parseServiceOrigin` refusals have.
+ */
+function serviceEndpointError(rule: string, message: string): DebuggenError {
+  return workerError(SERVICE_ENDPOINT_REFUSED_CODE, message, {
+    hint: SERVICE_ENDPOINT_HINT,
+    details: { rule },
+  });
+}
+
+/**
+ * Validate a service address as the extension can use it.
+ *
+ * 1. It must be text; surrounding whitespace is ignored.
+ * 2. It must satisfy the protocol's `parseServiceOrigin` — an absolute
+ *    loopback origin with no user information, path, query or fragment. That
+ *    refusal is returned as the protocol built it (`CONFIG_INVALID`, a
+ *    constant message and hint, `details: { rule }`).
+ * 3. It must be `http:` on one of {@link SERVICE_ENDPOINT_HOSTNAMES}, the
+ *    origins the manifest grants (`details.rule` `'scheme'` or
+ *    `'host-permission'`).
+ *
+ * Total: returns for every input and never throws.
+ *
+ * @example
+ * ```ts
+ * parseServiceEndpoint(' http://localhost:20150 '); // ok('http://localhost:20150')
+ * parseServiceEndpoint('https://127.0.0.1:20150');   // err: rule 'scheme'
+ * parseServiceEndpoint('http://[::1]:20150');        // err: rule 'host-permission'
+ * ```
+ *
+ * @param raw The value as entered or as read back from storage.
+ * @returns The canonical origin (`http://<host>:<port>`, the port omitted only
+ * when it is 80), or the refusal. The refusal never contains the value.
+ */
+export function parseServiceEndpoint(raw: unknown): Result<string, DebuggenError> {
+  if (typeof raw !== 'string') {
+    return err(serviceEndpointError('unparseable', 'The service address is not text.'));
+  }
+  const origin = parseServiceOrigin(raw);
+  if (isErr(origin)) {
+    return origin;
+  }
+  const parsed = tryCatch(() => new URL(origin.value), SERVICE_ENDPOINT_REFUSED_CODE);
+  if (isErr(parsed)) {
+    return err(serviceEndpointError('unparseable', 'The service address is not a URL.'));
+  }
+  if (parsed.value.protocol !== 'http:') {
+    return err(
+      serviceEndpointError(
+        'scheme',
+        'The service address must use http: the local service listens over plain HTTP.',
+      ),
+    );
+  }
+  if (!SERVICE_ENDPOINT_HOSTNAMES.includes(parsed.value.hostname)) {
+    return err(
+      serviceEndpointError(
+        'host-permission',
+        'The service address must name 127.0.0.1 or localhost, the hosts this extension may reach.',
+      ),
+    );
+  }
+  return ok(origin.value);
+}
+
+/**
+ * Read the configured service address.
+ *
+ * @param storage The area it is kept in — `chrome.storage.local`.
+ * @param logger Where a failure is noted (the key's name and the error code,
+ * never the value); defaults to no logging.
+ * @returns `ok(undefined)` when none is configured (use the default),
+ * `ok(origin)` for a valid stored value, or an `Err` — `STORE_ERROR` when
+ * storage could not be read, the {@link parseServiceEndpoint} refusal when the
+ * stored value is not one the extension can use. A stored value is never
+ * silently replaced by the default: the caller shows the refusal.
+ */
+export async function readServiceEndpoint(
+  storage: Pick<CredentialStorageArea, 'get'>,
+  logger: Logger = noopLogger,
+): Promise<Result<string | undefined, DebuggenError>> {
+  const read = await fromPromise(
+    Promise.resolve().then(() => storage.get(SERVICE_ENDPOINT_STORAGE_KEY)),
+    'STORE_ERROR',
+  );
+  if (isErr(read)) {
+    logger.warn('The service address could not be read from extension storage.', {
+      ...ENDPOINT_KEY_FIELDS,
+      errorCode: read.error.code,
+    });
+    return err(
+      workerError('STORE_ERROR', 'The service address could not be read from extension storage.', {
+        cause: read.error,
+      }),
+    );
+  }
+  const stored: unknown = isPlainRecord(read.value)
+    ? read.value[SERVICE_ENDPOINT_STORAGE_KEY]
+    : undefined;
+  if (stored === undefined) {
+    return ok(undefined);
+  }
+  const endpoint = parseServiceEndpoint(stored);
+  if (isErr(endpoint)) {
+    logger.warn('The stored service address is not one this extension can use.', {
+      ...ENDPOINT_KEY_FIELDS,
+      errorCode: endpoint.error.code,
+    });
+  }
+  return endpoint;
+}
+
+/**
+ * Validate and save the service address the developer entered.
+ *
+ * A blank value, or one whose canonical form is `DEFAULT_SERVICE_BASE_URL`,
+ * removes the key — "use the default" is stored as absence, so a later build
+ * with another default is followed. An invalid value is refused **without
+ * writing**, so a typo never replaces an address that works.
+ *
+ * @param storage The area it is kept in — `chrome.storage.local`.
+ * @param raw The value as entered.
+ * @returns `ok(origin)` when a non-default address was saved, `ok(undefined)`
+ * when the default now applies, or an `Err`: the {@link parseServiceEndpoint}
+ * refusal, or `STORE_ERROR` when storage refused the write.
+ */
+export async function writeServiceEndpoint(
+  storage: Pick<CredentialStorageArea, 'set' | 'remove'>,
+  raw: unknown,
+): Promise<Result<string | undefined, DebuggenError>> {
+  const blank = typeof raw === 'string' && raw.trim().length === 0;
+  const endpoint: Result<string | undefined, DebuggenError> = blank
+    ? ok(undefined)
+    : parseServiceEndpoint(raw);
+  if (isErr(endpoint)) {
+    return endpoint;
+  }
+  const defaultEndpoint = parseServiceEndpoint(DEFAULT_SERVICE_BASE_URL);
+  const value =
+    endpoint.value === undefined ||
+    (!isErr(defaultEndpoint) && endpoint.value === defaultEndpoint.value)
+      ? undefined
+      : endpoint.value;
+  const written = await fromPromise(
+    Promise.resolve().then(() =>
+      value === undefined
+        ? storage.remove(SERVICE_ENDPOINT_STORAGE_KEY)
+        : storage.set({ [SERVICE_ENDPOINT_STORAGE_KEY]: value }),
+    ),
+    'STORE_ERROR',
+  );
+  if (isErr(written)) {
+    return err(
+      workerError('STORE_ERROR', 'The service address could not be saved in extension storage.', {
+        hint: 'Try again; if it keeps failing, reload the extension from chrome://extensions.',
+        cause: written.error,
+      }),
+    );
+  }
+  return ok(value);
+}
+
+/**
+ * The service-address setting as the pairing dialog uses it: read the current
+ * value, and validate-and-save a new one. The dialog renders its field only
+ * when it has one of these, which keeps it free of any `chrome.*` reference.
+ */
+export interface ServiceEndpointAccessor {
+  /** {@link readServiceEndpoint} over the accessor's storage. */
+  readonly read: () => Promise<Result<string | undefined, DebuggenError>>;
+  /** {@link writeServiceEndpoint} over the accessor's storage. */
+  readonly write: (raw: string) => Promise<Result<string | undefined, DebuggenError>>;
+}
+
+/**
+ * Bind {@link readServiceEndpoint} and {@link writeServiceEndpoint} to one
+ * storage area. Pure construction: nothing is read until a member is called.
+ *
+ * @param storage `chrome.storage.local`, or a test's in-memory fake.
+ */
+export function createServiceEndpointAccessor(
+  storage: Pick<CredentialStorageArea, 'get' | 'set' | 'remove'>,
+): ServiceEndpointAccessor {
+  return Object.freeze({
+    read: () => readServiceEndpoint(storage),
+    write: (raw: string) => writeServiceEndpoint(storage, raw),
+  });
+}
+
+/*
+ * ===========================================================================
+ * Section G — compile-time contract proofs
  *
  * Type-level only: they emit nothing, and are exported solely so
  * `noUnusedLocals` accepts them — the convention `./messages` and

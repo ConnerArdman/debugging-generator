@@ -115,6 +115,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { getRDTHook, hasRDTHook, installRDTHook } from 'bippy';
 import type { Fiber, FiberRoot } from 'bippy';
 
+import { connectFakeBridge } from './__tests__/page-channel.js';
+import type { RecordedAgentFrame } from './__tests__/page-channel.js';
 import {
   attachInteractions,
   detachInteractions,
@@ -561,10 +563,10 @@ function expectEventTiming(draft: EventDraft): void {
 /**
  * Whether a draft survives the journey it is about to make.
  *
- * Every event crosses `window.postMessage` to the isolated-world bridge and is
- * then validated by the service's strict ingress schema, which admits no
- * function and no symbol in an attribute bag. A structural round trip through
- * JSON is the cheapest honest proxy for both.
+ * Every event crosses the private page channel to the isolated-world bridge as
+ * a JSON string and is then validated by the service's strict ingress schema,
+ * which admits no function and no symbol in an attribute bag. A structural
+ * round trip through JSON is the cheapest honest proxy for both.
  */
 function expectJsonSafe(draft: EventDraft): void {
   const roundTripped: unknown = JSON.parse(JSON.stringify(draft));
@@ -2161,8 +2163,8 @@ describe('commit traversal — React 19 under happy-dom', () => {
       expect('truncated' in node).toBe(false);
     }
 
-    // The snapshot crosses `window.postMessage` inside an event's attributes,
-    // so it must hold no cycle, no fiber and no DOM node.
+    // The snapshot crosses the page channel as JSON inside an event's
+    // attributes, so it must hold no cycle, no fiber and no DOM node.
     expect(JSON.parse(JSON.stringify(snapshot))).toStrictEqual(snapshot);
     // Asking for the documented defaults explicitly is the same request.
     expect(
@@ -2301,13 +2303,17 @@ describe('commit traversal — React 19 under happy-dom', () => {
  *   fresh graph, `./transport.js` included — which is why the transport this
  *   section observes is imported the same way rather than reused from the top
  *   of the file;
- * - the `finally` unmocks and resets the registry, so no later test file
- *   inherits any of it.
+ * - the `finally` resets that transport, unmocks and resets the registry, so no
+ *   later test inherits any of it.
  *
- * The failure frames are read off `window.postMessage`, because a control
- * frame needs no bridge handshake: `postControl` posts it whether or not a
- * bridge has announced itself, which is what makes a producer failure
- * reportable during teardown.
+ * The failure frames are read where the real bridge reads them: on the fresh
+ * transport's private channel node, through a fake bridge
+ * (`./__tests__/page-channel.ts`) connected to that instance as soon as it is
+ * imported. A fresh instance answers its one handshake request to that bridge;
+ * this file's statically imported instance never subscribes, so it never
+ * listens for one. Once the handshake is done a control frame needs nothing
+ * else — no subscription, no `bridge.ready` — which is what makes a producer
+ * failure reportable during teardown.
  * ---------------------------------------------------------------------------
  */
 
@@ -2329,8 +2335,9 @@ interface RegisteredHandlers {
  * property of the fake and not of the assertion order.
  *
  * @param releaseFailures How many release attempts throw before one succeeds.
- * @returns The freshly imported module, its fresh transport, the two spies and
- * the handlers the module registered.
+ * @returns The freshly imported module, its fresh transport, the fake bridge
+ * connected to that transport, the two spies and the handlers the module
+ * registered.
  */
 async function mockedReactModule(releaseFailures: number) {
   let releaseAttempts = 0;
@@ -2359,8 +2366,10 @@ async function mockedReactModule(releaseFailures: number) {
   return {
     /** The module under test, on its own module graph. */
     react: reactModule,
-    /** The transport instance that module posts through. */
+    /** The transport instance that module dispatches through. */
     transport: transportModule,
+    /** The fake bridge holding that transport's channel node. */
+    bridge: connectFakeBridge(transportModule),
     /** The faked release; its call count is the retry evidence. */
     release,
     /** The faked `instrument`; its call count is the no-double-subscribe evidence. */
@@ -2385,6 +2394,7 @@ async function withMockedBippy(
   try {
     await scenario(harness);
   } finally {
+    harness.transport.resetTransport();
     vi.doUnmock('bippy');
     vi.resetModules();
   }
@@ -2405,44 +2415,33 @@ function oneComponentRoot(containerId: string): FiberRoot {
 }
 
 /**
- * The `producer-failure` payloads a spied `window.postMessage` observed.
+ * The `producer-failure` payloads among the frames a fake bridge received.
  *
- * Filtered on the agent's source tag, so an unrelated frame — a page's own
- * `postMessage`, a bridge frame — is never read as a report.
+ * Filtered on the agent's source tag and the frame type, so a telemetry batch
+ * or any other control frame is never read as a report.
  *
- * @param messages The first argument of each recorded `postMessage` call.
+ * @param frames The frames the agent dispatched on the channel node.
  * @returns The payload of each `agent.error` frame that reports a producer
- * failure, in the order they were posted.
+ * failure, in the order they were dispatched.
  */
-function producerFailurePayloads(messages: readonly unknown[]): Record<string, unknown>[] {
-  const payloads: Record<string, unknown>[] = [];
-  for (const message of messages) {
-    if (typeof message !== 'object' || message === null) {
-      continue;
-    }
-    const frame = message as { source?: unknown; type?: unknown; payload?: unknown };
-    if (frame.source !== 'debuggen-agent' || frame.type !== 'agent.error') {
-      continue;
-    }
-    const payload = frame.payload;
-    if (typeof payload !== 'object' || payload === null) {
-      continue;
-    }
-    const record = payload as Record<string, unknown>;
-    if (record['code'] === 'producer-failure') {
-      payloads.push(record);
-    }
-  }
-  return payloads;
+function producerFailurePayloads(
+  frames: readonly RecordedAgentFrame[],
+): Readonly<Record<string, unknown>>[] {
+  return frames
+    .filter(
+      (frame) =>
+        frame.source === transport.AGENT_SOURCE_TAG &&
+        frame.type === 'agent.error' &&
+        frame.payload['code'] === 'producer-failure',
+    )
+    .map((frame) => frame.payload);
 }
 
 describe('cleanup that cannot complete, and the failures it reports', () => {
   it('stops observing and reports producer-failure when the release throws', async () => {
-    const postSpy = vi.spyOn(window, 'postMessage');
-
     await withMockedBippy(
       1,
-      ({ react: reactModule, release, instrument: instrumentFake, handlers }) => {
+      ({ react: reactModule, bridge, release, instrument: instrumentFake, handlers }) => {
         reactModule.attachReact();
         expect(instrumentFake).toHaveBeenCalledTimes(1);
         expect(reactModule.isReactAttached()).toBe(true);
@@ -2462,9 +2461,7 @@ describe('cleanup that cannot complete, and the failures it reports', () => {
         expect(reactModule.getReactStats().commits).toBe(0);
         expect(reactModule.getReactStats().renders).toBe(0);
 
-        const failures = producerFailurePayloads(
-          postSpy.mock.calls.map((call) => call[0] as unknown),
-        );
+        const failures = producerFailurePayloads(bridge.frames);
         expect(failures).toHaveLength(1);
         expect(failures[0]?.['source']).toBe('react');
         expect(failures[0]?.['stage']).toBe('release');
@@ -2534,38 +2531,37 @@ describe('cleanup that cannot complete, and the failures it reports', () => {
   });
 
   it('reports a commit whose body throws once and keeps it away from React', async () => {
-    const postSpy = vi.spyOn(window, 'postMessage');
+    await withMockedBippy(
+      0,
+      ({ react: reactModule, transport: freshTransport, bridge, handlers }) => {
+        // The hand-off is the last step of the commit body, so a throw here is a
+        // whole commit lost: no commit event, no render events, no evidence.
+        vi.spyOn(freshTransport, 'emitMany').mockImplementation(() => {
+          throw new TypeError('react.test.tsx: deliberate emit failure');
+        });
 
-    await withMockedBippy(0, ({ react: reactModule, transport: freshTransport, handlers }) => {
-      // The hand-off is the last step of the commit body, so a throw here is a
-      // whole commit lost: no commit event, no render events, no evidence.
-      vi.spyOn(freshTransport, 'emitMany').mockImplementation(() => {
-        throw new TypeError('react.test.tsx: deliberate emit failure');
-      });
+        reactModule.attachReact();
+        const root = oneComponentRoot('commit-body-failure');
 
-      reactModule.attachReact();
-      const root = oneComponentRoot('commit-body-failure');
+        // A throw out of here would surface inside React's commit phase, which
+        // is the one failure this product may never cause.
+        expect(() => {
+          dispatchCommit(handlers(), root);
+        }).not.toThrow();
 
-      // A throw out of here would surface inside React's commit phase, which
-      // is the one failure this product may never cause.
-      expect(() => {
-        dispatchCommit(handlers(), root);
-      }).not.toThrow();
+        expect(reactModule.getReactStats().commits).toBe(1);
+        expect(reactModule.getReactStats().failures).toBe(1);
 
-      expect(reactModule.getReactStats().commits).toBe(1);
-      expect(reactModule.getReactStats().failures).toBe(1);
-
-      const failures = producerFailurePayloads(
-        postSpy.mock.calls.map((call) => call[0] as unknown),
-      );
-      expect(failures).toHaveLength(1);
-      expect(failures[0]?.['source']).toBe('react');
-      expect(failures[0]?.['stage']).toBe('commit');
-      expect(failures[0]?.['error']).toBe('TypeError');
-      // Bounded by the transport, not by a second limiter here: a source gets
-      // one frame per capture (`MAX_PRODUCER_FAILURE_REPORTS`), so the frame
-      // this commit produced is also the last one this source gets.
-      expect(failures[0]?.['final']).toBe(true);
-    });
+        const failures = producerFailurePayloads(bridge.frames);
+        expect(failures).toHaveLength(1);
+        expect(failures[0]?.['source']).toBe('react');
+        expect(failures[0]?.['stage']).toBe('commit');
+        expect(failures[0]?.['error']).toBe('TypeError');
+        // Bounded by the transport, not by a second limiter here: a source gets
+        // one frame per capture (`MAX_PRODUCER_FAILURE_REPORTS`), so the frame
+        // this commit produced is also the last one this source gets.
+        expect(failures[0]?.['final']).toBe(true);
+      },
+    );
   });
 });

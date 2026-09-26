@@ -1474,11 +1474,15 @@ class SequencedPatcher implements Patcher {
       // ---------------------------------------------------------------------
       stage = 'baseline-check';
 
-      const parent = await this.#resolveChainParent(file, options.previousRecord);
+      const chain = await this.#resolveChainParent(file, options.previousRecord);
 
-      if (isErr(parent)) {
-        return await failed(parent.error);
+      if (isErr(chain)) {
+        return await failed(chain.error);
       }
+
+      // `listed` is the session listing the parent was chosen from, carried to
+      // the root walk below so one attempt reads the journal at most once.
+      const { parent, listed } = chain.value;
 
       // The developer's own text, for a file this session already patched: the
       // transform rewrites the layered bytes it was just handed, but records the
@@ -1486,8 +1490,8 @@ class SequencedPatcher implements Patcher {
       // has rather than one shifted by the wrappers above it.
       let locationText: string | undefined;
 
-      if (parent.value !== undefined) {
-        previousRecordId = parent.value.id;
+      if (parent !== undefined) {
+        previousRecordId = parent.id;
 
         // The detector resolves the parent record's own `file` lexically inside
         // the same project root, and `#resolveChainParent` has already
@@ -1495,7 +1499,7 @@ class SequencedPatcher implements Patcher {
         // canonical and contained. So the delegation cannot reach a file this
         // sequence has not already validated, and the lexical resolution there
         // is not a second escape route.
-        const baseline = await this.#confirmBaseline(parent.value, originalHash);
+        const baseline = await this.#confirmBaseline(parent, originalHash);
 
         if (isErr(baseline)) {
           conflict = baseline.error.conflict;
@@ -1510,7 +1514,8 @@ class SequencedPatcher implements Patcher {
         // Only once the baseline is confirmed: the root's backup is the
         // developer's text only while the chain above it is intact, and a
         // conflict must be reported as a conflict, not as an unreadable root.
-        const developerText = await this.#chainRootText(parent.value);
+        // The walk reuses `listed` rather than listing the session again.
+        const developerText = await this.#chainRootText(parent, listed);
 
         if (isErr(developerText)) {
           return await failed(developerText.error);
@@ -1814,11 +1819,24 @@ class SequencedPatcher implements Patcher {
    * refuses the patch. The baseline of such a file is undecided until
    * reconciliation has run, and layering a new record on an undecided one is
    * how a chain stops being unwindable.
+   *
+   * The listing is handed back beside the parent, because
+   * {@link SequencedPatcher.#chainRootText} needs the same records to walk the
+   * parent's ancestry back to the chain root, and listing the session's full
+   * records — diffs included — a second time would be nearly the whole cost of
+   * that walk, paid again on every chained patch. The explicit path lists
+   * nothing and hands back `undefined`, which is how the root walk knows it has
+   * no listing yet.
+   *
+   * @param file The target's project-relative path, already proven canonical.
+   * @param explicit The caller's parent record, when it supplied one.
+   * @returns The parent (`undefined` for a first patch of the file) and the
+   * listing it was chosen from, or the refusal of an unusable parent.
    */
   async #resolveChainParent(
     file: string,
     explicit: ModificationRecord | undefined,
-  ): Promise<Result<ModificationRecord | undefined>> {
+  ): Promise<Result<ChainParent>> {
     if (explicit !== undefined) {
       if (explicit.sessionId !== this.sessionId || explicit.file !== file) {
         return err(
@@ -1837,7 +1855,7 @@ class SequencedPatcher implements Patcher {
         return err(unreconciledRecord(file, explicit));
       }
 
-      return ok(explicit);
+      return ok({ parent: explicit, listed: undefined });
     }
 
     const listed = await this.#journal.listBySession(this.sessionId);
@@ -1863,7 +1881,7 @@ class SequencedPatcher implements Patcher {
       }
     }
 
-    return ok(parent);
+    return ok({ parent, listed: listed.value });
   }
 
   /**
@@ -1965,14 +1983,40 @@ class SequencedPatcher implements Patcher {
    * re-check on read and the bytes are about to decide what the developer is
    * sent to.
    *
+   * ## At most one journal read per attempt
+   *
+   * - **The parent is the root** (`previousRecordId` is absent): there is no
+   *   ancestry to walk, so the journal is not read at all.
+   * - **The parent was chosen from a listing**: the walk runs over that listing.
+   *   It was read moments earlier in the same attempt, after the file was
+   *   snapshotted, and every ancestor was appended before the parent that names
+   *   it, so an ancestor the journal still holds is in it. What the walk relies
+   *   on — `file`, `previousRecordId` and `originalHash` — is never revised by a
+   *   `ModificationStatusPatch`. The one revisable field it reads, `backupPath`,
+   *   cannot misdirect it: a stale path fails the read (`backup-unreadable`),
+   *   and bytes read from anywhere must still hash to the immutable
+   *   `originalHash` (`backup-digest-mismatch`).
+   * - **The caller supplied the parent and it has ancestors**: nothing has been
+   *   listed yet, so the session is listed here, once, and a journal error is
+   *   returned as it came.
+   *
+   * The id map is built only when a walk is needed, over every listed record
+   * rather than only this file's, so a link into another file is reported as
+   * `chain-link-other-file` instead of as a missing link.
+   *
    * Called only after the baseline is confirmed, and it reads nothing but the
    * state directory: no project byte is involved.
    *
    * @param parent The applied record the new patch layers on.
+   * @param listed The session listing {@link SequencedPatcher.#resolveChainParent}
+   * chose `parent` from, or `undefined` when the caller supplied `parent`.
    * @returns The root backup's decoded text, or `INSTRUMENTATION_INSTALL_FAILED`
    * with reason `chain-root-unreadable` naming why it could not be established.
    */
-  async #chainRootText(parent: ModificationRecord): Promise<Result<string>> {
+  async #chainRootText(
+    parent: ModificationRecord,
+    listed: readonly ModificationRecord[] | undefined,
+  ): Promise<Result<string>> {
     const unreadable = (cause: string, extra: Record<string, unknown> = {}): Result<never> =>
       err(
         new DebuggenError(
@@ -1991,33 +2035,42 @@ class SequencedPatcher implements Patcher {
         ),
       );
 
-    const listed = await this.#journal.listBySession(this.sessionId);
-
-    if (isErr(listed)) {
-      return listed;
-    }
-
-    const byId = new Map(listed.value.map((candidate) => [candidate.id, candidate] as const));
-    const visited = new Set<string>([parent.id]);
     let root = parent;
 
-    while (root.previousRecordId !== undefined) {
-      const previous = byId.get(root.previousRecordId);
+    if (parent.previousRecordId !== undefined) {
+      let records = listed;
 
-      if (previous === undefined) {
-        return unreadable('chain-link-missing', { missingRecordId: root.previousRecordId });
+      if (records === undefined) {
+        const read = await this.#journal.listBySession(this.sessionId);
+
+        if (isErr(read)) {
+          return read;
+        }
+
+        records = read.value;
       }
 
-      if (previous.file !== parent.file) {
-        return unreadable('chain-link-other-file', { linkRecordId: previous.id });
-      }
+      const byId = new Map(records.map((candidate) => [candidate.id, candidate] as const));
+      const visited = new Set<string>([parent.id]);
 
-      if (visited.has(previous.id)) {
-        return unreadable('chain-cycle', { linkRecordId: previous.id });
-      }
+      while (root.previousRecordId !== undefined) {
+        const previous = byId.get(root.previousRecordId);
 
-      visited.add(previous.id);
-      root = previous;
+        if (previous === undefined) {
+          return unreadable('chain-link-missing', { missingRecordId: root.previousRecordId });
+        }
+
+        if (previous.file !== parent.file) {
+          return unreadable('chain-link-other-file', { linkRecordId: previous.id });
+        }
+
+        if (visited.has(previous.id)) {
+          return unreadable('chain-cycle', { linkRecordId: previous.id });
+        }
+
+        visited.add(previous.id);
+        root = previous;
+      }
     }
 
     let bytes: Uint8Array;
@@ -2120,6 +2173,27 @@ interface BaselineRefusal {
 
   /** The report to show the developer, when the detector produced one. */
   readonly conflict: ModificationConflict | undefined;
+}
+
+/**
+ * What {@link SequencedPatcher.#resolveChainParent} settled on, and the session
+ * listing it settled it from.
+ *
+ * The listing travels with the parent so that
+ * {@link SequencedPatcher.#chainRootText} can walk the parent's ancestry over
+ * the records this attempt already read, instead of listing the session — every
+ * full record, diffs included — a second time for each chained patch.
+ */
+interface ChainParent {
+  /** The applied record the new patch layers on; `undefined` for a first patch of the file. */
+  readonly parent: ModificationRecord | undefined;
+
+  /**
+   * The session's records in append order, as listed to choose
+   * {@link ChainParent.parent}; `undefined` when the caller supplied the parent
+   * and nothing was listed.
+   */
+  readonly listed: readonly ModificationRecord[] | undefined;
 }
 
 /**

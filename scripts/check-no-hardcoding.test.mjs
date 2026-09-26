@@ -14,12 +14,13 @@
 //
 // They are the first four `describe` blocks below, in that order. The remaining
 // blocks cover the rules and guarantees the four cases do not reach
-// (`demo-import`, `demo-path`, the question-branch exemption, `policy-stale`,
-// the policy's canonical form, the canonical form of the committed policy
-// artifact itself, the exclusion list, the command-line surface, the enforcement
-// of policy drift whenever the demo corpus is present, and the fail-closed
-// scan), because a gate whose supporting rules are untested is a gate that can
-// rot silently.
+// (`demo-import`, `demo-path`, the question-branch exemption, the class D scan
+// of repository tooling, `policy-stale`, the policy's canonical form, the
+// canonical form of the committed policy artifact itself, the exclusion list,
+// the command-line surface - its invocation through a symbolic link included -
+// the enforcement of policy drift whenever the demo corpus is present, and the
+// fail-closed scan), because a gate whose supporting rules are untested is a
+// gate that can rot silently.
 //
 // THREE PROPERTIES THAT ARE THE GATE ITSELF, NOT A DETAIL
 // A guard is only evidence if it fails when it cannot do its job, so three
@@ -62,13 +63,15 @@
 // WHY THIS FILE MAY NAME DEMO SYMBOLS
 // The fixtures below deliberately use real demo vocabulary
 // (`RecommendationsRail`, `/api/recommendations`), because realistic names are
-// what make the assertions meaningful. `pnpm check:no-hardcoding` still passes
-// with this file present for two independent reasons, both asserted by the
-// scanner's own exclusion list: `scripts/**` is never scanned (the policy file
-// itself would otherwise fail the gate on sight), and `**/*.test.mjs` is never
-// scanned as product source. If this file is ever reported by the gate, the
-// scanner's exclusions are wrong - fix those rather than weakening these
-// fixtures.
+// what make the assertions meaningful. `scripts/` is repository tooling, and
+// the class D pass reads it as raw text, comments included, so this file is
+// covered by that pass's scope. `pnpm check:no-hardcoding` still passes with it
+// present because test suites (`**/*.test.mjs` among them) are never scanned by
+// any pass, in product packages or beside the guard scripts - which the
+// "class D" and "exclusions" cases below assert. The policy file is excluded
+// separately, by exact path, because it lists every forbidden token by
+// construction. If this file is ever reported by the gate, the scanner's
+// exclusions are wrong - fix those rather than weakening these fixtures.
 //
 // TS-MORPH AND SKIPPING
 // The scanner resolves ts-morph from `packages/code-analysis` (or
@@ -85,6 +88,7 @@
 // source file: `buildPolicy()` parses the demo corpus with ts-morph to harvest
 // it. Those cases are gated with the rest.
 // ---------------------------------------------------------------------------
+import { spawnSync } from 'node:child_process';
 import {
   chmodSync,
   mkdirSync,
@@ -94,6 +98,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
+import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
@@ -115,6 +120,7 @@ import {
   QUESTION_EXEMPT_FILE,
   RULE_IDS,
   SCRIPT_FILE,
+  TOOLING_TREES,
   buildPolicy,
   check,
   isDemoSpecificIdentifier,
@@ -124,6 +130,7 @@ import {
   renderReport,
   scanProductSource,
   scanStructuredText,
+  scanTooling,
   serializePolicy,
   updatePolicy,
 } from './check-no-hardcoding.mjs';
@@ -455,6 +462,32 @@ const canCreateSymlinks = (() => {
     return false;
   }
 })();
+
+/**
+ * Whether `workspace`'s manifest in this checkout resolves an installed
+ * ts-morph.
+ *
+ * @param {string} workspace Repository-relative workspace directory.
+ * @returns {boolean}
+ */
+function resolvesTsMorph(workspace) {
+  try {
+    createRequire(at(DEFAULT_ROOT, `${workspace}/package.json`)).resolve('ts-morph');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The workspace of this checkout whose installed ts-morph the scanner loads,
+ * tried in the scanner's own order. A copy of the script run as a separate
+ * process from a synthetic tree resolves ts-morph from that tree, so the one
+ * case that does so links this workspace's `node_modules` into it; `null` when
+ * neither declaring workspace is installed, and that case is declared skipped.
+ */
+const TS_MORPH_WORKSPACE =
+  ['packages/code-analysis', 'packages/instrumentation'].find(resolvesTsMorph) ?? null;
 
 /**
  * Run the command-line entry point against a synthetic root, capturing both
@@ -1133,6 +1166,662 @@ describe('question-branch', () => {
 });
 
 /* -------------------------------------------------------------------------------------------------
+ * class D: demo knowledge in repository tooling
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * A root lint configuration that relaxes a rule for one demo component and
+ * says why in a comment - demo knowledge recorded outside `docs/DEMO.md`. The
+ * workspace glob on the line below it is how the same exception is allowed to
+ * be written, and must not fire.
+ */
+const TOOLING_LINT_CONFIG = source(
+  "import reactHooks from 'eslint-plugin-react-hooks';",
+  '',
+  'export default [',
+  '  {',
+  '    // Relaxed for RecommendationsRail, whose effect refetches on purpose.',
+  `    files: ['${DEMO_TREE}/src/**/*.tsx'],`,
+  "    rules: { 'react-hooks/exhaustive-deps': 'off' },",
+  '  },',
+  '];',
+);
+
+/** A root test-runner configuration that probes a demo route. */
+const TOOLING_ROUTE_CONFIG = source(
+  "import { defineConfig } from '@playwright/test';",
+  '',
+  'export default defineConfig({',
+  "  webServer: { command: 'pnpm demo:dev', url: 'http://127.0.0.1:3000/api/recommendations' },",
+  '});',
+);
+
+/** A guard-script helper whose comment names a demo component. */
+const TOOLING_SCRIPT = source(
+  '// Warms the RecommendationsRail cache before the walkthrough starts.',
+  'export const warmUp = () => undefined;',
+);
+
+/** A CI workflow step that probes a demo route. */
+const TOOLING_WORKFLOW = source(
+  'name: ci',
+  'on: [push]',
+  'jobs:',
+  '  smoke:',
+  '    runs-on: ubuntu-latest',
+  '    steps:',
+  '      - run: curl -fsS http://127.0.0.1:3000/api/recommendations',
+);
+
+/** A product file with nothing to report, so a tree has a subject for `check()`. */
+const TOOLING_CASE_PRODUCT_FILE = source('export const sessionLimit = 8;');
+
+describe('class D: demo knowledge in repository tooling', () => {
+  /** The policy every tree in this block enforces. */
+  const TOOLING_POLICY = Object.freeze({
+    identifiers: ['RecommendationsRail'],
+    routePaths: ['/api/recommendations'],
+  });
+
+  it('scans the repository root and the three tooling trees', () => {
+    // Pinned so that shrinking the tooling scope is a failure here rather than
+    // a silently narrower gate.
+    expect([...TOOLING_TREES]).toEqual(['scripts', '.github', '.vscode']);
+  });
+
+  it('reports a root lint config that names a demo identifier in a comment', () => {
+    const root = makeTree({
+      ...artifacts(TOOLING_POLICY, { identifiers: ['Button'] }),
+      'eslint.config.js': TOOLING_LINT_CONFIG,
+    });
+
+    const scan = scanTooling(root);
+    expect(rulesOf(scan.findings)).toEqual(['tooling-identifier-text']);
+    expect(scan.findings).toHaveLength(1);
+    const [finding] = scan.findings;
+    expect(finding.file).toBe('eslint.config.js');
+    expect(finding.match).toBe('RecommendationsRail');
+    expect({ line: finding.line, column: finding.column }).toEqual(
+      positionOf(TOOLING_LINT_CONFIG, 'RecommendationsRail'),
+    );
+    expect(finding.message).toContain('RecommendationsRail');
+    expect(finding.hint).toContain('by workspace');
+    expect(finding.hint).toContain('docs/DEMO.md');
+    // The allowlist beside the policy is tooling too, and was read.
+    expect(scan.filesScanned).toBe(2);
+    expect(scan.failures).toEqual([]);
+    // The two tooling trees this tree lacks are informational, not failures.
+    expect(scan.notes).toContain('skipped .github: not present in this checkout');
+    expect(scan.notes).toContain('skipped .vscode: not present in this checkout');
+  });
+
+  it('reports a root config that names a demo route', () => {
+    const root = makeTree({
+      ...artifacts(TOOLING_POLICY),
+      'playwright.config.ts': TOOLING_ROUTE_CONFIG,
+    });
+
+    const scan = scanTooling(root);
+    expect(rulesOf(scan.findings)).toEqual(['tooling-route-text']);
+    const [finding] = scan.findings;
+    expect(finding.file).toBe('playwright.config.ts');
+    expect(finding.match).toBe('/api/recommendations');
+    expect({ line: finding.line, column: finding.column }).toEqual(
+      positionOf(TOOLING_ROUTE_CONFIG, '/api/recommendations'),
+    );
+    expect(finding.hint).toContain('docs/DEMO.md');
+  });
+
+  it('reports hits under scripts/, .github/ and .vscode/ at any depth', () => {
+    const launch = source(
+      '{',
+      '  "configurations": [{ "name": "Debug RecommendationsRail" }]',
+      '}',
+    );
+    const root = makeTree({
+      ...artifacts(TOOLING_POLICY),
+      'scripts/lib/warm-up.mjs': TOOLING_SCRIPT,
+      '.github/workflows/ci.yml': TOOLING_WORKFLOW,
+      '.vscode/launch.json': launch,
+    });
+
+    const scan = scanTooling(root);
+    // Files are read in path order, so the dot-directories come first.
+    expect(scan.findings.map((finding) => [finding.file, finding.rule])).toEqual([
+      ['.github/workflows/ci.yml', 'tooling-route-text'],
+      ['.vscode/launch.json', 'tooling-identifier-text'],
+      ['scripts/lib/warm-up.mjs', 'tooling-identifier-text'],
+    ]);
+    const [workflow, editor, script] = scan.findings;
+    expect({ line: script.line, column: script.column }).toEqual(
+      positionOf(TOOLING_SCRIPT, 'RecommendationsRail'),
+    );
+    expect({ line: workflow.line, column: workflow.column }).toEqual(
+      positionOf(TOOLING_WORKFLOW, '/api/recommendations'),
+    );
+    expect({ line: editor.line, column: editor.column }).toEqual(
+      positionOf(launch, 'RecommendationsRail'),
+    );
+    expect(scan.notes).toEqual([]);
+  });
+
+  it('reads the named extensionless configuration files, and no other dot-file', () => {
+    // `.editorconfig`, `.gitignore` and `CODEOWNERS` configure tooling per path, and an extension
+    // cannot identify them, so they are read by name. The pass lists the work tree rather than the
+    // index, so a developer's untracked credentials file and binary folder metadata sit beside
+    // them; neither is a name the pass reads, so neither is opened - the `.DS_Store` would fail
+    // the gate as binary if it were.
+    const editor = source('# Two-space indent, as RecommendationsRail expects', '[*]');
+    const ignore = source('# cached /api/recommendations responses', 'coverage/');
+    const owners = source('/apps/ @owner # RecommendationsRail reviewers');
+    const root = makeTree({
+      ...artifacts(TOOLING_POLICY),
+      '.editorconfig': editor,
+      '.gitignore': ignore,
+      '.github/CODEOWNERS': owners,
+      '.env': source('RAIL_NAME=RecommendationsRail'),
+      '.DS_Store': '\u0000\u0001RecommendationsRail\u0000',
+    });
+
+    const scan = scanTooling(root);
+    expect(scan.findings.map((finding) => [finding.file, finding.rule])).toEqual([
+      ['.editorconfig', 'tooling-identifier-text'],
+      ['.github/CODEOWNERS', 'tooling-identifier-text'],
+      ['.gitignore', 'tooling-route-text'],
+    ]);
+    const [editorHit, ownersHit, ignoreHit] = scan.findings;
+    expect({ line: editorHit.line, column: editorHit.column }).toEqual(
+      positionOf(editor, 'RecommendationsRail'),
+    );
+    expect({ line: ownersHit.line, column: ownersHit.column }).toEqual(
+      positionOf(owners, 'RecommendationsRail'),
+    );
+    expect({ line: ignoreHit.line, column: ignoreHit.column }).toEqual(
+      positionOf(ignore, '/api/recommendations'),
+    );
+    expect(scan.failures).toEqual([]);
+    // The allowlist and the three named files; `.env` and `.DS_Store` were never read.
+    expect(scan.filesScanned).toBe(4);
+  });
+
+  it('never reports test suites, the policy file, the lockfile or root documentation', () => {
+    const root = makeTree({
+      // The policy itself lists every forbidden token by construction.
+      ...artifacts(TOOLING_POLICY),
+      'scripts/lib/warm-up.test.mjs': source(
+        "it('warms the RecommendationsRail cache', () => {});",
+      ),
+      'scripts/check-no-hardcoding.test.mjs': source(
+        "it('rejects /api/recommendations in a prompt', () => {});",
+      ),
+      'pnpm-lock.yaml': source(
+        "lockfileVersion: '9.0'",
+        '# RecommendationsRail /api/recommendations',
+      ),
+      'README.md': source('The RecommendationsRail calls /api/recommendations twice.'),
+      // A directory at the root that is not a tooling tree is not descended.
+      'tools/notes.mjs': source('// RecommendationsRail'),
+    });
+
+    const scan = scanTooling(root);
+    expect(scan.findings).toEqual([]);
+    expect(scan.failures).toEqual([]);
+    // Only the allowlist was read.
+    expect(scan.filesScanned).toBe(1);
+  });
+
+  it('fails closed on an oversized or binary tooling file', () => {
+    const root = makeTree({
+      ...artifacts(TOOLING_POLICY),
+      '.vscode/settings.json': 'intro\n\u0000\u0000binary tail\n',
+      'scripts/lib/real.mjs': source('export const real = 1;'),
+    });
+    writeFileOfSize(root, 'scripts/huge.mjs', MAX_FILE_BYTES + 1);
+
+    const scan = scanTooling(root);
+    const [huge] = failuresFor(scan.failures, 'scripts/huge.mjs');
+    expect(huge).toBeDefined();
+    expect(huge.reason).toBe('too-large');
+    expect(huge.detail).toContain(String(MAX_FILE_BYTES));
+    const [binary] = failuresFor(scan.failures, '.vscode/settings.json');
+    expect(binary).toBeDefined();
+    expect(binary.reason).toBe('binary');
+    // The readable tooling beside them was still read: the allowlist and one script.
+    expect(scan.filesScanned).toBe(2);
+    expect(scan.findings).toEqual([]);
+  });
+
+  it(
+    'refuses a symbolic link standing where a tooling file was expected',
+    { skip: !canCreateSymlinks },
+    () => {
+      const root = makeTree({
+        ...artifacts(TOOLING_POLICY),
+        'scripts/lib/real.mjs': source('export const real = 1;'),
+      });
+      // A link where a root-level tooling file belongs, and one inside a tooling tree.
+      symlinkSync('./scripts/lib/real.mjs', at(root, 'vitest.config.ts'));
+      symlinkSync('./real.mjs', at(root, 'scripts/lib/linked.mjs'));
+
+      const scan = scanTooling(root);
+      expect(
+        failuresFor(scan.failures, 'vitest.config.ts').map((failure) => failure.reason),
+      ).toEqual(['symlink-not-followed']);
+      expect(
+        failuresFor(scan.failures, 'scripts/lib/linked.mjs').map((failure) => failure.reason),
+      ).toEqual(['symlink-not-followed']);
+      // Nothing was read through either link.
+      expect(scan.filesScanned).toBe(2);
+    },
+  );
+
+  it(
+    'fails the gate through check() and the command line, and tallies tooling separately',
+    astCase(),
+    async () => {
+      const root = makeTree({
+        ...artifacts(TOOLING_POLICY, { identifiers: ['Button'] }),
+        'eslint.config.js': TOOLING_LINT_CONFIG,
+        'apps/local-service/src/sessions/limits.ts': TOOLING_CASE_PRODUCT_FILE,
+      });
+
+      const result = await check(root, { stale: false });
+      expect(result.exitCode).toBe(EXIT_FINDINGS);
+      expect(result.ok).toBe(false);
+      expect(rulesOf(result.findings)).toEqual(['tooling-identifier-text']);
+      expect(result.sourceFilesScanned).toBe(1);
+      expect(result.structuredFilesScanned).toBe(0);
+      expect(result.toolingFilesScanned).toBe(2);
+      expect(result.filesScanned).toBe(3);
+      expect(renderReport(result)).toContain('3 files scanned (1 source, 0 structured, 2 tooling)');
+
+      const cli = await runCli([], root);
+      expect(cli.code).toBe(EXIT_FINDINGS);
+      expect(cli.stdout).toContain('eslint.config.js');
+      expect(cli.stdout).toContain('tooling-identifier-text');
+    },
+  );
+
+  it(
+    'stops the gate with the environment exit code when tooling cannot be read',
+    astCase(),
+    async () => {
+      const root = makeTree({
+        ...artifacts(TOOLING_POLICY),
+        'apps/local-service/src/sessions/limits.ts': TOOLING_CASE_PRODUCT_FILE,
+        '.github/workflows/ci.yml': 'name: ci\n\u0000\n',
+      });
+
+      const result = await check(root, { stale: false });
+      expect(failuresFor(result.failures, '.github/workflows/ci.yml')[0]?.reason).toBe('binary');
+      expect(result.findings).toEqual([]);
+      expect(result.exitCode).toBe(EXIT_ERROR);
+      expect((await runCli([], root)).code).toBe(EXIT_ERROR);
+    },
+  );
+
+  describe('tooling-demo-file: a concrete demo file named by path', () => {
+    // A path is demo knowledge as much as a name is: a lint exception keyed on
+    // one demo file records where something lives even when no policy
+    // identifier appears in it. Every tree below carries a small synthetic
+    // demo workspace with neutral names, so the cases never depend on what the
+    // real demo declares.
+    const LEDGER = `${DEMO_TREE}/src/server/services/ledger.service.ts`;
+    const MIGRATION = `${DEMO_TREE}/prisma/migrations/0001_init/migration.sql`;
+    const ITEM_PAGE = `${DEMO_TREE}/app/items/[id]/page.tsx`;
+    const GROUP_PAGE = `${DEMO_TREE}/app/(shop)/page.tsx`;
+
+    /** The synthetic demo workspace every case resolves against. */
+    const DEMO_WORKSPACE = Object.freeze({
+      [`${DEMO_TREE}/package.json`]: '{ "name": "synthetic-demo" }\n',
+      [`${DEMO_TREE}/next.config.ts`]: source('export default {};'),
+      [LEDGER]: source('export const ledgerTotal = () => 0;'),
+      [MIGRATION]: source('CREATE TABLE ledger_entry (id integer PRIMARY KEY);'),
+      [ITEM_PAGE]: source('export default function ItemPage() { return null; }'),
+      [GROUP_PAGE]: source('export default function ShopPage() { return null; }'),
+      [`${DEMO_TREE}/src/generated/client/index.ts`]: source('export {};'),
+    });
+
+    /** A policy with no entry any fixture below uses, so only the path rule can fire. */
+    const PATH_ONLY_POLICY = Object.freeze({ identifiers: ['UnusedWidget'], routePaths: [] });
+
+    /**
+     * @param {Record<string, string>} tooling Tooling files to add to the tree.
+     * @param {{ demo?: boolean }} [options] `demo: false` leaves the demo tree out.
+     * @returns {string}
+     */
+    function demoFileTree(tooling, options = {}) {
+      return makeTree({
+        ...artifacts(PATH_ONLY_POLICY),
+        ...(options.demo === false ? {} : DEMO_WORKSPACE),
+        ...tooling,
+      });
+    }
+
+    /**
+     * @param {{ file: string, line: number, column: number, match?: string }[]} findings
+     * @returns {[string, number, number, string|undefined][]}
+     */
+    function demoFileHits(findings) {
+      return byRule(findings, 'tooling-demo-file').map((finding) => [
+        finding.file,
+        finding.line,
+        finding.column,
+        finding.match,
+      ]);
+    }
+
+    it('is a documented rule id', () => {
+      expect(RULE_IDS).toContain('tooling-demo-file');
+    });
+
+    it('reports a demo file named in an extensionless root or .github configuration file', () => {
+      // An ignore list and review routing are keyed on paths, so a demo file named in either is a
+      // location recorded in tooling; the same entry as a glob ending in a wildcard is not.
+      const ignore = source('# formatter-owned files', MIGRATION, `${DEMO_TREE}/prisma/*.prisma`);
+      const owners = source(`/${LEDGER} @owner`, `/${DEMO_TREE}/ @owner`);
+      const root = demoFileTree({ '.prettierignore': ignore, '.github/CODEOWNERS': owners });
+
+      const scan = scanTooling(root);
+      expect(scan.failures).toEqual([]);
+      const ownersAt = positionOf(owners, LEDGER);
+      const ignoreAt = positionOf(ignore, MIGRATION);
+      expect(demoFileHits(scan.findings)).toEqual([
+        ['.github/CODEOWNERS', ownersAt.line, ownersAt.column, LEDGER],
+        ['.prettierignore', ignoreAt.line, ignoreAt.column, MIGRATION],
+      ]);
+    });
+
+    it('reports a root lint config whose comment names one demo file', () => {
+      const lint = source(
+        'export default [',
+        '  {',
+        `    // special lint for ${LEDGER}`,
+        `    files: ['${DEMO_TREE}/src/**/*.ts'],`,
+        "    rules: { 'no-console': 'off' },",
+        '  },',
+        '];',
+      );
+      const root = demoFileTree({ 'eslint.config.js': lint });
+
+      const scan = scanTooling(root);
+      expect(rulesOf(scan.findings)).toEqual(['tooling-demo-file']);
+      expect(scan.findings).toHaveLength(1);
+      const [finding] = scan.findings;
+      expect(finding.file).toBe('eslint.config.js');
+      expect(finding.match).toBe(LEDGER);
+      expect({ line: finding.line, column: finding.column }).toEqual(positionOf(lint, LEDGER));
+      expect(finding.message).toContain('names the demo file');
+      expect(finding.message).toContain(LEDGER);
+      expect(finding.hint).toContain('by workspace');
+      expect(finding.hint).toContain('docs/DEMO.md');
+      expect(finding.snippet).toContain('special lint for');
+      expect(scan.failures).toEqual([]);
+    });
+
+    it('reports a workflow step naming a demo migration file, and a relative path at its prefix', () => {
+      const workflow = source(
+        'name: ci',
+        'on: [push]',
+        'jobs:',
+        '  db:',
+        '    runs-on: ubuntu-latest',
+        '    steps:',
+        `      - run: psql -f ${MIGRATION}`,
+      );
+      const helper = source(`const target = '../../${LEDGER}';`, 'export default target;');
+      const root = demoFileTree({
+        '.github/workflows/db.yml': workflow,
+        'scripts/lib/target.mjs': helper,
+      });
+
+      const scan = scanTooling(root);
+      expect(demoFileHits(scan.findings)).toEqual([
+        ['.github/workflows/db.yml', ...Object.values(positionOf(workflow, MIGRATION)), MIGRATION],
+        [
+          'scripts/lib/target.mjs',
+          ...Object.values(positionOf(helper, `../../${LEDGER}`)),
+          `../../${LEDGER}`,
+        ],
+      ]);
+      expect(scan.failures).toEqual([]);
+    });
+
+    it('reports a glob whose last segment pins one existing demo file', () => {
+      const globs = source(
+        `export const itemPages = ['${DEMO_TREE}/app/items/*/page.tsx'];`,
+        `export const ledgers = ['${DEMO_TREE}/src/**/ledger.service.ts'];`,
+        `export const services = ['${DEMO_TREE}/src/{client,server}/services/ledger.service.ts'];`,
+        `export const pages = ['${DEMO_TREE}/app/*/page.tsx'];`,
+      );
+      const root = demoFileTree({ 'vitest.config.ts': globs });
+
+      const scan = scanTooling(root);
+      const hits = byRule(scan.findings, 'tooling-demo-file');
+      expect(hits.map((finding) => finding.match)).toEqual([
+        `${DEMO_TREE}/app/items/*/page.tsx`,
+        `${DEMO_TREE}/src/**/ledger.service.ts`,
+        `${DEMO_TREE}/src/{client,server}/services/ledger.service.ts`,
+        `${DEMO_TREE}/app/*/page.tsx`,
+      ]);
+      for (const finding of hits) {
+        expect(finding.message).toContain('pins a demo file with the glob');
+      }
+      expect(hits.map((finding) => finding.line)).toEqual([1, 2, 3, 4]);
+      expect(scan.failures).toEqual([]);
+    });
+
+    it('reports a bracketed literal path that exists as the file it names', () => {
+      const tasks = source('{', `  "label": "open ${ITEM_PAGE}"`, '}');
+      const root = demoFileTree({ '.vscode/tasks.json': tasks });
+
+      const scan = scanTooling(root);
+      expect(demoFileHits(scan.findings)).toEqual([
+        ['.vscode/tasks.json', ...Object.values(positionOf(tasks, ITEM_PAGE)), ITEM_PAGE],
+      ]);
+      // Resolved as a literal name, not matched as a character class.
+      expect(scan.findings[0]?.message).toContain('names the demo file');
+    });
+
+    it('allows the workspace, its directories, root configuration, wildcard globs and paths naming nothing', () => {
+      const workspaceConfig = source(
+        `// ${DEMO_TREE} is the instrumentation target.`,
+        `// ${DEMO_TREE}/ holds it, and ./${DEMO_TREE} is the same tree.`,
+        `export const surfaces = ['${DEMO_TREE}/src/**/*.tsx', '${DEMO_TREE}/app/**/*.tsx'];`,
+        `export const itemRoutes = '${DEMO_TREE}/app/items/*';`,
+        `export const itemDirectory = '${DEMO_TREE}/app/items/[id]';`,
+        `export const services = ['${DEMO_TREE}/src/server/services', '${DEMO_TREE}/src/server/services/'];`,
+        `export const manifest = '${DEMO_TREE}/package.json';`,
+        `export const nextConfig = '${DEMO_TREE}/next.config.ts';`,
+        `export const client = ['${DEMO_TREE}/src/generated/client/index.ts', '${DEMO_TREE}/src/generated/**'];`,
+        `export const missing = '${DEMO_TREE}/src/server/services/absent.service.ts';`,
+        `export const noMatch = '${DEMO_TREE}/app/items/*/absent.tsx';`,
+        `export const escapes = '${DEMO_TREE}/src/../src/server/services/ledger.service.ts';`,
+        `export const lookalike = 'foo-${LEDGER}';`,
+        `export const sibling = '${DEMO_TREE}-v2/src/server/services/ledger.service.ts';`,
+        `export const dotted = 'x.${LEDGER}';`,
+        // Longer than any file name can be: missing, not an uninspectable path.
+        `export const overlong = '${DEMO_TREE}/src/${'x'.repeat(300)}/ledger.service.ts';`,
+      );
+      const root = demoFileTree({ 'scripts/lib/workspace.mjs': workspaceConfig });
+
+      const scan = scanTooling(root);
+      expect(scan.findings).toEqual([]);
+      expect(scan.failures).toEqual([]);
+      expect(scan.notes).not.toContainEqual(expect.stringContaining('tooling-demo-file'));
+    });
+
+    it('drops trailing punctuation and a source location only when the longer form does not exist', () => {
+      const notes = source(
+        `// (see ${LEDGER}).`,
+        `// The total is computed at ${LEDGER}:12:5 today.`,
+        `// Pages: ${GROUP_PAGE}, and more.`,
+        `// The group directory (${DEMO_TREE}/app/(shop)). is allowed.`,
+        `// A missing file ${DEMO_TREE}/src/server/services/missing.service.ts. is not reported.`,
+      );
+      const root = demoFileTree({ 'scripts/lib/notes.mjs': notes });
+
+      const scan = scanTooling(root);
+      expect(demoFileHits(scan.findings)).toEqual([
+        ['scripts/lib/notes.mjs', 1, positionOnLine(notes, '(see', LEDGER).column, LEDGER],
+        ['scripts/lib/notes.mjs', 2, positionOnLine(notes, ':12:5', LEDGER).column, LEDGER],
+        ['scripts/lib/notes.mjs', 3, positionOf(notes, GROUP_PAGE).column, GROUP_PAGE],
+      ]);
+      expect(scan.failures).toEqual([]);
+    });
+
+    it(
+      'never follows a symbolic link to a file or directory in the demo tree',
+      { skip: !canCreateSymlinks },
+      () => {
+        const links = source(
+          `// ${DEMO_TREE}/src/linked.ts`,
+          `// ${DEMO_TREE}/src/linked-dir/outside.ts`,
+          `// ${DEMO_TREE}/src/*/outside.ts`,
+          `// ${DEMO_TREE}/src/**/outside.ts`,
+        );
+        const root = demoFileTree({
+          'scripts/lib/links.mjs': links,
+          'outside/outside.ts': source('export const outside = 1;'),
+        });
+        // Both links lead out of the demo tree to a real file.
+        symlinkSync('../../../outside/outside.ts', at(root, `${DEMO_TREE}/src/linked.ts`));
+        symlinkSync('../../../outside', at(root, `${DEMO_TREE}/src/linked-dir`));
+
+        const scan = scanTooling(root);
+        expect(scan.findings).toEqual([]);
+        expect(scan.failures).toEqual([]);
+      },
+    );
+
+    it('notes once, and reports nothing, when the demo tree is absent', () => {
+      const lint = source(`// ${LEDGER}`, `// again ${LEDGER}`, `// ${DEMO_TREE}/package.json`);
+      const root = demoFileTree(
+        {
+          'eslint.config.js': lint,
+          '.github/workflows/ci.yml': source('name: ci', `# ${LEDGER}`, `# ${MIGRATION}`),
+        },
+        { demo: false },
+      );
+
+      const scan = scanTooling(root);
+      expect(scan.findings).toEqual([]);
+      expect(scan.failures).toEqual([]);
+      const notes = scan.notes.filter((note) => note.includes('tooling-demo-file'));
+      expect(notes).toHaveLength(1);
+      expect(notes[0]).toContain(`${DEMO_TREE} is not present in this checkout`);
+      // Two distinct paths needed the tree; the workspace manifest did not.
+      expect(notes[0]).toContain('2 paths');
+    });
+
+    it('resolves each distinct path once per run, however often tooling names it', async () => {
+      const root = demoFileTree({
+        'eslint.config.js': source(`// ${LEDGER}`, `// ${LEDGER} again`),
+        '.github/workflows/ci.yml': source('name: ci', `# ${LEDGER}`),
+        'scripts/lib/one.mjs': source(`// ${LEDGER}`),
+      });
+      let ledgerStats = 0;
+
+      await withInjectedFs(
+        (real) => ({
+          lstatSync: /** @type {typeof real.lstatSync} */ (
+            (/** @type {any} */ target, /** @type {any} */ options) => {
+              if (typeof target === 'string' && target.endsWith('ledger.service.ts')) {
+                ledgerStats += 1;
+              }
+              return real.lstatSync(target, options);
+            }
+          ),
+        }),
+        async (injected) => {
+          const scan = injected.scanTooling(root);
+          // Every sighting is reported where it stands...
+          expect(byRule(scan.findings, 'tooling-demo-file')).toHaveLength(4);
+          // ...but the file was inspected once.
+          expect(ledgerStats).toBe(1);
+        },
+      );
+    });
+
+    it(
+      'fails closed when a demo entry cannot be inspected or a directory cannot be listed',
+      astCase(),
+      async () => {
+        const root = demoFileTree({
+          'eslint.config.js': source(`// ${LEDGER}`),
+          'vitest.config.ts': source(`export const pages = ['${DEMO_TREE}/app/items/*/page.tsx'];`),
+          'apps/local-service/src/sessions/limits.ts': TOOLING_CASE_PRODUCT_FILE,
+        });
+
+        await withInjectedFs(
+          (real) => ({
+            lstatSync: /** @type {typeof real.lstatSync} */ (
+              (/** @type {any} */ target, /** @type {any} */ options) => {
+                if (typeof target === 'string' && target.endsWith('ledger.service.ts')) {
+                  throw Object.assign(new Error(`EACCES: injected failure, lstat '${target}'`), {
+                    code: 'EACCES',
+                    syscall: 'lstat',
+                    path: target,
+                  });
+                }
+                return real.lstatSync(target, options);
+              }
+            ),
+            readdirSync: readdirSyncFailingDirectory(real, 'items'),
+          }),
+          async (injected) => {
+            const scan = injected.scanTooling(root);
+            expect(scan.findings).toEqual([]);
+            const [unreadable] = failuresFor(scan.failures, LEDGER);
+            expect(unreadable?.reason).toBe('unreadable-file');
+            expect(unreadable?.detail).toContain('EACCES');
+            expect(unreadable?.detail).toContain('eslint.config.js');
+            const [unlisted] = failuresFor(scan.failures, `${DEMO_TREE}/app/items`);
+            expect(unlisted?.reason).toBe('unreadable-directory');
+            expect(unlisted?.detail).toContain('vitest.config.ts');
+
+            const result = await injected.check(root, { stale: false });
+            expect(result.findings).toEqual([]);
+            expect(result.exitCode).toBe(EXIT_ERROR);
+          },
+        );
+      },
+    );
+
+    it('fails closed when the demo tree exists but is not a directory', () => {
+      const root = makeTree({
+        ...artifacts(PATH_ONLY_POLICY),
+        [DEMO_TREE]: 'not a directory\n',
+        'eslint.config.js': source(`// ${LEDGER}`),
+      });
+
+      const scan = scanTooling(root);
+      expect(scan.findings).toEqual([]);
+      expect(failuresFor(scan.failures, DEMO_TREE).map((failure) => failure.reason)).toEqual([
+        'not-a-directory',
+      ]);
+    });
+
+    it('fails the gate through check() and the command line', astCase(), async () => {
+      const root = demoFileTree({
+        'eslint.config.js': source(`// special lint for ${LEDGER}`),
+        'apps/local-service/src/sessions/limits.ts': TOOLING_CASE_PRODUCT_FILE,
+      });
+
+      const result = await check(root, { stale: false });
+      expect(result.exitCode).toBe(EXIT_FINDINGS);
+      expect(rulesOf(result.findings)).toEqual(['tooling-demo-file']);
+      expect(result.failures).toEqual([]);
+
+      const cli = await runCli([], root);
+      expect(cli.code).toBe(EXIT_FINDINGS);
+      expect(cli.stdout).toContain('eslint.config.js:1:21: tooling-demo-file');
+      expect(cli.stdout).toContain('docs/DEMO.md');
+    });
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
  * policy-stale
  * ---------------------------------------------------------------------------------------------- */
 
@@ -1677,6 +2366,13 @@ describe('command line', () => {
     expect(cli.stdout).toContain(ALLOWLIST_FILE);
     expect(cli.stdout).toContain(QUESTION_EXEMPT_FILE);
     expect(cli.stdout).toContain(FIXTURE_TREE);
+    expect(cli.stdout).toContain('Scanned as repository tooling');
+    for (const tree of TOOLING_TREES) {
+      expect(cli.stdout).toContain(`  ${tree}/ (the same extensions and names, recursively)`);
+    }
+    expect(cli.stdout).toContain('.editorconfig');
+    expect(cli.stdout).toContain('CODEOWNERS');
+    expect(cli.stdout).toContain('docs/DEMO.md');
   });
 
   it('rejects an unknown flag with the environment exit code', async () => {
@@ -1700,6 +2396,52 @@ describe('command line', () => {
     expect(rulesOf(report.findings)).toEqual(['policy-identifier', 'question-branch']);
     expect(report.root).toBe(root);
   });
+
+  it(
+    'runs the gate when invoked through a symbolically linked checkout',
+    {
+      skip: !canCreateSymlinks || !astScan.available || TS_MORPH_WORKSPACE === null,
+      timeout: AST_TIMEOUT_MS,
+    },
+    () => {
+      // Node reports the module's own URL as a real path but leaves argv[1] as
+      // typed. An entry-point guard comparing the two as they come skips `main`
+      // under any linked path and exits 0 having checked nothing - so this case
+      // runs a copy of the script as its own process, through a link to its
+      // checkout, and requires the violation to be reported.
+      const workspace = /** @type {string} */ (TS_MORPH_WORKSPACE);
+      const root = makeTree({
+        ...artifacts({ identifiers: ['RecommendationsRail'] }),
+        'apps/local-service/src/panels/generate.ts': DELIBERATE_CHEAT,
+        // The copy resolves ts-morph from its own checkout, through this
+        // manifest; the walk prunes `node_modules` by name before its symbolic
+        // link rule, so the link below never reaches the scan.
+        [`${workspace}/package.json`]: '{"name":"fixture","private":true}\n',
+        [SCRIPT_FILE]: readFileSync(at(DEFAULT_ROOT, SCRIPT_FILE), 'utf8'),
+      });
+      symlinkSync(
+        at(DEFAULT_ROOT, `${workspace}/node_modules`),
+        at(root, `${workspace}/node_modules`),
+      );
+      const linkParent = mkdtempSync(path.join(os.tmpdir(), 'debuggen-nohc-entry-'));
+      temporaryRoots.push(linkParent);
+      const linkedRoot = path.join(linkParent, 'checkout');
+      symlinkSync(root, linkedRoot);
+
+      const run = spawnSync(process.execPath, [at(linkedRoot, SCRIPT_FILE)], {
+        cwd: os.tmpdir(),
+        encoding: 'utf8',
+        timeout: AST_TIMEOUT_MS,
+      });
+
+      expect(run.error).toBeUndefined();
+      expect(run.stderr).toBe('');
+      expect(run.status).toBe(EXIT_FINDINGS);
+      expect(run.stdout).toContain('apps/local-service/src/panels/generate.ts');
+      expect(run.stdout).toContain('policy-identifier');
+      expect(run.stdout).toContain('question-branch');
+    },
+  );
 });
 
 /* -------------------------------------------------------------------------------------------------
@@ -2196,9 +2938,11 @@ describe('fail-closed scanning', () => {
     },
   );
 
-  it('stops a run that found nothing to scan at all', astCase(), async () => {
+  it('stops a run that found no product file to scan at all', astCase(), async () => {
     // Artifacts and nothing else: no product tree, so the gate has no subject
-    // and "0 violations" would be a statement about an empty set.
+    // and "0 violations" would be a statement about an empty set. The tooling
+    // pass reads the allowlist beside the policy, and that does not make the
+    // run a subject: the gate exists for the product.
     const root = makeTree(artifacts({ identifiers: ['RecommendationsRail'] }));
 
     const result = await check(root, { stale: false });
@@ -2206,7 +2950,10 @@ describe('fail-closed scanning', () => {
     expect(failure).toBeDefined();
     expect(failure.reason).toBe('no-subject');
     expect(failure.detail).toContain('not evidence');
-    expect(result.filesScanned).toBe(0);
+    expect(result.sourceFilesScanned).toBe(0);
+    expect(result.structuredFilesScanned).toBe(0);
+    expect(result.toolingFilesScanned).toBe(1);
+    expect(result.filesScanned).toBe(1);
     expect(result.ok).toBe(false);
     expect(result.exitCode).toBe(EXIT_ERROR);
 

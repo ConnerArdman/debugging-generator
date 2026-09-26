@@ -33,14 +33,34 @@
  * | --- | --- | --- |
  * | `* → capturing` | {@link SessionManager.startCapture} | a capture row must open and ownership must be claimed |
  * | `capturing → analyzing \| ready` | {@link SessionManager.stopCapture} | the capture row must close with its summary and ownership must be released |
- * | `* → ended` | {@link SessionManager.end} | cleanup must run first (AAP §0.5.1) |
+ * | `* → ended` | {@link SessionManager.end} | cleanup must run first (AAP §0.5.1), then the dev servers launched for the session are released (AAP §0.7.1 Group 2) — an incomplete release reports the cleanup `partial` |
  *
- * A transition into `failed` from `capturing` closes the open capture and
- * releases ownership in the same step, so a failed session never blocks its
- * project. It also emits the stage's `failed` progress row through
- * `./progress.ts` — protocol's `SessionRecord` has no failure field, so that
- * persisted row is how the failing stage reaches both user interfaces
- * (AAP §0.5.5).
+ * A transition into `failed` closes the open capture window and commits the
+ * `failed` status in **one store transaction**, then releases ownership, so a
+ * failed session never blocks its project. When the window cannot be closed
+ * the whole transition is refused: the status, the open window and the
+ * project's ownership all stay as they were, no progress row is emitted, and
+ * stopping or ending the session retries the closure. A committed transition
+ * emits the stage's `failed` progress row through `./progress.ts` — protocol's
+ * `SessionRecord` has no failure field, so that persisted row is how the
+ * failing stage reaches both user interfaces (AAP §0.5.5).
+ *
+ * ## Store atomicity and ownership
+ *
+ * Every lifecycle-owned edge writes a capture window and a session record
+ * together, and does so inside `SessionsRepo.transaction`: opening a window
+ * with the move to `capturing`, closing one with the move to
+ * `analyzing | ready | failed`, closing one with the record mirror before
+ * cleanup on `end`. A refused second write rolls the first back, so no window
+ * stays open for a start whose status was refused, and no window stays closed
+ * for a stop or a failure whose status change was refused. (An `end` whose
+ * cleanup fails after its closure committed leaves the session un-ended with
+ * its window closed; the next stop or end picks that window up again.)
+ * The in-memory owner index changes only **after** the store commits — claimed
+ * after the start commits, released after the closure commits — and a frame
+ * is broadcast only after that, so no client is told a capture started or
+ * stopped that the store does not hold, and no competing session is admitted
+ * to a project whose window is still open.
  *
  * ## Layering
  *
@@ -98,7 +118,9 @@ import type {
 import {
   CAPTURE_CONFLICT_ERROR_CODE,
   createEnvelope,
+  followUpAttemptIdSchema,
   isCleanupStatus,
+  isFollowUpAnswered,
   parseSessionRecord,
   type AnalysisResult,
   type BoundTab,
@@ -135,14 +157,20 @@ import {
 import type { CaptureSummary } from '@debuggen/telemetry';
 
 import { PROVIDER_REQUIREMENTS, type ServiceConfig } from '../config.js';
-import { sessionLogger, subsystemLogger } from '../logging.js';
+import { describeException, guardLogger, sessionLogger, subsystemLogger } from '../logging.js';
 import {
   MAX_SESSION_LIST_LIMIT,
   type ListSessionsOptions,
+  type OpenCaptureWindow,
   type SessionListItem,
   type SessionsRepo,
 } from '../store/sessions-repo.js';
-import type { ProgressBroadcaster, SessionProgress } from './progress.js';
+import {
+  authorProductText,
+  isProductAuthoredText,
+  type ProgressBroadcaster,
+  type SessionProgress,
+} from './progress.js';
 import {
   isTerminalSessionStatus,
   statusForStage,
@@ -226,6 +254,41 @@ export interface SessionCleanupRunner {
   run(sessionId: string): Promise<Result<SessionCleanupOutcome, DebuggenError>>;
 }
 
+/**
+ * Releases the dev servers launched for a session when it ends — the "child
+ * lifecycle tied to the session" of AAP §0.7.1 Group 2.
+ *
+ * Satisfied structurally by `apps/local-service/src/dev-server/launcher.ts`:
+ * it stops every child that was launched for sessions and that no other live
+ * session still relies on, and revokes that child's `server-agent` credential.
+ * A dev server the developer launched without naming a session is not
+ * touched, so the application keeps serving with the inert preload after the
+ * session ends (AAP §0.5.1).
+ *
+ * The release runs once the project's files are restored and never stops the
+ * session from ending. A release that reports a failure — typically a stopped
+ * child whose credential could not be revoked yet — makes the session's
+ * cleanup `partial` until {@link whenReleased} confirms the credential no
+ * longer authenticates, when the cleanup report is completed. A service that
+ * stops before then leaves the report `partial` in the store, and the next
+ * start completes it ({@link SessionManager.settleIncompleteCleanups}) once
+ * the leases of the stopped service are revoked.
+ *
+ * Only `end` releases. A `failed` session keeps its dev server: `failed` is
+ * retryable (AAP §0.5.5), and the retry needs the server the session was
+ * capturing from; ending the failed session releases it like any other, and
+ * the service's shutdown stops every child it launched regardless.
+ */
+export interface SessionDevServerRelease {
+  stopForSession(sessionId: string): Promise<Result<unknown, DebuggenError>>;
+  /**
+   * Resolves once the credentials of the dev servers {@link stopForSession}
+   * stopped for the session no longer authenticate. Optional: without it an
+   * incomplete release stays reported as `partial`.
+   */
+  whenReleased?(sessionId: string): Promise<void>;
+}
+
 // ---------------------------------------------------------------------------
 // Section B — inputs, outputs and the manager's public surface
 // ---------------------------------------------------------------------------
@@ -240,6 +303,11 @@ export interface SessionManagerDeps {
   readonly progress: SessionProgress;
   /** Runs cleanup on `end`. Absent in unit contexts, where cleanup is honestly reported `pending`. */
   readonly cleanup?: SessionCleanupRunner | undefined;
+  /**
+   * Stops the dev servers launched for a session after it has ended. Absent
+   * in unit contexts, which launch none.
+   */
+  readonly devServers?: SessionDevServerRelease | undefined;
   /** The provider provenance a session defaults to when its creator names none. */
   readonly config?: Pick<ServiceConfig, 'provider' | 'model'> | ServiceConfig | undefined;
   /** The service logger; defaults to `noopLogger`. Bound to `subsystem: "sessions"`. */
@@ -384,6 +452,101 @@ export function isCaptureConflict(error: unknown): error is CaptureConflictError
 }
 
 /**
+ * Where one ask of a follow-up attempt goes on a session's ladder: a new
+ * entry, or a retry in place of the entry at `index`.
+ */
+export type FollowUpAttemptPlacement =
+  | { readonly kind: 'new' }
+  | { readonly kind: 'retry'; readonly index: number; readonly previous: FollowUpRecord };
+
+/** The `details.reason` of each refusal {@link placeFollowUpAttempt} can return. */
+export const FOLLOW_UP_ATTEMPT_REFUSALS = Object.freeze({
+  /** The attempt id is not an identifier protocol accepts. */
+  invalid: 'follow-up-attempt-invalid',
+  /** The attempt was answered already: asking it again would duplicate it. */
+  answered: 'follow-up-attempt-answered',
+  /** A later follow-up followed the attempt, so its outcome could not be linked to it. */
+  superseded: 'follow-up-attempt-superseded',
+} as const);
+
+/**
+ * Decides how {@link SessionManager.appendFollowUp} records an ask of
+ * `attemptId` against `followUps`, without writing anything — the one
+ * definition of the follow-up idempotency rule, applied by the manager when it
+ * records the ask and by the pipeline orchestrator before it starts a
+ * follow-up at all, so a refused ask runs nothing and files no failure.
+ *
+ * - No entry carries `attemptId` → `new`.
+ * - The **latest** entry carries it and is unanswered (protocol's
+ *   `isFollowUpAnswered`) → `retry` of that entry.
+ * - An answered entry carries it → refused: the attempt already has its
+ *   answer, and a second run would append a second analysis and panel to one
+ *   question.
+ * - An earlier, unanswered entry carries it → refused: outcome links are
+ *   stamped on the latest follow-up, so reviving an earlier one would
+ *   misassociate the next analysis and panel.
+ *
+ * Only identifiers are compared; the question text is never read (AAP §0.5.4).
+ *
+ * @param sessionId The session, for the refusal's details.
+ * @param followUps The session's follow-up ladder.
+ * @param attemptId The attempt the ask names.
+ * @returns The placement, or `Err`: `PROTOCOL_INVALID_MESSAGE` for a malformed
+ * id, `SESSION_INVALID_STATE` with a {@link FOLLOW_UP_ATTEMPT_REFUSALS} reason
+ * for an answered or superseded attempt.
+ *
+ * @example
+ * ```ts
+ * const placed = placeFollowUpAttempt(session.id, session.followUps, attemptId);
+ * if (!placed.ok) return placed;                 // 409: answered or superseded
+ * placed.value.kind === 'retry';                 // the failed attempt, in place
+ * ```
+ */
+export function placeFollowUpAttempt(
+  sessionId: SessionId,
+  followUps: readonly FollowUpRecord[],
+  attemptId: string,
+): Result<FollowUpAttemptPlacement, DebuggenError> {
+  if (!followUpAttemptIdSchema.safeParse(attemptId).success) {
+    return err(
+      new DebuggenError('PROTOCOL_INVALID_MESSAGE', 'The follow-up attempt id is malformed.', {
+        hint: 'Send the follow-up again from the Debug Generator view; it mints a fresh attempt id.',
+        details: { sessionId, reason: FOLLOW_UP_ATTEMPT_REFUSALS.invalid },
+      }),
+    );
+  }
+
+  const index = followUps.findIndex((entry) => entry.attemptId === attemptId);
+  const previous = followUps[index];
+
+  if (index === -1 || previous === undefined) {
+    return ok({ kind: 'new' });
+  }
+
+  if (isFollowUpAnswered(previous)) {
+    return err(
+      invalidState(
+        'This follow-up was already answered, so it is not asked again.',
+        'Its answer is in the session. To ask something more, send it as a new follow-up question.',
+        { sessionId, reason: FOLLOW_UP_ATTEMPT_REFUSALS.answered },
+      ),
+    );
+  }
+
+  if (index !== followUps.length - 1) {
+    return err(
+      invalidState(
+        'A later follow-up was asked after this one, so this one can no longer be retried.',
+        'Ask the question again as a new follow-up.',
+        { sessionId, reason: FOLLOW_UP_ATTEMPT_REFUSALS.superseded },
+      ),
+    );
+  }
+
+  return ok({ kind: 'retry', index, previous });
+}
+
+/**
  * The session manager of one service process.
  *
  * Every method answers with a `Result`; none throws for an expected condition.
@@ -397,15 +560,43 @@ export interface SessionManager {
    * Called once by `src/main.ts` at the wiring step of its start-up order —
    * after the store is migrated and modification reconciliation has run — so a
    * service restart can neither lose nor duplicate a capture owner. Idempotent:
-   * a second call rebuilds the same index. An open row on a session that is
-   * not `capturing` is the orphan of an interrupted start and is closed rather
-   * than indexed. The index is also built lazily on first use, so a caller that
-   * never hydrates still gets a correct answer.
+   * a second call rebuilds the same index.
    *
-   * @returns `ok` once every readable session was indexed, or the first store
-   * error (after indexing everything that could be read).
+   * The open windows are read in one indexed statement; no session without an
+   * open window is read, paged or probed. An open window on a session that is
+   * not `capturing` is the orphan of an interrupted start or stop and is closed
+   * together with its record mirror rather than indexed — unless the store
+   * refuses to close it, in which case its session is indexed as the project's
+   * owner so no competing capture starts until the window is verifiably
+   * closed. The index is also built lazily on first use, so a caller that
+   * never hydrates still gets a correct answer, and a start is refused while
+   * it cannot be built.
+   *
+   * @returns `ok` once every open window was indexed or closed; the first
+   * store error that kept an orphan open (with the index in place); or the
+   * store error that kept the open windows from being read, in which case the
+   * previous index is kept.
    */
   hydrate(): Promise<Result<void, DebuggenError>>;
+
+  /**
+   * Settles the cleanup report of every ended session the previous service
+   * left `partial` — typically because a stopped dev server's credential was
+   * still authenticating when that service stopped, so the report could never
+   * be completed in memory (see {@link SessionDevServerRelease}).
+   *
+   * Called once by `src/main.ts` at start-up, after modification
+   * reconciliation and after the access boundary revoked every lease no
+   * running service holds — the two things an ended session's `partial` can
+   * wait for. Each such session's cleanup runner is run again (idempotent:
+   * restored records stay restored) and its verdict replaces the report when
+   * it knows more than `partial`; a session the runner still reports
+   * `partial`, or cannot run for, keeps its report.
+   *
+   * @returns How many reports were settled, or the store error that stopped the
+   * pass (after settling everything read before it).
+   */
+  settleIncompleteCleanups(): Promise<Result<number, DebuggenError>>;
 
   /**
    * Creates a session in status `created` and broadcasts `session.created`.
@@ -428,8 +619,13 @@ export interface SessionManager {
    * The state machine's refusal is propagated unchanged. A lifecycle-owned
    * edge (see the module overview) is refused with `SESSION_INVALID_STATE`
    * naming the method that owns it. A transition into `failed` requires
-   * `context.failure`, emits that stage's `failed` progress row and closes an
-   * open capture. Broadcasts `session.updated`.
+   * `context.failure`; it closes an open capture window and commits `failed`
+   * in one store transaction, then releases the project's capture ownership
+   * and emits that stage's `failed` progress row. When the window cannot be
+   * closed (or the status cannot be stored) the transition is refused with
+   * the store's error and nothing changes: the status, the open window and
+   * the ownership stay, and no progress row is emitted. Broadcasts
+   * `session.updated` after the commit.
    */
   transitionTo(
     sessionId: SessionId,
@@ -448,6 +644,11 @@ export interface SessionManager {
    * table and on the record — and broadcasts `session.updated`. Plans are
    * append-only; computing a follow-up delta is `pipeline/stages/followup.ts`'s
    * job, not this method's.
+   *
+   * The plan row and the record that mirrors it are written in one transaction
+   * (`SessionsRepo.insertPlanWithRecord`), so an `Err` from the store or the
+   * session contract means neither was written. Only a failure after that
+   * commit — none is expected — can answer `Err` with the plan recorded.
    */
   recordPlan(
     sessionId: SessionId,
@@ -455,13 +656,36 @@ export interface SessionManager {
   ): Promise<Result<RecordedPlan, DebuggenError>>;
 
   /**
-   * Records a follow-up question — in the store's `followups` table and on the
-   * record — and broadcasts `session.updated`. The question is stored, never
-   * inspected.
+   * Records one ask of a follow-up **attempt** — in the store's `followups`
+   * table and on the record — and broadcasts `session.updated`. The question is
+   * stored, never inspected.
+   *
+   * The attempt is identified by `attemptId` (protocol's
+   * `followUpAttemptIdSchema`) and by nothing else: never by the question's
+   * text (AAP §0.5.4), its time, the session's status or the entry's position.
+   * {@link placeFollowUpAttempt} decides, against the session's ladder:
+   *
+   * | `attemptId` names … | Recorded as … |
+   * | --- | --- |
+   * | no entry | a new entry appended, `attempt: 1`, and one new `followups` row |
+   * | the latest entry, unanswered | a retry **in place**: the same entry and the same `followups` row (`SessionsRepo.replaceFollowUpAttempt`), `attempt + 1`, this ask's question and `askedAt` |
+   * | an answered entry | refused, `SESSION_INVALID_STATE`, reason `follow-up-attempt-answered` |
+   * | an unanswered entry a later one followed | refused, `SESSION_INVALID_STATE`, reason `follow-up-attempt-superseded` |
+   *
+   * So the ladder and the table hold one entry and one row per question asked,
+   * however many times it is retried, and a caller detects that this ask was
+   * recorded by the entry's `attempt` counter growing — never by the ladder's
+   * length or a timestamp, which two asks in one millisecond share.
+   *
+   * @param sessionId The session.
+   * @param question The question as the developer asked it this time.
+   * @param attemptId The attempt's identity: fresh for a new question, the
+   *   failed attempt's own for a retry.
    */
   appendFollowUp(
     sessionId: SessionId,
     question: string,
+    attemptId: string,
   ): Promise<Result<SessionRecord, DebuggenError>>;
 
   /**
@@ -494,23 +718,38 @@ export interface SessionManager {
   captureOwnerForProject(projectRoot: string): CaptureOwner | undefined;
 
   /**
-   * Opens a capture window, claims the project's capture ownership and moves
-   * the session to `capturing`; broadcasts `session.updated` then
-   * `capture.started`.
+   * Opens a capture window and moves the session to `capturing` in one store
+   * transaction, then claims the project's capture ownership; broadcasts
+   * `session.updated` then `capture.started`.
+   *
+   * The window is opened with the store's own project-exclusivity check, so a
+   * window another session holds on the project — one the owner index has not
+   * seen — refuses the start too, and that session becomes the indexed owner.
+   * A refused status commit rolls the window back: no orphan window and no
+   * owner is left behind. When the owner index cannot be read from the store
+   * the start is refused: refusing a capture is recoverable, a second
+   * concurrent capture on the project is not.
    *
    * @returns The new capture's id, or `Err`: a {@link CaptureConflictError}
    * when another session owns the project's capture; `SESSION_INVALID_STATE`
    * when this session already holds one (with its `captureId` in `details`),
-   * has no plan, or may not move to `capturing` from its status.
+   * has no plan, or may not move to `capturing` from its status; the store's
+   * error when the index, the window or the status cannot be read or written.
    */
   startCapture(
     sessionId: SessionId,
   ): Promise<Result<{ readonly captureId: CaptureId }, DebuggenError>>;
 
   /**
-   * Closes the session's capture window with its summary, releases the
-   * project's ownership, broadcasts `capture.stopped` and moves the session to
-   * `options.next` (broadcasting `session.updated`).
+   * Closes the session's capture window with its summary and moves the
+   * session to `options.next` in one store transaction; only after that
+   * commit does it release the project's ownership, broadcast
+   * `capture.stopped` and then `session.updated`.
+   *
+   * When either write is refused nothing changes: the window stays open, the
+   * status stays `capturing`, the project stays owned by this session, no
+   * frame is sent, and the store's error is returned — so stopping again
+   * retries the whole step.
    */
   stopCapture(
     sessionId: SessionId,
@@ -518,10 +757,13 @@ export interface SessionManager {
   ): Promise<Result<CaptureRecord, DebuggenError>>;
 
   /**
-   * Ends a session: closes any open capture, runs cleanup, records its
-   * outcome and moves the session to `ended`. Idempotent — ending an ended
-   * session returns its stored record and cleanup without re-running
-   * anything — and concurrent calls share one run.
+   * Ends a session: closes any open capture window together with the record
+   * that mirrors it (one store transaction) and releases the project's
+   * ownership, runs cleanup, records its outcome and moves the session to
+   * `ended`. When the window cannot be closed the end is refused before
+   * cleanup runs, with ownership retained, so ending again retries.
+   * Idempotent — ending an ended session returns its stored record and
+   * cleanup without re-running anything — and concurrent calls share one run.
    */
   end(sessionId: SessionId): Promise<Result<SessionEndResult, DebuggenError>>;
 
@@ -545,7 +787,10 @@ export interface SessionManager {
   /**
    * Moves the session to `failed` for `failure` — the stage, code, message and
    * hint both user interfaces render — emitting that stage's `failed` progress
-   * row. A stage failure surfaces this way, never as a partial success.
+   * row. A stage failure surfaces this way, never as a partial success. The
+   * same guarantees as {@link SessionManager.transitionTo} into `failed`: an
+   * open capture window that cannot be closed refuses the move, and the
+   * session keeps its status, its window and its project's ownership.
    */
   fail(
     sessionId: SessionId,
@@ -599,6 +844,44 @@ const CAPTURE_STOP_TARGETS: ReadonlySet<string> = new Set<CaptureStopNext>(['ana
 /** The message a stage failure falls back to when a caught error carried none. */
 const CLEANUP_FAILURE_FALLBACK = 'Cleanup could not finish for this session.';
 
+/** The message an incomplete dev-server release falls back to when its error carried none. */
+const DEV_SERVER_RELEASE_FAILURE_FALLBACK =
+  'The dev server launched for this session could not be fully released.';
+
+/** The hint an incomplete dev-server release falls back to when its error carried none. */
+const DEV_SERVER_RELEASE_FAILURE_HINT =
+  'Stop the dev server from its terminal, or restart the Debug Generator service; the service log holds the reason.';
+
+/**
+ * The cleanup outcome of a session whose files are restored but whose stopped
+ * dev server's credential still authenticates: a `clean` outcome becomes
+ * `partial`, because not everything the session set up is undone yet. A
+ * `conflict` (an edited file left in place) or `pending` outcome says more and
+ * is kept.
+ */
+function withIncompleteRelease(outcome: SessionCleanupOutcome): SessionCleanupOutcome {
+  return outcome.status === 'clean' ? { ...outcome, status: 'partial' } : outcome;
+}
+
+/**
+ * The next step a cleanup failure's `failed` row shows when the failure
+ * carried no hint `./progress.ts` can prove the product wrote
+ * (`isProductAuthoredText`): cleanup leaves the session open, so ending it
+ * again is always the retry.
+ *
+ * Registered through `authorProductText` each time a failure is filed with it
+ * rather than once at load, so the row's projection recognises it however many
+ * texts other builders registered in between.
+ */
+const CLEANUP_RETRY_HINT = 'End the session again to retry cleanup.';
+
+/**
+ * The hint of a cleanup outcome outside the cleanup vocabulary: a product
+ * sentence, registered where the failure is built so its row may show it.
+ */
+const INVALID_CLEANUP_OUTCOME_HINT =
+  'End the session again to retry cleanup; the modification journal still holds every change.';
+
 /**
  * The capture-owner index key of a project root: POSIX separators, lexically
  * normalised. A created session's `projectRoot` is already in this form, so
@@ -608,24 +891,43 @@ function projectKey(projectRoot: string): string {
   return normalizePosix(toPosix(projectRoot));
 }
 
-/** The refusal for an id that names no stored session. */
+/**
+ * The refusal for an id that names no stored session. Its sentences are
+ * registered with `authorProductText`, so a failure surface proves them
+ * product copy and shows them verbatim.
+ */
 function sessionNotFound(sessionId: SessionId): DebuggenError {
-  return new DebuggenError('SESSION_NOT_FOUND', 'No debugging session with this id exists.', {
-    hint: 'Reopen the session from the Sessions view or start a new one; a session older than the retention window is purged.',
-    details: { sessionId },
-  });
+  return new DebuggenError(
+    'SESSION_NOT_FOUND',
+    authorProductText('No debugging session with this id exists.'),
+    {
+      hint: authorProductText(
+        'Reopen the session from the Sessions view or start a new one; a session older than the retention window is purged.',
+      ),
+      details: { sessionId },
+    },
+  );
 }
 
 /**
  * A request the session's current state does not admit. `reason` is the
  * machine-readable cause a caller or a test tells refusals apart by.
+ *
+ * Every caller passes sentences this module composed from its own literals
+ * and closed values (a session status, an operation name), so both are
+ * registered with `authorProductText` here: an HTTP refusal or a failed row
+ * then proves them product copy and shows them as written. Never pass text a
+ * collaborator or an exception supplied.
  */
 function invalidState(
   message: string,
   hint: string,
   details: Readonly<Record<string, unknown>> & { readonly reason: string },
 ): DebuggenError {
-  return new DebuggenError('SESSION_INVALID_STATE', message, { hint, details });
+  return new DebuggenError('SESSION_INVALID_STATE', authorProductText(message), {
+    hint: authorProductText(hint),
+    details,
+  });
 }
 
 /** The refusal for a mutation of a session that has ended. */
@@ -764,10 +1066,13 @@ function lifecycleOwnerOf(from: SessionStatus, to: SessionStatus): string | unde
   return undefined;
 }
 
-/** The conflict another session's capture on the same project produces. */
+/**
+ * The conflict another session's capture on the same project produces —
+ * whether the owner index or the store's own project check found it.
+ */
 function captureConflict(
   sessionId: SessionId,
-  owner: CaptureOwner,
+  owningSessionId: SessionId,
   projectRoot: string,
 ): CaptureConflictError {
   return new DebuggenError(
@@ -777,7 +1082,7 @@ function captureConflict(
       hint: 'Stop or end the capture in the other session, then start this capture again.',
       details: {
         sessionId,
-        owningSessionId: owner.sessionId,
+        owningSessionId,
         projectRoot,
         reason: 'project-capture-owned',
       },
@@ -825,7 +1130,9 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
   const { sessions, broadcaster, progress } = deps;
   const clock = deps.now ?? nowEpochMs;
   const mintId = deps.newId ?? newSessionId;
-  const log = subsystemLogger(deps.logger ?? noopLogger, LOG_SUBSYSTEM);
+  // Guarded before the child is derived, so no record written here — the
+  // clock fallback's included — can throw into a session change.
+  const log = subsystemLogger(guardLogger(deps.logger ?? noopLogger), LOG_SUBSYSTEM);
 
   /**
    * The capture-owner index: normalised project root → the session holding
@@ -833,10 +1140,16 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
    * authority; this map is the synchronous index the exclusivity decision is
    * made against, so that no `await` separates checking from claiming.
    *
-   * Ownership is released on **every** exit path — `stopCapture`, `end`, a
-   * transition into `failed`, and a `startCapture` whose transition could not
-   * be applied — which `apps/local-service/test/integration/concurrency.test.ts`
-   * proves.
+   * The map follows the store and never leads it. An entry is claimed only
+   * after `startCapture`'s window-and-status transaction has committed, and
+   * released on **every** exit path — `stopCapture`, `end`, a transition into
+   * `failed` — only after the transaction that closes the window has
+   * committed. A closure the store refuses leaves the entry in place, so a
+   * window that is still open keeps refusing competing captures on its
+   * project until it is verifiably closed; a refused start leaves no entry
+   * because its window was rolled back with it.
+   * `apps/local-service/test/integration/concurrency.test.ts` proves both
+   * halves, including with the store's closure blocked.
    */
   const owners = new Map<string, CaptureOwner>();
   let indexed = false;
@@ -856,9 +1169,13 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
       if (Number.isFinite(value) && value > 0) {
         return value;
       }
-    } catch {
-      // Fall through: an injected clock is a test seam, and its failure must
-      // not cost the developer a session change.
+    } catch (thrown) {
+      // An injected clock is a test seam, and its failure must not cost the
+      // developer a session change: the wall clock stamps it instead, and the
+      // substitution is recorded by the thrown value's closed class only.
+      log.debug('the injected clock threw; the wall clock stamps this change', {
+        ...describeException(thrown),
+      });
     }
 
     return nowEpochMs();
@@ -939,19 +1256,32 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
     return stored;
   }
 
+  /** A status change the store has committed and nobody has been told about yet. */
+  interface CommittedTransition {
+    /** The status the session left. */
+    readonly from: SessionStatus;
+    /** The record as stored, carrying the new status. */
+    readonly session: SessionRecord;
+    /** The evidence the transition was judged against; carries a `failed` edge's failure. */
+    readonly context: SessionTransitionContext;
+    /** The manager operation that made the change, for the log line. */
+    readonly operation: string;
+  }
+
   /**
-   * The one status applier every status change goes through: the state
-   * machine decides, `commit` persists the status together with `changes`,
-   * the failing stage's progress row is emitted for a transition into
-   * `failed`, and `session.updated` is broadcast last.
+   * The commit half of the one status applier every status change goes
+   * through: the state machine decides and `commit` persists the status
+   * together with `changes`. It emits no progress row and broadcasts no frame,
+   * so it can run inside a `SessionsRepo.transaction` whose rollback must
+   * leave nothing behind but a log line.
    */
-  function applyTransition(
+  function commitTransition(
     record: SessionRecord,
     to: SessionStatus,
     context: SessionTransitionContext,
     changes: Partial<Omit<SessionRecord, 'id' | 'status' | 'createdAt'>>,
     operation: string,
-  ): Result<SessionRecord, DebuggenError> {
+  ): Result<CommittedTransition, DebuggenError> {
     const verdict = transition(record.status, to, context);
 
     if (isErr(verdict)) {
@@ -963,14 +1293,23 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
       operation,
     );
 
-    if (isErr(stored)) {
-      return stored;
-    }
+    return isErr(stored)
+      ? stored
+      : ok({ from: record.status, session: stored.value, context, operation });
+  }
 
-    const session = stored.value;
+  /**
+   * The announce half, run only once the change is committed: the failing
+   * stage's progress row for a transition into `failed`, the status log line,
+   * and `session.updated` last.
+   *
+   * @returns The record as stored.
+   */
+  function announceTransition(committed: CommittedTransition): SessionRecord {
+    const { session, context } = committed;
     const logger = scoped(session.id);
 
-    if (verdict.value === 'failed' && context.failure !== undefined) {
+    if (session.status === 'failed' && context.failure !== undefined) {
       const row = progress.stageFailed(session.id, context.failure);
 
       if (isErr(row)) {
@@ -981,10 +1320,30 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
       }
     }
 
-    logger.info('session status changed', { operation, from: record.status, to: session.status });
+    logger.info('session status changed', {
+      operation: committed.operation,
+      from: committed.from,
+      to: session.status,
+    });
     announceUpdated(session);
 
-    return ok(session);
+    return session;
+  }
+
+  /**
+   * The status applier for an edge that writes nothing but the record:
+   * {@link commitTransition}, then {@link announceTransition}.
+   */
+  function applyTransition(
+    record: SessionRecord,
+    to: SessionStatus,
+    context: SessionTransitionContext,
+    changes: Partial<Omit<SessionRecord, 'id' | 'status' | 'createdAt'>>,
+    operation: string,
+  ): Result<SessionRecord, DebuggenError> {
+    const committed = commitTransition(record, to, context, changes, operation);
+
+    return isErr(committed) ? committed : ok(announceTransition(committed.value));
   }
 
   // -------------------------------------------------------------------------
@@ -1000,30 +1359,50 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
     }
   }
 
-  /**
-   * Closes the session's open capture window, if it has one, and releases its
-   * ownership. Used on the way into `failed` and `ended`, where no summary
-   * exists: the window closes without one.
-   *
-   * @returns The record's captures with the closed window mirrored, or
-   * `undefined` when nothing was closed.
-   */
-  function closeOpenCapture(record: SessionRecord, operation: string): CaptureRecord[] | undefined {
-    releaseOwnership(record);
+  /** A capture window {@link closeOpenCapture} closed, inside its caller's transaction. */
+  interface ClosedWindow {
+    /** The window that closed. */
+    readonly captureId: CaptureId;
+    /** The record's captures with the closed window mirrored. */
+    readonly captures: CaptureRecord[];
+  }
 
-    const logger = scoped(record.id);
+  /** A committed status change that closed a capture window in the same transaction. */
+  interface WindowClosingTransition {
+    /** The committed status change, still to be announced. */
+    readonly transition: CommittedTransition;
+    /** The window the transaction closed; absent when none was open. */
+    readonly closedCaptureId: CaptureId | undefined;
+  }
+
+  /**
+   * Closes the session's open capture window, if it has one, without a
+   * summary — the way into `failed` and `ended`, where none exists.
+   *
+   * Runs inside the caller's `SessionsRepo.transaction` and never touches the
+   * owner index: ownership is released by the caller only once this closure
+   * and the record change that goes with it have committed together, and a
+   * closure that fails leaves the window open and its session the owner.
+   *
+   * @returns The closed window, `ok(undefined)` when none was open, or the
+   * store error that kept it open — the read or the close.
+   */
+  function closeOpenCapture(
+    record: SessionRecord,
+    operation: string,
+  ): Result<ClosedWindow | undefined, DebuggenError> {
     const active = sessions.getActiveCapture(record.id);
 
     if (isErr(active)) {
-      logger.warn('the open capture window could not be read', {
+      scoped(record.id).warn('the open capture window could not be read', {
         operation,
         code: active.error.code,
       });
-      return undefined;
+      return active;
     }
 
     if (active.value === undefined) {
-      return undefined;
+      return ok(undefined);
     }
 
     const open = active.value.capture;
@@ -1037,12 +1416,13 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
         operation,
         code: stopped.error.code,
       });
-      return undefined;
+      return stopped;
     }
 
-    scoped(record.id, open.id).info('open capture window closed', { operation });
-
-    return mirrorCapture(record.captures, stopped.value.capture);
+    return ok({
+      captureId: open.id,
+      captures: mirrorCapture(record.captures, stopped.value.capture),
+    });
   }
 
   /** One index entry under construction, with the start time ties are broken by. */
@@ -1052,129 +1432,228 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
   }
 
   /**
-   * Indexes one session's open capture window into `index`.
-   *
-   * - No open window: nothing to index. A `capturing` session in this state
-   *   lost its window's close to a crash; it is logged, and `stopCapture` or
-   *   `end` recovers it.
-   * - An open window on a session that is not `capturing`: the orphan of a
-   *   start interrupted between opening the row and committing the status.
-   *   Closed rather than indexed, so it cannot block the project.
-   * - Two `capturing` sessions with open windows on one project, which the
-   *   manager never produces: the earlier-started window keeps ownership.
+   * Indexes the open window of a `capturing` session into `index`. Two such
+   * windows on one project, which the manager never produces, are logged as
+   * the defect they are, and the earlier-started window keeps ownership.
    */
-  function indexSession(
-    item: SessionListItem,
-    index: Map<string, IndexedOwner>,
-  ): Result<void, DebuggenError> {
-    const active = sessions.getActiveCapture(item.id);
+  function indexCapturingWindow(window: OpenCaptureWindow, index: Map<string, IndexedOwner>): void {
+    const key = projectKey(window.projectRoot);
+    const existing = index.get(key);
 
-    if (isErr(active)) {
-      scoped(item.id).warn('an open capture window could not be read while indexing', {
-        code: active.error.code,
-      });
-      return active;
-    }
+    if (existing !== undefined) {
+      scoped(window.sessionId, window.captureId).error(
+        'two sessions hold an open capture window on one project',
+        { owningSessionId: existing.owner.sessionId },
+      );
 
-    const open = active.value?.capture;
-
-    if (open === undefined) {
-      if (item.status === 'capturing') {
-        scoped(item.id).warn('a capturing session has no open capture window; stop or end it', {});
+      if (window.startedAt >= existing.startedAt) {
+        return;
       }
-      return ok(undefined);
     }
 
-    if (item.status !== 'capturing') {
+    index.set(key, {
+      owner: Object.freeze({ sessionId: window.sessionId, captureId: window.captureId }),
+      startedAt: window.startedAt,
+    });
+  }
+
+  /**
+   * Indexes an orphan window whose close the store refused: its session owns
+   * the project — refusing competing captures — until the window is
+   * verifiably closed. A `capturing` session already indexed on the project
+   * keeps ownership, since it refuses competitors just the same and is the
+   * one actually capturing; the second open window is logged.
+   */
+  function indexUnclosedOrphan(window: OpenCaptureWindow, index: Map<string, IndexedOwner>): void {
+    const key = projectKey(window.projectRoot);
+    const existing = index.get(key);
+
+    if (existing !== undefined) {
+      scoped(window.sessionId, window.captureId).error(
+        'two sessions hold an open capture window on one project',
+        { owningSessionId: existing.owner.sessionId },
+      );
+      return;
+    }
+
+    index.set(key, {
+      owner: Object.freeze({ sessionId: window.sessionId, captureId: window.captureId }),
+      startedAt: window.startedAt,
+    });
+  }
+
+  /**
+   * Closes the open window of a session that is not `capturing` — the orphan
+   * of a start or stop interrupted by a crash, or left by an earlier build —
+   * together with the session record that mirrors it, in one store
+   * transaction, so the record and the `captures` row never disagree. A
+   * record that cannot be read cannot mirror anything and does not keep the
+   * window open: the window closes alone, and the unreadable record is logged.
+   *
+   * @returns `ok` once the window is closed, or the store error that kept it
+   * open — in which case the caller indexes its session as the project's owner.
+   */
+  function closeOrphanWindow(window: OpenCaptureWindow): Result<void, DebuggenError> {
+    const logger = scoped(window.sessionId, window.captureId);
+    const closed = sessions.transaction((): Result<void, DebuggenError> => {
       const stopped = sessions.stopCapture({
-        captureId: open.id,
-        stoppedAt: Math.max(stamp(), open.startedAt),
+        captureId: window.captureId,
+        stoppedAt: Math.max(stamp(), window.startedAt),
       });
 
       if (isErr(stopped)) {
         return stopped;
       }
 
-      const record = sessions.get(item.id);
+      const read = sessions.get(window.sessionId);
 
-      if (
-        !isErr(record) &&
-        record.value !== undefined &&
-        hasCapture(record.value.captures, open.id)
-      ) {
-        const current = record.value;
-        commit(
-          {
-            ...current,
-            captures: mirrorCapture(current.captures, stopped.value.capture),
-            updatedAt: nextStamp(current),
-          },
-          'hydrate',
-        );
-      }
-
-      scoped(item.id, open.id).warn('an orphaned capture window was closed', {
-        status: item.status,
-      });
-      return ok(undefined);
-    }
-
-    const key = projectKey(item.projectRoot);
-    const existing = index.get(key);
-
-    if (existing !== undefined) {
-      scoped(item.id, open.id).error('two sessions hold an open capture window on one project', {
-        owningSessionId: existing.owner.sessionId,
-      });
-
-      if (open.startedAt >= existing.startedAt) {
+      if (isErr(read)) {
+        logger.warn('the record of an orphaned capture window could not be read to mirror it', {
+          code: read.error.code,
+        });
         return ok(undefined);
       }
+
+      const current = read.value;
+
+      if (current === undefined || !hasCapture(current.captures, window.captureId)) {
+        return ok(undefined);
+      }
+
+      const mirrored = commit(
+        {
+          ...current,
+          captures: mirrorCapture(current.captures, stopped.value.capture),
+          updatedAt: nextStamp(current),
+        },
+        'hydrate',
+      );
+
+      return isErr(mirrored) ? mirrored : ok(undefined);
+    });
+
+    if (isErr(closed)) {
+      logger.error(
+        'an orphaned capture window could not be closed; its session keeps the project until it is',
+        { status: window.sessionStatus, code: closed.error.code },
+      );
+      return closed;
     }
 
-    index.set(key, {
-      owner: Object.freeze({ sessionId: item.id, captureId: open.id }),
-      startedAt: open.startedAt,
-    });
+    logger.warn('an orphaned capture window was closed', { status: window.sessionStatus });
 
     return ok(undefined);
   }
 
   /**
-   * Rebuilds the owner index from the store. Every session is read first and
-   * processed second, because closing an orphaned window rewrites its record
-   * and would otherwise reorder the most-recently-updated listing underneath
-   * the paging. The new index replaces the old one in one step.
+   * Logs every `capturing` session that holds no open capture window — a
+   * closure whose status change was lost to a crash, or an `end` whose cleanup
+   * failed after its closure committed — which `stopCapture` or `end`
+   * recovers. Pages the `capturing` sessions only, never the whole store. A
+   * read failure is logged and not fatal: this is a diagnostic, and it changes
+   * nobody's ownership.
+   *
+   * @param withWindow The sessions that hold an open window.
    */
-  function rebuildIndex(): Result<void, DebuggenError> {
-    const items: SessionListItem[] = [];
-    let firstError: DebuggenError | undefined;
-
+  function reportCapturingWithoutWindow(withWindow: ReadonlySet<SessionId>): void {
     for (let offset = 0; ;) {
-      const page = sessions.list({ limit: MAX_SESSION_LIST_LIMIT, offset });
+      const page = sessions.list({
+        statuses: ['capturing'],
+        limit: MAX_SESSION_LIST_LIMIT,
+        offset,
+      });
 
       if (isErr(page)) {
-        firstError = page.error;
-        break;
+        log.warn('capturing sessions could not be listed to check their capture windows', {
+          code: page.error.code,
+        });
+        return;
       }
 
-      items.push(...page.value.items);
+      for (const item of page.value.items) {
+        if (!withWindow.has(item.id)) {
+          scoped(item.id).warn(
+            'a capturing session has no open capture window; stop or end it',
+            {},
+          );
+        }
+      }
+
       offset += page.value.items.length;
 
       if (page.value.items.length === 0 || offset >= page.value.total) {
-        break;
+        return;
       }
+    }
+  }
+
+  /** What one rebuild of the owner index concluded, once an index exists. */
+  interface IndexRebuild {
+    /**
+     * The first store error that kept an orphan window open, whose session is
+     * then indexed as its project's owner; absent when every orphan closed.
+     */
+    readonly closeFailure: DebuggenError | undefined;
+  }
+
+  /**
+   * Rebuilds the owner index from the store's open capture windows, read in
+   * one indexed statement (`SessionsRepo.listOpenCaptureWindows`) — no session
+   * is paged, hydrated or probed one by one, so the cost follows the handful
+   * of open windows rather than the number of stored sessions.
+   *
+   * - A window on a `capturing` session is indexed; the earliest-started one
+   *   wins a project two of them share.
+   * - A window on any other session is an orphan and is closed with its record
+   *   mirror; one the store refuses to close is indexed as its project's owner
+   *   instead, and its error is returned once the index is in place.
+   * - A `capturing` session with no open window is logged for recovery.
+   *
+   * The new index replaces the old one in one step. When the open windows
+   * cannot be read at all, nothing is replaced: the previous index is kept,
+   * `indexed` is not set — so before the first successful build every use
+   * retries, and a start is refused meanwhile — and the store error is
+   * returned.
+   */
+  function rebuildIndex(): Result<IndexRebuild, DebuggenError> {
+    const listed = sessions.listOpenCaptureWindows();
+
+    if (isErr(listed)) {
+      log.warn('the capture-owner index could not be rebuilt; the previous index is kept', {
+        code: listed.error.code,
+        owners: owners.size,
+      });
+      return listed;
     }
 
     const index = new Map<string, IndexedOwner>();
+    const unclosed: OpenCaptureWindow[] = [];
+    let closeFailure: DebuggenError | undefined;
+    let orphansClosed = 0;
 
-    for (const item of items) {
-      const indexedOne = indexSession(item, index);
+    for (const window of listed.value) {
+      if (window.sessionStatus === 'capturing') {
+        indexCapturingWindow(window, index);
+        continue;
+      }
 
-      if (isErr(indexedOne)) {
-        firstError ??= indexedOne.error;
+      const closed = closeOrphanWindow(window);
+
+      if (isErr(closed)) {
+        closeFailure ??= closed.error;
+        unclosed.push(window);
+      } else {
+        orphansClosed += 1;
       }
     }
+
+    // After every capturing window, so a capturing session keeps a project an
+    // unclosable orphan shares with it.
+    for (const window of unclosed) {
+      indexUnclosedOrphan(window, index);
+    }
+
+    reportCapturingWithoutWindow(new Set(listed.value.map((window) => window.sessionId)));
 
     owners.clear();
     for (const [key, entry] of index) {
@@ -1183,27 +1662,32 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
     indexed = true;
 
     log.info('capture-owner index rebuilt', {
-      sessions: items.length,
+      windows: listed.value.length,
       owners: owners.size,
-      complete: firstError === undefined,
+      orphansClosed,
+      orphansOpen: unclosed.length,
+      complete: closeFailure === undefined,
     });
 
-    return firstError === undefined ? ok(undefined) : err(firstError);
+    return ok({ closeFailure });
   }
 
-  /** Builds the index on first use for a caller that never hydrated. */
-  function ensureIndexed(): void {
+  /**
+   * Builds the index on first use for a caller that never hydrated.
+   *
+   * @returns `ok` once an index exists — one holding an orphan whose close the
+   * store refused included, because that orphan's session then blocks its
+   * project exactly as it should — or the store error that kept the open
+   * windows from being read, after which the next use retries.
+   */
+  function ensureIndexed(): Result<void, DebuggenError> {
     if (indexed) {
-      return;
+      return ok(undefined);
     }
 
     const rebuilt = rebuildIndex();
 
-    if (isErr(rebuilt)) {
-      log.warn('the capture-owner index was built from a partial read of the store', {
-        code: rebuilt.error.code,
-      });
-    }
+    return isErr(rebuilt) ? rebuilt : ok(undefined);
   }
 
   /**
@@ -1248,7 +1732,15 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
   // -------------------------------------------------------------------------
 
   function hydrate(): Result<void, DebuggenError> {
-    return rebuildIndex();
+    const rebuilt = rebuildIndex();
+
+    if (isErr(rebuilt)) {
+      return rebuilt;
+    }
+
+    const { closeFailure } = rebuilt.value;
+
+    return closeFailure === undefined ? ok(undefined) : err(closeFailure);
   }
 
   function create(input: CreateSessionInput): Result<SessionRecord, DebuggenError> {
@@ -1256,10 +1748,16 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
 
     if (posix.length === 0 || isWindowsAbsolute(posix) || !isAbsolutePosix(posix)) {
       return err(
-        new DebuggenError('PROJECT_NOT_FOUND', 'The project root must be an absolute path.', {
-          hint: 'Start the session from a workspace folder opened in VS Code, whose absolute path identifies the project.',
-          details: { reason: 'project-root-not-absolute' },
-        }),
+        new DebuggenError(
+          'PROJECT_NOT_FOUND',
+          authorProductText('The project root must be an absolute path.'),
+          {
+            hint: authorProductText(
+              'Start the session from a workspace folder opened in VS Code, whose absolute path identifies the project.',
+            ),
+            details: { reason: 'project-root-not-absolute' },
+          },
+        ),
       );
     }
 
@@ -1374,17 +1872,62 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
     }
 
     if (to === 'failed') {
-      const captures = closeOpenCapture(record, 'transitionTo');
-      return applyTransition(
-        record,
-        to,
-        context,
-        captures === undefined ? {} : { captures },
-        'transitionTo',
-      );
+      return failWithCaptureClosed(record, context);
     }
 
     return applyTransition(record, to, context, {}, 'transitionTo');
+  }
+
+  /**
+   * The move into `failed`: the open capture window closes and `failed` is
+   * committed in one store transaction, so a window that cannot be closed
+   * refuses the whole move — status, window and ownership all unchanged, no
+   * progress row — rather than leaving a failed session holding an open window
+   * nobody owns. Ownership is released only after the commit, then the
+   * transition is announced.
+   */
+  function failWithCaptureClosed(
+    record: SessionRecord,
+    context: SessionTransitionContext,
+  ): Result<SessionRecord, DebuggenError> {
+    const operation = 'transitionTo';
+    const committed = sessions.transaction((): Result<WindowClosingTransition, DebuggenError> => {
+      const closed = closeOpenCapture(record, operation);
+
+      if (isErr(closed)) {
+        return closed;
+      }
+
+      const moved = commitTransition(
+        record,
+        'failed',
+        context,
+        closed.value === undefined ? {} : { captures: closed.value.captures },
+        operation,
+      );
+
+      return isErr(moved)
+        ? moved
+        : ok({ transition: moved.value, closedCaptureId: closed.value?.captureId });
+    });
+
+    if (isErr(committed)) {
+      scoped(record.id).warn(
+        'the move to failed was not stored; the session keeps its status, capture window and project ownership',
+        { from: record.status, code: committed.error.code },
+      );
+      return committed;
+    }
+
+    const { transition: moved, closedCaptureId } = committed.value;
+
+    if (closedCaptureId !== undefined) {
+      scoped(record.id, closedCaptureId).info('open capture window closed', { operation });
+    }
+
+    releaseOwnership(record);
+
+    return ok(announceTransition(moved));
   }
 
   function patch(
@@ -1526,37 +2069,50 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
       return preview;
     }
 
-    const inserted = sessions.insertPlan(candidate);
+    // The plan row and the record that mirrors it are one transaction: the
+    // mirror is validated against the session contract inside it (what
+    // `commit` does), so a refusal at any step rolls the plan row back too.
+    const stored = sessions.insertPlanWithRecord(candidate, (inserted) => {
+      const mirrored = parseSessionRecord({
+        ...record,
+        plans: [...record.plans, inserted],
+        updatedAt: nextStamp(record),
+      });
 
-    if (isErr(inserted)) {
-      return inserted;
-    }
+      if (isErr(mirrored)) {
+        scoped(sessionId).error('a session change was rejected by the session contract', {
+          operation: 'recordPlan',
+          code: mirrored.error.code,
+        });
+      }
 
-    const stored = commit(
-      { ...record, plans: [...record.plans, inserted.value], updatedAt: nextStamp(record) },
-      'recordPlan',
-    );
+      return mirrored;
+    });
 
     if (isErr(stored)) {
-      scoped(sessionId).error('a plan was stored but the session record could not mirror it', {
-        planVersion,
-        code: stored.error.code,
-      });
+      scoped(sessionId).error(
+        'a plan could not be recorded; neither it nor its mirror was stored',
+        {
+          planVersion,
+          code: stored.error.code,
+        },
+      );
       return stored;
     }
 
     scoped(sessionId).info('plan recorded', {
       planVersion,
-      actions: inserted.value.instrumentationTargets.length,
+      actions: stored.value.plan.instrumentationTargets.length,
     });
-    announceUpdated(stored.value);
+    announceUpdated(stored.value.session);
 
-    return ok({ session: stored.value, plan: inserted.value });
+    return ok({ session: stored.value.session, plan: stored.value.plan });
   }
 
   function appendFollowUp(
     sessionId: SessionId,
     question: string,
+    attemptId: string,
   ): Result<SessionRecord, DebuggenError> {
     const loaded = load(sessionId);
 
@@ -1570,41 +2126,83 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
       return err(sessionEnded(sessionId, 'appendFollowUp'));
     }
 
-    // The question is stored and forwarded, never read: no branch here
-    // depends on its content (AAP §0.5.4).
-    const followUp: FollowUpRecord = { question, askedAt: stamp() };
-    const preview = parseSessionRecord({ ...record, followUps: [...record.followUps, followUp] });
+    // The attempt id alone decides between a new entry and a retry in place;
+    // the question is stored and forwarded, never read (AAP §0.5.4).
+    const placement = placeFollowUpAttempt(sessionId, record.followUps, attemptId);
+
+    if (isErr(placement)) {
+      const reason = placement.error.details?.['reason'];
+      scoped(sessionId).info('a follow-up attempt was refused', {
+        code: placement.error.code,
+        ...(typeof reason === 'string' ? { reason } : {}),
+      });
+      return placement;
+    }
+
+    const retry = placement.value.kind === 'retry' ? placement.value : undefined;
+    const followUp: FollowUpRecord = {
+      question,
+      askedAt: stamp(),
+      attemptId,
+      // An identified entry always carries its counter; `1` covers a writer
+      // that set only the id.
+      attempt: retry === undefined ? 1 : (retry.previous.attempt ?? 1) + 1,
+    };
+    const ladder =
+      retry === undefined
+        ? [...record.followUps, followUp]
+        : record.followUps.map((entry, index) => (index === retry.index ? followUp : entry));
+    const preview = parseSessionRecord({ ...record, followUps: ladder });
 
     if (isErr(preview)) {
       scoped(sessionId).warn(
         'a follow-up was rejected by the session contract and was not stored',
         {
           code: preview.error.code,
+          retry: retry !== undefined,
         },
       );
       return preview;
     }
 
-    const appended = sessions.appendFollowUp(sessionId, followUp);
+    // One `followups` row per attempt: a retry rewrites the row the attempt
+    // was first recorded in, so the log never gains a duplicate.
+    const written =
+      retry === undefined
+        ? sessions.appendFollowUp(sessionId, followUp)
+        : sessions.replaceFollowUpAttempt(sessionId, followUp);
 
-    if (isErr(appended)) {
-      return appended;
+    if (isErr(written)) {
+      return written;
     }
 
+    const storedFollowUp = written.value;
     const stored = commit(
       {
         ...record,
-        followUps: [...record.followUps, appended.value],
+        followUps:
+          retry === undefined
+            ? [...record.followUps, storedFollowUp]
+            : record.followUps.map((entry, index) =>
+                index === retry.index ? storedFollowUp : entry,
+              ),
         updatedAt: nextStamp(record),
       },
       'appendFollowUp',
     );
 
     if (isErr(stored)) {
+      scoped(sessionId).error('a follow-up was stored but the session record could not mirror it', {
+        code: stored.error.code,
+        retry: retry !== undefined,
+      });
       return stored;
     }
 
-    scoped(sessionId).info('follow-up recorded', { followUps: stored.value.followUps.length });
+    scoped(sessionId).info(
+      retry === undefined ? 'follow-up recorded' : 'follow-up attempt retried in place',
+      { followUps: stored.value.followUps.length, attempt: storedFollowUp.attempt ?? 1 },
+    );
     announceUpdated(stored.value);
 
     return stored;
@@ -1719,7 +2317,16 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
       return undefined;
     }
 
-    ensureIndexed();
+    const ready = ensureIndexed();
+
+    if (isErr(ready)) {
+      log.warn(
+        'the capture owner was answered from the current index: the store could not rebuild it',
+        {
+          code: ready.error.code,
+        },
+      );
+    }
 
     const owner = liveOwner(projectKey(projectRoot));
 
@@ -1728,12 +2335,68 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
       : Object.freeze({ sessionId: owner.sessionId, captureId: owner.captureId });
   }
 
+  /**
+   * The answer to a start the store refused, after its transaction rolled
+   * back.
+   *
+   * A `CAPTURE_ALREADY_ACTIVE` naming another session is the store's project
+   * check finding an open window the owner index did not hold: that session
+   * becomes the indexed owner, so the next caller is refused without a store
+   * write, and the refusal is the typed conflict the route answers `409` with.
+   * One naming no other session is this session's own open window. Every other
+   * refusal — a status commit the store refused included, whose window was
+   * rolled back with it — travels unchanged; the repository and `commit`
+   * already logged it.
+   */
+  function startRefusal(record: SessionRecord, key: string, error: DebuggenError): DebuggenError {
+    if (error.code !== CAPTURE_CONFLICT_ERROR_CODE) {
+      return error;
+    }
+
+    const owningSessionId = error.details?.['owningSessionId'];
+    const activeCaptureId = error.details?.['activeCaptureId'];
+    const heldCaptureId = typeof activeCaptureId === 'string' ? activeCaptureId : undefined;
+
+    if (typeof owningSessionId === 'string' && owningSessionId !== record.id) {
+      if (heldCaptureId !== undefined) {
+        owners.set(key, Object.freeze({ sessionId: owningSessionId, captureId: heldCaptureId }));
+      }
+
+      scoped(record.id).warn(
+        "capture refused: the store holds another session's open window on the project",
+        { owningSessionId },
+      );
+      return captureConflict(record.id, owningSessionId, record.projectRoot);
+    }
+
+    return ownCaptureActive(record.id, heldCaptureId);
+  }
+
   function startCapture(
     sessionId: SessionId,
   ): Result<{ readonly captureId: CaptureId }, DebuggenError> {
     // Everything from the ownership check to the claim below is synchronous:
-    // no other call can interleave between deciding and claiming.
-    ensureIndexed();
+    // no other call can interleave between deciding and claiming. Without an
+    // index there is nothing to decide against, so the start is refused:
+    // refusing a capture is recoverable, a second concurrent capture is not.
+    const ready = ensureIndexed();
+
+    if (isErr(ready)) {
+      scoped(sessionId).warn('capture refused: the capture-owner index could not be built', {
+        code: ready.error.code,
+      });
+      return err(
+        new DebuggenError(
+          'STORE_ERROR',
+          'The session store could not be read to decide who may capture this project, so no capture was started.',
+          {
+            hint: 'Start the capture again. If it keeps failing, check the service log for the store error and restart the service.',
+            details: { sessionId, reason: 'capture-index-unavailable' },
+            cause: ready.error,
+          },
+        ),
+      );
+    }
 
     const loaded = load(sessionId);
 
@@ -1751,7 +2414,7 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
       logger.info('capture refused: another session holds the project', {
         owningSessionId: owner.sessionId,
       });
-      return err(captureConflict(sessionId, owner, record.projectRoot));
+      return err(captureConflict(sessionId, owner.sessionId, record.projectRoot));
     }
 
     if (owner !== undefined) {
@@ -1791,55 +2454,48 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
       );
     }
 
-    // 3. Open the window and claim the project.
-    const opened = sessions.startCapture({
-      sessionId,
-      planVersion: latestPlan.value,
-      startedAt: stamp(),
-    });
+    // 3. Open the window and move to `capturing` as one store transaction. The
+    // window is opened with the store's own project check, and a refused
+    // status commit rolls the window back, so no orphan window is left behind.
+    const planVersion = latestPlan.value;
+    const opened = sessions.transaction(
+      (): Result<
+        { readonly capture: CaptureRecord; readonly moved: CommittedTransition },
+        DebuggenError
+      > => {
+        const window = sessions.startCapture({
+          sessionId,
+          planVersion,
+          startedAt: stamp(),
+          projectRoot: record.projectRoot,
+        });
 
-    if (isErr(opened)) {
-      if (opened.error.code === CAPTURE_CONFLICT_ERROR_CODE) {
-        const activeCaptureId = opened.error.details?.['activeCaptureId'];
-        return err(
-          ownCaptureActive(
-            sessionId,
-            typeof activeCaptureId === 'string' ? activeCaptureId : undefined,
-          ),
+        if (isErr(window)) {
+          return window;
+        }
+
+        const capture = window.value.capture;
+        const moved = commitTransition(
+          record,
+          'capturing',
+          {},
+          { captures: mirrorCapture(record.captures, capture) },
+          'startCapture',
         );
-      }
-      return opened;
-    }
 
-    const capture = opened.value.capture;
-    owners.set(key, Object.freeze({ sessionId, captureId: capture.id }));
-
-    // 4. The transition. If it cannot be applied, the claim and the window are
-    // both released so no phantom owner is left behind.
-    const moved = applyTransition(
-      record,
-      'capturing',
-      {},
-      { captures: mirrorCapture(record.captures, capture) },
-      'startCapture',
+        return isErr(moved) ? moved : ok({ capture, moved: moved.value });
+      },
     );
 
-    if (isErr(moved)) {
-      releaseOwnership(record);
-
-      const closed = sessions.stopCapture({ captureId: capture.id, stoppedAt: capture.startedAt });
-
-      if (isErr(closed)) {
-        scoped(sessionId, capture.id).error(
-          'a capture window opened for a refused start stays open',
-          {
-            code: closed.error.code,
-          },
-        );
-      }
-
-      return moved;
+    if (isErr(opened)) {
+      return err(startRefusal(record, key, opened.error));
     }
+
+    // 4. The claim, only now that the store holds the window and the status —
+    // still in the same synchronous turn as the check above.
+    const { capture, moved } = opened.value;
+    owners.set(key, Object.freeze({ sessionId, captureId: capture.id }));
+    announceTransition(moved);
 
     // 5. The announcement, last.
     send(sessionId, 'capture.started', () =>
@@ -1851,10 +2507,12 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
   }
 
   /**
-   * The capture window `stopCapture` closes, or the one an earlier stop
-   * already closed without moving the session on (the store's window was
-   * closed, then the status commit failed): that window is picked up again
-   * so the session is never stuck in `capturing`.
+   * The capture window `stopCapture` closes, inside its transaction — or one
+   * already closed while the session stayed `capturing`, which `stopCapture`
+   * itself can no longer leave behind (its closure and status commit are one
+   * transaction) but an `end` whose cleanup failed after its closure
+   * committed, or a store written by an earlier build, can: that window is
+   * picked up again so the session is never stuck in `capturing`.
    */
   function closeForStop(
     record: SessionRecord,
@@ -1960,18 +2618,50 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
       return verdict;
     }
 
-    const closed = closeForStop(record, options.summary);
+    // The window closes with its summary and the session moves to
+    // `options.next` in one store transaction. A refused status commit rolls
+    // the closure back: the window stays open, the status stays `capturing`,
+    // the project stays owned and no frame is sent, so stopping again retries
+    // the whole step instead of finding a half-stopped capture.
+    const committed = sessions.transaction(
+      (): Result<
+        { readonly capture: CaptureRecord; readonly moved: CommittedTransition },
+        DebuggenError
+      > => {
+        const closed = closeForStop(record, options.summary);
 
-    if (isErr(closed)) {
-      return closed;
+        if (isErr(closed)) {
+          return closed;
+        }
+
+        const eventCount = options.summary.eventCount;
+        const capture: CaptureRecord =
+          Number.isSafeInteger(eventCount) && eventCount >= 0
+            ? { ...closed.value, eventCount }
+            : closed.value;
+        const moved = commitTransition(
+          record,
+          options.next,
+          {},
+          { captures: mirrorCapture(record.captures, capture) },
+          'stopCapture',
+        );
+
+        return isErr(moved) ? moved : ok({ capture, moved: moved.value });
+      },
+    );
+
+    if (isErr(committed)) {
+      scoped(sessionId).info('capture stop refused; the capture keeps running', {
+        next: options.next,
+        code: committed.error.code,
+      });
+      return committed;
     }
 
-    const eventCount = options.summary.eventCount;
-    const capture: CaptureRecord =
-      Number.isSafeInteger(eventCount) && eventCount >= 0
-        ? { ...closed.value, eventCount }
-        : closed.value;
-
+    // Only once the store holds both: the project is released, then clients
+    // hear `capture.stopped` and, last, the `session.updated` of the move.
+    const { capture, moved } = committed.value;
     releaseOwnership(record);
 
     send(sessionId, 'capture.stopped', () =>
@@ -1981,18 +2671,7 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
         { ts: stamp() },
       ),
     );
-
-    const moved = applyTransition(
-      record,
-      options.next,
-      {},
-      { captures: mirrorCapture(record.captures, capture) },
-      'stopCapture',
-    );
-
-    if (isErr(moved)) {
-      return moved;
-    }
+    announceTransition(moved);
 
     scoped(sessionId, capture.id).info('capture stopped', { next: options.next });
 
@@ -2039,7 +2718,7 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
           'INTERNAL',
           'Cleanup reported an outcome outside the cleanup vocabulary.',
           {
-            hint: 'End the session again to retry cleanup; the modification journal still holds every change.',
+            hint: authorProductText(INVALID_CLEANUP_OUTCOME_HINT),
             details: { sessionId, reason: 'invalid-cleanup-outcome' },
           },
         ),
@@ -2052,11 +2731,19 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
         code: error.code,
       });
 
+      // The row shows the failure's own hint only when the product wrote it.
+      // A hint the runner propagated from a collaborator — the backup store, a
+      // filesystem call, a thrown error `DebuggenError.from` salvaged — may
+      // quote a path or a value, so the product's retry step is passed in its
+      // place (CWE-209); the failure's message still reaches the progress
+      // emitter's `debug` diagnostic under the row's reference.
       const row = progress.stageFailed(sessionId, {
         stage: 'cleanup',
         code: error.code,
         message: error.message.trim().length > 0 ? error.message : CLEANUP_FAILURE_FALLBACK,
-        hint: error.hint ?? 'End the session again to retry cleanup.',
+        hint: isProductAuthoredText(error.hint)
+          ? error.hint
+          : authorProductText(CLEANUP_RETRY_HINT),
       });
 
       if (isErr(row)) {
@@ -2142,17 +2829,51 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
       return ok({ session: record, cleanup: outcomeOf(record.cleanup, record.updatedAt) });
     }
 
-    // 2. Close any open capture window and release the project.
-    const captures = closeOpenCapture(record, 'end');
+    // 2. Close any open capture window together with the record that mirrors
+    // it, as one store transaction, and release the project only once both are
+    // stored. A window that cannot be closed refuses the end before cleanup
+    // runs, with ownership retained, so ending again retries the closure.
+    const mirrored = sessions.transaction(
+      (): Result<
+        { readonly session: SessionRecord; readonly captureId: CaptureId } | undefined,
+        DebuggenError
+      > => {
+        const closed = closeOpenCapture(record, 'end');
 
-    if (captures !== undefined) {
-      const mirrored = commit({ ...record, captures, updatedAt: nextStamp(record) }, 'end');
+        if (isErr(closed)) {
+          return closed;
+        }
 
-      if (isErr(mirrored)) {
-        return mirrored;
-      }
+        if (closed.value === undefined) {
+          return ok(undefined);
+        }
 
-      announceUpdated(mirrored.value);
+        const stored = commit(
+          { ...record, captures: closed.value.captures, updatedAt: nextStamp(record) },
+          'end',
+        );
+
+        return isErr(stored)
+          ? stored
+          : ok({ session: stored.value, captureId: closed.value.captureId });
+      },
+    );
+
+    if (isErr(mirrored)) {
+      scoped(sessionId).warn(
+        'the session was not ended: its capture window could not be closed; ending it again retries',
+        { code: mirrored.error.code },
+      );
+      return mirrored;
+    }
+
+    releaseOwnership(record);
+
+    if (mirrored.value !== undefined) {
+      scoped(sessionId, mirrored.value.captureId).info('open capture window closed', {
+        operation: 'end',
+      });
+      announceUpdated(mirrored.value.session);
     }
 
     // 3. Cleanup, whatever the session's status (AAP §0.5.1).
@@ -2162,14 +2883,20 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
       return outcome;
     }
 
-    // 4. The one cleanup report.
-    const recorded = recordOutcome(sessionId, outcome.value, 'end');
+    // 4. The dev servers launched for the session go with it (AAP §0.7.1
+    // Group 2), once its files are restored. A stopped child whose credential
+    // still authenticates leaves the cleanup incomplete.
+    const released = await releaseDevServers(sessionId);
+    const reported = released ? outcome.value : withIncompleteRelease(outcome.value);
+
+    // 5. The one cleanup report.
+    const recorded = recordOutcome(sessionId, reported, 'end');
 
     if (isErr(recorded)) {
       return recorded;
     }
 
-    // 5. The terminal transition — legal from every non-terminal status. The
+    // 6. The terminal transition — legal from every non-terminal status. The
     // tab binding goes with it: an ended session is no recipient.
     const moved = applyTransition(withoutField(recorded.value, 'boundTab'), 'ended', {}, {}, 'end');
 
@@ -2185,9 +2912,120 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
       });
     }
 
-    scoped(sessionId).info('session ended', { cleanup: outcome.value.status });
+    if (reported !== outcome.value) {
+      completeWhenReleased(sessionId, outcome.value);
+    }
 
-    return ok({ session: moved.value, cleanup: outcome.value });
+    scoped(sessionId).info('session ended', { cleanup: reported.status });
+
+    return ok({ session: moved.value, cleanup: reported });
+  }
+
+  /**
+   * Once the release port confirms that the credentials of the session's
+   * stopped dev servers no longer authenticate, completes the cleanup report
+   * an incomplete release had left `partial`: the files' own outcome is
+   * recorded (and broadcast as `cleanup.completed`) again. A report that
+   * changed meanwhile is left as it is.
+   */
+  function completeWhenReleased(sessionId: SessionId, filesOutcome: SessionCleanupOutcome): void {
+    const whenReleased = deps.devServers?.whenReleased?.bind(deps.devServers);
+
+    if (whenReleased === undefined) {
+      return;
+    }
+
+    void whenReleased(sessionId).then(
+      () => {
+        const loaded = load(sessionId);
+
+        if (isErr(loaded) || loaded.value.cleanup.status !== 'partial') {
+          return;
+        }
+
+        const completed = recordOutcome(
+          sessionId,
+          { ...filesOutcome, completedAt: stamp() },
+          'end',
+        );
+
+        if (isErr(completed)) {
+          scoped(sessionId).warn('the completed cleanup report could not be recorded', {
+            code: completed.error.code,
+          });
+          return;
+        }
+
+        scoped(sessionId).info('the dev servers of the ended session are fully released', {
+          cleanup: completed.value.cleanup.status,
+        });
+      },
+      (error: unknown) => {
+        scoped(sessionId).warn('waiting for the dev servers of the ended session failed', {
+          code: DebuggenError.from(error).code,
+        });
+      },
+    );
+  }
+
+  /**
+   * Asks the injected release port to stop the ending session's dev servers.
+   *
+   * Never fails the end — the session's files are restored — but never hides
+   * an incomplete release either: a refusal (typically `CLEANUP_PARTIAL`, a
+   * stopped child whose credential could not be revoked yet) or a rejection is
+   * logged by code and reported to both user interfaces as a `failed` cleanup
+   * progress row carrying the port's message and hint, and the caller records
+   * the cleanup as `partial`. The port itself keeps retrying the revocation,
+   * and the credential lapses with its lease at the latest.
+   *
+   * @returns `true` when the release completed (or there is no port), `false`
+   *   when it did not.
+   */
+  async function releaseDevServers(sessionId: SessionId): Promise<boolean> {
+    const release = deps.devServers;
+
+    if (release === undefined) {
+      return true;
+    }
+
+    let failure: DebuggenError | undefined;
+
+    try {
+      const released = await release.stopForSession(sessionId);
+
+      if (isErr(released)) {
+        failure = released.error;
+        scoped(sessionId).warn('the dev servers of the ended session were not fully released', {
+          code: failure.code,
+        });
+      }
+    } catch (error) {
+      failure = DebuggenError.from(error);
+      scoped(sessionId).error('releasing the dev servers of the ended session failed', {
+        code: failure.code,
+      });
+    }
+
+    if (failure === undefined) {
+      return true;
+    }
+
+    const row = progress.stageFailed(sessionId, {
+      stage: 'cleanup',
+      code: failure.code,
+      message:
+        failure.message.trim().length > 0 ? failure.message : DEV_SERVER_RELEASE_FAILURE_FALLBACK,
+      hint: failure.hint ?? DEV_SERVER_RELEASE_FAILURE_HINT,
+    });
+
+    if (isErr(row)) {
+      scoped(sessionId).error('the incomplete dev-server release could not be reported', {
+        code: row.error.code,
+      });
+    }
+
+    return false;
   }
 
   function end(sessionId: SessionId): Promise<Result<SessionEndResult, DebuggenError>> {
@@ -2258,18 +3096,94 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
     return applyTransition(record, target, {}, {}, 'retry');
   }
 
+  /** Page size of {@link settleIncompleteCleanups}'s walk over ended sessions. */
+  const SETTLE_PAGE_SIZE = 200;
+
+  async function settleIncompleteCleanups(): Promise<Result<number, DebuggenError>> {
+    const runner = deps.cleanup;
+
+    if (runner === undefined) {
+      return ok(0);
+    }
+
+    // Collected first, so the reports this pass writes (which move a session's
+    // `updatedAt`) cannot reorder the pages it is still walking.
+    const partial: SessionId[] = [];
+
+    for (let offset = 0; ;) {
+      const page = sessions.list({ statuses: ['ended'], limit: SETTLE_PAGE_SIZE, offset });
+
+      if (isErr(page)) {
+        return page;
+      }
+
+      for (const item of page.value.items) {
+        const loaded = load(item.id);
+
+        if (!isErr(loaded) && loaded.value.cleanup.status === 'partial') {
+          partial.push(item.id);
+        }
+      }
+
+      offset += page.value.items.length;
+
+      if (page.value.items.length === 0 || offset >= page.value.total) {
+        break;
+      }
+    }
+
+    let settledCount = 0;
+
+    for (const sessionId of partial) {
+      let outcome: Result<SessionCleanupOutcome, DebuggenError>;
+
+      try {
+        outcome = await runner.run(sessionId);
+      } catch (thrown) {
+        outcome = err(DebuggenError.from(thrown, 'INTERNAL'));
+      }
+
+      if (
+        isErr(outcome) ||
+        !isCleanupStatus(outcome.value.status) ||
+        outcome.value.status === 'partial' ||
+        outcome.value.status === 'pending'
+      ) {
+        scoped(sessionId).info('the partial cleanup of an ended session stays partial', {
+          ...(isErr(outcome) ? { code: outcome.error.code } : { cleanup: outcome.value.status }),
+        });
+        continue;
+      }
+
+      const recorded = recordOutcome(sessionId, outcome.value, 'settleIncompleteCleanups');
+
+      if (isErr(recorded)) {
+        return recorded;
+      }
+
+      settledCount += 1;
+      scoped(sessionId).info('settled the partial cleanup of an ended session', {
+        cleanup: recorded.value.cleanup.status,
+      });
+    }
+
+    return ok(settledCount);
+  }
+
   // The store is synchronous, so every operation but `end` completes in one
   // turn; `settle` gives each the asynchronous contract the interface states,
   // so a caller's code does not change if one of them ever gains an await.
   return Object.freeze({
     hydrate: () => settle(hydrate),
+    settleIncompleteCleanups,
     create: (input) => settle(() => create(input)),
     get,
     list,
     transitionTo: (sessionId, to, context) => settle(() => transitionTo(sessionId, to, context)),
     patch: (sessionId, changes) => settle(() => patch(sessionId, changes)),
     recordPlan: (sessionId, plan) => settle(() => recordPlan(sessionId, plan)),
-    appendFollowUp: (sessionId, question) => settle(() => appendFollowUp(sessionId, question)),
+    appendFollowUp: (sessionId, question, attemptId) =>
+      settle(() => appendFollowUp(sessionId, question, attemptId)),
     recordFollowUpOutcome: (sessionId, outcome) =>
       settle(() => recordFollowUpOutcome(sessionId, outcome)),
     setBoundTab: (sessionId, boundTab) => settle(() => setBoundTab(sessionId, boundTab)),

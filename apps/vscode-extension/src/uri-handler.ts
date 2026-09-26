@@ -100,20 +100,28 @@
  *   `@debuggen/shared`'s, so the attack table in `paths.test.ts` covers this
  *   file too, and `isWithin` is used rather than `startsWith` — `/proj-evil` is
  *   not inside `/proj`.
- * - **No second percent-decode.** `vscode.Uri.parse` has already decoded
- *   `query`, and `URLSearchParams` decodes the pairs it splits; nothing here
- *   calls `decodeURIComponent` on the result, and **every gate above runs on
- *   the fully decoded value**. That ordering is what makes `%252e%252e`
- *   harmless: by the time it has become `..` it still has to pass step 3, which
- *   refuses it. Two consequences of that one decode are worth knowing, and
- *   neither is a hole: a file name containing a literal `&` or `=` is *split*
- *   at that character, so the request names a shorter path — which the
- *   confirmation dialog displays verbatim and which step 6 must still prove is
- *   a regular file inside an open folder, so nothing is opened silently or
- *   outside the workspace; and `+` decodes to a space, since a query is
- *   form-encoded, so a `+` in a file name has to arrive as `%2B`. Producing
- *   these URIs is `PanelActions.openSource`'s side of the contract, and it
- *   encodes the value it sends.
+ * - **No decode of its own.** A value reaches the gates decoded exactly twice,
+ *   and by the editor's machinery alone: `vscode.Uri.parse` percent-decodes
+ *   `query` once, and `URLSearchParams` decodes each pair it splits once more.
+ *   Nothing here calls `decodeURIComponent` on the result, and **every gate
+ *   above runs on the fully decoded value**. That ordering is what makes
+ *   `%252e%252e` harmless: by the time it has become `..` it still has to pass
+ *   step 3, which refuses it.
+ * - **No URI grammar of its own.** The path and the three parameter names are
+ *   read from `EDITOR_OPEN_URI` in `@debuggen/protocol`, the one definition
+ *   this handler shares with the producer. Producing these URIs is the
+ *   protocol's `buildEditorOpenUri`: the DevTools panel opens what it returns
+ *   when the service answers a `source.open` with `no-editor`, and it encodes
+ *   every value **twice**, once for each decode above. So a file name
+ *   containing `+`, `&`, `=`, `%`, `#`, a space or any non-ASCII character
+ *   arrives here byte for byte as it was written — never split into other
+ *   parameters, never turned into a space, never decoded a third time. A link
+ *   built any other way carries no such guarantee and needs none: encoded only
+ *   once, it is still decoded twice, so a literal `&` or `=` splits the pair
+ *   and a `+` becomes a space, and the request then names another path — which
+ *   the confirmation dialog displays verbatim and which step 6 must still prove
+ *   is a regular file inside an open folder, so nothing is opened silently or
+ *   outside the workspace.
  * - **No editor policy.** Selection, clamping, scrolling and the transient
  *   highlight belong to `src/source/open-location.ts` and are not duplicated.
  * - **No echo of hostile input.** Every message and log line this file produces
@@ -150,6 +158,7 @@ import { URLSearchParams } from 'node:url';
 
 import * as vscode from 'vscode';
 
+import { EDITOR_OPEN_URI } from '@debuggen/protocol';
 import {
   DebuggenError,
   err,
@@ -177,8 +186,14 @@ import { revealLocationInEditor } from './source/open-location';
  * `//open`, `/Open`, `/open/source` and the empty path are all something else,
  * and something else has no behaviour here. A prefix or suffix match would
  * invent a second, undocumented verb out of whatever a caller appended.
+ *
+ * `EDITOR_OPEN_URI.path` of `@debuggen/protocol`, the value `buildEditorOpenUri`
+ * writes, rather than a second spelling of it: a verb the producer and this
+ * handler each wrote down would drift into a fallback link that is refused as
+ * `unsupported-path` on every click. Exported under this name so the suites
+ * and any other reader can compare against the handler's own value.
  */
-export const OPEN_SOURCE_URI_PATH = '/open';
+export const OPEN_SOURCE_URI_PATH = EDITOR_OPEN_URI.path;
 
 /**
  * The highest 1-based line a URI may name.
@@ -225,11 +240,16 @@ const MIN_URI_POSITION = 1;
  */
 const POSITION_PATTERN = /^[0-9]{1,7}$/;
 
-/** The query parameter naming the project-relative file. */
-const FILE_PARAMETER = 'file';
+/**
+ * The query parameter naming the project-relative file.
+ *
+ * All three parameter names are `EDITOR_OPEN_URI`'s, for the reason
+ * {@link OPEN_SOURCE_URI_PATH} is: the producer and the handler read one table.
+ */
+const FILE_PARAMETER = EDITOR_OPEN_URI.fileParameter;
 
 /** The query parameter naming the 1-based line. */
-const LINE_PARAMETER = 'line';
+const LINE_PARAMETER = EDITOR_OPEN_URI.lineParameter;
 
 /**
  * The query parameter naming the 1-based column.
@@ -238,7 +258,7 @@ const LINE_PARAMETER = 'line';
  * `vscode://debuggen.debug-generator/open?file&line&col`, and a handler that
  * silently accepted both spellings would make the documented one a suggestion.
  */
-const COLUMN_PARAMETER = 'col';
+const COLUMN_PARAMETER = EDITOR_OPEN_URI.columnParameter;
 
 /**
  * The label of the one button that proceeds, and the exact value
@@ -696,9 +716,11 @@ function parseOpenRequest(uri: vscode.Uri): Result<ParsedOpenRequest, UriRejecti
   //    `Uri.parse`; `URLSearchParams` splits the pairs and decodes each one,
   //    and nothing below decodes again — every gate that follows reads the
   //    fully decoded value, which is what makes a doubly-encoded traversal a
-  //    refusal rather than a bypass. Unknown extra parameters are ignored: they
-  //    cannot influence any decision, so refusing them would only make the URI
-  //    brittle.
+  //    refusal rather than a bypass. Those two decodes are exactly the two
+  //    encodings `buildEditorOpenUri` applies, so its values arrive unchanged
+  //    under `EDITOR_OPEN_URI`'s parameter names. Unknown extra parameters are
+  //    ignored: they cannot influence any decision, so refusing them would only
+  //    make the URI brittle.
   const params = new URLSearchParams(uri.query);
   const file = singleParameter(params, FILE_PARAMETER);
   const line = singleParameter(params, LINE_PARAMETER);

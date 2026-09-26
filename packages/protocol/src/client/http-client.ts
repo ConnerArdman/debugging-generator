@@ -1,5 +1,5 @@
 /**
- * The HTTP half of this package's transport SDK: one client over the seventeen
+ * The HTTP half of this package's transport SDK: one client over the twenty-one
  * routes `../http.ts` declares, with the bearer credential applied and every
  * reply parsed by the route's own schema before it reaches a caller.
  *
@@ -74,6 +74,18 @@
  * a credential is available, and a protected route with no credential fails
  * locally rather than reaching the service unauthenticated.
  *
+ * ## A DevTools request says which tab it acts for
+ *
+ * The Chrome service worker presents one paired DevTools credential for every
+ * inspected tab, so the credential alone cannot tell the service which tab's
+ * session a request may touch (AAP §0.5.6). A call's optional `tabId`
+ * ({@link HttpRequestArgs.tabId}, {@link HttpCallOptions.tabId}) is sent as
+ * {@link ACTING_TAB_HEADER}, formatted by {@link formatActingTabHeader}, and the
+ * service verifies it against its live binding table. No `tabId`, no header —
+ * the editor and the Node preload never send one — and a `tabId` that is not a
+ * Chrome tab id, or one given for an auth-exempt operation, is refused locally
+ * before the credential provider or the transport is reached.
+ *
  * Nothing here sets `Origin`, `Cookie` or any `Access-Control-*` header, and
  * `credentials: 'omit'` goes on every call. The service answers no
  * `Access-Control-Allow-Origin` and refuses web origins outright (AAP §0.5.6);
@@ -102,14 +114,18 @@
  *
  * ## The public surface
  *
- * One generic {@link HttpClient.request} covers all seventeen routes with exact
+ * One generic {@link HttpClient.request} covers all twenty-one routes with exact
  * body and response types, and three named methods exist only because their
  * callers need something a route table cannot express: {@link HttpClient.health}
  * is called before a credential exists, {@link HttpClient.pairComplete} carries
  * a capability that must not be logged, and {@link HttpClient.startCapture}
  * turns the documented `409` reply into a failure that names the session holding
  * the capture. There is deliberately no wrapper per route — that would be the
- * duplication this package exists to prevent.
+ * duplication this package exists to prevent. The three administrative
+ * operations are no exception: `devServer.credential`, `credentials.rotate`
+ * and `session.purge` need nothing the table does not already state, and the
+ * server-agent credential the first one returns is as safe in `request` as in
+ * a named method, because no body — sent or received — is ever logged here.
  *
  * Consumed through `./index.ts` only (`tsup.config.ts`: the barrel is the single
  * entry, so a symbol it does not re-export does not exist for a consumer), by
@@ -132,11 +148,14 @@ import {
 import type { DebuggenErrorCode, Logger, Result } from '@debuggen/shared';
 
 import {
+  ACTING_TAB_HEADER,
   AUTHORIZATION_HEADER,
   HTTP_ROUTES,
   buildPath,
   captureStartConflictResponseSchema,
+  formatActingTabHeader,
   formatBearer,
+  formatListPageQuery,
   httpErrorResponseSchema,
   isAuthExemptOperation,
   parseHttpRequest,
@@ -148,6 +167,8 @@ import type {
   HttpOperation,
   HttpRequestBody,
   HttpResponseBody,
+  ListPageOperation,
+  ListPageRequest,
   PairCompleteResponse,
 } from '../http.js';
 
@@ -957,8 +978,8 @@ export interface HttpClientOptions {
 /**
  * The per-call options the three named methods accept.
  *
- * The same two fields {@link HttpRequestArgs} carries, without the path
- * parameters and body those methods supply themselves. Both declare
+ * The same three fields {@link HttpRequestArgs} carries, without the path
+ * parameters and body those methods supply themselves. Each declares
  * `| undefined` for the reason {@link HttpClientOptions} states: a caller
  * forwarding its own `AbortSignal | undefined` should not need a conditional
  * spread to do it.
@@ -969,6 +990,12 @@ export interface HttpCallOptions {
 
   /** Overrides {@link HttpClientOptions.defaultTimeoutMs} for this call. */
   readonly timeoutMs?: number | undefined;
+
+  /**
+   * The inspected Chrome tab a DevTools request acts for, sent as
+   * {@link ACTING_TAB_HEADER}. See {@link HttpRequestArgs.tabId}.
+   */
+  readonly tabId?: number | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -982,7 +1009,7 @@ export interface HttpCallOptions {
 /**
  * The path parameters an operation declares, each a string.
  *
- * `{}` for the eight routes that declare none, `{ id }` for the session-scoped
+ * `{}` for the eleven routes that declare none, `{ id }` for the session-scoped
  * routes, `{ id, panelId }` for the one route that names a specific panel.
  *
  * @typeParam O The operation.
@@ -1014,11 +1041,40 @@ export interface HttpRequestArgs<O extends HttpOperation> {
    */
   readonly body?: HttpRequestBody<O> | undefined;
 
+  /**
+   * The page window of a paged listing — `limit` and `offset` — encoded into
+   * the query string by `formatListPageQuery`, which refuses a member the
+   * service would refuse before anything is sent.
+   *
+   * Typed `never` for every operation outside `LIST_PAGE_OPERATIONS`: only
+   * `session.list` and `modifications.list` read a query, and following a
+   * page's `nextOffset` is how a caller reaches the rest of either listing.
+   */
+  readonly query?: (O extends ListPageOperation ? ListPageRequest : never) | undefined;
+
   /** A caller-owned abort signal. */
   readonly signal?: AbortSignal | undefined;
 
   /** Overrides {@link HttpClientOptions.defaultTimeoutMs} for this call. */
   readonly timeoutMs?: number | undefined;
+
+  /**
+   * The inspected Chrome tab a DevTools request acts for, sent as
+   * {@link ACTING_TAB_HEADER} in the spelling {@link formatActingTabHeader}
+   * writes.
+   *
+   * The Chrome service worker presents one paired credential for every
+   * inspected tab, so it sets this — from Chrome's port metadata, never from a
+   * page — on every session-scoped request it makes for a tab, and the service
+   * holds the request to the session bound to that tab (AAP §0.5.6). Omitted
+   * (or `undefined`), no header is sent: the editor and the Node preload have no
+   * tab, and the service refuses the header from their credentials.
+   *
+   * Refused locally, before the credential provider or the transport is
+   * reached, when it is not a Chrome tab id or when the operation is one of the
+   * two auth-exempt ones — an unauthenticated call has no principal to act as.
+   */
+  readonly tabId?: number | undefined;
 }
 
 /**
@@ -1030,7 +1086,7 @@ interface PreparedRoute {
   /** The method, from the route definition. */
   readonly method: string;
 
-  /** The concrete, parameter-encoded path. */
+  /** The concrete, parameter-encoded path, then the page window's query string when one was given. */
   readonly path: string;
 
   /** Whether the route may be called without a credential. */
@@ -1133,7 +1189,10 @@ interface OutboundRequest {
   /** Whether the route is sent without a credential. */
   readonly authExempt: boolean;
 
-  /** The `accept` and, with a body, `content-type` headers — never a credential. */
+  /**
+   * The `accept` header, `content-type` with a body, and the acting-tab header
+   * when the call acts for a tab — never a credential.
+   */
   readonly headers: Readonly<Record<string, string>>;
 
   /** The serialised, schema-validated body, or `undefined` for none. */
@@ -1300,17 +1359,21 @@ export class HttpClient {
    *    anything else, so neither the credential provider nor the transport is
    *    reached for a host this client must not send to;
    * 2. resolve the route and encode the path;
-   * 3. validate the outbound body against the route's own schema, and
+   * 3. resolve the acting tab when one was given — refused on an auth-exempt
+   *    operation, which has no principal to act as, and when it is not a
+   *    Chrome tab id; otherwise formatted as the {@link ACTING_TAB_HEADER}
+   *    value;
+   * 4. validate the outbound body against the route's own schema, and
    *    serialise it;
-   * 4. resolve the transport and join the path to the validated origin;
-   * 5. link the caller's signal and the timeout into the call's cancellation —
+   * 5. resolve the transport and join the path to the validated origin;
+   * 6. link the caller's signal and the timeout into the call's cancellation —
    *    a signal that has already fired ends the call here, with nothing read
    *    and nothing sent;
-   * 6. resolve the credential unless the operation is exempt, raced against
+   * 7. resolve the credential unless the operation is exempt, raced against
    *    that cancellation;
-   * 7. send with the linked signal and read the body as text, both raced
+   * 8. send with the linked signal and read the body as text, both raced
    *    against it as well;
-   * 8. parse the body — with the route's response schema for a 2xx, and with
+   * 9. parse the body — with the route's response schema for a 2xx, and with
    *    the shared error payload for anything else.
    *
    * The timeout therefore bounds the whole call from the moment it is made,
@@ -1320,8 +1383,8 @@ export class HttpClient {
    *
    * @typeParam O The operation, which fixes both the body and the result type.
    * @param operation The operation to call, keyed into the route table.
-   * @param args The path parameters, body, abort signal and timeout for this
-   * call. Omitted entirely for a route that needs none of them.
+   * @param args The path parameters, body, abort signal, timeout and acting
+   * tab for this call. Omitted entirely for a route that needs none of them.
    * @returns `ok(body)` with the operation's parsed response, or `err(error)`
    * carrying a renderable code, a message naming the operation, and details
    * limited to the status, the operation and schema-validated payload fields.
@@ -1341,10 +1404,18 @@ export class HttpClient {
     }
 
     const baseUrl = origin.value;
-    const prepared = prepareRoute(operation, args?.params);
+    const prepared = prepareRoute(operation, args?.params, args?.query);
 
     if (isErr(prepared)) {
       return err(prepared.error);
+    }
+
+    // Settled before the body and the credential, so a request claiming a tab
+    // it cannot claim is refused with nothing resolved and nothing sent.
+    const actingTab = actingTabHeaderValue(operation, prepared.value.authExempt, args?.tabId);
+
+    if (isErr(actingTab)) {
+      return err(actingTab.error);
     }
 
     // The outbound body is validated by the same helper the service validates
@@ -1386,6 +1457,12 @@ export class HttpClient {
 
     if (bodyText !== undefined) {
       headers[CONTENT_TYPE_HEADER] = JSON_MEDIA_TYPE;
+    }
+
+    // Never sent without a tab: a request that acts for none carries no header
+    // at all rather than an empty one, which the service would refuse.
+    if (actingTab.value !== undefined) {
+      headers[ACTING_TAB_HEADER] = actingTab.value;
     }
 
     const fetchImpl = this.fetchImpl ?? resolveGlobalFetch();
@@ -1503,7 +1580,9 @@ export class HttpClient {
    * before any credential exists. A configured credential is deliberately **not**
    * sent (AAP §0.5.6).
    *
-   * @param options An abort signal and a timeout for this call.
+   * @param options An abort signal and a timeout for this call. A `tabId` is
+   * forwarded like the other options and refused locally: an unauthenticated
+   * probe has no principal to act for a tab.
    * @returns The service's build version, its protocol version and whether
    * pairing is available — or a failure, which is itself the answer "not
    * running".
@@ -1526,7 +1605,8 @@ export class HttpClient {
    * {@link HttpClient.setToken}.
    *
    * @param code The code the developer read from the editor.
-   * @param options An abort signal and a timeout for this call.
+   * @param options An abort signal and a timeout for this call. A `tabId` is
+   * forwarded and refused locally, as for {@link HttpClient.health}.
    * @returns The credential scoped to this client's origin, or a failure.
    */
   pairComplete(
@@ -1551,7 +1631,8 @@ export class HttpClient {
    * session holds the capture and offer to reopen it.
    *
    * @param sessionId The session to open a capture on.
-   * @param options An abort signal and a timeout for this call.
+   * @param options An abort signal, a timeout and — for the Chrome service
+   * worker — the acting tab, sent as {@link ACTING_TAB_HEADER}.
    * @returns The new capture's id, or a failure whose `details` name the owning
    * session when the refusal was an ownership conflict.
    */
@@ -1806,25 +1887,102 @@ export class HttpClient {
  * worker must not crash — and `tryCatch` preserves the `DebuggenError` that
  * `buildPath` already raises, including the parameter name it names.
  *
+ * The page window, when one is given, is encoded by `formatListPageQuery` and
+ * appended to the path; a window that operation does not read, or a member
+ * outside the listing's range, is the same returned failure the service would
+ * answer with `400`.
+ *
  * @typeParam O The operation.
  * @param operation The operation being prepared.
  * @param params The path parameters the caller supplied.
+ * @param query The page window the caller supplied, if any.
  * @returns The prepared route, or the failure that prevented it.
  */
 function prepareRoute<O extends HttpOperation>(
   operation: O,
   params: HttpPathParams<O> | undefined,
+  query: ListPageRequest | undefined,
 ): Result<PreparedRoute, DebuggenError> {
+  const search = query === undefined ? ok('') : formatListPageQuery(operation, query);
+
+  if (isErr(search)) {
+    return search;
+  }
+
   return tryCatch(() => {
     const route = HTTP_ROUTES[operation];
     const pathParams: Readonly<Record<string, string>> | undefined = params;
 
     return {
       method: route.method,
-      path: buildPath(operation, pathParams),
+      path: `${buildPath(operation, pathParams)}${search.value}`,
       authExempt: isAuthExemptOperation(operation),
     };
   }, 'INTERNAL');
+}
+
+/**
+ * Resolves a call's {@link ACTING_TAB_HEADER} value, or refuses the call.
+ *
+ * Three outcomes, each decided locally and before anything is resolved or sent:
+ *
+ * - no `tabId` — `ok(undefined)`, and no header is written;
+ * - a `tabId` on one of the two auth-exempt operations — refused: `health` and
+ *   `pair.complete` carry no credential, so there is no principal for a tab to
+ *   narrow, and a call that claims one is a caller mixing up two flows;
+ * - a `tabId` that is not a Chrome tab id — refused with
+ *   {@link formatActingTabHeader}'s own failure as `cause`, which holds a
+ *   constant message and no value.
+ *
+ * Both refusals are `PROTOCOL_INVALID_MESSAGE` with a constant message naming
+ * the operation and `details: { operation, header }`; the tab id is never
+ * quoted (AAP §0.5.2).
+ *
+ * @param operation The operation being called.
+ * @param authExempt Whether the operation is called without a credential.
+ * @param tabId The acting tab the caller supplied, if any.
+ * @returns `ok(value)` with the header value, `ok(undefined)` for none, or the
+ * refusal.
+ */
+function actingTabHeaderValue(
+  operation: HttpOperation,
+  authExempt: boolean,
+  tabId: number | undefined,
+): Result<string | undefined, DebuggenError> {
+  if (tabId === undefined) {
+    return ok(undefined);
+  }
+
+  if (authExempt) {
+    return err(
+      new DebuggenError(
+        'PROTOCOL_INVALID_MESSAGE',
+        `Cannot call ${operation}: an acting tab was given for an operation that carries no credential`,
+        {
+          hint: 'Omit tabId on health and pair.complete; an acting tab narrows a DevTools credential, and these two operations present none.',
+          details: { operation, header: ACTING_TAB_HEADER },
+        },
+      ),
+    );
+  }
+
+  const formatted = formatActingTabHeader(tabId);
+
+  if (isErr(formatted)) {
+    return err(
+      new DebuggenError(
+        'PROTOCOL_INVALID_MESSAGE',
+        `Cannot call ${operation}: tabId is not a non-negative safe-integer Chrome tab id`,
+        {
+          ...(formatted.error.hint === undefined ? {} : { hint: formatted.error.hint }),
+          details: { operation, header: ACTING_TAB_HEADER },
+          cause: formatted.error,
+        },
+      ),
+    );
+  }
+
+  return ok(formatted.value);
 }
 
 /**

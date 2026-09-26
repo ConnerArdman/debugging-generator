@@ -14,11 +14,22 @@
  * `applySessionSnapshot`, `setConnectionStatus`, `setBindingState` and the
  * binding-loss `resetPanelStore` are called from here and nowhere else.
  *
+ * It also holds the one piece of worker state that is not session state: the
+ * worker's **reload offer** ({@link PanelReloadState}) — whether the one-click
+ * reload of the inspected page is offered because its agent cannot observe it.
+ * The worker decides it (it performs the reload and holds the agent's
+ * readiness) and pushes it; this module stores the latest `reload` push or
+ * snapshot answer, returns it to `not-needed` when the binding is lost, the
+ * port is lost (a new port re-hydrates it) or the connection is torn down, and
+ * serves it through
+ * {@link usePanelReloadState} / {@link getPanelReloadState}.
+ *
  * `../data-provider.ts` and `../actions.ts` inject {@link panelRequest} (or
  * {@link getPanelConnection}) and **must never acquire a port of their own**;
  * `../App.tsx` owns only the lifetime, through {@link startPanelConnection} and
- * the returned handle's `stop()`, and reads the pill through
- * {@link usePanelConnection}.
+ * the returned handle's `stop()`, reads the pill through
+ * {@link usePanelConnection}, and reads the reload offer through
+ * {@link usePanelReloadState}.
  *
  * ## Lifecycle
  *
@@ -42,14 +53,25 @@
  *
  * The panel never sends the protocol's `session.bind`: the worker does, from
  * its tab registry, when the DevTools page announces the inspected tab. The
- * panel's part is the `session.snapshot` request, whose declared payload is
- * only an optional `sessionId`. When this document runs inside DevTools (a
- * numeric `chrome.devtools.inspectedWindow.tabId`, read defensively) and the
- * store holds a `bound` binding, the request names that session so a restarted
- * worker can re-associate this port with the session's tab. Outside DevTools —
- * `tests/browser/panel-render.spec.ts` opens the panel page directly as an
- * extension page — binding is skipped entirely: the request names no session,
- * nothing throws, and the port keeps working.
+ * panel's part is the `session.snapshot` request, whose declared payload is an
+ * optional `inspectedTabId` and an optional `sessionId`. When this document
+ * runs inside DevTools (a numeric `chrome.devtools.inspectedWindow.tabId`, read
+ * defensively) the request always names that tab: it is this port's identity,
+ * and the worker associates the port with exactly that tab and never moves it
+ * afterwards — so a restarted worker facing several reconnecting DevTools
+ * windows never has to guess which one this panel belongs to. When the store
+ * also holds a `bound` binding **of that inspected tab**, the request names
+ * that session too, as information only: the worker never lets it choose or
+ * assign a tab. Outside DevTools — `tests/browser/panel-render.spec.ts` opens
+ * the panel page directly as an extension page — binding is skipped entirely:
+ * the request names neither a tab nor a session, nothing throws, and the port
+ * keeps working.
+ *
+ * Inside DevTools the panel also refuses to present a `bound` binding that
+ * names a tab other than the one it inspects, from a snapshot answer or a
+ * binding push: it records `unbound` instead (and keeps none of that
+ * snapshot's session, analysis or panel), so it neither shows another tab's
+ * session as its own nor names it in its next handshake.
  *
  * ## Status, and what is never inferred
  *
@@ -66,9 +88,15 @@
  *
  * - No `WebSocket`, no `fetch`, no `HttpClient`, no `ReconnectingWsClient`: the
  *   worker owns the socket and every HTTP call, including the panel-data route.
- * - No validation of panel specifications and no schema parsing: the worker is
- *   same-extension and relays frames its protocol client already validated, so
- *   frames are only narrowed with `../../shared/messages`' guards.
+ * - No schema of its own, and no admission by framing alone (CWE-20): every
+ *   inbound frame goes through `../../shared/messages`' single admission
+ *   point, `classifyPanelPortFrame`, which parses a response with its kind's
+ *   own schema and a relayed push with the protocol's discriminated union, and
+ *   only the **parsed** value it returns settles a request or reaches the
+ *   store. A malformed answer rejects the request it names at once (reason
+ *   `malformed`) instead of waiting for the timeout; a malformed push is never
+ *   applied, and is reported through the store's non-blocking `lastError`.
+ *   Nothing here repairs, re-validates or casts a frame's content.
  * - No credential access: the devtools credential lives in
  *   `chrome.storage.local`, owned by the worker, and is never read here.
  * - No status or label authoring and no "Tab left ‹origin›" wording: the store
@@ -98,27 +126,34 @@
  * @module apps/chrome-extension/src/panel/state/connection
  */
 
+import type { ErrorPayload } from '@debuggen/protocol';
 import { DEBUGGEN_ERROR_CODES, DebuggenError, assertNever, noopLogger } from '@debuggen/shared';
 import type { DebuggenErrorCode, Logger, SessionId } from '@debuggen/shared';
+import { useSyncExternalStore } from 'react';
 
 import {
   EXTENSION_CHANNEL,
+  PANEL_RELOAD_NOT_NEEDED,
   PORT_PANEL,
   PORT_PROTOCOL_VERSION,
-  isPortPush,
-  isPortResponse,
+  classifyPanelPortFrame,
   newPortRequestId,
+  portErrorOwningSessionId,
 } from '../../shared/messages';
 import type {
   PanelBindingState,
   PanelConnectionStatus,
+  PanelReloadState,
   PanelSessionSnapshot,
+  PortErrorPayload,
   PortPush,
+  PortPushKind,
   PortRequestFrame,
   PortRequestId,
   PortRequestKind,
   PortRequestPayloads,
   PortResponse,
+  PortResponseCorrelation,
   PortResponsePayloads,
 } from '../../shared/messages';
 
@@ -171,10 +206,12 @@ export const PANEL_PORT_RECONNECT_JITTER = 0.2;
  * How long a panel request waits for its response before it is rejected, in
  * milliseconds, unless the caller passes its own `timeoutMs`.
  *
- * Deliberately longer than the worker's own request timeout (twenty seconds):
- * a handler that hangs is answered by the worker with a typed failure, which
- * carries more information than a local timeout, so this one only fires when
- * the worker went silent without closing the port.
+ * Deliberately longer than the worker's own port-request timeout (twenty-five
+ * seconds, which in turn outlasts the twenty seconds a consented page reload
+ * waits for the new document's agent, so that wait is answered with its own
+ * specific failure): a handler that hangs is answered by the worker with a
+ * typed failure, which carries more information than a local timeout, so this
+ * one only fires when the worker went silent without closing the port.
  */
 export const PANEL_PORT_REQUEST_TIMEOUT_MS = 30_000;
 
@@ -209,8 +246,16 @@ const PORT_DOWN_STATUS = 'reconnecting' satisfies PanelConnectionStatus;
  * - `aborted` — the caller's `AbortSignal` fired.
  * - `unavailable` — the document has no extension runtime to connect with.
  * - `mismatched` — the worker answered with a response of another kind.
+ * - `malformed` — the worker answered with a frame that names this request
+ *   but failed its kind's schema (`classifyPanelPortFrame`'s
+ *   `malformed-response`). Nothing from the frame is kept — not its payload,
+ *   not its error text — and the request is rejected at once with code
+ *   `PROTOCOL_INVALID_MESSAGE` rather than left to time out. Not retryable
+ *   in place: the same worker build answers the same way.
  * - `refused` — the worker answered with a typed failure; the rejection keeps
- *   that failure's code and message.
+ *   that failure's code and message, and — for a `capture.start` refused
+ *   because another session holds the project's capture — that session's id
+ *   ({@link panelRequestOwningSessionId}).
  */
 export const PANEL_REQUEST_FAILURE_REASONS = [
   'disconnected',
@@ -219,14 +264,12 @@ export const PANEL_REQUEST_FAILURE_REASONS = [
   'aborted',
   'unavailable',
   'mismatched',
+  'malformed',
   'refused',
 ] as const;
 
 /** One of {@link PANEL_REQUEST_FAILURE_REASONS}. */
 export type PanelRequestFailureReason = (typeof PANEL_REQUEST_FAILURE_REASONS)[number];
-
-/** The protocol error payload a worker failure response carries. */
-type PortErrorPayload = Extract<PortResponse, { readonly ok: false }>['error'];
 
 /*
  * ===========================================================================
@@ -492,6 +535,36 @@ export function panelRequestFailureReason(error: unknown): PanelRequestFailureRe
   return PANEL_REQUEST_FAILURE_REASONS.find((candidate) => candidate === reason);
 }
 
+/**
+ * The session that holds the project's capture, as named by a `refused`
+ * rejection of `capture.start` (AAP §0.4.2: the service "answers
+ * `409 { owningSessionId }`"), or `undefined` for any other value — another
+ * reason, another failure, or a refusal that names no owner.
+ *
+ * Read from the rejection's `details`, where {@link panelRequest} put the
+ * owner the parsed failure carried, and string-checked again here because a
+ * caller may pass any value.
+ *
+ * @param error A value a {@link panelRequest} promise rejected with, or anything.
+ * @returns The owning session's id, or `undefined`.
+ *
+ * @example
+ * ```ts
+ * try {
+ *   await panelRequest('capture.start', { sessionId });
+ * } catch (cause) {
+ *   const owner = panelRequestOwningSessionId(cause); // e.g. the other session's id
+ * }
+ * ```
+ */
+export function panelRequestOwningSessionId(error: unknown): SessionId | undefined {
+  if (panelRequestFailureReason(error) !== 'refused' || !DebuggenError.is(error)) {
+    return undefined;
+  }
+  const owner = error.details?.owningSessionId;
+  return typeof owner === 'string' && owner.length > 0 ? owner : undefined;
+}
+
 /** Whether a string is one of the closed `DEBUGGEN_ERROR_CODES`. */
 function isKnownErrorCode(code: string): code is DebuggenErrorCode {
   return DEBUGGEN_ERROR_CODES.some((candidate) => candidate === code);
@@ -558,7 +631,7 @@ function defaultRuntime(): PanelRuntimeLike | undefined {
 /** The rejection for a request that could not complete on the panel's side. */
 function transportError(
   kind: PortRequestKind,
-  reason: Exclude<PanelRequestFailureReason, 'refused' | 'mismatched'>,
+  reason: Exclude<PanelRequestFailureReason, 'refused' | 'mismatched' | 'malformed'>,
   options: { readonly timeoutMs?: number; readonly cause?: unknown } = {},
 ): DebuggenError {
   const details = {
@@ -617,19 +690,59 @@ function mismatchError(kind: PortRequestKind, answeredKind: PortRequestKind): De
 }
 
 /**
+ * The rejection for an answer that names this request but failed its kind's
+ * schema. Nothing from the frame is kept — neither its payload nor any error
+ * text it carried — so the rejection names only the request's kind and the
+ * kind the frame claimed (AAP §0.5.2). The hint is the recovery that applies:
+ * an unreadable answer means the panel and the worker disagree about the
+ * contract, which a reload of the extension and its panel resolves.
+ */
+function malformedResponseError(
+  kind: PortRequestKind,
+  answeredKind: PortRequestKind,
+): DebuggenError {
+  return new DebuggenError(
+    'PROTOCOL_INVALID_MESSAGE',
+    `The extension's service worker answered the ${kind} request with a response this panel could not read.`,
+    {
+      hint: 'Reload the Debug Generator extension, then reopen its DevTools panel.',
+      details: { kind, answeredKind, reason: 'malformed' satisfies PanelRequestFailureReason },
+    },
+  );
+}
+
+/**
+ * The store's non-blocking failure record for a push that failed its parse and
+ * was dropped: a dropped update is invisible otherwise, and a panel that shows
+ * stale state as if it were current misleads (AAP §0.5.5). Frozen and shared,
+ * so a burst of unreadable pushes writes one record — the store ignores an
+ * identical `setLastError` — rather than one per frame.
+ */
+const MALFORMED_PUSH_ERROR: ErrorPayload = Object.freeze({
+  code: 'PROTOCOL_INVALID_MESSAGE',
+  message:
+    "The panel ignored an update from the extension's service worker that it could not read, so what it shows may be out of date.",
+});
+
+/**
  * The rejection for a typed failure the worker answered with: its code (when it
- * is a member of the closed vocabulary) and message are kept, and its `ref`
- * travels in `details` so the store can be given the original payload.
+ * is a member of the closed vocabulary) and message are kept, its `ref`
+ * travels in `details` so the store can be given the original payload, and the
+ * owning session of a capture-ownership conflict — the one detail the port's
+ * failure payload admits — travels in `details.owningSessionId`, where
+ * {@link panelRequestOwningSessionId} reads it.
  */
 function refusedError(kind: PortRequestKind, error: PortErrorPayload): DebuggenError {
   const code: DebuggenErrorCode = isKnownErrorCode(error.code)
     ? error.code
     : 'PROTOCOL_INVALID_MESSAGE';
+  const owningSessionId = portErrorOwningSessionId(error);
   return new DebuggenError(code, error.message, {
     details: {
       kind,
       reason: 'refused' satisfies PanelRequestFailureReason,
       ...(error.ref === undefined ? {} : { ref: error.ref }),
+      ...(owningSessionId === undefined ? {} : { owningSessionId }),
     },
   });
 }
@@ -638,7 +751,7 @@ function refusedError(kind: PortRequestKind, error: PortErrorPayload): DebuggenE
  * The protocol error payload a `refused` rejection was built from, rebuilt for
  * the store's `setLastError`; `undefined` for any other rejection.
  */
-function refusedPayload(error: unknown): PortErrorPayload | undefined {
+function refusedPayload(error: unknown): ErrorPayload | undefined {
   if (panelRequestFailureReason(error) !== 'refused' || !DebuggenError.is(error)) {
     return undefined;
   }
@@ -735,6 +848,18 @@ const disconnectListeners = new Set<PanelPortDisconnectListener>();
 /** The started connection, or `undefined` while none is running. */
 let current: Controller | undefined;
 
+/**
+ * The worker's latest reload offer for the inspected tab. Held here rather
+ * than in `./session-store.ts` because it is not derived from any protocol
+ * frame: it is port state the worker composes and pushes, like the connection
+ * lifecycle this module already owns. Replaced only when its content changes,
+ * so its identity is a stable `useSyncExternalStore` snapshot.
+ */
+let reloadState: PanelReloadState = PANEL_RELOAD_NOT_NEEDED;
+
+/** The {@link usePanelReloadState} subscribers, notified when {@link reloadState} changes. */
+const reloadListeners = new Set<() => void>();
+
 /*
  * ===========================================================================
  * Section H — the request broker
@@ -742,12 +867,55 @@ let current: Controller | undefined;
  */
 
 /**
+ * One reader per request kind: the kind's success payload out of a parsed
+ * response, or `undefined` when the response is of another kind or a failure.
+ *
+ * A mapped type over `PortRequestKind`, so indexing it with a request's
+ * generic `Kind` yields exactly that kind's reader — which is what lets
+ * {@link dispatchRequest} resolve `PortResponsePayloads[Kind]` without a type
+ * assertion — and a kind added to the contract without a reader here fails to
+ * compile. `undefined` is never a success payload (every one is an object), so
+ * it can only mean "not this kind's success".
+ */
+type SuccessPayloadReaders = {
+  readonly [Kind in PortRequestKind]: (
+    response: PortResponse,
+  ) => PortResponsePayloads[Kind] | undefined;
+};
+
+/**
+ * The readers. Each narrows the `PortResponse` union on its own `kind` literal
+ * and then on `ok`, so the payload it returns is typed by the discriminants
+ * `classifyPanelPortFrame` parsed, never asserted.
+ */
+const SUCCESS_PAYLOAD_READERS: SuccessPayloadReaders = Object.freeze({
+  'panelData.query': (response: PortResponse) =>
+    response.kind === 'panelData.query' && response.ok ? response.payload : undefined,
+  'source.open': (response: PortResponse) =>
+    response.kind === 'source.open' && response.ok ? response.payload : undefined,
+  'capture.start': (response: PortResponse) =>
+    response.kind === 'capture.start' && response.ok ? response.payload : undefined,
+  'capture.stop': (response: PortResponse) =>
+    response.kind === 'capture.stop' && response.ok ? response.payload : undefined,
+  'target.pick': (response: PortResponse) =>
+    response.kind === 'target.pick' && response.ok ? response.payload : undefined,
+  'target.selected': (response: PortResponse) =>
+    response.kind === 'target.selected' && response.ok ? response.payload : undefined,
+  'pair.complete': (response: PortResponse) =>
+    response.kind === 'pair.complete' && response.ok ? response.payload : undefined,
+  'session.snapshot': (response: PortResponse) =>
+    response.kind === 'session.snapshot' && response.ok ? response.payload : undefined,
+  'page.reload': (response: PortResponse) =>
+    response.kind === 'page.reload' && response.ok ? response.payload : undefined,
+});
+
+/**
  * Send one request through `live`'s port, or hold it until a port opens.
  *
  * Every path ends in exactly one settlement: the matching response, a typed
- * rejection (abort, timeout, port loss, teardown, no runtime), never a promise
- * left pending. The request's timer and abort listener are removed on every
- * path.
+ * rejection (abort, timeout, port loss, teardown, no runtime, a mismatched or
+ * malformed answer), never a promise left pending. The request's timer and
+ * abort listener are removed on every path.
  */
 function dispatchRequest<Kind extends PortRequestKind>(
   live: Controller | undefined,
@@ -823,12 +991,18 @@ function dispatchRequest<Kind extends PortRequestKind>(
           reject(refusedError(kind, response.error));
           return;
         }
-        // The one admission of the port's payload into the typed result:
-        // `isPortResponse` validated the framing, and the response's `kind` was
-        // just proven equal to this request's, so its payload is this kind's
-        // success payload. The worker is same-extension and answers from
-        // bodies the protocol's client already validated.
-        resolve(response.payload as PortResponsePayloads[Kind]);
+        // The one admission of the port's payload into the typed result, and
+        // no assertion: `classifyPanelPortFrame` parsed this response with the
+        // schema of its own `kind`, just proven equal to this request's, and
+        // the kind's reader narrows the union on that discriminant. It answers
+        // `undefined` only for another kind or a failure — both settled above —
+        // so that branch rejects rather than ever resolving with nothing.
+        const payload = SUCCESS_PAYLOAD_READERS[kind](response);
+        if (payload === undefined) {
+          reject(malformedResponseError(kind, response.kind));
+          return;
+        }
+        resolve(payload);
       },
       fail,
     };
@@ -881,7 +1055,7 @@ function flushWaitingRequests(live: Controller, port: PanelPortLike): void {
 
 /** Reject every pending request `shouldReject` selects, each with its own kind's error. */
 function rejectRequests(
-  reason: Exclude<PanelRequestFailureReason, 'refused' | 'mismatched'>,
+  reason: Exclude<PanelRequestFailureReason, 'refused' | 'mismatched' | 'malformed'>,
   shouldReject: (entry: PendingRequest) => boolean,
 ): void {
   for (const entry of [...pendingRequests.values()]) {
@@ -901,6 +1075,37 @@ function settleResponse(live: Controller, port: PanelPortLike, response: PortRes
     return;
   }
   entry.settle(response);
+}
+
+/**
+ * Reject, at once, the request a malformed answer names — when that request is
+ * pending on this port — with a `malformed` rejection, instead of leaving it
+ * to its timeout. Nothing from the frame is kept. An answer whose correlation
+ * is unreadable, or that names a request nobody on this port awaits, is only
+ * logged, by its claimed kind when it has one.
+ *
+ * @param correlation The request the frame claims to answer, when readable.
+ */
+function rejectMalformedResponse(
+  live: Controller,
+  port: PanelPortLike,
+  correlation: PortResponseCorrelation | undefined,
+): void {
+  if (correlation === undefined) {
+    live.logger.warn('Dropped a malformed panel port response that names no request.');
+    return;
+  }
+  const entry = pendingRequests.get(correlation.requestId);
+  if (entry === undefined || entry.port !== port) {
+    live.logger.warn('Dropped a malformed panel port response with no pending request.', {
+      kind: correlation.kind,
+    });
+    return;
+  }
+  live.logger.warn('Rejected a panel request answered with a malformed response.', {
+    kind: correlation.kind,
+  });
+  entry.fail(malformedResponseError(entry.kind, correlation.kind));
 }
 
 /** Tell every consumer listener about a port loss or teardown; a throwing listener is logged. */
@@ -923,7 +1128,8 @@ function notifyDisconnect(logger: Logger, event: PanelPortDisconnectEvent): void
  *
  * The only protocol-derived writes into `./session-store.ts`. Each is guarded
  * so a reducer failure is logged instead of escaping into Chrome's event
- * dispatch, and none composes wording: the store holds imported vocabulary.
+ * dispatch, and none composes wording: the store holds imported vocabulary,
+ * and the one failure record written here is Section F's.
  * ===========================================================================
  */
 
@@ -932,27 +1138,90 @@ function currentBinding(): PanelBindingState {
   return getPanelSnapshot().connection.binding;
 }
 
+/** The binding recorded in place of one that names another tab. */
+const UNBOUND_BINDING: PanelBindingState = Object.freeze({ kind: 'unbound' });
+
 /**
- * Reset the session-scoped slices when the binding just moved to a non-bound
- * kind from a different kind — the tab was unbound (a session end included,
- * since ending a session unbinds its tab), left its session's origin, or had
- * its binding taken. `resetPanelStore()` keeps the connection slice, so the
- * pill and a "Tab left ‹origin›" binding survive the reset that it caused.
- * A binding to another session needs no call: the store resets on a change of
- * session identity itself.
+ * `binding`, or `unbound` when it is a `bound` state for a tab other than the
+ * one this document inspects inside DevTools. The worker answers and pushes
+ * the binding of the tab it associated this port with; if that tab is not the
+ * inspected one, the association is wrong, and presenting (or later claiming)
+ * its session would show this DevTools window another tab's session. Outside
+ * DevTools there is no inspected tab to compare with, and the binding is kept.
+ */
+function inspectedTabBinding(live: Controller, binding: PanelBindingState): PanelBindingState {
+  const inspectedTabId = live.inspectedTabId;
+  if (
+    inspectedTabId === undefined ||
+    binding.kind !== 'bound' ||
+    binding.tabId === inspectedTabId
+  ) {
+    return binding;
+  }
+  live.logger.warn('Ignored a binding for a tab this panel does not inspect.', {
+    tabId: binding.tabId,
+    inspectedTabId,
+  });
+  return UNBOUND_BINDING;
+}
+
+/** Whether two reload offers say the same thing: the same kind, and the same reason. */
+function sameReloadState(left: PanelReloadState, right: PanelReloadState): boolean {
+  if (left.kind === 'offered' || right.kind === 'offered') {
+    return left.kind === 'offered' && right.kind === 'offered' && left.reason === right.reason;
+  }
+  return left.kind === right.kind;
+}
+
+/**
+ * Replace the reload offer and notify {@link usePanelReloadState}'s
+ * subscribers — only when its content changed, so an unchanged push re-renders
+ * nothing and the snapshot identity stays stable. `not-needed` is always
+ * stored as the shared frozen {@link PANEL_RELOAD_NOT_NEEDED}.
+ */
+function setReloadState(next: PanelReloadState): void {
+  if (sameReloadState(reloadState, next)) {
+    return;
+  }
+  reloadState = next.kind === 'not-needed' ? PANEL_RELOAD_NOT_NEEDED : next;
+  for (const listener of [...reloadListeners]) {
+    listener();
+  }
+}
+
+/**
+ * Discard everything scoped to the session the panel showed: the store's
+ * session-scoped slices (`resetPanelStore()` keeps the connection slice, so the
+ * pill and a "Tab left ‹origin›" binding survive) and the reload offer, which
+ * was about that session's tab.
+ */
+function resetSessionScope(): void {
+  resetPanelStore();
+  setReloadState(PANEL_RELOAD_NOT_NEEDED);
+}
+
+/**
+ * Reset the session scope when the binding just moved to a non-bound kind from
+ * a different kind — the tab was unbound (a session end included, since ending
+ * a session unbinds its tab), left its session's origin, or had its binding
+ * taken. A binding to another session needs no call: the store resets on a
+ * change of session identity itself, and the worker pushes the new tab state's
+ * reload offer.
  */
 function resetIfBindingLost(before: PanelBindingState): void {
   const after = currentBinding();
   if (after.kind !== 'bound' && after.kind !== before.kind) {
-    resetPanelStore();
+    resetSessionScope();
   }
 }
 
 /**
  * Apply one push. Branches on the push's frame kind only — a relayed protocol
- * frame goes to `applyRelayedMessage` untouched, whatever its type.
+ * frame goes to `applyRelayedMessage` untouched, whatever its type — and a
+ * binding push naming another tab than the inspected one is recorded as
+ * `unbound` ({@link inspectedTabBinding}).
  */
-function applyPush(push: PortPush): void {
+function applyPush(live: Controller, push: PortPush): void {
   switch (push.kind) {
     case 'protocol': {
       const before = currentBinding();
@@ -967,27 +1236,55 @@ function applyPush(push: PortPush): void {
       return;
     case 'binding': {
       const before = currentBinding();
-      setBindingState(push.state);
+      setBindingState(inspectedTabBinding(live, push.state));
       resetIfBindingLost(before);
       return;
     }
+    case 'reload':
+      // The worker decided the offer from the tab's agent readiness; it is
+      // stored as is and read by the panel's reload notice.
+      setReloadState(push.state);
+      return;
     default:
       assertNever(push, 'Unhandled panel port push');
   }
 }
 
 /**
- * Apply a `session.snapshot` answer. When the snapshot's binding is non-bound
+ * Apply a `session.snapshot` answer. A snapshot whose binding names another
+ * tab than the inspected one is reduced to its connection state and an
+ * `unbound` binding ({@link inspectedTabBinding}): none of that tab's
+ * session, analysis or panel is kept. When the resulting binding is non-bound
  * and differs from the store's, the previous session's scope is reset first,
  * so its tail and progress cannot linger beside the new state; the snapshot
  * then lands, keeping the live tail, selection and drawer of an unchanged
- * session.
+ * session, and its reload offer replaces the held one — an absent offer reads
+ * as `not-needed`, as the contract declares.
  */
-function applySnapshot(snapshot: PanelSessionSnapshot): void {
+function applySnapshot(live: Controller, answer: PanelSessionSnapshot): void {
+  const binding = inspectedTabBinding(live, answer.binding);
+  const snapshot: PanelSessionSnapshot =
+    binding === answer.binding ? answer : { connection: answer.connection, binding };
   if (snapshot.binding.kind !== 'bound' && snapshot.binding.kind !== currentBinding().kind) {
-    resetPanelStore();
+    resetSessionScope();
   }
   applySessionSnapshot(snapshot);
+  setReloadState(snapshot.reload ?? PANEL_RELOAD_NOT_NEEDED);
+}
+
+/**
+ * Record a push that failed its parse: it is never applied, the log names only
+ * its push kind (never its content), and the developer sees the store's
+ * non-blocking `lastError` instead of a silently stale panel.
+ *
+ * @param pushKind The frame's push kind, when it is a known one.
+ */
+function reportMalformedPush(live: Controller, pushKind: PortPushKind | undefined): void {
+  live.logger.warn(
+    'Dropped a malformed panel port push.',
+    pushKind === undefined ? undefined : { pushKind },
+  );
+  setLastError(MALFORMED_PUSH_ERROR);
 }
 
 /** Write the locally observed status; a store failure is logged. */
@@ -1006,35 +1303,56 @@ function writePortDownStatus(logger: Logger): void {
  */
 
 /**
- * The `session.snapshot` payload: the bound session when this document runs
- * inside DevTools and the store holds a `bound` binding, so a restarted worker
- * can re-associate this port with the session's tab; otherwise no session.
+ * The `session.snapshot` payload. Inside DevTools it always names this
+ * document's inspected tab (`inspectedTabId`, from
+ * `chrome.devtools.inspectedWindow.tabId`): that is the port's identity, and
+ * the worker associates the port with exactly that tab — so a worker revived
+ * while several DevTools windows reconnect never has to guess which window
+ * this panel belongs to. It also names the bound session when the store holds
+ * a `bound` binding of the inspected tab; that claim is informational only
+ * (the worker logs and ignores one that has gone stale, and never lets it
+ * choose or assign a tab).
  *
- * Outside DevTools binding is skipped entirely — the request names no session,
- * so the worker never ties a page that inspects nothing to a tab. A `tab-left`
- * binding is not named either: its session may meanwhile be bound to another
- * tab, and naming it would attach this panel to that tab.
+ * Outside DevTools binding is skipped entirely — the request names neither a
+ * tab nor a session, so the worker never ties a page that inspects nothing to
+ * a tab on this document's word. A claim is dropped as soon as the panel can
+ * see it is stale: after an `unbound` or `tab-left` binding (a session end, a
+ * navigation away, a replacement), after a snapshot answer naming no session,
+ * and for a `bound` binding of any tab other than the inspected one. A
+ * snapshot answer naming a different session of this tab replaces the claim
+ * with that session, which is the tab's current truth.
+ *
+ * `readInspectedTabId` accepts any non-negative integer; the request guard
+ * accepts safe integers only, so an id beyond that range (which no Chrome tab
+ * has) is left out rather than turning the whole handshake into a malformed
+ * request.
  */
 function handshakePayload(live: Controller): PortRequestPayloads['session.snapshot'] {
-  if (live.inspectedTabId === undefined) {
+  const inspectedTabId = live.inspectedTabId;
+  if (inspectedTabId === undefined || !Number.isSafeInteger(inspectedTabId)) {
     return {};
   }
   const binding = currentBinding();
-  const sessionId: SessionId | undefined = binding.kind === 'bound' ? binding.sessionId : undefined;
-  return sessionId === undefined ? {} : { sessionId };
+  const sessionId: SessionId | undefined =
+    binding.kind === 'bound' && binding.tabId === inspectedTabId ? binding.sessionId : undefined;
+  return sessionId === undefined ? { inspectedTabId } : { inspectedTabId, sessionId };
 }
 
 /**
  * Record why a handshake did not complete. A typed failure the worker answered
- * with is surfaced through the store's non-blocking `lastError`, because a
- * panel that silently never hydrates would present nothing as if it were fine
- * (AAP §0.5.5); a transport loss is only logged, because the next port
- * hydrates again and the pill already says `reconnecting`.
+ * with — and an answer the panel could not use at all (`malformed` or
+ * `mismatched`) — is surfaced through the store's non-blocking `lastError`,
+ * because a panel that silently never hydrates would present nothing as if it
+ * were fine (AAP §0.5.5); a transport loss is only logged, because the next
+ * port hydrates again and the pill already says `reconnecting`.
  */
 function reportHydrationFailure(live: Controller, error: unknown): void {
-  const payload = refusedPayload(error);
+  const payload = refusedPayload(error) ?? unusableAnswerPayload(error);
   if (payload !== undefined) {
-    live.logger.warn('The service worker refused the panel snapshot.', { code: payload.code });
+    live.logger.warn('The service worker did not answer the panel snapshot usably.', {
+      code: payload.code,
+      reason: panelRequestFailureReason(error),
+    });
     try {
       setLastError(payload);
     } catch (cause) {
@@ -1051,6 +1369,24 @@ function reportHydrationFailure(live: Controller, error: unknown): void {
 }
 
 /**
+ * The store record of a `malformed` or `mismatched` rejection — its code, and
+ * its message followed by its recovery hint when it has one — or `undefined`
+ * for any other value. Both rejections were built here and carry nothing from
+ * the frame, so the record holds no payload content (AAP §0.5.2).
+ */
+function unusableAnswerPayload(error: unknown): ErrorPayload | undefined {
+  const reason = panelRequestFailureReason(error);
+  if ((reason !== 'malformed' && reason !== 'mismatched') || !DebuggenError.is(error)) {
+    return undefined;
+  }
+  const hint = error.hint;
+  return {
+    code: error.code,
+    message: hint === undefined || hint === '' ? error.message : `${error.message} ${hint}`,
+  };
+}
+
+/**
  * Run the handshake on `port`: request the snapshot and apply it if the port is
  * still the live one. At most one handshake per port is in flight. Never
  * rejects — every failure is recorded by {@link reportHydrationFailure}.
@@ -1063,7 +1399,7 @@ async function hydrate(live: Controller, port: PanelPortLike): Promise<void> {
   try {
     const snapshot = await dispatchRequest(live, 'session.snapshot', handshakePayload(live), {});
     if (live.port === port) {
-      applySnapshot(snapshot);
+      applySnapshot(live, snapshot);
     }
   } catch (error) {
     reportHydrationFailure(live, error);
@@ -1221,6 +1557,11 @@ function handlePortLoss(live: Controller, port: PanelPortLike): void {
 
   rejectRequests('disconnected', (entry) => entry.port === port);
   writePortDownStatus(live.logger);
+  // The offer was the worker's word about the tab this port was associated
+  // with; a new port starts unassociated, so the offer is withdrawn until that
+  // port's snapshot (or a `reload` push to it) states it afresh. A stale
+  // "Reload page" can therefore never be activated across a reconnect.
+  setReloadState(PANEL_RELOAD_NOT_NEEDED);
   notifyDisconnect(live.logger, {
     reason: 'disconnected',
     error: connectionLossError('disconnected'),
@@ -1230,26 +1571,50 @@ function handlePortLoss(live: Controller, port: PanelPortLike): void {
 }
 
 /**
- * Route one frame from the live port. A response settles its request; a push
- * is applied to the store; anything else is ignored harmlessly. Either valid
- * frame proves the worker is alive and resets the backoff.
+ * Route one frame from the live port through the panel's single admission
+ * point, `classifyPanelPortFrame`, and act only on what it parsed:
+ *
+ * - a parsed response settles its request, and a parsed push is applied to
+ *   the store — each as the rebuilt value the classifier returns, never the
+ *   raw frame;
+ * - a malformed response rejects the request it names at once
+ *   ({@link rejectMalformedResponse});
+ * - a malformed push is dropped and reported ({@link reportMalformedPush});
+ * - anything else — another channel or version, a request echoed back — is
+ *   ignored harmlessly.
+ *
+ * Every frame on this channel, well-formed or not, proves the worker is alive
+ * and resets the backoff.
  */
 function handleFrame(live: Controller, port: PanelPortLike, message: unknown): void {
   if (live.port !== port) {
     return;
   }
   try {
-    if (isPortResponse(message)) {
-      live.attempt = 0;
-      settleResponse(live, port, message);
-      return;
+    const inbound = classifyPanelPortFrame(message);
+    switch (inbound.kind) {
+      case 'response':
+        live.attempt = 0;
+        settleResponse(live, port, inbound.response);
+        return;
+      case 'push':
+        live.attempt = 0;
+        applyPush(live, inbound.push);
+        return;
+      case 'malformed-response':
+        live.attempt = 0;
+        rejectMalformedResponse(live, port, inbound.correlation);
+        return;
+      case 'malformed-push':
+        live.attempt = 0;
+        reportMalformedPush(live, inbound.pushKind);
+        return;
+      case 'unrecognised':
+        live.logger.debug('Ignored an unrecognised frame on the panel port.');
+        return;
+      default:
+        assertNever(inbound, 'Unhandled panel port frame classification');
     }
-    if (isPortPush(message)) {
-      live.attempt = 0;
-      applyPush(message);
-      return;
-    }
-    live.logger.debug('Ignored an unrecognised frame on the panel port.');
   } catch (cause) {
     live.logger.error('Applying a panel port frame failed.', { error: errorName(cause) });
   }
@@ -1293,6 +1658,9 @@ function teardown(live: Controller): void {
 
   rejectRequests('stopped', () => true);
   writePortDownStatus(live.logger);
+  // No worker speaks for this panel any more, so nothing can be offered: a
+  // later start hydrates the offer afresh from its snapshot.
+  setReloadState(PANEL_RELOAD_NOT_NEEDED);
   notifyDisconnect(live.logger, { reason: 'stopped', error: connectionLossError('stopped') });
   live.logger.debug('Stopped the panel connection.');
 }
@@ -1338,7 +1706,8 @@ function release(live: Controller): void {
  * `DebuggenError` whose `details.reason` is one of
  * {@link PANEL_REQUEST_FAILURE_REASONS}: the worker's own typed failure
  * (`refused`, keeping its code and message), a port loss (`disconnected`),
- * teardown (`stopped`), `timeout`, `aborted`, `unavailable` or `mismatched`.
+ * teardown (`stopped`), `timeout`, `aborted`, `unavailable`, `mismatched`, or
+ * an answer that failed its kind's schema (`malformed`).
  * Never throws synchronously, and never leaves a promise pending: a disconnect
  * rejects what was in flight so `useQuery` renders its error state with a retry
  * instead of a spinner.
@@ -1477,4 +1846,53 @@ function selectConnection(snapshot: PanelSnapshot): PanelConnectionSlice {
  */
 export function usePanelConnection(): PanelConnectionSlice {
   return usePanelStoreSelector(selectConnection);
+}
+
+/*
+ * ===========================================================================
+ * Section N — the reload offer
+ * ===========================================================================
+ */
+
+/**
+ * Register a {@link usePanelReloadState} subscriber. Module-scope, so the
+ * subscription's identity is stable and React never re-subscribes.
+ */
+function subscribePanelReloadState(listener: () => void): () => void {
+  reloadListeners.add(listener);
+  return () => {
+    reloadListeners.delete(listener);
+  };
+}
+
+/**
+ * The worker's current reload offer for the inspected tab, read outside React
+ * — `../App.tsx`'s reload command checks it at call time, so a consent is
+ * only ever sent while a reload is `offered`.
+ *
+ * @returns The held offer; the same object until its content changes.
+ */
+export function getPanelReloadState(): PanelReloadState {
+  return reloadState;
+}
+
+/**
+ * The worker's current reload offer for the inspected tab, for `../App.tsx`
+ * to decide whether to show the reload notice and its action.
+ *
+ * `not-needed` until the worker says otherwise, after a binding loss, after a
+ * port loss (until the new port's snapshot) and after teardown; `offered`
+ * (with its reason) or `reloading` exactly as the worker's
+ * last `reload` push or snapshot answer said.
+ *
+ * @returns The held offer; a new reference only when its content changed.
+ *
+ * @example
+ * ```tsx
+ * const reload = usePanelReloadState();
+ * return reload.kind === 'not-needed' ? null : <PageReloadNotice reload={reload} />;
+ * ```
+ */
+export function usePanelReloadState(): PanelReloadState {
+  return useSyncExternalStore(subscribePanelReloadState, getPanelReloadState);
 }

@@ -20,13 +20,22 @@
  * 2. **The watcher is stopped, and the hooks disarmed, before the first
  *    restore**: a restore write is a digest change, and the watcher's one
  *    mutation turns a digest change into a `conflict`.
- * 3. **Runtime hooks are disabled by delegation**: one disarm and one release
- *    per session, the disarm carries no capture id, and the module builds no
- *    agent or preload configuration of its own.
+ * 3. **Runtime hooks are disabled by delegation, and a disarm is confirmed by
+ *    its receipt**: one disarm and one release per session, the disarm carries
+ *    no capture id, the module builds no agent or preload configuration of its
+ *    own, and a disarm that failed, cannot say who received it, or names
+ *    producers that did not, reports `partial` with the files still restored —
+ *    upgraded to `clean` exactly once, through the sink, only when the service
+ *    later confirms a named shortfall dormant.
  * 4. **One delivery of the outcome**: `run` returns it once for
  *    `SessionManager.end` to record and broadcast; the start-up pass hands each
  *    session's verdict to the injected sink exactly once, or writes only the
  *    record's `cleanup` sub-object when there is no sink — never its status.
+ * 5. **A restart never leaves a session capturing what it removed**:
+ *    `settleInterruptedSessions` reads every interrupted session before acting,
+ *    fails an interrupted install and any ready or capturing session whose
+ *    records the reconciliation held, resumes a runtime-only capture with its
+ *    own plan version, and contains a per-session failure.
  *
  * and, around them: a developer-edited file is never overwritten, no backup is
  * deleted by this module, the independent end-state verification can only make
@@ -81,6 +90,7 @@ import type {
   CleanupContext,
   CleanupFailure,
   CleanupOutcome,
+  InstrumentationPlan,
   ModificationConflict,
   ModificationRecord,
   ModificationStatus,
@@ -116,25 +126,42 @@ import { sha256Hex, sha256OfFile } from '@debuggen/shared/node';
 
 import type { SessionCleanupOutcome } from '../sessions/manager.js';
 import type { SessionProgress } from '../sessions/progress.js';
+import type { SessionFailure } from '../sessions/state-machine.js';
 import type { ModificationsRepo } from '../store/modifications-repo.js';
-import type { SessionsRepo, StoredCapture } from '../store/sessions-repo.js';
+import { MAX_SESSION_LIST_LIMIT } from '../store/sessions-repo.js';
+import type {
+  ListSessionsOptions,
+  SessionListItem,
+  SessionsRepo,
+  StoredCapture,
+} from '../store/sessions-repo.js';
 import {
   CLEANUP_TRIGGERS,
   aggregateCleanupStatus,
   createCleanupContextFactory,
   createSessionCleanup,
   reconcileModificationsOnStartup,
+  settleInterruptedSessions,
 } from './cleanup.js';
 import type {
+  CaptureReleaseRequest,
+  CaptureReleaser,
   CleanupContextRequest,
   CleanupCounts,
+  CleanupDisarmOutcome,
   CleanupDisarmRequest,
   CleanupOutcomeSink,
+  CleanupVerdictHold,
   InstrumentationContextFactory,
   InstrumentationDisabler,
   InstrumentationSuspender,
+  InterruptedSessionDeps,
+  InterruptedSessionsReport,
+  ReleasedCaptureVerdict,
   SessionCleanup,
   SessionCleanupDeps,
+  SessionFailer,
+  SessionReconciliationSummary,
   StartupReconciliationDeps,
   StartupReconciliationReport,
 } from './cleanup.js';
@@ -213,7 +240,8 @@ type Actor =
   | 'watcher'
   | 'progress'
   | 'backups'
-  | 'engine';
+  | 'engine'
+  | 'manager';
 
 /** One call a double received, in the order every double received them. */
 interface CallEntry {
@@ -319,6 +347,13 @@ function createMemoryModifications(calls: CallEntry[]): MemoryModifications {
             (record) => statuses === undefined || statuses.includes(record.status),
           ),
         ),
+      );
+    },
+    listPageBySession(sessionId, window) {
+      note('listPageBySession', [sessionId, window.limit, window.offset]);
+      const all = bySession(sessionId);
+      return Promise.resolve(
+        ok({ records: all.slice(window.offset, window.offset + window.limit), total: all.length }),
       );
     },
     listOpen(sessionId) {
@@ -505,6 +540,9 @@ function createRecordingWatcher(calls: CallEntry[]): RecordingWatcher {
   };
 }
 
+/** What a scripted disarm reports as `pending`: a list, or no `pending` member at all. */
+type PendingScript = readonly string[] | 'unreported';
+
 /** The instrumentation-service double: the runtime-hook half of cleanup. */
 interface RecordingDisabler extends InstrumentationDisabler {
   /** Sessions reported as still installing. */
@@ -517,6 +555,23 @@ interface RecordingDisabler extends InstrumentationDisabler {
   readonly released: string[];
 
   readonly faults: FaultSwitch;
+
+  /**
+   * What the next disarm of a session reports as undelivered. A session with no
+   * entry answers `pending: []` — every armed producer received its dormant
+   * configuration, as the real service reports when the producers are connected.
+   */
+  readonly pendingFor: Map<string, PendingScript>;
+
+  /**
+   * Every listener subscribed to dormancy confirmations. Subscribing is kept out
+   * of the shared call log on purpose: it happens once, when a runner is built,
+   * and is not a call a pass makes.
+   */
+  readonly listeners: Set<(sessionId: string) => void>;
+
+  /** Fires a dormancy confirmation for a session, as the service does after a replay. */
+  confirmDormancy(sessionId: string): void;
 }
 
 function createRecordingDisabler(calls: CallEntry[]): RecordingDisabler {
@@ -524,13 +579,22 @@ function createRecordingDisabler(calls: CallEntry[]): RecordingDisabler {
   const disarmed: CleanupDisarmRequest[] = [];
   const released: string[] = [];
   const faults: FaultSwitch = { fault: 'none' };
+  const pendingFor = new Map<string, PendingScript>();
+  const listeners = new Set<(sessionId: string) => void>();
 
   return {
     installing,
     disarmed,
     released,
     faults,
-    disarmCapture(request: CleanupDisarmRequest) {
+    pendingFor,
+    listeners,
+    confirmDormancy(sessionId) {
+      for (const listener of [...listeners]) {
+        listener(sessionId);
+      }
+    },
+    disarmCapture(request: CleanupDisarmRequest): Result<CleanupDisarmOutcome, DebuggenError> {
       calls.push({ actor: 'instrumentation', method: 'disarmCapture', args: [request] });
       disarmed.push(request);
 
@@ -538,9 +602,24 @@ function createRecordingDisabler(calls: CallEntry[]): RecordingDisabler {
         throw new Error('The synthetic socket is gone.');
       }
 
-      return faults.fault === 'err'
-        ? err(new DebuggenError('TRANSPORT_DISCONNECTED', 'No synthetic client is connected.'))
-        : ok(undefined);
+      if (faults.fault === 'err') {
+        return err(
+          new DebuggenError('TRANSPORT_DISCONNECTED', 'No synthetic client is connected.'),
+        );
+      }
+
+      const pending = pendingFor.get(request.sessionId) ?? [];
+
+      return pending === 'unreported'
+        ? ok({ sessionId: request.sessionId })
+        : ok({ sessionId: request.sessionId, pending: [...pending] });
+    },
+    onDormancyConfirmed(listener) {
+      listeners.add(listener);
+
+      return () => {
+        listeners.delete(listener);
+      };
     },
     stopSession(sessionId) {
       calls.push({ actor: 'instrumentation', method: 'stopSession', args: [sessionId] });
@@ -949,10 +1028,10 @@ function addSession(
 }
 
 /** Marks a capture of the session open, validated by the protocol's capture schema. */
-function openCapture(h: Harness, sessionId: string, captureId: string): void {
+function openCapture(h: Harness, sessionId: string, captureId: string, planVersion = 1): void {
   h.sessions.captures.set(sessionId, {
     sessionId,
-    capture: captureRecordSchema.parse({ id: captureId, planVersion: 1, startedAt: SEEDED_AT }),
+    capture: captureRecordSchema.parse({ id: captureId, planVersion, startedAt: SEEDED_AT }),
   });
 }
 
@@ -1498,7 +1577,7 @@ describe('invariant 4 — the reconciliation set is never scoped by session stat
       expect(h.sessions.updates).toEqual([]);
     });
 
-    it('arms no runtime hook and disarms none: nothing is live before the service serves', async () => {
+    it('arms no runtime hook and disarms none: no producer is connected before the service serves', async () => {
       const h = createHarness();
       await seedEveryOwningState(h);
 
@@ -1702,25 +1781,332 @@ describe('invariant 3 — runtime hooks are disabled by delegation', () => {
   });
 
   it.each(['err', 'throw'] as const)(
-    'keeps restoring when the disarm answers %s, and logs the code',
+    'keeps restoring when the disarm answers %s, but reports partial: a failed disarm is no disarm',
     async (fault) => {
       const h = createHarness();
       addSession(h, SESSION.generated, 'generated');
       const seeded = await seedRecord(h, { sessionId: SESSION.generated, file: FILE.dial });
       h.instrumentation.faults.fault = fault;
+      const runner = makeRunner(h, { outcomeSink: h.sink });
 
-      const outcome = unwrap(await makeRunner(h).run(SESSION.generated));
+      const outcome = unwrap(await runner.run(SESSION.generated));
 
-      expect(outcome.status).toBe('clean');
+      // The files are put back regardless — a live hook is never a reason to
+      // leave a patch in place — but whether the hooks are dormant is unknown.
+      expect(outcome.status).toBe('partial');
       expect(journaled(h, seeded.record.id)?.status).toBe('reverted');
+      expect(readFileSync(seeded.path, 'utf8')).toBe(seeded.originalBytes);
       expect(h.instrumentation.released).toEqual([SESSION.generated]);
 
       const warning = h.logs.find((record) =>
         record.message.includes('runtime hooks could not be disarmed'),
       );
       expect(warning?.fields['code']).toBe('TRANSPORT_DISCONNECTED');
+
+      // An unknown outcome is never upgraded: no confirmation can vouch for it.
+      h.instrumentation.confirmDormancy(SESSION.generated);
+      await drained();
+      expect(h.sink.delivered).toEqual([]);
     },
   );
+});
+
+// ---------------------------------------------------------------------------
+// Runtime-hook dormancy — only a delivery receipt confirms a disarm
+// ---------------------------------------------------------------------------
+
+/**
+ * Lets every promise the runner started from a listener settle: `setImmediate`
+ * runs after the microtask queue has drained.
+ */
+function drained(): Promise<void> {
+  return new Promise((resolve) => {
+    setImmediate(resolve);
+  });
+}
+
+/** The sink deliveries whose verdict is `clean`: the upgrades, never a pass's own return. */
+function upgrades(h: Harness): SessionCleanupOutcome[] {
+  return h.sink.delivered
+    .filter((delivery) => delivery.outcome.status === 'clean')
+    .map((delivery) => delivery.outcome);
+}
+
+describe('runtime-hook dormancy — a disarm nobody received is not a clean end', () => {
+  it('reports partial with every file restored when producers did not receive the dormant configuration', async () => {
+    const h = createHarness();
+    addSession(h, SESSION.generated, 'generated');
+    const seeded = await seedRecord(h, { sessionId: SESSION.generated, file: FILE.dial });
+    h.instrumentation.pendingFor.set(SESSION.generated, ['server-agent', 'page-agent']);
+
+    const outcome = unwrap(await makeRunner(h).run(SESSION.generated));
+
+    expect(outcome).toEqual({ status: 'partial', conflicts: [], completedAt: FIXED_NOW });
+    expect(journaled(h, seeded.record.id)?.status).toBe('reverted');
+    expect(readFileSync(seeded.path, 'utf8')).toBe(seeded.originalBytes);
+
+    // The shortfall is named by producer kind, deduplicated and sorted.
+    const warning = h.logs.find((record) =>
+      record.message.includes('did not receive the dormant configuration'),
+    );
+    expect(warning?.level).toBe('warn');
+    expect(warning?.fields['pendingProducers']).toEqual(['page-agent', 'server-agent']);
+    expect(warning?.fields['count']).toBe(2);
+
+    const finished = h.logs.find((record) => record.message === 'session cleanup finished');
+    expect(finished?.fields).toMatchObject({
+      cleanup: 'partial',
+      files: 'clean',
+      hooksDormant: false,
+    });
+  });
+
+  it('reports partial for a disarm outcome that does not say who received it, and never upgrades it', async () => {
+    const h = createHarness();
+    addSession(h, SESSION.generated, 'generated');
+    const seeded = await seedRecord(h, { sessionId: SESSION.generated, file: FILE.dial });
+    h.instrumentation.pendingFor.set(SESSION.generated, 'unreported');
+    const runner = makeRunner(h, { outcomeSink: h.sink });
+
+    const outcome = unwrap(await runner.run(SESSION.generated));
+
+    expect(outcome.status).toBe('partial');
+    expect(journaled(h, seeded.record.id)?.status).toBe('reverted');
+    expect(
+      h.logs.some((record) =>
+        record.message.includes('did not report which producers received the dormant'),
+      ),
+    ).toBe(true);
+
+    h.instrumentation.confirmDormancy(SESSION.generated);
+    await drained();
+    expect(h.sink.delivered).toEqual([]);
+  });
+
+  it('answers clean when the receipt names no undelivered producer, or no instrumentation is wired', async () => {
+    const h = createHarness();
+    addSession(h, SESSION.generated, 'generated');
+    addSession(h, SESSION.failed, 'failed');
+    await seedRecord(h, { sessionId: SESSION.generated, file: FILE.dial });
+    await seedRecord(h, { sessionId: SESSION.failed, file: FILE.needle });
+
+    expect(unwrap(await makeRunner(h).run(SESSION.generated)).status).toBe('clean');
+    expect(
+      unwrap(await makeRunner(h, { instrumentation: undefined }).run(SESSION.failed)).status,
+    ).toBe('clean');
+  });
+
+  it('upgrades the verdict to clean through the sink exactly once when the service confirms dormancy', async () => {
+    const h = createHarness();
+    const stored = addSession(h, SESSION.generated, 'generated');
+    await seedRecord(h, { sessionId: SESSION.generated, file: FILE.dial });
+    h.instrumentation.pendingFor.set(SESSION.generated, ['page-agent']);
+    const runner = makeRunner(h, { outcomeSink: h.sink });
+
+    const outcome = unwrap(await runner.run(SESSION.generated));
+
+    // Invariant 6: the pass returns its verdict and delivers nothing itself.
+    expect(outcome.status).toBe('partial');
+    expect(h.sink.delivered).toEqual([]);
+
+    // `SessionManager.end` records what `run` returned.
+    unwrap(await h.sink.recordCleanupOutcome(SESSION.generated, outcome));
+    expect(h.sessions.rows.get(SESSION.generated)?.cleanup.status).toBe('partial');
+
+    // A later replay delivers the dormant configuration; the service says so.
+    h.instrumentation.confirmDormancy(SESSION.generated);
+    await drained();
+
+    expect(h.sink.delivered.map((delivery) => delivery.sessionId)).toEqual([
+      SESSION.generated,
+      SESSION.generated,
+    ]);
+    expect(upgrades(h)).toEqual([{ status: 'clean', conflicts: [], completedAt: FIXED_NOW }]);
+    expect(h.sessions.rows.get(SESSION.generated)?.cleanup).toEqual({
+      status: 'clean',
+      completedAt: FIXED_NOW,
+      conflicts: [],
+    });
+
+    // The status is the manager's; this module wrote nothing through `update`.
+    expect(h.sessions.updates).toEqual([]);
+    expect(h.sessions.rows.get(SESSION.generated)?.status).toBe(stored.status);
+
+    // Once: a second confirmation finds nothing remembered.
+    h.instrumentation.confirmDormancy(SESSION.generated);
+    await drained();
+    expect(upgrades(h)).toHaveLength(1);
+  });
+
+  it('without a sink, upgrades only the cleanup sub-object and never the status', async () => {
+    const h = createHarness();
+    const stored = addSession(h, SESSION.generated, 'generated');
+    await seedRecord(h, { sessionId: SESSION.generated, file: FILE.dial });
+    h.instrumentation.pendingFor.set(SESSION.generated, ['server-agent']);
+    const runner = makeRunner(h);
+
+    const outcome = unwrap(await runner.run(SESSION.generated));
+    h.sessions.rows.set(SESSION.generated, { ...stored, cleanup: storedCleanup(outcome) });
+
+    h.instrumentation.confirmDormancy(SESSION.generated);
+    await drained();
+
+    expect(h.sessions.updates).toHaveLength(1);
+    const [written] = h.sessions.updates;
+    expect(written?.cleanup).toEqual({ status: 'clean', completedAt: FIXED_NOW, conflicts: [] });
+    expect(written?.status).toBe(stored.status);
+    expect(withoutCleanup(written)).toEqual(withoutCleanup(stored));
+  });
+
+  it.each([
+    ['a conflict', 'conflict', 'conflict'],
+    ['a record it could not finish', 'fail', 'partial'],
+  ] as const)('never upgrades a pass whose files left %s', async (_label, verdict, expected) => {
+    const h = createHarness();
+    addSession(h, SESSION.generated, 'generated');
+    await seedRecord(h, {
+      sessionId: SESSION.generated,
+      file: FILE.needle,
+      fileState: verdict === 'conflict' ? 'edited' : 'original',
+      verdict,
+    });
+    h.instrumentation.pendingFor.set(SESSION.generated, ['page-agent']);
+    const runner = makeRunner(h, { outcomeSink: h.sink });
+
+    const outcome = unwrap(await runner.run(SESSION.generated));
+    expect(outcome.status).toBe(expected);
+    unwrap(await h.sink.recordCleanupOutcome(SESSION.generated, outcome));
+
+    h.instrumentation.confirmDormancy(SESSION.generated);
+    await drained();
+
+    expect(h.sink.delivered).toHaveLength(1);
+    expect(upgrades(h)).toEqual([]);
+  });
+
+  it('leaves a later, worse verdict on the session as it is', async () => {
+    const h = createHarness();
+    const stored = addSession(h, SESSION.generated, 'generated');
+    await seedRecord(h, { sessionId: SESSION.generated, file: FILE.dial });
+    h.instrumentation.pendingFor.set(SESSION.generated, ['page-agent']);
+    const runner = makeRunner(h, { outcomeSink: h.sink });
+
+    unwrap(await runner.run(SESSION.generated));
+    h.sessions.rows.set(SESSION.generated, {
+      ...stored,
+      cleanup: { status: 'conflict', completedAt: FIXED_NOW, conflicts: [] },
+    });
+
+    h.instrumentation.confirmDormancy(SESSION.generated);
+    await drained();
+
+    expect(h.sink.delivered).toEqual([]);
+    expect(h.sessions.rows.get(SESSION.generated)?.cleanup.status).toBe('conflict');
+  });
+
+  it('lets a later pass supersede the remembered one and ignores a confirmation while it runs', async () => {
+    const h = createHarness();
+    addSession(h, SESSION.generated, 'generated');
+    await seedRecord(h, { sessionId: SESSION.generated, file: FILE.dial });
+    h.instrumentation.pendingFor.set(SESSION.generated, ['page-agent']);
+    const runner = makeRunner(h, { outcomeSink: h.sink });
+
+    expect(unwrap(await runner.run(SESSION.generated)).status).toBe('partial');
+
+    // The next pass waits for a reconciliation, so it is in flight when the
+    // confirmation for the first one arrives; its own receipt decides.
+    h.instrumentation.pendingFor.delete(SESSION.generated);
+    const reconciling = runner.reconcileAll();
+    const again = runner.run(SESSION.generated);
+    h.instrumentation.confirmDormancy(SESSION.generated);
+
+    const [, second] = await Promise.all([reconciling, again]);
+    await drained();
+
+    expect(unwrap(second).status).toBe('clean');
+    expect(h.sink.delivered).toEqual([]);
+
+    // Nothing is remembered any more.
+    h.instrumentation.confirmDormancy(SESSION.generated);
+    await drained();
+    expect(h.sink.delivered).toEqual([]);
+  });
+
+  it('counts a confirmation that arrives while the pass is still restoring after its disarm', async () => {
+    const h = createHarness();
+    addSession(h, SESSION.generated, 'generated');
+    await seedRecord(h, { sessionId: SESSION.generated, file: FILE.dial });
+    await seedRecord(h, { sessionId: SESSION.generated, file: FILE.needle });
+    h.instrumentation.pendingFor.set(SESSION.generated, ['page-agent']);
+    const runner = makeRunner(h, { outcomeSink: h.sink });
+
+    // The page agent reconnects between two restores, and the replay delivers
+    // the dormant configuration the disarm could not.
+    let confirmed = false;
+    h.knobs.afterRecord = () => {
+      if (!confirmed) {
+        confirmed = true;
+        h.instrumentation.confirmDormancy(SESSION.generated);
+      }
+    };
+
+    const outcome = unwrap(await runner.run(SESSION.generated));
+
+    expect(firstIndex(h, 'instrumentation.disarmCapture')).toBeLessThan(
+      firstIndex(h, 'engine.cleanupSession'),
+    );
+    expect(outcome.status).toBe('clean');
+    expect(
+      h.logs.find((record) => record.message === 'session cleanup finished')?.fields,
+    ).toMatchObject({ cleanup: 'clean', hooksDormant: true });
+
+    // Settled by the pass itself: nothing is remembered, nothing is delivered.
+    h.instrumentation.confirmDormancy(SESSION.generated);
+    await drained();
+    expect(h.sink.delivered).toEqual([]);
+  });
+
+  it('upgrades nothing after dispose, and releases its subscription', async () => {
+    const h = createHarness();
+    addSession(h, SESSION.generated, 'generated');
+    await seedRecord(h, { sessionId: SESSION.generated, file: FILE.dial });
+    h.instrumentation.pendingFor.set(SESSION.generated, ['page-agent']);
+    const runner = makeRunner(h, { outcomeSink: h.sink });
+
+    expect(h.instrumentation.listeners.size).toBe(1);
+    expect(unwrap(await runner.run(SESSION.generated)).status).toBe('partial');
+
+    runner.dispose();
+    expect(h.instrumentation.listeners.size).toBe(0);
+
+    h.instrumentation.confirmDormancy(SESSION.generated);
+    await drained();
+    expect(h.sink.delivered).toEqual([]);
+  });
+
+  it('still cleans up when the confirmation subscription throws, and says so', async () => {
+    const h = createHarness();
+    addSession(h, SESSION.generated, 'generated');
+    await seedRecord(h, { sessionId: SESSION.generated, file: FILE.dial });
+    const instrumentation: InstrumentationDisabler = {
+      disarmCapture: (request) => h.instrumentation.disarmCapture(request),
+      stopSession: (sessionId) => h.instrumentation.stopSession(sessionId),
+      onDormancyConfirmed: () => {
+        throw new Error('The synthetic subscription failed.');
+      },
+    };
+
+    const outcome = unwrap(await makeRunner(h, { instrumentation }).run(SESSION.generated));
+
+    expect(outcome.status).toBe('clean');
+    expect(
+      h.logs.some(
+        (record) =>
+          record.level === 'warn' &&
+          record.message.includes('dormancy confirmations could not be subscribed to'),
+      ),
+    ).toBe(true);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -2765,4 +3151,1366 @@ describe('StartupReconciliationReport', () => {
 
     expect(JSON.stringify(reports[1])).toBe(JSON.stringify(reports[0]));
   });
+});
+
+// ---------------------------------------------------------------------------
+// settleInterruptedSessions — the sessions a restart interrupted
+// ---------------------------------------------------------------------------
+
+/** Invented ids for the settlement cases, listed in sorted order. */
+const INTERRUPTED = Object.freeze({
+  alpha: 'ses_quarryalpha',
+  bravo: 'ses_quarrybravo',
+  charlie: 'ses_quarrycharlie',
+  delta: 'ses_quarrydelta',
+  echo: 'ses_quarryecho',
+});
+
+/** The open capture window the settlement cases resume or fail. */
+const OPEN_CAPTURE_ID = 'cap_quarryopen01';
+
+/** The statuses the settlement must list, and only those. */
+const INTERRUPTIBLE: readonly SessionStatus[] = ['instrumenting', 'ready', 'capturing'];
+
+/** A runtime-only plan version: its one action is a runtime hook, so no file is patched. */
+function runtimePlan(sessionId: string, planVersion: number): InstrumentationPlan {
+  return {
+    version: 1,
+    planVersion,
+    sessionId,
+    objective: 'Find where the time between a dial press and the needle settling is spent.',
+    hypotheses: ['The needle waits on a request the dial issues.'],
+    capture: ['interaction timing', 'fetch calls'],
+    instrumentationTargets: [
+      {
+        id: `act_${String(planVersion).padStart(16, '0')}`,
+        file: FILE.dial,
+        symbol: 'DialFace',
+        type: 'fetch-tracking',
+        adapter: 'synthetic-request-adapter',
+        mode: 'runtime',
+        rationale: 'The requests the dial issues are observed by a runtime hook.',
+      },
+    ],
+  };
+}
+
+/** A session the previous process left in `status`, re-validated with its plans and stamp. */
+function interrupted(
+  h: Harness,
+  id: string,
+  status: SessionStatus,
+  options: { readonly plans?: readonly InstrumentationPlan[]; readonly updatedAt?: number } = {},
+): SessionRecord {
+  const base = addSession(h, id, status);
+  const record = unwrap(
+    parseSessionRecord({
+      ...base,
+      plans: [...(options.plans ?? [])],
+      updatedAt: options.updatedAt ?? SEEDED_AT,
+    }),
+  );
+
+  h.sessions.rows.set(id, record);
+  return record;
+}
+
+/** The session store settlement reads: the harness's rows and captures, plus a paged `list`. */
+interface ListingSessions extends Pick<SessionsRepo, 'list' | 'get' | 'getActiveCapture'> {
+  /** The most items one page holds, whatever `limit` asks for: a store may serve less. */
+  pageCap: number;
+
+  /** Offsets whose page answers `err`, as a store that stops answering does. */
+  readonly failingOffsets: Set<number>;
+
+  /** Sessions whose open capture cannot be read. */
+  readonly unreadableCaptures: Set<string>;
+}
+
+function createListingSessions(h: Harness): ListingSessions {
+  const failingOffsets = new Set<number>();
+  const unreadableCaptures = new Set<string>();
+  const listing: ListingSessions = {
+    pageCap: Number.POSITIVE_INFINITY,
+    failingOffsets,
+    unreadableCaptures,
+    list(options: ListSessionsOptions = {}) {
+      h.calls.push({ actor: 'sessions', method: 'list', args: [options] });
+      const offset = options.offset ?? 0;
+
+      if (failingOffsets.has(offset)) {
+        return err(new DebuggenError('STORE_ERROR', 'The synthetic session list did not answer.'));
+      }
+
+      const statuses = options.statuses;
+      // The store's order: most recently updated first.
+      const matching = [...h.sessions.rows.values()]
+        .filter((record) => statuses === undefined || statuses.includes(record.status))
+        .sort(
+          (left, right) =>
+            right.updatedAt - left.updatedAt ||
+            (left.id < right.id ? -1 : left.id > right.id ? 1 : 0),
+        );
+      const limit = Math.min(options.limit ?? 50, listing.pageCap);
+      const items: SessionListItem[] = matching.slice(offset, offset + limit).map((record) => ({
+        id: record.id,
+        projectRoot: record.projectRoot,
+        projectName: record.projectName,
+        status: record.status,
+        question: record.question,
+        createdAt: record.createdAt,
+        updatedAt: record.updatedAt,
+      }));
+
+      return ok({ items, total: matching.length });
+    },
+    get(id) {
+      return h.sessions.get(id);
+    },
+    getActiveCapture(sessionId) {
+      if (unreadableCaptures.has(sessionId)) {
+        h.calls.push({ actor: 'sessions', method: 'getActiveCapture', args: [sessionId] });
+        return err(new DebuggenError('STORE_ERROR', 'The synthetic capture row does not parse.'));
+      }
+
+      return h.sessions.getActiveCapture(sessionId);
+    },
+  };
+
+  return listing;
+}
+
+/** The session-manager double: `fail` recorded, applied to the rows, and scriptable to refuse. */
+interface RecordingManager extends SessionFailer {
+  readonly failures: { readonly sessionId: string; readonly failure: SessionFailure }[];
+  readonly faults: Map<string, Exclude<Fault, 'none'>>;
+
+  /** Called after each successful `fail`, for the cancellation cases. */
+  afterFail: ((sessionId: string) => void) | undefined;
+}
+
+function createRecordingManager(h: Harness): RecordingManager {
+  const failures: { sessionId: string; failure: SessionFailure }[] = [];
+  const faults = new Map<string, Exclude<Fault, 'none'>>();
+  const manager: RecordingManager = {
+    failures,
+    faults,
+    afterFail: undefined,
+    fail(sessionId, failure) {
+      h.calls.push({ actor: 'manager', method: 'fail', args: [sessionId, failure] });
+      const fault = faults.get(sessionId);
+
+      if (fault === 'throw') {
+        throw new Error('The synthetic session manager crashed.');
+      }
+
+      if (fault === 'err') {
+        return err(
+          new DebuggenError('SESSION_INVALID_STATE', 'The synthetic session refused the move.'),
+        );
+      }
+
+      failures.push({ sessionId, failure });
+      const row = h.sessions.rows.get(sessionId);
+
+      // Failing a session takes it out of the filtered listing, exactly as the
+      // real manager does — which is why the module must read every page first.
+      if (row !== undefined) {
+        h.sessions.rows.set(sessionId, { ...row, status: 'failed' });
+      }
+
+      manager.afterFail?.(sessionId);
+      return ok(row);
+    },
+  };
+
+  return manager;
+}
+
+/** The instrumentation-service double for releasing a capture a restart ended. */
+interface RecordingReleaser extends CaptureReleaser {
+  readonly releases: CaptureReleaseRequest[];
+  readonly faults: Map<string, Exclude<Fault, 'none'>>;
+}
+
+function createRecordingReleaser(h: Harness): RecordingReleaser {
+  const releases: CaptureReleaseRequest[] = [];
+  const faults = new Map<string, Exclude<Fault, 'none'>>();
+
+  return {
+    releases,
+    faults,
+    releaseInterruptedCapture(input) {
+      h.calls.push({
+        actor: 'instrumentation',
+        method: 'releaseInterruptedCapture',
+        args: [input],
+      });
+      releases.push(input);
+      const fault = faults.get(input.sessionId);
+
+      if (fault === 'throw') {
+        throw new Error('The synthetic instrumentation service crashed.');
+      }
+
+      // No producer is connected before the service serves: both are owed.
+      return fault === 'err'
+        ? err(new DebuggenError('TRANSPORT_DISCONNECTED', 'The synthetic release was refused.'))
+        : ok({ sessionId: input.sessionId, pending: ['page-agent', 'server-agent'] });
+    },
+  };
+}
+
+interface SettleHarness {
+  readonly h: Harness;
+  readonly sessions: ListingSessions;
+  readonly manager: RecordingManager;
+  readonly releaser: RecordingReleaser;
+  deps(overrides?: Partial<InterruptedSessionDeps>): InterruptedSessionDeps;
+}
+
+function createSettleHarness(): SettleHarness {
+  const h = createHarness();
+  const sessions = createListingSessions(h);
+  const manager = createRecordingManager(h);
+  const releaser = createRecordingReleaser(h);
+
+  return {
+    h,
+    sessions,
+    manager,
+    releaser,
+    deps: (overrides = {}) => ({
+      sessions,
+      manager,
+      instrumentation: releaser,
+      logger: h.logger,
+      now,
+      ...overrides,
+    }),
+  };
+}
+
+/** A start-up report whose `bySession` holds exactly the given sessions and verdicts. */
+function reconciliationOf(
+  verdicts: Readonly<Record<string, CleanupStatus>> = {},
+): StartupReconciliationReport {
+  const bySession: Record<string, SessionReconciliationSummary> = {};
+
+  for (const sessionId of Object.keys(verdicts).sort()) {
+    const verdict = verdicts[sessionId] ?? 'partial';
+
+    bySession[sessionId] = {
+      sessionId,
+      status: verdict,
+      scanned: 1,
+      restored: verdict === 'clean' ? 1 : 0,
+      closed: 0,
+      conflicts: verdict === 'conflict' ? 1 : 0,
+      skipped: 0,
+      failed: verdict === 'partial' ? 1 : 0,
+      unresolved: 0,
+    };
+  }
+
+  const summaries = Object.values(bySession);
+  const status: CleanupStatus = summaries.some((summary) => summary.status === 'conflict')
+    ? 'conflict'
+    : summaries.some((summary) => summary.status !== 'clean')
+      ? 'partial'
+      : 'clean';
+
+  return {
+    status,
+    scanned: summaries.length,
+    closed: 0,
+    restored: summaries.filter((summary) => summary.status === 'clean').length,
+    conflicts: summaries.filter((summary) => summary.status === 'conflict').length,
+    unresolved: 0,
+    failed: summaries.filter((summary) => summary.status === 'partial').length,
+    skipped: 0,
+    aborted: false,
+    bySession,
+    errors: [],
+    completedAt: FIXED_NOW,
+  };
+}
+
+/** The `statuses` and `offset` of every `list` call, in order. */
+function listCalls(h: Harness): ListSessionsOptions[] {
+  return callsOf(h, 'sessions', 'list').map((call) => call.args[0] as ListSessionsOptions);
+}
+
+describe('settleInterruptedSessions — a restart never leaves a session capturing what it removed', () => {
+  it('fails every instrumenting session at instrument: an install cannot survive a restart', async () => {
+    const s = createSettleHarness();
+    interrupted(s.h, INTERRUPTED.alpha, 'instrumenting');
+    interrupted(s.h, INTERRUPTED.bravo, 'instrumenting');
+
+    const report = unwrap(
+      await settleInterruptedSessions(s.deps(), reconciliationOf({ [INTERRUPTED.bravo]: 'clean' })),
+    );
+
+    expect(report.failed).toEqual([
+      { sessionId: INTERRUPTED.alpha, status: 'instrumenting', reason: 'install-interrupted' },
+      { sessionId: INTERRUPTED.bravo, status: 'instrumenting', reason: 'install-interrupted' },
+    ]);
+    expect(
+      s.manager.failures.map(({ sessionId, failure }) => [sessionId, failure.stage, failure.code]),
+    ).toEqual([
+      [INTERRUPTED.alpha, 'instrument', 'INSTRUMENTATION_UNAVAILABLE'],
+      [INTERRUPTED.bravo, 'instrument', 'INSTRUMENTATION_UNAVAILABLE'],
+    ]);
+    expect(s.releaser.releases).toEqual([]);
+    expect(s.h.sessions.rows.get(INTERRUPTED.alpha)?.status).toBe('failed');
+  });
+
+  it('fails a ready or capturing session whose journal records the start-up reconciliation held', async () => {
+    const s = createSettleHarness();
+    interrupted(s.h, INTERRUPTED.alpha, 'ready', { plans: [runtimePlan(INTERRUPTED.alpha, 1)] });
+    interrupted(s.h, INTERRUPTED.bravo, 'capturing', {
+      plans: [runtimePlan(INTERRUPTED.bravo, 1)],
+    });
+    interrupted(s.h, INTERRUPTED.charlie, 'capturing', {
+      plans: [runtimePlan(INTERRUPTED.charlie, 1)],
+    });
+    openCapture(s.h, INTERRUPTED.bravo, OPEN_CAPTURE_ID);
+    openCapture(s.h, INTERRUPTED.charlie, 'cap_quarryopen02');
+    await seedRecord(s.h, { sessionId: INTERRUPTED.alpha, file: FILE.dial });
+    await seedRecord(s.h, { sessionId: INTERRUPTED.bravo, file: FILE.needle });
+    await seedRecord(s.h, {
+      sessionId: INTERRUPTED.charlie,
+      file: FILE.bezel,
+      fileState: 'edited',
+      verdict: 'conflict',
+    });
+
+    // The real first half of the start: it restores two sessions' files and
+    // leaves the third's edited file in conflict.
+    const reconciled = unwrap(await reconcileModificationsOnStartup(startupDeps(s.h)));
+    const report = unwrap(await settleInterruptedSessions(s.deps(), reconciled));
+
+    expect(report.failed).toEqual([
+      { sessionId: INTERRUPTED.alpha, status: 'ready', reason: 'instrumentation-removed' },
+      { sessionId: INTERRUPTED.bravo, status: 'capturing', reason: 'instrumentation-removed' },
+      {
+        sessionId: INTERRUPTED.charlie,
+        status: 'capturing',
+        reason: 'instrumentation-unsettled',
+      },
+    ]);
+    expect(s.manager.failures.map(({ failure }) => failure.stage)).toEqual([
+      'instrument',
+      'instrument',
+      'instrument',
+    ]);
+
+    // Each capture window is released, whatever became of its files.
+    expect(s.releaser.releases.map(({ sessionId, captureId }) => [sessionId, captureId])).toEqual([
+      [INTERRUPTED.bravo, OPEN_CAPTURE_ID],
+      [INTERRUPTED.charlie, 'cap_quarryopen02'],
+    ]);
+
+    // The unsettled one points the developer at the cleanup report.
+    const [removed, , unsettled] = s.manager.failures.map(({ failure }) => failure);
+    expect(removed?.message).toBe(
+      'The Debug Generator service restarted and removed the instrumentation this session had added to your files, so it can no longer capture.',
+    );
+    expect(unsettled?.hint).toContain('cleanup report');
+    expect(unsettled?.hint).not.toBe(removed?.hint);
+  });
+
+  /** The failure every runtime-only capture a restart interrupted is moved to. */
+  const CAPTURE_INTERRUPTED = {
+    stage: 'capture',
+    code: 'INSTRUMENTATION_UNAVAILABLE',
+    message:
+      'The Debug Generator service restarted during this session’s capture, so the capture was closed.',
+    hint: 'Ask your question again in a new session, or end this one.',
+  };
+
+  it('fails a runtime-only capture rather than continuing it, releasing its window with the plan it was opened with', async () => {
+    const s = createSettleHarness();
+    const first = runtimePlan(INTERRUPTED.alpha, 1);
+    const second = runtimePlan(INTERRUPTED.alpha, 2);
+    interrupted(s.h, INTERRUPTED.alpha, 'capturing', { plans: [first, second] });
+    openCapture(s.h, INTERRUPTED.alpha, OPEN_CAPTURE_ID, 2);
+
+    const report = unwrap(await settleInterruptedSessions(s.deps(), reconciliationOf()));
+
+    // No producer has taken this capture's configuration from the new
+    // process, so it is never advertised as capturing.
+    expect(report.failed).toEqual([
+      { sessionId: INTERRUPTED.alpha, status: 'capturing', reason: 'capture-interrupted' },
+    ]);
+    expect(s.manager.failures.map(({ failure }) => failure)).toEqual([CAPTURE_INTERRUPTED]);
+    expect(s.h.sessions.rows.get(INTERRUPTED.alpha)?.status).toBe('failed');
+    expect(s.releaser.releases).toEqual([
+      {
+        sessionId: INTERRUPTED.alpha,
+        captureId: OPEN_CAPTURE_ID,
+        projectRoot: s.h.project,
+        plan: second,
+      },
+    ]);
+  });
+
+  const INTERRUPTED_CAPTURES: readonly {
+    readonly label: string;
+    readonly releases: number;
+    readonly arrange: (s: SettleHarness) => Partial<InterruptedSessionDeps>;
+  }[] = [
+    {
+      label: 'no instrumentation service is wired',
+      releases: 0,
+      arrange: () => ({ instrumentation: undefined }),
+    },
+    {
+      label: 'the session holds no open capture window',
+      releases: 0,
+      arrange: (s) => {
+        s.h.sessions.captures.delete(INTERRUPTED.alpha);
+        return {};
+      },
+    },
+    {
+      label: 'its open capture cannot be read',
+      releases: 0,
+      arrange: (s) => {
+        s.sessions.unreadableCaptures.add(INTERRUPTED.alpha);
+        return {};
+      },
+    },
+    {
+      label: 'the session record cannot be read',
+      releases: 0,
+      arrange: (s) => {
+        s.h.sessions.unreadable.add(INTERRUPTED.alpha);
+        return {};
+      },
+    },
+    {
+      label: 'the capture names a plan version the session does not hold',
+      releases: 1,
+      arrange: (s) => {
+        openCapture(s.h, INTERRUPTED.alpha, OPEN_CAPTURE_ID, 3);
+        return {};
+      },
+    },
+    {
+      label: 'the instrumentation service refuses the release',
+      releases: 1,
+      arrange: (s) => {
+        s.releaser.faults.set(INTERRUPTED.alpha, 'err');
+        return {};
+      },
+    },
+    {
+      label: 'the instrumentation service throws',
+      releases: 1,
+      arrange: (s) => {
+        s.releaser.faults.set(INTERRUPTED.alpha, 'throw');
+        return {};
+      },
+    },
+  ];
+
+  it.each(INTERRUPTED_CAPTURES)(
+    'fails a runtime-only capture at capture when $label',
+    async ({ releases, arrange }) => {
+      const s = createSettleHarness();
+      interrupted(s.h, INTERRUPTED.alpha, 'capturing', {
+        plans: [runtimePlan(INTERRUPTED.alpha, 1)],
+      });
+      openCapture(s.h, INTERRUPTED.alpha, OPEN_CAPTURE_ID);
+      const overrides = arrange(s);
+
+      const report = unwrap(await settleInterruptedSessions(s.deps(overrides), reconciliationOf()));
+
+      expect(report.failed).toEqual([
+        { sessionId: INTERRUPTED.alpha, status: 'capturing', reason: 'capture-interrupted' },
+      ]);
+      expect(report.errors).toEqual([]);
+      expect(s.releaser.releases).toHaveLength(releases);
+      expect(s.manager.failures.map(({ failure }) => failure)).toEqual([CAPTURE_INTERRUPTED]);
+    },
+  );
+
+  it('leaves a ready session with nothing in the journal, and every other status, as they are', async () => {
+    const s = createSettleHarness();
+    interrupted(s.h, INTERRUPTED.alpha, 'ready', { plans: [runtimePlan(INTERRUPTED.alpha, 1)] });
+    interrupted(s.h, INTERRUPTED.bravo, 'generated');
+    interrupted(s.h, INTERRUPTED.charlie, 'analyzing');
+    interrupted(s.h, INTERRUPTED.delta, 'created');
+    interrupted(s.h, INTERRUPTED.echo, 'failed');
+    const before = new Map(s.h.sessions.rows);
+
+    const report = unwrap(await settleInterruptedSessions(s.deps(), reconciliationOf()));
+
+    expect(report).toMatchObject({ examined: 1, failed: [], errors: [] });
+    expect(callsOf(s.h, 'manager')).toEqual([]);
+    expect(callsOf(s.h, 'instrumentation')).toEqual([]);
+    expect(s.h.sessions.rows).toEqual(before);
+    expect(s.h.sessions.updates).toEqual([]);
+    expect(listCalls(s.h).map((options) => options.statuses)).toEqual([INTERRUPTIBLE]);
+  });
+
+  it('reads every page before it fails anything, then decides in sorted id order', async () => {
+    const s = createSettleHarness();
+    const ids = [
+      INTERRUPTED.alpha,
+      INTERRUPTED.bravo,
+      INTERRUPTED.charlie,
+      INTERRUPTED.delta,
+      INTERRUPTED.echo,
+    ];
+
+    // Stamped so the store lists them newest first — the reverse of id order.
+    for (const [index, id] of ids.entries()) {
+      interrupted(s.h, id, 'instrumenting', { updatedAt: SEEDED_AT + index });
+    }
+
+    // A store serving two rows a page, whatever the module asks for.
+    s.sessions.pageCap = 2;
+
+    const report = unwrap(await settleInterruptedSessions(s.deps(), reconciliationOf()));
+
+    const options = listCalls(s.h);
+    expect(options.map((call) => call.offset)).toEqual([0, 2, 4]);
+
+    for (const call of options) {
+      expect(call.statuses).toEqual(INTERRUPTIBLE);
+      expect(call.limit).toBeGreaterThan(0);
+      expect(call.limit).toBeLessThanOrEqual(MAX_SESSION_LIST_LIMIT);
+    }
+
+    // Failing a session removes it from the filtered listing; acting between
+    // pages would have shifted the later pages and skipped sessions.
+    expect(order(s.h).lastIndexOf('sessions.list')).toBeLessThan(firstIndex(s.h, 'manager.fail'));
+    expect(report.examined).toBe(5);
+    expect(s.manager.failures.map(({ sessionId }) => sessionId)).toEqual(ids);
+    expect(report.failed.map(({ sessionId }) => sessionId)).toEqual(ids);
+  });
+
+  it('contains a session the manager will not fail, and settles every other one', async () => {
+    const s = createSettleHarness();
+    interrupted(s.h, INTERRUPTED.alpha, 'instrumenting');
+    interrupted(s.h, INTERRUPTED.bravo, 'instrumenting');
+    interrupted(s.h, INTERRUPTED.charlie, 'instrumenting');
+    s.manager.faults.set(INTERRUPTED.alpha, 'err');
+    s.manager.faults.set(INTERRUPTED.bravo, 'throw');
+
+    const result = await settleInterruptedSessions(s.deps(), reconciliationOf());
+
+    expect(isOk(result)).toBe(true);
+    const report = unwrap(result);
+    expect(report.failed.map(({ sessionId }) => sessionId)).toEqual([INTERRUPTED.charlie]);
+    expect(report.errors).toEqual([
+      {
+        sessionId: INTERRUPTED.alpha,
+        code: 'SESSION_INVALID_STATE',
+        message: 'The synthetic session refused the move.',
+      },
+      {
+        sessionId: INTERRUPTED.bravo,
+        code: 'INTERNAL',
+        message: 'The synthetic session manager crashed.',
+      },
+    ]);
+    expect(
+      s.h.logs.filter((record) => record.message.includes('could not be failed')),
+    ).toHaveLength(2);
+  });
+
+  it.each([0, 2])(
+    'answers err when the page at offset %i cannot be listed, and decides nothing',
+    async (offset) => {
+      const s = createSettleHarness();
+      interrupted(s.h, INTERRUPTED.alpha, 'instrumenting');
+      interrupted(s.h, INTERRUPTED.bravo, 'instrumenting');
+      interrupted(s.h, INTERRUPTED.charlie, 'instrumenting');
+      s.sessions.pageCap = 2;
+      s.sessions.failingOffsets.add(offset);
+
+      const result = await settleInterruptedSessions(s.deps(), reconciliationOf());
+
+      expect(isErr(result) ? result.error.code : undefined).toBe('STORE_ERROR');
+      expect(callsOf(s.h, 'manager')).toEqual([]);
+      expect(callsOf(s.h, 'instrumentation')).toEqual([]);
+    },
+  );
+
+  it('lists nothing when the signal is already aborted, and says so', async () => {
+    const s = createSettleHarness();
+    interrupted(s.h, INTERRUPTED.alpha, 'instrumenting');
+    const controller = new AbortController();
+    controller.abort();
+
+    const report = unwrap(
+      await settleInterruptedSessions(s.deps(), reconciliationOf(), {
+        signal: controller.signal,
+      }),
+    );
+
+    expect(report).toMatchObject({ examined: 0, failed: [], aborted: true });
+    expect(s.h.calls).toEqual([]);
+  });
+
+  it('finishes the session in hand when aborted, starts no other and reports what was done', async () => {
+    const s = createSettleHarness();
+    interrupted(s.h, INTERRUPTED.alpha, 'instrumenting');
+    interrupted(s.h, INTERRUPTED.bravo, 'instrumenting');
+    interrupted(s.h, INTERRUPTED.charlie, 'instrumenting');
+    const controller = new AbortController();
+    s.manager.afterFail = () => {
+      controller.abort();
+    };
+
+    const report = unwrap(
+      await settleInterruptedSessions(s.deps(), reconciliationOf(), {
+        signal: controller.signal,
+      }),
+    );
+
+    expect(report).toMatchObject({ examined: 3, aborted: true });
+    expect(report.failed.map(({ sessionId }) => sessionId)).toEqual([INTERRUPTED.alpha]);
+    expect(callsOf(s.h, 'manager')).toHaveLength(1);
+  });
+
+  it('says what the restart did in complete sentences that name no path and never the question', async () => {
+    const s = createSettleHarness();
+    interrupted(s.h, INTERRUPTED.alpha, 'instrumenting');
+    interrupted(s.h, INTERRUPTED.bravo, 'ready');
+    interrupted(s.h, INTERRUPTED.charlie, 'ready');
+    interrupted(s.h, INTERRUPTED.delta, 'capturing', {
+      plans: [runtimePlan(INTERRUPTED.delta, 1)],
+    });
+
+    unwrap(
+      await settleInterruptedSessions(
+        s.deps(),
+        reconciliationOf({ [INTERRUPTED.bravo]: 'clean', [INTERRUPTED.charlie]: 'conflict' }),
+      ),
+    );
+
+    const failures = s.manager.failures.map(({ failure }) => failure);
+    expect(failures).toHaveLength(4);
+    expect(new Set(failures.map((failure) => failure.message)).size).toBe(4);
+
+    const question = s.h.sessions.rows.get(INTERRUPTED.alpha)?.question ?? '<none>';
+
+    for (const failure of failures) {
+      expect(failure.code).toBe('INSTRUMENTATION_UNAVAILABLE');
+      expect(isKnownCode(failure.code)).toBe(true);
+
+      for (const sentence of [failure.message, failure.hint ?? '']) {
+        expect(sentence).toMatch(/^[A-Z].*\.$/);
+        expect(sentence).not.toContain(question);
+        expect(sentence).not.toContain(s.h.root);
+        expect(sentence).not.toMatch(/(?:^|[\s'"(=:])\/[A-Za-z0-9._-]/);
+      }
+    }
+  });
+
+  it('is deterministic JSON stamped by the injected clock, and logs one summary of counts', async () => {
+    const reports: InterruptedSessionsReport[] = [];
+
+    for (let pass = 0; pass < 2; pass += 1) {
+      const s = createSettleHarness();
+      interrupted(s.h, INTERRUPTED.echo, 'instrumenting', { updatedAt: SEEDED_AT + 3 });
+      interrupted(s.h, INTERRUPTED.delta, 'ready', { updatedAt: SEEDED_AT + 2 });
+      interrupted(s.h, INTERRUPTED.bravo, 'capturing', {
+        plans: [runtimePlan(INTERRUPTED.bravo, 1)],
+        updatedAt: SEEDED_AT + 1,
+      });
+      interrupted(s.h, INTERRUPTED.alpha, 'capturing', {
+        plans: [runtimePlan(INTERRUPTED.alpha, 1)],
+      });
+      openCapture(s.h, INTERRUPTED.bravo, OPEN_CAPTURE_ID);
+
+      const report = unwrap(await settleInterruptedSessions(s.deps(), reconciliationOf()));
+      reports.push(report);
+
+      const summary = s.h.logs.find((record) => record.message === 'interrupted sessions settled');
+      expect(summary?.level).toBe('info');
+      expect(summary?.fields).toMatchObject({
+        trigger: 'service-start',
+        examined: 4,
+        failed: 3,
+        released: 1,
+        kept: 1,
+        errors: 0,
+        aborted: false,
+      });
+
+      // No log record carries an absolute path, though the release request does.
+      for (const text of s.h.logs.flatMap((record) =>
+        stringLeaves([record.message, record.fields]),
+      )) {
+        expect(text).not.toContain(s.h.root);
+      }
+    }
+
+    const [first] = reports;
+    expect(first).toEqual({
+      examined: 4,
+      failed: [
+        { sessionId: INTERRUPTED.alpha, status: 'capturing', reason: 'capture-interrupted' },
+        { sessionId: INTERRUPTED.bravo, status: 'capturing', reason: 'capture-interrupted' },
+        { sessionId: INTERRUPTED.echo, status: 'instrumenting', reason: 'install-interrupted' },
+      ],
+      errors: [],
+      aborted: false,
+      completedAt: FIXED_NOW,
+    });
+    expect(JSON.parse(JSON.stringify(first))).toEqual(first);
+    expect(JSON.stringify(reports[1])).toBe(JSON.stringify(first));
+  });
+});
+
+describe('settleInterruptedSessions — a failed capture’s producers are owed their dormant configuration', () => {
+  it('releases the window a failed capturing session held, read before the failure closed it', async () => {
+    const s = createSettleHarness();
+    const plan = runtimePlan(INTERRUPTED.alpha, 1);
+    interrupted(s.h, INTERRUPTED.alpha, 'capturing', { plans: [plan] });
+    openCapture(s.h, INTERRUPTED.alpha, OPEN_CAPTURE_ID);
+    await seedRecord(s.h, { sessionId: INTERRUPTED.alpha, file: FILE.dial });
+
+    const reconciled = unwrap(await reconcileModificationsOnStartup(startupDeps(s.h)));
+    const report = unwrap(await settleInterruptedSessions(s.deps(), reconciled));
+
+    expect(report.failed).toEqual([
+      { sessionId: INTERRUPTED.alpha, status: 'capturing', reason: 'instrumentation-removed' },
+    ]);
+    expect(s.releaser.releases).toEqual([
+      {
+        sessionId: INTERRUPTED.alpha,
+        captureId: OPEN_CAPTURE_ID,
+        projectRoot: s.h.project,
+        plan,
+      },
+    ]);
+    // The session is failed first: only a session that cannot continue is released.
+    expect(firstIndex(s.h, 'manager.fail')).toBeLessThan(
+      firstIndex(s.h, 'instrumentation.releaseInterruptedCapture'),
+    );
+    const summary = s.h.logs.find((record) => record.message === 'interrupted sessions settled');
+    expect(summary?.fields).toMatchObject({ failed: 1, released: 1 });
+  });
+
+  it('releases a capture without a plan when its plan version is missing', async () => {
+    const s = createSettleHarness();
+    interrupted(s.h, INTERRUPTED.alpha, 'capturing', {
+      plans: [runtimePlan(INTERRUPTED.alpha, 1)],
+    });
+    openCapture(s.h, INTERRUPTED.alpha, OPEN_CAPTURE_ID, 3);
+
+    const report = unwrap(await settleInterruptedSessions(s.deps(), reconciliationOf()));
+
+    expect(report.failed).toEqual([
+      { sessionId: INTERRUPTED.alpha, status: 'capturing', reason: 'capture-interrupted' },
+    ]);
+    expect(s.releaser.releases).toEqual([
+      { sessionId: INTERRUPTED.alpha, captureId: OPEN_CAPTURE_ID, projectRoot: s.h.project },
+    ]);
+  });
+
+  it('releases nothing for a failed session that held no capture window', async () => {
+    const s = createSettleHarness();
+    interrupted(s.h, INTERRUPTED.alpha, 'instrumenting');
+    interrupted(s.h, INTERRUPTED.bravo, 'ready', { plans: [runtimePlan(INTERRUPTED.bravo, 1)] });
+    interrupted(s.h, INTERRUPTED.charlie, 'capturing', {
+      plans: [runtimePlan(INTERRUPTED.charlie, 1)],
+    });
+
+    const report = unwrap(
+      await settleInterruptedSessions(s.deps(), reconciliationOf({ [INTERRUPTED.bravo]: 'clean' })),
+    );
+
+    expect(report.failed.map(({ sessionId, reason }) => [sessionId, reason])).toEqual([
+      [INTERRUPTED.alpha, 'install-interrupted'],
+      [INTERRUPTED.bravo, 'instrumentation-removed'],
+      [INTERRUPTED.charlie, 'capture-interrupted'],
+    ]);
+    expect(s.releaser.releases).toEqual([]);
+  });
+
+  it('releases nothing for a session the manager would not fail, and reports it unsettled', async () => {
+    const s = createSettleHarness();
+    interrupted(s.h, INTERRUPTED.alpha, 'capturing', {
+      plans: [runtimePlan(INTERRUPTED.alpha, 1)],
+    });
+    interrupted(s.h, INTERRUPTED.bravo, 'capturing', {
+      plans: [runtimePlan(INTERRUPTED.bravo, 1)],
+    });
+    openCapture(s.h, INTERRUPTED.alpha, OPEN_CAPTURE_ID);
+    openCapture(s.h, INTERRUPTED.bravo, 'cap_quarryopen02');
+    s.manager.faults.set(INTERRUPTED.bravo, 'err');
+
+    const report = unwrap(await settleInterruptedSessions(s.deps(), reconciliationOf()));
+
+    expect(report.failed.map(({ sessionId }) => sessionId)).toEqual([INTERRUPTED.alpha]);
+    expect(report.errors.map(({ sessionId }) => sessionId)).toEqual([INTERRUPTED.bravo]);
+    expect(s.releaser.releases.map(({ sessionId }) => sessionId)).toEqual([INTERRUPTED.alpha]);
+  });
+
+  it.each(['err', 'throw'] as const)(
+    'contains a release that answers %s: the session stays failed and no error is reported',
+    async (fault) => {
+      const s = createSettleHarness();
+      interrupted(s.h, INTERRUPTED.alpha, 'capturing', {
+        plans: [runtimePlan(INTERRUPTED.alpha, 1)],
+      });
+      openCapture(s.h, INTERRUPTED.alpha, OPEN_CAPTURE_ID, 3);
+      s.releaser.faults.set(INTERRUPTED.alpha, fault);
+
+      const report = unwrap(await settleInterruptedSessions(s.deps(), reconciliationOf()));
+
+      expect(report.failed.map(({ sessionId }) => sessionId)).toEqual([INTERRUPTED.alpha]);
+      expect(report.errors).toEqual([]);
+      expect(s.releaser.releases).toHaveLength(1);
+      expect(s.h.sessions.rows.get(INTERRUPTED.alpha)?.status).toBe('failed');
+      expect(
+        s.h.logs.filter((record) => record.message.includes('could not be released')),
+      ).toHaveLength(1);
+      const summary = s.h.logs.find((record) => record.message === 'interrupted sessions settled');
+      expect(summary?.fields).toMatchObject({ failed: 1, released: 0 });
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
+// A released capture's session never claims a clean cleanup early
+// ---------------------------------------------------------------------------
+
+/** A start-up verdict that says every file of the session was restored. */
+const STARTUP_CLEAN: SessionRecord['cleanup'] = {
+  status: 'clean',
+  completedAt: SEEDED_AT,
+  conflicts: [],
+};
+
+/** A start-up verdict for a session left `capturing`: files clean, hooks not known dormant. */
+const STARTUP_PARTIAL: SessionRecord['cleanup'] = {
+  status: 'partial',
+  completedAt: SEEDED_AT,
+  conflicts: [],
+};
+
+/** Both producers, as a release before any connection reports them. */
+const BOTH_OWED = ['page-agent', 'server-agent'] as const;
+
+describe('the start-up reconciliation of a capturing session', () => {
+  it('records a session left capturing no better than partial, and any other by its files alone', async () => {
+    const h = createHarness();
+    addSession(h, SESSION.capturing, 'capturing');
+    addSession(h, SESSION.generated, 'generated');
+    await seedRecord(h, { sessionId: SESSION.capturing, file: FILE.dial });
+    await seedRecord(h, { sessionId: SESSION.generated, file: FILE.needle });
+
+    const report = unwrap(
+      await reconcileModificationsOnStartup(startupDeps(h, { outcomeSink: h.sink })),
+    );
+
+    // The summaries keep the files' own verdict ...
+    expect(report.bySession[SESSION.capturing]?.status).toBe('clean');
+    expect(report.bySession[SESSION.generated]?.status).toBe('clean');
+    // ... and the capturing session is recorded partial in that same write.
+    expect(
+      h.sink.delivered.map(({ sessionId, outcome }) => [sessionId, outcome.status]).sort(),
+    ).toEqual(
+      [
+        [SESSION.capturing, 'partial'],
+        [SESSION.generated, 'clean'],
+      ].sort(),
+    );
+    expect(h.sessions.rows.get(SESSION.capturing)?.status).toBe('capturing');
+  });
+});
+
+describe('holdUntilDormant — a session whose producers may hold a capture is not clean', () => {
+  it('remembers the partial the reconciliation recorded and upgrades it once the service confirms dormancy', async () => {
+    const h = createHarness();
+    const stored = addSession(h, SESSION.failed, 'failed', STARTUP_PARTIAL);
+    const runner = makeRunner(h, { outcomeSink: h.sink });
+
+    const held = await runner.holdUntilDormant(SESSION.failed, {
+      pending: [...BOTH_OWED],
+      files: 'clean',
+    });
+
+    // Nothing to write: the verdict is partial already.
+    expect(isOk(held)).toBe(true);
+    expect(h.sink.delivered).toEqual([]);
+    const warning = h.logs.find((record) => record.message.includes('may still hold it'));
+    expect(warning?.level).toBe('warn');
+    expect(warning?.fields).toMatchObject({
+      pendingProducers: [...BOTH_OWED],
+      producersKnown: true,
+      trigger: 'service-start',
+    });
+
+    // Both producers reconnect and take their dormant configuration.
+    h.instrumentation.confirmDormancy(SESSION.failed);
+    await drained();
+
+    expect(upgrades(h)).toEqual([{ status: 'clean', conflicts: [], completedAt: FIXED_NOW }]);
+    expect(h.sessions.rows.get(SESSION.failed)?.cleanup.status).toBe('clean');
+
+    // Once, through the manager's sink only, and the status is never touched.
+    h.instrumentation.confirmDormancy(SESSION.failed);
+    await drained();
+    expect(upgrades(h)).toHaveLength(1);
+    expect(h.sessions.updates).toEqual([]);
+    expect(h.sessions.rows.get(SESSION.failed)?.status).toBe(stored.status);
+  });
+
+  it('records a clean verdict it finds as partial before remembering it', async () => {
+    const h = createHarness();
+    addSession(h, SESSION.failed, 'failed', STARTUP_CLEAN);
+    const runner = makeRunner(h, { outcomeSink: h.sink });
+
+    unwrap(
+      await runner.holdUntilDormant(SESSION.failed, { pending: ['page-agent'], files: 'clean' }),
+    );
+
+    expect(h.sink.delivered).toEqual([
+      {
+        sessionId: SESSION.failed,
+        outcome: { status: 'partial', conflicts: [], completedAt: FIXED_NOW },
+      },
+    ]);
+
+    h.instrumentation.confirmDormancy(SESSION.failed);
+    await drained();
+    expect(h.sink.delivered.map(({ outcome }) => outcome.status)).toEqual(['partial', 'clean']);
+  });
+
+  it('upgrades at once when the release reached every producer', async () => {
+    const h = createHarness();
+    addSession(h, SESSION.failed, 'failed', STARTUP_PARTIAL);
+    const runner = makeRunner(h, { outcomeSink: h.sink });
+
+    unwrap(await runner.holdUntilDormant(SESSION.failed, { pending: [], files: 'clean' }));
+    await drained();
+
+    expect(upgrades(h)).toEqual([{ status: 'clean', conflicts: [], completedAt: FIXED_NOW }]);
+  });
+
+  it('holds partial for good when the release did not say who received the dormant configuration', async () => {
+    const h = createHarness();
+    addSession(h, SESSION.failed, 'failed', STARTUP_CLEAN);
+    const runner = makeRunner(h, { outcomeSink: h.sink });
+
+    unwrap(await runner.holdUntilDormant(SESSION.failed, { pending: undefined, files: 'clean' }));
+
+    expect(h.sink.delivered.map(({ outcome }) => outcome.status)).toEqual(['partial']);
+    expect(
+      h.logs.find((record) => record.message.includes('may still hold it'))?.fields,
+    ).toMatchObject({ pendingProducers: [], producersKnown: false });
+
+    h.instrumentation.confirmDormancy(SESSION.failed);
+    await drained();
+    expect(upgrades(h)).toEqual([]);
+    expect(h.sessions.rows.get(SESSION.failed)?.cleanup.status).toBe('partial');
+  });
+
+  const holdsNothing: readonly (readonly [
+    string,
+    SessionRecord['cleanup'],
+    ReleasedCaptureVerdict,
+  ])[] = [
+    [
+      'every producer took its dormant configuration and the verdict is clean',
+      STARTUP_CLEAN,
+      { pending: [], files: 'clean' },
+    ],
+    [
+      'no pass has run and no record was reconciled',
+      { status: 'pending', conflicts: [] },
+      { pending: ['page-agent'], files: undefined },
+    ],
+    [
+      'the files themselves were left partial',
+      STARTUP_PARTIAL,
+      { pending: ['page-agent'], files: 'partial' },
+    ],
+    [
+      'the verdict is a conflict',
+      { status: 'conflict', completedAt: SEEDED_AT, conflicts: [] },
+      { pending: undefined, files: 'conflict' },
+    ],
+  ];
+
+  it.each(holdsNothing)('holds nothing when %s', async (_label, cleanup, release) => {
+    const h = createHarness();
+    addSession(h, SESSION.failed, 'failed', cleanup);
+    const runner = makeRunner(h, { outcomeSink: h.sink });
+
+    unwrap(await runner.holdUntilDormant(SESSION.failed, release));
+    h.instrumentation.confirmDormancy(SESSION.failed);
+    await drained();
+
+    expect(h.sink.delivered).toEqual([]);
+    expect(h.sessions.updates).toEqual([]);
+    expect(h.sessions.rows.get(SESSION.failed)?.cleanup).toEqual(cleanup);
+  });
+
+  it('upgrades at once when the confirmation arrives while the partial is being recorded', async () => {
+    const h = createHarness();
+    addSession(h, SESSION.failed, 'failed', STARTUP_CLEAN);
+    let confirmed = false;
+    const sink: CleanupOutcomeSink = {
+      recordCleanupOutcome(sessionId, outcome) {
+        const recorded = h.sink.recordCleanupOutcome(sessionId, outcome);
+
+        // The producer reconnects between the store write and the hold's next step.
+        if (!confirmed) {
+          confirmed = true;
+          h.instrumentation.confirmDormancy(sessionId);
+        }
+
+        return recorded;
+      },
+    };
+    const runner = makeRunner(h, { outcomeSink: sink });
+
+    unwrap(
+      await runner.holdUntilDormant(SESSION.failed, { pending: ['page-agent'], files: 'clean' }),
+    );
+    await drained();
+
+    expect(h.sink.delivered.map(({ outcome }) => outcome.status)).toEqual(['partial', 'clean']);
+    expect(h.sessions.rows.get(SESSION.failed)?.cleanup.status).toBe('clean');
+
+    // Settled by the hold itself: nothing is remembered.
+    h.instrumentation.confirmDormancy(SESSION.failed);
+    await drained();
+    expect(h.sink.delivered).toHaveLength(2);
+  });
+
+  it('without a sink, writes only the cleanup sub-object and never the status', async () => {
+    const h = createHarness();
+    const stored = addSession(h, SESSION.failed, 'failed', STARTUP_CLEAN);
+    const runner = makeRunner(h);
+
+    unwrap(
+      await runner.holdUntilDormant(SESSION.failed, { pending: ['server-agent'], files: 'clean' }),
+    );
+
+    expect(h.sessions.updates).toHaveLength(1);
+    const [written] = h.sessions.updates;
+    expect(written?.cleanup).toEqual({ status: 'partial', completedAt: FIXED_NOW, conflicts: [] });
+    expect(withoutCleanup(written)).toEqual(withoutCleanup(stored));
+  });
+
+  it('holds nothing after dispose, nor while a pass for the session is in flight', async () => {
+    const h = createHarness();
+    addSession(h, SESSION.failed, 'failed', STARTUP_CLEAN);
+    addSession(h, SESSION.generated, 'generated', STARTUP_CLEAN);
+    const runner = makeRunner(h, { outcomeSink: h.sink });
+    const release: ReleasedCaptureVerdict = { pending: ['page-agent'], files: 'clean' };
+
+    // A pass waiting for a reconciliation is in flight: it decides its own verdict.
+    const reconciling = runner.reconcileAll();
+    const running = runner.run(SESSION.generated);
+    unwrap(await runner.holdUntilDormant(SESSION.generated, release));
+    await Promise.all([reconciling, running]);
+
+    runner.dispose();
+    unwrap(await runner.holdUntilDormant(SESSION.failed, release));
+
+    expect(h.sink.delivered).toEqual([]);
+    expect(h.sessions.rows.get(SESSION.failed)?.cleanup).toEqual(STARTUP_CLEAN);
+  });
+
+  it('answers err when the session cannot be read or a clean verdict cannot be corrected', async () => {
+    const h = createHarness();
+    addSession(h, SESSION.failed, 'failed', STARTUP_CLEAN);
+    addSession(h, SESSION.generated, 'generated', STARTUP_CLEAN);
+    h.sessions.unreadable.add(SESSION.failed);
+    const refusing: CleanupOutcomeSink = {
+      recordCleanupOutcome: () =>
+        err(new DebuggenError('STORE_ERROR', 'The synthetic session row is locked.')),
+    };
+    const runner = makeRunner(h, { outcomeSink: refusing });
+    const release: ReleasedCaptureVerdict = { pending: ['page-agent'], files: 'clean' };
+
+    const unreadable = await runner.holdUntilDormant(SESSION.failed, release);
+    const refused = await runner.holdUntilDormant(SESSION.generated, release);
+
+    expect(isErr(unreadable) ? unreadable.error.code : undefined).toBe('STORE_ERROR');
+    expect(isErr(refused) ? refused.error.code : undefined).toBe('STORE_ERROR');
+    expect(
+      h.logs.some(
+        (record) =>
+          record.level === 'error' &&
+          record.message.includes('its cleanup verdict could not be held'),
+      ),
+    ).toBe(true);
+
+    // Nothing was remembered, so a confirmation writes nothing.
+    h.instrumentation.confirmDormancy(SESSION.generated);
+    await drained();
+    expect(h.sessions.rows.get(SESSION.generated)?.cleanup).toEqual(STARTUP_CLEAN);
+  });
+});
+
+describe('a confirmed dormancy upgrade that cannot be recorded is retried', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** A sink that refuses each session's first `refusals` deliveries, then records like the manager. */
+  function flakySink(h: Harness, refusals: number): CleanupOutcomeSink {
+    const refused = new Map<string, number>();
+
+    return {
+      recordCleanupOutcome(sessionId, outcome) {
+        const count = refused.get(sessionId) ?? 0;
+
+        if (count < refusals) {
+          refused.set(sessionId, count + 1);
+          return err(new DebuggenError('STORE_ERROR', 'The synthetic session row is locked.'));
+        }
+
+        return h.sink.recordCleanupOutcome(sessionId, outcome);
+      },
+    };
+  }
+
+  it('records the upgrade once the store answers again, with a backoff between attempts', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const h = createHarness();
+    addSession(h, SESSION.failed, 'failed', STARTUP_PARTIAL);
+    const runner = makeRunner(h, { outcomeSink: flakySink(h, 2) });
+    unwrap(
+      await runner.holdUntilDormant(SESSION.failed, { pending: ['page-agent'], files: 'clean' }),
+    );
+
+    h.instrumentation.confirmDormancy(SESSION.failed);
+    await drained();
+    expect(upgrades(h)).toEqual([]);
+
+    await vi.advanceTimersByTimeAsync(500);
+    expect(upgrades(h)).toEqual([]);
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(upgrades(h)).toEqual([{ status: 'clean', conflicts: [], completedAt: FIXED_NOW }]);
+    expect(
+      h.logs.filter((record) => record.message.includes('the upgrade is retried')),
+    ).toHaveLength(2);
+    runner.dispose();
+  });
+
+  it('gives up after the last attempt, leaving the conservative partial and saying so', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const h = createHarness();
+    addSession(h, SESSION.failed, 'failed', STARTUP_PARTIAL);
+    const runner = makeRunner(h, { outcomeSink: flakySink(h, Number.MAX_SAFE_INTEGER) });
+    unwrap(
+      await runner.holdUntilDormant(SESSION.failed, { pending: ['page-agent'], files: 'clean' }),
+    );
+
+    h.instrumentation.confirmDormancy(SESSION.failed);
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expect(h.sessions.rows.get(SESSION.failed)?.cleanup.status).toBe('partial');
+    expect(
+      h.logs.some(
+        (record) => record.level === 'error' && record.message.includes('after every retry'),
+      ),
+    ).toBe(true);
+    runner.dispose();
+  });
+
+  it('cancels a scheduled retry when a later pass decides the verdict, and on dispose', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const h = createHarness();
+    addSession(h, SESSION.failed, 'failed', STARTUP_PARTIAL);
+    addSession(h, SESSION.generated, 'generated', STARTUP_PARTIAL);
+    const sink = flakySink(h, 1);
+    const runner = makeRunner(h, { outcomeSink: sink });
+    const release: ReleasedCaptureVerdict = { pending: ['page-agent'], files: 'clean' };
+    unwrap(await runner.holdUntilDormant(SESSION.failed, release));
+
+    h.instrumentation.confirmDormancy(SESSION.failed);
+    await drained();
+
+    // The session is ended again: its own pass decides, and the retry is dropped.
+    unwrap(await runner.run(SESSION.failed));
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(upgrades(h)).toEqual([]);
+
+    // A retry still scheduled when the runner stops never fires.
+    unwrap(await runner.holdUntilDormant(SESSION.generated, release));
+    h.instrumentation.confirmDormancy(SESSION.generated);
+    await drained();
+    runner.dispose();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(upgrades(h)).toEqual([]);
+  });
+});
+
+/** A verdict-hold double: records what each released capture reported. */
+interface RecordingVerdictHold extends CleanupVerdictHold {
+  readonly held: { readonly sessionId: string; readonly release: ReleasedCaptureVerdict }[];
+}
+
+function createRecordingVerdictHold(
+  fault: 'none' | 'err' | 'throw' | 'reject' = 'none',
+): RecordingVerdictHold {
+  const held: { sessionId: string; release: ReleasedCaptureVerdict }[] = [];
+
+  return {
+    held,
+    holdUntilDormant(sessionId, release) {
+      held.push({ sessionId, release });
+
+      if (fault === 'throw') {
+        throw new Error('The synthetic cleanup runner crashed.');
+      }
+
+      if (fault === 'reject') {
+        return Promise.reject(new Error('The synthetic cleanup runner rejected.'));
+      }
+
+      return Promise.resolve(
+        fault === 'err'
+          ? err(new DebuggenError('STORE_ERROR', 'The synthetic session row is locked.'))
+          : ok(undefined),
+      );
+    },
+  };
+}
+
+describe('settleInterruptedSessions — a released capture’s cleanup verdict is held until dormancy', () => {
+  it('keeps the verdict the reconciliation recorded partial until the producers are confirmed dormant', async () => {
+    const s = createSettleHarness();
+    const plan = runtimePlan(INTERRUPTED.alpha, 1);
+    interrupted(s.h, INTERRUPTED.alpha, 'capturing', { plans: [plan] });
+    openCapture(s.h, INTERRUPTED.alpha, OPEN_CAPTURE_ID);
+    await seedRecord(s.h, { sessionId: INTERRUPTED.alpha, file: FILE.dial });
+    const runner = makeRunner(s.h, { outcomeSink: s.h.sink });
+
+    // Files restored, hooks not known dormant: recorded partial by the first half.
+    const reconciled = unwrap(await reconcileModificationsOnStartup(startupDeps(s.h)));
+    expect(reconciled.bySession[INTERRUPTED.alpha]?.status).toBe('clean');
+    expect(s.h.sessions.rows.get(INTERRUPTED.alpha)?.cleanup.status).toBe('partial');
+
+    const report = unwrap(
+      await settleInterruptedSessions(s.deps({ verdicts: runner }), reconciled),
+    );
+
+    // Failed, released, and — with both producers still owed — still partial.
+    expect(report.errors).toEqual([]);
+    expect(s.h.sessions.rows.get(INTERRUPTED.alpha)?.status).toBe('failed');
+    expect(s.h.sessions.rows.get(INTERRUPTED.alpha)?.cleanup.status).toBe('partial');
+    expect(s.h.sink.delivered).toEqual([]);
+
+    s.h.instrumentation.confirmDormancy(INTERRUPTED.alpha);
+    await drained();
+    expect(s.h.sessions.rows.get(INTERRUPTED.alpha)?.cleanup.status).toBe('clean');
+  });
+
+  it('tells the runner what each release reported, and nothing for a session it did not release', async () => {
+    const s = createSettleHarness();
+    interrupted(s.h, INTERRUPTED.alpha, 'capturing', {
+      plans: [runtimePlan(INTERRUPTED.alpha, 1)],
+    });
+    interrupted(s.h, INTERRUPTED.bravo, 'capturing', {
+      plans: [runtimePlan(INTERRUPTED.bravo, 1)],
+    });
+    interrupted(s.h, INTERRUPTED.charlie, 'instrumenting');
+    openCapture(s.h, INTERRUPTED.alpha, OPEN_CAPTURE_ID, 3);
+    openCapture(s.h, INTERRUPTED.bravo, 'cap_quarryopen02');
+    const verdicts = createRecordingVerdictHold();
+
+    const report = unwrap(
+      await settleInterruptedSessions(
+        s.deps({ verdicts }),
+        reconciliationOf({ [INTERRUPTED.bravo]: 'clean' }),
+      ),
+    );
+
+    expect(report.failed.map(({ sessionId }) => sessionId)).toEqual([
+      INTERRUPTED.alpha,
+      INTERRUPTED.bravo,
+      INTERRUPTED.charlie,
+    ]);
+    expect(verdicts.held).toEqual([
+      { sessionId: INTERRUPTED.alpha, release: { pending: [...BOTH_OWED], files: undefined } },
+      { sessionId: INTERRUPTED.bravo, release: { pending: [...BOTH_OWED], files: 'clean' } },
+    ]);
+  });
+
+  it.each(['err', 'throw'] as const)(
+    'tells the runner nothing is known when the release answers %s',
+    async (fault) => {
+      const s = createSettleHarness();
+      interrupted(s.h, INTERRUPTED.alpha, 'capturing', {
+        plans: [runtimePlan(INTERRUPTED.alpha, 1)],
+      });
+      openCapture(s.h, INTERRUPTED.alpha, OPEN_CAPTURE_ID, 3);
+      s.releaser.faults.set(INTERRUPTED.alpha, fault);
+      const verdicts = createRecordingVerdictHold();
+
+      unwrap(await settleInterruptedSessions(s.deps({ verdicts }), reconciliationOf()));
+
+      expect(verdicts.held).toEqual([
+        { sessionId: INTERRUPTED.alpha, release: { pending: undefined, files: undefined } },
+      ]);
+    },
+  );
+
+  it('holds nothing when no instrumentation service is wired to release the capture', async () => {
+    const s = createSettleHarness();
+    interrupted(s.h, INTERRUPTED.alpha, 'capturing', {
+      plans: [runtimePlan(INTERRUPTED.alpha, 1)],
+    });
+    openCapture(s.h, INTERRUPTED.alpha, OPEN_CAPTURE_ID, 3);
+    const verdicts = createRecordingVerdictHold();
+
+    const report = unwrap(
+      await settleInterruptedSessions(
+        s.deps({ instrumentation: undefined, verdicts }),
+        reconciliationOf(),
+      ),
+    );
+
+    expect(report.failed.map(({ sessionId }) => sessionId)).toEqual([INTERRUPTED.alpha]);
+    expect(verdicts.held).toEqual([]);
+  });
+
+  it.each(['err', 'throw', 'reject'] as const)(
+    'reports a session whose verdict the runner could not hold (%s) as unsettled, so the start is refused',
+    async (fault) => {
+      const s = createSettleHarness();
+      interrupted(s.h, INTERRUPTED.alpha, 'capturing', {
+        plans: [runtimePlan(INTERRUPTED.alpha, 1)],
+      });
+      interrupted(s.h, INTERRUPTED.bravo, 'instrumenting');
+      openCapture(s.h, INTERRUPTED.alpha, OPEN_CAPTURE_ID, 3);
+
+      const report = unwrap(
+        await settleInterruptedSessions(
+          s.deps({ verdicts: createRecordingVerdictHold(fault) }),
+          reconciliationOf(),
+        ),
+      );
+
+      // The pass still settles every other session.
+      expect(report.failed.map(({ sessionId }) => sessionId)).toEqual([
+        INTERRUPTED.alpha,
+        INTERRUPTED.bravo,
+      ]);
+      expect(report.errors.map(({ sessionId }) => sessionId)).toEqual([INTERRUPTED.alpha]);
+      expect(
+        s.h.logs.some(
+          (record) =>
+            record.level === 'error' && record.message.includes('could not be held at partial'),
+        ),
+      ).toBe(true);
+    },
+  );
 });

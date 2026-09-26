@@ -32,6 +32,18 @@
  *   second request however many spans follow. Its negative control is
  *   {@link RETRYABLE_CLIENT_STATUSES} plus a `5xx`, which must leave the
  *   transport running so a service restart still recovers.
+ * - {@link MAX_ACKNOWLEDGEMENT_BYTES} (4 KiB) — the most of a `2xx` body read
+ *   as the service's `{ accepted, rejected? }` acknowledgement. Asserted at the
+ *   bound (read), one over (refused), with a declared `Content-Length` over it
+ *   (refused unread) and with a body that never ends (cancelled at the cap).
+ *   What the acknowledgement says is asserted on every counter it moves: a
+ *   batch the service stored nothing of is refused — never posted, never
+ *   retried — a partial one is split, inconsistent counts are clamped to the
+ *   batch, and a body that is absent or unusable falls back to "posted, and
+ *   unacknowledged" without a throw and without a byte of it being logged.
+ * - {@link REFUSAL_WARNING_INTERVAL_MS} — refusals are summarised in at most
+ *   one warning per drain, no more often than this interval, with nothing lost
+ *   to it and the remainder written by the shutdown flush.
  *
  * ## Techniques, and why each one is the way it is
  *
@@ -62,7 +74,8 @@
  * assertion about what was posted is made after an `await` rather than after a
  * timer, and the suite has no wall-clock waits at all: the two cases that need
  * the backoff or the shutdown deadline to elapse use Vitest's fake timers and
- * advance them explicitly.
+ * advance them explicitly, and the refusal-interval case moves the faked
+ * system clock rather than waiting on the real one.
  *
  * **Bounds are imported, never spelled**, and the exact/one-over cases are
  * derived from them (`BATCH_MAX_EVENTS - 1`), so retuning a constant in
@@ -91,8 +104,10 @@ import { NEXT_SPAN_TYPE_ATTRIBUTE, NEXT_SPAN_TYPES } from './convert.js';
 import {
   AUTH_REJECTED_STATUSES,
   DebuggenSpanProcessor,
+  MAX_ACKNOWLEDGEMENT_BYTES,
   MAX_DRAIN_BATCHES,
   MAX_POST_ATTEMPTS,
+  REFUSAL_WARNING_INTERVAL_MS,
   RETRYABLE_CLIENT_STATUSES,
   SHUTDOWN_FLUSH_DEADLINE_MS,
 } from './exporter.js';
@@ -146,8 +161,28 @@ const SPAN_END: HrTime = [1_700_000_000, 133_456_789];
 /** The relative duration the SDK also records for the same 10 ms. */
 const SPAN_DURATION: HrTime = [0, 10_000_000];
 
-/** `204 No Content`: the honest shape of an ingest acknowledgement. */
+/**
+ * `204 No Content`: a `2xx` that says nothing about counts.
+ *
+ * The default answer of this suite's `fetch` double, and the shape of a
+ * service that acknowledges with a status only. The exporter counts such a
+ * batch as posted in full and as unacknowledged, which is why every case
+ * written before the acknowledgement was read still holds unchanged.
+ */
 const ACCEPTED_STATUS = 204;
+
+/**
+ * `202 Accepted`: the status the local service answers an ingest with, its
+ * body being the `{ accepted, rejected? }` acknowledgement.
+ */
+const ACKNOWLEDGED_STATUS = 202;
+
+/**
+ * A string no diagnostic may ever contain, planted in answer bodies to prove
+ * that nothing the service says is echoed into the developer's terminal.
+ * Assembled from fragments for the same reason the credential is.
+ */
+const BODY_MARKER = ['ack', 'body', 'marker', 'z'.repeat(12)].join('-');
 
 /** `401 Unauthorized`: a credential the service refused. */
 const UNAUTHORIZED_STATUS = 401;
@@ -396,6 +431,22 @@ interface FetchCall {
   readonly init?: RequestInit | undefined;
 }
 
+/**
+ * The body of one answer.
+ *
+ * `json` is serialised with a JSON content type, as the service serialises its
+ * acknowledgement. `raw` is anything else — text, bytes or a stream — produced
+ * by a factory, because a response body can be read once and a plan's last
+ * entry answers every call after it, so each call needs a fresh one; `headers`
+ * lets a case declare a `Content-Length` the body does not have.
+ */
+type AnswerBody =
+  | { readonly json: unknown }
+  | {
+      readonly raw: () => BodyInit;
+      readonly headers?: Readonly<Record<string, string>> | undefined;
+    };
+
 /** How a case wants its `fetch` double to answer. */
 interface FetchPlan {
   /**
@@ -406,6 +457,14 @@ interface FetchPlan {
    * implementation.
    */
   readonly statuses?: readonly number[] | undefined;
+
+  /**
+   * The bodies to answer with, one per call, the last one repeating.
+   *
+   * Absent — or a `null` entry — means no body at all, which is what every
+   * case that does not assert on the acknowledgement answers with.
+   */
+  readonly bodies?: readonly (AnswerBody | null)[] | undefined;
 
   /** When true, every call rejects, as an unreachable service does. */
   readonly rejectEverything?: boolean | undefined;
@@ -426,6 +485,26 @@ interface FetchRig {
 }
 
 /**
+ * Build one answer.
+ *
+ * @param status The status.
+ * @param body The body, or `null` for none.
+ * @returns A fresh response.
+ */
+function answerWith(status: number, body: AnswerBody | null): Response {
+  if (body === null) {
+    return new Response(null, { status });
+  }
+  if ('json' in body) {
+    return new Response(JSON.stringify(body.json), {
+      status,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+  return new Response(body.raw(), { status, headers: { ...body.headers } });
+}
+
+/**
  * Create a `fetch` that records every request and reaches nothing.
  *
  * @param plan How it should answer.
@@ -434,6 +513,7 @@ interface FetchRig {
 function createFetchRig(plan: FetchPlan = {}): FetchRig {
   const calls: FetchCall[] = [];
   const statuses = plan.statuses ?? [ACCEPTED_STATUS];
+  const bodies = plan.bodies ?? [];
 
   const impl: typeof fetch = (input, init) => {
     calls.push(init === undefined ? { input } : { input, init });
@@ -451,7 +531,8 @@ function createFetchRig(plan: FetchPlan = {}): FetchRig {
 
     const index = Math.min(calls.length - 1, statuses.length - 1);
     const status = statuses[index] ?? ACCEPTED_STATUS;
-    return Promise.resolve(new Response(null, { status }));
+    const body = bodies[Math.min(calls.length - 1, bodies.length - 1)] ?? null;
+    return Promise.resolve(answerWith(status, body));
   };
 
   return { impl, calls };
@@ -1165,5 +1246,648 @@ describe('AUTH_REJECTED_STATUSES', () => {
       expect(rig.calls, `${label} keeps posting afterwards`).toHaveLength(3);
       expect(processor.stats().postedBatches).toBe(2);
     }
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The ingest acknowledgement
+ *
+ * The local service answers an ingest it processed with
+ * `202 { accepted, rejected? }`, and `202 { accepted: 0, rejected: N }` is a
+ * batch it received and stored nothing of. Every case below answers through
+ * the rig's `bodies` and asserts three things: the counters the answer moves,
+ * the number of requests (a `2xx` is never retried), and what reached the
+ * logger — counts and fixed reason words, never a byte of the answer.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * A JSON body padded with trailing whitespace to exactly `bytes` bytes.
+ *
+ * Trailing whitespace is valid JSON, so the padded body parses to the same
+ * value and only its length moves — which is what lets a case sit exactly on
+ * {@link MAX_ACKNOWLEDGEMENT_BYTES} and exactly one byte over it.
+ *
+ * @param value The acknowledgement.
+ * @param bytes The body's length; ASCII, so characters are bytes.
+ * @returns The padded text.
+ */
+function paddedJson(value: unknown, bytes: number): string {
+  const text = JSON.stringify(value);
+  if (text.length > bytes) {
+    throw new Error('the padded body would be shorter than the JSON it pads');
+  }
+  return text.padEnd(bytes, ' ');
+}
+
+/**
+ * The reason words the exporter recorded for `2xx` answers that carried no
+ * usable acknowledgement, in order.
+ *
+ * @param logger The recording logger.
+ * @returns One reason per such answer.
+ */
+function unacknowledgedReasonsOf(logger: RecordingLogger): unknown[] {
+  return logger
+    .entriesAt('debug')
+    .flatMap((entry) =>
+      entry.fields !== undefined && 'reason' in entry.fields ? [entry.fields.reason] : [],
+    );
+}
+
+/**
+ * The `clamped` flag of every acknowledged answer, in order.
+ *
+ * @param logger The recording logger.
+ * @returns One flag per acknowledged answer.
+ */
+function clampedFlagsOf(logger: RecordingLogger): unknown[] {
+  return logger
+    .entriesAt('debug')
+    .flatMap((entry) =>
+      entry.fields !== undefined && 'clamped' in entry.fields ? [entry.fields.clamped] : [],
+    );
+}
+
+/** A body stream that never ends, and the record of what it handed out. */
+interface EndlessBody {
+  /** A fresh endless stream, for one answer. */
+  readonly open: () => ReadableStream<Uint8Array>;
+  /** Bytes handed out so far, across every stream it opened. */
+  readonly pulledBytes: () => number;
+  /** Streams whose reader cancelled them. */
+  readonly cancelled: () => number;
+}
+
+/**
+ * Create a body that produces whitespace for as long as it is read.
+ *
+ * Whitespace so that no prefix of it is ever a complete answer: without the
+ * streamed cap, reading it would never finish.
+ *
+ * @param chunkBytes Bytes per chunk.
+ * @returns The body and its record.
+ */
+function createEndlessBody(chunkBytes: number): EndlessBody {
+  let pulled = 0;
+  let cancelled = 0;
+  return {
+    open: (): ReadableStream<Uint8Array> =>
+      new ReadableStream<Uint8Array>({
+        pull(controller): void {
+          pulled += chunkBytes;
+          controller.enqueue(new Uint8Array(chunkBytes).fill(0x20));
+        },
+        cancel(): void {
+          cancelled += 1;
+        },
+      }),
+    pulledBytes: (): number => pulled,
+    cancelled: (): number => cancelled,
+  };
+}
+
+/**
+ * A body that delivers the start of an acknowledgement and then errors, with
+ * the marker in the error's message.
+ *
+ * @returns A fresh stream.
+ */
+function erroringBody(): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(controller): void {
+      controller.enqueue(new TextEncoder().encode('{"accepted":'));
+      controller.error(new Error(BODY_MARKER));
+    },
+  });
+}
+
+/**
+ * A body whose chunk is a string rather than bytes, as a response double
+ * could hand over.
+ *
+ * @returns A fresh stream.
+ */
+function textChunkBody(): ReadableStream<string> {
+  return new ReadableStream<string>({
+    start(controller): void {
+      controller.enqueue(JSON.stringify({ accepted: 0, rejected: 1, note: BODY_MARKER }));
+      controller.close();
+    },
+  });
+}
+
+describe('the ingest acknowledgement', () => {
+  it('counts a batch the service stored nothing of as refused, never posted, and never retries it', async () => {
+    const events = 3;
+    // The second answer would read as a success, so a retry could not hide.
+    const {
+      processor,
+      fetch: rig,
+      logger,
+    } = createHarness({
+      statuses: [ACKNOWLEDGED_STATUS, ACCEPTED_STATUS],
+      bodies: [{ json: { accepted: 0, rejected: events } }, null],
+    });
+
+    feedSpans(processor, events);
+    await processor.forceFlush();
+
+    expect(rig.calls).toHaveLength(1);
+    expect(processor.stats()).toMatchObject({
+      refusedBatches: 1,
+      postedBatches: 0,
+      postedEvents: 0,
+      droppedRejectedByService: events,
+      unacknowledgedBatches: 0,
+      failedBatches: 0,
+      droppedFailedBatch: 0,
+      credentialRejected: false,
+      internalErrors: 0,
+      buffered: 0,
+    });
+
+    const warnings = logger.entriesAt('warn');
+    expect(warnings).toHaveLength(1);
+    expect(at(warnings, 0, 'the warnings').fields).toEqual({
+      events,
+      fullyRefusedBatches: 1,
+      droppedTotal: events,
+    });
+
+    // A refusal is about those bytes, not about the transport: the next batch
+    // still travels, and is counted by its own answer.
+    feedSpans(processor, 1, events);
+    await processor.forceFlush();
+
+    expect(rig.calls).toHaveLength(2);
+    expect(processor.stats()).toMatchObject({
+      postedBatches: 1,
+      postedEvents: 1,
+      unacknowledgedBatches: 1,
+      refusedBatches: 1,
+    });
+  });
+
+  it('splits a partly stored batch between the posted and the refused counters', async () => {
+    const refused = 6;
+    const {
+      processor,
+      fetch: rig,
+      logger,
+    } = createHarness({
+      statuses: [ACKNOWLEDGED_STATUS],
+      bodies: [{ json: { accepted: BATCH_MAX_EVENTS - refused, rejected: refused } }],
+    });
+
+    feedSpans(processor, BATCH_MAX_EVENTS);
+    await processor.forceFlush();
+
+    expect(rig.calls).toHaveLength(1);
+    expect(processor.stats()).toMatchObject({
+      postedBatches: 1,
+      postedEvents: BATCH_MAX_EVENTS - refused,
+      droppedRejectedByService: refused,
+      refusedBatches: 0,
+      unacknowledgedBatches: 0,
+      failedBatches: 0,
+      internalErrors: 0,
+    });
+
+    const warnings = logger.entriesAt('warn');
+    expect(warnings).toHaveLength(1);
+    expect(at(warnings, 0, 'the warnings').fields).toEqual({
+      events: refused,
+      fullyRefusedBatches: 0,
+      droppedTotal: refused,
+    });
+    expect(clampedFlagsOf(logger)).toEqual([false]);
+  });
+
+  it('posts a batch the service stored in full, and writes nothing at warn', async () => {
+    const {
+      processor,
+      fetch: rig,
+      logger,
+    } = createHarness({
+      statuses: [ACKNOWLEDGED_STATUS],
+      bodies: [{ json: { accepted: BATCH_MAX_EVENTS } }],
+    });
+
+    feedSpans(processor, BATCH_MAX_EVENTS);
+    await processor.forceFlush();
+
+    expect(rig.calls).toHaveLength(1);
+    expect(processor.stats()).toMatchObject({
+      postedBatches: 1,
+      postedEvents: BATCH_MAX_EVENTS,
+      droppedRejectedByService: 0,
+      refusedBatches: 0,
+      unacknowledgedBatches: 0,
+      internalErrors: 0,
+    });
+    expect(logger.entriesAt('warn')).toHaveLength(0);
+    expect(clampedFlagsOf(logger)).toEqual([false]);
+  });
+
+  it('counts a 2xx with no body as posted in full and unacknowledged', async () => {
+    for (const status of [ACCEPTED_STATUS, ACKNOWLEDGED_STATUS]) {
+      const label = `status ${String(status)}`;
+      const { processor, fetch: rig, logger } = createHarness({ statuses: [status] });
+
+      feedSpans(processor, 2);
+      await processor.forceFlush();
+
+      expect(rig.calls, `${label} is posted once`).toHaveLength(1);
+      expect(processor.stats(), `${label} falls back to "posted"`).toMatchObject({
+        postedBatches: 1,
+        postedEvents: 2,
+        unacknowledgedBatches: 1,
+        refusedBatches: 0,
+        droppedRejectedByService: 0,
+        internalErrors: 0,
+      });
+      expect(logger.entriesAt('warn'), `${label} is not a degraded capture`).toHaveLength(0);
+      expect(unacknowledgedReasonsOf(logger)).toEqual(['no-body']);
+    }
+  });
+
+  it('reads an acknowledgement of exactly MAX_ACKNOWLEDGEMENT_BYTES and refuses one byte over', async () => {
+    const refusal = { accepted: 0, rejected: 1 };
+
+    const atBound = createHarness({
+      statuses: [ACKNOWLEDGED_STATUS],
+      bodies: [{ raw: () => paddedJson(refusal, MAX_ACKNOWLEDGEMENT_BYTES) }],
+    });
+    feedSpans(atBound.processor, 1);
+    await atBound.processor.forceFlush();
+
+    expect(atBound.processor.stats()).toMatchObject({
+      refusedBatches: 1,
+      droppedRejectedByService: 1,
+      postedBatches: 0,
+      unacknowledgedBatches: 0,
+    });
+
+    // No declared length: `new Response(text)` sets none, so this is the
+    // streamed cap refusing the body.
+    const overBound = createHarness({
+      statuses: [ACKNOWLEDGED_STATUS],
+      bodies: [{ raw: () => paddedJson(refusal, MAX_ACKNOWLEDGEMENT_BYTES + 1) }],
+    });
+    feedSpans(overBound.processor, 1);
+    await overBound.processor.forceFlush();
+
+    expect(overBound.fetch.calls).toHaveLength(1);
+    expect(overBound.processor.stats()).toMatchObject({
+      refusedBatches: 0,
+      droppedRejectedByService: 0,
+      postedBatches: 1,
+      postedEvents: 1,
+      unacknowledgedBatches: 1,
+      internalErrors: 0,
+    });
+    expect(unacknowledgedReasonsOf(overBound.logger)).toEqual(['oversized']);
+  });
+
+  it('refuses a declared Content-Length over the bound without reading the body', async () => {
+    // The body itself is a small, valid refusal, so reading it would count the
+    // batch as refused. Being counted as unacknowledged is the proof that the
+    // declaration alone decided.
+    const {
+      processor,
+      fetch: rig,
+      logger,
+    } = createHarness({
+      statuses: [ACKNOWLEDGED_STATUS],
+      bodies: [
+        {
+          raw: () => JSON.stringify({ accepted: 0, rejected: 1 }),
+          headers: { 'Content-Length': String(MAX_ACKNOWLEDGEMENT_BYTES + 1) },
+        },
+      ],
+    });
+
+    feedSpans(processor, 1);
+    await processor.forceFlush();
+
+    expect(rig.calls).toHaveLength(1);
+    expect(processor.stats()).toMatchObject({
+      refusedBatches: 0,
+      droppedRejectedByService: 0,
+      postedBatches: 1,
+      unacknowledgedBatches: 1,
+      internalErrors: 0,
+    });
+    expect(unacknowledgedReasonsOf(logger)).toEqual(['oversized']);
+  });
+
+  it('cancels a body that never ends once it passes the bound, and resolves', async () => {
+    const chunkBytes = 512;
+    const endless = createEndlessBody(chunkBytes);
+    const {
+      processor,
+      fetch: rig,
+      logger,
+    } = createHarness({
+      statuses: [ACKNOWLEDGED_STATUS],
+      bodies: [{ raw: endless.open }],
+    });
+
+    feedSpans(processor, 1);
+    await expect(processor.forceFlush()).resolves.toBeUndefined();
+
+    expect(rig.calls).toHaveLength(1);
+    expect(endless.cancelled()).toBe(1);
+    // The cap, the chunk that crossed it, and the one the stream's queue had
+    // already pulled ahead of the reader — and not a byte more.
+    expect(endless.pulledBytes()).toBeLessThanOrEqual(MAX_ACKNOWLEDGEMENT_BYTES + 2 * chunkBytes);
+    expect(processor.stats()).toMatchObject({
+      postedBatches: 1,
+      unacknowledgedBatches: 1,
+      internalErrors: 0,
+    });
+    expect(unacknowledgedReasonsOf(logger)).toEqual(['oversized']);
+  });
+
+  it('falls back to posted-and-unacknowledged for every body it cannot use, and never throws', async () => {
+    const cases: readonly {
+      readonly label: string;
+      readonly body: AnswerBody;
+      readonly reason: string;
+    }[] = [
+      { label: 'an empty body', body: { raw: () => '' }, reason: 'empty' },
+      { label: 'text that is not JSON', body: { raw: () => BODY_MARKER }, reason: 'malformed' },
+      { label: 'truncated JSON', body: { raw: () => '{"accepted":' }, reason: 'malformed' },
+      {
+        label: 'bytes that are not UTF-8',
+        body: { raw: () => new Uint8Array([0x7b, 0xff, 0xfe, 0x7d]) },
+        reason: 'malformed',
+      },
+      { label: 'a JSON array', body: { json: [1, 2] }, reason: 'unrecognised' },
+      { label: 'JSON null', body: { json: null }, reason: 'unrecognised' },
+      {
+        label: 'a string count',
+        body: { json: { accepted: BODY_MARKER } },
+        reason: 'unrecognised',
+      },
+      { label: 'a negative count', body: { json: { accepted: -1 } }, reason: 'unrecognised' },
+      { label: 'a fractional count', body: { json: { accepted: 1.5 } }, reason: 'unrecognised' },
+      {
+        label: 'a count past 2^53',
+        body: { raw: () => '{"accepted":9007199254740993}' },
+        reason: 'unrecognised',
+      },
+      {
+        label: 'a count that overflows to infinity',
+        body: { raw: () => '{"accepted":1e400}' },
+        reason: 'unrecognised',
+      },
+      { label: 'no accepted count', body: { json: { rejected: 1 } }, reason: 'unrecognised' },
+      {
+        label: 'a negative rejected count',
+        body: { json: { accepted: 1, rejected: -1 } },
+        reason: 'unrecognised',
+      },
+      {
+        label: 'a null rejected count',
+        body: { json: { accepted: 1, rejected: null } },
+        reason: 'unrecognised',
+      },
+      { label: 'a stream that errors mid-read', body: { raw: erroringBody }, reason: 'unreadable' },
+      {
+        label: 'a stream of strings rather than bytes',
+        body: { raw: textChunkBody },
+        reason: 'unreadable',
+      },
+    ];
+
+    for (const { label, body, reason } of cases) {
+      const {
+        processor,
+        fetch: rig,
+        logger,
+      } = createHarness({
+        statuses: [ACKNOWLEDGED_STATUS],
+        bodies: [body],
+      });
+
+      feedSpans(processor, 2);
+      await expect(processor.forceFlush(), `${label} resolves`).resolves.toBeUndefined();
+
+      expect(rig.calls, `${label} is posted once`).toHaveLength(1);
+      expect(processor.stats(), `${label} falls back to "posted"`).toMatchObject({
+        postedBatches: 1,
+        postedEvents: 2,
+        unacknowledgedBatches: 1,
+        refusedBatches: 0,
+        droppedRejectedByService: 0,
+        failedBatches: 0,
+        internalErrors: 0,
+      });
+      expect(unacknowledgedReasonsOf(logger), `${label} is recorded as ${reason}`).toEqual([
+        reason,
+      ]);
+      expect(logger.entriesAt('warn'), `${label} writes nothing at warn`).toHaveLength(0);
+      expect(logText(logger), `${label} is not echoed`).not.toContain(BODY_MARKER);
+    }
+  });
+
+  it('clamps counts that do not fit the batch, so no event is counted twice or invented', async () => {
+    const events = 3;
+    const cases: readonly {
+      readonly label: string;
+      readonly json: Readonly<Record<string, number>>;
+      readonly posted: number;
+      readonly rejected: number;
+    }[] = [
+      { label: 'more accepted than were sent', json: { accepted: 10 }, posted: 3, rejected: 0 },
+      { label: 'fewer accepted, rejected omitted', json: { accepted: 1 }, posted: 1, rejected: 2 },
+      {
+        label: 'a rejected count that overshoots',
+        json: { accepted: 1, rejected: 99 },
+        posted: 1,
+        rejected: 2,
+      },
+      {
+        label: 'counts that add up to more than the batch',
+        json: { accepted: 3, rejected: 5 },
+        posted: 3,
+        rejected: 0,
+      },
+      {
+        label: 'nothing accepted and too few rejected',
+        json: { accepted: 0, rejected: 1 },
+        posted: 0,
+        rejected: 3,
+      },
+    ];
+
+    for (const { label, json, posted, rejected } of cases) {
+      const {
+        processor,
+        fetch: rig,
+        logger,
+      } = createHarness({
+        statuses: [ACKNOWLEDGED_STATUS],
+        bodies: [{ json }],
+      });
+
+      feedSpans(processor, events);
+      await processor.forceFlush();
+
+      expect(rig.calls, `${label} is posted once`).toHaveLength(1);
+      expect(posted + rejected, `${label} accounts for the batch exactly`).toBe(events);
+      expect(processor.stats(), `${label} is clamped to the batch`).toMatchObject({
+        postedBatches: posted > 0 ? 1 : 0,
+        postedEvents: posted,
+        droppedRejectedByService: rejected,
+        refusedBatches: posted === 0 ? 1 : 0,
+        unacknowledgedBatches: 0,
+        internalErrors: 0,
+      });
+      expect(clampedFlagsOf(logger), `${label} is recorded as clamped`).toEqual([true]);
+    }
+  });
+
+  it('never writes a byte of an answer into a log record', async () => {
+    const bodies: readonly AnswerBody[] = [
+      // Read despite a key this module does not know: the reading is tolerant,
+      // and the unknown value goes nowhere.
+      { json: { accepted: 1, rejected: 1, note: BODY_MARKER } },
+      { raw: () => BODY_MARKER },
+      { json: { accepted: BODY_MARKER } },
+      { raw: erroringBody },
+      { raw: textChunkBody },
+    ];
+    const {
+      processor,
+      config,
+      fetch: rig,
+      logger,
+    } = createHarness({
+      statuses: [ACKNOWLEDGED_STATUS],
+      bodies,
+    });
+
+    for (let index = 0; index < bodies.length; index += 1) {
+      feedSpans(processor, 2, index * 2);
+      await processor.forceFlush();
+    }
+
+    expect(rig.calls).toHaveLength(bodies.length);
+    expect(processor.stats()).toMatchObject({
+      postedBatches: bodies.length,
+      postedEvents: 1 + 2 * (bodies.length - 1),
+      droppedRejectedByService: 1,
+      unacknowledgedBatches: bodies.length - 1,
+      internalErrors: 0,
+    });
+
+    // Something was written — every answer is recorded at debug, the partial
+    // refusal at warn — and none of it quotes the answers or the credential.
+    expect(logger.entriesAt('debug').length).toBeGreaterThanOrEqual(bodies.length);
+    expect(logger.entriesAt('warn')).toHaveLength(1);
+    expect(logText(logger)).not.toContain(BODY_MARKER);
+    expect(logText(logger)).not.toContain(config.token);
+  });
+
+  it('summarises every refusal of one drain in a single warning', async () => {
+    const batches = 3;
+    const {
+      processor,
+      fetch: rig,
+      logger,
+    } = createHarness({
+      statuses: [ACKNOWLEDGED_STATUS],
+      bodies: [{ json: { accepted: 0, rejected: BATCH_MAX_EVENTS } }],
+    });
+
+    feedSpans(processor, BATCH_MAX_EVENTS * batches);
+    await processor.forceFlush();
+
+    expect(rig.calls).toHaveLength(batches);
+    expect(processor.stats()).toMatchObject({
+      refusedBatches: batches,
+      droppedRejectedByService: BATCH_MAX_EVENTS * batches,
+      postedBatches: 0,
+      postedEvents: 0,
+    });
+
+    const warnings = logger.entriesAt('warn');
+    expect(warnings).toHaveLength(1);
+    expect(at(warnings, 0, 'the warnings').fields).toEqual({
+      events: BATCH_MAX_EVENTS * batches,
+      fullyRefusedBatches: batches,
+      droppedTotal: BATCH_MAX_EVENTS * batches,
+    });
+  });
+
+  it('waits REFUSAL_WARNING_INTERVAL_MS between warnings, carrying what it held back, and writes the rest at shutdown', async () => {
+    vi.useFakeTimers();
+    const start = Date.now();
+    const { processor, logger } = createHarness({
+      statuses: [ACKNOWLEDGED_STATUS],
+      bodies: [{ json: { accepted: 0, rejected: 1 } }],
+    });
+
+    /** Feed one span, flush it into a refusal, and return the warnings so far. */
+    const refuseOne = async (index: number): Promise<readonly LogEntry[]> => {
+      feedSpans(processor, 1, index);
+      await processor.forceFlush();
+      return logger.entriesAt('warn');
+    };
+
+    // The first refusal is reported at once.
+    expect(await refuseOne(0)).toHaveLength(1);
+
+    // One millisecond short of the interval, the next is held back.
+    vi.setSystemTime(start + REFUSAL_WARNING_INTERVAL_MS - 1);
+    expect(await refuseOne(1)).toHaveLength(1);
+
+    // At the interval, one warning carries both the held-back refusal and its own.
+    vi.setSystemTime(start + REFUSAL_WARNING_INTERVAL_MS);
+    const afterInterval = await refuseOne(2);
+    expect(afterInterval).toHaveLength(2);
+    expect(at(afterInterval, 1, 'the warnings').fields).toEqual({
+      events: 2,
+      fullyRefusedBatches: 2,
+      droppedTotal: 3,
+    });
+
+    // Held back again, and then written by the shutdown flush regardless.
+    expect(await refuseOne(3)).toHaveLength(2);
+    await processor.shutdown();
+
+    const warnings = logger.entriesAt('warn');
+    expect(warnings).toHaveLength(3);
+    expect(at(warnings, 2, 'the warnings').fields).toEqual({
+      events: 1,
+      fullyRefusedBatches: 1,
+      droppedTotal: 4,
+    });
+    expect(processor.stats()).toMatchObject({ refusedBatches: 4, droppedRejectedByService: 4 });
+  });
+
+  it('treats a clock that moved backwards as the interval having passed', async () => {
+    vi.useFakeTimers();
+    const start = Date.now();
+    const { processor, logger } = createHarness({
+      statuses: [ACKNOWLEDGED_STATUS],
+      bodies: [{ json: { accepted: 0, rejected: 1 } }],
+    });
+
+    feedSpans(processor, 1);
+    await processor.forceFlush();
+    expect(logger.entriesAt('warn')).toHaveLength(1);
+
+    // A wall-clock correction must not silence the summary for however long
+    // the clock was wrong by.
+    vi.setSystemTime(start - 1);
+    feedSpans(processor, 1, 1);
+    await processor.forceFlush();
+
+    expect(logger.entriesAt('warn')).toHaveLength(2);
   });
 });

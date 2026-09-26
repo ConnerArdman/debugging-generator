@@ -11,53 +11,75 @@
  * pairing code is deleted, a new editor credential is minted and `auth.json` is
  * regenerated, and every open socket is closed with code 4401 — so paired
  * Chrome extensions must pair again and launched dev servers must be
- * relaunched. The service implements exactly that as one transaction
- * (`AuthService.rotateAll` in `apps/local-service/src/server/auth.ts`, pinned by
- * `apps/local-service/src/server/auth.test.ts` and the "rotation and
- * revocation" suite of `apps/local-service/test/integration/auth.test.ts`).
+ * relaunched.
  *
- * ## Why this command reports instead of rotating
+ * The service performs all of it behind the protocol's `credentials.rotate`
+ * operation (`POST /credentials/rotate`, editor credential only), which this
+ * command reaches through `ServiceClient.rotateCredentials` — by operation id,
+ * never a hand-written path.
  *
- * The extension may reach the service only through an operation the protocol
- * declares — `ServiceClient.request(operation, args)` by operation id, never a
- * hand-written path, method or `fetch` — and the protocol declares no rotation
- * operation: `HTTP_OPERATIONS` in `packages/protocol/src/http.ts` lists the
- * session, capture, panel, modification, telemetry-ingest, dev-server, health
- * and pairing operations and nothing that rotates, and no WebSocket message
- * requests a rotation either. `AuthService.rotateAll` is therefore reachable
- * only from inside the service process.
+ * ## The flow
  *
- * Inventing a route here would be worse than useless: the service registers
- * exactly the protocol's operations, so a hand-written request would reach no
- * handler (its `notFound` answer), and a command that appeared to rotate would
- * leave the developer believing credentials were revoked when every one of
- * them is still valid. The command consequently performs no request and renders exactly one
- * typed failure (`NOT_IMPLEMENTED`, built by {@link rotationUnavailableError})
- * whose message says that nothing was changed and whose hint says that nothing
- * needs to be re-paired or relaunched.
- *
- * No confirmation modal is shown. The modal guards a destructive request, and
- * this build issues none: asking the developer to accept "every credential is
- * deleted" and then reporting that nothing happened would be the misleading
- * sequence the confirmation exists to prevent.
+ * 1. **Confirm first.** One modal ({@link ROTATE_SERVICE_TOKEN_CONFIRMATION})
+ *    states what is lost before anything is sent. Dismissing it ends the
+ *    command silently: no request, no notice.
+ * 2. **Exactly one request.** `rotateCredentials()` is called once and never
+ *    retried here; the client's own single re-read on `UNAUTHORIZED` is the
+ *    only repeat that can happen, and only when `auth.json` already holds a
+ *    different token.
+ * 3. **Re-read the credential on every outcome.** The cached editor token is
+ *    dropped and `auth.json` read again whether or not the reply was a
+ *    success, because a failure *after* the service's commit ("Credentials
+ *    were rotated, but …") can also have rewritten the file. The socket needs
+ *    nothing from this command: the service publishes `auth.json` before it
+ *    closes the sockets, and the client's 4401 handling re-reads the file and
+ *    reconnects with the new token by itself.
+ * 4. **One message per outcome.**
+ *    - Failure: one error notice, `ROTATE_SERVICE_TOKEN_FAILURE_PREFIX` plus
+ *      the service's own message and hint. The service's message says whether
+ *      the rotation was applied ("Credentials were not rotated; every existing
+ *      credential is still valid." before its commit, "Credentials were
+ *      rotated, but …" with a restart hint after it), so this command never
+ *      states on its own that nothing changed. A credential re-read that failed
+ *      too is logged, not shown a second time.
+ *      Because a committed rotation can still end in an error, and the error
+ *      carries no structured "rotated" flag, every failure is treated as
+ *      possibly applied unless the client's structured facts prove the
+ *      request never reached the service (no HTTP status, and a refusal raised
+ *      before sending or a refused connection): the pairing code on display
+ *      is cleared and the notice offers "Pair Chrome". A request that provably
+ *      never left keeps the code and offers nothing, since nothing changed.
+ *    - Success: the pairing code on display is cleared (the service deleted
+ *      every outstanding code), then one warning notice with the service's
+ *      tally and the two follow-ups — "Pair Chrome" (`debuggen.pairChrome`)
+ *      and, when the window holds a project a dev server can be launched for,
+ *      "Relaunch Dev Server". A failed re-read of the new credential is named
+ *      in that notice's detail.
+ * 5. **Relaunch means stop, then launch.** The service's launcher answers a
+ *    launch for a project whose child still runs with that same child, which
+ *    still holds the revoked credential. "Relaunch Dev Server" therefore asks
+ *    the service to stop the dev server it launched (`devServer.stop`, which
+ *    answers once the child has exited) and only then runs
+ *    `debuggen.launchDevServer`, which spawns a fresh child with a new
+ *    credential. When the service launched none for the project, the developer
+ *    is told to restart theirs the way it was started, and offered
+ *    "Launch Dev Server".
  *
  * ## What the command never does
  *
- * - It never writes, deletes or re-reads `$DEBUGGEN_HOME/auth.json` and never
- *   mints or hashes a credential: the service owns that file, and
- *   `../service/auth.ts` is the only reader in the extension. Nothing was
- *   rotated, so the cached editor credential is still the valid one and is left
- *   untouched, as is any pairing code on display.
- * - It never opens, closes or reconnects a socket: reconnection and backoff
- *   belong to the protocol's `ReconnectingWsClient` inside
- *   `../service/client.ts`, and a 4401 close is handled there and in
- *   `src/extension.ts`.
+ * - It never writes or deletes `$DEBUGGEN_HOME/auth.json` and never mints or
+ *   hashes a credential: the service owns that file, and `../service/auth.ts`
+ *   is the only reader in the extension.
+ * - It never opens, closes or reconnects a socket: reconnection belongs to the
+ *   protocol's `ReconnectingWsClient` inside `../service/client.ts`.
+ * - It never signals a process: the service stops the dev server it launched,
+ *   and only through `devServer.stop`, keyed by project, never by pid.
  * - It never logs or displays a credential, a credential hash or the content of
- *   `auth.json` (AAP §0.5.2): its one log record carries the command id and the
- *   error code.
- * - It never throws for this expected condition. The failure is a
- *   `DebuggenError` rendered once through `CommandUi.notifyFailure`, so the
- *   registration wrapper in `./index.ts` never sees it.
+ *   `auth.json` (AAP §0.5.2): log records carry the command id, error codes,
+ *   the service's two counts and flags — never a project path.
+ * - It never throws for an expected condition. Every failure is a
+ *   `DebuggenError` rendered once through `CommandUi`, so the registration
+ *   wrapper in `./index.ts` never sees it.
  *
  * ## Module conventions
  *
@@ -66,12 +88,20 @@
  * only. Like every command module it imports **types only** from `./index`,
  * which keeps the barrel → module edge the folder's single runtime edge.
  *
+ * @example
+ * ```ts
+ * // src/commands/index.ts maps the id to this function:
+ * 'debuggen.rotateServiceToken': (...args) => rotateServiceToken(ctx, ...args),
+ * ```
+ *
  * @packageDocumentation
  */
 
-import { DebuggenError } from '@debuggen/shared';
+import type { CredentialsRotateResponse, DevServerStopResponse } from '@debuggen/protocol';
+import { DebuggenError, err, isErr, isOk, ok } from '@debuggen/shared';
+import type { Result } from '@debuggen/shared';
 
-import type { CommandContext, CommandId } from './index';
+import type { CommandContext, CommandId, CommandNotice, DestructiveConfirmation } from './index';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -84,55 +114,426 @@ import type { CommandContext, CommandId } from './index';
  */
 const COMMAND_ID = 'debuggen.rotateServiceToken' satisfies CommandId;
 
+/** The command the "Pair Chrome" action runs. */
+const PAIR_CHROME_COMMAND = 'debuggen.pairChrome' satisfies CommandId;
+
+/**
+ * The command that launches a fresh dev server: run by "Relaunch Dev Server"
+ * once the service has stopped the old one, and by "Launch Dev Server".
+ */
+const LAUNCH_DEV_SERVER_COMMAND = 'debuggen.launchDevServer' satisfies CommandId;
+
 /**
  * What was being attempted, prefixed to the failure headline by
  * `CommandUi.notifyFailure` ("Could not rotate the service token: …").
  */
 export const ROTATE_SERVICE_TOKEN_FAILURE_PREFIX = 'Could not rotate the service token';
 
-/**
- * The failure's message: why nothing happened, stated so that it cannot be
- * read as a partial rotation.
- */
-const ROTATION_UNAVAILABLE_MESSAGE =
-  'This build of Debug Generator has no service operation for rotating credentials, so no credential was changed.';
+/** Prefixed to the headline when a follow-up command cannot be dispatched at all. */
+const ACTION_FAILURE_PREFIX = 'Could not run the requested action';
 
 /**
- * The failure's actionable half: what the developer does next — nothing, which
- * is exactly what must be said, because a developer who believes a rotation ran
- * would otherwise go and re-pair Chrome and relaunch dev servers for no reason.
+ * The button that starts a new Chrome pairing: on the success notice, and on
+ * the failure notice of a rotation that may have been applied.
  */
-const ROTATION_UNAVAILABLE_HINT =
-  'Every existing credential stays valid: the editor, paired Chrome DevTools panels and launched dev servers keep working, and nothing needs to be re-paired or relaunched.';
+export const PAIR_CHROME_ACTION = 'Pair Chrome';
 
 /**
- * The diagnostic reason recorded in the failure's `details`. `details` never
- * reaches a notification (`CommandUi.notifyFailure` renders the message and the
- * hint only); it exists for a caller or a test that inspects the error.
+ * The success notice's button that stops the dev server the service launched
+ * for the project and launches a fresh one (see {@link relaunchDevServer}).
  */
-const ROTATION_UNAVAILABLE_REASON = 'rotation-operation-not-declared';
+export const RELAUNCH_DEV_SERVER_ACTION = 'Relaunch Dev Server';
+
+/**
+ * The button of the "Debug Generator did not launch it" notice: asks the
+ * service to launch the project's dev server with a new credential.
+ */
+export const LAUNCH_DEV_SERVER_ACTION = 'Launch Dev Server';
+
+/** Prefixed to the headline when the relaunch cannot tell which project to act on. */
+export const RELAUNCH_PROJECT_FAILURE_PREFIX = 'Could not determine the project to relaunch';
+
+/** Prefixed to the headline when the service could not stop the dev server it launched. */
+export const STOP_DEV_SERVER_FAILURE_PREFIX = 'Could not stop the launched dev server';
+
+/**
+ * Upper bound on the `devServer.stop` request of a relaunch, in milliseconds.
+ *
+ * The service answers only once the child is gone: `SIGTERM`, a grace period
+ * (5 s by default), then `SIGKILL` and a short confirmation, and the child's
+ * credential revoked. This bound sits well above that, so only a stalled
+ * service reaches it, and it also overrides any shorter default timeout the
+ * service client may have been constructed with.
+ */
+const STOP_DEV_SERVER_TIMEOUT_MS = 30_000;
+
+/**
+ * The modal shown before the request. Its detail names every consequence the
+ * service's rotation has, so confirming it is an informed choice; the file is
+ * named by its variable-relative location because the state directory is the
+ * developer's configuration, not a fixed path.
+ */
+export const ROTATE_SERVICE_TOKEN_CONFIRMATION: DestructiveConfirmation = Object.freeze({
+  message: 'Rotate the Debug Generator service token?',
+  detail:
+    'Every stored credential is deleted and $DEBUGGEN_HOME/auth.json is regenerated with a new editor credential. ' +
+    'Every open connection to the local service is closed (code 4401), and the credentials of dev servers it launched stop working: ' +
+    'Chrome must be paired again and launched dev servers must be relaunched.',
+  confirmLabel: 'Rotate token',
+});
+
+/** Formats counts for display, for example `1,234`. */
+const COUNT_FORMAT = new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 });
 
 // ---------------------------------------------------------------------------
-// The failure
+// Helpers
 // ---------------------------------------------------------------------------
 
+/** `1 credential`, `2 credentials`, `1,234 credentials`. */
+function quantity(count: number, singular: string, plural: string): string {
+  return `${COUNT_FORMAT.format(count)} ${count === 1 ? singular : plural}`;
+}
+
 /**
- * Builds the typed failure this command reports: the protocol this build
- * speaks declares no credential-rotation operation, so no request was made and
- * no credential changed.
- *
- * A fresh instance per call, so no caller can observe another's error object.
- * The error carries no credential, path or URL — only fixed sentences, the
- * command id and a reason — so it is safe to log and to render.
- *
- * @returns A `NOT_IMPLEMENTED` error with a developer-facing hint and
- *   `details: { command, reason }`.
+ * The system error code of a TCP connection nothing accepted. Node's `fetch`
+ * rejects with a `TypeError` whose `cause` carries it, and the protocol client
+ * keeps that rejection as the `cause` of its `TRANSPORT_DISCONNECTED` failure.
  */
-export function rotationUnavailableError(): DebuggenError {
-  return new DebuggenError('NOT_IMPLEMENTED', ROTATION_UNAVAILABLE_MESSAGE, {
-    hint: ROTATION_UNAVAILABLE_HINT,
-    details: { command: COMMAND_ID, reason: ROTATION_UNAVAILABLE_REASON },
+const CONNECTION_REFUSED_ERRNO = 'ECONNREFUSED';
+
+/**
+ * How many `cause` links {@link causeChainHasCode} follows. The protocol
+ * client's chain for a refused connection is four links deep; the bound only
+ * keeps a cyclic chain from looping.
+ */
+const MAX_CAUSE_DEPTH = 8;
+
+/**
+ * The client failures that are raised before any request is sent: a refused
+ * service URL setting (or a runtime without `fetch`), and a missing editor
+ * credential. Without an HTTP status they cannot have come from the service.
+ */
+const UNSENT_FAILURE_CODES: ReadonlySet<DebuggenError['code']> = new Set<DebuggenError['code']>([
+  'CONFIG_INVALID',
+  'UNAUTHORIZED',
+]);
+
+/**
+ * Whether `error` or any error in its `cause` chain carries `code`.
+ *
+ * @param error The failure to inspect.
+ * @param code The system error code to look for.
+ */
+function causeChainHasCode(error: unknown, code: string): boolean {
+  let current: unknown = error;
+  for (let depth = 0; depth < MAX_CAUSE_DEPTH; depth += 1) {
+    if (typeof current !== 'object' || current === null) {
+      return false;
+    }
+    if ('code' in current && current.code === code) {
+      return true;
+    }
+    current = 'cause' in current ? current.cause : undefined;
+  }
+  return false;
+}
+
+/**
+ * Whether a failed `credentials.rotate` request provably never reached the
+ * service — the only failure after which the rotation certainly was not
+ * applied, so a pairing code on display is still redeemable.
+ *
+ * The service can commit a rotation (every credential and every pairing code
+ * deleted) and still answer with an error, and its error body carries no
+ * structured "rotated" flag. So the answer is built only from the structured
+ * facts the protocol client attaches, never from message prose:
+ *
+ * - a failure with `details.status` is an HTTP reply: the service had the
+ *   request, and a post-commit failure arrives exactly that way;
+ * - {@link UNSENT_FAILURE_CODES} without a status are the client's own
+ *   refusals before its transport is invoked;
+ * - a `TRANSPORT_DISCONNECTED` that no timeout or abort ended and whose cause
+ *   chain holds `ECONNREFUSED` is a connection no listener accepted.
+ *
+ * Everything else — a timeout, a connection dropped mid-exchange, a reply
+ * body that could not be read — can follow a committed rotation, and counts
+ * as possibly applied.
+ *
+ * @param error The rotation's failure.
+ */
+function provablyNeverReachedService(error: DebuggenError): boolean {
+  if (error.details?.['status'] !== undefined) {
+    return false;
+  }
+  if (UNSENT_FAILURE_CODES.has(error.code)) {
+    return true;
+  }
+  return (
+    error.code === 'TRANSPORT_DISCONNECTED' &&
+    error.details?.['cancelled'] === undefined &&
+    causeChainHasCode(error, CONNECTION_REFUSED_ERRNO)
+  );
+}
+
+/**
+ * Clears the pairing code on display, in the store and in the view. The
+ * service deletes every outstanding code together with the credentials, so a
+ * code still shown after a rotation could no longer be redeemed.
+ *
+ * @param ctx The resolved command context.
+ */
+function clearPairingDisplay(ctx: CommandContext): void {
+  ctx.state.clearPairing();
+  ctx.sessionView.postPairing();
+}
+
+/**
+ * Drops the cached editor token and reads `auth.json` again.
+ *
+ * Called after every reply, successful or not, because a failure after the
+ * service's commit can have rewritten the file too. `refresh()` resolves to a
+ * `Result` and never rejects by contract; the `catch` keeps that promise for
+ * this command even if a store broke it. A failure is logged here by code and
+ * returned for the caller to decide whether it belongs in a notice.
+ *
+ * @param ctx The resolved command context.
+ * @param rotated Whether the service reported the rotation as applied, recorded
+ *   in the log line so the two situations can be told apart.
+ * @returns `undefined` once the credential was read, otherwise the failure.
+ */
+async function reloadEditorCredential(
+  ctx: CommandContext,
+  rotated: boolean,
+): Promise<DebuggenError | undefined> {
+  let failure: DebuggenError | undefined;
+  try {
+    ctx.credentials.invalidate();
+    const refreshed = await ctx.credentials.refresh();
+    failure = isErr(refreshed) ? refreshed.error : undefined;
+  } catch (thrown) {
+    failure = DebuggenError.from(thrown);
+  }
+  if (failure !== undefined) {
+    // Facts only: the command, the outcome and the error code — never the
+    // file's content or a token.
+    ctx.logger.warn('The editor credential could not be read again after rotation', {
+      command: COMMAND_ID,
+      rotated,
+      code: failure.code,
+    });
+  }
+  return failure;
+}
+
+/**
+ * Whether this window holds a project `debuggen.launchDevServer` can act on —
+ * the same resolution that command's workspace guard performs, without its
+ * notice. The extension keeps no record of which dev servers the service
+ * launched, so this is the reliable signal that relaunching is possible here.
+ * A resolver that throws answers "no": the action would only fail.
+ *
+ * @param ctx The resolved command context.
+ */
+function canRelaunchDevServer(ctx: CommandContext): boolean {
+  try {
+    return isOk(ctx.discovery.resolveProjectRoot({ logger: ctx.logger }));
+  } catch (thrown) {
+    ctx.logger.debug('The workspace project could not be resolved', {
+      command: COMMAND_ID,
+      code: DebuggenError.from(thrown).code,
+    });
+    return false;
+  }
+}
+
+/**
+ * The single success notice: the service's tally, what the developer has to
+ * redo, and — when the new credential could not be read back — that fact as
+ * well. It never contains a credential.
+ *
+ * @param tally What the service revoked.
+ * @param reloadFailure Why re-reading `auth.json` failed, if it did.
+ * @param offerRelaunch Whether "Relaunch Dev Server" is offered.
+ */
+function rotatedNotice(
+  tally: CredentialsRotateResponse,
+  reloadFailure: DebuggenError | undefined,
+  offerRelaunch: boolean,
+): CommandNotice {
+  const revoked = quantity(tally.credentialsDeleted, 'credential', 'credentials');
+  const closed = quantity(tally.socketsClosed, 'connection', 'connections');
+  const reloadDetail =
+    reloadFailure === undefined
+      ? undefined
+      : `The editor could not read its new credential yet (${reloadFailure.message}); it reads auth.json again on its next request.`;
+  return {
+    level: 'warning',
+    message: `Service token rotated: ${revoked} revoked, ${closed} closed.`,
+    detail: [
+      'Pair Chrome again to reconnect the DevTools panel, and relaunch any dev server Debug Generator launched so it receives a new credential.',
+      reloadDetail,
+    ]
+      .filter((part): part is string => part !== undefined)
+      .join(' '),
+    actions: offerRelaunch
+      ? [PAIR_CHROME_ACTION, RELAUNCH_DEV_SERVER_ACTION]
+      : [PAIR_CHROME_ACTION],
+  };
+}
+
+/**
+ * Runs a follow-up command. The target command reports its own failures, so
+ * only a failure to dispatch it is reported here, once.
+ *
+ * @param ctx The resolved command context.
+ * @param command The follow-up's id.
+ */
+async function runFollowUp(ctx: CommandContext, command: CommandId): Promise<void> {
+  try {
+    await ctx.ui.executeCommand(command);
+  } catch (thrown) {
+    await ctx.ui.notifyFailure(DebuggenError.from(thrown), { prefix: ACTION_FAILURE_PREFIX });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Relaunching the launched dev server
+// ---------------------------------------------------------------------------
+
+/** The project a relaunch acts on: the service's spelling of its root, and its display name. */
+interface RelaunchProject {
+  /** The normalised project root, exactly as `devServer.stop` and `devServer.launch` expect it. */
+  readonly projectRoot: string;
+  /** The workspace folder's display name; never a path. */
+  readonly name: string;
+}
+
+/**
+ * Resolves the project "Relaunch Dev Server" acts on — the selection
+ * `debuggen.launchDevServer` makes too, so the stop and the launch that
+ * follows name the same project. It is resolved again when the button is
+ * chosen rather than reused from when the notice was built, because the
+ * window's folders and its active editor can change while the notice waits.
+ * A resolver that throws is reported like one that returns a failure.
+ *
+ * @param ctx The resolved command context.
+ */
+function resolveRelaunchProject(ctx: CommandContext): Result<RelaunchProject, DebuggenError> {
+  try {
+    const resolved = ctx.discovery.resolveProjectRoot({ logger: ctx.logger });
+    if (isErr(resolved)) {
+      return resolved;
+    }
+    const { projectRoot, name } = resolved.value;
+    return ok({ projectRoot, name });
+  } catch (thrown) {
+    return err(DebuggenError.from(thrown));
+  }
+}
+
+/**
+ * `devServer.stop` for one project. The client resolves every outcome as a
+ * `Result` by contract; the `catch` keeps that promise for this command even
+ * if a client broke it.
+ *
+ * @param ctx The resolved command context.
+ * @param projectRoot The resolved project root.
+ */
+async function stopLaunchedDevServer(
+  ctx: CommandContext,
+  projectRoot: string,
+): Promise<Result<DevServerStopResponse, DebuggenError>> {
+  try {
+    return await ctx.client.stopDevServer(
+      { projectRoot },
+      { timeoutMs: STOP_DEV_SERVER_TIMEOUT_MS },
+    );
+  } catch (thrown) {
+    return err(DebuggenError.from(thrown));
+  }
+}
+
+/**
+ * The notice for a project the service launched no dev server for. A dev
+ * server the developer started some other way with the preload holds the
+ * credential the rotation revoked until it is restarted, and only whoever
+ * started it can restart it — so the notice says so without naming a command
+ * line (the product knows none for a server it did not start), and offers to
+ * let Debug Generator launch one instead.
+ *
+ * @param projectName The workspace folder's display name.
+ */
+function notLaunchedNotice(projectName: string): CommandNotice {
+  return {
+    level: 'info',
+    message: `Debug Generator did not launch the dev server for ${projectName}.`,
+    detail:
+      'If one is running with the Debug Generator preload, restart it the way it was started so it receives a new credential, ' +
+      `or choose "${LAUNCH_DEV_SERVER_ACTION}" to have Debug Generator launch it.`,
+    actions: [LAUNCH_DEV_SERVER_ACTION],
+  };
+}
+
+/**
+ * "Relaunch Dev Server": replaces the dev server the service launched for the
+ * project with a fresh one that holds a new `server-agent` credential
+ * (AAP §0.5.6: launched dev servers must be relaunched after a rotation).
+ *
+ * `debuggen.launchDevServer` alone cannot do this: the service's launcher
+ * answers a launch for a project whose child is still running with that very
+ * child — its pid and its environment, including the credential the rotation
+ * just revoked. So the service is first asked to stop the child it launched
+ * (`devServer.stop`, which answers only once the child has exited and its
+ * credential is revoked), and only then is the launch command run: it probes,
+ * finds nothing running, and the service spawns a new child with a new
+ * credential.
+ *
+ * One message per outcome:
+ * - the project cannot be resolved: one failure, and nothing is sent;
+ * - the stop fails: one failure, and no launch — launching now would hand back
+ *   the child that still holds the revoked credential;
+ * - `stopped: true`: the launch command runs and reports its own outcome;
+ * - `stopped: false`: the service launched no dev server for this project, so
+ *   one information notice says it has to be restarted the way it was started,
+ *   and "Launch Dev Server" runs the launch command only when chosen.
+ *
+ * @param ctx The resolved command context.
+ */
+async function relaunchDevServer(ctx: CommandContext): Promise<void> {
+  const project = resolveRelaunchProject(ctx);
+  if (isErr(project)) {
+    ctx.logger.warn('The project to relaunch a dev server for could not be resolved', {
+      command: COMMAND_ID,
+      code: project.error.code,
+    });
+    await ctx.ui.notifyFailure(project.error, { prefix: RELAUNCH_PROJECT_FAILURE_PREFIX });
+    return;
+  }
+
+  const stopped = await stopLaunchedDevServer(ctx, project.value.projectRoot);
+  if (isErr(stopped)) {
+    ctx.logger.warn('The launched dev server could not be stopped for a relaunch', {
+      command: COMMAND_ID,
+      code: stopped.error.code,
+    });
+    await ctx.ui.notifyFailure(stopped.error, { prefix: STOP_DEV_SERVER_FAILURE_PREFIX });
+    return;
+  }
+
+  // The flag only: the project root is a path and stays out of the log.
+  ctx.logger.info('The launched dev server was stopped for a relaunch', {
+    command: COMMAND_ID,
+    stopped: stopped.value.stopped,
   });
+  if (stopped.value.stopped) {
+    await runFollowUp(ctx, LAUNCH_DEV_SERVER_COMMAND);
+    return;
+  }
+
+  const choice = await ctx.ui.notify(notLaunchedNotice(project.value.name));
+  if (choice === LAUNCH_DEV_SERVER_ACTION) {
+    await runFollowUp(ctx, LAUNCH_DEV_SERVER_COMMAND);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -142,30 +543,72 @@ export function rotationUnavailableError(): DebuggenError {
 /**
  * Runs `debuggen.rotateServiceToken`.
  *
- * Reports, as exactly one error notice in the Debug Generator view and as a VS
- * Code notification, that credential rotation is not available in this build
- * and that every existing credential stays valid. It performs no HTTP request,
- * opens no confirmation modal (nothing destructive can follow it), leaves the
- * editor credential and any displayed pairing code untouched, and resolves
- * normally — it never throws for this expected condition.
+ * Asks for confirmation, then rotates every service credential with one
+ * `credentials.rotate` request, re-reads the editor credential, and reports the
+ * outcome once — a failure with the service's own message (offering "Pair
+ * Chrome", with the pairing code cleared, whenever the rotation may have been
+ * applied), or a warning that names what was revoked and offers "Pair Chrome"
+ * and, when a project is open, "Relaunch Dev Server". Resolves after the
+ * developer has answered or dismissed that notice and any follow-up it chose
+ * has run; it never rejects for an expected condition.
  *
  * @param ctx The command context built by `registerCommands`.
  * @param args Whatever VS Code invoked the command with. The command takes no
- *   argument; any given is ignored, and only their count is logged.
+ *   argument; any given is ignored and never inspected.
  */
 export async function rotateServiceToken(
   ctx: CommandContext,
   ...args: readonly unknown[]
 ): Promise<void> {
-  const error = rotationUnavailableError();
+  // The registration signature forwards every argument; rotation reads none.
+  void args;
 
-  // Facts only: the command id, the error code and how many arguments were
-  // ignored — never a credential, a hash or the content of auth.json.
-  ctx.logger.warn('Service token rotation is not available in this build', {
+  if (!(await ctx.ui.confirmDestructive(ROTATE_SERVICE_TOKEN_CONFIRMATION))) {
+    ctx.logger.debug('Service token rotation cancelled', { command: COMMAND_ID });
+    return;
+  }
+
+  const rotated = await ctx.client.rotateCredentials();
+  const reloadFailure = await reloadEditorCredential(ctx, isOk(rotated));
+
+  if (isErr(rotated)) {
+    // Unless the request provably never reached the service, the rotation may
+    // have been applied before the failure, taking every pairing code with it:
+    // the code on display is cleared and re-pairing is offered.
+    const possiblyApplied = !provablyNeverReachedService(rotated.error);
+    ctx.logger.warn('Service token rotation failed', {
+      command: COMMAND_ID,
+      code: rotated.error.code,
+      pairingCleared: possiblyApplied,
+    });
+    if (possiblyApplied) {
+      clearPairingDisplay(ctx);
+    }
+    const choice = await ctx.ui.notifyFailure(rotated.error, {
+      prefix: ROTATE_SERVICE_TOKEN_FAILURE_PREFIX,
+      ...(possiblyApplied ? { actions: [PAIR_CHROME_ACTION] } : {}),
+    });
+    if (possiblyApplied && choice === PAIR_CHROME_ACTION) {
+      await runFollowUp(ctx, PAIR_CHROME_COMMAND);
+    }
+    return;
+  }
+
+  // The service deleted every outstanding pairing code with the credentials.
+  clearPairingDisplay(ctx);
+
+  const { credentialsDeleted, socketsClosed } = rotated.value;
+  ctx.logger.warn('Service credentials rotated', {
     command: COMMAND_ID,
-    code: error.code,
-    ignoredArguments: args.length,
+    credentialsDeleted,
+    socketsClosed,
   });
 
-  await ctx.ui.notifyFailure(error, { prefix: ROTATE_SERVICE_TOKEN_FAILURE_PREFIX });
+  const offerRelaunch = canRelaunchDevServer(ctx);
+  const choice = await ctx.ui.notify(rotatedNotice(rotated.value, reloadFailure, offerRelaunch));
+  if (choice === PAIR_CHROME_ACTION) {
+    await runFollowUp(ctx, PAIR_CHROME_COMMAND);
+  } else if (offerRelaunch && choice === RELAUNCH_DEV_SERVER_ACTION) {
+    await relaunchDevServer(ctx);
+  }
 }

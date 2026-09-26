@@ -7,8 +7,9 @@
  * the `dist/` layout `esbuild.mjs` and `vite.config.ts` write, the keep-set of
  * `.vscodeignore`, vsce's license and icon checks (evaluated against the
  * packaged file list, not the working directory), the VS Code CLI's install
- * path, and the runtime prerequisites of the coordination service embedded in
- * the VSIX. In order, one `it` per step:
+ * path, and the INSTALLED extension running in an editor: its activation, the
+ * paths it resolves from its own install, and the coordination service it
+ * embeds. In order, one `it` per step:
  *
  * 1. build through the workspace's own `vscode:prepublish` script — the build
  *    vsce itself runs, including `esbuild.mjs --package`, which stages the
@@ -23,43 +24,54 @@
  *    directory, never into the workspace;
  * 4. the VS Code CLI installs it into a throwaway profile and lists exactly
  *    `debuggen.debug-generator@<manifest version>` there;
- * 5. the installed tree holds the host, webview, service, store DDL, preload,
- *    icon, license and changelog — and none of the sources or tooling;
+ * 5. the installed tree holds the host, webview, service, preload, icon,
+ *    license and changelog — and none of the sources or tooling;
  * 6. the embedded prompt directory resolves: all six pipeline stages, and
  *    every prompt file the manifest names;
- * 7. the embedded service, started from the installed tree exactly as the
- *    extension starts it, answers `GET /health` with a body that
- *    `healthResponseSchema` from `@debuggen/protocol` accepts;
+ * 7. the installed extension, activated in a second, isolated VS Code window
+ *    on that throwaway profile, starts its embedded service from its own
+ *    install: the service answers `GET /health` with a body
+ *    `healthResponseSchema` from `@debuggen/protocol` accepts, the extension's
+ *    editor client has connected to it, it runs with the installed prompt
+ *    directory, the window's `DEBUGGEN_HOME` and the configured port, it
+ *    created its session store, and the extension's `deactivate()` stopped it
+ *    when the window quit. The companion extension that drives the window is
+ *    `test/probe/installed-extension-probe.ts`;
  * 8. teardown (`after`): every child is stopped and every scratch directory is
  *    removed, and both facts are asserted rather than assumed.
  *
  * DURATION. The slowest suite of the extension-host gate: two production
  * builds (step 1, and the `vscode:prepublish` that `vsce package` runs again
  * in step 3), vsce's secret scan of an 8.5 MB package of some 1 200 files, an
- * install and a service start. Measured at 10 seconds for the seven steps
- * (13 seconds for the whole `vscode-test` run, editor start-up included) on a
- * warm 12-CPU host shared with other builds. A cold cache or a saturated CPU
- * stretches every step by an order of magnitude, so the budgets are minutes:
- * each test and hook gets {@link TEST_TIMEOUT_MS}, and every command inside a
- * step has a smaller budget of its own, so a slow or hung command fails with
- * its captured output instead of a bare mocha timeout.
+ * install, and a second editor window that starts, activates the extension,
+ * waits for its service and shuts down (about five seconds on its own). On a
+ * warm 12-CPU host shared with other builds the seven steps take tens of
+ * seconds; a cold cache or a saturated CPU stretches every step by an order of
+ * magnitude, so the budgets are minutes: each test and hook gets
+ * {@link TEST_TIMEOUT_MS}, and every command or window inside a step has a
+ * smaller budget of its own, so a slow or hung one fails with its captured
+ * output instead of a bare mocha timeout.
  *
  * SIDE EFFECT ON THE WORKSPACE. Like every production build, steps 1 and 3
- * clean `apps/vscode-extension/dist/` — including the compiled suites under
- * `dist/test/`. Mocha has loaded every suite before the first test runs, and
- * `pretest:vscode` rebuilds them before every `test:vscode`, so the run is
- * unaffected; `dist/` and the staged `LICENSE` are git-ignored build output.
+ * clean `apps/vscode-extension/dist/` — including the compiled suites and the
+ * probe under `dist/test/`. Mocha has loaded every suite before the first test
+ * runs, `before` copies the compiled probe into the scratch directory before
+ * step 1, and `pretest:vscode` rebuilds both before every `test:vscode`, so
+ * the run is unaffected; `dist/` and the staged `LICENSE` are git-ignored
+ * build output.
  *
  * HERMETICITY. Every child runs through `test/helpers.ts` (`spawnTracked` /
  * `runToCompletion`): stdin is closed, so a tool that tries to prompt fails
  * fast instead of hanging; the environment is `hermeticEnv()`, so no provider
- * credential and no ambient `DEBUGGEN_*` value reaches it; and each child leads
- * its own process group, so stopping it stops everything it started. The VS
- * Code CLI only ever sees the throwaway profile of `throwawayCliProfileArgs`,
- * the embedded service gets a scratch `DEBUGGEN_HOME` and a free loopback port,
- * and the only network traffic is loopback to the service this suite started.
- * Nothing is skipped: a missing prerequisite (pnpm, vsce, the VS Code CLI, a
- * Node without built-in `node:sqlite`) is a failure with a message naming it.
+ * credential, no ambient `DEBUGGEN_*` value and no editor-internal `ELECTRON_*`
+ * or `VSCODE_*` variable reaches it; and each child leads its own process
+ * group, so stopping it stops everything it started. The VS Code CLI and the
+ * isolated window only ever see the throwaway profile of
+ * `throwawayCliProfileArgs`; the window's extension and its service get a
+ * scratch `DEBUGGEN_HOME` and a free loopback port through that profile's user
+ * settings; and the only network traffic is loopback to that service. Nothing
+ * is skipped: a missing prerequisite (pnpm, vsce, the VS Code CLI or binary,
+ * the compiled probe) is a failure with a message naming it.
  *
  * Mocha's `bdd` interface is supplied as globals by the `@vscode/test-cli`
  * runner, and this workspace declares no `@types/mocha` (see the
@@ -71,9 +83,12 @@
  */
 
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import type { Stats } from 'node:fs';
 import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+import { setTimeout as sleep } from 'node:timers/promises';
 
 import { PROTOCOL_VERSION, healthPath, healthResponseSchema } from '@debuggen/protocol';
 import * as vscode from 'vscode';
@@ -85,18 +100,21 @@ import {
   extensionDevelopmentRoot,
   findFreePort,
   hermeticEnv,
+  isProcessAlive,
   listTrackedProcesses,
   readManifestFromDisk,
   repositoryRoot,
-  resolveNodeExecutable,
   resolveVsCodeCliArgs,
+  resolveVsCodeExecutable,
   runToCompletion,
   spawnTracked,
   stopTrackedProcesses,
   throwawayCliProfileArgs,
-  waitForHttpOk,
+  writeFixtureFile,
 } from '../helpers';
 import type { ExtensionManifest, ProcessExit, TrackedProcess } from '../helpers';
+import { PROBE_CONFIG_FILE, parseProbeResult } from '../probe/installed-extension-probe';
+import type { ProbeConfig, ProbeResult } from '../probe/installed-extension-probe';
 
 // ---------------------------------------------------------------------------
 // Mocha's bdd globals, as provided by the @vscode/test-cli runner
@@ -145,24 +163,34 @@ const LIST_TIMEOUT_MS = 2 * 60_000;
 /** Budget of one VS Code CLI call (`--install-extension`, `--list-extensions`). */
 const CLI_TIMEOUT_MS = 3 * 60_000;
 
-/** Budget of a `node --version` probe. */
-const PROBE_TIMEOUT_MS = 30_000;
-
-/** How long the embedded service gets to answer `GET /health` after it is spawned. */
+/**
+ * How long the installed extension's embedded service gets, once the probe
+ * has activated the extension, to answer `GET /health` with the extension's
+ * editor client connected (step 7).
+ */
 const HEALTH_TIMEOUT_MS = 90_000;
 
-/** Delay between two health probes. */
-const HEALTH_POLL_INTERVAL_MS = 250;
+/**
+ * Budget of the isolated window of step 7, from launch to exit: editor
+ * start-up, the probe's activation (`onStartupFinished`), the target's
+ * activation, {@link HEALTH_TIMEOUT_MS}, and the shutdown in which VS Code
+ * deactivates the extension. Measured at about five seconds on a warm host.
+ */
+const ISOLATED_WINDOW_TIMEOUT_MS = 5 * 60_000;
+
+/**
+ * How long the service may outlive the isolated window's exit. The extension's
+ * `deactivate()` stops it during the shutdown itself, so it is normally gone
+ * before the window exits; the margin covers the child's own graceful stop.
+ */
+const SERVICE_EXIT_TIMEOUT_MS = 15_000;
+
+/** Delay between two liveness checks of the stopped service. */
+const SERVICE_EXIT_POLL_MS = 100;
 
 // ---------------------------------------------------------------------------
 // The packaging contract
 // ---------------------------------------------------------------------------
-
-/**
- * The oldest Node major the embedded service runs on: the repository pins
- * `>=24.21.0 <25`, and the service's session store is built-in `node:sqlite`.
- */
-const MINIMUM_SERVICE_NODE_MAJOR = 24;
 
 /**
  * The script that builds exactly what vsce packages: `node esbuild.mjs
@@ -183,7 +211,6 @@ const PACKAGED_FILES: readonly string[] = Object.freeze([
   'dist/webview/main.css',
   'dist/service/main.js',
   'dist/service/package.json',
-  'dist/service/store/schema.sql',
   'dist/service/prompts/manifest.json',
   'dist/telemetry/node/register.mjs',
 ]);
@@ -207,6 +234,14 @@ const FORBIDDEN_ENTRIES: readonly string[] = Object.freeze([
   'tsconfig.webview.json',
   '.vscodeignore',
 ]);
+
+/**
+ * A file name no VSIX entry may have. `esbuild.mjs` inlines the store DDL into
+ * `dist/service/main.js` as a string (AAP 0.7.1 Group 3), so a `.sql` file in
+ * the listing or in the installed tree means a copy slipped back in beside the
+ * bundle — one the installed service must never depend on.
+ */
+const SQL_FILE = /\.sql$/i;
 
 /** Where the staged license lives in the workspace (`esbuild.mjs --package`). */
 const STAGED_LICENSE = 'LICENSE';
@@ -247,6 +282,65 @@ const STAGE_NAME_PATTERN = /^[a-z][a-z0-9-]*$/;
 
 /** One installed-extension line of `--list-extensions --show-versions`. */
 const EXTENSION_LISTING_LINE = /^[A-Za-z0-9][\w-]*\.[A-Za-z0-9][\w.-]*@\S+$/;
+
+// ---------------------------------------------------------------------------
+// Step 7: the isolated window and its probe
+// ---------------------------------------------------------------------------
+
+/**
+ * The compiled probe, extension-relative: `esbuild.mjs --tests`
+ * (`LAYOUT.testProbeOut`) writes it, from
+ * `test/probe/installed-extension-probe.ts`.
+ */
+const PROBE_BUNDLE = 'dist/test/probe/installed-extension-probe.js';
+
+/** The command that builds the suites and the probe; named in the hint. */
+const PREPARE_TESTS_COMMAND = 'pnpm --filter debug-generator run pretest:vscode';
+
+/**
+ * The probe's manifest, less `engines`, which is copied from the workspace
+ * manifest so the probe loads in every editor the extension admits. It is a
+ * development extension (`--extensionDevelopmentPath`) that activates once
+ * the window has started, beside the installed extension.
+ */
+const PROBE_MANIFEST = Object.freeze({
+  name: 'packaged-vsix-probe',
+  displayName: 'Packaged VSIX probe (test only)',
+  publisher: 'debuggen-test',
+  version: '0.0.0',
+  private: true,
+  main: `./${path.posix.basename(PROBE_BUNDLE)}`,
+  activationEvents: ['onStartupFinished'],
+});
+
+/**
+ * Flags of the isolated window beyond its profile, workspace and probe: the
+ * container requirements `.vscode-test.mjs` documents for the test editor
+ * (`--no-sandbox` as root, no GPU, no `/dev/shm`), no telemetry, and no
+ * trust prompt, welcome page or release notes that could hold focus. There is
+ * deliberately no `--disable-extensions` — it would disable the installed
+ * extension this step exists to run — and no `--extensionTestsPath`: with it
+ * VS Code exits 1 after a quit, which would make the exit code meaningless.
+ */
+const ISOLATED_WINDOW_FLAGS: readonly string[] = Object.freeze([
+  '--no-sandbox',
+  '--disable-gpu',
+  '--disable-dev-shm-usage',
+  '--disable-telemetry',
+  '--disable-workspace-trust',
+  '--skip-welcome',
+  '--skip-release-notes',
+]);
+
+/**
+ * The store's DDL in the repository: the installed service must have migrated
+ * its database from exactly this text (`meta.ddl_sha256`, written by
+ * `apps/local-service/src/store/migrations.ts`).
+ */
+const STORE_DDL_SOURCE = 'apps/local-service/src/store/schema.sql';
+
+/** Upper bound on the characters one window-log file contributes to a failure message. */
+const MAX_WINDOW_LOG_CHARS = 4_000;
 
 // ---------------------------------------------------------------------------
 // Small local utilities (assertion support only; processes, ports, polling and
@@ -342,16 +436,6 @@ function describeExit(exit: ProcessExit): string {
   return exit.code === null
     ? `was ended by ${exit.signal ?? 'an unknown signal'}`
     : `exited with ${exit.code}`;
-}
-
-/** Whether a process with this pid still exists (signal 0 probes without signalling). */
-function pidExists(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return errnoCode(error) === 'EPERM';
-  }
 }
 
 /**
@@ -452,6 +536,117 @@ function summariseListing(lines: readonly string[]): string {
   return shown.join('\n');
 }
 
+/** The message of anything thrown. */
+function reasonOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** How `child` exited, or `undefined` when it was still running after `budgetMs`. */
+async function exitWithin(
+  child: TrackedProcess,
+  budgetMs: number,
+): Promise<ProcessExit | undefined> {
+  const controller = new AbortController();
+  const budget = sleep(budgetMs, undefined, { signal: controller.signal }).then(
+    () => undefined,
+    () => undefined,
+  );
+  try {
+    return await Promise.race([child.exited, budget]);
+  } finally {
+    controller.abort();
+  }
+}
+
+/** Whether process `pid` is gone within `budgetMs` (zombies count as gone). */
+async function stoppedWithin(pid: number, budgetMs: number): Promise<boolean> {
+  const deadline = performance.now() + budgetMs;
+  for (;;) {
+    if (!isProcessAlive(pid)) {
+      return true;
+    }
+    const remaining = deadline - performance.now();
+    if (remaining <= 0) {
+      return false;
+    }
+    await sleep(Math.min(SERVICE_EXIT_POLL_MS, remaining));
+  }
+}
+
+/** The real path of `target`, or `target` itself when nothing exists there. */
+async function realPathOrSelf(target: string): Promise<string> {
+  try {
+    return await fsp.realpath(target);
+  } catch (error) {
+    if (errnoCode(error) === 'ENOENT') {
+      return path.resolve(target);
+    }
+    throw error;
+  }
+}
+
+/**
+ * The isolated window's extension-host log and every Debug Generator output
+ * log under `<userDataDir>/logs/`, the tail of each, as one message section.
+ * They are what explains a failed activation or a service that never started.
+ */
+async function windowLogs(userDataDir: string): Promise<string> {
+  const root = path.join(userDataDir, 'logs');
+  let entries: string[];
+  try {
+    entries = await fsp.readdir(root, { recursive: true });
+  } catch (error) {
+    return quoted('isolated window logs', `could not list ${root}: ${reasonOf(error)}`);
+  }
+  const wanted = entries
+    .filter((entry) => {
+      const name = path.basename(entry);
+      return name === 'exthost.log' || (name.includes('Debug Generator') && name.endsWith('.log'));
+    })
+    .sort();
+  if (wanted.length === 0) {
+    return quoted('isolated window logs', `no exthost.log or Debug Generator log under ${root}`);
+  }
+  const sections: string[] = [];
+  for (const entry of wanted) {
+    let text: string;
+    try {
+      text = await fsp.readFile(path.join(root, entry), 'utf8');
+    } catch (error) {
+      text = `could not read it: ${reasonOf(error)}`;
+    }
+    const tailText =
+      text.length > MAX_WINDOW_LOG_CHARS ? `…${text.slice(-MAX_WINDOW_LOG_CHARS)}` : text;
+    sections.push(`[${entry}]\n${tailText.trim()}`);
+  }
+  return quoted('isolated window logs', sections.join('\n'));
+}
+
+/** What the installed service wrote into its session store, read without writing. */
+interface StoreFacts {
+  /** `meta.ddl_sha256`: the digest of the DDL the store was migrated from. */
+  readonly ddlSha256: string | undefined;
+  /** Every table name, sorted. */
+  readonly tables: readonly string[];
+}
+
+/** Opens `file` read-only with the runtime's built-in `node:sqlite`. */
+function readStoreFacts(file: string): StoreFacts {
+  const db = new DatabaseSync(file, { readOnly: true });
+  try {
+    const digest = db.prepare("SELECT value FROM meta WHERE key = 'ddl_sha256'").get();
+    const tables = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+      .all()
+      .map((row) => row['name'])
+      .filter((name): name is string => typeof name === 'string');
+    const value = digest?.['value'];
+    return { ddlSha256: typeof value === 'string' ? value : undefined, tables };
+  } finally {
+    db.close();
+  }
+}
+
 // ---------------------------------------------------------------------------
 // The suite
 // ---------------------------------------------------------------------------
@@ -479,9 +674,14 @@ describe('packaged VSIX: a self-contained install with a working embedded servic
   let userDataDir: string | undefined;
   /** The installed extension's directory (step 5). */
   let installedRoot: string | undefined;
-  /** The embedded service's scratch state root and process (step 7). */
-  let serviceHome: string | undefined;
-  let service: TrackedProcess | undefined;
+  /** The staged companion extension of the isolated window (`before`, step 7). */
+  let probeDir: string | undefined;
+  /** The isolated window's `DEBUGGEN_HOME`, workspace and process (step 7). */
+  let isolatedHome: string | undefined;
+  let isolatedWorkspace: string | undefined;
+  let isolatedWindow: TrackedProcess | undefined;
+  /** The pid of the service the installed extension started (step 7). */
+  let servicePid: number | undefined;
 
   before(async function () {
     extensionRoot = extensionDevelopmentRoot();
@@ -493,6 +693,37 @@ describe('packaged VSIX: a self-contained install with a working embedded servic
     );
     preexistingWorkspaceVsix = await vsixFilesIn(extensionRoot);
     scratch = createScratchDir('packaged-vsix-');
+
+    // Stage the probe of step 7 now: the production builds of steps 1 and 3
+    // delete dist/test/, and the compiled probe with it.
+    const bundle = below(extensionRoot, PROBE_BUNDLE);
+    const bundleStats = await lstatOrUndefined(bundle);
+    if (bundleStats?.isFile() !== true || bundleStats.size === 0) {
+      throw new Error(
+        `The compiled probe ${bundle} does not exist or is empty. Build the suites and the probe ` +
+          `with "${PREPARE_TESTS_COMMAND}" (pnpm test:vscode runs it first).`,
+      );
+    }
+    probeDir = path.join(scratch, 'probe');
+    await fsp.mkdir(probeDir);
+    const bundleName = path.basename(bundle);
+    await fsp.copyFile(bundle, path.join(probeDir, bundleName), fsp.constants.COPYFILE_EXCL);
+    if ((await lstatOrUndefined(`${bundle}.map`))?.isFile() === true) {
+      await fsp.copyFile(
+        `${bundle}.map`,
+        path.join(probeDir, `${bundleName}.map`),
+        fsp.constants.COPYFILE_EXCL,
+      );
+    }
+    writeFixtureFile(
+      probeDir,
+      'package.json',
+      `${JSON.stringify(
+        { ...PROBE_MANIFEST, engines: { vscode: workspaceManifest.engines.vscode } },
+        null,
+        2,
+      )}\n`,
+    );
   });
 
   it('1. builds the extension with its own vscode:prepublish script', async function () {
@@ -554,6 +785,14 @@ describe('packaged VSIX: a self-contained install with a working embedded servic
       [],
       `vsce ls lists workspace files that must never ship: ${leaked.join(', ')}. ` +
         `.vscodeignore must exclude everything outside its keep-set.${lsSection}`,
+    );
+
+    const sqlFiles = [...listed].filter((entry) => SQL_FILE.test(entry));
+    assert.deepEqual(
+      sqlFiles,
+      [],
+      `vsce ls lists SQL file(s): ${sqlFiles.join(', ')}. The store DDL must ship only inlined in ` +
+        `dist/service/main.js; esbuild.mjs must not write a .sql file under dist/.${lsSection}`,
     );
 
     // The staged license must be the repository-root LICENSE, byte for byte.
@@ -722,6 +961,18 @@ describe('packaged VSIX: a self-contained install with a working embedded servic
       }
     }
 
+    // Absent anywhere in the tree: a SQL file. The store DDL is inlined into
+    // the service bundle, and step 7 proves the service migrates from it.
+    const installedSql = (await fsp.readdir(found.dir, { recursive: true }))
+      .filter((entry) => SQL_FILE.test(entry))
+      .sort();
+    if (installedSql.length > 0) {
+      problems.push(
+        `SQL file(s) are installed (${installedSql.join(', ')}) although the store DDL ships only ` +
+          'inlined in dist/service/main.js',
+      );
+    }
+
     // The running editor loaded nothing from the throwaway profile: the
     // install went to that profile only.
     const loadedFromScratch = vscode.extensions.all
@@ -810,128 +1061,262 @@ describe('packaged VSIX: a self-contained install with a working embedded servic
     );
   });
 
-  it('7. the embedded service answers GET /health from the installed tree', async function () {
-    const root = fromEarlierStep(installedRoot, 'The installed extension');
+  it('7. the installed extension, activated in an isolated VS Code window, starts its embedded service, which answers GET /health', async function () {
+    const manifest = fromEarlierStep(workspaceManifest, 'The workspace manifest');
     const scratchRoot = fromEarlierStep(scratch, 'The scratch directory');
+    const root = fromEarlierStep(installedRoot, 'The installed extension');
+    const extensions = fromEarlierStep(extensionsDir, 'The throwaway extensions directory');
+    const userData = fromEarlierStep(userDataDir, 'The throwaway user-data directory');
+    const probe = fromEarlierStep(probeDir, 'The staged probe');
 
-    // The pinned Node, never Electron: the service needs built-in node:sqlite.
-    const node = resolveNodeExecutable();
-    const probe = await runToCompletion(node, ['--version'], { timeoutMs: PROBE_TIMEOUT_MS });
-    const reported = probe.output.trim();
-    const major = /^v(\d+)\./.exec(reported)?.[1];
-    assert.ok(
-      major !== undefined && Number(major) >= MINIMUM_SERVICE_NODE_MAJOR,
-      `${node} reports ${JSON.stringify(reported)}; the embedded service needs Node ` +
-        `${MINIMUM_SERVICE_NODE_MAJOR} or newer (built-in node:sqlite). Put the repository's pinned ` +
-        'Node first on PATH or set DEBUGGEN_TEST_NODE to it.',
-    );
-
-    const serviceMain = below(root, 'dist/service/main.js');
-    const promptsDir = below(root, 'dist/service/prompts');
     const port = await findFreePort();
-    // Not created here: the service creates its state root itself, 0700.
-    serviceHome = path.join(scratchRoot, 'service-home');
-    // An empty working directory, so the service's dotenv finds no .env file.
-    const serviceCwd = path.join(scratchRoot, 'service-cwd');
-    await fsp.mkdir(serviceCwd);
+    // Not created here: the extension's process manager creates it, 0700.
+    const home = path.join(scratchRoot, 'installed-home');
+    isolatedHome = home;
+    // An empty folder, so the window opens a workspace that is nobody's project.
+    const workspace = path.join(scratchRoot, 'installed-workspace');
+    isolatedWorkspace = workspace;
+    await fsp.mkdir(workspace);
+    const resultFile = path.join(scratchRoot, 'probe-result.json');
 
-    const child = spawnTracked(node, [serviceMain], {
-      cwd: serviceCwd,
-      env: hermeticEnv({
-        DEBUGGEN_HOME: serviceHome,
-        DEBUGGEN_HOST: '127.0.0.1',
-        DEBUGGEN_PORT: String(port),
-        DEBUGGEN_PROMPTS_DIR: promptsDir,
-        DEBUGGEN_LOG_LEVEL: 'error',
-      }),
-    });
-    service = child;
+    // User settings of the throwaway profile: debuggen.serviceUrl is
+    // machine-scoped, so VS Code honours it from user settings only. Nothing
+    // may reach a marketplace or an update server.
+    writeFixtureFile(
+      userData,
+      'User/settings.json',
+      `${JSON.stringify(
+        {
+          'debuggen.serviceUrl': `http://127.0.0.1:${port}`,
+          'debuggen.autoStartService': true,
+          'debuggen.provider': 'deterministic',
+          'update.mode': 'none',
+          'extensions.autoCheckUpdates': false,
+          'extensions.autoUpdate': false,
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    const config: ProbeConfig = {
+      targetExtensionId: EXTENSION_ID,
+      expectedVersion: manifest.version,
+      installedExtensionsDir: extensions,
+      servicePort: port,
+      healthPath: healthPath(),
+      resultFile,
+      healthTimeoutMs: HEALTH_TIMEOUT_MS,
+    };
+    writeFixtureFile(probe, PROBE_CONFIG_FILE, `${JSON.stringify(config, null, 2)}\n`);
 
-    // Origin-less and unauthenticated: GET /health is auth-exempt and the
-    // service rejects every web origin. A service that exits early (a broken
-    // prompt tree, a missing module) fails the step at once.
-    const url = `http://127.0.0.1:${port}${healthPath()}`;
-    let response: { readonly status: number; readonly body: unknown };
-    try {
-      response = await Promise.race([
-        waitForHttpOk(url, {
-          timeoutMs: HEALTH_TIMEOUT_MS,
-          intervalMs: HEALTH_POLL_INTERVAL_MS,
-          message: `the embedded service (${child.commandLine}) to answer GET ${url}`,
-        }),
-        child.exited.then((exit): never => {
-          throw new Error(
-            `The embedded service ${describeExit(exit)} before it answered GET ${url}.`,
-          );
-        }),
-      ]);
-    } catch (cause) {
-      throw new Error(
-        `${cause instanceof Error ? cause.message : String(cause)}` +
-          quoted('embedded service output', child.output()),
-        { cause },
+    // The editor binary itself, as a separate instance on the throwaway
+    // profile: it loads the installed extension from --extensions-dir in
+    // Production mode and the probe as its one development extension.
+    // hermeticEnv() strips ELECTRON_* and VSCODE_*, so the binary starts as an
+    // editor and cannot attach to the window running this suite; DEBUGGEN_HOME
+    // reaches the extension, which hands it to its service.
+    const window = spawnTracked(
+      resolveVsCodeExecutable(),
+      [
+        ...ISOLATED_WINDOW_FLAGS,
+        `--user-data-dir=${userData}`,
+        `--extensions-dir=${extensions}`,
+        `--extensionDevelopmentPath=${probe}`,
+        workspace,
+      ],
+      { cwd: scratchRoot, env: hermeticEnv({ DEBUGGEN_HOME: home }) },
+    );
+    isolatedWindow = window;
+
+    const exit = await exitWithin(window, ISOLATED_WINDOW_TIMEOUT_MS);
+    if (exit === undefined) {
+      let stopNote = 'It was stopped.';
+      try {
+        await window.stop();
+      } catch (error) {
+        stopNote = `Stopping it failed as well: ${reasonOf(error)}`;
+      }
+      assert.fail(
+        `The isolated window (${window.commandLine}) did not exit within ${ISOLATED_WINDOW_TIMEOUT_MS} ms: ` +
+          `the probe never quit it. ${stopNote}` +
+          quoted('isolated window output', window.output()) +
+          (await windowLogs(userData)),
       );
     }
 
-    assert.equal(response.status, 200, `GET ${url} answered ${response.status}.`);
-    const parsed = healthResponseSchema.safeParse(response.body);
+    // The probe's record, validated, then every assertion quotes it together
+    // with the window's own output and logs.
+    const resultStats = await lstatOrUndefined(resultFile);
+    if (resultStats === undefined) {
+      assert.fail(
+        `The probe wrote no result to ${resultFile}; the isolated window ${describeExit(exit)}.` +
+          quoted('isolated window output', window.output()) +
+          (await windowLogs(userData)),
+      );
+    }
+    const result: ProbeResult = parseProbeResult(await readJsonFile(resultFile), resultFile);
+    const evidence =
+      quoted('probe result', JSON.stringify(result, null, 2)) +
+      quoted('isolated window output', window.output()) +
+      (await windowLogs(userData));
+
+    assert.equal(exit.code, 0, `The isolated window ${describeExit(exit)}, not 0.${evidence}`);
+    assert.ok(
+      result.ok,
+      `The probe in the isolated window failed: ${result.failure ?? 'no reason recorded'}.${evidence}`,
+    );
+
+    // The window ran the copy step 5 inspected, from the throwaway profile.
+    const extension = result.extension;
+    assert.ok(extension !== null, `The probe recorded no extension facts.${evidence}`);
+    const installedReal = await fsp.realpath(root);
+    assert.equal(
+      extension.realPath,
+      installedReal,
+      `The isolated window loaded ${EXTENSION_ID} from ${extension.realPath}, not from the installed copy.${evidence}`,
+    );
+    assert.ok(
+      isWithin(extension.realPath, await fsp.realpath(extensions)),
+      `${extension.realPath} is outside the throwaway extensions directory ${extensions}.${evidence}`,
+    );
+    assert.equal(
+      extension.version,
+      manifest.version,
+      `The isolated window loaded ${EXTENSION_ID}@${String(extension.version)}, not the packaged version.${evidence}`,
+    );
+    assert.equal(
+      extension.activeAfter,
+      true,
+      `The installed ${EXTENSION_ID} is not active after activate().${evidence}`,
+    );
+
+    // Its embedded service answers, and the extension's own client is connected.
+    const health = result.health;
+    assert.ok(health !== null, `The probe recorded no health facts.${evidence}`);
+    assert.equal(
+      health.status,
+      200,
+      `GET ${health.url} answered ${String(health.status)}.${evidence}`,
+    );
+    const parsed = healthResponseSchema.safeParse(health.body);
     if (!parsed.success) {
       assert.fail(
-        `GET ${url} answered a body healthResponseSchema rejects: ${JSON.stringify(parsed.error.issues)}; ` +
-          `body: ${JSON.stringify(response.body)}`,
+        `GET ${health.url} answered a body healthResponseSchema rejects: ` +
+          `${JSON.stringify(parsed.error.issues)}.${evidence}`,
       );
     }
     assert.equal(
       parsed.data.protocolVersion,
       PROTOCOL_VERSION,
-      'The embedded service speaks a different wire version than the @debuggen/protocol it was built with.',
+      `The embedded service speaks a different wire version than the @debuggen/protocol it was built with.${evidence}`,
     );
     assert.equal(
       parsed.data.pairingAvailable,
-      false,
-      'No editor client has connected to the service this suite started, so pairing cannot be available.',
-    );
-    assert.ok(
-      child.isRunning(),
-      `The embedded service exited right after answering GET ${url}.` +
-        quoted('embedded service output', child.output()),
+      true,
+      `The installed extension's editor client never connected to its service, so pairing is unavailable.${evidence}`,
     );
 
-    // It keeps its state in the scratch root it was given, created owner-only.
-    const home = await lstatOrUndefined(serviceHome);
+    // Exactly one service process, the extension host's child, running the
+    // installed entry with the installed prompts, the window's state
+    // directory and the configured port.
+    const serviceEntry = await fsp.realpath(below(root, 'dist/service/main.js'));
+    const processes = result.serviceProcesses ?? [];
+    const service = processes[0];
     assert.ok(
-      home?.isDirectory() === true,
-      `The embedded service did not create DEBUGGEN_HOME ${serviceHome}.`,
+      service !== undefined && processes.length === 1,
+      `Expected exactly one process running ${serviceEntry}; found ${processes.length}: ` +
+        `${JSON.stringify(processes)}.${evidence}`,
+    );
+    servicePid = service.pid;
+    assert.equal(
+      service.entry,
+      serviceEntry,
+      `The service process runs ${service.entry}, not the installed entry.${evidence}`,
     );
     assert.equal(
-      home.mode & 0o777,
-      0o700,
-      `DEBUGGEN_HOME ${serviceHome} has mode ${(home.mode & 0o777).toString(8)}, not 700.`,
+      service.ppid,
+      result.hostPid,
+      `The service process (pid ${service.pid}) is not a child of the isolated window's extension ` +
+        `host (pid ${result.hostPid}): the installed extension did not start it.${evidence}`,
     );
-    for (const name of ['sessions.sqlite', 'auth.json']) {
-      const stats = await lstatOrUndefined(path.join(serviceHome, name));
+    const promptsDir = service.env.DEBUGGEN_PROMPTS_DIR;
+    assert.equal(
+      promptsDir === null ? null : await realPathOrSelf(promptsDir),
+      await fsp.realpath(below(root, 'dist/service/prompts')),
+      `The service's DEBUGGEN_PROMPTS_DIR is ${JSON.stringify(promptsDir)}, not the installed prompt directory.${evidence}`,
+    );
+    const serviceHome = service.env.DEBUGGEN_HOME;
+    assert.equal(
+      serviceHome === null ? null : path.resolve(serviceHome),
+      home,
+      `The service's DEBUGGEN_HOME is ${JSON.stringify(serviceHome)}, not the window's ${home}.${evidence}`,
+    );
+    assert.equal(
+      service.env.DEBUGGEN_PORT,
+      String(port),
+      `The service's DEBUGGEN_PORT is ${JSON.stringify(service.env.DEBUGGEN_PORT)}, not ${port}.${evidence}`,
+    );
+
+    // The window quit, so VS Code deactivated the extension, which stops its
+    // service: nothing of it may outlive the editor.
+    assert.ok(
+      await stoppedWithin(service.pid, SERVICE_EXIT_TIMEOUT_MS),
+      `The embedded service (pid ${service.pid}) is still alive ${SERVICE_EXIT_TIMEOUT_MS} ms after ` +
+        `the isolated window exited: the installed extension's deactivate() did not stop it.${evidence}`,
+    );
+
+    // It kept its state in the window's DEBUGGEN_HOME, created owner-only.
+    const homeStats = await lstatOrUndefined(home);
+    assert.ok(
+      homeStats?.isDirectory() === true,
+      `The installed extension's service did not create DEBUGGEN_HOME ${home}.${evidence}`,
+    );
+    assert.equal(
+      homeStats.mode & 0o777,
+      0o700,
+      `DEBUGGEN_HOME ${home} has mode ${(homeStats.mode & 0o777).toString(8)}, not 700.`,
+    );
+    for (const name of ['auth.json', 'sessions.sqlite']) {
+      const stats = await lstatOrUndefined(path.join(home, name));
       assert.ok(
         stats?.isFile() === true,
-        `The embedded service did not write ${name} into DEBUGGEN_HOME ${serviceHome}.`,
+        `The installed extension and its service did not write ${name} into ${home}.${evidence}`,
       );
     }
+
+    // And it migrated its store from the repository's DDL, which the VSIX
+    // carries only inside the service bundle.
+    const ddl = await fsp.readFile(
+      path.join(repositoryRoot(), ...STORE_DDL_SOURCE.split('/')),
+      'utf8',
+    );
+    const expectedDigest = createHash('sha256').update(ddl, 'utf8').digest('hex');
+    const store = readStoreFacts(path.join(home, 'sessions.sqlite'));
+    assert.equal(
+      store.ddlSha256,
+      expectedDigest,
+      `${path.join(home, 'sessions.sqlite')} records meta.ddl_sha256 ${JSON.stringify(store.ddlSha256)}, ` +
+        `not the digest of ${STORE_DDL_SOURCE}.`,
+    );
+    assert.ok(
+      store.tables.includes('sessions'),
+      `${path.join(home, 'sessions.sqlite')} has no "sessions" table (tables: ${store.tables.join(', ') || 'none'}).`,
+    );
   });
 
   // Step 8: teardown, then proof that it left nothing behind.
   after(async function () {
     const problems: string[] = [];
-    const reason = (error: unknown): string =>
-      error instanceof Error ? error.message : String(error);
 
     try {
       await stopTrackedProcesses();
     } catch (error) {
-      problems.push(`stopTrackedProcesses() failed: ${reason(error)}`);
+      problems.push(`stopTrackedProcesses() failed: ${reasonOf(error)}`);
     }
     try {
       await cleanupScratch();
     } catch (error) {
-      problems.push(`cleanupScratch() failed: ${reason(error)}`);
+      problems.push(`cleanupScratch() failed: ${reasonOf(error)}`);
     }
 
     const survivors = listTrackedProcesses().map(
@@ -940,15 +1325,22 @@ describe('packaged VSIX: a self-contained install with a working embedded servic
     if (survivors.length > 0) {
       problems.push(`tracked child processes survived teardown: ${survivors.join(', ')}`);
     }
-    if (service?.pid !== undefined && (service.isRunning() || pidExists(service.pid))) {
-      problems.push(`the embedded service (pid ${service.pid}) is still alive`);
+    if (isolatedWindow?.pid !== undefined && isolatedWindow.isRunning()) {
+      problems.push(`the isolated window (pid ${isolatedWindow.pid}) is still running`);
+    }
+    if (servicePid !== undefined && isProcessAlive(servicePid)) {
+      problems.push(
+        `the installed extension's embedded service (pid ${servicePid}) is still alive`,
+      );
     }
 
     const leftovers: readonly (readonly [string, string | undefined])[] = [
       ['the packaged .vsix', vsixPath],
       ['the throwaway extensions directory', extensionsDir],
       ['the throwaway user-data directory', userDataDir],
-      ["the embedded service's DEBUGGEN_HOME", serviceHome],
+      ['the staged probe', probeDir],
+      ["the isolated window's DEBUGGEN_HOME", isolatedHome],
+      ["the isolated window's workspace", isolatedWorkspace],
       ['the scratch directory', scratch],
     ];
     for (const [label, target] of leftovers) {

@@ -23,7 +23,13 @@
  * 2. **Verification** ({@link AnalysisFacts.verifyFindings}). Every evidence
  *    reference of every observed fact *and* every likely cause is resolved
  *    against the capture's `telemetry_events` rows through the store's own
- *    existence lookups; one unresolved reference rejects the whole analysis.
+ *    lookups, and resolved as *one* event: each id must exist in the capture,
+ *    a cited span must be the cited event's own span, and the cited event must
+ *    be one of the cited trace's events in the capture. A cited span that
+ *    cannot be checked — the port offers no span lookup — fails closed
+ *    (`span-unverifiable`) rather than passing unchecked. One reference that
+ *    fails any of these rejects the whole analysis, so valid ids of unrelated
+ *    events cannot be combined into a citation.
  * 3. **Assembly and persistence** ({@link AnalysisFacts.acceptFindings}). The
  *    verified findings become an `AnalysisResult` through the protocol's single
  *    constructor, are re-validated, and are stored as the session's next
@@ -119,6 +125,7 @@ import {
 } from '@debuggen/telemetry';
 import {
   CONFIDENCE_LEVELS,
+  DATA_QUERY_MAX_LIMIT,
   MAX_EVENT_REF_LABEL_LENGTH,
   MAX_EVIDENCE_REFS,
   MAX_STATEMENT_LENGTH,
@@ -374,13 +381,20 @@ export type FactCandidateReport = {
 /**
  * The closed vocabulary of verification issues. Each code has one fixed reason
  * ({@link FACT_VERIFICATION_ISSUE_REASONS}), so an issue never carries data.
+ *
+ * `span-unverifiable` is the fail-closed code: a citation carrying a span id is
+ * rejected when the {@link EvidenceLookupPort} offers no span lookup, because
+ * a span that was never compared with the cited event is not evidence.
  */
 export const FACT_VERIFICATION_ISSUE_CODES = Object.freeze([
   'event-unresolved',
   'trace-unresolved',
   'span-unresolved',
+  'span-unverifiable',
   'span-outside-capture',
   'span-trace-mismatch',
+  'span-event-mismatch',
+  'event-trace-mismatch',
   'location-invalid',
   'location-outside-project',
   'statement-bounds',
@@ -398,8 +412,13 @@ export const FACT_VERIFICATION_ISSUE_REASONS: Readonly<Record<FactVerificationIs
     'event-unresolved': 'The cited event id does not exist among the events of this capture.',
     'trace-unresolved': 'The cited trace id does not exist among the events of this capture.',
     'span-unresolved': 'The cited span id does not exist among the events of this session.',
+    'span-unverifiable':
+      'The cited span id could not be checked: the evidence store offers no span lookup.',
     'span-outside-capture': 'The cited span id belongs to an event of another capture.',
     'span-trace-mismatch': 'The cited span id belongs to a different trace than the one cited.',
+    'span-event-mismatch': 'The cited span id belongs to a different event than the one cited.',
+    'event-trace-mismatch':
+      'The cited event is not one of the events of the cited trace in this capture.',
     'location-invalid': 'The suggested location is not a valid source location.',
     'location-outside-project':
       'The suggested location does not name a file inside the session project.',
@@ -440,7 +459,12 @@ export type FactVerificationReport = {
   readonly checkedSpanIds: readonly string[];
   /** Distinct span ids the session does not hold. */
   readonly unresolvedSpanIds: readonly string[];
-  /** Whether span ids could be checked at all. */
+  /**
+   * Whether span ids could be checked at all. `unavailable` never lets a span
+   * pass unchecked: every citation carrying a span id then fails with
+   * `span-unverifiable`, so the report is invalid. Only citations without a
+   * span id can verify against a port that offers no span lookup.
+   */
   readonly spanCheck: 'performed' | 'unavailable';
   /** Suggested locations checked. */
   readonly checkedLocations: number;
@@ -505,13 +529,48 @@ export type EvidenceResolvers = {
 /** The fields of a stored event the span check reads. */
 export type EvidenceSpanRecord = Pick<TelemetryEvent, 'id' | 'traceId' | 'captureId'>;
 
+/** The fields of a stored event the trace-membership check reads. */
+export type EvidenceTraceRecord = Pick<TelemetryEvent, 'id' | 'traceId' | 'captureId'>;
+
 /**
- * The existence lookups this module asks of the telemetry store (satisfied by
+ * The narrowing and paging {@link EvidenceLookupPort.listByTrace} accepts: a
+ * subset of `TelemetryRepo`'s `TelemetryReadOptions`, so the repository's own
+ * reader satisfies the port unchanged.
+ */
+export type EvidenceTracePageOptions = {
+  /** Only this capture's events of the trace; absent means every capture's. */
+  readonly captureId?: CaptureId | undefined;
+  /** Rows per page; the store clamps it to its own maximum page. */
+  readonly limit?: number | undefined;
+  /** Rows to skip. */
+  readonly offset?: number | undefined;
+};
+
+/**
+ * One page of a trace's events, as {@link EvidenceLookupPort.listByTrace}
+ * returns it: `TelemetryRepo`'s `TelemetryPage` viewed through the fields the
+ * membership check reads.
+ */
+export type EvidenceTracePage = {
+  /** The page's events, in the store's stable trace order. */
+  readonly rows: readonly EvidenceTraceRecord[];
+  /**
+   * The offset of the next page, strictly greater than this page's offset, or
+   * absent when this page is the last one.
+   */
+  readonly nextOffset?: number | undefined;
+};
+
+/**
+ * The evidence lookups this module asks of the telemetry store (satisfied by
  * `TelemetryRepo`, asserted by {@link TelemetryRepoSatisfiesEvidenceLookupPort}).
  *
- * They are the single implementation of existence: verification and the
- * semantic-validation resolvers both call them, and nothing here scans a
- * summary or writes SQL instead.
+ * They are the single implementation of existence and of citation
+ * consistency: verification and the semantic-validation resolvers both call
+ * them, and nothing here scans a summary or writes SQL instead. Verification
+ * calls them once for the distinct cited event ids, once for the distinct
+ * cited trace ids, once per distinct cited span id and once per page of each
+ * distinct cited trace whose membership still has to be established.
  */
 export interface EvidenceLookupPort {
   /** Which of `ids` the session holds as event ids, narrowed to `captureId` when given. */
@@ -527,13 +586,29 @@ export interface EvidenceLookupPort {
     captureId?: CaptureId,
   ): Result<ReadonlySet<string>, DebuggenError>;
   /**
-   * One stored event by span id, session-wide. Optional: without it cited span
-   * ids are not checked and the report says so.
+   * One stored event by span id, session-wide. Optional, and fail-closed when
+   * absent: a port without it still verifies event and trace citations, but
+   * every citation that carries a span id is rejected with
+   * `span-unverifiable` (the report's `spanCheck` is `unavailable`), so an
+   * unchecked span can never reach the store.
    */
   readonly getBySpanId?: (
     sessionId: SessionId,
     spanId: string,
   ) => Result<EvidenceSpanRecord | undefined, DebuggenError>;
+  /**
+   * One page of the events of `traceId` in the session, narrowed to
+   * `options.captureId` when given. Required: it is how verification proves
+   * that a cited event belongs to the trace the citation names, which no
+   * existence lookup can answer. Pages must advance — a present `nextOffset`
+   * is strictly greater than the page's own offset — as `TelemetryRepo`
+   * guarantees.
+   */
+  listByTrace(
+    sessionId: SessionId,
+    traceId: string,
+    options?: EvidenceTracePageOptions,
+  ): Result<EvidenceTracePage, DebuggenError>;
 }
 
 /**
@@ -575,10 +650,10 @@ export interface AnalysisFacts {
 
   /**
    * Checkpoint one of two: parses `findings` with the protocol's findings
-   * schema and resolves every cited event, trace and span id against the
-   * capture, and every suggested location against the project. Any failed
-   * check rejects the whole analysis; on success the parsed findings are
-   * returned unchanged.
+   * schema and resolves every citation to one event of the capture — its event,
+   * trace and span ids must exist there and name that same event — and every
+   * suggested location against the project. Any failed check rejects the whole
+   * analysis; on success the parsed findings are returned unchanged.
    */
   verifyFindings(
     findings: unknown,
@@ -734,6 +809,13 @@ const REPORTABLE_ID_PATTERN = /^[a-z]{3}_[0-9a-z]{16}$/;
 
 /** Most ids and paths a rejection error lists. */
 const MAX_REPORTED_ITEMS = 20;
+
+/**
+ * Rows asked for per page of a trace-membership walk: the panel-data surface's
+ * maximum page, which `TelemetryRepo` clamps every reader to, so a trace of up
+ * to that many events in the capture is answered by one read.
+ */
+const TRACE_MEMBERSHIP_PAGE_SIZE = DATA_QUERY_MAX_LIMIT;
 
 /** Locale-independent string order. */
 function compareStrings(left: string, right: string): number {
@@ -1981,17 +2063,109 @@ function locationIssues(
   return { issues, checked };
 }
 
+/** The refusal of a trace page whose `nextOffset` does not move the walk forward. */
+function pageNotAdvancingError(scope: LookupScope): DebuggenError {
+  return new DebuggenError(
+    'STORE_ERROR',
+    'The session store returned a trace page that does not advance, so nothing was verified or stored.',
+    {
+      hint: 'Retry the analysis once the session store is available.',
+      details: {
+        reason: 'page-not-advancing',
+        operation: 'listByTrace',
+        ...reportableScope(scope),
+      },
+    },
+  );
+}
+
+/**
+ * Which of `wanted` are events of `traceId` in the context's capture.
+ *
+ * Reads the trace page by page through {@link EvidenceLookupPort.listByTrace},
+ * narrowed to the capture, from offset zero in the store's stable trace order.
+ * The walk is bounded by the trace's own size in the capture: it stops as soon
+ * as every wanted id has been seen or at the last page (no `nextOffset`), so a
+ * trace of at most {@link TRACE_MEMBERSHIP_PAGE_SIZE} events costs one read. A row
+ * counts only when it names both the cited trace and the capture, so a port
+ * that ignored the narrowing can cause a rejection, never an acceptance.
+ *
+ * @param lookup The evidence lookups.
+ * @param context The session and capture the findings are verified against.
+ * @param scope The reportable identifiers of a failure.
+ * @param traceId A cited trace id the capture holds.
+ * @param wanted The cited event ids, each already known to exist in the
+ * capture, that cite `traceId`.
+ * @returns The subset of `wanted` that belongs to the trace, or `Err` when a
+ * page could not be read or did not advance: an incomplete walk proves nothing
+ * either way.
+ */
+function traceMembersOf(
+  lookup: EvidenceLookupPort,
+  context: FactVerificationContext,
+  scope: LookupScope,
+  traceId: string,
+  wanted: ReadonlySet<string>,
+): Result<ReadonlySet<string>, DebuggenError> {
+  const found = new Set<string>();
+  let offset: number | undefined = 0;
+  while (offset !== undefined && found.size < wanted.size) {
+    const pageOffset: number = offset;
+    const page = callPort('listByTrace', scope, () =>
+      lookup.listByTrace(context.sessionId, traceId, {
+        captureId: context.captureId,
+        limit: TRACE_MEMBERSHIP_PAGE_SIZE,
+        offset: pageOffset,
+      }),
+    );
+    if (!page.ok) {
+      return err(page.error);
+    }
+    for (const row of page.value.rows) {
+      if (row.traceId === traceId && row.captureId === context.captureId && wanted.has(row.id)) {
+        found.add(row.id);
+      }
+    }
+    const next = page.value.nextOffset;
+    if (next !== undefined && (!Number.isSafeInteger(next) || next <= pageOffset)) {
+      return err(pageNotAdvancingError(scope));
+    }
+    offset = next;
+  }
+  return ok(found);
+}
+
 /**
  * The verification core: every check of {@link AnalysisFacts.verifyFindings}
- * over already-parsed findings, as a report. Synchronous and deterministic for a
- * deterministic port; the port is called once for the distinct event ids, once
- * for the distinct trace ids and once per distinct span id.
+ * over already-parsed findings, as a report.
+ *
+ * Each citation is resolved to one captured event and its ids are compared
+ * together, not only one by one: the event id must exist in the capture; a
+ * cited trace id must exist in the capture *and* the event must be one of that
+ * trace's events there (`event-trace-mismatch`); a cited span id must be the
+ * cited event's own span (`span-event-mismatch`), recorded in this capture and,
+ * when a trace is cited, in that trace. A span record that is the cited event,
+ * in this capture and in the cited trace, already proves trace membership, so
+ * only citations it does not confirm cost a trace read; a citation whose event
+ * or trace does not resolve is reported as unresolved and not also as a
+ * mismatch.
+ *
+ * The span check fails closed. When the port offers no `getBySpanId`
+ * (`spanCheck: 'unavailable'`), every citation that carries a span id is
+ * reported as `span-unverifiable` at its `spanId` path, so the report is
+ * invalid and nothing downstream stores it; its event and trace ids are still
+ * checked as usual. Citations without a span id are unaffected.
+ *
+ * Synchronous and deterministic for a deterministic port; the port is called
+ * once for the distinct event ids, once for the distinct trace ids, once per
+ * distinct span id, and once per page of each distinct cited trace whose
+ * membership still has to be established (see {@link traceMembersOf}).
  *
  * @param findings Findings that passed `parseAnalysisFindings`.
  * @param context The session, capture and project to verify against.
- * @param lookup The existence lookups.
- * @returns The report — valid or not — or `Err` when a lookup failed, in which
- * case nothing can be concluded.
+ * @param lookup The evidence lookups.
+ * @returns The report — valid or not — or `Err` when a lookup failed or a trace
+ * page did not advance, in which case nothing can be concluded.
  */
 export function collectFactVerificationReport(
   findings: AnalysisFindings,
@@ -2046,14 +2220,68 @@ export function collectFactVerificationReport(
     spanRecords.set(spanId, found.value);
   }
 
+  /** Whether the span lookup found the cited event itself, in this capture and in the cited trace. */
+  const spanConfirmsTrace = (ref: EventRef): boolean => {
+    if (ref.spanId === undefined || ref.traceId === undefined) {
+      return false;
+    }
+    const record = spanRecords.get(ref.spanId);
+    return (
+      record !== undefined &&
+      record.id === ref.eventId &&
+      record.captureId === context.captureId &&
+      record.traceId === ref.traceId
+    );
+  };
+
+  // Trace membership still to establish: resolved events citing a resolved
+  // trace, grouped by trace so each distinct trace is walked once.
+  const wantedByTrace = new Map<string, Set<string>>();
+  for (const { ref } of refs) {
+    if (
+      ref.traceId === undefined ||
+      !events.value.has(ref.eventId) ||
+      !traces.value.has(ref.traceId) ||
+      spanConfirmsTrace(ref)
+    ) {
+      continue;
+    }
+    const wanted = wantedByTrace.get(ref.traceId) ?? new Set<string>();
+    wanted.add(ref.eventId);
+    wantedByTrace.set(ref.traceId, wanted);
+  }
+  const membersByTrace = new Map<string, ReadonlySet<string>>();
+  const pendingTraces = [...wantedByTrace.entries()].sort(([left], [right]) =>
+    compareStrings(left, right),
+  );
+  for (const [traceId, wanted] of pendingTraces) {
+    const members = traceMembersOf(lookup, context, scope, traceId, wanted);
+    if (!members.ok) {
+      return err(members.error);
+    }
+    membersByTrace.set(traceId, members.value);
+  }
+
   for (const { path, ref } of refs) {
-    if (!events.value.has(ref.eventId)) {
+    const eventResolved = events.value.has(ref.eventId);
+    if (!eventResolved) {
       issues.push(issueAt(`${path}.eventId`, 'event-unresolved'));
     }
-    if (ref.traceId !== undefined && !traces.value.has(ref.traceId)) {
-      issues.push(issueAt(`${path}.traceId`, 'trace-unresolved'));
+    if (ref.traceId !== undefined) {
+      if (!traces.value.has(ref.traceId)) {
+        issues.push(issueAt(`${path}.traceId`, 'trace-unresolved'));
+      } else if (
+        eventResolved &&
+        !spanConfirmsTrace(ref) &&
+        membersByTrace.get(ref.traceId)?.has(ref.eventId) !== true
+      ) {
+        issues.push(issueAt(`${path}.traceId`, 'event-trace-mismatch'));
+      }
     }
-    if (ref.spanId !== undefined && spanCheck === 'performed') {
+    if (ref.spanId !== undefined && spanCheck === 'unavailable') {
+      // Fail closed: a span never compared with the cited event is not evidence.
+      issues.push(issueAt(`${path}.spanId`, 'span-unverifiable'));
+    } else if (ref.spanId !== undefined) {
       const record = spanRecords.get(ref.spanId);
       if (record === undefined) {
         issues.push(issueAt(`${path}.spanId`, 'span-unresolved'));
@@ -2063,6 +2291,9 @@ export function collectFactVerificationReport(
         }
         if (ref.traceId !== undefined && record.traceId !== ref.traceId) {
           issues.push(issueAt(`${path}.spanId`, 'span-trace-mismatch'));
+        }
+        if (record.id !== ref.eventId) {
+          issues.push(issueAt(`${path}.spanId`, 'span-event-mismatch'));
         }
       }
     }
@@ -2107,7 +2338,7 @@ function rejectionError(report: FactVerificationReport, scope: LookupScope): Deb
     'MODEL_OUTPUT_INVALID',
     `The analysis was rejected: ${plural(report.issues.length, 'evidence check', 'evidence checks')} failed, so no part of it was stored.`,
     {
-      hint: 'Observed facts and likely causes must cite events present in the capture, and a suggested location must name a file inside the project. Run the analysis again.',
+      hint: "Observed facts and likely causes must cite events present in the capture, with each citation's trace and span ids being those of the cited event, and a suggested location must name a file inside the project. Run the analysis again.",
       details: {
         reason: 'evidence-unverified',
         ...reportableScope(scope),

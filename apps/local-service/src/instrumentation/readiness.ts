@@ -27,10 +27,10 @@
  *   now?" It derives the signals a plan needs through the upstream
  *   derivations, asks every adapter that claims the plan's action types for its
  *   own readiness report, adds the session-level preconditions no adapter can
- *   see — a bound tab, a page agent for its current document, a React hook
- *   installed before React loaded — and returns a {@link ReadinessVerdict}
- *   whose `satisfied` flag feeds the state machine's `instrumenting → ready`
- *   guard.
+ *   see — a bound tab, a page agent for its current document, that agent
+ *   installed before React and the page loaded — and returns a
+ *   {@link ReadinessVerdict} whose `satisfied` flag feeds the state machine's
+ *   `instrumenting → ready` guard.
  *
  * ## What blocks, and what merely degrades
  *
@@ -43,11 +43,19 @@
  * | --- | --- | --- |
  * | browser signals planned, no bound tab | blocking | `bind-tab` |
  * | browser signals planned, no `agent.ready` for the current document | blocking | `reload-page` |
- * | React/state signals planned, hook installed after React loaded | blocking | `reload-page` (with the document id) |
+ * | browser signals planned, the current document's agent installed late (`installedBeforeReact = false`: after React loaded, or after the page began loading) | blocking, for every browser signal | `reload-page` (with the document id) |
  * | no planned signal deliverable at all | blocking | whatever the gaps name |
  * | server signals planned, no `server-agent` for the project | degraded | `relaunch-dev-server` |
- * | React signals planned, no React on the page | degraded | — |
+ * | React signals planned, agent installed in time, no React on the page | degraded | — |
  * | any adapter-reported gap, including a stale preload heartbeat | degraded | the adapter's hint |
+ * | an adapter's readiness probe throws or answers an invalid report | its signals `unavailable`: degraded when another adapter confirms them, else not deliverable | the failure's hint |
+ *
+ * An adapter-reported gap degrades only while some adapter still establishes
+ * the signal. A probe that fails establishes nothing, so it can never be the
+ * reason a signal counts as deliverable; when no other adapter vouches for any
+ * planned signal, the "no planned signal deliverable" row applies and the
+ * session does not become ready (AAP §0.5.5: capture proceeds with the signals
+ * that are *available*, and a failure is never presented as success).
  *
  * A stale heartbeat is judged by the adapters that depend on the preload: this
  * module hands them `lastHeartbeatAt` and they apply their own staleness
@@ -55,6 +63,37 @@
  * disagree. A caller that wants the stricter reading of AAP §0.7.1 — no ready
  * state until the preload connects whenever server signals are planned — sets
  * {@link EvaluateReadinessRequest.requireServerAgent}.
+ *
+ * ## The current document
+ *
+ * The page gate judges the bound tab's *current* document, and the registry
+ * cannot say which that is: the relaying layer replaces a tab's report only
+ * when a new document's `agent.ready` arrives, and a navigation by itself
+ * clears nothing. What does follow every committed same-origin navigation is
+ * the binding — the binding route mirrors the new URL onto the session
+ * record's `boundTab`, which is what this module receives, and the capture
+ * stage re-evaluates readiness at capture start with the fresh record. So
+ * {@link evaluateReadiness} is the "before capture" check, and it judges
+ * currency itself:
+ *
+ * | The report, against the binding | Judgement |
+ * | --- | --- |
+ * | same origin and path (query and fragment ignored), or either URL unreadable, and no navigation recorded after it was received | current, used at once |
+ * | another path — or the same one, with a navigation recorded after it was received ({@link BrowserAgentRegistry.latestNavigationAt}: a reload, a load of the same URL) — and a new document for the bound origin reports within {@link EvaluateReadinessDeps.navigationSettleMs} | replaced: the new document's facts are judged |
+ * | as above, and a new document reports from another origin | no page agent for the current document |
+ * | as above, and nothing new reports within the bound | a same-document navigation: the report is kept |
+ *
+ * A mismatch alone never blocks. `tab.navigated` carries no document id, and a
+ * history-API navigation moves the binding's URL within one document whose
+ * agent never announces itself again; only a replacement document that
+ * actually reports supersedes the stored one. Telling a replacement that never
+ * reports apart from a history-API navigation needs the navigation's own
+ * document identity, which no port carries today. The wait is bounded
+ * ({@link DEFAULT_NAVIGATION_SETTLE_MS}, at most
+ * {@link MAX_NAVIGATION_SETTLE_MS}, `0` for none), skipped for an already
+ * aborted request, and backstopped like the reload wait. The collection
+ * functions never wait: they record the report as observed, with a note when
+ * it is not trusted on sight.
  *
  * ## The one-click reload
  *
@@ -71,7 +110,10 @@
  * - **It writes nothing** — not to the developer's project, not to
  *   `$DEBUGGEN_HOME`, not to the database — and spawns nothing: launching a dev
  *   server is `../dev-server/launcher.ts`'s job, reached by the pipeline and
- *   the routes, never from here.
+ *   the routes, never from here. The one state it touches is
+ *   `../sessions/progress.ts`'s bounded, in-memory product-text registry: the
+ *   fixed wording it places in a gap entry is registered there as it is used,
+ *   so a failure surface can prove it is the product's (CWE-209).
  * - **It restates no vocabulary.** Signal names, readiness statuses, progress
  *   stages, error codes, signal labels, the "Ready to capture" wording and the
  *   relaunch command are all imported from the module that owns them.
@@ -86,9 +128,16 @@
  *   (AAP §0.5.4).
  * - **It is side-effect free at load time**: no environment read, no console,
  *   no timer, no global. Every collaborator is injected.
+ * - **It logs no page-supplied identifier.** A relayed `agent.ready` is shaped
+ *   by the page, so its `documentId` is page-controlled text: the verdict, the
+ *   reload ledger and the "different document" comparison keep it as is, and
+ *   every log line carries only `./document-fingerprint.ts`'s `document`
+ *   fingerprint and `documentIdCanonical` flag in its place (CWE-532,
+ *   AAP §0.5.2).
  *
  * `./service.ts` imports this module; this module imports neither it nor
- * `./watcher.ts`, which keeps the folder's dependency direction one-way.
+ * `./watcher.ts`, which keeps the folder's dependency direction one-way. Its
+ * only import from this folder is the leaf `./document-fingerprint.ts`.
  *
  * @module
  */
@@ -97,7 +146,6 @@ import { PACKAGE_MANAGERS } from '@debuggen/code-analysis';
 import {
   BROWSER_CAPTURE_SIGNALS,
   CAPTURE_SIGNALS,
-  READINESS_HINT_MAX_LENGTH,
   READINESS_REASON_MAX_LENGTH,
   SERVER_CAPTURE_SIGNALS,
   buildReadiness,
@@ -137,6 +185,7 @@ import {
   nowEpochMs,
   ok,
   toPosix,
+  type LogFields,
   type Logger,
   type Result,
 } from '@debuggen/shared';
@@ -158,8 +207,14 @@ import type {
   LaunchedDevServer,
   LaunchedDevServerStatus,
 } from '../dev-server/launcher.js';
-import { LOG_BINDING_KEYS } from '../logging.js';
-import type { SessionProgress } from '../sessions/progress.js';
+import {
+  LOG_BINDING_KEYS,
+  LOG_ERROR_FIELD_KEY,
+  describeException,
+  guardLogger,
+} from '../logging.js';
+import { authorProductText, type SessionProgress } from '../sessions/progress.js';
+import { documentLogFields } from './document-fingerprint.js';
 
 // ---------------------------------------------------------------------------
 // Section A — constants
@@ -194,6 +249,24 @@ export const DEFAULT_RELOAD_WAIT_MS = 60_000;
 export const MAX_RELOAD_WAIT_MS = 300_000;
 
 /**
+ * How long {@link evaluateReadiness} waits, in milliseconds, for the document
+ * that replaced a page-agent report the binding has moved away from, when the
+ * caller injects nothing else (see "The current document" in the module
+ * overview).
+ *
+ * A full navigation's new document announces itself as soon as its agent has
+ * installed at `document_start` and the service worker has relayed it — well
+ * inside this window on a local dev server. A history-API navigation keeps its
+ * document and announces nothing, so this is also the delay such a navigation
+ * adds to one evaluation: short enough not to be noticed, long enough for a
+ * relay to arrive.
+ */
+export const DEFAULT_NAVIGATION_SETTLE_MS = 1_500;
+
+/** The ceiling an injected {@link EvaluateReadinessDeps.navigationSettleMs} is clamped to. */
+export const MAX_NAVIGATION_SETTLE_MS = 10_000;
+
+/**
  * Grace added to this module's own backstop timer around
  * {@link BrowserAgentRegistry.waitForAgentReady}.
  *
@@ -224,9 +297,11 @@ const DEGRADED_STATUS: ReadinessStatus = 'degraded';
  * `react` is the hook itself; `state` is recorded while a commit is walked and
  * `componentTree` is taken from the retained fiber root, so neither exists
  * without it (see `AGENT_HOOKS_BY_ACTION_TYPE` in the instrumentation schema).
- * These are the signals AAP §0.7.1 Group 2's `installedBeforeReact` gate
- * applies to. Checked against the imported vocabulary with `satisfies`, so a
- * renamed signal is a compile error here.
+ * These are the signals a page without React cannot deliver, so the
+ * `react-absent` degradation applies to them alone; AAP §0.7.1 Group 2's
+ * `installedBeforeReact` gate applies to every planned browser signal. Checked
+ * against the imported vocabulary with `satisfies`, so a renamed signal is a
+ * compile error here.
  */
 const FIBER_HOOK_SIGNALS: ReadonlySet<CaptureSignal> = new Set([
   'react',
@@ -254,6 +329,17 @@ const KNOWN_PACKAGE_MANAGERS: readonly string[] = PACKAGE_MANAGERS;
  * wording belongs here. Each `reason` is a fragment that reads after "Could not
  * enable ‹signal›: " (AAP §0.5.5) and each `hint` names one action. The reload
  * gates' hint is {@link RELOAD_REQUEST_MESSAGE} itself.
+ *
+ * The late-install gate has two wordings for one fact (`installedBeforeReact`
+ * false): `hookLate` for a document where the agent found React, `agentLate`
+ * for one without React, where there is no React to have been late for — only
+ * an agent that started after the page had begun loading.
+ *
+ * Every text here is registered with `authorProductText` where it is placed in
+ * a gap entry ({@link gateWording}), not once at load time: the registry
+ * forgets its least recently used texts, and registering on use keeps the
+ * wording in use proven. The capture gate quotes a registered reason or hint
+ * verbatim in its refusal and replaces anything unproven with fixed copy.
  */
 const GATE_WORDING = Object.freeze({
   noTab: Object.freeze({
@@ -266,6 +352,10 @@ const GATE_WORDING = Object.freeze({
   }),
   hookLate: Object.freeze({
     reason: 'the React hook was installed after the page had already loaded React',
+    hint: RELOAD_REQUEST_MESSAGE,
+  }),
+  agentLate: Object.freeze({
+    reason: 'the page agent was installed after the page had already started loading',
     hint: RELOAD_REQUEST_MESSAGE,
   }),
   reactAbsent: Object.freeze({
@@ -318,11 +408,14 @@ export interface WaitForAgentReadyOptions {
  */
 export interface BrowserAgentRegistry {
   /**
-   * The newest relayed `agent.ready` for `tabId`.
+   * The newest relayed `agent.ready` for `tabId`; absent when no page agent has
+   * reported from the tab.
    *
-   * The relaying layer replaces the stored report on every document load, so a
-   * stale document's facts are never returned: absent means "no page agent has
-   * reported for the tab's current document".
+   * The relaying layer replaces the stored report when a new document's
+   * `agent.ready` arrives. A navigation does not replace or clear it, so the
+   * report returned may describe a document the tab has since left; this
+   * module judges currency against the binding's URL (see "The current
+   * document" in the module overview) rather than trusting the port to know.
    */
   latestAgentReady(tabId: number): AgentReadyPayload | undefined;
 
@@ -345,6 +438,20 @@ export interface BrowserAgentRegistry {
    * was read, which an adapter's staleness window then measures from.
    */
   latestAgentReadyAt?(tabId: number): number | undefined;
+
+  /**
+   * When the binding last recorded a committed navigation of `tabId`, in epoch
+   * milliseconds — every same-origin `tab.navigated` the binding keeps,
+   * including a reload and a navigation that leaves the URL unchanged, which
+   * the binding's URL alone cannot show. Optional: without it, readiness can
+   * tell that a report may be stale only from the binding's URL.
+   *
+   * Compared with the report's receipt time ({@link latestAgentReadyAt}): a
+   * report received before the latest navigation describes a document the tab
+   * may have left, so it is not trusted on sight (see "The current document" in
+   * the module overview).
+   */
+  latestNavigationAt?(tabId: number): number | undefined;
 }
 
 /**
@@ -412,8 +519,10 @@ export interface ReloadPromptLedger {
  * - `bind-tab` — browser signals are planned but no Chrome tab is bound to the
  *   session: open the application and the "Debug Generator" DevTools panel.
  * - `reload-page` — the bound tab's current document cannot be observed: no
- *   page agent has reported for it, or its React hook arrived after React.
- *   `documentId` names the document to replace when one is known.
+ *   page agent has reported for it, or its agent was installed late
+ *   (`installedBeforeReact` false — its React hook arrived after React, or the
+ *   agent after the page began loading). `documentId` names the document to
+ *   replace when one is known.
  * - `relaunch-dev-server` — server signals are planned but no preload is
  *   connected for the project. `command` and `hint` are the dev-server
  *   detection's `relaunchCommand` and `relaunchHint`, verbatim, so every
@@ -439,8 +548,10 @@ export interface ReadinessAdapterReport {
 
   /**
    * Its report — validated against the readiness schema. For an adapter whose
-   * probe rejected or answered something invalid, a report built here with a
-   * `'degraded'` row per signal it covers, carrying the failure's reason.
+   * probe rejected or answered something invalid, a report built here with an
+   * `'unavailable'` row per signal it covers, carrying the failure's reason: an
+   * unverified probe establishes nothing, so such a signal is deliverable only
+   * when another adapter's row confirms it.
    */
   readonly readiness: Readiness;
 }
@@ -613,6 +724,14 @@ export interface EvaluateReadinessDeps {
   readonly reloadWaitMs?: number | undefined;
 
   /**
+   * How long to wait, in milliseconds, for the document that replaced a report
+   * whose page no longer matches the binding's URL. Default
+   * {@link DEFAULT_NAVIGATION_SETTLE_MS}, clamped to
+   * {@link MAX_NAVIGATION_SETTLE_MS}; `0` does not wait, and the report is kept.
+   */
+  readonly navigationSettleMs?: number | undefined;
+
+  /**
    * The documents already asked about, across calls. Absent, the request is
    * still emitted at most once per call.
    */
@@ -651,7 +770,10 @@ export interface EvaluateReadinessRequest {
   /** `false` suppresses the "Ready to capture" row on success. Default `true`. */
   readonly announceReady?: boolean | undefined;
 
-  /** Abandons the reload wait early; the verdict is still returned. */
+  /**
+   * Abandons the navigation-settle and reload waits early; the verdict is
+   * still returned. Already aborted, neither wait starts.
+   */
   readonly signal?: AbortSignal | undefined;
 }
 
@@ -659,9 +781,16 @@ export interface EvaluateReadinessRequest {
 // Section F — small internal helpers
 // ---------------------------------------------------------------------------
 
-/** The session-bound child logger every function here writes through. */
+/**
+ * The session-bound child logger every function here writes through.
+ *
+ * Guarded once, here, with `guardLogger`: every log call in this module runs
+ * on a degraded path — a port that threw, a probe that failed, a clock that
+ * misread — and an injected logger that throws there must not replace the
+ * verdict being assembled with its own failure.
+ */
 function bindLogger(parent: Logger | undefined, sessionId: string): Logger {
-  return (parent ?? noopLogger).child({
+  return guardLogger(parent ?? noopLogger).child({
     [LOG_BINDING_KEYS.subsystem]: LOG_SUBSYSTEM,
     [LOG_BINDING_KEYS.sessionId]: sessionId,
   });
@@ -676,24 +805,42 @@ function isEpochMs(value: unknown): value is number {
  * The injected clock, made total: a clock that throws or answers something
  * other than a positive finite number is replaced by `nowEpochMs` for that
  * reading, because a test seam must not cost the developer a verdict.
+ *
+ * The fallback is a deliberate best-effort decision, not a silent one: the
+ * first fallback of each clock this returns is recorded at `debug` with an
+ * enumerated reason and, for a throw, the closed exception fields. Later
+ * readings of the same clock fall back without a record, so a clock broken
+ * for a whole evaluation yields one line rather than one per reading.
+ *
+ * @param now The injected clock, if any.
+ * @param log The (guarded) logger the fallback is recorded through.
  */
-function totalClock(now: (() => number) | undefined): () => number {
+function totalClock(now: (() => number) | undefined, log: Logger): () => number {
   if (now === undefined) {
     return nowEpochMs;
   }
 
-  return () => {
-    try {
-      const value = now();
+  let recorded = false;
 
-      if (isEpochMs(value)) {
-        return value;
-      }
-    } catch {
-      // Fall through to the wall clock.
+  const wallClock = (fields: LogFields): number => {
+    if (!recorded) {
+      recorded = true;
+      log.debug('The injected clock could not be read; the wall clock is used instead', fields);
     }
 
     return nowEpochMs();
+  };
+
+  return () => {
+    let value: unknown;
+
+    try {
+      value = now();
+    } catch (thrown) {
+      return wallClock({ reason: 'clock-threw', ...describeException(thrown) });
+    }
+
+    return isEpochMs(value) ? value : wallClock({ reason: 'clock-reading-unusable' });
   };
 }
 
@@ -708,15 +855,18 @@ function isTabId(value: unknown): value is number {
 }
 
 /**
- * The name of a caught value's class, for a log line — never its message,
- * which may carry a path or a value.
+ * The log fields of a caught value: its label in the closed exception
+ * taxonomy, its closed-vocabulary code when it carries one, and the value
+ * itself under {@link LOG_ERROR_FIELD_KEY}, where the service logger's error
+ * serializer decides what of it a record may hold.
+ *
+ * Never the value's own `name` or `message`: both are writable text an
+ * adapter, a registry port or a dependency can fill with a path, a query
+ * value or a statement (CWE-532), and `describeException` maps rather than
+ * copies.
  */
-function errorName(thrown: unknown): string {
-  if (thrown instanceof Error) {
-    return thrown.name;
-  }
-
-  return typeof thrown;
+function exceptionFields(thrown: unknown): LogFields {
+  return { ...describeException(thrown), [LOG_ERROR_FIELD_KEY]: thrown };
 }
 
 /** Whether a value is a plain (non-null, non-array) object. */
@@ -792,6 +942,29 @@ function toSingleLine(text: string, maxLength: number): string {
   }
 
   return `${collapsed.slice(0, Math.max(maxLength - 1, 0)).trimEnd()}…`;
+}
+
+/**
+ * The reason a readiness probe that threw is reported with: a fixed sentence
+ * naming only the adapter's registered id, which reads after "Could not enable
+ * ‹signal›: " (AAP §0.5.5) and is bounded like every reason. Whatever the
+ * probe threw stays in the local log (see `askAdapter`).
+ */
+function adapterFailedReason(adapterId: string): string {
+  return authorProductText(
+    toSingleLine(
+      `the ${adapterId} adapter could not report readiness`,
+      READINESS_REASON_MAX_LENGTH,
+    ),
+  );
+}
+
+/**
+ * One of this module's fixed gate texts, registered as product-authored where
+ * it is used (see {@link GATE_WORDING}), and returned unchanged.
+ */
+function gateWording(text: string): string {
+  return authorProductText(text);
 }
 
 /**
@@ -901,10 +1074,12 @@ export function toObservedBrowserAgent(
 }
 
 /**
- * Whether a relayed report describes the bound tab's current document: the
+ * Whether a relayed report can describe a document of the binding at all: the
  * same tab, and — when both origins can be read — the same origin as the
  * binding. A report from another origin is a document the binding no longer
- * covers (the service worker unbinds on a cross-origin navigation).
+ * covers (the service worker unbinds on a cross-origin navigation). Whether it
+ * is the tab's *current* document is a separate judgement,
+ * {@link isOnBoundPage}.
  */
 function describesBoundDocument(payload: AgentReadyPayload, boundTab: BoundTab): boolean {
   if (payload.tabId !== boundTab.tabId) {
@@ -920,9 +1095,67 @@ function describesBoundDocument(payload: AgentReadyPayload, boundTab: BoundTab):
 }
 
 /**
- * Reads the bound tab's current page-agent report through the registry,
+ * Whether an observed report (already matched to the bound tab and origin) is
+ * for the page the binding records now: the same origin and path, query and
+ * fragment ignored — the binding route mirrors every committed same-origin
+ * navigation's URL onto the binding, while the stored report changes only
+ * when a new document announces itself.
+ *
+ * Either URL unreadable as an `http(s)` URL gives no judgement and reads as
+ * current, so a comparison this module cannot make never withholds a report.
+ * `false` is not a verdict that the report is stale — a history-API navigation
+ * moves the binding's URL within one document — only that it is not trusted on
+ * sight (see {@link settleCurrentDocument}).
+ */
+function isOnBoundPage(agent: ObservedBrowserAgent, boundTab: BoundTab): boolean {
+  const boundPage = displayUrl(boundTab.url);
+
+  return agent.url === undefined || boundPage === undefined || agent.url === boundPage;
+}
+
+/**
+ * Whether the registry recorded a committed navigation of the tab after the
+ * report was received ({@link BrowserAgentRegistry.latestNavigationAt}) — the
+ * one sign of a reload or a same-URL load, which {@link isOnBoundPage} cannot
+ * see. A registry without the method, one that throws or answers something
+ * that is not an epoch time, gives no such sign.
+ */
+function navigatedSinceReport(
+  agents: BrowserAgentRegistry,
+  tabId: number,
+  agent: ObservedBrowserAgent,
+): boolean {
+  if (agents.latestNavigationAt === undefined) {
+    return false;
+  }
+
+  try {
+    const navigatedAt = agents.latestNavigationAt(tabId);
+
+    return isEpochMs(navigatedAt) && navigatedAt > agent.observedAt;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whether a report (already matched to the bound tab and origin) may be judged
+ * as the tab's current document without waiting: it is for the page the
+ * binding records, and no navigation was recorded after it arrived.
+ */
+function isTrustedOnSight(
+  agents: BrowserAgentRegistry,
+  agent: ObservedBrowserAgent,
+  boundTab: BoundTab,
+): boolean {
+  return isOnBoundPage(agent, boundTab) && !navigatedSinceReport(agents, boundTab.tabId, agent);
+}
+
+/**
+ * Reads the bound tab's latest page-agent report through the registry,
  * defensively: a registry that throws, a report for another tab or another
- * origin all read as "no report", each with a note.
+ * origin all read as "no report", each with a note. Synchronous; whether the
+ * report is for the tab's current document is judged by the caller.
  */
 function readBoundTabAgent(
   agents: BrowserAgentRegistry,
@@ -939,7 +1172,7 @@ function readBoundTabAgent(
     notes.push('The page-agent registry could not be read; the page agent is treated as absent.');
     log.warn('Reading the latest agent.ready failed; treating the page agent as absent', {
       tabId: boundTab.tabId,
-      errorName: errorName(thrown),
+      ...exceptionFields(thrown),
     });
     return undefined;
   }
@@ -954,7 +1187,7 @@ function readBoundTabAgent(
     log.debug('Ignoring an agent.ready for a different tab or origin', {
       tabId: boundTab.tabId,
       reportedTabId: payload.tabId,
-      documentId: payload.documentId,
+      ...documentLogFields(payload.documentId),
     });
     return undefined;
   }
@@ -997,7 +1230,7 @@ function observeServerAgent(
   } catch (thrown) {
     notes.push('Dev-server preload presence could not be read; the preload is treated as absent.');
     log.warn('Reading server-agent presence failed; treating the preload as absent', {
-      errorName: errorName(thrown),
+      ...exceptionFields(thrown),
     });
     return undefined;
   }
@@ -1009,7 +1242,7 @@ function observeServerAgent(
     snapshot = described === undefined || isErr(described) ? undefined : described.value;
   } catch (thrown) {
     log.debug('Reading the server-agent snapshot failed; heartbeat age is unknown', {
-      errorName: errorName(thrown),
+      ...exceptionFields(thrown),
     });
     snapshot = undefined;
   }
@@ -1056,7 +1289,7 @@ function findLaunchedDevServer(
     launched = launcher.list();
   } catch (thrown) {
     notes.push('The list of launched dev servers could not be read.');
-    log.warn('Listing launched dev servers failed', { errorName: errorName(thrown) });
+    log.warn('Listing launched dev servers failed', exceptionFields(thrown));
     return undefined;
   }
 
@@ -1138,8 +1371,11 @@ function checkCollectRequest(
  * Steps, each of which degrades to a note instead of failing (AAP §0.5.5):
  *
  * 1. **Page agent.** With a bound tab, the latest relayed `agent.ready` for it,
- *    when it describes the tab's current document. Without one, the absence is
- *    recorded — never a default that reads as "present".
+ *    when it names the bound tab and origin. Without one, the absence is
+ *    recorded — never a default that reads as "present". A report for another
+ *    path than the binding records is kept, with a note: this read never
+ *    waits, and {@link evaluateReadiness} confirms the current document before
+ *    capture.
  * 2. **Preload.** `hasServerAgentForProject` decides whether it is connected;
  *    the optional snapshot supplies when it last spoke, so the preload-bound
  *    adapters can apply their own staleness windows.
@@ -1172,7 +1408,7 @@ export async function collectReadinessEvidence(
 
   const { sessionId, projectRoot } = checked.value;
   const log = bindLogger(deps.logger, sessionId);
-  const clock = totalClock(deps.now);
+  const clock = totalClock(deps.now, log);
   const notes: string[] = [];
 
   let browserAgent: ObservedBrowserAgent | undefined;
@@ -1181,6 +1417,18 @@ export async function collectReadinessEvidence(
     notes.push('No tab is bound to this session.');
   } else {
     browserAgent = readBoundTabAgent(deps.agents, request.boundTab, clock, notes, log);
+
+    // Collection stays a synchronous read: the report is kept as observed, and
+    // evaluateReadiness — run again at capture start — decides whether it is
+    // the current document.
+    if (
+      browserAgent !== undefined &&
+      !isTrustedOnSight(deps.agents, browserAgent, request.boundTab)
+    ) {
+      notes.push(
+        'The latest page-agent report predates the page the binding records now; readiness confirms the current document before capture.',
+      );
+    }
   }
 
   const serverAgent = observeServerAgent(deps.serverAgents, projectRoot, notes, log);
@@ -1208,7 +1456,7 @@ export async function collectReadinessEvidence(
     } catch (thrown) {
       notes.push('Dev-server detection failed; the preload is treated as not attached.');
       log.warn('Dev-server detection failed; treating the preload as not attached', {
-        errorName: errorName(thrown),
+        ...exceptionFields(thrown),
       });
       devServer = undefined;
     }
@@ -1267,7 +1515,10 @@ export async function collectObservedReadiness(
  * The page gate's answer for one planned browser signal.
  *
  * - `no-tab` / `no-agent` / `hook-late` block (AAP §0.7.1 Group 2).
- * - `react-absent` degrades: the page is observable, it just renders no React.
+ *   `hook-late` is the current document's report with `installedBeforeReact`
+ *   false, and applies to every planned browser signal.
+ * - `react-absent` degrades a fiber-hook signal on a timely document: the page
+ *   is observable, it just renders no React.
  * - `ok` passes, leaving the decision to the adapters' rows.
  */
 type BrowserGate = 'ok' | 'no-tab' | 'no-agent' | 'hook-late' | 'react-absent';
@@ -1369,7 +1620,7 @@ function selectAdapters(
     } catch (thrown) {
       log.warn('Looking up an action adapter failed; relying on claimants', {
         actionId: action.id,
-        errorName: errorName(thrown),
+        ...exceptionFields(thrown),
       });
       named = undefined;
     }
@@ -1389,7 +1640,7 @@ function selectAdapters(
     } catch (thrown) {
       log.warn('Asking the registry for claimants failed', {
         actionType: type,
-        errorName: errorName(thrown),
+        ...exceptionFields(thrown),
       });
       claimants = [];
     }
@@ -1409,7 +1660,7 @@ function selectAdapters(
     registered = registry.adapters();
   } catch (thrown) {
     log.warn('Listing registered adapters failed; keeping discovery order', {
-      errorName: errorName(thrown),
+      ...exceptionFields(thrown),
     });
     registered = [];
   }
@@ -1438,12 +1689,28 @@ function selectAdapters(
  * Asks one adapter for its readiness, so that nothing it does can propagate.
  *
  * A report is validated with `parseReadiness`. A probe that rejects (or throws
- * synchronously) or answers an invalid report becomes a report built here with
- * one `'degraded'` row per planned signal the adapter's actions cover: the
- * reason is the error's message and the hint its hint, both reduced to one
- * bounded line, so capture proceeds and the developer is told why the signal
- * may be thin. When the failure covers no known signal, the gap travels as an
- * extra degraded entry named after the adapter.
+ * synchronously) or answers an invalid report has established nothing, so it
+ * becomes a report built here with one `'unavailable'` row per planned signal
+ * the adapter's actions cover. An unverified probe therefore never makes a
+ * signal deliverable on its own — the signal stays deliverable only when
+ * another adapter's row for it is not `'unavailable'` (independent
+ * confirmation, the `evaluatePass` rule), and a plan left with nothing
+ * deliverable blocks. When the failure covers no known signal, the gap travels
+ * as an extra degraded entry named after the adapter: there is no signal to
+ * withhold, only a failure to report.
+ *
+ * The reason of a thrown probe is always this module's fixed sentence
+ * ({@link adapterFailedReason}), never the thrown value's message: a reason is
+ * shown in both user interfaces' progress rows, in `instrumentation.ready`'s
+ * `unavailable` list and in the capture gate's refusal, and an adapter or a
+ * dependency it calls can throw text quoting a path, a statement or a URL
+ * (CWE-209). The hint is always this module's generic next step, never the
+ * thrown value's — not even a `DebuggenError`'s: an adapter mints its own
+ * errors, and their hints can quote the same private text. Both are
+ * registered as product-authored, so the capture gate may show them. The
+ * value itself is logged locally under the logger's error key, with the
+ * closed exception class, once at `warn` and once more at `debug`, where the
+ * service's error serializer adds its redacted message and hint.
  */
 async function askAdapter(
   adapter: InstrumentationAdapter,
@@ -1463,32 +1730,33 @@ async function askAdapter(
       return { report: { adapterId: adapter.id, readiness: parsed.value } };
     }
 
-    log.warn('An adapter returned an invalid readiness report; treating its signals as degraded', {
-      adapterId: adapter.id,
-      issues: parsed.error.details,
-    });
-    reason = GATE_WORDING.invalidReport.reason;
-    hint = GATE_WORDING.adapterFailed.hint;
+    log.warn(
+      'An adapter returned an invalid readiness report; treating its signals as unavailable',
+      {
+        adapterId: adapter.id,
+        issues: parsed.error.details,
+      },
+    );
+    reason = gateWording(GATE_WORDING.invalidReport.reason);
+    hint = gateWording(GATE_WORDING.adapterFailed.hint);
   } catch (thrown) {
-    const error = DebuggenError.from(thrown, 'INSTRUMENTATION_UNAVAILABLE');
-    const statedReason = toSingleLine(error.message, READINESS_REASON_MAX_LENGTH);
-    const statedHint =
-      error.hint === undefined ? '' : toSingleLine(error.hint, READINESS_HINT_MAX_LENGTH);
-
-    log.warn('An adapter readiness probe failed; treating its signals as degraded', {
+    log.warn('An adapter readiness probe failed; treating its signals as unavailable', {
       adapterId: adapter.id,
-      code: error.code,
+      ...exceptionFields(thrown),
     });
-    reason =
-      statedReason.length > 0
-        ? statedReason
-        : `the ${adapter.id} adapter could not report readiness`;
-    hint = statedHint.length > 0 ? statedHint : GATE_WORDING.adapterFailed.hint;
+    log.debug('The diagnostic of a failed adapter readiness probe', {
+      adapterId: adapter.id,
+      ...exceptionFields(thrown),
+    });
+    reason = adapterFailedReason(adapter.id);
+    hint = gateWording(GATE_WORDING.adapterFailed.hint);
   }
 
+  // Fail closed: a probe that could not answer has not established any of the
+  // signals it covers, so each is withheld until another adapter confirms it.
   const readiness = buildReadiness({
     adapter: adapter.id,
-    signals: covered.map((signal) => ({ signal, status: DEGRADED_STATUS, reason, hint })),
+    signals: covered.map((signal) => ({ signal, status: UNAVAILABLE_STATUS, reason, hint })),
     now: clock,
   });
 
@@ -1500,7 +1768,16 @@ async function askAdapter(
       };
 }
 
-/** The page gate for one planned browser signal. */
+/**
+ * The page gate for one planned browser signal, in AAP §0.7.1 Group 2's order:
+ * a bound tab, a page agent for its current document, and that agent installed
+ * at `document_start` — before React and before the page began loading
+ * (`installedBeforeReact`). The late-install check applies to every browser
+ * signal: an agent that started late may have missed part of the load it
+ * joined — requests, performance entries, errors and interactions, not only
+ * React's commits. Only on a timely document is a missing React judged, and
+ * only for the fiber-hook signals, as a degradation.
+ */
 function browserGateFor(signal: CaptureSignal, input: PassInput): BrowserGate {
   if (input.boundTab === undefined) {
     return 'no-tab';
@@ -1512,17 +1789,28 @@ function browserGateFor(signal: CaptureSignal, input: PassInput): BrowserGate {
     return 'no-agent';
   }
 
-  if (FIBER_HOOK_SIGNALS.has(signal)) {
-    if (!agent.installedBeforeReact) {
-      return 'hook-late';
-    }
+  if (!agent.installedBeforeReact) {
+    return 'hook-late';
+  }
 
-    if (!agent.reactDetected) {
-      return 'react-absent';
-    }
+  if (FIBER_HOOK_SIGNALS.has(signal) && !agent.reactDetected) {
+    return 'react-absent';
   }
 
   return 'ok';
+}
+
+/**
+ * The late-install gate's wording for one document: the React hook's when the
+ * agent found React on the page, the page agent's otherwise (see
+ * {@link GATE_WORDING}). Used for every gap entry and for the reload request,
+ * so the row's second line and the gaps it would clear say the same thing.
+ */
+function lateInstallWording(agent: ObservedBrowserAgent | undefined): {
+  readonly reason: string;
+  readonly hint: string;
+} {
+  return agent?.reactDetected === true ? GATE_WORDING.hookLate : GATE_WORDING.agentLate;
 }
 
 /** Whether a page gate holds the session back. */
@@ -1532,17 +1820,38 @@ function isBlockingGate(
   return gate === 'no-tab' || gate === 'no-agent' || gate === 'hook-late';
 }
 
-/** The gap one page gate reports for one signal, in this module's words. */
-function gateEntry(signal: CaptureSignal, gate: Exclude<BrowserGate, 'ok'>): UnavailableSignal {
+/**
+ * The gap one page gate reports for one signal, in this module's words, both
+ * registered as product-authored (see {@link GATE_WORDING}). `agent` is the
+ * report the gate read, which chooses the late-install wording.
+ */
+function gateEntry(
+  signal: CaptureSignal,
+  gate: Exclude<BrowserGate, 'ok'>,
+  agent: ObservedBrowserAgent | undefined,
+): UnavailableSignal {
+  const wording = gateWordingOf(gate, agent);
+
+  return { signal, reason: gateWording(wording.reason), hint: gateWording(wording.hint) };
+}
+
+/** The fixed reason and hint of one page gate; `agent` chooses the late-install wording. */
+function gateWordingOf(
+  gate: Exclude<BrowserGate, 'ok'>,
+  agent: ObservedBrowserAgent | undefined,
+): {
+  readonly reason: string;
+  readonly hint: string;
+} {
   switch (gate) {
     case 'no-tab':
-      return { signal, ...GATE_WORDING.noTab };
+      return GATE_WORDING.noTab;
     case 'no-agent':
-      return { signal, ...GATE_WORDING.noAgent };
+      return GATE_WORDING.noAgent;
     case 'hook-late':
-      return { signal, ...GATE_WORDING.hookLate };
+      return lateInstallWording(agent);
     case 'react-absent':
-      return { signal, ...GATE_WORDING.reactAbsent };
+      return GATE_WORDING.reactAbsent;
   }
 }
 
@@ -1557,14 +1866,24 @@ function strongestGap(rows: readonly AttributedRow[]): AttributedRow | undefined
   );
 }
 
-/** An adapter row as a gap entry, in the adapter's own words. */
+/**
+ * An adapter row as a gap entry, in the adapter's own words.
+ *
+ * The adapter's `reason` and `hint` are relayed verbatim — they are the
+ * "Could not enable ‹signal›: ‹reason›" of AAP §0.5.5's degradation rows — and
+ * are never registered as product-authored, so the capture gate never quotes
+ * them in a refusal. Only the fallbacks this module writes for a row that
+ * states none are registered: a sentence naming the adapter's registered id
+ * and the row's schema-validated status, and the generic next step.
+ */
 function rowEntry(signal: CaptureSignal, attributed: AttributedRow): UnavailableSignal {
   const { adapterId, row } = attributed;
 
   return {
     signal,
-    reason: row.reason ?? `the ${adapterId} adapter reported it as ${row.status}`,
-    hint: row.hint ?? GATE_WORDING.adapterFailed.hint,
+    reason:
+      row.reason ?? authorProductText(`the ${adapterId} adapter reported it as ${row.status}`),
+    hint: row.hint ?? gateWording(GATE_WORDING.adapterFailed.hint),
   };
 }
 
@@ -1701,14 +2020,16 @@ async function evaluatePass(input: PassInput): Promise<PassOutcome> {
     }
 
     if (isBlockingGate(gate)) {
-      blocking.push(gateEntry(signal, gate));
+      blocking.push(gateEntry(signal, gate, browserAgent));
 
       if (gate === 'no-tab') {
         tabMissing = true;
       } else if (boundTab !== undefined && reload === undefined) {
         const documentId = gate === 'hook-late' ? browserAgent?.documentId : undefined;
         const reason =
-          gate === 'hook-late' ? GATE_WORDING.hookLate.reason : GATE_WORDING.noAgent.reason;
+          gate === 'hook-late'
+            ? lateInstallWording(browserAgent).reason
+            : GATE_WORDING.noAgent.reason;
         reload = {
           tabId: boundTab.tabId,
           ...(documentId === undefined ? {} : { documentId }),
@@ -1729,7 +2050,7 @@ async function evaluatePass(input: PassInput): Promise<PassOutcome> {
     if (gap !== undefined) {
       degraded.push(rowEntry(signal, gap));
     } else if (gate === 'react-absent') {
-      degraded.push(gateEntry(signal, gate));
+      degraded.push(gateEntry(signal, gate, browserAgent));
     }
   }
 
@@ -1793,16 +2114,19 @@ async function evaluatePass(input: PassInput): Promise<PassOutcome> {
 }
 
 /**
- * The wait for a reload, clamped: the default when nothing usable was
- * injected, `0` to ask without waiting, and never above
- * {@link MAX_RELOAD_WAIT_MS}.
+ * An injected wait, clamped: `fallback` when nothing usable was injected (absent,
+ * not finite, or negative), `0` to not wait at all, whole milliseconds, and
+ * never above `ceiling`. Used for {@link EvaluateReadinessDeps.reloadWaitMs}
+ * ({@link DEFAULT_RELOAD_WAIT_MS}, {@link MAX_RELOAD_WAIT_MS}) and
+ * {@link EvaluateReadinessDeps.navigationSettleMs}
+ * ({@link DEFAULT_NAVIGATION_SETTLE_MS}, {@link MAX_NAVIGATION_SETTLE_MS}).
  */
-function resolveReloadWaitMs(value: number | undefined): number {
+function resolveWaitMs(value: number | undefined, fallback: number, ceiling: number): number {
   if (value === undefined || !Number.isFinite(value) || value < 0) {
-    return DEFAULT_RELOAD_WAIT_MS;
+    return fallback;
   }
 
-  return Math.min(Math.floor(value), MAX_RELOAD_WAIT_MS);
+  return Math.min(Math.floor(value), ceiling);
 }
 
 /** The ledger key of one reload request: one per session, tab and document. */
@@ -1828,7 +2152,7 @@ function askForReload(
   if (deps.reloadPrompts?.has(key) === true) {
     log.debug('The reload was already requested for this document', {
       tabId: reload.tabId,
-      documentId: reload.documentId,
+      ...documentLogFields(reload.documentId),
     });
     return false;
   }
@@ -1850,36 +2174,55 @@ function askForReload(
       return false;
     }
   } catch (thrown) {
-    log.warn('Emitting the reload request failed', { errorName: errorName(thrown) });
+    log.warn('Emitting the reload request failed', exceptionFields(thrown));
     return false;
   }
 
   deps.reloadPrompts?.add(key);
   log.info('Asked the developer to reload the bound tab', {
     tabId: reload.tabId,
-    documentId: reload.documentId,
+    ...documentLogFields(reload.documentId),
   });
 
   return true;
 }
 
+/** What one bounded wait for a tab's next `agent.ready` is about. */
+interface NextAgentReadyWait {
+  /** The tab whose next report is awaited. */
+  readonly tabId: number;
+
+  /** The document already known; only a report for another document answers. */
+  readonly afterDocumentId: string | undefined;
+
+  /** The port's deadline, in milliseconds; `0` does not wait at all. */
+  readonly timeoutMs: number;
+
+  /** Abandons the wait early; already aborted, the wait never starts. */
+  readonly signal: AbortSignal | undefined;
+
+  /** The `warn` line a rejecting port is logged with; the error's name is its only field. */
+  readonly failureMessage: string;
+}
+
 /**
- * Waits, bounded, for the `agent.ready` that follows a reload.
+ * Waits, bounded, for a tab's next `agent.ready` — the one wait behind both the
+ * navigation settle ({@link settleCurrentDocument}) and the reload.
  *
- * The port is asked for the next report whose document differs from the one
- * the gate failed on. Its promise is raced against a backstop timer that fires
+ * The port is asked for the next report whose document differs from
+ * `afterDocumentId`. Its promise is raced against a backstop timer that fires
  * {@link WAIT_BACKSTOP_GRACE_MS} after the port's own deadline and against the
  * abort signal, and a rejection is contained — so this never waits longer than
  * the stated bound and never throws. The timer and listener are always
  * released.
  */
-async function waitForReload(
+async function waitForNextAgentReady(
   agents: BrowserAgentRegistry,
-  reload: ReloadAsk,
-  timeoutMs: number,
-  signal: AbortSignal | undefined,
+  wait: NextAgentReadyWait,
   log: Logger,
 ): Promise<AgentReadyPayload | undefined> {
+  const { tabId, afterDocumentId, timeoutMs, signal } = wait;
+
   if (timeoutMs <= 0 || signal?.aborted === true) {
     return undefined;
   }
@@ -1887,7 +2230,7 @@ async function waitForReload(
   const options: WaitForAgentReadyOptions = {
     timeoutMs,
     ...(signal === undefined ? {} : { signal }),
-    ...(reload.documentId === undefined ? {} : { afterDocumentId: reload.documentId }),
+    ...(afterDocumentId === undefined ? {} : { afterDocumentId }),
   };
 
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -1904,9 +2247,9 @@ async function waitForReload(
   });
 
   const waited = Promise.resolve()
-    .then(() => agents.waitForAgentReady(reload.tabId, options))
+    .then(() => agents.waitForAgentReady(tabId, options))
     .catch((thrown: unknown) => {
-      log.warn('Waiting for the reloaded page agent failed', { errorName: errorName(thrown) });
+      log.warn(wait.failureMessage, exceptionFields(thrown));
       return undefined;
     });
 
@@ -1921,6 +2264,116 @@ async function waitForReload(
       signal?.removeEventListener('abort', onAbort);
     }
   }
+}
+
+/**
+ * When the registry received the report of `documentId`: its receipt time while
+ * the registry still holds that very report and knows when it arrived,
+ * `undefined` otherwise — and for a registry that throws — so the caller stamps
+ * the report with its own clock instead.
+ */
+function receivedAtOf(
+  agents: BrowserAgentRegistry,
+  tabId: number,
+  documentId: string,
+): number | undefined {
+  if (agents.latestAgentReadyAt === undefined) {
+    return undefined;
+  }
+
+  try {
+    if (agents.latestAgentReady(tabId)?.documentId !== documentId) {
+      return undefined;
+    }
+
+    const receivedAt = agents.latestAgentReadyAt(tabId);
+    return isEpochMs(receivedAt) ? receivedAt : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** What {@link settleCurrentDocument} confirms, and with what. */
+interface CurrentDocumentCheck {
+  readonly agents: BrowserAgentRegistry;
+  readonly boundTab: BoundTab;
+  /** The bound tab's latest report, as {@link readBoundTabAgent} read it. */
+  readonly agent: ObservedBrowserAgent | undefined;
+  /** The resolved {@link EvaluateReadinessDeps.navigationSettleMs}. */
+  readonly settleMs: number;
+  readonly signal: AbortSignal | undefined;
+  readonly clock: () => number;
+  readonly log: Logger;
+}
+
+/**
+ * Confirms that the report readiness is about to judge is the bound tab's
+ * current document (see "The current document" in the module overview).
+ *
+ * A report on the page the binding records, with no navigation recorded after
+ * it arrived ({@link isTrustedOnSight}), is returned as it is, without
+ * waiting. One for another page — or received before the tab's latest recorded
+ * navigation, as a reload or a same-URL load leaves it — is not trusted on
+ * sight: the registry is asked, for at most `settleMs` plus the backstop
+ * grace, for the document that replaced it ({@link waitForNextAgentReady}).
+ *
+ * - A report that arrives for the bound tab and origin with another document
+ *   id is the current document. It is stamped with the registry's receipt time
+ *   when the registry holds that document, else with the clock.
+ * - A report that arrives for the bound tab from another origin is a document
+ *   the binding no longer covers: no page agent is known for the current
+ *   document, exactly as {@link readBoundTabAgent} reads such a report.
+ * - Nothing within the bound — a zero wait, an aborted request, a timeout, a
+ *   port that rejects or never answers, or an answer about another tab or the
+ *   same document — means no replacement document announced itself. That is
+ *   read as a navigation that stayed within one document (the history API),
+ *   and the original report is kept.
+ *
+ * Never throws, and never waits longer than the stated bound.
+ */
+async function settleCurrentDocument(
+  check: CurrentDocumentCheck,
+): Promise<ObservedBrowserAgent | undefined> {
+  const { agents, boundTab, agent, settleMs, signal, clock, log } = check;
+
+  if (agent === undefined || isTrustedOnSight(agents, agent, boundTab)) {
+    return agent;
+  }
+
+  const waited = settleMs > 0 && signal?.aborted !== true;
+  const next = await waitForNextAgentReady(
+    agents,
+    {
+      tabId: boundTab.tabId,
+      afterDocumentId: agent.documentId,
+      timeoutMs: settleMs,
+      signal,
+      failureMessage: 'Waiting for the page agent of the navigated document failed',
+    },
+    log,
+  );
+
+  if (next === undefined || next.tabId !== boundTab.tabId || next.documentId === agent.documentId) {
+    log.debug('No new document announced itself on the bound page; keeping the latest report', {
+      tabId: boundTab.tabId,
+      waited,
+    });
+    return agent;
+  }
+
+  if (!describesBoundDocument(next, boundTab)) {
+    log.debug('The document that replaced the report is outside the binding; no current report', {
+      tabId: boundTab.tabId,
+    });
+    return undefined;
+  }
+
+  log.debug('The bound tab reported the document it navigated to', { tabId: boundTab.tabId });
+
+  return toObservedBrowserAgent(
+    next,
+    receivedAtOf(agents, boundTab.tabId, next.documentId) ?? clock(),
+  );
 }
 
 /** Validates an evaluation request. */
@@ -1992,12 +2445,22 @@ function checkEvaluateRequest(request: EvaluateReadinessRequest): Result<void, D
  *    `deriveServerAgentSignals` for the dev-server preload.
  * 2. **Adapters** are the registry's — the one each action was normalised to
  *    and every applicable claimant of each action type — deduplicated and asked
- *    in registry order. A probe that fails is a degraded gap, never an error.
+ *    in registry order. A probe that fails is never an error: its signals read
+ *    `unavailable`, so each stays deliverable only when another adapter's row
+ *    confirms it.
  * 3. **Page facts** are read fresh for the bound tab, so the verdict describes
  *    the document open now, and handed to the adapters on a copy of the
- *    context; the context itself is never mutated.
+ *    context; the context itself is never mutated. A report whose origin and
+ *    path differ from the binding's URL, or that arrived before the tab's
+ *    latest recorded navigation, is not trusted on sight: the document
+ *    that replaced it is awaited for at most
+ *    {@link EvaluateReadinessDeps.navigationSettleMs} and, when one reports,
+ *    its facts are the ones judged; when none does, the navigation stayed
+ *    within one document and the report is kept (see "The current document"
+ *    in the module overview).
  * 4. **Gates** apply as the module overview's table states: a missing binding,
- *    a missing page agent and a React hook installed after React block; a
+ *    a missing page agent and a page agent installed late
+ *    (`installedBeforeReact` false) block every planned browser signal; a
  *    missing preload, a page without React and every adapter-reported gap
  *    degrade; nothing deliverable at all blocks.
  * 5. **The reload.** When a page gate blocks and the request allows it, one
@@ -2044,7 +2507,7 @@ export async function evaluateReadiness(
   const { context, plan, boundTab } = request;
   const sessionId = context.sessionId;
   const log = bindLogger(deps.logger, sessionId);
-  const clock = totalClock(deps.now);
+  const clock = totalClock(deps.now, log);
   const planned = derivePlannedSignals(plan.instrumentationTargets);
   const selection = selectAdapters(deps.adapters, context, plan.instrumentationTargets, log);
 
@@ -2061,7 +2524,21 @@ export async function evaluateReadiness(
   });
 
   const initialAgent =
-    boundTab === undefined ? undefined : readBoundTabAgent(deps.agents, boundTab, clock, [], log);
+    boundTab === undefined
+      ? undefined
+      : await settleCurrentDocument({
+          agents: deps.agents,
+          boundTab,
+          agent: readBoundTabAgent(deps.agents, boundTab, clock, [], log),
+          settleMs: resolveWaitMs(
+            deps.navigationSettleMs,
+            DEFAULT_NAVIGATION_SETTLE_MS,
+            MAX_NAVIGATION_SETTLE_MS,
+          ),
+          signal: request.signal,
+          clock,
+          log,
+        });
   let outcome = await evaluatePass(passInput(initialAgent));
   let reloadRequested = false;
 
@@ -2075,11 +2552,15 @@ export async function evaluateReadiness(
   ) {
     reloadRequested = askForReload(deps, sessionId, reload, log);
 
-    const next = await waitForReload(
+    const next = await waitForNextAgentReady(
       deps.agents,
-      reload,
-      resolveReloadWaitMs(deps.reloadWaitMs),
-      request.signal,
+      {
+        tabId: reload.tabId,
+        afterDocumentId: reload.documentId,
+        timeoutMs: resolveWaitMs(deps.reloadWaitMs, DEFAULT_RELOAD_WAIT_MS, MAX_RELOAD_WAIT_MS),
+        signal: request.signal,
+        failureMessage: 'Waiting for the reloaded page agent failed',
+      },
       log,
     );
 
@@ -2090,7 +2571,7 @@ export async function evaluateReadiness(
     ) {
       log.info('The bound tab reported a new document; evaluating readiness again', {
         tabId: boundTab.tabId,
-        documentId: next.documentId,
+        ...documentLogFields(next.documentId),
       });
       outcome = await evaluatePass(passInput(toObservedBrowserAgent(next, clock())));
     } else {
@@ -2121,7 +2602,7 @@ export async function evaluateReadiness(
         log.warn('The ready-to-capture row was rejected and not sent', { code: sent.error.code });
       }
     } catch (thrown) {
-      log.warn('Emitting the ready-to-capture row failed', { errorName: errorName(thrown) });
+      log.warn('Emitting the ready-to-capture row failed', exceptionFields(thrown));
     }
   }
 

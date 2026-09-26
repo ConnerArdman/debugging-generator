@@ -964,6 +964,90 @@ export function redactStackUrls(value: unknown): string {
 }
 
 /**
+ * A query carried inside free text: a `?`, then a run up to the first
+ * whitespace, quote, angle bracket or backtick (the delimiters of
+ * {@link STACK_URL_PATTERN}) that holds at least one `name=value` pair before
+ * any `#`, then the fragment that follows it, if any.
+ *
+ * The first `=` must come before a second `?`, so `Why? a=b` or `a?b?c=1`
+ * anchor the match at the `?` that actually opens the pairs. A `?` with no pair
+ * after it — `Why?`, `?flag` — carries no value and is not matched.
+ *
+ * Global, and therefore used only with `replace`, which resets `lastIndex`
+ * around every call.
+ */
+const TEXT_QUERY_PATTERN = /\?[^\s"'<>`?#=]*=[^\s"'<>`#]*(?:#[^\s"'<>`]*)?/g;
+
+/**
+ * Punctuation that closes the sentence or the construct around an embedded
+ * query rather than belonging to its last value: brackets, a comma, a
+ * semicolon, a full stop, an exclamation mark.
+ */
+const TEXT_QUERY_TRAILING_PATTERN = /[)\]},;.!]+$/;
+
+/**
+ * Masks one query run found by {@link TEXT_QUERY_PATTERN}: every value becomes
+ * {@link REDACTION_MASK} through {@link redactQueryString}, a non-empty fragment
+ * becomes the mask too, and trailing sentence punctuation is kept verbatim.
+ */
+function maskTextQuery(run: string): string {
+  const trailing = TEXT_QUERY_TRAILING_PATTERN.exec(run)?.[0] ?? '';
+  const body = run.slice(1, run.length - trailing.length);
+  const hash = body.indexOf('#');
+  const query = hash === -1 ? body : body.slice(0, hash);
+  const fragment = hash === -1 ? undefined : body.slice(hash + 1);
+  const maskedFragment =
+    fragment === undefined ? '' : fragment.length === 0 ? '#' : `#${REDACTION_MASK}`;
+  return `?${redactQueryString(query)}${maskedFragment}${trailing}`;
+}
+
+/**
+ * Redacts every URL embedded in free text — a label, a selector, a sentence —
+ * leaving the text around it intact.
+ *
+ * Page-derived strings that are not URL-valued fields still carry URLs: a link
+ * whose visible text is its own address, an attribute selector such as
+ * `a[href="/reset?code=…"]`, a sentence quoting `/orders?id=…`. The privacy
+ * model's URL rule applies to them all (AAP 0.5.2: query values become `?` per
+ * key for display and storage), so two passes run:
+ *
+ * 1. every absolute `http`/`https` URL goes through {@link redactStackUrls} —
+ *    the same {@link redactUrl} treatment a request URL gets: query values and
+ *    a non-empty fragment masked, userinfo replaced, path scrubbed;
+ * 2. every remaining query run — the query of an origin-relative or bare
+ *    relative reference (`/p?id=7`, `p?id=7`, `?id=7`) — has its values masked
+ *    with {@link redactQueryString}, and a non-empty fragment after it becomes
+ *    `?`. Keys, their order, the path and the surrounding text are kept.
+ *
+ * Over-matching is the safe direction, as for {@link isUrlAttributeKey}: prose
+ * that merely looks like `a?b=c` is masked to `a?b=?`, which loses nothing a
+ * debugging question needs.
+ *
+ * Content scrubbing is **not** performed here: a caller runs `scrub` first, as
+ * `redactor.ts` does before {@link redactStackUrls}, so a credential is replaced
+ * by pattern before its position in a query is considered.
+ *
+ * **Idempotent** — a masked query re-masks to itself — and **never throws**,
+ * for any input of any type (`asScannableText` normalises a non-string).
+ *
+ * @example
+ * ```ts
+ * redactTextUrls('Visit /reset?coupon=SPRING and https://x.test/a?b=1#top');
+ * // → 'Visit /reset?coupon=? and https://x.test/a?b=?#?'
+ * ```
+ *
+ * @param value - Free text, already scrubbed by content.
+ * @returns The text with every embedded query value and fragment masked.
+ */
+export function redactTextUrls(value: unknown): string {
+  const absolute = redactStackUrls(value);
+  if (!absolute.includes('?')) {
+    return absolute;
+  }
+  return absolute.replace(TEXT_QUERY_PATTERN, maskTextQuery);
+}
+
+/**
  * Whether an attribute key names a URL value, and therefore selects
  * {@link redactUrl} in `redactor.ts`'s dispatch table.
  *

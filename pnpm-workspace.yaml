@@ -20,6 +20,25 @@ autoInstallPeers: true
 # actually skips the three hooks.
 enablePrePostScripts: true
 
+# NODE_OPTIONS for every script pnpm runs, which is where the one measured memory
+# requirement lives so that no script has to carry a runtime flag or a path into
+# node_modules. `pnpm lint` is exactly `eslint . --max-warnings 0` (AAP 0.8.5), and
+# its type-aware pass holds every project's TypeScript program in one process: on
+# the full tree it aborts with "JavaScript heap out of memory" under Node 24's
+# default ~4 GiB heap and completes with this 8 GiB ceiling. A ceiling is not an
+# allocation - a process that never approaches 4 GiB behaves exactly as before.
+#
+# pnpm replaces NODE_OPTIONS with this value rather than merging it, so the
+# inherited value is spliced back in through `${NODE_OPTIONS}`, which pnpm expands
+# from the environment when it reads this file: `--trace-warnings`, `--inspect` or a
+# developer's own `--import` still reach every script, and a caller's own
+# `--max-old-space-size` wins because Node applies the last occurrence. Unset, it
+# expands to nothing. The product code that launches instrumented dev servers
+# (apps/local-service/src/dev-server/launcher.ts, scripts/dev-instrumented.mjs)
+# appends its `--import` of the telemetry preload to whatever arrives here, and
+# never replaces it.
+nodeOptions: "--max-old-space-size=8192 ${NODE_OPTIONS}"
+
 # Dependency lifecycle scripts stay blocked unless they are allowlisted here, so
 # every entry below is a deliberate permission for third-party code to run at
 # install time and the list is kept to the packages that need one. `allowBuilds`
@@ -79,21 +98,21 @@ allowBuilds:
 # patched version stops being load-bearing and should be deleted, and the same
 # command proves that either way.
 #
-# THE GATE THAT ENFORCES THIS, and the one thing still to wire up: the policy above
-# holds for the committed lockfile, which audits clean, but nothing in the
-# repository re-checks it on the next lockfile change yet. The check is
+# THE GATE THAT ENFORCES THIS: the committed lockfile audits clean, and every
+# lockfile change is re-checked by
 #
 #   pnpm audit --audit-level=low
 #
-# and it belongs as a failing step of the `verify` job in .github/workflows/ci.yml,
-# after `pnpm install --frozen-lockfile`, when that workflow is authored (AAP 0.7.1
-# Group 0). It is deliberately NOT a root script and not part of the `verify`
-# script: AAP 0.7.1 Group 0 fixes the root script list and AAP 0.8.5 defines
-# `verify` exactly once, and `verify` must stay runnable offline, which an audit
-# call is not. A reviewed advisory - one accepted rather than eliminated - is
-# recorded here beside the overrides as a comment carrying its GHSA id, the reason
-# it is accepted and the date, so the exception is reviewable in the pull request
-# that adds it; there is none today.
+# which runs as the blocking "Audit dependencies" step of the `verify` job in
+# .github/workflows/ci.yml, directly after `pnpm install --frozen-lockfile`. Any
+# advisory at or above `low` fails that job until it is reconciled here. It is
+# deliberately NOT a root script and not part of the `verify` script: AAP 0.7.1
+# Group 0 fixes the root script list and AAP 0.8.5 defines `verify` exactly once,
+# and `verify` must stay runnable offline, which an audit call is not - so run the
+# same command locally before pushing a dependency change. A reviewed advisory -
+# one accepted rather than eliminated - is recorded here beside the overrides as a
+# comment carrying its GHSA id, the reason it is accepted and the date, so the
+# exception is reviewable in the pull request that adds it; there is none today.
 overrides:
   # GHSA-ggr8-5vv4-36mx (high): stack exhaustion when merging recursive object
   # graphs, patched in 8.0.0. Arrives as prisma -> @prisma/config -> deepmerge-ts,

@@ -23,9 +23,16 @@
  *
  * The assertions are behavioural on purpose. They read the page (how many
  * listeners are registered, which function is on the prototype, how many
- * observers are live) and the `agent.error` frames the agent posts, never this
- * folder's internals, so a different implementation of the same guarantee
- * still passes.
+ * observers are live) and the `agent.error` frames the agent dispatches, never
+ * this folder's internals, so a different implementation of the same
+ * guarantee still passes.
+ *
+ * The frames are read where the real bridge reads them: on the private channel
+ * node, through the fake bridge in `./__tests__/page-channel.ts`, which this
+ * file connects once at module scope. The same bridge is what the last
+ * `describe` uses to show *who* can trigger the teardown at all — the bridge,
+ * through the node, and not a page script posting an all-false `agent.config`
+ * to its own window.
  */
 /* eslint-disable @typescript-eslint/unbound-method -- this suite compares the
    *identity* of methods rather than calling them: `window.fetch` and the three
@@ -35,7 +42,9 @@
    to the stub observer's own methods. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { applyConfig } from './agent.js';
+import { bridgeFrameDetail, connectFakeBridge } from './__tests__/page-channel.js';
+import type { FakeBridge } from './__tests__/page-channel.js';
+import { applyConfig, getAgentState } from './agent.js';
 import { attachErrors, detachErrors, hasErrorsResidue, isErrorsAttached } from './errors.js';
 import {
   attachFetch,
@@ -53,12 +62,17 @@ import {
 } from './interaction.js';
 import { OBSERVED_ENTRY_TYPES, attachPerf, detachPerf, hasPerfResidue } from './perf.js';
 import {
+  AGENT_SOURCE_TAG,
+  BRIDGE_FRAME_EVENT,
+  BRIDGE_SOURCE_TAG,
+  CHANNEL_VERSION,
   MAX_PRODUCER_FAILURE_REPORTS,
   configureTransport,
   getProducerFailureStats,
   getTransportStats,
   reportProducerFailure,
   resetTransport,
+  subscribe,
 } from './transport.js';
 
 /*
@@ -67,46 +81,35 @@ import {
  * ---------------------------------------------------------------------------
  */
 
-/** A frame the agent posted to the isolated-world bridge. */
+/** A frame the agent dispatched to the isolated-world bridge. */
 interface AgentFrame {
   type: string;
-  payload: Record<string, unknown>;
+  payload: Readonly<Record<string, unknown>>;
 }
 
 /** One entry of the listener ledger: what the page believes is registered. */
 type ListenerLedger = Map<string, number>;
 
 /**
- * Every frame the agent posted in the current test, oldest first.
+ * The fake bridge, holding the agent's channel node.
  *
- * `postFrame` hands everything it sends — telemetry batches and the
- * `agent.error` control frames these tests read — to `window.postMessage`, so
- * recording that one call site captures all of it and no bridge handshake is
- * needed. The frames are collected into an array rather than read back off a
- * spy, because `postMessage` is overloaded and its recorded arguments are
- * typed `any`.
+ * Everything the agent sends — telemetry batches and the `agent.error`
+ * control frames these tests read — is dispatched on that node and nowhere
+ * else, so this is the one place to read it from. Connected here, at module
+ * scope, because the agent's transport answers exactly one handshake request
+ * in the life of the document: `./agent.js` subscribed at import, this asks,
+ * and the node then survives every `resetTransport()` the cases below run. A
+ * control frame needs only the handshake, not a subscription, which is why the
+ * `agent.error` frames still arrive after `beforeEach` has reset the
+ * transport.
  */
-let postedFrames: unknown[] = [];
+const bridge: FakeBridge = connectFakeBridge({ subscribe });
 
-/** Every frame the agent has posted in this test, in order. */
+/** Every frame the agent has dispatched in this test, in order. */
 function agentFrames(): AgentFrame[] {
-  const frames: AgentFrame[] = [];
-  for (const message of postedFrames) {
-    if (typeof message !== 'object' || message === null) {
-      continue;
-    }
-    const frame = message as { source?: unknown; type?: unknown; payload?: unknown };
-    if (frame.source !== 'debuggen-agent' || typeof frame.type !== 'string') {
-      continue;
-    }
-    const payload = frame.payload;
-    frames.push({
-      type: frame.type,
-      payload:
-        typeof payload === 'object' && payload !== null ? (payload as Record<string, unknown>) : {},
-    });
-  }
-  return frames;
+  return bridge.frames
+    .filter((frame) => frame.source === AGENT_SOURCE_TAG)
+    .map((frame) => ({ type: frame.type, payload: frame.payload }));
 }
 
 /** The `producer-failure` frames among them. */
@@ -194,10 +197,7 @@ function installPageHarness(): PageHarness {
 
 beforeEach(() => {
   resetTransport();
-  postedFrames = [];
-  vi.spyOn(window, 'postMessage').mockImplementation((message: unknown): void => {
-    postedFrames.push(message);
-  });
+  bridge.clear();
   configureTransport({ sessionId: 'sess-cleanup', captureId: 'cap-cleanup', enabled: true });
 });
 
@@ -395,10 +395,7 @@ describe('deferred work that outlived its capture', () => {
       // enter it: an event stamped with B's capture id but describing A's
       // interaction would be evidence of something that never happened in B.
       resetTransport();
-      postedFrames = [];
-      vi.spyOn(window, 'postMessage').mockImplementation((message: unknown): void => {
-        postedFrames.push(message);
-      });
+      bridge.clear();
       configureTransport({ sessionId: 'sess-cleanup', captureId: 'cap-b', enabled: true });
       attachInteractions();
       expect(getTransportStats().seq).toBe(0);
@@ -725,5 +722,152 @@ describe('unreleased hooks, as the agent announces them', () => {
     expect(unreleasedFrames()).toHaveLength(0);
     expect(hasInteractionsResidue()).toBe(false);
     expect(hasErrorsResidue()).toBe(false);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Who can trigger the teardown
+ *
+ * AAP 0.5.1's "agent.config with all hooks false returns the browser agent to
+ * dormant" is a capability, and the cases above show what the agent does once
+ * it is exercised. These show who can exercise it: the bridge, through the
+ * channel node it was handed — and not a page script, whatever it posts to its
+ * own window or dispatches on the page, because the agent listens for bridge
+ * frames on that node and nowhere else.
+ * ---------------------------------------------------------------------------
+ */
+
+describe('who can return the agent to dormant', () => {
+  /** A capture with one hook, so "armed" is observable on the page. */
+  const ARMING = {
+    sessionId: 'sess-channel',
+    captureId: 'cap-channel',
+    hooks: { interactions: true },
+  };
+
+  /** The configuration that disarms: every hook false. */
+  const ALL_FALSE = {
+    sessionId: 'sess-channel',
+    captureId: 'cap-channel',
+    hooks: { interactions: false },
+  };
+
+  /** Macrotask yields a posted message is given to arrive before a case fails. */
+  const MAX_WAITED_TURNS = 20;
+
+  /** Yield one macrotask, the turn `window.postMessage` delivers on. */
+  async function nextTurn(): Promise<void> {
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 0);
+    });
+  }
+
+  /**
+   * Arm a capture the way a second capture on this document is armed.
+   *
+   * The disarm first is what re-subscribes the agent to the channel after
+   * `beforeEach` reset the transport, exactly as `./agent.ts` does at the end
+   * of every capture; the node the bridge holds is the same one throughout.
+   */
+  function armCapture(): void {
+    applyConfig({});
+    applyConfig(ARMING);
+    expect(getAgentState().armed).toBe(true);
+    expect(isInteractionsAttached()).toBe(true);
+  }
+
+  it('stays armed through every all-false agent.config a page script can send', async () => {
+    armCapture();
+
+    const posted: readonly unknown[] = [
+      // The version-2 frame, with a token of the length version 2 used — the
+      // replay the old window channel allowed.
+      {
+        source: BRIDGE_SOURCE_TAG,
+        version: CHANNEL_VERSION - 1,
+        type: 'agent.config',
+        token: 'f'.repeat(64),
+        payload: ALL_FALSE,
+      },
+      // Version 3's fields, and version 3's detail string, posted instead of
+      // dispatched on the node.
+      {
+        source: BRIDGE_SOURCE_TAG,
+        version: CHANNEL_VERSION,
+        type: 'agent.config',
+        payload: ALL_FALSE,
+      },
+      bridgeFrameDetail('agent.config', ALL_FALSE),
+    ];
+
+    let arrived = 0;
+    const onMessage = (): void => {
+      arrived += 1;
+    };
+    window.addEventListener('message', onMessage);
+
+    try {
+      for (const forgery of posted) {
+        window.postMessage(forgery, '*');
+      }
+      // A well-formed bridge frame, dispatched everywhere a page script can
+      // reach: nobody acknowledges it.
+      for (const target of [window, document, document.documentElement]) {
+        const unclaimed = target.dispatchEvent(
+          new CustomEvent(BRIDGE_FRAME_EVENT, {
+            detail: bridgeFrameDetail('agent.config', ALL_FALSE),
+            cancelable: true,
+          }),
+        );
+        expect(unclaimed).toBe(true);
+      }
+
+      for (let turn = 0; turn < MAX_WAITED_TURNS && arrived < posted.length; turn += 1) {
+        await nextTurn();
+      }
+      // Self-check: every posted forgery reached the page's window.
+      expect(arrived).toBe(posted.length);
+
+      expect(getAgentState().armed).toBe(true);
+      expect(isInteractionsAttached()).toBe(true);
+    } finally {
+      window.removeEventListener('message', onMessage);
+    }
+
+    // The same configuration from the bridge, on the node, does disarm: the
+    // forgeries were refused for where they came from, not for what they said.
+    expect(bridge.send('agent.config', ALL_FALSE)).toBe(true);
+    expect(getAgentState().armed).toBe(false);
+    expect(isInteractionsAttached()).toBe(false);
+  });
+
+  it('publishes nothing on __DEBUGGEN__ that leads to the channel node', () => {
+    armCapture();
+
+    // Every data value reachable from the helper, three levels deep, read from
+    // property descriptors so no getter runs.
+    const reachable: unknown[] = [];
+    let frontier: unknown[] = [Reflect.get(globalThis, '__DEBUGGEN__')];
+    for (let level = 0; level < 3; level += 1) {
+      const next: unknown[] = [];
+      for (const holder of frontier) {
+        if ((typeof holder !== 'object' && typeof holder !== 'function') || holder === null) {
+          continue;
+        }
+        for (const descriptor of Object.values(Object.getOwnPropertyDescriptors(holder))) {
+          if ('value' in descriptor) {
+            const held: unknown = descriptor.value;
+            reachable.push(held);
+            next.push(held);
+          }
+        }
+      }
+      frontier = next;
+    }
+
+    // Self-check: the helper is published and has members to walk.
+    expect(reachable.length).toBeGreaterThan(0);
+    expect(reachable).not.toContain(bridge.node);
   });
 });

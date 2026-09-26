@@ -130,7 +130,7 @@ import type {
   SessionRecord,
   SessionTracker,
 } from './helpers/fixtures';
-import { withEditorAnnouncement } from './helpers/demo-app';
+import { waitForStreamedContent, withEditorAnnouncement } from './helpers/demo-app';
 
 // ---------------------------------------------------------------------------
 // The question, the target and the demo's observable surface
@@ -307,9 +307,68 @@ interface VisitedProduct {
   readonly responseTexts: readonly string[];
 }
 
-/** When the capture moved from the first product to the second (Node epoch milliseconds). */
+/**
+ * When the capture moved from the first product to the second, and which visit
+ * each page document belongs to.
+ */
 interface CaptureTimeline {
+  /** When the second product was opened (Node epoch milliseconds). */
   readonly secondVisitStartedAt: number;
+  /**
+   * The visit of each page document that sent capture events, by producer id:
+   * the visit its earliest event started in.
+   */
+  readonly documentVisits: ReadonlyMap<string, Visit>;
+  /** The producer of each captured event, by event id. */
+  readonly producerOfEvent: ReadonlyMap<string, string>;
+  /**
+   * When the reproduction navigated each page document away (the reload that
+   * opened the first product, the navigation that opened the second), by
+   * producer id: the first navigation mark after the document's earliest event.
+   * A document keeps running until its successor commits, and the requests it
+   * starts in that window are cancelled by the navigation.
+   */
+  readonly navigatedAwayAt: ReadonlyMap<string, number>;
+}
+
+/**
+ * The capture's timeline. A request belongs to the product whose page issued
+ * it: the first product's document keeps running its ticker-driven refetches
+ * until the second product's document commits, so a request it starts after
+ * the second visit began — while that navigation is still in flight — is still
+ * a first-product request. Each browser document (its own `producerId`) is
+ * therefore assigned to the visit its earliest event started in, and an event
+ * is judged by its document; only an event without a known document is judged
+ * by its start time.
+ */
+function captureTimeline(
+  marks: { readonly firstVisitStartedAt: number; readonly secondVisitStartedAt: number },
+  captured: readonly TelemetryEvent[],
+): CaptureTimeline {
+  const { secondVisitStartedAt } = marks;
+  const navigations = [marks.firstVisitStartedAt, secondVisitStartedAt].sort((a, b) => a - b);
+  const earliest = new Map<string, number>();
+  const producerOfEvent = new Map<string, string>();
+  for (const event of captured) {
+    producerOfEvent.set(event.id, event.producerId);
+    if (event.tier !== 'browser') {
+      continue;
+    }
+    const seen = earliest.get(event.producerId);
+    if (seen === undefined || event.startTime < seen) {
+      earliest.set(event.producerId, event.startTime);
+    }
+  }
+  const documentVisits = new Map<string, Visit>();
+  const navigatedAwayAt = new Map<string, number>();
+  for (const [producerId, startTime] of earliest) {
+    documentVisits.set(producerId, startTime < secondVisitStartedAt ? 'first' : 'second');
+    const leftAt = navigations.find((mark) => mark > startTime);
+    if (leftAt !== undefined) {
+      navigatedAwayAt.set(producerId, leftAt);
+    }
+  }
+  return { secondVisitStartedAt, documentVisits, producerOfEvent, navigatedAwayAt };
 }
 
 let tracker: SessionTracker | undefined;
@@ -394,14 +453,39 @@ function visitOf(startTime: number, captured: CaptureTimeline): Visit {
   return startTime < captured.secondVisitStartedAt ? 'first' : 'second';
 }
 
-/** The visits a group's occurrences (and its first and last start) fall in. */
+/** The visit of one event: its page document's, else its start time's. */
+function visitOfEvent(
+  event: { readonly startTime: number; readonly producerId: string | undefined },
+  captured: CaptureTimeline,
+): Visit {
+  const byDocument =
+    event.producerId === undefined ? undefined : captured.documentVisits.get(event.producerId);
+  return byDocument ?? visitOf(event.startTime, captured);
+}
+
+/**
+ * The visits a group's occurrences fall in, each judged by the document that
+ * issued it; a group that lists no occurrence is judged by its first and last
+ * start.
+ */
 function visitsOfGroup(group: RequestGroup, captured: CaptureTimeline): Set<Visit> {
-  const visits = new Set<Visit>([
-    visitOf(group.firstStartTime, captured),
-    visitOf(group.lastStartTime, captured),
-  ]);
+  if (group.occurrences.length === 0) {
+    return new Set<Visit>([
+      visitOf(group.firstStartTime, captured),
+      visitOf(group.lastStartTime, captured),
+    ]);
+  }
+  const visits = new Set<Visit>();
   for (const occurrence of group.occurrences) {
-    visits.add(visitOf(occurrence.startTime, captured));
+    visits.add(
+      visitOfEvent(
+        {
+          startTime: occurrence.startTime,
+          producerId: captured.producerOfEvent.get(occurrence.eventId),
+        },
+        captured,
+      ),
+    );
   }
   return visits;
 }
@@ -497,7 +581,7 @@ function railRendersOfVisit(
     if (
       event.kind === 'render' &&
       stringAttribute(event, 'component') === RAIL_COMPONENT &&
-      visitOf(event.startTime, captured) === visit
+      visitOfEvent(event, captured) === visit
     ) {
       const chain = ownerChainOf(event);
       if (chain.length > 0) {
@@ -777,6 +861,7 @@ async function settlePage(page: Page): Promise<void> {
       await delay(SETTLE_POLL_MS);
     }
     await page.waitForLoadState('load', { timeout: NAVIGATION_TIMEOUT_MS });
+    await waitForStreamedContent(page);
   } finally {
     page.off('framenavigated', onNavigated);
   }
@@ -970,11 +1055,12 @@ test.describe('demo defect 3 — duplicate recommendations requests', () => {
     // product page so both rails mount and fetch, let the header's
     // ticker-driven renders provoke refetches, then open a second product.
     // Each step moves on only once its evidence is stored.
+    let firstVisitStartedAt: number | undefined;
     let secondVisitStartedAt: number | undefined;
     const beforeCapture: SessionPreparation = ({ appPage: page }) => settlePage(page);
     const interact: SessionInteraction = async ({ appPage: page }) => {
       const sessionId = currentSessionId(active);
-      const firstVisitStartedAt = Date.now();
+      firstVisitStartedAt = Date.now();
       await reloadPage(page);
       await expectBothRailsMounted(page);
       await awaitRecommendationRequests(service, sessionId, firstVisitStartedAt, 'first product');
@@ -1070,9 +1156,6 @@ test.describe('demo defect 3 — duplicate recommendations requests', () => {
     session = run.session;
     analysis = run.analysis;
     panelSpec = run.panel;
-    timeline = {
-      secondVisitStartedAt: required(secondVisitStartedAt, 'the second visit start time'),
-    };
     products = [
       {
         ...firstProduct,
@@ -1088,6 +1171,13 @@ test.describe('demo defect 3 — duplicate recommendations requests', () => {
     events = (
       await service.queryAllPanelData(sessionId, { source: 'events', limit: DATA_QUERY_MAX_LIMIT })
     ).items;
+    timeline = captureTimeline(
+      {
+        firstVisitStartedAt: required(firstVisitStartedAt, 'the first visit start time'),
+        secondVisitStartedAt: required(secondVisitStartedAt, 'the second visit start time'),
+      },
+      events,
+    );
     groups = (
       await service.queryAllPanelData(sessionId, {
         source: 'requests',
@@ -1369,6 +1459,7 @@ test.describe('demo defect 3 — duplicate recommendations requests', () => {
 
   test('stores the requests redacted, without bodies or header values', () => {
     const all = required(events, 'the captured events');
+    const captured = required(timeline, 'the capture timeline');
     const [first, second] = required(products, 'the visited products');
     const requests = all.filter(isRecommendationsRequest);
     expect(requests.length).toBeGreaterThanOrEqual(2 * MIN_OCCURRENCES_PER_PRODUCT);
@@ -1439,16 +1530,23 @@ test.describe('demo defect 3 — duplicate recommendations requests', () => {
       // A status code on every settled request, always the route's success
       // status. The hook aborts the request its previous effect run left in
       // flight, so an aborted request settles as an error without one; a
-      // request still open when the capture stopped has none either.
+      // request its page started after the reproduction navigated that page
+      // away is cancelled when the next document commits, a network error
+      // without one; a request still open when the capture stopped has none
+      // either.
       const statusCode = numberAttribute(event, 'http.status_code');
       if (statusCode !== undefined) {
         expect(statusCode, `${where}: status`).toBe(EXPECTED_STATUS);
         settled += 1;
       } else {
+        const leftAt = captured.navigatedAwayAt.get(event.producerId);
+        const cancelledByNavigation =
+          event.status === 'error' && leftAt !== undefined && event.startTime >= leftAt;
         expect(
           (event.status === 'error' && event.attributes.aborted === true) ||
+            cancelledByNavigation ||
             event.attributes.inFlight === true,
-          `${where}: a request without a status code was aborted or was still in flight when the capture stopped`,
+          `${where}: a request without a status code was aborted, cancelled by its page's navigation, or still in flight when the capture stopped`,
         ).toBe(true);
       }
     }

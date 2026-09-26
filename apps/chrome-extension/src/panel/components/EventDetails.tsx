@@ -38,9 +38,39 @@
  *                              (AAP 0.5.5);
  *   - no `event`             → `EmptyState` naming how to select one;
  *   - an `event`             → the body: summary line and badges, timing,
- *                              `Section`s for Source, Parent chain (only when a
- *                              chain was supplied), Attributes (`DataTable`) and
- *                              Identity.
+ *                              `Section`s for Source, Parent chain, Attributes
+ *                              (`DataTable`) and Identity.
+ *
+ * The Parent chain section renders for every shown event, so "no parent",
+ * "parent not in the capture" and "not looked up yet" never look alike. What it
+ * holds follows from the event and the `ancestry` the composition root
+ * resolved for it ({@link EventAncestry}):
+ *
+ *   - no `parentSpanId`      → the event is its trace's root (any `ancestry`
+ *                              is ignored);
+ *   - no `ancestry`          → a neutral sentence: the event has a parent span
+ *                              whose ancestors have not been looked up;
+ *   - `loading`              → a one-row `LoadingState`;
+ *   - `complete`             → the ordered chain, trace root first and the
+ *                              selected event last;
+ *   - `missing`              → why the chain stops (the immediate parent, or an
+ *                              ancestor's parent, is not part of the capture),
+ *                              the missing span id as copyable text and the
+ *                              known part of the chain beneath the gap;
+ *   - `incomplete`           → how many stored events of the trace were read
+ *                              without finding the parent span, the missing
+ *                              span id and the known part of the chain;
+ *   - `cycle`                → that the recorded parent links loop, and the
+ *                              chain up to the loop;
+ *   - `error`                → a polite `ErrorState` with a retry action when
+ *                              `onRetryAncestry` is supplied.
+ *
+ * A partial chain opens with a muted, non-interactive marker saying that the
+ * ancestors above it are unknown, so a fragment is never read as the whole
+ * lineage. A `complete` chain that does not reach a trace root (it is empty,
+ * or its first entry still names a parent) is contradictory and is shown as
+ * `missing` at the first unresolved span: a false complete chain is never
+ * presented.
  *
  * ## Evidence fidelity and privacy (AAP 0.5.2)
  *
@@ -72,6 +102,14 @@
  *   moved to the newly shown event's name once it arrives rather than being
  *   dropped to the document body. Focus on opening and after closing the
  *   drawer belongs to the composition root, which owns the drawer's pane.
+ * - A partial chain's first item is muted text, not a control, so the list's
+ *   position count stays honest and nothing in it pretends to be selectable.
+ *   The missing span id is `Code` behind a visible label, so it can be read
+ *   and copied into a trace search.
+ * - The parent-chain lookup announces itself politely: its loading row is a
+ *   `role="status"` region, and its failure is an `ErrorState` rendered with
+ *   `announce="polite"`, because it is a subsection of a drawer that loaded —
+ *   the assertive alert stays reserved for the drawer's own failure.
  * - "Close" is a visible text button whose accessible name contains that text.
  *   Escape anywhere in the drawer closes it too, unless a control inside
  *   already consumed the key (the table's own Escape returns focus to its row).
@@ -94,15 +132,19 @@
  * client or `chrome.runtime` port), no `chrome.*` access (it renders unchanged
  * with `chrome.devtools` undefined), no store writes and no schema validation.
  * The only outbound calls are the injected `onOpenSource` and `onSelectEvent`
- * (plus `onClose` and `onRetry`). Protocol, schema and shared imports are
- * types, apart from `assertNever`. The copy is generic product vocabulary:
+ * (plus `onClose`, `onRetry` and `onRetryAncestry`). The ancestry arrives
+ * already resolved: this component never fetches an ancestor itself, it only
+ * states what the composition root found. Protocol, schema and shared imports
+ * are types, apart from `assertNever`. The copy is generic product vocabulary:
  * every name, path and statement on screen is captured data (AAP 0.5.4).
  *
  * @example
- * // The composition root, with the actions built once by `createPanelActions`:
+ * // The composition root, with the actions built once by `createPanelActions`
+ * // and the ancestry resolved across the stored trace for the selected event:
  * <EventDetails
  *   event={selectedEvent}
- *   parentChain={ancestors}
+ *   ancestry={{ state: 'complete', ancestors: resolvedAncestors }}
+ *   onRetryAncestry={retryAncestryLookup}
  *   onOpenSource={actions.onOpenSource}
  *   onSelectEvent={actions.onSelectEvent}
  *   onClose={actions.clearSelectedEvent}
@@ -170,6 +212,57 @@ export interface EventDetailsError {
 }
 
 /**
+ * What the composition root found when it looked up the selected event's
+ * ancestors, which the Parent chain section states as it is (see the module
+ * documentation for how each state renders). It is consulted only for an event
+ * that names a `parentSpanId`; a trace root needs no lookup.
+ *
+ * In every state that carries `ancestors`, the list is ordered from the
+ * topmost ancestor that was found down to the selected event's IMMEDIATE
+ * parent, and an entry with the selected event's own id is ignored. The chain
+ * is assumed to be linked in that order (each entry is the parent of the next);
+ * it is never synthesised from `parentSpanId` alone.
+ *
+ * - `loading` — the lookup is in flight.
+ * - `complete` — the chain reaches the trace root, which is its first entry.
+ * - `missing` — the whole trace was read and `missingSpanId`, the first span
+ *   id on the way up that no stored event carries, is not part of the capture.
+ *   `ancestors` is the part of the chain below that gap: empty when the
+ *   immediate parent itself is missing.
+ * - `incomplete` — the lookup stopped at its page bound after reading
+ *   `eventsRead` stored events of the trace without finding `missingSpanId`;
+ *   `ancestors` as for `missing`.
+ * - `cycle` — the recorded parent links loop; `ancestors` is the chain up to
+ *   the loop.
+ * - `error` — the lookup failed; `onRetryAncestry` retries it.
+ *
+ * @example
+ * // The immediate parent was found; the span it names as its own parent
+ * // (`grandparentSpanId`) is carried by no stored event of the trace:
+ * const ancestry: EventAncestry = {
+ *   state: 'missing',
+ *   missingSpanId: grandparentSpanId,
+ *   ancestors: [parent],
+ * };
+ */
+export type EventAncestry =
+  | { readonly state: 'loading' }
+  | { readonly state: 'complete'; readonly ancestors: readonly TelemetryEvent[] }
+  | {
+      readonly state: 'missing';
+      readonly missingSpanId: string;
+      readonly ancestors: readonly TelemetryEvent[];
+    }
+  | {
+      readonly state: 'incomplete';
+      readonly missingSpanId: string;
+      readonly ancestors: readonly TelemetryEvent[];
+      readonly eventsRead: number;
+    }
+  | { readonly state: 'cycle'; readonly ancestors: readonly TelemetryEvent[] }
+  | { readonly state: 'error'; readonly error: EventDetailsError };
+
+/**
  * Props of {@link EventDetails}.
  *
  * Every optional member states `| undefined` explicitly, because
@@ -192,13 +285,18 @@ export interface EventDetailsProps {
   onOpenSource: (location: SourceLocation) => void;
 
   /**
-   * The selected event's ancestors, ordered from the trace root to its
-   * immediate parent. Omitted, no parent-chain section renders; the chain is
-   * never synthesised from `parentSpanId` alone. An entry with the selected
-   * event's own id is ignored, so a chain that ends with the event itself is
-   * accepted too.
+   * The outcome of the selected event's ancestor lookup
+   * ({@link EventAncestry}). Ignored for a trace root. Omitted for an event
+   * that names a parent, the Parent chain section says the ancestors have not
+   * been looked up — never that they are missing.
    */
-  parentChain?: readonly TelemetryEvent[] | undefined;
+  ancestry?: EventAncestry | undefined;
+
+  /**
+   * Retries a failed ancestor lookup — the retry action of the `error`
+   * ancestry state, which renders only when this is given.
+   */
+  onRetryAncestry?: (() => void) | undefined;
 
   /**
    * Selects another event — raised when an ancestor in the parent chain is
@@ -280,9 +378,53 @@ const NO_SOURCE_MESSAGE =
 /** The parent-chain text for a trace root. */
 const TRACE_ROOT_MESSAGE = 'This event is the root of its trace; it has no parent span.';
 
-/** The parent-chain text for an event whose parent never arrived. */
+/**
+ * The parent-chain text for an event that names a parent span when no lookup
+ * outcome was supplied. Neutral on purpose: nothing is known yet, so nothing is
+ * claimed missing.
+ */
+const ANCESTRY_NOT_LOOKED_UP_MESSAGE =
+  'This event has a parent span; its ancestors have not been looked up yet.';
+
+/** The parent-chain loading row's announced label. */
+const ANCESTRY_LOADING_LABEL = 'Loading the parent chain';
+
+/** The number of skeleton rows while the parent chain loads. */
+const ANCESTRY_LOADING_ROWS = 1;
+
+/** The parent-chain text for an event whose immediate parent never arrived. */
 const MISSING_PARENT_MESSAGE =
   'This event names a parent span that is not part of the capture, so its ancestors are unknown.';
+
+/** The parent-chain text when an ancestor, not the immediate parent, is missing. */
+const MISSING_ANCESTOR_MESSAGE =
+  'An ancestor of this event names a parent span that is not part of the capture, so the chain above it is unknown.';
+
+/** The parent-chain text when the recorded parent links loop. */
+const CYCLE_MESSAGE =
+  'The recorded parent links of this trace form a loop, so the full ancestry of this event cannot be stated.';
+
+/** The label of the copyable span id the chain stops at. */
+const MISSING_SPAN_LABEL = 'Missing span ID';
+
+/**
+ * The first, non-interactive item of a partial chain, stating that the
+ * ancestors above the first one shown are unknown — one wording per reason the
+ * chain stops there.
+ */
+const UNKNOWN_ABOVE_MISSING_MARKER =
+  'Ancestors above this point are unknown: a parent span is not part of the capture.';
+const UNKNOWN_ABOVE_INCOMPLETE_MARKER =
+  'Ancestors above this point are unknown: a parent span was not among the events read.';
+const UNKNOWN_ABOVE_CYCLE_MARKER =
+  'Ancestors above this point are unknown: the recorded parent links form a loop.';
+
+/** The parent-chain failure's title. */
+const ANCESTRY_ERROR_TITLE = 'Could not load the parent chain';
+
+/** The parent-chain failure's message when the reported one has no text. */
+const ANCESTRY_ERROR_FALLBACK_MESSAGE =
+  'The ancestors of this event could not be looked up in the capture.';
 
 /** Marks the selected event at the end of the parent chain. */
 const CURRENT_EVENT_LABEL = 'selected';
@@ -613,6 +755,106 @@ function eventRefFor(event: TelemetryEvent): EventRef {
   return { eventId: event.id, traceId: event.traceId, spanId: event.spanId, kind: event.kind };
 }
 
+/**
+ * The stored events an `incomplete` lookup read, as the object of "was not
+ * among …": the count in the reader's locale with digit grouping, singular for
+ * one. A count that is not a non-negative whole number is left out rather than
+ * printed as a fabricated figure.
+ */
+function describeEventsRead(eventsRead: number): string {
+  if (!Number.isSafeInteger(eventsRead) || eventsRead < 0) {
+    return 'the stored events of this trace that were read';
+  }
+  const count = new Intl.NumberFormat(undefined, {
+    useGrouping: true,
+    maximumFractionDigits: 0,
+  }).format(eventsRead);
+  return eventsRead === 1
+    ? `the ${count} stored event of this trace that was read`
+    : `the ${count} stored events of this trace that were read`;
+}
+
+/**
+ * The parent-chain text for an `incomplete` lookup, naming the immediate
+ * parent when that is the span that was not found and an ancestor's parent
+ * otherwise.
+ */
+function incompleteAncestryMessage(immediateParentMissing: boolean, eventsRead: number): string {
+  const subject = immediateParentMissing
+    ? 'The parent span of this event'
+    : 'A parent span further up the chain';
+  return `${subject} was not among ${describeEventsRead(eventsRead)}, so the chain above it is not shown.`;
+}
+
+/** The ancestors without any entry carrying the selected event's own id. */
+function withoutSelectedEvent(
+  event: TelemetryEvent,
+  ancestors: readonly TelemetryEvent[],
+): readonly TelemetryEvent[] {
+  return ancestors.filter((ancestor) => ancestor.id !== event.id);
+}
+
+/**
+ * The ancestry the Parent chain section states, for an event that names
+ * `parentSpanId`.
+ *
+ * Applies the tolerances of {@link EventAncestry} and refuses the
+ * contradictions that would otherwise misstate the lineage:
+ *
+ * - every `ancestors` list loses entries carrying the selected event's id;
+ * - a `complete` chain must reach a trace root: an empty one is `missing` at
+ *   the event's own `parentSpanId`, and one whose first entry still names a
+ *   parent is `missing` at that parent;
+ * - a `missing` or `incomplete` gap at the event's own `parentSpanId` leaves no
+ *   chain below it, so any `ancestors` supplied with it are dropped rather than
+ *   shown as if they were linked to the selected event.
+ */
+function effectiveAncestry(
+  event: TelemetryEvent,
+  parentSpanId: string,
+  ancestry: EventAncestry,
+): EventAncestry {
+  switch (ancestry.state) {
+    case 'loading':
+    case 'error':
+      return ancestry;
+    case 'complete': {
+      const ancestors = withoutSelectedEvent(event, ancestry.ancestors);
+      const top = ancestors[0];
+      if (top === undefined) {
+        return { state: 'missing', missingSpanId: parentSpanId, ancestors };
+      }
+      if (top.parentSpanId !== undefined) {
+        return { state: 'missing', missingSpanId: top.parentSpanId, ancestors };
+      }
+      return { state: 'complete', ancestors };
+    }
+    case 'missing':
+      return {
+        state: 'missing',
+        missingSpanId: ancestry.missingSpanId,
+        ancestors:
+          ancestry.missingSpanId === parentSpanId
+            ? []
+            : withoutSelectedEvent(event, ancestry.ancestors),
+      };
+    case 'incomplete':
+      return {
+        state: 'incomplete',
+        missingSpanId: ancestry.missingSpanId,
+        eventsRead: ancestry.eventsRead,
+        ancestors:
+          ancestry.missingSpanId === parentSpanId
+            ? []
+            : withoutSelectedEvent(event, ancestry.ancestors),
+      };
+    case 'cycle':
+      return { state: 'cycle', ancestors: withoutSelectedEvent(event, ancestry.ancestors) };
+    default:
+      return assertNever(ancestry, 'Unhandled event ancestry state');
+  }
+}
+
 /*
  * ===========================================================================
  * Section D — building blocks
@@ -702,7 +944,11 @@ function AttributeValue(props: AttributeValueProps): ReactElement {
 /**
  * The attributes table's two columns. Neither sorts: the rows are a complete
  * local object rendered in capture order, and `DataTable` never sorts locally.
- * The tracks are `ch` minimums sharing the free width, as the table requires.
+ * Each width is the `DataTable` role for the column's content, never a length:
+ * the attribute key is a short `label`; the value is a `name`, which takes the
+ * larger share of the drawer's spare width and wraps inside its `Code` beyond
+ * that. Both roles have a readable floor, so a drawer narrower than the two
+ * scrolls the table instead of squeezing either column.
  */
 const ATTRIBUTE_COLUMNS: readonly DataTableColumn<AttributeRow>[] = [
   {
@@ -710,7 +956,7 @@ const ATTRIBUTE_COLUMNS: readonly DataTableColumn<AttributeRow>[] = [
     header: ATTRIBUTE_KEY_HEADER,
     rowHeader: true,
     sortable: false,
-    width: 'minmax(14ch, 1fr)',
+    width: 'label',
     cell: (row) => (
       <Code size="sm" wrap>
         {row.key}
@@ -721,7 +967,7 @@ const ATTRIBUTE_COLUMNS: readonly DataTableColumn<AttributeRow>[] = [
     key: 'value',
     header: ATTRIBUTE_VALUE_HEADER,
     sortable: false,
-    width: 'minmax(18ch, 2fr)',
+    width: 'name',
     cell: (row) => <AttributeValue row={row} />,
   },
 ];
@@ -770,36 +1016,41 @@ function SourceDetails(props: SourceDetailsProps): ReactElement {
   );
 }
 
-/** Props of {@link ParentChain}. */
-interface ParentChainProps {
+/** Props of {@link AncestorList}. */
+interface AncestorListProps {
   readonly event: TelemetryEvent;
-  readonly chain: readonly TelemetryEvent[];
+  /** Ordered from the topmost ancestor shown down to the immediate parent. */
+  readonly ancestors: readonly TelemetryEvent[];
+  /**
+   * The first, non-interactive item of a partial chain, saying why the
+   * ancestors above it are unknown; `undefined` for a chain that reaches the
+   * trace root.
+   */
+  readonly unknownAboveMarker: string | undefined;
   readonly onSelectEvent: ((ref: EventRef) => void) | undefined;
 }
 
 /**
- * The selected event's ancestry as an ordered list, from the trace root down
- * to the selected event itself (the final, `aria-current` item). Each ancestor
- * is a button selecting it when a selection handler exists, and plain text
- * otherwise. An empty chain states whether the event is a trace root or names
- * a parent the capture does not hold.
+ * The known part of the selected event's ancestry as an ordered list, from the
+ * topmost ancestor shown down to the selected event itself (the final,
+ * `aria-current` item). A partial chain opens with a muted marker item; each
+ * ancestor is a button selecting it when a selection handler exists, and plain
+ * text otherwise.
  */
-function ParentChain(props: ParentChainProps): ReactElement {
-  const { event, chain, onSelectEvent } = props;
-  const ancestors = chain.filter((ancestor) => ancestor.id !== event.id);
-
-  if (ancestors.length === 0) {
-    return (
-      <Text as="p" size="sm" tone="muted">
-        {event.parentSpanId === undefined ? TRACE_ROOT_MESSAGE : MISSING_PARENT_MESSAGE}
-      </Text>
-    );
-  }
+function AncestorList(props: AncestorListProps): ReactElement {
+  const { event, ancestors, unknownAboveMarker, onSelectEvent } = props;
 
   return (
     // The list inherits the block's type role, so its numerals match the items.
     <Text as="div" size="sm">
       <ol>
+        {unknownAboveMarker === undefined ? null : (
+          <li>
+            <Text size="sm" tone="muted">
+              {unknownAboveMarker}
+            </Text>
+          </li>
+        )}
         {ancestors.map((ancestor, index) => (
           // The index is part of the key: a malformed chain may repeat an id.
           <li key={`${String(index)}:${ancestor.id}`}>
@@ -832,6 +1083,160 @@ function ParentChain(props: ParentChainProps): ReactElement {
       </ol>
     </Text>
   );
+}
+
+/** Props of {@link ChainGap}. */
+interface ChainGapProps {
+  readonly event: TelemetryEvent;
+  /** Why the chain stops, as one sentence. */
+  readonly message: string;
+  /** The span id the chain stops at, shown copyably; omitted for a loop. */
+  readonly missingSpanId: string | undefined;
+  /** The known part of the chain below the gap, possibly empty. */
+  readonly ancestors: readonly TelemetryEvent[];
+  /** The partial list's first item, used only when `ancestors` is non-empty. */
+  readonly unknownAboveMarker: string;
+  readonly onSelectEvent: ((ref: EventRef) => void) | undefined;
+}
+
+/**
+ * A chain that stops short of the trace root: the sentence saying why, the
+ * span id it stops at as copyable text, and — when anything below the gap is
+ * known — the partial list, opened by its marker item. The parts are siblings
+ * so the enclosing `Section`'s space step separates them.
+ */
+function ChainGap(props: ChainGapProps): ReactElement {
+  const { event, message, missingSpanId, ancestors, unknownAboveMarker, onSelectEvent } = props;
+
+  return (
+    <>
+      <Text as="p" size="sm" tone="muted">
+        {message}
+      </Text>
+      {missingSpanId === undefined ? null : (
+        <LabelledValue label={MISSING_SPAN_LABEL}>
+          <Code size="sm" wrap>
+            {missingSpanId}
+          </Code>
+        </LabelledValue>
+      )}
+      {ancestors.length === 0 ? null : (
+        <AncestorList
+          event={event}
+          ancestors={ancestors}
+          unknownAboveMarker={unknownAboveMarker}
+          onSelectEvent={onSelectEvent}
+        />
+      )}
+    </>
+  );
+}
+
+/** Props of {@link ParentChain}. */
+interface ParentChainProps {
+  readonly event: TelemetryEvent;
+  readonly ancestry: EventAncestry | undefined;
+  readonly onSelectEvent: ((ref: EventRef) => void) | undefined;
+  readonly onRetryAncestry: (() => void) | undefined;
+}
+
+/**
+ * The Parent chain section's content for the shown event: the trace-root
+ * sentence, the not-looked-up sentence, or the state of the supplied ancestry
+ * (see the module documentation), after {@link effectiveAncestry} has applied
+ * its tolerances.
+ */
+function ParentChain(props: ParentChainProps): ReactElement {
+  const { event, ancestry, onSelectEvent, onRetryAncestry } = props;
+  const { parentSpanId } = event;
+
+  if (parentSpanId === undefined) {
+    return (
+      <Text as="p" size="sm" tone="muted">
+        {TRACE_ROOT_MESSAGE}
+      </Text>
+    );
+  }
+
+  if (ancestry === undefined) {
+    return (
+      <Text as="p" size="sm" tone="muted">
+        {ANCESTRY_NOT_LOOKED_UP_MESSAGE}
+      </Text>
+    );
+  }
+
+  const shown = effectiveAncestry(event, parentSpanId, ancestry);
+  switch (shown.state) {
+    case 'loading':
+      return (
+        <LoadingState variant="rows" rows={ANCESTRY_LOADING_ROWS} label={ANCESTRY_LOADING_LABEL} />
+      );
+    case 'complete':
+      return (
+        <AncestorList
+          event={event}
+          ancestors={shown.ancestors}
+          unknownAboveMarker={undefined}
+          onSelectEvent={onSelectEvent}
+        />
+      );
+    case 'missing':
+      return (
+        <ChainGap
+          event={event}
+          message={
+            shown.missingSpanId === parentSpanId ? MISSING_PARENT_MESSAGE : MISSING_ANCESTOR_MESSAGE
+          }
+          missingSpanId={shown.missingSpanId}
+          ancestors={shown.ancestors}
+          unknownAboveMarker={UNKNOWN_ABOVE_MISSING_MARKER}
+          onSelectEvent={onSelectEvent}
+        />
+      );
+    case 'incomplete':
+      return (
+        <ChainGap
+          event={event}
+          message={incompleteAncestryMessage(
+            shown.missingSpanId === parentSpanId,
+            shown.eventsRead,
+          )}
+          missingSpanId={shown.missingSpanId}
+          ancestors={shown.ancestors}
+          unknownAboveMarker={UNKNOWN_ABOVE_INCOMPLETE_MARKER}
+          onSelectEvent={onSelectEvent}
+        />
+      );
+    case 'cycle':
+      return (
+        <ChainGap
+          event={event}
+          message={CYCLE_MESSAGE}
+          missingSpanId={undefined}
+          ancestors={shown.ancestors}
+          unknownAboveMarker={UNKNOWN_ABOVE_CYCLE_MARKER}
+          onSelectEvent={onSelectEvent}
+        />
+      );
+    case 'error':
+      return (
+        <ErrorState
+          title={ANCESTRY_ERROR_TITLE}
+          message={
+            shown.error.message.trim() === ''
+              ? ANCESTRY_ERROR_FALLBACK_MESSAGE
+              : shown.error.message
+          }
+          hint={shown.error.hint}
+          code={shown.error.code}
+          announce="polite"
+          onRetry={onRetryAncestry}
+        />
+      );
+    default:
+      return assertNever(shown, 'Unhandled event ancestry state');
+  }
 }
 
 /** One copyable identifier of the identity block. */
@@ -871,7 +1276,8 @@ function identityFieldsFor(event: TelemetryEvent): readonly IdentityField[] {
 /** Props of {@link EventDetailsBody}. */
 interface EventDetailsBodyProps {
   readonly event: TelemetryEvent;
-  readonly parentChain: readonly TelemetryEvent[] | undefined;
+  readonly ancestry: EventAncestry | undefined;
+  readonly onRetryAncestry: (() => void) | undefined;
   readonly onOpenSource: (location: SourceLocation) => void;
   readonly onSelectEvent: ((ref: EventRef) => void) | undefined;
   /**
@@ -890,7 +1296,7 @@ interface EventDetailsBodyProps {
  * unconditionally, as hooks must, only when there is an event to derive from.
  */
 function EventDetailsBody(props: EventDetailsBodyProps): ReactElement {
-  const { event, parentChain, onOpenSource, onSelectEvent, nameRef } = props;
+  const { event, ancestry, onRetryAncestry, onOpenSource, onSelectEvent, nameRef } = props;
 
   const started = useMemo(() => formatStartTime(event.startTime), [event.startTime]);
   const attributeRows = useMemo(
@@ -936,11 +1342,16 @@ function EventDetailsBody(props: EventDetailsBodyProps): ReactElement {
         <SourceDetails source={event.source} onOpenSource={onOpenSource} />
       </Section>
 
-      {parentChain === undefined ? null : (
-        <Section title={PARENT_CHAIN_TITLE} headingLevel={3} gap={2}>
-          <ParentChain event={event} chain={parentChain} onSelectEvent={onSelectEvent} />
-        </Section>
-      )}
+      {/* Rendered for every event, so a root, a missing parent and a chain
+          not looked up yet are three different statements. */}
+      <Section title={PARENT_CHAIN_TITLE} headingLevel={3} gap={2}>
+        <ParentChain
+          event={event}
+          ancestry={ancestry}
+          onSelectEvent={onSelectEvent}
+          onRetryAncestry={onRetryAncestry}
+        />
+      </Section>
 
       <Section title={ATTRIBUTES_TITLE} headingLevel={3} gap={2}>
         {anyRedacted ? (
@@ -991,7 +1402,8 @@ export function EventDetails(props: EventDetailsProps): ReactElement {
   const {
     event,
     onOpenSource,
-    parentChain,
+    ancestry,
+    onRetryAncestry,
     onSelectEvent,
     status = 'idle',
     error,
@@ -1080,7 +1492,8 @@ export function EventDetails(props: EventDetailsProps): ReactElement {
         ) : (
           <EventDetailsBody
             event={event}
-            parentChain={parentChain}
+            ancestry={ancestry}
+            onRetryAncestry={onRetryAncestry}
             onOpenSource={onOpenSource}
             onSelectEvent={handleSelectAncestor}
             nameRef={nameRef}

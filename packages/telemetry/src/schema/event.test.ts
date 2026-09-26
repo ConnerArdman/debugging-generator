@@ -141,6 +141,7 @@ import {
   RENDER_TRIGGERS,
   attributeKeysFor,
 } from './attributes.js';
+import { CLOCK_OFFSET_BOUND_MS } from './clock-offset.js';
 import {
   MAX_EPOCH_MS,
   MIN_EPOCH_MS,
@@ -327,6 +328,7 @@ const FULL_EVENT: TelemetryEvent = {
   status: 'ok',
   producerId: newProducerId(),
   seq: 7,
+  clockOffsetMs: -3,
   source: SOURCE,
   redacted: ['attributes.authorization'],
   sessionId: newSessionId(),
@@ -721,6 +723,32 @@ const SEQ_REJECTIONS: readonly RejectionCase[] = [
   { label: 'a fractional counter', input: 1.5, path: 'seq', code: 'invalid_type' },
   { label: 'a numeric string', input: '0', path: 'seq', code: 'invalid_type' },
   { label: 'NaN', input: Number.NaN, path: 'seq', code: 'invalid_type' },
+];
+
+/** Every way `clockOffsetMs` can fail to be a bounded whole-millisecond offset. */
+const CLOCK_OFFSET_REJECTIONS: readonly RejectionCase[] = [
+  { label: 'a fractional offset', input: 12.5, path: 'clockOffsetMs', code: 'invalid_type' },
+  {
+    label: 'an offset beyond the bound ahead',
+    input: CLOCK_OFFSET_BOUND_MS + 1,
+    path: 'clockOffsetMs',
+    code: 'too_big',
+  },
+  {
+    label: 'an offset beyond the bound behind',
+    input: -CLOCK_OFFSET_BOUND_MS - 1,
+    path: 'clockOffsetMs',
+    code: 'too_small',
+  },
+  { label: 'a numeric string', input: '0', path: 'clockOffsetMs', code: 'invalid_type' },
+  { label: 'NaN', input: Number.NaN, path: 'clockOffsetMs', code: 'invalid_type' },
+  {
+    label: 'an infinite offset',
+    input: Number.POSITIVE_INFINITY,
+    path: 'clockOffsetMs',
+    code: 'invalid_type',
+  },
+  { label: 'null', input: null, path: 'clockOffsetMs', code: 'invalid_type' },
 ];
 
 /** Every way `ingestSeq` can fail to be the store's one-based arrival number. */
@@ -1629,6 +1657,43 @@ describe('seq', () => {
 
   it.each(SEQ_REJECTIONS)('rejects $label', ({ input, path, code }: RejectionCase) => {
     expect(expectIngressRejected(makeIngress({ seq: input }))).toContainEqual({ path, code });
+  });
+});
+
+describe('clockOffsetMs', () => {
+  it('is absent until the producer has a usable sample', () => {
+    expect('clockOffsetMs' in okValue(parseTelemetryEventIngress(makeIngress()))).toBe(false);
+  });
+
+  it.each([0, 1, -1, 437, -1_250, CLOCK_OFFSET_BOUND_MS, -CLOCK_OFFSET_BOUND_MS])(
+    'accepts the whole-millisecond offset %d from a producer, unchanged',
+    (clockOffsetMs: number) => {
+      const input = makeIngress({ clockOffsetMs });
+
+      expect(okValue(parseTelemetryEventIngress(input))).toEqual(input);
+    },
+  );
+
+  it('is part of the core both schemas share, so the store keeps what the producer sent', () => {
+    const persisted = makePersisted({ clockOffsetMs: -42 });
+
+    expect(okValue(parseTelemetryEvent(persisted)).clockOffsetMs).toBe(-42);
+  });
+
+  it('is never an attribution field: a producer may send it', () => {
+    expect(Object.keys(telemetryEventIngressSchema.shape)).toContain('clockOffsetMs');
+    expect(ATTRIBUTION_FIELDS).not.toContain('clockOffsetMs');
+  });
+
+  it.each(CLOCK_OFFSET_REJECTIONS)('rejects $label', ({ input, path, code }: RejectionCase) => {
+    expect(expectIngressRejected(makeIngress({ clockOffsetMs: input }))).toContainEqual({
+      path,
+      code,
+    });
+    expect(expectPersistedRejected(makePersisted({ clockOffsetMs: input }))).toContainEqual({
+      path,
+      code,
+    });
   });
 });
 

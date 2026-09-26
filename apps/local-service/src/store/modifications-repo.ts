@@ -55,6 +55,9 @@
  * queries only the service needs — start-up reconciliation, chain walking,
  * conflict reporting, retention — so the port stays the narrow contract the
  * patcher and cleanup share while the service keeps one place that knows SQL.
+ * The repository also answers {@link ModificationCorroborationReader}, the
+ * metadata-only read the telemetry ingest path corroborates patch stamps with,
+ * which never loads a diff.
  *
  * Every shape crossing that seam is imported, never restated:
  * {@link ModificationRecord}, {@link ModificationStatus},
@@ -168,6 +171,7 @@ import type {
   ModificationStatus,
   ModificationStatusPatch,
 } from '@debuggen/instrumentation';
+import { MODIFICATIONS_PAGE_DIFF_BUDGET, MODIFICATION_DIFF_MAX_BYTES } from '@debuggen/protocol';
 import { DebuggenError, err, isErr, noopLogger, nowEpochMs, ok } from '@debuggen/shared';
 import type { Logger, ModificationId, Result, SessionId } from '@debuggen/shared';
 
@@ -396,6 +400,65 @@ const SELECT_BY_SESSION_SQL = `SELECT ${SELECTED} FROM modifications
 WHERE session_id = ?
 ORDER BY applied_at ASC, rowid ASC`;
 
+/**
+ * Reads the corroboration facts of one session's records — file, status and
+ * application time only — in append order.
+ *
+ * The telemetry ingest path's read (see
+ * {@link ModificationCorroborationReader}): it runs for every batch that
+ * carries a patch-stamped span, so it selects none of the columns only a
+ * restore or a display needs — above all not `diff`, which may hold megabytes
+ * of the developer's source. The `session_id`-prefixed indexes serve the
+ * filter.
+ */
+const SELECT_CORROBORATIONS_BY_SESSION_SQL = `SELECT file, status, applied_at FROM modifications
+WHERE session_id = ?
+ORDER BY applied_at ASC, rowid ASC`;
+
+/**
+ * Reads the patch evidence of one session's records of one file — file,
+ * status, application time and diff — in append order.
+ *
+ * The ingest path's second read (see {@link ModificationCorroborationReader}):
+ * the source resolver asks it only for a file the metadata read above found in
+ * force, to prove a patch stamp's exact position and symbol against the diff
+ * the patch wrote, so no other file's diff is ever loaded. Still no hash and
+ * no backup path. The `session_id`-prefixed indexes serve the filter.
+ */
+const SELECT_PATCH_EVIDENCE_BY_SESSION_FILE_SQL = `SELECT file, status, applied_at, diff FROM modifications
+WHERE session_id = ? AND file = ?
+ORDER BY applied_at ASC, rowid ASC`;
+
+/**
+ * Reads a window of one session's records in append order: exactly
+ * {@link SELECT_BY_SESSION_SQL} — derived from it, so the two orders cannot
+ * drift — bounded by `LIMIT ? OFFSET ?`. Run by
+ * {@link ModificationsRepo.listPageBySession} only once
+ * {@link SELECT_PAGE_DIFF_BYTES_SQL} has decided how many records the page
+ * holds, with exactly that many as its `LIMIT`, so no row past the page is
+ * read.
+ */
+const SELECT_PAGE_BY_SESSION_SQL = `${SELECT_BY_SESSION_SQL}
+LIMIT ? OFFSET ?`;
+
+/**
+ * Measures a window of one session's records before any of them is read: each
+ * record's id and the UTF-8 byte length of its diff, in the append order of
+ * {@link SELECT_BY_SESSION_SQL}.
+ *
+ * `octet_length()` of a column is answered from the row's record header — the
+ * serial type of a text value encodes its length — so SQLite computes it
+ * without loading the diff (the `Column` opcode is compiled with the
+ * byte-length-only flag). The diff column is `TEXT` in a UTF-8 database, so
+ * the value is exactly protocol's `utf8ByteLength` of the diff this repository
+ * would return: `node:sqlite` writes a lone surrogate as U+FFFD, three bytes,
+ * the same count protocol assigns it.
+ */
+const SELECT_PAGE_DIFF_BYTES_SQL = `SELECT id, octet_length(diff) AS diff_bytes FROM modifications
+WHERE session_id = ?
+ORDER BY applied_at ASC, rowid ASC
+LIMIT ? OFFSET ?`;
+
 /** Reads one session's records in a set of statuses, in append order. */
 const SELECT_BY_SESSION_AND_STATUS_SQL = `SELECT ${SELECTED} FROM modifications
 WHERE session_id = ? AND status IN (${STATUS_IN_LIST})
@@ -471,6 +534,18 @@ ORDER BY backup_path ASC`;
 const SELECT_BACKUP_PATHS_BY_SESSION_AND_STATUS_SQL = `SELECT DISTINCT backup_path FROM modifications
 WHERE session_id = ? AND status IN (${STATUS_IN_LIST})
 ORDER BY backup_path ASC`;
+
+/**
+ * One session's backup references, metadata only: the three columns the
+ * retention sweep's membership probe reads, never the diff or the patched
+ * hash. An index range read — the `session_id` prefix of
+ * `idx_modifications_session_id_file` — so a probe examines that session's
+ * records and no other row of the journal; streamed row by row by
+ * {@link scanSessionBackupReferences}, so no `DISTINCT`, no sort and no array
+ * is built.
+ */
+export const SELECT_SESSION_BACKUP_REFERENCES_SQL =
+  'SELECT backup_path, original_hash, status FROM modifications WHERE session_id = ?';
 
 /**
  * The column each member of {@link ModificationStatusPatch} is persisted in.
@@ -573,15 +648,58 @@ export interface ListModificationsOptions {
   readonly statuses?: readonly ModificationStatus[] | undefined;
 }
 
+/** The window of {@link ModificationsRepo.listPageBySession}. */
+export interface ModificationPageWindow {
+  /**
+   * The most records the page holds, a non-negative safe integer. `0` is a
+   * count-only request: the page reads the journal's length and no record.
+   */
+  readonly limit: number;
+
+  /** How many of the session's records to skip, in application order. */
+  readonly offset: number;
+
+  /**
+   * The most diff text the page may carry, summed over its records in **UTF-8
+   * bytes** — the encoding the page travels in, the unit protocol's
+   * `utf8ByteLength` and `modificationsDiffBytes` measure and the store's
+   * `octet_length()` reports. Defaults to protocol's
+   * `MODIFICATIONS_PAGE_DIFF_BUDGET`. Must be at least protocol's
+   * `MODIFICATION_DIFF_MAX_BYTES`, the most bytes one journalled diff can
+   * encode to, which is what guarantees that the first record of a page always
+   * fits and a paging loop never stalls.
+   */
+  readonly maxDiffBytes?: number | undefined;
+}
+
+/**
+ * One page of a session's modification journal.
+ *
+ * `records` holds at most `limit` records in application order, and ends
+ * early — before `limit` — when the next record's diff would take the page's
+ * diff bytes past their budget; it is never empty while `offset < total` and
+ * `limit > 0`. The following page therefore starts at `offset +
+ * records.length`.
+ */
+export interface ModificationPage {
+  /** This page's records, validated, in the order they were applied. */
+  readonly records: ModificationRecord[];
+
+  /** How many records the session's journal holds in total. */
+  readonly total: number;
+}
+
 /** Narrowing for {@link ModificationsRepo.listBackupPaths}. */
 export interface ListBackupPathsOptions {
   /**
    * Keep only the paths referenced by records in these statuses.
    *
-   * Retention uses it in both directions: the union of every status tells it
-   * which files under the backups directory are still referenced at all, and
-   * `['conflict']` tells it which of those it must never delete, because a
-   * conflicting record's backup is the developer's only pristine copy.
+   * The union of every status says which files under the backups directory are
+   * still referenced at all, and `['conflict']` says which of those must never
+   * be deleted, because a conflicting record's backup is the developer's only
+   * pristine copy. The retention sweep asks the same two questions of only the
+   * files it is about to judge, one session directory at a time, through
+   * {@link scanSessionBackupReferences}, rather than materialising either list.
    *
    * Absent means every status; an empty array matches nothing, as in
    * {@link ListModificationsOptions.statuses}.
@@ -590,6 +708,94 @@ export interface ListBackupPathsOptions {
 
   /** Keep only the paths referenced by one session's records. */
   readonly sessionId?: SessionId | undefined;
+}
+
+/**
+ * The facts of one modification record that prove a file was instrumented
+ * when a span ran: which file, in which status, since when.
+ *
+ * A `Pick` of the upstream {@link ModificationRecord}, never a restatement, so
+ * a change to any of the three fields there changes this shape too. It is what
+ * the source resolver's `patch` route corroborates a patch stamp with
+ * (`../source/resolve.ts`), and all it needs: no hash, no backup path, no diff.
+ */
+export type ModificationCorroboration = Pick<ModificationRecord, 'file' | 'status' | 'appliedAt'>;
+
+/**
+ * One record's patch evidence: its {@link ModificationCorroboration} facts and
+ * the diff the patch wrote, whose added lines carry the span `meta` literal the
+ * source resolver's `patch` route checks a stamp's exact position and symbol
+ * against. Also a `Pick` of the upstream {@link ModificationRecord}.
+ */
+export type ModificationPatchEvidence = Pick<
+  ModificationRecord,
+  'file' | 'status' | 'appliedAt' | 'diff'
+>;
+
+/**
+ * The journal's metadata-only read for the telemetry ingest path.
+ *
+ * A separate interface rather than a member of {@link ModificationsRepo}: that
+ * interface is also implemented by in-memory journals in other suites, which
+ * have no reason to know about the ingest path, and
+ * {@link createModificationsRepo} returns both.
+ */
+export interface ModificationCorroborationReader {
+  /**
+   * Lists the corroboration facts of one session's records, in append order —
+   * the order {@link ModificationsRepo.listBySession} guarantees.
+   *
+   * Reads only the `file`, `status` and `applied_at` columns. Each row is
+   * checked on the way out: a status outside the vocabulary, a blank file or a
+   * timestamp that is not a finite number fails the whole read, as a corrupt
+   * row fails every other read here, rather than being skipped.
+   *
+   * @param sessionId The session to list.
+   * @returns The facts, oldest first; an empty array is a success.
+   */
+  listCorroborationsBySession(sessionId: SessionId): Promise<Result<ModificationCorroboration[]>>;
+
+  /**
+   * Lists the patch evidence of one session's records of one file, in append
+   * order: the `file`, `status`, `applied_at` and `diff` columns, and only for
+   * rows whose stored `file` equals `file` exactly.
+   *
+   * Asked only for a file {@link listCorroborationsBySession} found in force,
+   * so a session's other diffs are never read. Each row is checked on the way
+   * out as that read checks its own, and a `diff` that is not text fails the
+   * read too.
+   *
+   * @param sessionId The session to list.
+   * @param file The file exactly as the journal stores it.
+   * @returns The evidence, oldest first; an empty array is a success.
+   */
+  listPatchEvidenceBySessionFile(
+    sessionId: SessionId,
+    file: string,
+  ): Promise<Result<ModificationPatchEvidence[]>>;
+}
+
+/**
+ * One journal record's reference to a backup file: the metadata the retention
+ * sweep's membership probe reads, and nothing else.
+ *
+ * A record's backup lives in its own session's directory:
+ * `backups/<sessionId>/<originalHash>`, the path the backup store composes, or
+ * a relocation into a subdirectory of that same directory, which `backupPath`
+ * then names (`@debuggen/instrumentation`'s `patch/backup-store.ts`). The
+ * store never opens a recorded path outside the record's own session
+ * directory; it substitutes the composed path. So `originalHash` names the
+ * composed file even when `backupPath` does not, and `backupPath` is the
+ * stored text exactly — the journal validates only that it is not blank — so a
+ * consumer comparing it with a walked path normalises it first.
+ */
+export interface BackupReference {
+  /** The backup path the record names, as stored. */
+  readonly backupPath: string;
+  /** The digest of the original bytes: the file name of the composed backup. */
+  readonly originalHash: string;
+  /** The record's status. */
+  readonly status: ModificationStatus;
 }
 
 /**
@@ -695,6 +901,48 @@ export interface ModificationsRepo extends ModificationJournal {
     sessionId: SessionId,
     options?: ListModificationsOptions,
   ): Promise<Result<ModificationRecord[]>>;
+
+  /**
+   * Reads one diff-budgeted page of a session's journal, in the application
+   * order {@link ModificationsRepo.listBySession} uses, with the journal's
+   * length — what `GET /sessions/:id/modifications` serves, so the editor's
+   * `ModificationsList` never receives every diff of a large journal in one
+   * body.
+   *
+   * At most three statements inside one transaction, so the page and the
+   * total describe the same state:
+   *
+   * 1. a `COUNT(*)` by `session_id` — the only statement for `limit: 0` or an
+   *    `offset` at or past the end, which therefore read no record at all;
+   * 2. the window **measured**: each record's id and `octet_length(diff)`,
+   *    which SQLite answers from the row header without loading the diff. The
+   *    page is the longest prefix of the window whose diffs fit `maxDiffBytes`
+   *    UTF-8 bytes — always at least one record, because no journalled diff
+   *    exceeds `MODIFICATION_DIFF_MAX_BYTES`; a first record measuring more
+   *    than the budget is therefore a corrupt row;
+   * 3. exactly that many full rows read and parsed, in the same order.
+   *
+   * No diff past the page is ever read, and the record that ends a page is
+   * measured, never parsed. A row of the page that no longer parses fails the
+   * read, as in `listBySession`. Diffs are never logged.
+   *
+   * @param sessionId The session whose journal to page.
+   * @param window The page window and diff budget; see
+   * {@link ModificationPageWindow}.
+   * @returns The page, or `err` `STORE_ERROR` for a window outside its domain
+   * (`invalid-argument`), a corrupt row or a store failure.
+   *
+   * @example
+   * ```ts
+   * const page = await modifications.listPageBySession(sessionId, { limit: 256, offset: 0 });
+   * // page.value.records → the first records whose diffs fit the 6 MiB (UTF-8) budget
+   * // page.value.total   → the journal's length
+   * ```
+   */
+  listPageBySession(
+    sessionId: SessionId,
+    window: ModificationPageWindow,
+  ): Promise<Result<ModificationPage>>;
 
   /**
    * Lists the records still requiring reconciliation — every status except
@@ -810,9 +1058,12 @@ export interface ModificationsRepo extends ModificationJournal {
   /**
    * Lists the distinct backup paths the journal still references.
    *
-   * This is what lets retention tell a referenced backup from an orphan left by
-   * a crash between the backup write and the journal append, and what protects
-   * a conflicting record's backup from a sweep.
+   * This is what tells a referenced backup from an orphan left by a crash
+   * between the backup write and the journal append, and what protects a
+   * conflicting record's backup. It materialises the whole answer, so the
+   * retention sweep — which may face a large journal on every start — asks the
+   * same question of one session at a time through the indexed, streaming
+   * {@link scanSessionBackupReferences} instead.
    *
    * @param options Optional status and session narrowing.
    * @returns The distinct paths, sorted, or the failure.
@@ -1000,6 +1251,42 @@ function corruptRowError(recordId: string, cause: DebuggenError): DebuggenError 
       details: { subsystem: SUBSYSTEM, [REPO_BINDING_KEY]: REPO, recordId },
       cause,
     },
+  );
+}
+
+/**
+ * The error for a journalled diff that measures more bytes than any diff the
+ * journal accepts — a row written past this repository's validation.
+ *
+ * Reported as the corrupt row it is, by id, with the measured and permitted
+ * byte counts as the cause's details: counts only, never any of the diff.
+ *
+ * @param recordId The row's id.
+ * @param diffBytes The diff's measured UTF-8 byte length.
+ * @param budgetBytes The page budget it exceeded on its own.
+ * @returns The coded error.
+ */
+function oversizedDiffError(
+  recordId: string,
+  diffBytes: number,
+  budgetBytes: number,
+): DebuggenError {
+  return corruptRowError(
+    recordId,
+    new DebuggenError(
+      'STORE_ERROR',
+      'A journalled diff is larger than any diff the modification journal accepts.',
+      {
+        details: {
+          subsystem: SUBSYSTEM,
+          [REPO_BINDING_KEY]: REPO,
+          reason: 'diff-over-cap',
+          diffBytes,
+          budgetBytes,
+          maxDiffBytes: MODIFICATION_DIFF_MAX_BYTES,
+        },
+      },
+    ),
   );
 }
 
@@ -1665,6 +1952,47 @@ function unknownStatusError(operation: string): DebuggenError {
 }
 
 /**
+ * The error for a paging argument outside its domain.
+ *
+ * Reachable only through a caller defect — `src/server/routes/sessions.ts`
+ * passes a window protocol's `parseListPageQuery` already bounded — and
+ * refused rather than clamped, because a clamped window would answer a page
+ * the caller did not ask for.
+ *
+ * @param operation The repository method that was called.
+ * @param field The argument's name — an identifier from this module.
+ * @param expectation What the argument must be, as a fixed phrase.
+ * @returns The coded error.
+ */
+function invalidWindowError(operation: string, field: string, expectation: string): DebuggenError {
+  return new DebuggenError(
+    'STORE_ERROR',
+    `The ${field} passed to the modification journal must be ${expectation}.`,
+    {
+      hint: 'This is a defect in the caller rather than a setting: correct the argument and retry.',
+      details: {
+        subsystem: SUBSYSTEM,
+        [REPO_BINDING_KEY]: REPO,
+        operation,
+        field,
+        reason: 'invalid-argument',
+      },
+    },
+  );
+}
+
+/**
+ * Whether `value` is a safe integer of at least `min`.
+ *
+ * @param value The candidate.
+ * @param min The inclusive lower bound.
+ * @returns `true` when it is.
+ */
+function isSafeIntegerFrom(value: unknown, min: number): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= min;
+}
+
+/**
  * Builds the fixed-width bind list for a `status IN (…)` filter.
  *
  * Duplicates are collapsed and the list is then padded to
@@ -1812,7 +2140,8 @@ interface StatusWrite {
  * database's contents.
  *
  * @param deps The store, and optionally a logger and a clock.
- * @returns The journal.
+ * @returns The journal, which is also the
+ * {@link ModificationCorroborationReader} the telemetry ingest path reads.
  *
  * @example
  * ```ts
@@ -1826,7 +2155,9 @@ interface StatusWrite {
  * }
  * ```
  */
-export function createModificationsRepo(deps: ModificationsRepoDeps): ModificationsRepo {
+export function createModificationsRepo(
+  deps: ModificationsRepoDeps,
+): ModificationsRepo & ModificationCorroborationReader {
   const { store } = deps;
   const now = deps.now ?? nowEpochMs;
   const logger = (deps.logger ?? noopLogger).child({
@@ -2199,6 +2530,179 @@ export function createModificationsRepo(deps: ModificationsRepoDeps): Modificati
     );
   }
 
+  /**
+   * Validates one corroboration row. The columns are checked individually,
+   * because there is no record to parse: a status outside the vocabulary, a
+   * blank or non-text file and a non-finite timestamp are each a corrupt
+   * column, reported by name and never by value.
+   */
+  function toCorroboration(
+    row: StoredRow,
+    operation = 'listCorroborationsBySession',
+  ): Result<ModificationCorroboration> {
+    const file = row['file'];
+    const status = row['status'];
+    const appliedAt = toColumnNumber(row['applied_at']);
+
+    if (typeof file !== 'string' || file.trim().length === 0) {
+      return err(corruptColumnError(operation, 'file'));
+    }
+
+    if (!isModificationStatus(status)) {
+      return err(corruptColumnError(operation, 'status'));
+    }
+
+    if (typeof appliedAt !== 'number' || !Number.isFinite(appliedAt)) {
+      return err(corruptColumnError(operation, 'applied_at'));
+    }
+
+    return ok({ file, status, appliedAt });
+  }
+
+  function listCorroborationsBySession(
+    sessionId: SessionId,
+  ): Promise<Result<ModificationCorroboration[]>> {
+    return Promise.resolve(
+      attempt('listCorroborationsBySession', () => {
+        const rows = store.statement(SELECT_CORROBORATIONS_BY_SESSION_SQL).all(sessionId);
+        const facts: ModificationCorroboration[] = [];
+
+        for (const row of rows) {
+          const fact = toCorroboration(row);
+
+          if (isErr(fact)) {
+            return fact;
+          }
+
+          facts.push(fact.value);
+        }
+
+        return ok(facts);
+      }),
+    );
+  }
+
+  function listPatchEvidenceBySessionFile(
+    sessionId: SessionId,
+    file: string,
+  ): Promise<Result<ModificationPatchEvidence[]>> {
+    const operation = 'listPatchEvidenceBySessionFile';
+
+    return Promise.resolve(
+      attempt(operation, () => {
+        const rows = store
+          .statement(SELECT_PATCH_EVIDENCE_BY_SESSION_FILE_SQL)
+          .all(sessionId, file);
+        const evidence: ModificationPatchEvidence[] = [];
+
+        for (const row of rows) {
+          const fact = toCorroboration(row, operation);
+
+          if (isErr(fact)) {
+            return fact;
+          }
+
+          const diff = row['diff'];
+
+          if (typeof diff !== 'string') {
+            return err(corruptColumnError(operation, 'diff'));
+          }
+
+          evidence.push({ ...fact.value, diff });
+        }
+
+        return ok(evidence);
+      }),
+    );
+  }
+
+  function listPageBySession(
+    sessionId: SessionId,
+    window: ModificationPageWindow,
+  ): Promise<Result<ModificationPage>> {
+    const operation = 'listPageBySession';
+
+    return Promise.resolve(
+      attempt(
+        operation,
+        (): Result<ModificationPage> => {
+          const { limit, offset } = window;
+          const budget = window.maxDiffBytes ?? MODIFICATIONS_PAGE_DIFF_BUDGET;
+
+          if (!isSafeIntegerFrom(limit, 0)) {
+            return err(invalidWindowError(operation, 'limit', 'a non-negative integer'));
+          }
+
+          if (!isSafeIntegerFrom(offset, 0)) {
+            return err(invalidWindowError(operation, 'offset', 'a non-negative integer'));
+          }
+
+          if (!isSafeIntegerFrom(budget, MODIFICATION_DIFF_MAX_BYTES)) {
+            return err(
+              invalidWindowError(
+                operation,
+                'maxDiffBytes',
+                `an integer of at least ${String(MODIFICATION_DIFF_MAX_BYTES)}`,
+              ),
+            );
+          }
+
+          // One transaction, so the measured window, the rows read and the
+          // total all describe the same state.
+          return store.transaction((): Result<ModificationPage> => {
+            const counted = store.statement(COUNT_BY_SESSION_SQL).get(sessionId);
+            const total = counted === undefined ? undefined : toColumnNumber(counted['total']);
+
+            if (typeof total !== 'number' || !Number.isSafeInteger(total)) {
+              return err(corruptColumnError(operation, 'total'));
+            }
+
+            // A count-only request, or a window past the end: no record is read.
+            if (limit === 0 || offset >= total) {
+              return ok({ records: [], total });
+            }
+
+            // Measure before reading: the longest prefix of the window whose
+            // diffs fit the budget. Stepped, so the record that ends the page
+            // is the last one measured; leaving the loop early resets the
+            // statement.
+            let kept = 0;
+            let used = 0;
+
+            for (const row of store
+              .statement(SELECT_PAGE_DIFF_BYTES_SQL)
+              .iterate(sessionId, limit, offset)) {
+              const bytes = toColumnNumber(row['diff_bytes']);
+
+              if (typeof bytes !== 'number' || !Number.isSafeInteger(bytes) || bytes < 0) {
+                return err(corruptColumnError(operation, 'diff'));
+              }
+
+              if (used + bytes > budget) {
+                // No journalled diff exceeds the budget on its own, so a first
+                // record that does is a row written past validation.
+                if (kept === 0) {
+                  return err(oversizedDiffError(rowIdOf(row), bytes, budget));
+                }
+
+                break;
+              }
+
+              kept += 1;
+              used += bytes;
+            }
+
+            // Read exactly the measured prefix, in the same order.
+            const records = readAll(SELECT_PAGE_BY_SESSION_SQL, [sessionId, kept, offset]);
+
+            return isErr(records) ? records : ok({ records: records.value, total });
+          });
+        },
+        { [LOG_BINDING_KEYS.sessionId]: sessionId },
+      ),
+    );
+  }
+
   function listAllOpen(): Promise<Result<ModificationRecord[]>> {
     return Promise.resolve(
       attempt('listAllOpen', () => {
@@ -2455,6 +2959,7 @@ export function createModificationsRepo(deps: ModificationsRepoDeps): Modificati
     append,
     updateStatus,
     listBySession,
+    listPageBySession,
     listOpen,
     listAllOpen,
     get,
@@ -2465,5 +2970,94 @@ export function createModificationsRepo(deps: ModificationsRepoDeps): Modificati
     listBackupPaths,
     countBySession,
     deleteBySession,
-  } satisfies ModificationJournal & ModificationsRepo;
+    listCorroborationsBySession,
+    listPatchEvidenceBySessionFile,
+  } satisfies ModificationJournal & ModificationsRepo & ModificationCorroborationReader;
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * The retention sweep's membership probe
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * Streams the {@link BackupReference} of every record of one session to
+ * `visit`, one row at a time, without materialising them.
+ *
+ * The retention sweep's membership probe. A backup file sits in the directory
+ * of the session whose record it protects, and no other session's record can
+ * resolve to it (see {@link BackupReference}), so whether a file in
+ * `backups/<sessionId>/` is still referenced is a question about that one
+ * session's records. The statement is an index range read on `session_id`
+ * that selects three metadata columns, so a probe examines exactly that
+ * session's records — however large the rest of the journal — and holds none
+ * of them: the sweep compares each row with the bounded batch of files it is
+ * judging and keeps only the matches. It is called only for a directory that
+ * holds a file old enough to be an orphan, which keeps a start-up with
+ * nothing aged free of any journal read.
+ *
+ * A standalone function over the store rather than a {@link ModificationsRepo}
+ * member on purpose: the repository implements the `ModificationJournal` port
+ * that `@debuggen/instrumentation` and this service's in-memory journal fakes
+ * type-check against, and a retention-only streaming read does not belong in
+ * that contract.
+ *
+ * Synchronous from the first row to the last, so no other statement on this
+ * connection can interleave with the scan. `visit` must not use the store.
+ *
+ * @param store The open, migrated store.
+ * @param sessionId The session whose records are read — for the sweep, the
+ * name of the backup directory it is judging. A name no session has simply
+ * yields no row.
+ * @param visit Called once per record; answering `false` stops the scan early
+ * (every remaining row is then unread), `true` continues.
+ * @returns `ok(rowsVisited)`, or `err` `STORE_ERROR`: a column that does not
+ * hold the type the DDL declares (`details.column` names it; nothing more is
+ * visited, so a caller discards whatever it gathered) or a statement the store
+ * refused. Never throws.
+ *
+ * @example
+ * ```ts
+ * const referenced = new Set<string>();
+ * const scanned = scanSessionBackupReferences(store, sessionId, (reference) => {
+ *   if (candidateNames.has(reference.originalHash)) referenced.add(reference.originalHash);
+ *   return referenced.size < candidateNames.size;
+ * });
+ * ```
+ */
+export function scanSessionBackupReferences(
+  store: Store,
+  sessionId: SessionId,
+  visit: (reference: BackupReference) => boolean,
+): Result<number> {
+  const operation = 'scanSessionBackupReferences';
+
+  return attempt(operation, (): Result<number> => {
+    let visited = 0;
+
+    for (const row of store.statement(SELECT_SESSION_BACKUP_REFERENCES_SQL).iterate(sessionId)) {
+      const backupPath = row['backup_path'];
+      const originalHash = row['original_hash'];
+      const status = row['status'];
+
+      if (typeof backupPath !== 'string') {
+        return err(corruptColumnError(operation, 'backup_path'));
+      }
+
+      if (typeof originalHash !== 'string') {
+        return err(corruptColumnError(operation, 'original_hash'));
+      }
+
+      if (!isModificationStatus(status)) {
+        return err(corruptColumnError(operation, 'status'));
+      }
+
+      visited += 1;
+
+      if (!visit({ backupPath, originalHash, status })) {
+        break;
+      }
+    }
+
+    return ok(visited);
+  });
 }

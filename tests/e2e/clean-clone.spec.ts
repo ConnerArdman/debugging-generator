@@ -12,15 +12,25 @@
  *
  * ## What a "clone" is here
  *
- * The working-tree content of every tracked file, copied by `copyTrackedTree()`
- * (`./helpers/repo`), which enumerates paths with `git ls-files -z` and never creates, reads,
- * copies or archives `.git/`. That is not a convenience: the repository's `origin` URL embeds a
- * live access token (AAP §0.2.1), so a real `git clone` — or any copy of `.git` — could carry
- * it into build logs, caches or the uploaded Playwright report. Starting from the tracked files
- * is exactly what a fresh checkout contains, minus the repository metadata; each clone is
- * asserted to hold no `.git` at all, which is the "no dependence on the remote" guarantee
- * stated as a test. This spec runs no `git remote`/`git config` (`runGit` refuses both) and
- * never prints an environment.
+ * A real `git clone` of the commit under test, made by `cloneRepository()` (`./helpers/repo`):
+ * the source is the LOCAL checkout's absolute path — never a URL, never the checkout's remote —
+ * cloned with `--no-local --no-checkout --template=` into an empty directory under
+ * `os.tmpdir()` and detached at the commit the checkout's `HEAD` named when the suite started
+ * (`git rev-parse --verify HEAD^{commit}`). What is tested is exactly what a fresh checkout of
+ * that commit contains: an uncommitted edit, a staged deletion or an untracked file in the
+ * checkout can neither break nor rescue it, and a checkout with uncommitted changes is
+ * reported by an annotation saying the clones test the commit, not the working tree.
+ *
+ * The checkout's `.git/config` carries a live access token in its `origin` URL (AAP §0.2.1),
+ * and it cannot reach a clone: a clone never copies its source's configuration, the clone's own
+ * `origin` (which names only the local path) is removed, and no git output is echoed. Each
+ * clone is then asserted to be self-contained and pristine — `HEAD` is the target commit, `git
+ * ls-files` equals the commit's `git ls-tree`, the root manifests and every workspace are
+ * present, the only `.env*` files outside `.git/` are the two committed examples, there is no
+ * remote and no `objects/info/alternates`, and nothing is modified, untracked or ignored. Every
+ * metadata check is an `lstat` or a git command that prints paths and object ids: this spec
+ * never opens a file under any `.git/`, runs no `git remote`/`git config` of its own (`runGit`
+ * refuses both) and never prints an environment.
  *
  * ## What each clone proves
  *
@@ -35,26 +45,30 @@
  *   declarations. Cross-package types resolve on such a tree through the second entry of each
  *   package's `types` fallback array (`["./dist/…d.ts", "./src/…ts"]`), which `tsc -b` redirects
  *   to the referenced project's own declarations.
- * - **both** — `--frozen-lockfile` was honoured: the copied `pnpm-lock.yaml` is byte-identical
- *   to the checkout's before install and unchanged after every command, so a stale committed
- *   lockfile fails here rather than being silently rewritten.
+ * - **both** — `--frozen-lockfile` was honoured and nothing rewrote the tree: each clone's
+ *   `pnpm-lock.yaml` is the committed blob (`git hash-object` in the clone equals `git rev-parse
+ *   <commit>:pnpm-lock.yaml`) and byte-identical to the other clone's, it is unchanged after
+ *   every command, and after the last command `git status --porcelain --untracked-files=no` in
+ *   the clone is empty. A stale committed lockfile, or a build step that rewrites a tracked file
+ *   (a generated file that drifted from its committed copy), fails here instead of passing on
+ *   a tree nobody committed.
  *
  * ## What this spec deliberately does NOT run inside the clones
  *
  * `pnpm test`, `lint`, `format:check` and the guard scripts (`check:secrets`,
  * `check:no-hardcoding`, `check:no-residual-instrumentation`). Those gates run on the real
- * checkout in CI's `verify` job; the clones have no `.git`, and `check-secrets` and
- * `check-no-residual-instrumentation` enumerate content with git, so they cannot work there.
- * Do not "improve" this spec by adding them — it would fail for a reason unrelated to the
- * orderings it exists to prove.
+ * checkout in CI's `verify` job, and this spec exists to prove the two orderings, not to repeat
+ * that job: each would add minutes per clone and could fail for a reason unrelated to install,
+ * build or typecheck standing alone. Do not "improve" this spec by adding them.
  *
- * ## Cost, environment and the local escape hatch
+ * ## Cost and environment
  *
- * Two installs, a full monorepo build and a solution-wide typecheck. The installs need registry
- * access; with a warm pnpm content-addressable store (CI's cache, or a developer machine that
- * has installed this lockfile before) packages are linked rather than downloaded, which turns
- * tens of minutes into a few. Every command streams its output line by line, prefixed with the
- * clone and the command, plus a heartbeat every 30 s (`runCommand` in `./helpers/repo`), so a
+ * Two local clones (seconds each, no network), two installs, a full monorepo build and a
+ * solution-wide typecheck. The installs need registry access; with a warm pnpm
+ * content-addressable store (CI's cache, or a developer machine that has installed this
+ * lockfile before) packages are linked rather than downloaded, which turns tens of minutes
+ * into a few. Every command streams its output line by line, prefixed with the clone and the
+ * command, plus a heartbeat every 30 s (`runCommand` in `./helpers/repo`), so a
  * quiet install is never mistaken for a hang; each full log is attached to the Playwright
  * report (`playwright-report/`, git-ignored).
  *
@@ -65,8 +79,8 @@
  * nothing here connects to a database) and `NEXT_TELEMETRY_DISABLED=1`. A probe asserts that
  * environment from inside a child before anything else runs.
  *
- * The spec runs by default. Locally only, `DEBUGGEN_SKIP_CLEAN_CLONE=1` skips it with a
- * reported reason; under `CI` it can never be skipped.
+ * This is an acceptance proof, so it has no skip switch: every run of the `e2e` project runs
+ * both clones, locally exactly as under `CI`.
  *
  * Nothing is written inside the checkout: both clones live under `os.tmpdir()` (created with
  * `fs.mkdtemp`) and are removed in `afterAll`, so sibling specs' `git status` assertions are
@@ -76,23 +90,28 @@ import { createHash } from 'node:crypto';
 import { lstat, mkdtemp, readFile, readdir, realpath, rm, stat } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 
+import { expect, test } from './helpers/fixtures';
+// Straight from the foundation module: `./helpers/fixtures` re-exports only part of it, and
+// the clone helpers (`cloneRepository`, `resolveHeadCommit`, `listCommitFiles`) are not among
+// that part. Importing `./helpers/repo` evaluates nothing else (it imports no sibling helper).
 import {
   BUILD_TIMEOUT_MS,
+  CLONE_TIMEOUT_MS,
   CommandFailedError,
   INSTALL_TIMEOUT_MS,
   SHORT_COMMAND_TIMEOUT_MS,
   TYPECHECK_TIMEOUT_MS,
-  copyTrackedTree,
-  expect,
-  listTrackedFiles,
-  repoPath,
+  cloneRepository,
+  listCommitFiles,
   repoRoot,
+  resolveHeadCommit,
   runCommand,
+  runGit,
   runPnpm,
-  test,
-} from './helpers/fixtures';
-import type { CommandResult, CopyTrackedTreeResult } from './helpers/fixtures';
+} from './helpers/repo';
+import type { CommandResult } from './helpers/repo';
 
 // ---------------------------------------------------------------------------
 // Named constants
@@ -120,10 +139,12 @@ const CLONE_COMMAND_ENV: Readonly<Record<string, string>> = Object.freeze({
 });
 
 /**
- * Copying ~900 tracked files, the environment probe, the artefact checks and the log
- * attachments of one clone — everything in a test except its two long commands.
+ * Everything in a test except its two long commands: the clone's two slow git steps (`git
+ * clone --no-local` and the checkout) at their full {@link CLONE_TIMEOUT_MS} budget, plus five
+ * minutes for its verification, the environment probe, the artefact checks, the tracked-tree
+ * status and the log attachments.
  */
-const SETUP_ALLOWANCE_MS = 5 * 60_000;
+const SETUP_ALLOWANCE_MS = 2 * CLONE_TIMEOUT_MS + 5 * 60_000;
 
 /** clone-1's whole budget: the two command budgets of `./helpers/repo` plus setup. */
 const BUILD_ORDERING_TIMEOUT_MS = INSTALL_TIMEOUT_MS + BUILD_TIMEOUT_MS + SETUP_ALLOWANCE_MS;
@@ -134,6 +155,20 @@ const TYPECHECK_ORDERING_TIMEOUT_MS =
 
 /** Removing two trees that each hold a linked `node_modules/` and build output. */
 const CLEANUP_TIMEOUT_MS = 10 * 60_000;
+
+/**
+ * Removal attempts per clone root before teardown gives up on it and fails. Each attempt is an
+ * `fs.rm` that itself retries transient errors (`EBUSY`, `ENOTEMPTY`, `EPERM`, ...), so this
+ * outer loop covers a tree something else was still writing into when the first pass ran.
+ */
+const REMOVAL_ATTEMPTS = 3;
+
+/** `fs.rm`'s own retries of a transient error within one attempt, and the pause between them. */
+const RM_MAX_RETRIES = 3;
+const RM_RETRY_DELAY_MS = 250;
+
+/** Pause after a failed removal attempt, multiplied by the attempt number (1 s, then 2 s). */
+const REMOVAL_BACKOFF_MS = 1_000;
 
 /** Root files without which an install, a build or a typecheck cannot even start. */
 const REQUIRED_ROOT_FILES = Object.freeze([
@@ -171,6 +206,15 @@ const WORKSPACE_MANIFEST_PATTERN = /^((?:apps|packages)\/[^/]+)\/package\.json$/
 
 /** The only `.env*` files a clone may contain: the two committed examples (AAP §0.3.4). */
 const ALLOWED_ENV_FILES = Object.freeze(['.env.example', 'apps/demo-app/.env.example']);
+
+/** The lockfile `--frozen-lockfile` must leave untouched, relative to the clone root. */
+const LOCKFILE = 'pnpm-lock.yaml';
+
+/** A full git object id: SHA-1 (40 hex digits) or SHA-256 (64). */
+const OBJECT_ID_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+
+/** How many offending paths an assertion message lists before summarising the rest. */
+const LISTED_PATHS_LIMIT = 20;
 
 /** Where `prisma generate` writes the demo's client (`generator client { output }`). */
 const GENERATED_PRISMA_CLIENT_DIR = 'apps/demo-app/src/generated/prisma';
@@ -262,20 +306,39 @@ interface CloneRoot {
   readonly dir: string;
 }
 
-/** What the checkout looks like, computed once in `beforeAll` and compared against each clone. */
+/**
+ * The commit under test, computed once in `beforeAll` from the checkout and compared against
+ * each clone. The tracked set and the lockfile blob are read from the commit object, not from
+ * the working tree; only the two `uncommittedChanges*` fields describe the working tree.
+ */
 interface SourceFacts {
   /** Real path of the repository root. */
   readonly root: string;
-  /** Every tracked path, POSIX and repository-relative. */
+  /** Full object id of the commit both clones check out: the checkout's `HEAD` at `beforeAll`. */
+  readonly commit: string;
+  /** Every path the commit tracks (`git ls-tree -r`), POSIX and repository-relative, sorted. */
   readonly tracked: readonly string[];
-  /** Workspace directories derived from the tracked manifests. */
+  /** Workspace directories derived from the commit's tracked manifests. */
   readonly workspaces: readonly string[];
-  /** SHA-256 of the checkout's `pnpm-lock.yaml`. */
-  readonly lockfileDigest: string;
+  /** Blob id of the commit's `pnpm-lock.yaml` (`git rev-parse <commit>:pnpm-lock.yaml`). */
+  readonly lockfileBlob: string;
+  /**
+   * Lines `git status --porcelain` printed in the checkout — a count, never the paths. Non-zero
+   * means the working tree differs from the commit the clones test.
+   */
+  readonly uncommittedChanges: number;
+  /** True when that status listing was truncated, so the count is a lower bound. */
+  readonly uncommittedChangesTruncated: boolean;
 }
 
-/** Every directory `beforeAll` created, removed (best effort) by `afterAll`. */
+/** Every directory `beforeAll` created; `afterAll` removes each and fails if one survives. */
 const createdRoots: string[] = [];
+
+/**
+ * SHA-256 of each clone's `pnpm-lock.yaml` as checked out (keyed by clone name), recorded once
+ * the file has been proven to be the committed blob; every later lockfile check compares to it.
+ */
+const lockfileDigests = new Map<string, string>();
 
 let buildClone: CloneRoot | undefined;
 let typecheckClone: CloneRoot | undefined;
@@ -291,25 +354,27 @@ test.describe('clean clone: install → build and install → typecheck each wor
   // temporary trees.
   test.describe.configure({ mode: 'serial' });
 
-  test.skip(
-    !process.env.CI && process.env.DEBUGGEN_SKIP_CLEAN_CLONE === '1',
-    'DEBUGGEN_SKIP_CLEAN_CLONE=1 skips the clean-clone ordering proof locally (it is never skipped under CI).',
-  );
-
   test.beforeAll(async () => {
     const root = await realpath(repoRoot());
-    const tracked = await listTrackedFiles();
+    // Pin both clones to one immutable commit up front, so a commit landing in the checkout
+    // while clone-1 builds cannot make clone-2 test something else.
+    const commit = await resolveHeadCommit();
+    const tracked = await listCommitFiles(commit);
+    const status = await runGit(['status', '--porcelain'], { expectSuccess: true });
     sourceFacts = {
       root,
+      commit,
       tracked,
       workspaces: workspacesOf(tracked),
-      lockfileDigest: await sha256Of(repoPath('pnpm-lock.yaml')),
+      lockfileBlob: await gitObjectId(`${commit}:${LOCKFILE}`, root),
+      uncommittedChanges: nonEmptyLines(status.stdout).length,
+      uncommittedChangesTruncated: status.truncated,
     };
 
     const first = await createCloneRoot();
     const second = await createCloneRoot();
     // Two independent trees: distinct, neither nested in the other, neither inside (or
-    // containing) the checkout. `copyTrackedTree()` re-checks the checkout boundary itself.
+    // containing) the checkout. `cloneRepository()` re-checks the checkout boundary itself.
     expect(first, 'the two clones must be different directories').not.toBe(second);
     for (const [label, candidate, other] of [
       ['clone-1', first, second],
@@ -332,18 +397,9 @@ test.describe('clean clone: install → build and install → typecheck each wor
 
   test.afterAll(async () => {
     test.setTimeout(CLEANUP_TIMEOUT_MS);
-    // Best effort by design: a tree that cannot be fully removed is reported, never a failure
-    // of the suite — the orderings were proven (or not) by the tests themselves.
-    for (const dir of createdRoots.splice(0)) {
-      try {
-        await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 250 });
-        process.stdout.write(`[clean-clone] removed ${dir}\n`);
-      } catch (error) {
-        console.warn(
-          `[clean-clone] could not remove ${dir} (${describeError(error)}); delete it by hand.`,
-        );
-      }
-    }
+    // Strict by design: each clone holds a linked node_modules/ and a full build, so a tree left
+    // behind is a teardown failure naming the path — never a warning a green run hides.
+    await removeCreatedRoots();
   });
 
   test('clone-1: pnpm install --frozen-lockfile && pnpm build', async () => {
@@ -352,7 +408,7 @@ test.describe('clean clone: install → build and install → typecheck each wor
     const clone = requireClone(buildClone);
     const facts = requireFacts();
 
-    await test.step(`${clone.name}: materialise the tracked tree`, async () => {
+    await test.step(`${clone.name}: git clone of the commit under test`, async () => {
       await materialiseClone(clone, facts);
     });
     await test.step(`${clone.name}: verify the child environment`, async () => {
@@ -360,18 +416,20 @@ test.describe('clean clone: install → build and install → typecheck each wor
     });
     await test.step(`${clone.name}: pnpm install --frozen-lockfile`, async () => {
       await runInClone(clone, ['install', '--frozen-lockfile'], INSTALL_TIMEOUT_MS);
-      await expectLockfileUnchanged(clone, facts, 'after pnpm install --frozen-lockfile');
+      await expectLockfileUnchanged(clone, 'after pnpm install --frozen-lockfile');
     });
     await test.step(`${clone.name}: pnpm build`, async () => {
       await runInClone(clone, ['build'], BUILD_TIMEOUT_MS);
-      await expectLockfileUnchanged(clone, facts, 'after pnpm build');
+      await expectLockfileUnchanged(clone, 'after pnpm build');
     });
     await test.step(`${clone.name}: every build artefact exists`, async () => {
       await expectBuildArtifacts(clone, facts);
     });
-    await test.step(`${clone.name}: still no repository metadata`, async () => {
-      expect(await pathExists(path.join(clone.dir, '.git')), `${clone.name} grew a .git`).toBe(
-        false,
+    await test.step(`${clone.name}: every tracked file is unmodified`, async () => {
+      await expectTrackedFilesUnmodified(
+        clone,
+        facts,
+        'pnpm install --frozen-lockfile && pnpm build',
       );
     });
   });
@@ -382,7 +440,7 @@ test.describe('clean clone: install → build and install → typecheck each wor
     const clone = requireClone(typecheckClone);
     const facts = requireFacts();
 
-    await test.step(`${clone.name}: materialise the tracked tree`, async () => {
+    await test.step(`${clone.name}: git clone of the commit under test`, async () => {
       await materialiseClone(clone, facts);
     });
     await test.step(`${clone.name}: verify the child environment`, async () => {
@@ -390,18 +448,20 @@ test.describe('clean clone: install → build and install → typecheck each wor
     });
     await test.step(`${clone.name}: pnpm install --frozen-lockfile`, async () => {
       await runInClone(clone, ['install', '--frozen-lockfile'], INSTALL_TIMEOUT_MS);
-      await expectLockfileUnchanged(clone, facts, 'after pnpm install --frozen-lockfile');
+      await expectLockfileUnchanged(clone, 'after pnpm install --frozen-lockfile');
     });
     await test.step(`${clone.name}: pnpm typecheck`, async () => {
       await runInClone(clone, ['typecheck'], TYPECHECK_TIMEOUT_MS);
-      await expectLockfileUnchanged(clone, facts, 'after pnpm typecheck');
+      await expectLockfileUnchanged(clone, 'after pnpm typecheck');
     });
     await test.step(`${clone.name}: typecheck needed prisma generate and nothing built`, async () => {
       await expectTypecheckStoodAlone(clone, facts);
     });
-    await test.step(`${clone.name}: still no repository metadata`, async () => {
-      expect(await pathExists(path.join(clone.dir, '.git')), `${clone.name} grew a .git`).toBe(
-        false,
+    await test.step(`${clone.name}: every tracked file is unmodified`, async () => {
+      await expectTrackedFilesUnmodified(
+        clone,
+        facts,
+        'pnpm install --frozen-lockfile && pnpm typecheck',
       );
     });
   });
@@ -419,71 +479,134 @@ async function createCloneRoot(): Promise<string> {
 }
 
 /**
- * Copy the tracked tree into `clone.dir` and prove the copy is what a fresh checkout would
- * start from: every tracked path accounted for, the manifests and configs every command needs,
- * every workspace, a byte-identical lockfile, exactly the tracked files on disk — and no `.git`
- * and no `.env*` beyond the two committed examples.
+ * `git clone` the commit under test into `clone.dir` with `cloneRepository()` — which itself
+ * refuses to resolve unless `HEAD` is the commit, the tree is pristine, no remote is left and
+ * the object store is self-contained — and prove from this side that the clone is what a fresh
+ * checkout of that commit contains: `HEAD` is the commit; the clone's index lists exactly the
+ * commit's paths; the manifests and configs every command needs and every workspace are there;
+ * the lockfile is the committed blob and identical in both clones; the files on disk are
+ * exactly the tracked ones, with no `.env*` beyond the two committed examples; and the
+ * repository is the clone's own.
  */
 async function materialiseClone(clone: CloneRoot, facts: SourceFacts): Promise<void> {
-  const copy = await copyTrackedTree(clone.dir, { label: `${clone.name} copy` });
-  expect(copy.dest, `${clone.name} was copied somewhere else`).toBe(clone.dir);
-  if (copy.missing.length > 0) {
-    // A tracked path deleted in the local working tree (never the case on a CI checkout).
+  if (facts.uncommittedChanges > 0) {
+    // A local run on an edited checkout: say plainly what is (and is not) being tested.
     test.info().annotations.push({
       type: 'clean-clone',
-      description: `${clone.name}: ${String(copy.missing.length)} tracked path(s) are missing from the working tree and were not copied: ${copy.missing.slice(0, 10).join(', ')}`,
+      description: `${clone.name}: the checkout has ${facts.uncommittedChangesTruncated ? 'at least ' : ''}${String(facts.uncommittedChanges)} uncommitted change(s) (git status --porcelain); this clone tests commit ${facts.commit}, not the working tree.`,
     });
   }
 
-  expectTrackedPathsAccountedFor(clone, copy, facts);
+  const cloned = await cloneRepository(clone.dir, { commit: facts.commit, label: clone.name });
+  expect(cloned.dest, `${clone.name} was cloned somewhere else`).toBe(clone.dir);
+  expect(cloned.commit, `${clone.name}: cloneRepository() checked out another commit`).toBe(
+    facts.commit,
+  );
+  expect(
+    await gitObjectId('HEAD^{commit}', clone.dir),
+    `${clone.name}: HEAD is not the commit under test`,
+  ).toBe(facts.commit);
 
-  const copied = new Set(copy.files);
-  const missingRootFiles = REQUIRED_ROOT_FILES.filter((file) => !copied.has(file));
+  expectSameTrackedPaths(clone, cloned.files, facts);
+
+  const tracked = new Set(cloned.files);
+  const missingRootFiles = REQUIRED_ROOT_FILES.filter((file) => !tracked.has(file));
   expect(missingRootFiles, `${clone.name} lacks required root files`).toEqual([]);
 
   const missingWorkspaces = EXPECTED_WORKSPACES.filter((dir) => !facts.workspaces.includes(dir));
-  expect(missingWorkspaces, 'workspaces of AAP §0.2.2 absent from the tracked tree').toEqual([]);
+  expect(missingWorkspaces, 'workspaces of AAP §0.2.2 absent from the commit').toEqual([]);
   const incompleteWorkspaces = facts.workspaces.filter(
     (dir) =>
-      !copied.has(`${dir}/package.json`) ||
-      !copy.files.some((file) => file.startsWith(`${dir}/`) && file !== `${dir}/package.json`),
+      !tracked.has(`${dir}/package.json`) ||
+      !cloned.files.some((file) => file.startsWith(`${dir}/`) && file !== `${dir}/package.json`),
   );
-  expect(incompleteWorkspaces, `${clone.name}: workspaces copied incompletely`).toEqual([]);
+  expect(incompleteWorkspaces, `${clone.name}: workspaces checked out incompletely`).toEqual([]);
 
-  expect(
-    await sha256Of(path.join(clone.dir, 'pnpm-lock.yaml')),
-    `${clone.name}: the copied pnpm-lock.yaml differs from the checkout's`,
-  ).toBe(facts.lockfileDigest);
+  await recordCommittedLockfile(clone, facts);
 
   const inventory = await inventoryTree(clone.dir);
-  expect(inventory.gitEntries, `${clone.name} contains repository metadata`).toEqual([]);
+  expect(
+    inventory.nestedGitEntries,
+    `${clone.name} contains repository metadata beyond its own .git`,
+  ).toEqual([]);
   expect(inventory.envFiles, `${clone.name} contains .env files beyond the examples`).toEqual([
     ...ALLOWED_ENV_FILES,
   ]);
   expect(
     inventory.fileCount,
-    `${clone.name} holds files that are not tracked (or lost tracked ones) during the copy`,
-  ).toBe(copy.files.length);
+    `${clone.name} holds files on disk beyond (or short of) the ones the commit tracks`,
+  ).toBe(cloned.files.length);
+
+  await expectSelfContainedRepository(clone);
 }
 
-/** Every tracked path was either copied or reported missing, and nothing else was copied. */
-function expectTrackedPathsAccountedFor(
+/** The clone's index (`git ls-files -z`) lists exactly the paths the commit tracks. */
+function expectSameTrackedPaths(
   clone: CloneRoot,
-  copy: CopyTrackedTreeResult,
+  files: readonly string[],
   facts: SourceFacts,
 ): void {
-  const accounted = new Set([...copy.files, ...copy.missing]);
-  const unaccounted = facts.tracked.filter((file) => !accounted.has(file));
-  expect(unaccounted, `${clone.name}: tracked paths neither copied nor reported`).toEqual([]);
-  const tracked = new Set(facts.tracked);
-  const extra = copy.files.filter((file) => !tracked.has(file));
-  expect(extra, `${clone.name}: copied paths that are not tracked`).toEqual([]);
+  const inClone = new Set(files);
+  const inCommit = new Set(facts.tracked);
+  expect(
+    listed(facts.tracked.filter((file) => !inClone.has(file))),
+    `${clone.name}: paths commit ${facts.commit} tracks that the clone's index lacks`,
+  ).toEqual([]);
+  expect(
+    listed(files.filter((file) => !inCommit.has(file))),
+    `${clone.name}: paths in the clone's index that commit ${facts.commit} does not track`,
+  ).toEqual([]);
 }
 
-/** What a recursive walk of a freshly copied (not yet installed) clone found. */
+/**
+ * The clone's `pnpm-lock.yaml` is the committed blob byte for byte (`git hash-object` in the
+ * clone equals `git rev-parse <commit>:pnpm-lock.yaml` in the checkout) and identical to every
+ * other clone's; its SHA-256 is recorded for {@link expectLockfileUnchanged}.
+ */
+async function recordCommittedLockfile(clone: CloneRoot, facts: SourceFacts): Promise<void> {
+  expect(
+    await gitBlobIdOf(clone, LOCKFILE),
+    `${clone.name}: ${LOCKFILE} is not the committed blob of commit ${facts.commit}`,
+  ).toBe(facts.lockfileBlob);
+  const digest = await sha256Of(inClone(clone, LOCKFILE));
+  for (const [other, otherDigest] of lockfileDigests) {
+    if (other !== clone.name) {
+      expect(digest, `${clone.name}'s ${LOCKFILE} differs from ${other}'s`).toBe(otherDigest);
+    }
+  }
+  lockfileDigests.set(clone.name, digest);
+}
+
+/**
+ * The clone owns its repository and refers to nothing outside itself: `.git` is a real
+ * directory (not a gitlink file or a symbolic link), its object store borrows nothing
+ * (`objects/info/alternates` is absent) and no remote-tracking ref survived the removal of the
+ * remote. `lstat` calls and ref NAMES only — nothing under `.git/` is opened. That `git remote`
+ * lists nothing was verified by `cloneRepository()`, which alone may run it (`runGit` refuses).
+ */
+async function expectSelfContainedRepository(clone: CloneRoot): Promise<void> {
+  const gitDir = inClone(clone, '.git');
+  expect((await lstat(gitDir)).isDirectory(), `${clone.name}: .git is not a real directory`).toBe(
+    true,
+  );
+  expect(
+    await pathExists(path.join(gitDir, 'objects', 'info', 'alternates')),
+    `${clone.name} borrows objects from another repository (objects/info/alternates exists)`,
+  ).toBe(false);
+  const remoteRefs = await runGit(['for-each-ref', '--format=%(refname)', 'refs/remotes'], {
+    cwd: clone.dir,
+    expectSuccess: true,
+  });
+  expect(
+    listed(nonEmptyLines(remoteRefs.stdout)),
+    `${clone.name} still has remote-tracking refs`,
+  ).toEqual([]);
+}
+
+/** What a recursive walk of a fresh (not yet installed) clone found outside its `.git/`. */
 interface TreeInventory {
-  /** Every entry named `.git`, at any depth. */
-  readonly gitEntries: readonly string[];
+  /** Every entry named `.git` other than the clone's own root `.git`, at any depth. */
+  readonly nestedGitEntries: readonly string[];
   /** Every non-directory entry whose name starts with `.env`, sorted. */
   readonly envFiles: readonly string[];
   /** Files and symbolic links (everything but directories). */
@@ -492,27 +615,111 @@ interface TreeInventory {
 
 /**
  * Walk a clone before `pnpm install` has populated it — a few thousand entries at most — and
- * collect what must never be there. Names only; no file is opened.
+ * collect what must never be there. The clone's own `.git/` subtree is skipped, never listed,
+ * and no other `.git` entry is descended into. Names only; no file is opened.
  */
 async function inventoryTree(root: string): Promise<TreeInventory> {
-  const entries = await readdir(root, { recursive: true, withFileTypes: true });
-  const gitEntries: string[] = [];
+  const nestedGitEntries: string[] = [];
   const envFiles: string[] = [];
   let fileCount = 0;
-  for (const entry of entries) {
-    const relative = toPosix(path.relative(root, path.join(entry.parentPath, entry.name)));
-    if (entry.name.toLowerCase() === '.git') {
-      gitEntries.push(relative);
-    }
-    if (entry.isDirectory()) {
-      continue;
-    }
-    fileCount += 1;
-    if (entry.name.startsWith('.env')) {
-      envFiles.push(relative);
+  const pending: string[] = [root];
+  for (let dir = pending.pop(); dir !== undefined; dir = pending.pop()) {
+    for (const entry of await readdir(dir, { withFileTypes: true })) {
+      if (dir === root && entry.name === '.git') {
+        continue;
+      }
+      const absolute = path.join(dir, entry.name);
+      const relative = toPosix(path.relative(root, absolute));
+      if (entry.name.toLowerCase() === '.git') {
+        nestedGitEntries.push(relative);
+        continue;
+      }
+      if (entry.isDirectory()) {
+        pending.push(absolute);
+        continue;
+      }
+      fileCount += 1;
+      if (entry.name.startsWith('.env')) {
+        envFiles.push(relative);
+      }
     }
   }
-  return { gitEntries: gitEntries.sort(), envFiles: envFiles.sort(), fileCount };
+  return { nestedGitEntries: nestedGitEntries.sort(), envFiles: envFiles.sort(), fileCount };
+}
+
+// ---------------------------------------------------------------------------
+// Removing the clones
+// ---------------------------------------------------------------------------
+
+/**
+ * Remove every root `beforeAll` created and prove each one gone. A root leaves `createdRoots`
+ * only once `lstat` reports `ENOENT` for it; after every root has been tried, one error names
+ * each survivor with the reason it persists, so teardown fails visibly instead of leaving
+ * gigabytes behind under a green result. Git's pack files are read-only (`0444`), which `fs.rm`
+ * with `force` removes all the same: unlinking needs only a writable parent directory.
+ */
+async function removeCreatedRoots(): Promise<void> {
+  const survivors: string[] = [];
+  for (const dir of [...createdRoots]) {
+    const failure = await removeTree(dir);
+    if (failure === undefined) {
+      createdRoots.splice(createdRoots.indexOf(dir), 1);
+      process.stdout.write(`[clean-clone] removed ${dir}\n`);
+    } else {
+      survivors.push(`${dir} - ${failure}`);
+    }
+  }
+  if (survivors.length > 0) {
+    throw new Error(
+      `clean-clone: ${String(survivors.length)} temporary clone tree(s) persist after ${String(REMOVAL_ATTEMPTS)} removal attempts each; delete them by hand:\n${survivors.map((line) => `  ${line}`).join('\n')}`,
+    );
+  }
+}
+
+/**
+ * Remove `dir` with up to {@link REMOVAL_ATTEMPTS} attempts, backing off between them, and
+ * verify the removal. Resolves `undefined` once `dir` is verifiably gone, otherwise the reason
+ * it persists after the last attempt (the `fs.rm` error, or what the verification found).
+ */
+async function removeTree(dir: string): Promise<string | undefined> {
+  let failure = 'not attempted';
+  for (let attempt = 1; attempt <= REMOVAL_ATTEMPTS; attempt += 1) {
+    let rmError: string | undefined;
+    try {
+      await rm(dir, {
+        recursive: true,
+        force: true,
+        maxRetries: RM_MAX_RETRIES,
+        retryDelay: RM_RETRY_DELAY_MS,
+      });
+    } catch (error) {
+      rmError = describeError(error);
+    }
+    const remaining = await describeRemaining(dir);
+    if (remaining === undefined) {
+      return undefined;
+    }
+    failure =
+      rmError === undefined
+        ? `${remaining} although fs.rm reported success`
+        : `${remaining}; fs.rm failed: ${rmError}`;
+    if (attempt < REMOVAL_ATTEMPTS) {
+      await delay(REMOVAL_BACKOFF_MS * attempt);
+    }
+  }
+  return failure;
+}
+
+/** `undefined` when `lstat` reports `dir` absent (`ENOENT`), otherwise what it found instead. */
+async function describeRemaining(dir: string): Promise<string | undefined> {
+  try {
+    const info = await lstat(dir);
+    return `still present (${info.isDirectory() ? 'directory' : 'non-directory'})`;
+  } catch (error) {
+    return hasErrorCode(error, 'ENOENT')
+      ? undefined
+      : `cannot be verified gone (lstat: ${describeError(error)})`;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -592,16 +799,50 @@ function renderCommandLog(result: CommandResult): string {
   ].join('\n');
 }
 
-/** `--frozen-lockfile` was honoured: the clone's lockfile is still the checkout's, byte for byte. */
-async function expectLockfileUnchanged(
+/**
+ * `--frozen-lockfile` was honoured: the clone's lockfile is still, byte for byte, the committed
+ * blob it held when {@link recordCommittedLockfile} checked it.
+ */
+async function expectLockfileUnchanged(clone: CloneRoot, when: string): Promise<void> {
+  const expected = lockfileDigests.get(clone.name);
+  if (expected === undefined) {
+    throw new Error(`${clone.name}: no ${LOCKFILE} digest was recorded when the clone was made`);
+  }
+  expect(
+    await sha256Of(inClone(clone, LOCKFILE)),
+    `${clone.name}: ${LOCKFILE} changed ${when} - the committed lockfile is stale`,
+  ).toBe(expected);
+}
+
+/**
+ * After `commands`, the clone is still exactly the commit: `git status --porcelain
+ * --untracked-files=no` lists nothing — no tracked file was modified, deleted or changed type
+ * (build output and `node_modules/` are untracked and ignored, so they are not what this is
+ * about) — `HEAD` has not moved, and the lockfile is still the committed blob.
+ */
+async function expectTrackedFilesUnmodified(
   clone: CloneRoot,
   facts: SourceFacts,
-  when: string,
+  commands: string,
 ): Promise<void> {
+  const status = await runGit(['status', '--porcelain', '--untracked-files=no'], {
+    cwd: clone.dir,
+    expectSuccess: true,
+  });
+  expect(status.truncated, `${clone.name}: git status output was truncated`).toBe(false);
   expect(
-    await sha256Of(path.join(clone.dir, 'pnpm-lock.yaml')),
-    `${clone.name}: pnpm-lock.yaml changed ${when} - the committed lockfile is stale`,
-  ).toBe(facts.lockfileDigest);
+    listed(nonEmptyLines(status.stdout)),
+    `${clone.name}: ${commands} modified tracked files (git status --porcelain --untracked-files=no)`,
+  ).toEqual([]);
+  expect(
+    await gitObjectId('HEAD^{commit}', clone.dir),
+    `${clone.name}: HEAD moved during ${commands}`,
+  ).toBe(facts.commit);
+  expect(
+    await gitBlobIdOf(clone, LOCKFILE),
+    `${clone.name}: ${LOCKFILE} is no longer the committed blob after ${commands}`,
+  ).toBe(facts.lockfileBlob);
+  await expectLockfileUnchanged(clone, `after ${commands}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -698,7 +939,7 @@ async function expectTypecheckStoodAlone(clone: CloneRoot, facts: SourceFacts): 
 }
 
 /**
- * The `dist/` files the workspaces themselves promise, read from each copied manifest's
+ * The `dist/` files the workspaces themselves promise, read from each cloned manifest's
  * `exports` map and `main` field rather than guessed: a manifest naming a file its build does
  * not write fails here. Targets outside `dist/` (the `src/` fallback of a `types` array) and
  * pattern targets are not build outputs and are skipped.
@@ -811,6 +1052,44 @@ async function sha256Of(file: string): Promise<string> {
   return createHash('sha256')
     .update(await readFile(file))
     .digest('hex');
+}
+
+/** The object id `git rev-parse --verify <revision>` names in the repository at `cwd`. */
+async function gitObjectId(revision: string, cwd: string): Promise<string> {
+  const result = await runGit(['rev-parse', '--verify', revision], { cwd, expectSuccess: true });
+  return requireObjectId(result.stdout.trim(), `git rev-parse --verify ${revision} in ${cwd}`);
+}
+
+/** The blob id git computes for a clone's working-tree file (`git hash-object <path>`). */
+async function gitBlobIdOf(clone: CloneRoot, relative: string): Promise<string> {
+  const result = await runGit(['hash-object', relative], { cwd: clone.dir, expectSuccess: true });
+  return requireObjectId(result.stdout.trim(), `git hash-object ${relative} in ${clone.name}`);
+}
+
+function requireObjectId(value: string, source: string): string {
+  if (!OBJECT_ID_PATTERN.test(value)) {
+    throw new Error(`${source} printed ${JSON.stringify(value.slice(0, 80))}, not an object id`);
+  }
+  return value;
+}
+
+/** The non-blank lines of a command's output. */
+function nonEmptyLines(text: string): string[] {
+  return text.split('\n').filter((line) => line.trim() !== '');
+}
+
+/**
+ * At most {@link LISTED_PATHS_LIMIT} entries plus one `… and N more` marker, so a failed
+ * comparison of two ~900-path listings prints a readable excerpt; an empty list stays empty.
+ */
+function listed(entries: readonly string[]): string[] {
+  if (entries.length <= LISTED_PATHS_LIMIT) {
+    return [...entries];
+  }
+  return [
+    ...entries.slice(0, LISTED_PATHS_LIMIT),
+    `… and ${String(entries.length - LISTED_PATHS_LIMIT)} more`,
+  ];
 }
 
 /** True when `candidate` is `parent` or lies below it (both already resolved). */

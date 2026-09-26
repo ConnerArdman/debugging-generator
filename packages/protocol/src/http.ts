@@ -10,32 +10,57 @@
  * than a convenience, because the two copies can only ever disagree at run
  * time, in the process that receives the body.
  *
- * ## Seventeen routes, and where their names come from
+ * ## Twenty-one routes, and where their names come from
  *
  * Six of the operation keys are the user's own names for these operations
  * (prompt §16), preserved character for character: `session.create`,
  * `session.question`, `session.end`, `capture.start`, `capture.stop` and
  * `telemetry.event`. They are **HTTP operations, not WebSocket message types**.
  * Nothing in this file may enter the envelope's discriminated union, and the
- * twenty-five WebSocket message types — `client.hello`, `session.created`,
+ * twenty-six WebSocket message types — `client.hello`, `session.created`,
  * `session.updated`, `session.progress`, `session.bind`, `session.bound`,
  * `tab.navigated`, `session.unbind`, `target.request`, `target.selected`,
  * `instrumentation.plan`, `instrumentation.ready`, `instrumentation.failed`,
  * `capture.started`, `capture.stopped`, `agent.ready`, `agent.config`,
  * `server-agent.config`, `telemetry.event`, `telemetry.tail`,
- * `analysis.completed`, `panel.generated`, `source.open`, `cleanup.completed`
- * and `error` — live in `./messages/**` and are registered there. One name,
- * `telemetry.event`, is deliberately both: a batch reaches the service over the
- * WebSocket from the page agent's relay and over HTTP from the Node preload,
- * and the two transports carry the same events under the same operation name.
+ * `analysis.completed`, `panel.generated`, `source.open`, `source.result`,
+ * `cleanup.completed` and `error` — live in `./messages/**` and are registered
+ * there. Two names are deliberately both, each because one instruction crosses
+ * two transports on its way:
+ *
+ * - `telemetry.event`: a batch reaches the service over the WebSocket from the
+ *   page agent's relay and over HTTP from the Node preload, and the two
+ *   transports carry the same events under the same operation name.
+ * - `target.request`: the editor asks over HTTP
+ *   (`POST /sessions/:id/target/request`, Section D2) and the service pushes
+ *   the same instruction over the WebSocket to the session's bound DevTools
+ *   tab, and to it alone. The editor holds no connection to that tab, and the
+ *   service is the one process that knows which tab is bound, so the request is
+ *   a conventional HTTP call (AAP §0.2.3) and the push stays the service-only
+ *   message `./messages/target.ts` defines — the vocabulary keeps its
+ *   twenty-six types.
+ *
+ * Three of the twenty are administrative operations whose behaviour the AAP
+ * mandates without naming a path, and they are declared here so that no
+ * process has to define a route of its own to reach them:
+ * `devServer.credential` (`POST /dev-server/credential`, the server-agent
+ * credential `scripts/dev-instrumented.mjs` requests with the editor
+ * credential, AAP §0.5.6), `credentials.rotate` (`POST /credentials/rotate`,
+ * the revocation `debuggen.rotateServiceToken` performs, AAP §0.5.6) and
+ * `session.purge` (`POST /sessions/purge`, the retention sweep
+ * `debuggen.purgeSessions` runs on demand, AAP §0.4.2). A route the service
+ * registered outside this table would be a route no client could discover and
+ * no test could enumerate, so none may exist.
  *
  * The bodies those operations already own are **imported, never restated**:
  * `./messages/session.ts` owns the three session request bodies,
  * `./messages/capture.ts` the four capture bodies and the embedded capture
- * summary, `./messages/error.ts` the one error body both transports share, and
- * `./session-record.ts` the `SessionRecord` and the cleanup vocabulary. This
- * module adds what only a route can have: its method, its path, its parameters,
- * whether it is exempt from authentication, and its response.
+ * summary, `./messages/binding.ts` the Chrome tab-id rule the target-request
+ * reply carries, `./messages/error.ts` the one error body both transports
+ * share, and `./session-record.ts` the `SessionRecord` and the cleanup
+ * vocabulary. This module adds what only a route can have: its method, its
+ * path, its parameters, whether it is exempt from authentication, and its
+ * response.
  *
  * ## Patterns are for the server; `buildPath` is for the client
  *
@@ -98,7 +123,10 @@
 
 import { z } from 'zod';
 
-import { modificationRecordSchema } from '@debuggen/instrumentation/schema';
+import {
+  MAX_MODIFICATION_DIFF_LENGTH,
+  modificationRecordSchema,
+} from '@debuggen/instrumentation/schema';
 import type { ModificationRecord } from '@debuggen/instrumentation/schema';
 import {
   DATA_QUERY_DEFAULT_LIMIT,
@@ -110,7 +138,12 @@ import {
 import type { DataQuery, DataQuerySource, PanelSpec } from '@debuggen/panel-schema';
 import { DebuggenError, err, ok } from '@debuggen/shared';
 import type { DebuggenErrorCode, Result } from '@debuggen/shared';
-import { METRIC_IDS, telemetryEventIngressSchema, telemetryEventSchema } from '@debuggen/telemetry';
+import {
+  MAX_EPOCH_MS,
+  METRIC_IDS,
+  telemetryEventIngressSchema,
+  telemetryEventSchema,
+} from '@debuggen/telemetry';
 import type {
   ComponentTreeSnapshot,
   DependencyGraphData,
@@ -123,6 +156,8 @@ import type {
   TraceTree,
 } from '@debuggen/telemetry';
 
+import { sessionBindPayloadSchema, tabIdSchema } from './messages/binding.js';
+import type { SessionBindPayload } from './messages/binding.js';
 import {
   captureStartRequestSchema,
   captureStartResponseSchema,
@@ -131,11 +166,16 @@ import {
 } from './messages/capture.js';
 import { errorPayloadSchema } from './messages/error.js';
 import {
+  devServerUrlSchema,
   sessionCreateRequestSchema,
   sessionEndRequestSchema,
   sessionQuestionRequestSchema,
 } from './messages/session.js';
-import { cleanupStatusSchema, sessionRecordSchema } from './session-record.js';
+import {
+  cleanupStatusSchema,
+  sessionCleanupSchema,
+  sessionRecordSchema,
+} from './session-record.js';
 import type { SessionRecord } from './session-record.js';
 import {
   epochMsSchema,
@@ -210,6 +250,172 @@ export const AUTHORIZATION_HEADER = 'authorization';
  */
 export function formatBearer(token: string): string {
   return `Bearer ${token}`;
+}
+
+/**
+ * The acting-tab request header's name, lowercase: the inspected Chrome tab a
+ * DevTools request acts for.
+ *
+ * ## Why a request has to say which tab it is for
+ *
+ * One pairing issues one DevTools credential, and the Chrome service worker
+ * presents it for every tab the developer inspects. The credential therefore
+ * cannot say *which* tab a request comes from, and AAP §0.5.6 allows a DevTools
+ * principal to bind, capture and query panel data only for the session bound to
+ * its tab. The service worker fills this header from Chrome's own metadata for
+ * the panel or page that asked — never from anything a page supplied — and the
+ * service checks it against its live tab-to-session binding table:
+ *
+ * - **required** on every session-scoped request presented with a DevTools
+ *   credential; a request without it, or for a session whose live binding is
+ *   another tab's, is refused;
+ * - **refused** from every other role: an editor or server-agent credential has
+ *   no tab, so a request that claims one is a confused client rather than a
+ *   narrower one.
+ *
+ * It is a claim the service verifies, never a capability: presenting a tab id
+ * gains nothing without both the DevTools credential and a live binding for that
+ * tab. The WebSocket counterpart is the envelope's `tabId` (`./envelope.ts`).
+ *
+ * The value is one tab id in canonical decimal — see
+ * {@link parseActingTabHeader} for exactly what is accepted — written only by
+ * {@link formatActingTabHeader}. Lowercase for the reason
+ * {@link AUTHORIZATION_HEADER} is.
+ */
+export const ACTING_TAB_HEADER = 'x-debuggen-tab';
+
+/**
+ * The one spelling of a tab id {@link parseActingTabHeader} accepts: `0`, or a
+ * non-zero digit followed by at most fifteen more — sixteen digits being the
+ * width of `Number.MAX_SAFE_INTEGER` (`9007199254740991`).
+ *
+ * Anchored and bounded, so a hostile value costs a fixed amount of work
+ * whatever its length. No sign, no leading zero, no fraction, no exponent and
+ * no whitespace: a header that two parsers could read as two different numbers
+ * is refused rather than normalised. A duplicated header, which the platform's
+ * `Headers.get` joins as `"4, 5"`, fails this pattern too.
+ */
+const ACTING_TAB_HEADER_PATTERN = /^(0|[1-9][0-9]{0,15})$/;
+
+/**
+ * What {@link parseActingTabHeader} reports for a value that is not one tab id.
+ *
+ * Constant: the refused value is never interpolated (AAP §0.5.2), because a
+ * header this service did not expect is unvalidated data from another process.
+ */
+const ACTING_TAB_HEADER_INVALID_MESSAGE =
+  'Invalid x-debuggen-tab header: expected the decimal id of exactly one Chrome tab';
+
+/** The constant next step for {@link ACTING_TAB_HEADER_INVALID_MESSAGE}. */
+const ACTING_TAB_HEADER_INVALID_HINT =
+  'Send x-debuggen-tab once, as the inspected tab’s non-negative integer id in canonical decimal (no sign, no leading zero, no whitespace), or omit it on a request that acts for no tab.';
+
+/**
+ * What {@link formatActingTabHeader} reports for a number that is not a tab id.
+ *
+ * Constant, like its parsing counterpart.
+ */
+const ACTING_TAB_FORMAT_INVALID_MESSAGE =
+  'Cannot send the x-debuggen-tab header: the value is not a non-negative safe-integer Chrome tab id';
+
+/** The constant next step for {@link ACTING_TAB_FORMAT_INVALID_MESSAGE}. */
+const ACTING_TAB_FORMAT_INVALID_HINT =
+  'Pass the inspected tab’s id as Chrome reports it (a port sender’s tab.id, or chrome.devtools.inspectedWindow.tabId); -1 is chrome.tabs.TAB_ID_NONE, not a tab.';
+
+/**
+ * Formats a tab id as an {@link ACTING_TAB_HEADER} value, without throwing.
+ *
+ * The one place the header's value is written, so every sender produces the
+ * spelling {@link parseActingTabHeader} accepts: the decimal string of a tab id
+ * that passes `tabIdSchema` (`./messages/binding.ts`) — the same schema a
+ * payload's `tabId` and the envelope's acting tab are held to. A safe integer's
+ * decimal string never has a sign, a leading zero or an exponent, so what this
+ * returns always parses back to the number it was given.
+ *
+ * @param tabId The inspected tab's id.
+ * @returns `ok(value)` with the header value, or `err(error)` with code
+ * `PROTOCOL_INVALID_MESSAGE` and a constant message when `tabId` is negative,
+ * fractional, non-finite, beyond the safe-integer range or not a number.
+ *
+ * @example
+ * ```ts
+ * const header = formatActingTabHeader(tabId);
+ * if (isOk(header)) {
+ *   headers[ACTING_TAB_HEADER] = header.value; // '42'
+ * }
+ * ```
+ */
+export function formatActingTabHeader(tabId: number): Result<string, DebuggenError> {
+  if (!tabIdSchema.safeParse(tabId).success) {
+    return err(
+      new DebuggenError('PROTOCOL_INVALID_MESSAGE', ACTING_TAB_FORMAT_INVALID_MESSAGE, {
+        hint: ACTING_TAB_FORMAT_INVALID_HINT,
+        details: { header: ACTING_TAB_HEADER },
+      }),
+    );
+  }
+
+  return ok(String(tabId));
+}
+
+/**
+ * Parses an {@link ACTING_TAB_HEADER} value, without throwing.
+ *
+ * The service's half of the contract: it reads the header — hono's
+ * `c.req.header()` answers `undefined` for an absent one, `Headers.get` answers
+ * `null` — and hands the value here before any authorization decision.
+ *
+ * - `null` or `undefined` is **absent**, answered `ok(undefined)`: whether a
+ *   request needed a tab is the service's decision, made with the principal in
+ *   hand, not a shape rule.
+ * - Anything else must be exactly one tab id in canonical decimal
+ *   ({@link ACTING_TAB_HEADER_PATTERN}) that is a safe integer and passes
+ *   `tabIdSchema`. An empty string is refused — a header that is present but
+ *   names no tab is a client bug, not an absent header — and so are `-1`, `01`,
+ *   `+3`, `1.5`, `1e3`, surrounding whitespace, a duplicated header joined as
+ *   `4, 5`, and `9007199254740992`, the first integer a double cannot tell from
+ *   its neighbour.
+ *
+ * The rejection is `PROTOCOL_INVALID_MESSAGE` with a constant message and hint
+ * and `details: { header }`; the value is never quoted (AAP §0.5.2).
+ *
+ * @param value The raw header value, or `null` / `undefined` when absent.
+ * @returns `ok(tabId)`, `ok(undefined)` when absent, or `err(error)`.
+ *
+ * @example
+ * ```ts
+ * const actingTab = parseActingTabHeader(c.req.header(ACTING_TAB_HEADER));
+ * if (isErr(actingTab)) {
+ *   return refuse(c, actingTab.error); // the service's own error responder
+ * }
+ * // actingTab.value: the tab id, or undefined when the header was absent.
+ * ```
+ */
+export function parseActingTabHeader(
+  value: string | null | undefined,
+): Result<number | undefined, DebuggenError> {
+  if (value === null || value === undefined) {
+    return ok(undefined);
+  }
+
+  // The pattern first: it is what refuses every non-canonical spelling, and it
+  // keeps `Number()` — which would accept ' 4', '0x4' and '1e3' — from ever
+  // seeing one. The safe-integer and schema checks then refuse the sixteen-digit
+  // values beyond `Number.MAX_SAFE_INTEGER`.
+  if (ACTING_TAB_HEADER_PATTERN.test(value)) {
+    const tabId = Number(value);
+
+    if (Number.isSafeInteger(tabId) && tabIdSchema.safeParse(tabId).success) {
+      return ok(tabId);
+    }
+  }
+
+  return err(
+    new DebuggenError('PROTOCOL_INVALID_MESSAGE', ACTING_TAB_HEADER_INVALID_MESSAGE, {
+      hint: ACTING_TAB_HEADER_INVALID_HINT,
+      details: { header: ACTING_TAB_HEADER },
+    }),
+  );
 }
 
 /**
@@ -349,6 +555,23 @@ function urlSchema(): z.ZodType<string> {
   });
 }
 
+/**
+ * A count the service reports as a body field: a non-negative safe integer.
+ *
+ * Used for the tallies of the two administrative reports (`credentials.rotate`
+ * and `session.purge`). The field's own name goes into the refusal so a
+ * producer that sent `-1` learns which tally was wrong; no value is ever
+ * echoed (AAP §0.5.2).
+ *
+ * @param field The body field the count is declared under.
+ * @returns An integer schema refusing a negative, fractional or unsafe value.
+ */
+function countSchema(field: string): z.ZodInt {
+  const expectation = `expected ${field} to be a non-negative integer count`;
+
+  return z.int({ error: expectation }).nonnegative({ error: expectation });
+}
+
 // ---------------------------------------------------------------------------
 // Section B — compile-time assertion helpers
 //
@@ -486,18 +709,22 @@ export interface HttpRouteDefinition<
 // Section C — the session routes
 //
 // `POST /sessions`, `GET /sessions`, `GET /sessions/:id`,
-// `POST /sessions/:id/question`, `POST /sessions/:id/end`.
+// `POST /sessions/:id/question`, `POST /sessions/:id/end`,
+// `POST /sessions/purge`.
 //
 // The three request bodies are `./messages/session.ts`'s and are re-exported
 // here under their own names so a caller that holds this module holds the whole
 // route surface; they are not redeclared. The responses are this module's,
 // because the session record and the cleanup vocabulary belong to
-// `./session-record.ts` and a route is what binds them to a status code.
+// `./session-record.ts` and a route is what binds them to a status code. The
+// purge bodies are this module's too: the retention sweep acts on the store as
+// a whole rather than on one session, and no WebSocket message carries them.
 // ---------------------------------------------------------------------------
 
 export {
   /**
-   * The `session.create` request body, `{ projectRoot, question, target? }`.
+   * The `session.create` request body,
+   * `{ projectRoot, question, target?, devServerUrl? }`.
    *
    * Defined by `./messages/session.ts` and re-exported unchanged: one schema
    * object, two import paths, no second definition. Bound below to
@@ -530,32 +757,527 @@ export type {
   SessionQuestionRequest,
 } from './messages/session.js';
 
+// ---------------------------------------------------------------------------
+// Section C.1 — paged listings: `GET /sessions` and
+// `GET /sessions/:id/modifications`
+//
+// Both listings are assembled by the service from its own store and both used
+// to answer with every stored item in one body. Neither may: a developer who
+// debugs a lot accumulates sessions until retention removes them, and a
+// modification journal holds up to 256 records whose diffs may each reach
+// 2 MiB. Each listing therefore answers one **page**, echoes the window it
+// applied in the same four fields the panel-data results carry (`total`,
+// `limit`, `offset`, `nextOffset`, AAP §0.4.2), and reads its window from the
+// store with one indexed query instead of hydrating whole documents.
+//
+// The page window is requested with two query-string parameters, `limit` and
+// `offset`, parsed by {@link parseListPageQuery}. A `GET` carries no body, so
+// the query string is where a window can travel; every parameter is optional,
+// and — as everywhere in this package — **no default is applied by a schema**:
+// the service fills an omitted `limit` with the listing's documented default
+// and an omitted `offset` with `0`, and echoes both.
+// ---------------------------------------------------------------------------
+
 /**
- * The `GET /sessions` response: every session the service holds, for the editor's
- * Sessions tree.
+ * The query-string parameters a paged listing accepts, and nothing else.
  *
- * Wrapped in an object rather than returned as a bare array, so the reply can
- * grow a field — a retention cut-off, a count — without becoming a different
- * JSON type and breaking every client at once.
+ * A request carrying any other parameter is refused rather than ignored, for the
+ * reason every body in this package is a strict object: a parameter the service
+ * does not honour is a client that disagrees with this contract, and silently
+ * answering an unfiltered page would hide that disagreement.
+ */
+export const LIST_PAGE_QUERY_KEYS = ['limit', 'offset'] as const;
+
+/** One parameter name of {@link LIST_PAGE_QUERY_KEYS}. */
+export type ListPageQueryKey = (typeof LIST_PAGE_QUERY_KEYS)[number];
+
+/**
+ * The largest `offset` a listing accepts.
  *
- * Deliberately **unbounded**. Every other list in this package carries a
- * maximum, and the difference is who produces it: an ingest batch comes from a
- * page-side agent and needs a ceiling, while this array is assembled by the
- * service from its own store, whose size `store/retention.ts` already bounds by
- * `DEBUGGEN_RETENTION_DAYS`. A cap here would be a guess that refuses a
- * legitimate response and empties the Sessions tree of a developer who debugs a
- * lot.
+ * `Number.MAX_SAFE_INTEGER`, so the value survives the string-to-number step
+ * exactly; no store holds anywhere near that many rows, and an offset past the
+ * end is an ordinary empty last page.
+ */
+export const LIST_PAGE_MAX_OFFSET = Number.MAX_SAFE_INTEGER;
+
+/**
+ * A canonical non-negative decimal integer as it appears in a query string: `0`,
+ * or a digit string with no leading zero, no sign, no exponent and no
+ * whitespace. Anything else — `"1e3"`, `" 5"`, `"05"`, `"-1"` — is refused
+ * rather than coerced, so one window has exactly one spelling.
+ */
+const DECIMAL_INTEGER_PATTERN = /^(?:0|[1-9]\d{0,15})$/;
+
+/** A query-string integer, validated as text: the conversion happens after. */
+const queryIntegerSchema = z
+  .string()
+  .regex(DECIMAL_INTEGER_PATTERN, { error: 'expected a non-negative decimal integer' });
+
+/**
+ * The raw query of a paged listing: at most the two {@link LIST_PAGE_QUERY_KEYS},
+ * each a canonical decimal integer string.
  *
- * Consumed by `apps/vscode-extension/src/views/sessions-tree.ts` and
+ * Validated as text because a query string is text; {@link parseListPageQuery}
+ * converts the validated strings to numbers and applies the listing's ceiling,
+ * which is how the conversion stays out of the schema (no `.transform()` or
+ * `.coerce` anywhere in this package).
+ */
+export const listPageQuerySchema = z.strictObject({
+  /** The page size requested, as a decimal string. */
+  limit: queryIntegerSchema.optional(),
+  /** How many items to skip, as a decimal string. */
+  offset: queryIntegerSchema.optional(),
+});
+
+/** A validated, converted page window. Absent members were not requested. */
+export interface ListPageQuery {
+  /** The requested page size, within the listing's ceiling. */
+  readonly limit?: number;
+  /** The requested offset, at most {@link LIST_PAGE_MAX_OFFSET}. */
+  readonly offset?: number;
+}
+
+/** The ceiling a listing enforces on its `limit` parameter. */
+export interface ListPageBounds {
+  /** The largest page the listing serves. */
+  readonly maxLimit: number;
+}
+
+/**
+ * Validates the query string of a paged listing, without throwing.
+ *
+ * Shared by both listings so their window vocabulary cannot drift: the service's
+ * `GET /sessions` and `GET /sessions/:id/modifications` handlers pass hono's
+ * `c.req.query()` record here, and a refusal is the same `400`-mapped
+ * `PROTOCOL_INVALID_MESSAGE` a malformed body produces. The error carries issue
+ * paths and codes only (AAP §0.5.2), never the rejected text.
+ *
+ * @param query The request's query parameters, one value per name.
+ * @param bounds The listing's `limit` ceiling —
+ * {@link SESSION_LIST_MAX_LIMIT} or {@link MODIFICATIONS_PAGE_MAX_LIMIT}.
+ * @returns `ok(window)` with only the members the request named, or
+ * `err(error)` naming the offending parameter.
+ */
+export function parseListPageQuery(
+  query: Readonly<Record<string, string | undefined>>,
+  bounds: ListPageBounds,
+): Result<ListPageQuery, DebuggenError> {
+  const parsed = listPageQuerySchema.safeParse(query);
+
+  if (!parsed.success) {
+    return err(
+      protocolParseError(
+        'PROTOCOL_INVALID_MESSAGE',
+        'Invalid listing query',
+        parsed.error.issues,
+        `Page a listing with at most "limit" (0 to ${String(bounds.maxLimit)}) and "offset" (a non-negative integer).`,
+      ),
+    );
+  }
+
+  const limit = parsed.data.limit === undefined ? undefined : Number(parsed.data.limit);
+  const offset = parsed.data.offset === undefined ? undefined : Number(parsed.data.offset);
+
+  if (limit !== undefined && limit > bounds.maxLimit) {
+    return err(
+      new DebuggenError('PROTOCOL_INVALID_MESSAGE', 'Invalid listing query: limit is too large', {
+        hint: `Ask for at most ${String(bounds.maxLimit)} items per page and follow nextOffset for the rest.`,
+        details: { parameter: 'limit', maxLimit: bounds.maxLimit },
+      }),
+    );
+  }
+
+  if (offset !== undefined && offset > LIST_PAGE_MAX_OFFSET) {
+    return err(
+      new DebuggenError('PROTOCOL_INVALID_MESSAGE', 'Invalid listing query: offset is too large', {
+        hint: 'Follow nextOffset from the previous page instead of computing an offset.',
+        details: { parameter: 'offset' },
+      }),
+    );
+  }
+
+  return ok({
+    ...(limit === undefined ? {} : { limit }),
+    ...(offset === undefined ? {} : { offset }),
+  });
+}
+
+/**
+ * The paging echo of a listing, for a listing whose pages hold at most
+ * `maxLimit` items.
+ *
+ * The same four fields and meanings as the panel-data results' `dataPageShape`
+ * (Section I): `total` counts every item the listing holds in full, `limit` and
+ * `offset` echo the window the service applied (its defaults included), and
+ * `nextOffset` is the offset of the following page or `null` on the last one.
+ * A factory rather than a reuse of that shape because each listing has its own,
+ * smaller ceiling.
+ *
+ * @param maxLimit The listing's page ceiling.
+ * @returns A spreadable shape.
+ */
+function listPageShape(maxLimit: number) {
+  return {
+    /** How many items the listing holds in total, before paging. */
+    total: z.int().min(0, { error: 'expected a non-negative total' }),
+    /** The page size the service applied: `0` is a count-only request. */
+    limit: z
+      .int()
+      .min(0, { error: 'expected a non-negative limit' })
+      .max(maxLimit, { error: `expected a limit of at most ${String(maxLimit)}` }),
+    /** How many items were skipped before this page. */
+    offset: z
+      .int()
+      .min(0, { error: 'expected a non-negative offset' })
+      .max(LIST_PAGE_MAX_OFFSET, { error: 'expected a safe-integer offset' }),
+    /** The offset of the following page, or `null` when this page is the last. */
+    nextOffset: z.int().min(0, { error: 'expected a non-negative nextOffset' }).nullable(),
+  };
+}
+
+/** The fields {@link checkListPage} reads from a parsed listing page. */
+interface ListPageWindow {
+  readonly total: number;
+  readonly limit: number;
+  readonly offset: number;
+  readonly nextOffset: number | null;
+}
+
+/** A page never holds more items than the page size it echoes. */
+const LIST_PAGE_LIMIT_RULE =
+  'a listing page holds at most limit items: it never exceeds the page size it echoes.';
+
+/** A page never holds more items than remain from its offset. */
+const LIST_PAGE_REMAINDER_RULE =
+  'a listing page holds at most total minus offset items: it cannot carry more than remains.';
+
+/** A following page starts past this one and inside the listing. */
+const LIST_PAGE_NEXT_OFFSET_RULE =
+  'nextOffset must lie past every item of this page, at most offset plus limit, and below total — or be null.';
+
+/** A full page with items left beyond its window is not the last page. */
+const LIST_PAGE_EARLY_END_RULE =
+  'nextOffset must not be null while a full page leaves items beyond offset plus limit.';
+
+/**
+ * Records one breach of a listing's paging rule on `payload`, with no input
+ * attached (AAP §0.5.2).
+ */
+function reportListPageIssue(
+  payload: z.core.ParsePayload<unknown>,
+  path: (string | number)[],
+  message: string,
+): void {
+  payload.issues.push({ code: 'custom', path, message, input: undefined });
+}
+
+/**
+ * Rejects a listing page that breaks the listings' paging rule.
+ *
+ * The page holds at most `limit` items and at most `total - offset` items.
+ * `nextOffset` is the offset just past the part of the listing this page
+ * **consumed**, or `null` when nothing remains after it. That is usually
+ * `offset + length`, but a page may consume more of the window than it returns
+ * — the session list leaves out a stored row it cannot read rather than empty
+ * the Sessions tree, and moves past it — and it may end before `limit` — the
+ * journal's diff budget. So a non-null `nextOffset` must lie past every item
+ * returned (and past `offset`, so a loop always advances), no further than
+ * `offset + limit` (a page consumes at most its window), and below `total`
+ * (something remains); and a full page whose window ends before `total` must
+ * not claim to be the last. `limit: 0` is a count-only request, whose only valid
+ * `nextOffset` is `null`. A paging loop that follows `nextOffset` therefore
+ * always advances, never skips an unread item, and always stops.
+ *
+ * @param payload The parse payload of the page being checked.
+ * @param window The page's echoed window.
+ * @param items The page's items, under `field`.
+ * @param field The items' field name, the path a producer has to change.
+ */
+function checkListPage(
+  payload: z.core.ParsePayload<unknown>,
+  window: ListPageWindow,
+  items: readonly unknown[],
+  field: string,
+): void {
+  const { total, limit, offset, nextOffset } = window;
+
+  if (items.length > limit) {
+    reportListPageIssue(payload, [field], LIST_PAGE_LIMIT_RULE);
+  }
+
+  if (items.length > Math.max(0, total - offset)) {
+    reportListPageIssue(payload, [field], LIST_PAGE_REMAINDER_RULE);
+  }
+
+  if (nextOffset === null) {
+    if (limit > 0 && items.length === limit && offset + limit < total) {
+      reportListPageIssue(payload, ['nextOffset'], LIST_PAGE_EARLY_END_RULE);
+    }
+    return;
+  }
+
+  const lowest = offset + Math.max(items.length, 1);
+
+  if (nextOffset < lowest || nextOffset > offset + limit || nextOffset >= total) {
+    reportListPageIssue(payload, ['nextOffset'], LIST_PAGE_NEXT_OFFSET_RULE);
+  }
+}
+
+/**
+ * The page size `GET /sessions` applies when the request names none.
+ *
+ * One hundred sessions, most recently updated first: more than a Sessions tree
+ * shows at a glance, far fewer than a developer can accumulate over the
+ * retention window. The service fills it in; no schema applies it.
+ */
+export const SESSION_LIST_DEFAULT_LIMIT = 100;
+
+/**
+ * The largest page `GET /sessions` serves.
+ *
+ * A request above it is refused rather than truncated, so a client never
+ * mistakes a clipped page for the whole window it asked for.
+ */
+export const SESSION_LIST_MAX_LIMIT = 500;
+
+/**
+ * The session record's ceiling on its modification list, 256 — and, since a
+ * conflict names one modification record, on the conflicts its cleanup can
+ * record (`./session-record.ts` bounds both by the same number).
+ */
+const RECORD_MODIFICATION_CEILING = 256;
+
+/**
+ * A session's cleanup outcome as its list row reports it: the status, when the
+ * pass completed, and **how many** conflicts it preserved.
+ *
+ * A count rather than the conflicts themselves, because a conflict may carry a
+ * three-way diff (`ModificationConflict.diffs`, up to 512 KiB per member) — the
+ * one thing a list row must never carry. The conflicts stay on the whole record
+ * (`GET /sessions/:id`) and on the `cleanup.completed` frame. `status` and
+ * `completedAt` reuse the record's own member schemas.
+ */
+export const sessionListCleanupSchema = z.strictObject({
+  /** The cleanup status, over the record's four-value vocabulary. */
+  status: cleanupStatusSchema,
+  /** When the cleanup pass completed; absent while it has not. */
+  completedAt: sessionCleanupSchema.shape.completedAt,
+  /** How many files cleanup refused to overwrite and preserved. */
+  conflictCount: z
+    .int()
+    .min(0, { error: 'expected a non-negative conflict count' })
+    .max(RECORD_MODIFICATION_CEILING, {
+      error: `expected at most ${String(RECORD_MODIFICATION_CEILING)} conflicts`,
+    }),
+});
+
+/** A validated cleanup summary of a session list row. */
+export type SessionListCleanup = z.infer<typeof sessionListCleanupSchema>;
+
+/**
+ * One row of the session list: the fields the editor's Sessions tree renders,
+ * and nothing it would have to hydrate a whole record for.
+ *
+ * Picked from the imported {@link sessionRecordSchema} — the single definition of
+ * the record (AAP §0.9.1) — rather than restated, so a member's constraints are
+ * the record's own, and `.pick()`/`.extend()` keep the record's strictness: a row
+ * carrying any other member (a plan, a diff, an analysis) is refused. `cleanup`
+ * is the diff-free {@link sessionListCleanupSchema} summary.
+ *
+ * Consumed by `apps/vscode-extension/src/views/sessions-tree.ts`, the editor's
+ * `debuggen.reopenSession` quick pick through `src/state.ts`, and
+ * `apps/local-service/src/server/routes/sessions.ts`, which builds each row from
+ * the store's indexed projection without parsing the stored document.
+ */
+export const sessionListItemSchema = sessionRecordSchema
+  .pick({
+    id: true,
+    projectRoot: true,
+    projectName: true,
+    status: true,
+    question: true,
+    createdAt: true,
+    updatedAt: true,
+  })
+  .extend({
+    /** The cleanup outcome, summarised. */
+    cleanup: sessionListCleanupSchema,
+  });
+
+/** One validated row of the `GET /sessions` page. */
+export type SessionListItem = z.infer<typeof sessionListItemSchema>;
+
+/**
+ * Projects a whole session record onto its list row.
+ *
+ * What a holder of a full record — a `session.updated` push, a reopened
+ * session — uses to refresh the row it lists, so a list never retains a whole
+ * record (its plans, diffs, analyses and conflict diffs) for a row that shows
+ * eight fields. Pure, and the result shares no structure with the record.
+ *
+ * @param record A validated session record.
+ * @returns The record's list row.
+ */
+export function toSessionListItem(record: SessionRecord): SessionListItem {
+  const { status, completedAt, conflicts } = record.cleanup;
+
+  return {
+    id: record.id,
+    projectRoot: record.projectRoot,
+    projectName: record.projectName,
+    status: record.status,
+    question: record.question,
+    createdAt: record.createdAt,
+    updatedAt: record.updatedAt,
+    cleanup: {
+      status,
+      ...(completedAt === undefined ? {} : { completedAt }),
+      conflictCount: conflicts.length,
+    },
+  };
+}
+
+/**
+ * The `GET /sessions` response: one page of the sessions the requesting editor's
+ * announced workspace covers, most recently updated first.
+ *
+ * Each row is a {@link SessionListItem}, never a whole record — reopening a
+ * session (`GET /sessions/:id`) is how a client obtains one. `total` counts the
+ * in-scope sessions before paging, so the tree can say how many older sessions
+ * the page left out, and `nextOffset` names the following page.
+ *
+ * The page window is requested with the `limit` and `offset` query parameters
+ * ({@link parseListPageQuery}); the service applies
+ * {@link SESSION_LIST_DEFAULT_LIMIT} and offset `0` when they are omitted and
+ * refuses a `limit` above {@link SESSION_LIST_MAX_LIMIT}. The ordering is stable
+ * — `updatedAt` descending, the id breaking ties — so consecutive pages neither
+ * repeat nor skip a session.
+ *
+ * Consumed by `apps/vscode-extension/src/views/sessions-tree.ts` (through
+ * `src/service/client.ts`) and produced by
  * `apps/local-service/src/server/routes/sessions.ts`.
  */
-export const sessionListResponseSchema = z.strictObject({
-  /** The sessions, as the service's store holds them. */
-  sessions: z.array(sessionRecordSchema),
-});
+export const sessionListResponseSchema = z
+  .strictObject({
+    /** This page's rows, most recently updated first. */
+    sessions: z.array(sessionListItemSchema).max(SESSION_LIST_MAX_LIMIT, {
+      error: `expected at most ${String(SESSION_LIST_MAX_LIMIT)} sessions in one page`,
+    }),
+    ...listPageShape(SESSION_LIST_MAX_LIMIT),
+  })
+  .check((payload) => {
+    checkListPage(payload, payload.value, payload.value.sessions, 'sessions');
+  });
 
 /** The validated `GET /sessions` response body. */
 export type SessionListResponse = z.infer<typeof sessionListResponseSchema>;
+
+/**
+ * The largest page `GET /sessions/:id/modifications` serves: 256 records, the
+ * session record's own ceiling on its modification list
+ * (`./session-record.ts`), so a journal the record can describe always fits a
+ * single count-bounded page.
+ */
+export const MODIFICATIONS_PAGE_MAX_LIMIT = RECORD_MODIFICATION_CEILING;
+
+/**
+ * The page size `GET /sessions/:id/modifications` applies when the request
+ * names none: the whole count ceiling, so an ordinary journal arrives in one
+ * page and only the diff budget ever ends a page early.
+ */
+export const MODIFICATIONS_PAGE_DEFAULT_LIMIT = MODIFICATIONS_PAGE_MAX_LIMIT;
+
+/**
+ * The most UTF-8 bytes one recorded diff can occupy: three times
+ * `MAX_MODIFICATION_DIFF_LENGTH`, 6 MiB.
+ *
+ * `@debuggen/instrumentation` caps a diff in UTF-16 code units
+ * (`string.length`, 2 Mi units). UTF-8 spends at most three bytes on one code
+ * unit — a surrogate pair is two units encoded in four bytes, and a lone
+ * surrogate is written as the three-byte replacement character — so no diff
+ * the journal accepts encodes to more than this.
+ */
+export const MODIFICATION_DIFF_MAX_BYTES = 3 * MAX_MODIFICATION_DIFF_LENGTH;
+
+/**
+ * How many bytes of diff text one journal page may carry, summed over its
+ * records and measured in UTF-8 — the encoding the page travels in: 6 MiB,
+ * {@link MODIFICATION_DIFF_MAX_BYTES}.
+ *
+ * Equal to the largest single diff, which is what keeps a paging loop from
+ * stalling: the first record of a page always fits, however large its diff.
+ * The service measures each record's diff before it reads it — the session
+ * store answers `octet_length(diff)` from the row header — so a page is ended
+ * at the budget without loading the diff that would have exceeded it.
+ */
+export const MODIFICATIONS_PAGE_DIFF_BUDGET = MODIFICATION_DIFF_MAX_BYTES;
+
+/** A journal page never carries more diff text than its budget. */
+const MODIFICATIONS_PAGE_BUDGET_RULE = `the page's diffs must hold at most ${String(
+  MODIFICATIONS_PAGE_DIFF_BUDGET,
+)} UTF-8 bytes together: a larger journal continues at nextOffset.`;
+
+/**
+ * The number of bytes `text` occupies encoded as UTF-8 — the unit
+ * {@link MODIFICATIONS_PAGE_DIFF_BUDGET} is measured in, and the one the session
+ * store's `octet_length()` reports for the text it holds.
+ *
+ * Counted over the UTF-16 code units rather than by encoding, so measuring a
+ * diff allocates nothing. A lone surrogate counts three bytes: it has no UTF-8
+ * form and is encoded as U+FFFD, which is what the store then holds.
+ *
+ * @param text Any string.
+ * @returns Its UTF-8 byte length.
+ */
+export function utf8ByteLength(text: string): number {
+  let bytes = 0;
+
+  for (let index = 0; index < text.length; index += 1) {
+    const unit = text.charCodeAt(index);
+
+    if (unit < 0x80) {
+      bytes += 1;
+    } else if (unit < 0x800) {
+      bytes += 2;
+    } else if (unit >= 0xd800 && unit <= 0xdbff && index + 1 < text.length) {
+      const next = text.charCodeAt(index + 1);
+
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        // A surrogate pair: one code point beyond the BMP, four bytes.
+        bytes += 4;
+        index += 1;
+      } else {
+        bytes += 3;
+      }
+    } else {
+      bytes += 3;
+    }
+  }
+
+  return bytes;
+}
+
+/**
+ * The diff text a set of journal records carries, in the unit
+ * {@link MODIFICATIONS_PAGE_DIFF_BUDGET} is measured in: UTF-8 bytes.
+ *
+ * Exported so the service ends each page by the same arithmetic this module
+ * validates it with.
+ *
+ * @param records Journal records, or anything carrying their `diff`.
+ * @returns The summed UTF-8 byte length of the records' diffs.
+ */
+export function modificationsDiffBytes(
+  records: readonly Pick<ModificationRecord, 'diff'>[],
+): number {
+  let bytes = 0;
+
+  for (const record of records) {
+    bytes += utf8ByteLength(record.diff);
+  }
+
+  return bytes;
+}
 
 /**
  * The `session.end` response: what cleanup concluded.
@@ -584,6 +1306,212 @@ export const sessionEndResponseSchema = z.strictObject({
 
 /** The validated `session.end` response body. */
 export type SessionEndResponse = z.infer<typeof sessionEndResponseSchema>;
+
+/**
+ * The most session ids one `session.purge` report lists.
+ *
+ * Unlike {@link sessionListResponseSchema}, whose purpose is completeness — the
+ * Sessions tree shows every session — the purge report is a summary: counts of
+ * what the sweep removed, plus enough ids to name what it kept. The number of
+ * aged sessions an unresolved conflict holds back grows with every session a
+ * developer leaves conflicted, so the list is bounded here and
+ * `sessionsRetainedForConflictsTotal` carries the true count. A truncated list
+ * is therefore never mistaken for a complete one, and a reply cannot grow with
+ * the developer's history.
+ */
+export const SESSION_PURGE_MAX_REPORTED_SESSIONS = 100;
+
+/**
+ * The `POST /sessions/purge` request body: `{}`, and strictly that.
+ *
+ * The retention window is the service's configuration — `DEBUGGEN_RETENTION_DAYS`
+ * (AAP §0.3.4) — and never a caller's choice: a body that could shorten the
+ * window would let one call delete sessions the developer's own setting keeps.
+ * Strict over an empty shape for the reason {@link pairStartRequestSchema} is,
+ * so a body carrying a key is refused rather than silently ignored.
+ */
+export const sessionPurgeRequestSchema = z.strictObject({});
+
+/** The validated `POST /sessions/purge` request body. */
+export type SessionPurgeRequest = z.infer<typeof sessionPurgeRequestSchema>;
+
+/**
+ * The refusal a purge report whose conflict list disagrees with its total
+ * carries. Names fields and the bound, never a value (AAP §0.5.2).
+ */
+const SESSION_PURGE_TRUNCATION_RULE = `sessionsRetainedForConflicts must list exactly min(sessionsRetainedForConflictsTotal, ${String(
+  SESSION_PURGE_MAX_REPORTED_SESSIONS,
+)}) ids: the list is truncated at the bound, never partial below it.`;
+
+/** The refusal a purge report that names one retained session twice carries. */
+const SESSION_PURGE_UNIQUE_ID_RULE =
+  'sessionsRetainedForConflicts must not repeat an id: each retained session is listed once.';
+
+/**
+ * Records one breach of the purge report's list rule on `payload`.
+ *
+ * @param payload The parse payload of the purge report being checked.
+ * @param path The field a producer has to change, as a Zod issue path.
+ * @param message One of the `SESSION_PURGE_*_RULE` statements above.
+ */
+function reportSessionPurgeIssue(
+  payload: z.core.ParsePayload<unknown>,
+  path: (string | number)[],
+  message: string,
+): void {
+  payload.issues.push({
+    code: 'custom',
+    path,
+    message,
+    // Left empty for the reason `reportMetricsPageIssue` states: a failure here
+    // never carries the value that caused it (AAP §0.5.2).
+    input: undefined,
+  });
+}
+
+/**
+ * Rejects a purge report whose retained-session list is not the truncation of
+ * its total.
+ *
+ * Two checks, each on the path a producer has to change: the list holds exactly
+ * `min(total, SESSION_PURGE_MAX_REPORTED_SESSIONS)` ids — every retained
+ * session while there are at most that many, and the first that many of them
+ * otherwise — and no id repeats, reported at the repeating index. A list past
+ * its `.max` or a negative total is already an issue of its own and does not
+ * abort the parse, so the comparison is written to hold for any integer.
+ */
+function checkSessionPurgeReport(
+  payload: z.core.ParsePayload<{
+    readonly sessionsRetainedForConflicts: readonly string[];
+    readonly sessionsRetainedForConflictsTotal: number;
+  }>,
+): void {
+  const { sessionsRetainedForConflicts: listed, sessionsRetainedForConflictsTotal: total } =
+    payload.value;
+
+  if (listed.length !== Math.max(0, Math.min(total, SESSION_PURGE_MAX_REPORTED_SESSIONS))) {
+    reportSessionPurgeIssue(
+      payload,
+      ['sessionsRetainedForConflicts'],
+      SESSION_PURGE_TRUNCATION_RULE,
+    );
+  }
+
+  const seen = new Set<string>();
+
+  for (const [index, sessionId] of listed.entries()) {
+    if (seen.has(sessionId)) {
+      reportSessionPurgeIssue(
+        payload,
+        ['sessionsRetainedForConflicts', index],
+        SESSION_PURGE_UNIQUE_ID_RULE,
+      );
+    }
+
+    seen.add(sessionId);
+  }
+}
+
+/**
+ * The `POST /sessions/purge` response: what one retention sweep removed, and
+ * what it kept.
+ *
+ * The retention sweep of AAP §0.4.2 runs at service start and, through this
+ * operation, on demand from the editor command `debuggen.purgeSessions`. It
+ * deletes the sessions last updated before the window `DEBUGGEN_RETENTION_DAYS`
+ * sets, together with their telemetry, panels, analyses, modification records
+ * and backup directories; code-index caches whose project was not opened
+ * inside the same window; and backup files no modification record references
+ * once they are older than seven days. Conflict backups are exempt until the
+ * conflict is resolved: an aged session whose journal holds a `conflict`
+ * record keeps its rows and its backups, and is named in
+ * `sessionsRetainedForConflicts` instead of being counted as deleted.
+ *
+ * A successful reply means the sweep ran, not that every item went: a
+ * per-item problem (a backup that could not be removed, a session another
+ * operation touched mid-sweep) is stepped over and counted in `issueCount`,
+ * and its detail stays with the service. The counts are therefore what the
+ * sweep actually removed, so the editor can report exactly what went and then
+ * refresh its Sessions tree. Paths and messages are deliberately absent — the
+ * report is a count of what went, and the developer's file layout is not the
+ * client's to read.
+ *
+ * `.check()` preserves `.shape`, so a consumer can still read one field's
+ * schema from the object.
+ */
+export const sessionPurgeResponseSchema = z
+  .strictObject({
+    /**
+     * The age threshold the sweep applied, in epoch milliseconds: a session
+     * last updated strictly before this instant was a purge candidate.
+     *
+     * Deliberately **not** {@link epochMsSchema}. That schema's lower bound
+     * (2020-01-01) exists to refuse a mis-scaled *event* timestamp, while this
+     * value is computed as `now − DEBUGGEN_RETENTION_DAYS × 86 400 000`, and a
+     * retention window configured in years — which the service accepts — puts
+     * it legitimately before that bound. A finite number is required, and the
+     * upper bound is kept, because a cutoff is never later than the moment the
+     * sweep ran.
+     */
+    cutoff: z
+      .number({ error: 'expected a finite cutoff instant in epoch milliseconds' })
+      .max(MAX_EPOCH_MS, {
+        error:
+          'expected a cutoff instant in epoch milliseconds (a microsecond- or nanosecond-scale value is too large)',
+      }),
+
+    /** How many sessions were deleted. */
+    sessionsDeleted: countSchema('sessionsDeleted'),
+
+    /** How many telemetry events the deleted sessions held. */
+    telemetryEventsDeleted: countSchema('telemetryEventsDeleted'),
+
+    /** How many panels the deleted sessions held. */
+    panelsDeleted: countSchema('panelsDeleted'),
+
+    /** How many analyses the deleted sessions held. */
+    analysesDeleted: countSchema('analysesDeleted'),
+
+    /** How many modification-journal records the deleted sessions held. */
+    modificationsDeleted: countSchema('modificationsDeleted'),
+
+    /**
+     * How many backup directories were removed: those of deleted sessions, and
+     * session directories the orphan rule left empty.
+     */
+    backupDirsDeleted: countSchema('backupDirsDeleted'),
+
+    /** How many unreferenced backup files past the seven-day grace were removed. */
+    orphanBackupsDeleted: countSchema('orphanBackupsDeleted'),
+
+    /** How many code-index cache entries were removed. */
+    indexCachesDeleted: countSchema('indexCachesDeleted'),
+
+    /**
+     * The aged sessions kept because their journal holds a `conflict` record,
+     * in the sweep's sorted order: all of them while there are at most
+     * {@link SESSION_PURGE_MAX_REPORTED_SESSIONS}, and the first that many
+     * otherwise.
+     */
+    sessionsRetainedForConflicts: z.array(idSchema()).max(SESSION_PURGE_MAX_REPORTED_SESSIONS, {
+      error: `expected at most ${String(SESSION_PURGE_MAX_REPORTED_SESSIONS)} retained session ids`,
+    }),
+
+    /** How many aged sessions were kept for a conflict, whether or not all are listed. */
+    sessionsRetainedForConflictsTotal: countSchema('sessionsRetainedForConflictsTotal'),
+
+    /** How many per-item problems the sweep recorded and stepped over. */
+    issueCount: countSchema('issueCount'),
+
+    /** How long the sweep took, in milliseconds of monotonic time. */
+    durationMs: z
+      .number({ error: 'expected a finite durationMs' })
+      .nonnegative({ error: 'expected a non-negative durationMs' }),
+  })
+  .check(checkSessionPurgeReport);
+
+/** The validated `POST /sessions/purge` response body. */
+export type SessionPurgeResponse = z.infer<typeof sessionPurgeResponseSchema>;
 
 // ---------------------------------------------------------------------------
 // Section D — the capture routes
@@ -683,6 +1611,81 @@ export const captureStartConflictResponseSchema = errorPayloadSchema.extend({
 export type CaptureStartConflictResponse = z.infer<typeof captureStartConflictResponseSchema>;
 
 // ---------------------------------------------------------------------------
+// Section D2 — the target-request route
+//
+// `POST /sessions/:id/target/request`.
+//
+// The editor's half of element selection (AAP §0.4.2). The VS Code view's
+// element-request control has no DevTools connection of its own, so it asks the
+// service, and the service — the one process that knows which tab is bound to
+// the session — pushes `target.request { sessionId }` to that tab's connection
+// alone (`./messages/target.ts`). The operation id is the message's own name,
+// exactly as `telemetry.event` is both an ingest route and a frame: one
+// instruction, carried editor→service over HTTP and service→panel over the
+// WebSocket. The panel's answer is a `target.selected` frame, whose verdict the
+// editor observes as the `session.updated` that carries the new target.
+//
+// ERROR CONTRACT, which the service implements and every client may switch on.
+// Each failure is the shared error body (`httpErrorResponseSchema`), checked in
+// this order:
+//
+//   401 `UNAUTHORIZED`              no valid credential.
+//   403 `UNAUTHORIZED`              a credential of another role: the route is
+//                                   for the editor (role `vscode`) alone — a
+//                                   DevTools panel enters picker mode on its
+//                                   own, and a server-agent has no panel to ask.
+//   404 `SESSION_NOT_FOUND`         no such session.
+//   409 `SESSION_INVALID_STATE`     the session has ended or failed terminally,
+//                                   so a target could no longer be used.
+//   409 `TAB_NOT_BOUND`             the session has no bound DevTools tab: the
+//                                   developer opens the Debug Generator panel in
+//                                   the app's tab first.
+//   503 `TRANSPORT_DISCONNECTED`    a tab is bound but its connection is
+//                                   offline, so no frame could be handed to it.
+//
+// Success means the frame was handed to the bound tab's live connection, never
+// that an element was picked: picking is the developer's, and it may never
+// happen, which costs the session nothing (a target is an input to the first
+// stage, never a precondition).
+// ---------------------------------------------------------------------------
+
+/**
+ * The `target.request` request body: `{}`, and strictly that.
+ *
+ * The session comes from the route and the recipient from the session's
+ * binding, so there is nothing left to say. Strict, like every other empty
+ * body here: a caller that sends `{ tabId }` believes it can choose which tab
+ * enters picker mode, and silence would let it keep believing that — the
+ * binding, not the caller, decides (AAP §0.5.6).
+ */
+export const targetRequestRequestSchema = z.strictObject({});
+
+/** The validated `POST /sessions/:id/target/request` request body. */
+export type TargetRequestRequest = z.infer<typeof targetRequestRequestSchema>;
+
+/**
+ * The `target.request` response: the session whose bound DevTools tab received
+ * the `target.request` push, and that tab.
+ *
+ * The tab id is what lets the editor say *where* to pick — in the Debug
+ * Generator panel of that tab — and correlate the push with the
+ * `session.bound` state it already shows. Its rule is `./messages/binding.ts`'s
+ * own tab-id schema, taken by identity from the `session.bind` payload rather
+ * than restated: a non-negative safe integer, never `-1`
+ * (`chrome.tabs.TAB_ID_NONE`).
+ */
+export const targetRequestResponseSchema = z.strictObject({
+  /** The session whose bound tab was asked to enter element-picker mode. */
+  sessionId: idSchema(),
+
+  /** The bound DevTools tab the `target.request` frame was handed to. */
+  tabId: sessionBindPayloadSchema.shape.tabId,
+});
+
+/** The validated `POST /sessions/:id/target/request` response body. */
+export type TargetRequestResponse = z.infer<typeof targetRequestResponseSchema>;
+
+// ---------------------------------------------------------------------------
 // Section E — the panel routes
 //
 // `POST /sessions/:id/panel-data`, `GET /sessions/:id/panel`,
@@ -690,39 +1693,84 @@ export type CaptureStartConflictResponse = z.infer<typeof captureStartConflictRe
 // ---------------------------------------------------------------------------
 
 /**
- * The `POST /sessions/:id/panel-data` request body: a `DataQuery`, exactly as
- * `@debuggen/panel-schema` defines it.
+ * The `POST /sessions/:id/panel-data` request body: the node's own `DataQuery`,
+ * field for field, plus the optional `panelId` of the panel specification the
+ * node was rendered from.
  *
- * This is the imported schema **itself**, bound by identity rather than cloned
- * or wrapped: a panel node's `query` is what a client sends, so the body a
- * renderer's `DataProvider` posts is byte-identical to the node it came from
+ * ## The query half is panel-schema's, by identity
+ *
+ * Built by **extending** `@debuggen/panel-schema`'s `dataQuerySchema`, never by
+ * restating it: `.extend` keeps every one of that schema's field schemas as the
+ * very same object (`panelDataRequestSchema.shape.source` *is*
+ * `dataQuerySchema.shape.source`), and it keeps the strict object, so an
+ * unrecognised key is still a rejection. A panel node's `query` therefore
+ * travels field for field as the node carries it
  * (`packages/panel-renderer/src/host/useQuery.ts` →
- * `apps/chrome-extension/src/panel/data-provider.ts`). Wrapping it in
- * `{ query: … }` would make the two shapes differ for no gain, and re-declaring
- * its fields would be the second definition AAP §0.9.1 forbids — the node
- * catalog's per-node source constraints are validated against *that* schema, and
- * a copy here would drift from them silently.
+ * `apps/chrome-extension/src/panel/data-provider.ts`), and the node catalog's
+ * per-node source constraints — validated against *that* schema — cannot drift
+ * from what this route accepts. Re-declaring a query field here would be the
+ * second definition AAP §0.9.1 forbids. The identity is asserted field by field
+ * in `./__tests__/http.test.ts` and at compile time in
+ * {@link PanelDataRequestIsDataQueryWithPanelId}.
  *
- * Semantics the service implements (AAP §0.4.2), stated here because this schema
- * is the contract: `filter` narrows the source; `sort` orders with a stable
- * secondary key (each source's `id`) so equal keys never reorder between pages;
- * `limit` and `offset` page the array-valued sources, and the response echoes
- * `total` and `nextOffset` so a view never has to guess whether more remain.
- * **No default is applied by this schema.** An omitted `limit` means
- * `DATA_QUERY_DEFAULT_LIMIT` and an omitted `offset` means
+ * ## `panelId` says which evidence the node describes
+ *
+ * A session holds several captures and several panel versions (a follow-up
+ * stores the next `panelVersion`, and each panel row keeps the capture it was
+ * generated from), and the query alone names neither. With `panelId`, the
+ * service answers from the capture that panel was generated from, so a panel
+ * that is still on screen after a newer capture started keeps drawing the
+ * evidence its own findings cite; a `panelId` the session does not hold is
+ * refused rather than answered from some other capture. Without it, the service
+ * reads **live** evidence: the session's open capture, else its most recent
+ * one — which is what a view with no rendered panel behind it asks for.
+ *
+ * `panelId` is an opaque identifier checked for exactly what a transport can
+ * check — present means non-empty and at most sixty-four characters, the bound
+ * every other identifier in this module and `panel.generated`'s own `panelId`
+ * carry — and resolved where the panel row lives. A stored specification's own
+ * `id` may be longer (panel-schema bounds a stored document more generously);
+ * such a panel cannot be named here, exactly as `panel.generated` cannot
+ * announce it. The field sits beside the query fields rather than wrapping them
+ * because the query must stay the node's own, unwrapped, for the identity above
+ * to hold.
+ *
+ * ## Semantics the service implements (AAP §0.4.2)
+ *
+ * Stated here because this schema is the contract: `filter` narrows the source;
+ * `sort` orders with a stable secondary key (each source's `id`) so equal keys
+ * never reorder between pages; `limit` and `offset` page the array-valued
+ * sources, and the response echoes `total` and `nextOffset` so a view never has
+ * to guess whether more remain. **No default is applied by this schema.** An
+ * omitted `limit` means `DATA_QUERY_DEFAULT_LIMIT` and an omitted `offset` means
  * `DATA_QUERY_DEFAULT_OFFSET`, both applied by
  * `apps/local-service/src/panels/data.ts`; `limit: 0` is a legitimate request
- * for no items and is not the same as an omitted one.
+ * for no items and is not the same as an omitted one; and an omitted `panelId`
+ * stays omitted — it is never filled in with the session's current panel.
  */
-export const panelDataRequestSchema = dataQuerySchema;
+export const panelDataRequestSchema = dataQuerySchema.extend({
+  /**
+   * The id of the panel specification the querying node belongs to — the
+   * rendered `PanelSpec`'s own `id`. Present, the service answers from the
+   * capture that panel was generated from and refuses a panel the session does
+   * not hold; absent, it answers from the open capture, else the most recent.
+   */
+  panelId: idSchema()
+    .optional()
+    .describe(
+      'The id of the panel specification the node was rendered from; the service answers from the capture that panel was generated from. Omitted, it reads the open capture, else the most recent one.',
+    ),
+});
 
 /**
- * The validated panel-data request body.
+ * The validated panel-data request body: a `DataQuery`, plus the optional
+ * `panelId` of the panel the node belongs to.
  *
- * An alias of `@debuggen/panel-schema`'s `DataQuery`, so a consumer can name the
- * role without acquiring a second type for one shape.
+ * Inferred from {@link panelDataRequestSchema}, so every query field keeps
+ * `@debuggen/panel-schema`'s own type and a bare `DataQuery` is a valid body as
+ * it stands — a consumer that sends live reads needs no second type.
  */
-export type PanelDataRequest = DataQuery;
+export type PanelDataRequest = z.infer<typeof panelDataRequestSchema>;
 
 /**
  * The `GET /sessions/:id/panel` response: the session's current panel, or `null`.
@@ -775,18 +1823,167 @@ export type PanelByIdResponse = z.infer<typeof panelByIdResponseSchema>;
  * render: the editor's `ModificationsList` with its `DiffView`, and the DevTools
  * `SessionSummary`.
  *
- * Unbounded for the reason {@link sessionListResponseSchema} is: the service
- * assembles it from its own journal, whose length the session record already
- * bounds, and a ceiling here would refuse the one reply a developer most needs
- * to see.
+ * ## One page at a time, under a diff budget
+ *
+ * A journal holds at most {@link MODIFICATIONS_PAGE_MAX_LIMIT} records and each
+ * diff may reach `MAX_MODIFICATION_DIFF_LENGTH` (2 MiB), so the whole journal in
+ * one body could be hundreds of megabytes. The response is therefore one page
+ * of the journal in application order, bounded twice:
+ *
+ * - by count — `limit` records at most, {@link MODIFICATIONS_PAGE_DEFAULT_LIMIT}
+ *   when the request names none (the `limit` and `offset` query parameters,
+ *   {@link parseListPageQuery}); and
+ * - by size — the page's diffs together hold at most
+ *   {@link MODIFICATIONS_PAGE_DIFF_BUDGET} UTF-8 bytes. The service ends a page
+ *   early rather than exceed it and says so through `nextOffset`; because no
+ *   single diff can exceed the budget, a page always carries at least one
+ *   record while any remain.
+ *
+ * `total` is the journal's length, so a caller that only needs the count asks
+ * for `limit=0` and receives no diff at all. Records keep the full
+ * `modificationRecordSchema` shape — hashes, backup path and diff — because AAP
+ * §0.4.2 names this route's answer "modification records", and the
+ * reversibility checks and the diff views read exactly those fields.
  */
-export const modificationsResponseSchema = z.strictObject({
-  /** Every modification this session recorded, in the order they were applied. */
-  modifications: z.array(modificationRecordSchema),
-});
+export const modificationsResponseSchema = z
+  .strictObject({
+    /** This page's records, in the order they were applied. */
+    modifications: z.array(modificationRecordSchema).max(MODIFICATIONS_PAGE_MAX_LIMIT, {
+      error: `expected at most ${String(MODIFICATIONS_PAGE_MAX_LIMIT)} modification records in one page`,
+    }),
+    ...listPageShape(MODIFICATIONS_PAGE_MAX_LIMIT),
+  })
+  .check((payload) => {
+    const { modifications } = payload.value;
+    checkListPage(payload, payload.value, modifications, 'modifications');
+
+    if (modificationsDiffBytes(modifications) > MODIFICATIONS_PAGE_DIFF_BUDGET) {
+      reportListPageIssue(payload, ['modifications'], MODIFICATIONS_PAGE_BUDGET_RULE);
+    }
+  });
 
 /** The validated `GET /sessions/:id/modifications` response body. */
 export type ModificationsResponse = z.infer<typeof modificationsResponseSchema>;
+
+/**
+ * The operations that answer one page of a listing and read the
+ * {@link LIST_PAGE_QUERY_KEYS} window from the query string.
+ *
+ * The only operations a client may send a query to: every other route takes
+ * its input from the path and the body alone.
+ */
+export const LIST_PAGE_OPERATIONS = ['session.list', 'modifications.list'] as const;
+
+/** One of {@link LIST_PAGE_OPERATIONS}. */
+export type ListPageOperation = (typeof LIST_PAGE_OPERATIONS)[number];
+
+/**
+ * Whether `operation` answers a page and accepts a window.
+ *
+ * @param operation Any operation id.
+ * @returns `true` for a member of {@link LIST_PAGE_OPERATIONS}.
+ */
+export function isListPageOperation(operation: string): operation is ListPageOperation {
+  return (LIST_PAGE_OPERATIONS as readonly string[]).includes(operation);
+}
+
+/**
+ * The window a client asks a listing for. Both members are optional: the
+ * service applies the listing's default `limit` and an `offset` of `0` to an
+ * omitted one, and echoes both in the page.
+ *
+ * Declared with `| undefined` so a caller can forward its own optional window
+ * without a conditional spread.
+ */
+export interface ListPageRequest {
+  /** The page size, from `0` to the listing's ceiling. */
+  readonly limit?: number | undefined;
+  /** How many items to skip — a page's `nextOffset`, or `0`. */
+  readonly offset?: number | undefined;
+}
+
+/**
+ * The largest `limit` each listing serves — the ceiling
+ * {@link parseListPageQuery} enforces on the service side.
+ */
+export const LIST_PAGE_MAX_LIMITS: Readonly<Record<ListPageOperation, number>> = Object.freeze({
+  'session.list': SESSION_LIST_MAX_LIMIT,
+  'modifications.list': MODIFICATIONS_PAGE_MAX_LIMIT,
+});
+
+/**
+ * Encodes a window as the query string of a paged listing — the inverse of
+ * {@link parseListPageQuery}, so what a client sends is exactly what the service
+ * accepts: each present member as a canonical decimal integer, in
+ * {@link LIST_PAGE_QUERY_KEYS} order, and nothing for an empty window.
+ *
+ * Refuses, rather than clamps, a member the service would refuse — a limit
+ * above the listing's ceiling, a negative, fractional or unsafe number — and a
+ * window sent to an operation that takes none, so a caller learns of the
+ * mistake before a request is made. The error names the parameter, never its
+ * value.
+ *
+ * @param operation The operation the window is for.
+ * @param window The requested window.
+ * @returns `ok("")` for an empty window, `ok("?limit=…&offset=…")` otherwise,
+ * or `err(error)` with code `PROTOCOL_INVALID_MESSAGE`.
+ */
+export function formatListPageQuery(
+  operation: HttpOperationId,
+  window: ListPageRequest,
+): Result<string, DebuggenError> {
+  const requested: readonly (readonly [ListPageQueryKey, number | undefined])[] = [
+    ['limit', window.limit],
+    ['offset', window.offset],
+  ];
+  const present = requested.filter(
+    (entry): entry is readonly [ListPageQueryKey, number] => entry[1] !== undefined,
+  );
+
+  if (present.length === 0) {
+    return ok('');
+  }
+
+  if (!isListPageOperation(operation)) {
+    return err(
+      new DebuggenError(
+        'PROTOCOL_INVALID_MESSAGE',
+        `Invalid ${operation} request: the operation takes no page window`,
+        {
+          hint: `Only ${LIST_PAGE_OPERATIONS.join(' and ')} answer a page; send no limit or offset to any other route.`,
+          details: { operation },
+        },
+      ),
+    );
+  }
+
+  const ceilings: Readonly<Record<ListPageQueryKey, number>> = {
+    limit: LIST_PAGE_MAX_LIMITS[operation],
+    offset: LIST_PAGE_MAX_OFFSET,
+  };
+  const parts: string[] = [];
+
+  for (const [parameter, value] of present) {
+    const ceiling = ceilings[parameter];
+
+    if (!Number.isSafeInteger(value) || value < 0 || value > ceiling) {
+      return err(
+        new DebuggenError(
+          'PROTOCOL_INVALID_MESSAGE',
+          `Invalid ${operation} request: ${parameter} is out of range`,
+          {
+            hint: `Send ${parameter} as an integer from 0 to ${String(ceiling)}; follow nextOffset for the rest.`,
+            details: { operation, parameter, maxValue: ceiling },
+          },
+        ),
+      );
+    }
+
+    parts.push(`${parameter}=${String(value)}`);
+  }
+
+  return ok(`?${parts.join('&')}`);
+}
 
 // ---------------------------------------------------------------------------
 // Section F — the telemetry ingest route
@@ -800,7 +1997,7 @@ export type ModificationsResponse = z.infer<typeof modificationsResponseSchema>;
 // (server-agent) → service | `{ projectRoot, events: TelemetryEventIngress[] }`"),
 // its process edge appears in that section's architecture diagram, and
 // `apps/local-service/src/server/routes/telemetry.ts` exists to serve it. The
-// AAP has primary authority, so the table below has seventeen routes.
+// AAP has primary authority, so the table below carries it.
 //
 // Note which side of the wire reads this definition. `@debuggen/telemetry` sits
 // BELOW this package in the layering (AAP §0.2.2) and may not import it, so the
@@ -876,7 +2073,8 @@ export type TelemetryIngestResponse = z.infer<typeof telemetryIngestResponseSche
 // ---------------------------------------------------------------------------
 // Section G — the dev-server routes
 //
-// `POST /dev-server/launch`, `POST /dev-server/stop`.
+// `POST /dev-server/launch`, `POST /dev-server/stop`,
+// `POST /dev-server/credential`.
 // ---------------------------------------------------------------------------
 
 /**
@@ -889,10 +2087,42 @@ export type TelemetryIngestResponse = z.infer<typeof telemetryIngestResponseSche
  * their project. `command` overrides the command the launcher would otherwise
  * derive from the target's own `package.json` scripts; it is optional because
  * deriving it is the normal path and naming it is the escape hatch.
+ *
+ * `sessionId` decides who owns the process the service spawns. A launch that
+ * names a session ties the child's lifetime to it (AAP §0.7.1 Group 2, "child
+ * lifecycle tied to the session"): the child is stopped and its `server-agent`
+ * credential revoked when the last session that launched or joined it ends. A
+ * launch that names none is the developer's own dev server — it keeps serving
+ * after any session ends, with the inert preload still attached (AAP §0.5.1),
+ * until `POST /dev-server/stop`, the editor's deactivation or the service's
+ * shutdown stops it.
  */
 export const devServerLaunchRequestSchema = z.strictObject({
   /** The project whose dev server should be running. */
   projectRoot: projectRootSchema(),
+
+  /**
+   * The session this launch is for, when there is one.
+   *
+   * Shape only, like every id in this module. The service refuses an id that
+   * names no session, a session of another project, or a session that has
+   * already ended — a child tied to an ended session would have no owner left
+   * to stop it.
+   */
+  sessionId: idSchema().optional(),
+
+  /**
+   * Where the project's dev server serves or is meant to serve, when the caller
+   * knows: the editor's probed `debuggen.devServerUrl`, or — when the body
+   * names a session and omits this — the service uses the URL that session
+   * recorded. The launcher probes it first, so a second dev server is never
+   * started on the port of one already answering there: a dev server the
+   * service launched itself is reused, and any other — the service cannot
+   * attribute a preload to a process it did not start — is reported with the
+   * exact relaunch command (AAP §0.5.5). A child that prints no address is
+   * polled at it. The same URL constraints as `session.create`'s.
+   */
+  devServerUrl: devServerUrlSchema.optional(),
 
   /**
    * The command to run instead of the derived one, when the caller knows better.
@@ -965,6 +2195,53 @@ export const devServerStopResponseSchema = z.strictObject({
 
 /** The validated `POST /dev-server/stop` response body. */
 export type DevServerStopResponse = z.infer<typeof devServerStopResponseSchema>;
+
+/**
+ * The `POST /dev-server/credential` request: which project the credential will
+ * be scoped to.
+ *
+ * The route mints the server-agent credential of AAP §0.5.6 for a dev server
+ * the caller starts itself rather than through `devServer.launch` —
+ * `scripts/dev-instrumented.mjs` "requests one with the editor credential" and
+ * hands it to the Node preload as `DEBUGGEN_TOKEN`. The body is the same as
+ * {@link devServerStopRequestSchema}'s, and checked for the same thing: a
+ * non-empty, bounded path. Deliberately no absolute-path refinement: whether
+ * the path is absolute, exists, and lies inside a workspace folder the
+ * editor credential announced is answered by the service, which can resolve a
+ * real path, and this package is Node-neutral (see `projectRootSchema`).
+ */
+export const devServerCredentialRequestSchema = z.strictObject({
+  /** The project the minted credential may post ingest batches for. */
+  projectRoot: projectRootSchema(),
+});
+
+/** The validated `POST /dev-server/credential` request body. */
+export type DevServerCredentialRequest = z.infer<typeof devServerCredentialRequestSchema>;
+
+/**
+ * The `POST /dev-server/credential` response: the server-agent credential,
+ * once, and when it stops being accepted.
+ *
+ * One of exactly two HTTP responses in the product that carry a plaintext
+ * credential — {@link pairCompleteResponseSchema} is the other — so the caller
+ * treats `token` accordingly: it goes into the child's environment and nowhere
+ * else, never into a log line, a message or a file. The credential is scoped
+ * to the one `projectRoot` the request named, so `POST /telemetry/ingest` and
+ * `client.hello` accept it only for that project, and it expires at
+ * `expiresAt` even if the dev server it was minted for is never stopped.
+ * Nothing rides along with the token: a role or a scope echoed here would be a
+ * client's word for what it was granted.
+ */
+export const devServerCredentialResponseSchema = z.strictObject({
+  /** The bearer credential for the Node preload, `DEBUGGEN_TOKEN`. */
+  token: opaqueTokenSchema(),
+
+  /** When the credential stops being accepted, in Unix epoch milliseconds. */
+  expiresAt: epochMsSchema,
+});
+
+/** The validated `POST /dev-server/credential` response body. */
+export type DevServerCredentialResponse = z.infer<typeof devServerCredentialResponseSchema>;
 
 // ---------------------------------------------------------------------------
 // Section H — health and pairing
@@ -1104,6 +2381,58 @@ export const httpErrorResponseSchema = errorPayloadSchema;
 
 /** The validated error body of a non-2xx response. */
 export type HttpErrorResponse = z.infer<typeof httpErrorResponseSchema>;
+
+// ---------------------------------------------------------------------------
+// Section H2 — credential rotation
+//
+// `POST /credentials/rotate`. The revocation half of the access boundary:
+// pairing (Section H) and the dev-server routes (Section G) mint credentials,
+// and this route withdraws every one of them at once.
+// ---------------------------------------------------------------------------
+
+/**
+ * The `POST /credentials/rotate` request body: `{}`, and strictly that.
+ *
+ * Rotation is all or nothing (AAP §0.5.6): a body that could name one
+ * credential to keep would be a way to survive the revocation the command
+ * exists to perform. Which credential may call it — the editor's alone — is
+ * the service's role table (Section A: no permission is expressed here), not
+ * anything this body could say. Strict over an empty shape for the reason
+ * {@link pairStartRequestSchema} is.
+ */
+export const credentialsRotateRequestSchema = z.strictObject({});
+
+/** The validated `POST /credentials/rotate` request body. */
+export type CredentialsRotateRequest = z.infer<typeof credentialsRotateRequestSchema>;
+
+/**
+ * The `POST /credentials/rotate` response: how much the rotation revoked.
+ *
+ * The route is what `debuggen.rotateServiceToken` calls, and it performs the
+ * whole of AAP §0.5.6's rotation: it deletes every row of the `credentials`
+ * table — the DevTools credentials of paired extensions and the server-agent
+ * credentials of launched dev servers among them — regenerates
+ * `$DEBUGGEN_HOME/auth.json` with a new editor credential, and closes every
+ * open socket with `WS_CLOSE_UNAUTHORIZED` (4401, `./messages/agent.ts`).
+ * Paired Chrome extensions must pair again, and launched dev servers must be
+ * relaunched to receive a fresh credential.
+ *
+ * The caller's own credential is among those deleted: this reply is the last
+ * response it earns. The editor therefore reads the regenerated `auth.json`
+ * before its next call and reconnects its socket with the new token. No
+ * credential travels in this body — the new editor credential is written to
+ * the `0600` file only, never onto the wire.
+ */
+export const credentialsRotateResponseSchema = z.strictObject({
+  /** Credential rows deleted: every credential that existed before the call. */
+  credentialsDeleted: countSchema('credentialsDeleted'),
+
+  /** Open sockets closed with `WS_CLOSE_UNAUTHORIZED`. */
+  socketsClosed: countSchema('socketsClosed'),
+});
+
+/** The validated `POST /credentials/rotate` response body. */
+export type CredentialsRotateResponse = z.infer<typeof credentialsRotateResponseSchema>;
 
 // ---------------------------------------------------------------------------
 // Section I — `DataResult`: what a panel-data query answers
@@ -1625,7 +2954,7 @@ export function parseDataResult(value: unknown): Result<DataResult, DebuggenErro
 // ---------------------------------------------------------------------------
 // Section J — the route table
 //
-// Seventeen entries, keyed by operation id, and the single definition of the
+// Twenty-one entries, keyed by operation id, and the single definition of the
 // service's HTTP surface (AAP §0.9.1). `as const satisfies` is load-bearing
 // twice over: `as const` keeps every key, method, pattern and `authExempt` flag
 // a literal type, which is what lets `HttpOperationId`, the mapped body helpers
@@ -1640,13 +2969,15 @@ export function parseDataResult(value: unknown): Result<DataResult, DebuggenErro
  *
  * The keys are operation ids, six of them the user's own names for these
  * operations (prompt §16) preserved character for character. Grouped by resource
- * in the order the module documentation lists them: sessions, captures, panels,
- * modifications, telemetry ingest, dev server, health and pairing.
+ * in the order the sections above declare them: sessions (the retention purge
+ * among them), captures, the target request, panels, modifications, telemetry
+ * ingest, dev server (the server-agent credential among them), health and
+ * pairing, and credential rotation.
  *
  * Read by `apps/local-service/src/server/http.ts` to register handlers and to
  * apply its bearer and origin middleware, by `./client/http-client.ts` to build
  * and validate a call, and by `packages/protocol/src/__tests__/http.test.ts`,
- * which pins all seventeen `(operation, method, pattern)` triples literally so
+ * which pins all twenty-one `(operation, method, pattern)` triples literally so
  * that adding, renaming or re-pathing a route is a deliberate edit in two
  * places rather than an accident in one.
  */
@@ -1662,7 +2993,7 @@ export const HTTP_ROUTES = {
     response: sessionRecordSchema,
   },
 
-  /** `GET /sessions` — every session, for the editor's Sessions tree. */
+  /** `GET /sessions` — one page of session list rows, for the editor's Sessions tree. */
   'session.list': {
     operation: 'session.list',
     method: 'GET',
@@ -1707,6 +3038,25 @@ export const HTTP_ROUTES = {
   },
 
   /**
+   * `POST /sessions/purge` — run the retention sweep now, for
+   * `debuggen.purgeSessions`.
+   *
+   * A static segment beside the `:id` routes, and unambiguous with them: no
+   * `POST /sessions/:id` route exists — the one two-segment `:id` route is
+   * `GET` and every `POST` under `:id` has a further segment — so a `POST` to
+   * this path can reach no other route.
+   */
+  'session.purge': {
+    operation: 'session.purge',
+    method: 'POST',
+    pattern: '/sessions/purge',
+    params: [],
+    authExempt: false,
+    request: sessionPurgeRequestSchema,
+    response: sessionPurgeResponseSchema,
+  },
+
+  /**
    * `POST /sessions/:id/capture/start` — open a capture window.
    *
    * Answers `409` with {@link captureStartConflictResponseSchema} when another
@@ -1731,6 +3081,24 @@ export const HTTP_ROUTES = {
     authExempt: false,
     request: captureStopRequestSchema,
     response: captureStopResponseSchema,
+  },
+
+  /**
+   * `POST /sessions/:id/target/request` — ask the session's bound DevTools tab
+   * to enter element-picker mode (editor credential only).
+   *
+   * The service answers by pushing `target.request { sessionId }` to that tab
+   * alone; `409 TAB_NOT_BOUND` when no tab is bound and
+   * `503 TRANSPORT_DISCONNECTED` when its connection is offline (Section D2).
+   */
+  'target.request': {
+    operation: 'target.request',
+    method: 'POST',
+    pattern: '/sessions/:id/target/request',
+    params: ['id'],
+    authExempt: false,
+    request: targetRequestRequestSchema,
+    response: targetRequestResponseSchema,
   },
 
   /**
@@ -1773,7 +3141,7 @@ export const HTTP_ROUTES = {
     response: panelByIdResponseSchema,
   },
 
-  /** `GET /sessions/:id/modifications` — the session's modification journal. */
+  /** `GET /sessions/:id/modifications` — one diff-budgeted page of the modification journal. */
   'modifications.list': {
     operation: 'modifications.list',
     method: 'GET',
@@ -1823,6 +3191,21 @@ export const HTTP_ROUTES = {
   },
 
   /**
+   * `POST /dev-server/credential` — mint a project-scoped server-agent
+   * credential for a dev server the caller starts itself
+   * (`scripts/dev-instrumented.mjs`, with the editor credential).
+   */
+  'devServer.credential': {
+    operation: 'devServer.credential',
+    method: 'POST',
+    pattern: '/dev-server/credential',
+    params: [],
+    authExempt: false,
+    request: devServerCredentialRequestSchema,
+    response: devServerCredentialResponseSchema,
+  },
+
+  /**
    * `GET /health` — **unauthenticated**: version and pairing availability only.
    *
    * How a client discovers whether the service is running at all, which is why
@@ -1865,6 +3248,20 @@ export const HTTP_ROUTES = {
     request: pairCompleteRequestSchema,
     response: pairCompleteResponseSchema,
   },
+
+  /**
+   * `POST /credentials/rotate` — revoke every credential and socket, and
+   * regenerate the editor credential, for `debuggen.rotateServiceToken`.
+   */
+  'credentials.rotate': {
+    operation: 'credentials.rotate',
+    method: 'POST',
+    pattern: '/credentials/rotate',
+    params: [],
+    authExempt: false,
+    request: credentialsRotateRequestSchema,
+    response: credentialsRotateResponseSchema,
+  },
 } as const satisfies Readonly<Record<string, HttpRouteDefinition>>;
 
 // ---------------------------------------------------------------------------
@@ -1889,8 +3286,10 @@ export const HTTP_OPERATIONS = [
   'session.get',
   'session.question',
   'session.end',
+  'session.purge',
   'capture.start',
   'capture.stop',
+  'target.request',
   'panel.data',
   'panel.get',
   'panel.getById',
@@ -1898,16 +3297,18 @@ export const HTTP_OPERATIONS = [
   'telemetry.event',
   'devServer.launch',
   'devServer.stop',
+  'devServer.credential',
   'health',
   'pair.start',
   'pair.complete',
+  'credentials.rotate',
 ] as const satisfies readonly (keyof typeof HTTP_ROUTES)[];
 
 /**
  * One of {@link HTTP_OPERATIONS}: the canonical operation-id type of the HTTP
  * surface.
  *
- * Derived from the tuple, so it is exactly the seventeen table keys and can
+ * Derived from the tuple, so it is exactly the twenty-one table keys and can
  * neither gain nor lose a member without the tuple and the table changing in
  * the same edit. It is the type every helper below is generic over, and the key
  * type of the one structure that must name every route:
@@ -1937,7 +3338,7 @@ export type HttpOperationId = (typeof HTTP_OPERATIONS)[number];
  * either is assignable to the other in both directions and the suite proves the
  * two identical. `./client/http-client.ts`'s single `request(operation, …)`
  * method is generic over this name, which is what makes one method fully typed
- * for seventeen routes; new code may use either spelling.
+ * for twenty-one routes; new code may use either spelling.
  */
 export type HttpOperation = HttpOperationId;
 
@@ -2046,7 +3447,7 @@ export type AuthExemptOperationsMatchRouteFlags = AssertTrue<
  *
  * @param operation The operation being called.
  * @returns `true` for `health` and `pair.complete`, `false` for the other
- * fifteen.
+ * nineteen.
  */
 export function isAuthExemptOperation(operation: HttpOperationId): boolean {
   return HTTP_ROUTES[operation].authExempt;
@@ -2139,6 +3540,11 @@ export function sessionEndPath(sessionId: string): string {
   return buildPath('session.end', { id: sessionId });
 }
 
+/** `/sessions/purge` — for `session.purge`, the on-demand retention sweep. */
+export function sessionPurgePath(): string {
+  return buildPath('session.purge');
+}
+
 /** `/sessions/:id/capture/start` — for `capture.start`. */
 export function captureStartPath(sessionId: string): string {
   return buildPath('capture.start', { id: sessionId });
@@ -2147,6 +3553,11 @@ export function captureStartPath(sessionId: string): string {
 /** `/sessions/:id/capture/stop` — for `capture.stop`. */
 export function captureStopPath(sessionId: string): string {
   return buildPath('capture.stop', { id: sessionId });
+}
+
+/** `/sessions/:id/target/request` — for `target.request`, the editor's pick request. */
+export function targetRequestPath(sessionId: string): string {
+  return buildPath('target.request', { id: sessionId });
 }
 
 /** `/sessions/:id/panel-data` — for `panel.data`. */
@@ -2184,6 +3595,11 @@ export function devServerStopPath(): string {
   return buildPath('devServer.stop');
 }
 
+/** `/dev-server/credential` — for `devServer.credential`. */
+export function devServerCredentialPath(): string {
+  return buildPath('devServer.credential');
+}
+
 /** `/health` — for `health`, the unauthenticated probe. */
 export function healthPath(): string {
   return buildPath('health');
@@ -2197,6 +3613,11 @@ export function pairStartPath(): string {
 /** `/pair/complete` — for `pair.complete`. */
 export function pairCompletePath(): string {
   return buildPath('pair.complete');
+}
+
+/** `/credentials/rotate` — for `credentials.rotate`. */
+export function credentialsRotatePath(): string {
+  return buildPath('credentials.rotate');
 }
 
 // ---------------------------------------------------------------------------
@@ -2324,15 +3745,22 @@ export type SessionCreateResponseIsSessionRecord = AssertTrue<
 >;
 
 /**
- * The panel-data request body is `@debuggen/panel-schema`'s `DataQuery` itself.
+ * The panel-data request body is `@debuggen/panel-schema`'s `DataQuery`, field
+ * for field, plus an optional string `panelId` — and nothing else.
  *
- * The type-level half of the identity the table asserts by reference; the suite
- * asserts the other half, that `HTTP_ROUTES['panel.data'].request` is the very
- * same schema object.
+ * The type-level half of the identity the suite asserts by reference (each
+ * query field schema of `HTTP_ROUTES['panel.data'].request` is panel-schema's
+ * own object). The first member states that removing `panelId` leaves exactly
+ * `DataQuery`, so no query field was restated, widened or dropped; the second
+ * that a bare `DataQuery` is a valid body, which is what makes `panelId`
+ * optional rather than merely nullable; the third that a present `panelId` is a
+ * string.
  */
-export type PanelDataRequestIsDataQuery = AssertTrue<
-  Identical<HttpRequestBody<'panel.data'>, DataQuery>
->;
+export type PanelDataRequestIsDataQueryWithPanelId = [
+  AssertTrue<Identical<Omit<HttpRequestBody<'panel.data'>, 'panelId'>, DataQuery>>,
+  AssertTrue<AssignableTo<DataQuery, HttpRequestBody<'panel.data'>>>,
+  AssertTrue<Identical<Exclude<HttpRequestBody<'panel.data'>['panelId'], undefined>, string>>,
+];
 
 /** A `GET` route's request body type is `undefined`. */
 export type GetRoutesCarryNoRequestBody = AssertTrue<
@@ -2357,10 +3785,58 @@ export type PanelResponsesDifferInNullability = [
   AssertTrue<Identical<AssignableTo<null, HttpResponseBody<'panel.getById'>['panel']>, false>>,
 ];
 
+/**
+ * The two administrative requests carry no field at all.
+ *
+ * Rotation is all or nothing and the retention window is configuration, so a
+ * key added to either body would be a caller choosing what survives the
+ * operation — the property both request schemas document, held at compile
+ * time so it cannot be relaxed in one edit. `Record<string, never>` is what
+ * zod infers for a strict object over an empty shape: no key may hold a value.
+ */
+export type AdministrativeRequestsCarryNoField = [
+  AssertTrue<Identical<HttpRequestBody<'credentials.rotate'>, Record<string, never>>>,
+  AssertTrue<Identical<HttpRequestBody<'session.purge'>, Record<string, never>>>,
+];
+
+/**
+ * A server-agent credential is requested for a project exactly as a launched
+ * dev server is stopped: by `projectRoot`, and by nothing else.
+ */
+export type DevServerCredentialRequestMatchesStop = AssertTrue<
+  Identical<HttpRequestBody<'devServer.credential'>, HttpRequestBody<'devServer.stop'>>
+>;
+
 /** The modification journal carries `@debuggen/instrumentation`'s records. */
 export type ModificationsResponseCarriesRecords = AssertTrue<
   Identical<ModificationsResponse['modifications'], ModificationRecord[]>
 >;
+
+/**
+ * The target-request reply names exactly the session and the bound tab, and
+ * its tab id is the one the binding messages carry.
+ *
+ * The run-time half — that the field's schema *is* the `session.bind` payload's
+ * tab-id schema, not a copy of its rule — is asserted by identity in the suite.
+ */
+export type TargetRequestResponseNamesTheBoundTab = [
+  AssertTrue<Identical<keyof HttpResponseBody<'target.request'>, 'sessionId' | 'tabId'>>,
+  AssertTrue<Identical<HttpResponseBody<'target.request'>['tabId'], SessionBindPayload['tabId']>>,
+];
+
+/**
+ * A session list row is a projection of the record: its members keep the
+ * record's own types, so {@link toSessionListItem} can never need a field the
+ * record lacks, and only `cleanup` is summarised.
+ */
+export type SessionListItemProjectsTheRecord = [
+  AssertTrue<Identical<SessionListItem['id'], SessionRecord['id']>>,
+  AssertTrue<Identical<SessionListItem['status'], SessionRecord['status']>>,
+  AssertTrue<Identical<SessionListItem['cleanup']['status'], SessionRecord['cleanup']['status']>>,
+  AssertTrue<
+    Identical<SessionListItem['cleanup']['completedAt'], SessionRecord['cleanup']['completedAt']>
+  >,
+];
 
 /**
  * The ingest body carries **ingress** events, which cannot claim a session.

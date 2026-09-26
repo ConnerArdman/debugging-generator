@@ -33,10 +33,31 @@
  *   content-addressed backup directory under the digest the second delta
  *   target will need makes the backup store refuse that write, so the patcher
  *   stops after the first delta target was already applied.
+ * - **A delta whose plan version cannot be stored is undone as well.** The
+ *   failure is injected at the database: a temporary trigger on the service's
+ *   own connection aborts every insert into `plans`, so the install completes
+ *   and only recording plan version n + 1 fails. The follow-up stage then
+ *   reverse-restores the delta itself, and the files, the journal and the plan
+ *   ladder all stand at version n again.
+ * - **A plan row and its session record are one write.** A second trigger
+ *   aborts the session-record update that mirrors a new plan row, *after* that
+ *   row was inserted in the same transaction: the row is rolled back with it,
+ *   so the `plans` table and `SessionRecord.plans` both stay at n, the delta is
+ *   undone, and the later status write that files the session `failed` goes
+ *   through. In both persistence failures the undone record reaches the editor
+ *   and the DevTools clients as `reverted` through `session.updated`.
  * - **An edit between two installs becomes a conflict, never an overwrite.**
  *   A second session on a second copy edits the chained file after the first
  *   install; the second install refuses to layer over it, and cleanup leaves
  *   the developer's bytes exactly as they were.
+ * - **A failed follow-up is retried by its attempt id, never duplicated.** A
+ *   follow-up recorded and then failed at its decision is asked again with the
+ *   same `attemptId`: the ladder keeps one entry and the store one `followups`
+ *   row, rewritten in place as attempt 2. The service clock is frozen across
+ *   both asks, so the two carry the same `askedAt`, and the retry's decision is
+ *   held, so the route can only answer by recognising the attempt's identity.
+ *   Asking the answered attempt again is refused before any stage runs, and a
+ *   question sent under a new id is appended as its own follow-up.
  *
  * ## Rules ruling
  *
@@ -88,18 +109,26 @@ import type {
   InstrumentationTargetInput,
   ModificationRecord,
 } from '@debuggen/instrumentation';
+import type { ModelProvider } from '@debuggen/model-provider';
 import { validatePanelSpec } from '@debuggen/panel-schema';
 import type { PanelSpec } from '@debuggen/panel-schema';
 import {
   CLEANUP_STATUSES,
+  FOLLOW_UP_ATTEMPT_ID_PREFIX,
   PROGRESS_STAGES,
   PROGRESS_STATUSES,
   SESSION_STATUSES,
+  isFollowUpAnswered,
   isMessageOfType,
 } from '@debuggen/protocol';
-import type { AnalysisResult, SessionRecord, SessionStatus } from '@debuggen/protocol';
-import { isErr, newActionId } from '@debuggen/shared';
-import type { DebuggenError, Result } from '@debuggen/shared';
+import type {
+  AnalysisResult,
+  FollowUpRecord,
+  SessionRecord,
+  SessionStatus,
+} from '@debuggen/protocol';
+import { DebuggenError, isErr, newActionId, newId } from '@debuggen/shared';
+import type { Result } from '@debuggen/shared';
 import { SECURE_FILE_MODE, sha256Hex, sha256OfFile } from '@debuggen/shared/node';
 import { TELEMETRY_TIERS } from '@debuggen/telemetry';
 
@@ -112,10 +141,12 @@ import type {
   FollowUpAdditionalAction,
   FollowUpDecision,
 } from '../../src/pipeline/stages/followup.js';
+import { publicFailureCopy } from '../../src/sessions/progress.js';
 import { transition } from '../../src/sessions/state-machine.js';
 import {
   HARNESS_TIMEOUTS,
   assertTreeUnchanged,
+  createHarnessClock,
   createScriptedProvider,
   diffTreeSnapshots,
   readTelemetryBatch,
@@ -185,6 +216,8 @@ const PATCH_MODE = memberOf(INSTRUMENTATION_MODES, 'patch');
 
 /** The progress stage and status of the install's closing "ready" row. */
 const INSTRUMENT_STAGE = memberOf(PROGRESS_STAGES, 'instrument');
+/** The progress stage a plan version that could not be recorded is filed under. */
+const PLAN_STAGE = memberOf(PROGRESS_STAGES, 'plan');
 const PROGRESS_DONE = memberOf(PROGRESS_STATUSES, 'done');
 const PROGRESS_FAILED = memberOf(PROGRESS_STATUSES, 'failed');
 
@@ -199,6 +232,23 @@ const BROWSER_TIER = memberOf(TELEMETRY_TIERS, 'browser');
  * harness's capture of the service's own logger.
  */
 const FOLLOW_UP_DECIDED_LOG = 'Follow-up decided.';
+
+/**
+ * The message of the follow-up stage's record of a compensation that undid an
+ * installed delta in full. Its fields — counts, record ids and whether the
+ * arming state was returned to plan version n — are the witness that the
+ * stage, not the installer, restored the delta whose plan version could not be
+ * stored, and that `restoreArming` answered.
+ */
+const DELTA_ROLLED_BACK_LOG =
+  'An installed follow-up delta could not be kept and was reverse-restored; the session stays at its previous plan version.';
+
+/**
+ * The message `session.question` logs when it answers because it observed the
+ * ask recorded — rather than because the follow-up settled — with `retried`
+ * telling a retry in place from a new follow-up.
+ */
+const RECORDED_FOLLOW_UP_LOG = 'Recorded a follow-up question; its answer continues';
 
 /* -------------------------------------------------------------------------------------------------
  * The corpus — `test/fixtures/sample-project`, copied, never written in place
@@ -320,36 +370,76 @@ function inProject(project: FixtureProjectCopy, file: string): string {
  * ---------------------------------------------------------------------------------------------- */
 
 /**
- * How many follow-ups this file asks: four in the first session (existing
- * evidence, the refused-and-accepted delta, the delta that fails part-way and
- * the chain) and two in the conflict session. Exactly this many script steps
- * exist, and the last test asserts every one was served — a repair turn or an
- * unexpected extra decision would shift the queue and fail loudly.
+ * How many follow-up decisions this file's model calls answer: six in the
+ * first session (existing evidence, the refused-and-accepted delta, the delta
+ * that fails part-way, the delta whose plan row cannot be stored, the delta
+ * whose session record cannot account for its plan row, and the chain) and
+ * five in the conflict session (the first delta, an attempt whose decision
+ * fails, that attempt's retry, a new question under a new attempt id, and the
+ * conflict). The refused re-ask of an answered attempt reaches no model call,
+ * so it has no step. Exactly this many script steps exist, and the last test
+ * asserts every one was served — a repair turn or an unexpected extra decision
+ * would shift the queue and fail loudly.
  */
-const FOLLOW_UP_COUNT = 6;
+const FOLLOW_UP_COUNT = 11;
 
-/** The decisions the next follow-ups receive, oldest first. */
-const pendingDecisions: FollowUpDecision[] = [];
+/**
+ * What one follow-up's decision call answers: a decision handed to the stage's
+ * structured-output gate, or a failure the provider's transport reports.
+ */
+type ScriptedDecision = FollowUpDecision | DebuggenError;
 
-/** Queues the decision the next follow-up's model call answers with. */
-function enqueueDecision(decision: FollowUpDecision): void {
-  pendingDecisions.push(decision);
+/** The answers the next follow-up decision calls receive, oldest first. */
+const pendingDecisions: ScriptedDecision[] = [];
+
+/** Queues the answer the next follow-up's model call receives. */
+function enqueueDecision(answer: ScriptedDecision): void {
+  pendingDecisions.push(answer);
 }
 
 /**
- * One script step per follow-up, answering only the `followup` stage. The
- * answer is read when the call arrives — a decision can only name the live
- * plan's action ids once that plan exists — and is handed to the stage's own
+ * A decision call that fails at the transport, as an unreachable provider
+ * reports it: returned as the call's `Err`, never thrown.
+ */
+function decisionUnavailable(): DebuggenError {
+  return new DebuggenError(
+    'MODEL_UNAVAILABLE',
+    'The scripted provider did not answer this follow-up decision.',
+    { details: { stage: FOLLOW_UP_STAGE } },
+  );
+}
+
+/**
+ * One script step answering only the `followup` stage. The answer is taken
+ * from the queue when the call arrives — a decision can only name the live
+ * plan's action ids once that plan exists — and exactly once per step, however
+ * often the provider reads the step's fields: a queued failure is served as
+ * `failure`, a queued decision as `raw`, handed to the stage's own
  * structured-output gate exactly as a provider's transport would hand it over.
  */
+function decisionStep(): ScriptedStep {
+  let answer: { readonly value: ScriptedDecision | undefined } | undefined;
+  const take = (): ScriptedDecision | undefined => {
+    answer ??= { value: pendingDecisions.shift() };
+    return answer.value;
+  };
+  return {
+    stage: FOLLOW_UP_STAGE,
+    get failure(): DebuggenError | undefined {
+      const value = take();
+      return value instanceof DebuggenError ? value : undefined;
+    },
+    get raw(): unknown {
+      const value = take();
+      return value instanceof DebuggenError ? undefined : value;
+    },
+  };
+}
+
+/** One script step per follow-up decision, in the order they are asked. */
 const DECISION_SCRIPT: readonly ScriptedStep[] = Array.from(
   { length: FOLLOW_UP_COUNT },
-  (): ScriptedStep => ({
-    stage: FOLLOW_UP_STAGE,
-    get raw(): unknown {
-      return pendingDecisions.shift();
-    },
-  }),
+  decisionStep,
 );
 
 /** An authoring target for a scripted decision. */
@@ -388,6 +478,73 @@ function resolvedProposal(
 
 let harness: Harness;
 let scripted: ScriptedProvider;
+
+/**
+ * The service clock: the harness's own monotonic counter clock, which a test
+ * can freeze so that every read answers one millisecond — the only way to make
+ * two asks carry the same `askedAt` through the real stage and store.
+ */
+const counterClock = createHarnessClock();
+let frozenAt: number | undefined;
+
+/** The clock handed to {@link startHarness}. */
+function serviceNow(): number {
+  return frozenAt ?? counterClock.now();
+}
+
+/**
+ * Freezes the service clock until {@link thawServiceClock}.
+ *
+ * @returns The millisecond every read answers meanwhile.
+ */
+function freezeServiceClock(): number {
+  frozenAt = counterClock.now();
+  return frozenAt;
+}
+
+/** Lets the service clock move on from where it was frozen, monotonically. */
+function thawServiceClock(): void {
+  frozenAt = undefined;
+}
+
+/** A follow-up decision call held until its release, or `undefined` when none is held. */
+let heldDecision: Promise<void> | undefined;
+
+/**
+ * Holds the next follow-up decision call until the returned function is
+ * called. While it is held the follow-up cannot settle, so the route's answer
+ * can only come from observing the recorded attempt.
+ */
+function holdNextDecision(): () => void {
+  let release: () => void = () => undefined;
+  heldDecision = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return () => {
+    heldDecision = undefined;
+    release();
+  };
+}
+
+/**
+ * The scripted provider with {@link holdNextDecision}'s gate in front of its
+ * follow-up decision calls. Every call is still answered by the scripted
+ * provider — and recorded by it — exactly once; only its timing is held.
+ */
+function withDecisionGate(provider: ModelProvider): ModelProvider {
+  return {
+    id: provider.id,
+    generateText: (request) => provider.generateText(request),
+    generateStructured: async (schema, request) => {
+      const held = request.metadata.stage === FOLLOW_UP_STAGE ? heldDecision : undefined;
+      if (held !== undefined) {
+        await held;
+      }
+      return provider.generateStructured(schema, request);
+    },
+    callTools: (request, tools) => provider.callTools(request, tools),
+  };
+}
 
 /** A session driven through the real routes, with the connections that speak for it. */
 interface LiveSession {
@@ -495,6 +652,31 @@ function waitForPushedStatus(
       message.payload.session.id === session.id &&
       message.payload.session.status === status &&
       predicate(message.payload.session),
+    HARNESS_TIMEOUTS.pipeline,
+  );
+}
+
+/**
+ * Waits for the `session.updated` push, after `client`'s transcript index
+ * `from`, whose record lists `recordId` as `reverted`: the mirror a follow-up
+ * compensation sends so a client that was told the record was applied (by
+ * `instrumentation.ready`) stops showing it so.
+ */
+function waitForRevertedMirror(
+  client: HarnessWsClient,
+  sessionId: string,
+  from: number,
+  recordId: string,
+): Promise<HarnessMessage<'session.updated'>> {
+  return waitFor(
+    client,
+    'session.updated',
+    (message, index) =>
+      index >= from &&
+      message.payload.session.id === sessionId &&
+      message.payload.session.modifications.some(
+        (record) => record.id === recordId && record.status === MODIFICATION.reverted,
+      ),
     HARNESS_TIMEOUTS.pipeline,
   );
 }
@@ -644,20 +826,78 @@ interface AskedFollowUp {
   readonly answered: Result<SessionRecord, DebuggenError>;
 }
 
-/** Queues `decision` and asks `question` through `POST /sessions/:id/question`. */
+/**
+ * Queues `answer` and asks `question` through `POST /sessions/:id/question`.
+ *
+ * @param attemptId The follow-up attempt to ask; omitted, the body carries
+ *   none and the service mints one, which makes the ask a new follow-up.
+ */
 async function askFollowUp(
   session: LiveSession,
   question: string,
-  decision: FollowUpDecision,
+  answer: ScriptedDecision,
+  attemptId?: string,
 ): Promise<AskedFollowUp> {
-  enqueueDecision(decision);
+  enqueueDecision(answer);
+  return sendFollowUp(session, question, attemptId);
+}
+
+/**
+ * Asks `question` through `POST /sessions/:id/question` without queueing a
+ * decision — for an ask the service must refuse before any model call.
+ */
+async function sendFollowUp(
+  session: LiveSession,
+  question: string,
+  attemptId?: string,
+): Promise<AskedFollowUp> {
   await harness.editor(session.project.root);
   const mark = session.editor.received.length;
   const answered = await harness.http().request('session.question', {
     params: { id: session.id },
-    body: { question },
+    body: attemptId === undefined ? { question } : { question, attemptId },
   });
   return { mark, answered };
+}
+
+/** The session's stored `followups` rows, in the order they were first asked. */
+function followUpRowsOf(sessionId: string): FollowUpRecord[] {
+  return unwrap(harness.repos.sessions.listFollowUps(sessionId), 'sessions.listFollowUps');
+}
+
+/** The only follow-up of `followUps` carrying `attemptId`, failing when there is not exactly one. */
+function attemptOf(followUps: readonly FollowUpRecord[], attemptId: string): FollowUpRecord {
+  return only(
+    followUps.filter((entry) => entry.attemptId === attemptId),
+    `follow-up of attempt ${attemptId}`,
+  );
+}
+
+/**
+ * The orchestrator's record of an operation that ended well. It is written as
+ * the operation releases the session, so counting it tells a settled operation
+ * from one still finishing its last writes — which a following ask would meet
+ * as a `pipeline-busy` refusal rather than the refusal under test.
+ */
+const OPERATION_COMPLETED_LOG = 'Pipeline operation completed.';
+
+/** How many operations on `sessionId` have completed so far. */
+function completedOperations(sessionId: string): number {
+  return harness.logger
+    .withMessage(OPERATION_COMPLETED_LOG)
+    .filter((record) => record.fields['sessionId'] === sessionId).length;
+}
+
+/** Waits until more than `before` operations on `sessionId` have completed. */
+function waitForCompletedOperation(sessionId: string, before: number): Promise<number> {
+  return waitUntil(
+    () => {
+      const completed = completedOperations(sessionId);
+      return completed > before ? completed : undefined;
+    },
+    'the follow-up operation has released the session',
+    HARNESS_TIMEOUTS.pipeline,
+  );
 }
 
 /**
@@ -715,7 +955,7 @@ const CONFLICT_TAB = 42;
 
 beforeAll(async () => {
   scripted = createScriptedProvider(DECISION_SCRIPT);
-  harness = await startHarness({ provider: scripted.provider });
+  harness = await startHarness({ provider: withDecisionGate(scripted.provider), now: serviceNow });
 });
 
 afterAll(async () => {
@@ -1255,6 +1495,311 @@ describe('the follow-up paths of one session', () => {
     expect(transition(STATUS.analyzing, STATUS.generated).ok).toBe(false);
   });
 
+  it('undoes a fully installed delta whose plan version cannot be stored and leaves the session at its previous plan version', async () => {
+    const question = 'Does the condition-report query itself hold the report up?';
+    const plansBefore = plansOf(session.id);
+    const previousVersion = last(plansBefore, 'plan version').planVersion;
+    const analysesBefore = analysesOf(session.id);
+    const panelsBefore = panelsOf(session.id);
+    const followUpsBefore = storedSession(session.id).followUps.length;
+    const recordsBefore = await modificationsOf(session.id);
+    const filesBefore = new Map<string, string>();
+    for (const file of new Set(recordsBefore.map((record) => record.file))) {
+      filesBefore.set(file, await digestOf(session.project, file));
+    }
+    // The target is a file no open record patches: the part-way delta's record on it was reverted,
+    // so the install has nothing to layer over and completes on its own.
+    expect(await digestOf(session.project, CORPUS.poolFile)).toBe(
+      pristineDigest(session.project, CORPUS.poolFile),
+    );
+    expect(
+      recordsFor(recordsBefore, CORPUS.poolFile).every(
+        (record) => record.status === MODIFICATION.reverted,
+      ),
+    ).toBe(true);
+
+    // The injected failure: plan persistence refuses at the database, not through a code seam. A
+    // temporary trigger on the service's own connection aborts every insert into `plans`, so the
+    // install succeeds and only recording plan version n + 1 fails.
+    const trigger = 'followup_suite_refuses_plan_rows';
+    harness.store.db.exec(
+      `CREATE TEMP TRIGGER ${trigger} BEFORE INSERT ON plans BEGIN SELECT RAISE(ABORT, 'plan rows are refused by the follow-up suite'); END`,
+    );
+    const devtoolsMark = session.devtools.received.length;
+    let asked: AskedFollowUp;
+    try {
+      asked = await askFollowUp(session, question, {
+        needsNewCapture: true,
+        additionalActions: [
+          authoringTarget(
+            CORPUS.poolFile,
+            CORPUS.poolQuerySymbol,
+            ACTION_TYPE.functionTiming,
+            'The query layer is where the report waits.',
+          ),
+        ],
+      });
+      const from = asked.mark;
+      // The session was already `failed`, so the walk — not the status alone — shows this run ended.
+      await waitUntil(
+        () => {
+          const walk = statusWalk(session.editor, session.id, from, STATUS.failed);
+          return walk.length === 4 ? walk : undefined;
+        },
+        'the unrecorded plan version files the session as failed again',
+        HARNESS_TIMEOUTS.pipeline,
+      );
+    } finally {
+      harness.store.db.exec(`DROP TRIGGER IF EXISTS ${trigger}`);
+    }
+    const { mark } = asked;
+    expect(statusWalk(session.editor, session.id, mark, STATUS.failed)).toEqual([
+      STATUS.failed,
+      STATUS.planning,
+      STATUS.instrumenting,
+      STATUS.failed,
+    ]);
+    expectRecordedOrFailedAs(asked.answered, question, 'STORE_ERROR');
+
+    // The install itself completed: it announced the record it applied before the plan failed.
+    const records = await modificationsOf(session.id);
+    const attempted = records.filter(
+      (record) => !recordsBefore.some((earlier) => earlier.id === record.id),
+    );
+    const undone = only(attempted, 'record of the unrecorded delta');
+    const announced = await waitFor(
+      session.editor,
+      'instrumentation.ready',
+      (message, index) => index >= mark && message.payload.sessionId === session.id,
+    );
+    expect(announced.payload.applied.map((record) => record.id)).toEqual([undone.id]);
+
+    // The plan ladder did not move: version n + 1 was never stored.
+    expect(plansOf(session.id)).toEqual(plansBefore);
+    expect(unwrap(harness.repos.sessions.latestPlanVersion(session.id), 'latestPlanVersion')).toBe(
+      previousVersion,
+    );
+    expect(
+      unwrap(harness.repos.sessions.getPlan(session.id, previousVersion + 1), 'getPlan'),
+    ).toBeUndefined();
+
+    // The stage reverse-restored the delta: its record is reverted, its file is pristine again and
+    // its backup is gone; every earlier record and the file it patched are exactly as they were.
+    expect(undone).toMatchObject({
+      file: CORPUS.poolFile,
+      planVersion: previousVersion + 1,
+      status: MODIFICATION.reverted,
+      originalHash: pristineDigest(session.project, CORPUS.poolFile),
+    });
+    expect(await digestOf(session.project, CORPUS.poolFile)).toBe(
+      pristineDigest(session.project, CORPUS.poolFile),
+    );
+    expect(await exists(undone.backupPath)).toBe(false);
+    for (const earlier of recordsBefore) {
+      expect(recordById(records, earlier.id)).toEqual(earlier);
+    }
+    for (const [file, digest] of filesBefore) {
+      expect(await digestOf(session.project, file)).toBe(digest);
+    }
+    const rolledBack = last(harness.logger.withMessage(DELTA_ROLLED_BACK_LOG), 'rollback record');
+    expect(rolledBack.fields).toMatchObject({
+      planVersion: previousVersion + 1,
+      previousPlanVersion: previousVersion,
+      trigger: 'plan-unrecorded',
+      attempted: 1,
+      restored: 1,
+      journal: 'listed',
+      arming: 'restored',
+      mirrored: true,
+    });
+
+    // The clients were told the record was applied; the compensation's mirror tells both of them
+    // it is reverted, and the stored record says so too.
+    await waitForRevertedMirror(session.editor, session.id, mark, undone.id);
+    await waitForRevertedMirror(session.devtools, session.id, devtoolsMark, undone.id);
+
+    // No analysis or panel came of it, and the follow-up carries no outcome link.
+    expect(analysesOf(session.id)).toEqual(analysesBefore);
+    expect(panelsOf(session.id)).toEqual(panelsBefore);
+    const record = storedSession(session.id);
+    expect(record.status).toBe(STATUS.failed);
+    expect(recordById(record.modifications, undone.id).status).toBe(MODIFICATION.reverted);
+    expect(record.followUps).toHaveLength(followUpsBefore + 1);
+    const followUp = last(record.followUps, 'follow-up');
+    expect(followUp.question).toBe(question);
+    expect(followUp.planVersion).toBeUndefined();
+    expect(followUp.analysisId).toBeUndefined();
+    expect(followUp.panelId).toBeUndefined();
+
+    // The failure is filed under the plan stage and says what the project holds now: its first
+    // line is the public copy of its code — a failed row never shows a failure's own words — and
+    // its detail, the failure's product-authored hint, states what the compensation left.
+    const failedRow = await waitFor(
+      session.editor,
+      'session.progress',
+      (message, index) =>
+        index >= mark &&
+        message.payload.sessionId === session.id &&
+        message.payload.stage === PLAN_STAGE &&
+        message.payload.status === PROGRESS_FAILED,
+    );
+    expect(failedRow.payload.message).toBe(publicFailureCopy(PLAN_STAGE, 'STORE_ERROR').message);
+    expect(failedRow.payload.detail).toContain(
+      `so the project holds exactly what plan version ${String(previousVersion)} installed`,
+    );
+  });
+
+  it('rolls a stored plan row back with the session record that could not account for it, and undoes the delta', async () => {
+    const question = 'Is the condition-report query still the slow step after the retry?';
+    const plansBefore = plansOf(session.id);
+    const previousVersion = last(plansBefore, 'plan version').planVersion;
+    const recordBefore = storedSession(session.id);
+    const followUpsBefore = recordBefore.followUps.length;
+    const recordsBefore = await modificationsOf(session.id);
+    const filesBefore = new Map<string, string>();
+    for (const file of new Set(recordsBefore.map((record) => record.file))) {
+      filesBefore.set(file, await digestOf(session.project, file));
+    }
+    // As before, the target carries no open record, so the install completes on its own.
+    expect(await digestOf(session.project, CORPUS.poolFile)).toBe(
+      pristineDigest(session.project, CORPUS.poolFile),
+    );
+    expect(recordBefore.plans).toEqual(plansBefore);
+
+    // The injected failure: the plan row is inserted, and then the session-record update that
+    // mirrors it — in the same transaction — is aborted. The trigger sees the inserted row (same
+    // transaction) and refuses only while the session holds more plan rows than it did, so every
+    // session update after the rollback passes.
+    const trigger = 'followup_suite_refuses_record_mirror';
+    harness.store.db.exec(
+      `CREATE TEMP TRIGGER ${trigger} BEFORE UPDATE ON sessions WHEN (SELECT COUNT(*) FROM plans WHERE session_id = NEW.id) > ${String(plansBefore.length)} BEGIN SELECT RAISE(ABORT, 'the session record may not account for a new plan in the follow-up suite'); END`,
+    );
+    const devtoolsMark = session.devtools.received.length;
+    let asked: AskedFollowUp;
+    try {
+      asked = await askFollowUp(session, question, {
+        needsNewCapture: true,
+        additionalActions: [
+          authoringTarget(
+            CORPUS.poolFile,
+            CORPUS.poolQuerySymbol,
+            ACTION_TYPE.functionTiming,
+            'The query layer is where the report waits.',
+          ),
+        ],
+      });
+      const from = asked.mark;
+      await waitUntil(
+        () => {
+          const walk = statusWalk(session.editor, session.id, from, STATUS.failed);
+          return walk.length === 4 ? walk : undefined;
+        },
+        'the rolled-back plan version files the session as failed again',
+        HARNESS_TIMEOUTS.pipeline,
+      );
+    } finally {
+      harness.store.db.exec(`DROP TRIGGER IF EXISTS ${trigger}`);
+    }
+    const { mark } = asked;
+    expect(statusWalk(session.editor, session.id, mark, STATUS.failed)).toEqual([
+      STATUS.failed,
+      STATUS.planning,
+      STATUS.instrumenting,
+      STATUS.failed,
+    ]);
+    expectRecordedOrFailedAs(asked.answered, question, 'STORE_ERROR');
+
+    // Atomic: the plan row went back with the record update, so the table and the record agree.
+    expect(plansOf(session.id)).toEqual(plansBefore);
+    expect(unwrap(harness.repos.sessions.latestPlanVersion(session.id), 'latestPlanVersion')).toBe(
+      previousVersion,
+    );
+    expect(
+      unwrap(harness.repos.sessions.getPlan(session.id, previousVersion + 1), 'getPlan'),
+    ).toBeUndefined();
+    const record = storedSession(session.id);
+    expect(record.plans).toEqual(plansBefore);
+    const pairRolledBack = last(
+      harness.logger.withMessage(
+        'a plan and the session record mirroring it were rolled back together; neither was stored',
+      ),
+      'plan-and-record rollback record',
+    );
+    expect(pairRolledBack.fields).toMatchObject({
+      operation: 'insertPlanWithRecord',
+      step: 'update',
+      planVersion: previousVersion + 1,
+      code: 'STORE_ERROR',
+    });
+
+    // The install completed and announced its record; the stage then reverse-restored it.
+    const records = await modificationsOf(session.id);
+    const undone = only(
+      records.filter((entry) => !recordsBefore.some((earlier) => earlier.id === entry.id)),
+      'record of the delta whose plan row was rolled back',
+    );
+    const announced = await waitFor(
+      session.editor,
+      'instrumentation.ready',
+      (message, index) => index >= mark && message.payload.sessionId === session.id,
+    );
+    expect(announced.payload.applied.map((entry) => entry.id)).toEqual([undone.id]);
+    expect(undone).toMatchObject({
+      file: CORPUS.poolFile,
+      planVersion: previousVersion + 1,
+      status: MODIFICATION.reverted,
+      originalHash: pristineDigest(session.project, CORPUS.poolFile),
+    });
+    expect(await digestOf(session.project, CORPUS.poolFile)).toBe(
+      pristineDigest(session.project, CORPUS.poolFile),
+    );
+    expect(await exists(undone.backupPath)).toBe(false);
+    for (const earlier of recordsBefore) {
+      expect(recordById(records, earlier.id)).toEqual(earlier);
+    }
+    for (const [file, digest] of filesBefore) {
+      expect(await digestOf(session.project, file)).toBe(digest);
+    }
+    const rolledBack = last(harness.logger.withMessage(DELTA_ROLLED_BACK_LOG), 'rollback record');
+    expect(rolledBack.fields).toMatchObject({
+      planVersion: previousVersion + 1,
+      previousPlanVersion: previousVersion,
+      trigger: 'plan-unrecorded',
+      attempted: 1,
+      restored: 1,
+      journal: 'listed',
+      arming: 'restored',
+      mirrored: true,
+    });
+
+    // Both clients hear that the announced record is reverted, and the stored record lists it so —
+    // written after the rollback, like the `failed` status that followed it.
+    await waitForRevertedMirror(session.editor, session.id, mark, undone.id);
+    await waitForRevertedMirror(session.devtools, session.id, devtoolsMark, undone.id);
+    expect(record.status).toBe(STATUS.failed);
+    expect(recordById(record.modifications, undone.id).status).toBe(MODIFICATION.reverted);
+    expect(record.followUps).toHaveLength(followUpsBefore + 1);
+    const followUp = last(record.followUps, 'follow-up');
+    expect(followUp.question).toBe(question);
+    expect(followUp.planVersion).toBeUndefined();
+
+    // Filed under the plan stage, saying what the project holds now — in the row's detail, under
+    // the public copy of the failure's code.
+    const failedRow = await waitFor(
+      session.editor,
+      'session.progress',
+      (message, index) =>
+        index >= mark &&
+        message.payload.sessionId === session.id &&
+        message.payload.stage === PLAN_STAGE &&
+        message.payload.status === PROGRESS_FAILED,
+    );
+    expect(failedRow.payload.message).toBe(publicFailureCopy(PLAN_STAGE, 'STORE_ERROR').message);
+    expect(failedRow.payload.detail).toContain(
+      `so the project holds exactly what plan version ${String(previousVersion)} installed`,
+    );
+  });
+
   it('layers the next plan version over an already instrumented file as a verified `previousRecordId` chain', async () => {
     const question = 'How long does folding the reports into a summary take?';
     const plansBefore = plansOf(session.id);
@@ -1403,6 +1948,19 @@ describe('an edit made between two installs of one file', () => {
   /** The bytes the developer saved over the instrumented file. */
   let developerBytes: Buffer;
 
+  /** The follow-up attempt that failed and was retried in place, once it has been. */
+  let retriedAttempt: { readonly attemptId: string; readonly question: string } | undefined;
+
+  /** The attempt {@link retriedAttempt} named, or a failure naming the test that should have set it. */
+  function requireRetriedAttempt(): { readonly attemptId: string; readonly question: string } {
+    if (retriedAttempt === undefined) {
+      throw new Error(
+        'The retried follow-up attempt was not recorded by the test before this one.',
+      );
+    }
+    return retriedAttempt;
+  }
+
   beforeAll(async () => {
     const project = await harness.copyFixtureProject();
     session = await openReadySession(
@@ -1441,6 +1999,198 @@ describe('an edit made between two installs of one file', () => {
     expect(await digestOf(session.project, CORPUS.serviceFile)).toBe(firstRecord.instrumentedHash);
 
     await captureAndGenerate(session, reidentifyBatch(readTelemetryBatch(CROSS_TIER_BATCH), 3));
+  });
+
+  it('retries a failed follow-up in place by its attempt id: one ladder entry, one stored row, answered once recorded under the same `askedAt`', async () => {
+    const attemptId = newId(FOLLOW_UP_ATTEMPT_ID_PREFIX);
+    const question = 'Does the conditions board wait for every trail report before it renders?';
+    const before = storedSession(session.id);
+    expect(before.status).toBe(STATUS.generated);
+    const rowsBefore = followUpRowsOf(session.id);
+    const analysesBefore = analysesOf(session.id);
+    const panelsBefore = panelsOf(session.id);
+    const plansBefore = plansOf(session.id);
+    const recordsBefore = await modificationsOf(session.id);
+    const treeBefore = await snapshotTree(session.project.root);
+    const completedBefore = completedOperations(session.id);
+    const recordedLogsBefore = harness.logger.withMessage(RECORDED_FOLLOW_UP_LOG).length;
+
+    // From the first ask until the retry is recorded, every read of the service
+    // clock answers one millisecond: both asks of the attempt carry the same
+    // `askedAt`, and the retry keeps the ladder's length, so only the attempt's
+    // identity can tell the route that the retry was recorded.
+    let first: FollowUpRecord;
+    let retriedMark: number;
+    let release: (() => void) | undefined;
+    freezeServiceClock();
+    try {
+      // Attempt 1 is recorded, then its decision call fails at the transport.
+      const failedAsk = await askFollowUp(session, question, decisionUnavailable(), attemptId);
+      const failed = await waitForStored(
+        session.id,
+        (record) => record.status === STATUS.failed,
+        'the follow-up decision failed and the session is filed as failed',
+      );
+      const failedRow = await waitFor(
+        session.editor,
+        'session.progress',
+        (message, index) =>
+          index >= failedAsk.mark &&
+          message.payload.sessionId === session.id &&
+          message.payload.stage === FOLLOW_UP_STAGE &&
+          message.payload.status === PROGRESS_FAILED,
+      );
+      expect(failedRow.payload.message.length).toBeGreaterThan(0);
+      // The route answered with the recorded attempt, or — when the failure
+      // settled first — with that failure itself.
+      if (isErr(failedAsk.answered)) {
+        expect(failedAsk.answered.error.code).toBe('MODEL_UNAVAILABLE');
+      } else {
+        expect(attemptOf(failedAsk.answered.value.followUps, attemptId).attempt).toBe(1);
+      }
+      first = attemptOf(failed.followUps, attemptId);
+      expect(first).toMatchObject({ question, attemptId, attempt: 1 });
+      expect(isFollowUpAnswered(first)).toBe(false);
+      expect(failed.followUps).toEqual([...before.followUps, first]);
+      expect(followUpRowsOf(session.id)).toEqual([...rowsBefore, first]);
+
+      // The retry: the same attempt id, with its decision held so the follow-up
+      // cannot settle before the route answers.
+      release = holdNextDecision();
+      const retried = await askFollowUp(
+        session,
+        question,
+        { needsNewCapture: false, additionalActions: [] },
+        attemptId,
+      );
+      retriedMark = retried.mark;
+      const recorded = unwrap(retried.answered, 'session.question (retry)');
+      const second = attemptOf(recorded.followUps, attemptId);
+      expect(second).toEqual({ question, askedAt: first.askedAt, attemptId, attempt: 2 });
+      expect(recorded.followUps).toEqual([...before.followUps, second]);
+      // One row for the attempt, rewritten in place — never a second one.
+      expect(followUpRowsOf(session.id)).toEqual([...rowsBefore, second]);
+      const recordedLogs = harness.logger.withMessage(RECORDED_FOLLOW_UP_LOG);
+      expect(recordedLogs.length).toBeGreaterThan(recordedLogsBefore);
+      expect(last(recordedLogs, 'recorded follow-up log').fields).toMatchObject({ retried: true });
+    } finally {
+      thawServiceClock();
+      release?.();
+    }
+
+    // Released, the retried attempt answers from the stored evidence:
+    // `failed → analyzing → generated`, rung n + 1 of the analysis and panel ladders.
+    const done = await waitForStored(
+      session.id,
+      (record) =>
+        record.status === STATUS.generated &&
+        record.analyses.length === analysesBefore.length + 1 &&
+        record.panelIds.length === panelsBefore.length + 1 &&
+        isFollowUpAnswered(attemptOf(record.followUps, attemptId)),
+      'the retried follow-up regenerated the analysis and the panel',
+    );
+    await waitForPushedStatus(
+      session,
+      retriedMark,
+      STATUS.generated,
+      (record) => record.panelIds.length === panelsBefore.length + 1,
+    );
+    expect(statusWalk(session.editor, session.id, retriedMark, STATUS.failed)).toEqual([
+      STATUS.failed,
+      STATUS.analyzing,
+      STATUS.generated,
+    ]);
+    await waitForCompletedOperation(session.id, completedBefore);
+
+    // Still one entry for the attempt, now carrying the outcome it produced.
+    const answered = attemptOf(done.followUps, attemptId);
+    expect(done.followUps).toHaveLength(before.followUps.length + 1);
+    expect(done.followUps.slice(0, -1)).toEqual(before.followUps);
+    expect(answered).toMatchObject({
+      question,
+      askedAt: first.askedAt,
+      attemptId,
+      attempt: 2,
+      needsNewCapture: false,
+      analysisId: last(done.analyses, 'analysis').id,
+      panelId: last(done.panelIds, 'panel id'),
+    });
+    expect(followUpRowsOf(session.id)).toHaveLength(rowsBefore.length + 1);
+    expect(attemptOf(followUpRowsOf(session.id), attemptId).attempt).toBe(2);
+
+    // Nothing was installed or captured, and no byte of the project moved.
+    expect(plansOf(session.id)).toEqual(plansBefore);
+    expect(await modificationsOf(session.id)).toEqual(recordsBefore);
+    await assertTreeUnchanged(session.project.root, treeBefore);
+    retriedAttempt = Object.freeze({ attemptId, question });
+  });
+
+  it('refuses to ask an answered attempt again, before any model call or write', async () => {
+    const { attemptId, question } = requireRetriedAttempt();
+    const before = storedSession(session.id);
+    const rowsBefore = followUpRowsOf(session.id);
+    const decisionCalls = scripted.calls.filter((call) => call.stage === FOLLOW_UP_STAGE).length;
+
+    const refused = await sendFollowUp(session, question, attemptId);
+    if (!isErr(refused.answered)) {
+      throw new Error('Asking an answered follow-up attempt again was accepted.');
+    }
+    expect(refused.answered.error.code).toBe('SESSION_INVALID_STATE');
+    expect(refused.answered.error.message).toMatch(/already answered/u);
+
+    // The idempotent duplicate ran nothing: no model call, no follow-up entry
+    // or row, no status change.
+    expect(scripted.calls.filter((call) => call.stage === FOLLOW_UP_STAGE)).toHaveLength(
+      decisionCalls,
+    );
+    expect(storedSession(session.id)).toEqual(before);
+    expect(followUpRowsOf(session.id)).toEqual(rowsBefore);
+  });
+
+  it('appends a question sent under a new attempt id as its own follow-up', async () => {
+    const retried = requireRetriedAttempt();
+    const attemptId = newId(FOLLOW_UP_ATTEMPT_ID_PREFIX);
+    expect(attemptId).not.toBe(retried.attemptId);
+    const question = 'Which of those trail reports took the longest to load?';
+    const before = storedSession(session.id);
+    const rowsBefore = followUpRowsOf(session.id);
+    const analysesBefore = analysesOf(session.id);
+    const completedBefore = completedOperations(session.id);
+
+    const asked = await askFollowUp(
+      session,
+      question,
+      { needsNewCapture: false, additionalActions: [] },
+      attemptId,
+    );
+    const recorded = unwrap(asked.answered, 'session.question (new attempt)');
+    expect(attemptOf(recorded.followUps, attemptId)).toMatchObject({
+      question,
+      attemptId,
+      attempt: 1,
+    });
+
+    const done = await waitForStored(
+      session.id,
+      (record) =>
+        record.status === STATUS.generated &&
+        record.analyses.length === analysesBefore.length + 1 &&
+        isFollowUpAnswered(attemptOf(record.followUps, attemptId)),
+      'the new follow-up regenerated the analysis',
+    );
+    await waitForCompletedOperation(session.id, completedBefore);
+
+    // Appended after the retried attempt, which it left exactly as it was.
+    expect(done.followUps).toHaveLength(before.followUps.length + 1);
+    expect(done.followUps.slice(0, -1)).toEqual(before.followUps);
+    expect(last(done.followUps, 'follow-up').attemptId).toBe(attemptId);
+    expect(attemptOf(done.followUps, retried.attemptId)).toEqual(
+      attemptOf(before.followUps, retried.attemptId),
+    );
+    const rows = followUpRowsOf(session.id);
+    expect(rows).toHaveLength(rowsBefore.length + 1);
+    expect(rows.slice(0, -1)).toEqual(rowsBefore);
+    expect(attemptOf(rows, attemptId).attempt).toBe(1);
   });
 
   it('turns the edit into a conflict and refuses to layer the second install over it', async () => {

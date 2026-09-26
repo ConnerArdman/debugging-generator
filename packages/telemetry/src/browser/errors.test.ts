@@ -290,8 +290,8 @@ function expectWellFormedErrorEvent(draft: EventDraft): void {
   expect(draft.startTime).toBeGreaterThan(Date.now() - CLOCK_WINDOW_MS);
   expect(draft.startTime).toBeLessThan(Date.now() + CLOCK_WINDOW_MS);
   expect(draft.attributes['errorType']).toBeTypeOf('string');
-  // Every event crosses `window.postMessage` and is then validated by the
-  // service's strict ingress schema, which admits no function and no symbol.
+  // Every event crosses the page channel as JSON text and is then validated by
+  // the service's strict ingress schema, which admits no function and no symbol.
   const roundTripped: unknown = JSON.parse(draftText(draft));
   expect(roundTripped).toStrictEqual(draft);
 }
@@ -1106,8 +1106,8 @@ describe('bounds', () => {
     expect(bounded).toHaveLength(MAX_MESSAGE_CHARS - 1);
     expect(bounded.endsWith('m')).toBe(true);
     // A lone half is a well-formed JavaScript string and an ill-formed one to
-    // send: it survives `postMessage` and becomes a replacement character
-    // somewhere downstream.
+    // send: it survives the page channel's JSON text and becomes a replacement
+    // character somewhere downstream.
     const lastUnit = bounded.charCodeAt(bounded.length - 1);
     expect(lastUnit >= 0xd800 && lastUnit <= 0xdbff).toBe(false);
     expect(bounded).not.toContain('\ud83d');

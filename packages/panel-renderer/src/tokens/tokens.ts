@@ -68,10 +68,24 @@
  * ## Sizes
  *
  * Every visual dimension a stylesheet renders is a token too — the spacing
- * scale, the radii, and the glyph, spinner and icon-only control sizes. The
- * last three are font-relative (`1em`-based), and the token test forbids a
- * length literal anywhere in the authored stylesheets, so a glyph box can no
- * more be written inline than a colour can.
+ * scale, the radii, the two border widths, the glyph, spinner and icon-only
+ * control sizes, the one-line block size, the unit a measured coordinate is
+ * given, and the column geometry of every data table. The glyph, line and
+ * column sizes are font-relative (`em`, `lh` and `ch`), and the token test
+ * forbids a length literal and a border-width keyword anywhere in the authored
+ * stylesheets, so a glyph box, a hairline or a table track can no more be
+ * written inline than a colour can.
+ *
+ * ## Table columns
+ *
+ * A data table's columns are sized by ROLE, never by a number a component
+ * picks: `src/primitives/DataTable.tsx` maps each semantic column role
+ * (ordinal, count, quantity, status, label, name, text, standard) to a grid
+ * track built from one `columnMin*` token — the readable minimum of that kind
+ * of content, in `ch` of the table's own type — and one `columnShare*` token —
+ * the share of spare width it takes. Both extension surfaces and every
+ * visualization table therefore agree on how wide a duration or a path column
+ * is, and one edit here re-densifies all of them at once.
  */
 
 /**
@@ -93,6 +107,20 @@ const darkTokens = {
   borderSubtle: '#262c3a',
   /** Emphasised separation, such as a table header rule. */
   borderStrong: '#3a4356',
+
+  // --- Border widths --------------------------------------------------------
+  // The two stroke weights every edge is drawn in. They are the CSS width
+  // keywords the browser resolves device-crisply (a hairline stays one device
+  // pixel wide at any zoom), stated here so a stylesheet names the ROLE of an
+  // edge rather than its weight. Theme-invariant: the high-contrast theme
+  // raises border colours, never border widths.
+  /** Dividers, table rules, control and card outlines. */
+  borderWidthHairline: 'thin',
+  /**
+   * The emphasis edge: the inline-start marker of an active or selected row,
+   * the accent edge of a callout, and the ring of the progress spinner.
+   */
+  borderWidthMarker: 'medium',
 
   // --- Text -----------------------------------------------------------------
   /** Body and heading text. */
@@ -251,12 +279,78 @@ const darkTokens = {
   spinnerSize: 'var(--dg-icon-size)',
   /**
    * The inline size of an icon-only button: its glyph, the icon-only inline
-   * padding on either side (`space1`) and its two `thin` hairline borders,
-   * which together add the scale's smallest step (`space0`). This is the box
-   * `.dg-button--icon-only` renders, stated once so an element that reserves
-   * that control's room tracks it through any token change.
+   * padding on either side (`space1`) and its two `borderWidthHairline`
+   * borders, which together add the scale's smallest step (`space0`). This is
+   * the box `.dg-button--icon-only` renders, stated once so an element that
+   * reserves that control's room tracks it through any token change.
    */
   iconButtonSize: 'calc(var(--dg-icon-size) + var(--dg-space-1) * 2 + var(--dg-space-0))',
+  /**
+   * The block size of one line of text in the consuming element's own type
+   * role — the floor of a row that must stay one line tall even when it is
+   * empty, such as a blank line of a diff. Font-relative like the glyph sizes
+   * above: `1lh` resolves against the element that consumes the token.
+   */
+  lineBlockSize: '1lh',
+
+  // --- Measured geometry ----------------------------------------------------
+  /**
+   * One CSS pixel: the unit a component's MEASURED geometry is given. A
+   * virtualizer offset, a canvas height and a tooltip coordinate are numbers
+   * the DOM reports in CSS pixels; a component hands them to the stylesheet
+   * UNITLESS through a `--dgc-*` property, and the stylesheet multiplies them
+   * by this token (`calc(var(--dgc-…, 0) * var(--dg-pixel-unit))`). It encodes
+   * no design decision — the number is the value — which is why the token test
+   * pins it to exactly `1px`: any other value would misplace every measured
+   * element by the same factor.
+   */
+  pixelUnit: '1px',
+
+  // --- Table columns: readable minimums -------------------------------------
+  // The floor of each semantic column role, in `ch` of the table's own type,
+  // sized for the role's widest ordinary content plus the cell's inline
+  // padding. A table sums its columns' floors into its own minimum width, so a
+  // surface narrower than that sum scrolls horizontally with every column
+  // still readable instead of painting one cell over the next.
+  /** A short position number: an event sequence number, a plan version. */
+  columnMinOrdinal: '8ch',
+  /**
+   * An integer tally, with room for a compact badge beside it and for its
+   * column header — a one-word label such as "Occurrences" with its sort
+   * indicator — so a table held at its floor never clips a heading.
+   */
+  columnMinCount: '12ch',
+  /** A formatted measurement with its unit: a duration, a time, a byte size. */
+  columnMinQuantity: '14ch',
+  /**
+   * A short status word or badge, a tier, or one compact action control, with
+   * the badge's own inline padding.
+   */
+  columnMinStatus: '13ch',
+  /**
+   * A short categorical label: a kind chip, a key, a system name, or a
+   * two-word status chip such as "Transitions dropped".
+   */
+  columnMinLabel: '20ch',
+  /** An identifier: a component, operation or file name, a source chip. */
+  columnMinName: '24ch',
+  /** Long free text that truncates: a statement, a URL, a value preview. */
+  columnMinText: '32ch',
+  /** A column declared with no role: room for a short label or a figure. */
+  columnMinStandard: '10ch',
+
+  // --- Table columns: spare-width shares ------------------------------------
+  // How the width left over after every floor is shared out. Figures take a
+  // little, labels an equal part, names and free text the most, so a wide
+  // panel spends its room where content is longest.
+  /** Counts, quantities and statuses. */
+  columnShareCompact: '0.6fr',
+  /** Labels, unsized columns, and a single track that fills its grid. */
+  columnShareDefault: '1fr',
+  /** Names. */
+  columnShareWide: '2fr',
+  /** Free text. */
+  columnShareWidest: '3fr',
 
   // --- Elevation ------------------------------------------------------------
   shadow0: 'none',
@@ -308,10 +402,11 @@ export type TokenValues = Readonly<Record<TokenKey, string>>;
 
 /**
  * The light value set — a complete second palette, emitted under
- * `[data-theme="light"]`. Theme-invariant families (spacing, font stacks, type
- * roles, radii, duration aliases and stacking levels) repeat the dark values
- * verbatim, which is what lets the generator emit three self-contained blocks
- * and lets the token test assert those families are identical.
+ * `[data-theme="light"]`. Theme-invariant families (border widths, spacing,
+ * font stacks, type roles, radii, glyph and line sizes, measured geometry,
+ * table column geometry, duration aliases and stacking levels) repeat the dark
+ * values verbatim, which is what lets the generator emit three self-contained
+ * blocks and lets the token test assert those families are identical.
  */
 const lightTokens: TokenValues = {
   // --- Surfaces -------------------------------------------------------------
@@ -322,6 +417,10 @@ const lightTokens: TokenValues = {
   // --- Borders --------------------------------------------------------------
   borderSubtle: '#d9dee7',
   borderStrong: '#b6bfcc',
+
+  // --- Border widths --------------------------------------------------------
+  borderWidthHairline: 'thin',
+  borderWidthMarker: 'medium',
 
   // --- Text -----------------------------------------------------------------
   textPrimary: '#16191f',
@@ -407,6 +506,26 @@ const lightTokens: TokenValues = {
   iconSize: '1em',
   spinnerSize: 'var(--dg-icon-size)',
   iconButtonSize: 'calc(var(--dg-icon-size) + var(--dg-space-1) * 2 + var(--dg-space-0))',
+  lineBlockSize: '1lh',
+
+  // --- Measured geometry ----------------------------------------------------
+  pixelUnit: '1px',
+
+  // --- Table columns: readable minimums -------------------------------------
+  columnMinOrdinal: '8ch',
+  columnMinCount: '12ch',
+  columnMinQuantity: '14ch',
+  columnMinStatus: '13ch',
+  columnMinLabel: '20ch',
+  columnMinName: '24ch',
+  columnMinText: '32ch',
+  columnMinStandard: '10ch',
+
+  // --- Table columns: spare-width shares ------------------------------------
+  columnShareCompact: '0.6fr',
+  columnShareDefault: '1fr',
+  columnShareWide: '2fr',
+  columnShareWidest: '3fr',
 
   // --- Elevation ------------------------------------------------------------
   // Same geometry as dark, tinted for a light background.
@@ -450,6 +569,11 @@ const highContrastTokens: TokenValues = {
   // --- Borders (delta 1: raised to the primary text colour) -----------------
   borderSubtle: '#e6e9f0',
   borderStrong: '#e6e9f0',
+
+  // --- Border widths (as dark) ----------------------------------------------
+  // Delta 1 raises border COLOURS only; every edge keeps its dark weight.
+  borderWidthHairline: 'thin',
+  borderWidthMarker: 'medium',
 
   // --- Text (as dark) -------------------------------------------------------
   textPrimary: '#e6e9f0',
@@ -530,6 +654,26 @@ const highContrastTokens: TokenValues = {
   iconSize: '1em',
   spinnerSize: 'var(--dg-icon-size)',
   iconButtonSize: 'calc(var(--dg-icon-size) + var(--dg-space-1) * 2 + var(--dg-space-0))',
+  lineBlockSize: '1lh',
+
+  // --- Measured geometry (as dark) ------------------------------------------
+  pixelUnit: '1px',
+
+  // --- Table columns: readable minimums (as dark) ---------------------------
+  columnMinOrdinal: '8ch',
+  columnMinCount: '12ch',
+  columnMinQuantity: '14ch',
+  columnMinStatus: '13ch',
+  columnMinLabel: '20ch',
+  columnMinName: '24ch',
+  columnMinText: '32ch',
+  columnMinStandard: '10ch',
+
+  // --- Table columns: spare-width shares (as dark) --------------------------
+  columnShareCompact: '0.6fr',
+  columnShareDefault: '1fr',
+  columnShareWide: '2fr',
+  columnShareWidest: '3fr',
 
   // --- Elevation (delta 3: no elevation shadows) ----------------------------
   shadow0: 'none',

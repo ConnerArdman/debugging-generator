@@ -4,16 +4,18 @@
  *
  * ## What this module owns
  *
- * Seven tables of `./schema.sql` name this file as their owner, and no other
- * module writes them:
+ * Eight tables name this file as their owner — seven declared by
+ * `./schema.sql` and one added by schema version 4 in `./migrations.ts` — and no
+ * other module writes them:
  *
  * | Table | What a row is |
  * | --- | --- |
  * | `sessions` | one session: the authoritative `SessionRecord` JSON document plus its indexed projections |
+ * | `session_cleanup_summaries` | one session's cleanup status, completion time and conflict count: the list row's projection of `record.cleanup` |
  * | `session_progress` | one line of the append-only pipeline progress log the editor replays on reopen |
  * | `plans` | one version of the session's instrumentation plan ladder |
  * | `captures` | one capture window, open while `stopped_at` is `NULL` |
- * | `followups` | one follow-up question, in the order it was asked |
+ * | `followups` | one follow-up attempt — rewritten in place when it is retried — in the order it was first asked |
  * | `bindings` | which inspected browser tab belongs to which session |
  * | `session_keys` | the per-session keyed-hash secret behind duplicate-request grouping |
  *
@@ -22,6 +24,14 @@
  * journal to `./modifications-repo.ts`, panels and analyses to
  * `./panels-repo.ts`, and the credential and pairing-code tables to
  * `src/server/auth.ts` through the store handle.
+ *
+ * One read crosses that line, and only from the capture side:
+ * {@link SessionsRepo.getPanelCapture} joins a `panels` row to the `captures`
+ * row its `capture_id` names, because a rendered panel's data must be resolved
+ * from the capture it was generated from and `PanelSpec` does not carry that
+ * id. It selects the one `capture_id` column of `panels` and never writes the
+ * table; the panel document and every other panel column stay
+ * `./panels-repo.ts`'s.
  *
  * ## The JSON document is the contract
  *
@@ -33,16 +43,21 @@
  * `updated_at`) are **projections**: they are computed from the validated record
  * on every write — never accepted separately — so a projection cannot disagree
  * with the document it was derived from, and they exist only so that the
- * session list and the retention sweep can filter and sort without parsing JSON.
+ * session list, the retention sweep and the binding route's dev-server lookup
+ * ({@link SessionsRepo.findLatestByDevServer}) can filter and sort without
+ * parsing JSON.
  * The same pattern holds for `followups` (`question`, `asked_at` projected from
- * the `FollowUpRecord` document).
+ * the `FollowUpRecord` document) and for `session_cleanup_summaries`, whose row
+ * is upserted from the validated record inside the transaction of every write
+ * of `sessions.record`, so the session list reads a row's cleanup summary
+ * without SQLite ever reading the document.
  *
  * Every read path maps a row through one helper per table, and every value that
  * leaves this module has been validated by the upstream schema that owns its
  * shape: `parseSessionRecord`, `parseInstrumentationPlan`, and the protocol's
- * capture, follow-up and bound-tab schemas. No shape is re-declared here; the
- * types this module exports are repository-local projections and option
- * objects that *embed* the upstream types.
+ * capture, follow-up, bound-tab and session-list-row schemas. No shape is
+ * re-declared here; the types this module exports are repository-local
+ * projections and option objects that *embed* the upstream types.
  *
  * ## Results, not exceptions
  *
@@ -55,8 +70,9 @@
  * carry the request-key secret into its JSON column, which no caller can
  * recover from and every caller must be stopped by.
  *
- * Absence is not a failure. `get`, `getPlan`, `getCapture`, `getActiveCapture`
- * and the two binding lookups answer `ok(undefined)` for "no such row".
+ * Absence is not a failure. `get`, `getPlan`, `getCapture`, `getActiveCapture`,
+ * `getLatestCapture` and the two binding lookups answer `ok(undefined)` for "no
+ * such row", and `getPanelCapture` answers `{ panel: 'unknown' }`.
  *
  * ## Transactions and composition
  *
@@ -67,7 +83,30 @@
  * either all of it commits or none of it does. Inside a transaction every
  * refusal is decided *before* the first write, so returning an `err` never
  * commits half an operation; a write that fails throws inside the callback,
- * which rolls it back.
+ * which rolls it back. The one method whose refusal can come *after* a write —
+ * {@link SessionsRepo.insertPlanWithRecord}, a plan row and the session record
+ * mirroring it — turns every later refusal into such a throw, so the pair is
+ * stored whole or not at all.
+ *
+ * `Store.transaction` commits whatever its callback *returns*, an `err`
+ * included, so a caller composing several of these methods cannot roll back
+ * the writes of the ones that succeeded by returning the refusal of the one
+ * that did not. {@link SessionsRepo.transaction} is the composition point for
+ * that: it runs a `Result`-returning body inside `Store.transaction`, turns a
+ * returned `err` into a module-private throw so the outermost transaction (or
+ * the savepoint, when already nested) rolls back **every** write the body's
+ * nested repository calls made, and hands the body's `err` back unchanged.
+ * The session manager uses it wherever a capture window and the session
+ * status must change together — opening a window with the move to
+ * `capturing`, closing one with the move out of it — so a failed second write
+ * can never leave the first one standing.
+ *
+ * Project-wide capture exclusivity stays the session manager's decision, made
+ * against its in-memory owner index. {@link SessionsRepo.startCapture} adds an
+ * opt-in store-side check of the same rule (`StartCaptureInput.projectRoot`),
+ * made in the transaction that inserts the window, and
+ * {@link SessionsRepo.listOpenCaptureWindows} is the single indexed statement
+ * the owner index is rebuilt from.
  *
  * ## Privacy
  *
@@ -104,16 +143,20 @@ import {
   boundTabSchema,
   captureRecordSchema,
   followUpRecordSchema,
+  isCleanupStatus,
   isSessionStatus,
   parseSessionRecord,
   protocolParseError,
+  sessionListItemSchema,
   touchSessionRecord,
 } from '@debuggen/protocol';
 import type {
   BoundTab,
   CaptureRecord,
+  CleanupStatus,
   FollowUpRecord,
   ProgressStatus,
+  SessionListItem as SessionSummary,
   SessionRecord,
   SessionStatus,
 } from '@debuggen/protocol';
@@ -123,10 +166,12 @@ import {
   isErr,
   newCaptureId,
   noopLogger,
+  normalizePosix,
   nowEpochMs,
   ok,
+  toPosix,
 } from '@debuggen/shared';
-import type { CaptureId, Logger, Result, SessionId } from '@debuggen/shared';
+import type { CaptureId, Logger, PanelId, Result, SessionId } from '@debuggen/shared';
 
 import { LOG_BINDING_KEYS } from '../logging.js';
 import type { Store } from './db.js';
@@ -166,6 +211,17 @@ export const DEFAULT_SESSION_LIST_LIMIT = 50;
  * columns only, so a thousand rows is a cheap page.
  */
 export const MAX_SESSION_LIST_LIMIT = 1000;
+
+/**
+ * How many candidate rows {@link SessionsRepo.findLatestByDevServer} reads per
+ * page when the caller names no `batchSize`.
+ *
+ * The lookup stops at the first match, and the candidates are only the
+ * sessions in the caller's statuses — in practice the handful that are still
+ * running — so one page almost always answers it; the bound is what keeps a
+ * store with an unusual number of open sessions from being read in one go.
+ */
+export const DEV_SERVER_LOOKUP_BATCH_SIZE = 100;
 
 /**
  * How many random bytes a per-session request-key secret carries: 32, rendered
@@ -286,8 +342,29 @@ const REWRITE_SESSION_SQL = `UPDATE sessions SET
   record = ?
 WHERE id = ?`;
 
+/**
+ * Writes a session's cleanup summary — the row the session list reads the
+ * cleanup status, completion time and conflict count from — replacing the one
+ * it had. Run by every write path, inside the transaction that writes
+ * `sessions.record`, right after that write, so the summary and the document
+ * commit together or not at all and can never disagree.
+ */
+const UPSERT_CLEANUP_SUMMARY_SQL = `INSERT INTO session_cleanup_summaries (session_id, status, completed_at, conflict_count)
+VALUES (?, ?, ?, ?)
+ON CONFLICT (session_id) DO UPDATE SET
+  status = excluded.status,
+  completed_at = excluded.completed_at,
+  conflict_count = excluded.conflict_count`;
+
 /** Reads one session's document. */
 const SELECT_SESSION_SQL = 'SELECT id, record FROM sessions WHERE id = ?';
+
+/**
+ * Reads what the per-session access rule decides on — the id and the project
+ * root — by primary key. Both columns are declared before `record`, so the
+ * document is never read.
+ */
+const SELECT_SESSION_ACCESS_TARGET_SQL = 'SELECT id, project_root FROM sessions WHERE id = ?';
 
 /** Reads the two stamps the upsert path reconciles against. */
 const SELECT_SESSION_STAMPS_SQL = 'SELECT created_at, updated_at FROM sessions WHERE id = ?';
@@ -324,6 +401,147 @@ const UPDATED_BEFORE_TERM = 'updated_at < ?';
  */
 const SESSION_LIST_ORDER = 'ORDER BY updated_at DESC, id DESC';
 
+/**
+ * The dev-server lookup's projection: the key, the URL and the stamp the page
+ * cursor continues from — never the `record` document, so no candidate's JSON
+ * is read, let alone parsed.
+ */
+const DEV_SERVER_LOOKUP_COLUMNS = 'id, dev_server_url, updated_at';
+
+/**
+ * The table and index the dev-server lookup reads.
+ *
+ * `INDEXED BY` rather than trusting the planner, because the candidates are
+ * the few sessions still running while the table is dominated by ended ones,
+ * and a planner cannot see that from a bound `status IN (…)`: with statistics
+ * gathered (`ANALYZE`, which the store itself never runs but a developer may)
+ * it rates the whole-table walk cheaper and reads every ended session. Named
+ * this way, the lookup is served by `idx_sessions_status` or refused outright
+ * — a dropped or renamed index becomes a loud `STORE_ERROR`, never a silent
+ * scan of the whole history.
+ */
+const DEV_SERVER_LOOKUP_SOURCE = 'sessions INDEXED BY idx_sessions_status';
+
+/**
+ * The dev-server lookup's candidates: sessions in the given statuses that
+ * recorded a dev-server URL.
+ */
+const DEV_SERVER_CANDIDATE_TERMS = `${STATUS_TERM} AND dev_server_url IS NOT NULL`;
+
+/** The dev-server lookup's order: the session list's, newest first with the id breaking ties. */
+const DEV_SERVER_LOOKUP_ORDER = SESSION_LIST_ORDER;
+
+/**
+ * The keyset cursor of the next page: strictly after the last row read in
+ * {@link DEV_SERVER_LOOKUP_ORDER}, so consecutive pages neither repeat nor
+ * skip a candidate and no page re-reads the ones before it (as an `OFFSET`
+ * would).
+ */
+const DEV_SERVER_LOOKUP_AFTER_TERM = '(updated_at < ? OR (updated_at = ? AND id < ?))';
+
+/** The first page of the dev-server lookup. */
+const DEV_SERVER_LOOKUP_FIRST_SQL = `SELECT ${DEV_SERVER_LOOKUP_COLUMNS} FROM ${DEV_SERVER_LOOKUP_SOURCE}
+WHERE ${DEV_SERVER_CANDIDATE_TERMS}
+${DEV_SERVER_LOOKUP_ORDER} LIMIT ?`;
+
+/** Every later page of the dev-server lookup, after the cursor. */
+const DEV_SERVER_LOOKUP_NEXT_SQL = `SELECT ${DEV_SERVER_LOOKUP_COLUMNS} FROM ${DEV_SERVER_LOOKUP_SOURCE}
+WHERE ${DEV_SERVER_CANDIDATE_TERMS} AND ${DEV_SERVER_LOOKUP_AFTER_TERM}
+${DEV_SERVER_LOOKUP_ORDER} LIMIT ?`;
+
+/**
+ * The columns {@link SessionsRepo.listWithinFolders} reads: the list
+ * projections of `sessions` plus the three cleanup facts a session list row
+ * summarises, read from the session's `session_cleanup_summaries` row.
+ *
+ * Qualified and aliased because both tables declare a `status` column. Every
+ * `sessions` column named here is declared before `record`, and the cleanup
+ * facts come from the side table, so the statement never names — and SQLite
+ * never reads — the stored document, however large it has grown (see the
+ * version 4 step of `./migrations.ts` for why the facts live in a side table
+ * rather than in columns appended to `sessions`).
+ */
+const SESSION_SUMMARY_COLUMNS = `sessions.id AS id,
+  sessions.project_root AS project_root,
+  sessions.project_name AS project_name,
+  sessions.status AS status,
+  sessions.question AS question,
+  sessions.created_at AS created_at,
+  sessions.updated_at AS updated_at,
+  summary.status AS cleanup_status,
+  summary.completed_at AS cleanup_completed_at,
+  summary.conflict_count AS cleanup_conflict_count`;
+
+/**
+ * What {@link SESSION_SUMMARY_COLUMNS} are read from: each session with its
+ * cleanup summary, looked up by the summary table's primary key. A `LEFT JOIN`,
+ * so a session that has no summary row — its document yielded none when schema
+ * version 4 backfilled the table — still reaches the page with `NULL` cleanup
+ * facts, fails `sessionListItemSchema`, and is reported as unreadable rather
+ * than silently shortening the page.
+ */
+const SESSION_SUMMARY_SOURCE =
+  'sessions LEFT JOIN session_cleanup_summaries AS summary ON summary.session_id = sessions.id';
+
+/**
+ * One workspace folder's share of the session-list scope: the folder itself,
+ * or anything strictly beneath `folder + '/'`.
+ *
+ * Bound as `(folder, folder + '/', folder + '0')`. `'0'` is the character
+ * after `'/'`, so under SQLite's byte-wise `BINARY` collation the open range
+ * `(folder/, folder0)` holds exactly the texts that start with `folder/` and
+ * continue past it — the containment `isWithin` from `@debuggen/shared`
+ * decides, with a sibling that merely shares a prefix (`/w/ab`, `/w/a-b` for
+ * `/w/a`) outside it. Both halves are ranges over `project_root`, so
+ * `idx_sessions_project_root` serves each one (a multi-index `OR`).
+ */
+const FOLDER_SCOPE_TERM = '(project_root = ? OR (project_root > ? AND project_root < ?))';
+
+/**
+ * The most workspace folders one scoped list binds, after nested and repeated
+ * folders are folded away. Three parameters each, so the widest statement binds
+ * 768 values, far below SQLite's variable limit; an editor announces one folder
+ * per open connection, so real scopes hold a handful.
+ */
+const MAX_SCOPE_FOLDERS = 256;
+
+/**
+ * The columns {@link SessionsRepo.listRetentionCandidates} reads: exactly what
+ * the retention sweep decides with, never the question or the document, plus
+ * the row's `rowid` as its keyset position.
+ */
+const RETENTION_CANDIDATE_COLUMNS = 'rowid AS position, id, status, updated_at';
+
+/**
+ * The first page of retention candidates: the sessions last updated strictly
+ * before a cutoff, oldest first, the `rowid` breaking a tie.
+ *
+ * The tie-break is the `rowid` rather than the id because every SQLite index
+ * of a rowid table carries the `rowid` as its implicit last column: the
+ * single-column `idx_sessions_updated_at` is already ordered by
+ * `(updated_at, rowid)`, so this order — and the keyset seek of the next
+ * statement — is an index range read with no sort, however many sessions
+ * share one `updated_at`. Ordering by `(updated_at, id)` would sort every
+ * session of a tie group before the first row of a page could be returned.
+ * No `COUNT(*)` and no offset either, so a page costs the same however deep
+ * into the backlog it is.
+ */
+export const SELECT_RETENTION_CANDIDATES_SQL = `SELECT ${RETENTION_CANDIDATE_COLUMNS} FROM sessions
+WHERE updated_at < ?
+ORDER BY updated_at ASC, rowid ASC
+LIMIT ?`;
+
+/**
+ * Every later page: the same filter and order, strictly after the last
+ * `(updated_at, rowid)` the previous page ended on — a seek into the same
+ * index. A keyset rather than an offset, so rows deleted — or retained —
+ * behind the cursor can neither shift the next page nor be read twice.
+ */
+export const SELECT_RETENTION_CANDIDATES_AFTER_SQL = `SELECT ${RETENTION_CANDIDATE_COLUMNS} FROM sessions
+WHERE updated_at < ? AND (updated_at, rowid) > (?, ?)
+ORDER BY updated_at ASC, rowid ASC
+LIMIT ?`;
+
 /** Appends one progress line; `detail` is JSON text or `NULL`. */
 const INSERT_PROGRESS_SQL = `INSERT INTO session_progress (session_id, stage, status, message, detail, ts)
 VALUES (?, ?, ?, ?, ?, ?)`;
@@ -337,6 +555,21 @@ FROM session_progress
 WHERE session_id = ? AND id > ?
 ORDER BY id ASC
 LIMIT ?`;
+
+/**
+ * Reads a session's **most recent** progress lines, newest first: a backward
+ * walk of `idx_session_progress_session_id_id` that stops after `LIMIT` rows,
+ * so a long history costs no more than the tail it keeps. The caller reverses
+ * the rows into append order.
+ */
+const SELECT_PROGRESS_TAIL_SQL = `SELECT id, session_id, stage, status, message, detail, ts
+FROM session_progress
+WHERE session_id = ?
+ORDER BY id DESC
+LIMIT ?`;
+
+/** How many progress lines a session has stored, counted on the same index. */
+const COUNT_PROGRESS_SQL = 'SELECT COUNT(*) AS total FROM session_progress WHERE session_id = ?';
 
 /** Stores one plan version; the composite primary key refuses a duplicate. */
 const INSERT_PLAN_SQL = `INSERT INTO plans (session_id, plan_version, plan, created_at)
@@ -355,8 +588,22 @@ ORDER BY plan_version ASC`;
 const SELECT_LATEST_PLAN_VERSION_SQL =
   'SELECT MAX(plan_version) AS latest FROM plans WHERE session_id = ?';
 
+/**
+ * The `captures` columns every capture read selects, in select order: exactly
+ * the columns {@link toStoredCapture} reads, named once so a joined read cannot
+ * select a different set.
+ */
+const CAPTURE_COLUMN_NAMES: readonly string[] = Object.freeze([
+  'id',
+  'session_id',
+  'plan_version',
+  'started_at',
+  'stopped_at',
+  'summary',
+]);
+
 /** The columns every capture read selects. */
-const CAPTURE_COLUMNS = 'id, session_id, plan_version, started_at, stopped_at, summary';
+const CAPTURE_COLUMNS = CAPTURE_COLUMN_NAMES.join(', ');
 
 /** Opens a capture window: no stop time and no summary until it closes. */
 const INSERT_CAPTURE_SQL = `INSERT INTO captures (id, session_id, plan_version, started_at, stopped_at, summary)
@@ -390,6 +637,77 @@ WHERE session_id = ?
 ORDER BY started_at ASC, rowid ASC`;
 
 /**
+ * A session's newest capture: the last element {@link SELECT_CAPTURES_SQL}
+ * would list, read as one row instead of the whole history.
+ *
+ * The ordering is that statement's reversed key for key, so the two agree on a
+ * same-millisecond tie (the later `rowid` is the newer capture). It is an
+ * ordered read of `idx_captures_session_id_started_at` taken backwards — the
+ * index carries the `rowid` after `started_at`, so no temporary B-tree sorts
+ * the session's captures — and it stops at the first entry. Every capture
+ * counts, open or stopped: while a capture runs, it is the newest one.
+ */
+const SELECT_LATEST_CAPTURE_SQL = `SELECT ${CAPTURE_COLUMNS} FROM captures
+WHERE session_id = ?
+ORDER BY started_at DESC, rowid DESC
+LIMIT 1`;
+
+/**
+ * The `captures` columns of {@link CAPTURE_COLUMNS}, qualified with the join
+ * alias `c` and aliased back to their own names, so a joined row maps through
+ * {@link toStoredCapture} exactly as a plain capture row does.
+ */
+const JOINED_CAPTURE_COLUMNS = CAPTURE_COLUMN_NAMES.map((name) => `c.${name} AS ${name}`).join(
+  ', ',
+);
+
+/**
+ * One panel of one session, with the capture it was generated from.
+ *
+ * The one read of the `panels` table in this module (see the overview), and it
+ * selects `capture_id` alone — written by `./panels-repo.ts` from
+ * `insertPanel(spec, { captureId })` and set to `NULL` by the schema when that
+ * capture is purged. Binds the panel id, then the session id: the session term
+ * is part of the match, so a panel of another session is no row at all rather
+ * than a row this module must refuse. Both sides are primary-key point reads
+ * (`panels.id`, `captures.id`), and the `LEFT JOIN` keeps a panel whose
+ * `capture_id` is `NULL`, reporting its capture columns as `NULL`.
+ */
+const SELECT_PANEL_CAPTURE_SQL = `SELECT p.capture_id AS panel_capture_id, ${JOINED_CAPTURE_COLUMNS}
+FROM panels p
+LEFT JOIN captures c ON c.id = p.capture_id
+WHERE p.id = ? AND p.session_id = ?`;
+
+/**
+ * The earliest open capture window another session of the same project holds:
+ * the store-side half of project-wide capture exclusivity, run only when
+ * {@link StartCaptureInput.projectRoot} opts in. `project_root` is served by
+ * `idx_sessions_project_root` and the open windows by the partial index
+ * `idx_captures_session_id_active`.
+ */
+const SELECT_PROJECT_ACTIVE_CAPTURE_SQL = `SELECT captures.id AS capture_id, captures.session_id AS session_id
+FROM captures JOIN sessions ON sessions.id = captures.session_id
+WHERE sessions.project_root = ? AND sessions.id <> ? AND captures.stopped_at IS NULL
+ORDER BY captures.started_at ASC, captures.rowid ASC
+LIMIT 1`;
+
+/**
+ * Every open capture window with its session's project root and status, in one
+ * statement: the rows the session manager rebuilds its capture-owner index
+ * from. The open rows come from the partial index
+ * `idx_captures_session_id_active` and each session through its primary key,
+ * so the cost follows the number of open windows — a handful — never the
+ * number of stored sessions. Oldest first, `rowid` breaking a tie, so the
+ * earliest-started window of a project is met first.
+ */
+const SELECT_OPEN_CAPTURE_WINDOWS_SQL = `SELECT captures.id AS capture_id, captures.session_id AS session_id,
+  captures.started_at AS started_at, sessions.project_root AS project_root,
+  sessions.status AS session_status
+FROM captures JOIN sessions ON sessions.id = captures.session_id
+WHERE captures.stopped_at IS NULL
+ORDER BY captures.started_at ASC, captures.rowid ASC`;
+
+/**
  * Closes a capture. The trailing `stopped_at IS NULL` is an optimistic guard:
  * a capture another writer already closed matches no row.
  */
@@ -404,6 +722,23 @@ VALUES (?, ?, ?, ?)`;
 const SELECT_FOLLOWUPS_SQL = `SELECT id, record FROM followups
 WHERE session_id = ?
 ORDER BY id ASC`;
+
+/**
+ * The rows of a session that record one follow-up attempt, found by the
+ * attempt id inside the authoritative document — no projection column exists
+ * for it, and none is needed: the `session_id` index bounds the scan to one
+ * session's follow-ups. More than one row is a broken store invariant.
+ */
+const SELECT_FOLLOWUP_IDS_BY_ATTEMPT_SQL = `SELECT id FROM followups
+WHERE session_id = ? AND json_extract(record, '$.attemptId') = ?
+ORDER BY id ASC`;
+
+/**
+ * Rewrites one follow-up row in place — the retry of an attempt — keeping its
+ * autoincrement id, and with it the position the question was first asked in.
+ */
+const UPDATE_FOLLOWUP_SQL = `UPDATE followups SET question = ?, asked_at = ?, record = ?
+WHERE id = ? AND session_id = ?`;
 
 /** The columns every binding read selects. */
 const BINDING_COLUMNS = 'tab_id, session_id, url, bound_at';
@@ -478,9 +813,10 @@ export interface SessionsRepoDeps {
  * One row of the session list: the indexed projections of a session, read
  * without parsing its document.
  *
- * Backs the editor's Sessions tree and `GET /sessions` paging, and is what the
- * retention sweep enumerates purge candidates with. Fetch the whole record with
- * {@link SessionsRepo.get} when more than this is needed.
+ * Backs the editor's Sessions tree and `GET /sessions` paging, and the retention
+ * sweep's scan for project roots active inside the window; its purge candidates
+ * come from {@link SessionsRepo.listRetentionCandidates} instead. Fetch the
+ * whole record with {@link SessionsRepo.get} when more than this is needed.
  */
 export interface SessionListItem {
   /** The session's id. */
@@ -499,6 +835,19 @@ export interface SessionListItem {
   readonly updatedAt: number;
 }
 
+/**
+ * What the per-session access rule needs to know about a session, as
+ * {@link SessionsRepo.getAccessTarget} reads it: which session it is and which
+ * project it belongs to — structurally the `SessionAccessTarget` that
+ * `requireSessionAccess` in `src/server/auth.ts` decides on.
+ */
+export interface StoredAccessTarget {
+  /** The session's id. */
+  readonly id: SessionId;
+  /** The absolute POSIX root of the project the session debugs. */
+  readonly projectRoot: string;
+}
+
 /** Narrowing and paging for {@link SessionsRepo.list}. All members optional. */
 export interface ListSessionsOptions {
   /** Keep only the sessions of this exact project root. */
@@ -513,7 +862,8 @@ export interface ListSessionsOptions {
 
   /**
    * Keep only the sessions last updated strictly before this epoch-millisecond
-   * instant — the retention sweep's purge-candidate filter.
+   * instant — the same age filter the retention sweep's keyset enumeration,
+   * {@link SessionsRepo.listRetentionCandidates}, applies.
    */
   readonly updatedBefore?: number | undefined;
 
@@ -534,6 +884,140 @@ export interface SessionListPage {
   readonly items: readonly SessionListItem[];
   /** How many sessions match the filter in total, before `limit` and `offset`. */
   readonly total: number;
+}
+
+/**
+ * What {@link SessionsRepo.findLatestByDevServer} looks for.
+ *
+ * The repository knows neither which statuses count as active nor what makes
+ * two dev-server URLs "the same": the state machine owns the first and
+ * `src/server/routes/binding.ts` owns origin canonicalisation, so both arrive
+ * here as arguments and each rule keeps one definition.
+ */
+export interface FindByDevServerOptions {
+  /**
+   * The statuses a candidate may be in. Same semantics as
+   * {@link ListSessionsOptions.statuses}: an empty array selects nothing, and a
+   * value outside the vocabulary is refused.
+   */
+  readonly statuses: readonly SessionStatus[];
+
+  /**
+   * Whether a stored `dev_server_url` projection is the one sought, given the
+   * session it belongs to. Called newest session first, at most once per
+   * candidate, and the lookup stops at the first `true`. Must be pure and must
+   * not throw: it runs between two page reads of the store.
+   */
+  readonly matches: (devServerUrl: string, sessionId: SessionId) => boolean;
+
+  /**
+   * How many candidate rows one page reads: an integer from 1 to
+   * {@link MAX_SESSION_LIST_LIMIT}, defaulting to
+   * {@link DEV_SERVER_LOOKUP_BATCH_SIZE}.
+   */
+  readonly batchSize?: number | undefined;
+}
+
+/**
+ * The window of {@link SessionsRepo.listWithinFolders}: which workspace folders
+ * the list is confined to, and which page of them to read.
+ */
+export interface ListSessionsWithinFoldersOptions {
+  /**
+   * The folders whose sessions are listed: a session is in scope when its
+   * project root **is** one of them or lies beneath one — the rule
+   * `requireProjectScope` in `src/server/auth.ts` applies to an editor
+   * principal. Each folder is normalised (`toPosix`, then `normalizePosix`)
+   * before it is bound; repeated folders and folders nested under another are
+   * folded away. An **empty** list selects nothing and answers an empty page
+   * with a `total` of zero. At most {@link MAX_SCOPE_FOLDERS} distinct folders
+   * remain after folding.
+   */
+  readonly folders: readonly string[];
+
+  /**
+   * The page size: an integer from 0 to {@link MAX_SESSION_LIST_LIMIT},
+   * defaulting to {@link DEFAULT_SESSION_LIST_LIMIT}. `0` is a count-only
+   * request: no row is read, and `total` is real.
+   */
+  readonly limit?: number | undefined;
+
+  /** How many in-scope sessions to skip, a non-negative integer. Defaults to 0. */
+  readonly offset?: number | undefined;
+}
+
+/**
+ * One page of session list rows confined to a set of workspace folders.
+ *
+ * `consumed` can exceed `items.length`: a stored row whose projections or
+ * cleanup summary fail `sessionListItemSchema` is left out and counted in
+ * `unreadable`, yet the page still moves past it, so the following page begins
+ * after it rather than repeating it — which is what lets a paging caller set
+ * `nextOffset = offset + consumed`.
+ */
+export interface SessionSummaryPage {
+  /** The readable rows of the window, most recently updated first. */
+  readonly items: readonly SessionSummary[];
+  /** How many sessions the folders cover in total, before `limit` and `offset`. */
+  readonly total: number;
+  /** How many stored rows of the window were read: `items` plus the unreadable ones. */
+  readonly consumed: number;
+  /** How many rows of the window were left out because they failed validation. */
+  readonly unreadable: number;
+}
+
+/**
+ * A session the retention sweep may purge: the columns its decision reads and
+ * its keyset position, and nothing else — no question, no document.
+ */
+export interface RetentionCandidate {
+  /** The session's id. */
+  readonly id: SessionId;
+  /** Where the session was in the pipeline when the page was read. */
+  readonly status: SessionStatus;
+  /** When the session last changed, in epoch milliseconds: the age basis. */
+  readonly updatedAt: number;
+  /**
+   * The row's position in the store — its SQLite `rowid` — which breaks a tie
+   * between sessions last updated in the same millisecond. Opaque: meaningful
+   * only as half of a {@link RetentionCandidateCursor}, and only for the sweep
+   * that read it. A row keeps its `rowid` across every write this service
+   * makes to it (`update` is an upsert that never re-inserts), and the only
+   * statement that may renumber rows, `VACUUM`, runs after the sweep's
+   * enumeration has finished.
+   */
+  readonly position: number;
+}
+
+/**
+ * Where a {@link SessionsRepo.listRetentionCandidates} page ended: the
+ * `(updatedAt, position)` of its last candidate. The next page starts strictly
+ * after it.
+ */
+export interface RetentionCandidateCursor {
+  /** The last candidate's `updatedAt`. */
+  readonly updatedAt: number;
+  /** The last candidate's {@link RetentionCandidate.position}. */
+  readonly position: number;
+}
+
+/** What {@link SessionsRepo.listRetentionCandidates} pages over. */
+export interface ListRetentionCandidatesOptions {
+  /**
+   * The retention cutoff: only sessions last updated strictly before this
+   * epoch-millisecond instant are candidates. The caller computes it once per
+   * sweep, so every page is read against the same threshold.
+   */
+  readonly updatedBefore: number;
+
+  /** The cursor the previous page ended on; absent for the first page. */
+  readonly after?: RetentionCandidateCursor | undefined;
+
+  /**
+   * The page size: an integer from 1 to {@link MAX_SESSION_LIST_LIMIT},
+   * defaulting to {@link MAX_SESSION_LIST_LIMIT}.
+   */
+  readonly limit?: number | undefined;
 }
 
 /**
@@ -589,6 +1073,14 @@ export interface ListProgressOptions {
   readonly limit?: number | undefined;
 }
 
+/** The most recent lines of a session's progress log, as {@link SessionsRepo.listProgressTail} reads them. */
+export interface ProgressTail {
+  /** The most recent lines, at most the requested count, in **append order** (oldest first). */
+  readonly entries: readonly ProgressEntry[];
+  /** How many lines the session has stored in all, so a caller can tell how many were left out. */
+  readonly total: number;
+}
+
 /**
  * A capture summary, as `@debuggen/telemetry` computes it. Named here from the
  * upstream `CaptureRecord` member rather than restated: the store treats it as
@@ -606,6 +1098,36 @@ export interface StartCaptureInput {
   readonly captureId?: CaptureId | undefined;
   /** When the capture started, in epoch milliseconds. Defaults to `now()`. */
   readonly startedAt?: number | undefined;
+  /**
+   * Opts in to the store-side check of project-wide capture exclusivity: when
+   * present, the window is refused while any **other** session whose stored
+   * `project_root` equals this value holds an open window. Pass the session's
+   * own stored `projectRoot`. Absent, only the session's own open window is
+   * checked — the behaviour a caller that manages project ownership itself, or
+   * a suite that opens windows directly, relies on.
+   */
+  readonly projectRoot?: string | undefined;
+}
+
+/**
+ * One open capture window, as {@link SessionsRepo.listOpenCaptureWindows}
+ * reads it: the window's identity and start, and the two projections of its
+ * session the capture-owner index is keyed and filtered by.
+ */
+export interface OpenCaptureWindow {
+  /** The session holding the window. */
+  readonly sessionId: SessionId;
+  /** That session's stored project root: the key capture ownership is decided by. */
+  readonly projectRoot: string;
+  /**
+   * That session's stored status. A window on a session that is not
+   * `capturing` is the orphan of an interrupted start or stop.
+   */
+  readonly sessionStatus: SessionStatus;
+  /** The open window's id. */
+  readonly captureId: CaptureId;
+  /** When the window opened, in epoch milliseconds. */
+  readonly startedAt: number;
 }
 
 /** What {@link SessionsRepo.stopCapture} closes. */
@@ -641,6 +1163,34 @@ export interface StoredCapture {
   /** The capture, validated by the protocol's capture schema. */
   readonly capture: CaptureRecord;
 }
+
+/**
+ * What {@link SessionsRepo.getPanelCapture} found for one panel of one
+ * session.
+ *
+ * Two outcomes a caller must keep apart, because they call for different
+ * answers:
+ *
+ * - `'unknown'` — the session holds no panel with this id (never generated,
+ *   deleted with its session, or a panel of another session). The request
+ *   names something that does not exist here.
+ * - `'found'` — the panel exists. `capture` is the capture it was generated
+ *   from, or `undefined` when the panel is linked to none: it was assembled
+ *   without a capture, or its capture has since been purged and the schema set
+ *   the link to `NULL`. A panel whose capture is gone must not silently fall
+ *   back to another capture's evidence.
+ *
+ * @example
+ * ```ts
+ * const lookup = sessions.getPanelCapture(sessionId, panelId);
+ * if (lookup.ok && lookup.value.panel === 'found' && lookup.value.capture !== undefined) {
+ *   resolveAgainst(lookup.value.capture.capture.id);
+ * }
+ * ```
+ */
+export type PanelCaptureLookup =
+  | { readonly panel: 'unknown' }
+  | { readonly panel: 'found'; readonly capture: StoredCapture | undefined };
 
 /** What {@link SessionsRepo.upsertBinding} records. */
 export interface UpsertBindingInput {
@@ -691,6 +1241,28 @@ export interface BindingUpsert {
 }
 
 /**
+ * Builds the session record that accounts for a plan version just stored:
+ * called by {@link SessionsRepo.insertPlanWithRecord} inside its transaction,
+ * with the plan exactly as the `plans` row holds it.
+ *
+ * Synchronous, like every write of this repository. An `err` — the session
+ * contract refusing the record, say — rolls the plan row back with it; a throw
+ * does too and reaches the caller as `STORE_ERROR`.
+ */
+export type PlanRecordMirror = (stored: InstrumentationPlan) => Result<SessionRecord>;
+
+/**
+ * The outcome of {@link SessionsRepo.insertPlanWithRecord}: one plan version
+ * and the session record that mirrors it, stored together.
+ */
+export interface StoredPlanWithRecord {
+  /** The plan version as the `plans` row holds it. */
+  readonly plan: InstrumentationPlan;
+  /** The session record as stored, its `plans` accounting for {@link StoredPlanWithRecord.plan}. */
+  readonly session: SessionRecord;
+}
+
+/**
  * The sessions repository, over the session store.
  *
  * Every method is synchronous — `node:sqlite` is — and answers with a
@@ -700,11 +1272,47 @@ export interface BindingUpsert {
  */
 export interface SessionsRepo {
   /**
+   * Runs `body` as one atomic unit: every write its repository calls make
+   * commits together, or none of them does.
+   *
+   * `body` runs inside `Store.transaction` — `BEGIN IMMEDIATE` at the outermost
+   * level, a savepoint when a transaction is already open — and must stay
+   * synchronous. When it returns `ok`, the unit commits. When it returns an
+   * `err`, that error is carried out of the transaction as a module-private
+   * throw, so the transaction (or the savepoint) rolls back every write made
+   * inside it, including those of nested repository calls that succeeded, and
+   * the same `err` is returned unchanged. A throw from `body` rolls back too:
+   * this module's programmer errors are rethrown, anything else becomes
+   * `STORE_ERROR`, as for every method here.
+   *
+   * @typeParam T The body's success value.
+   * @param body The composed repository calls, returning a `Result`.
+   * @returns What `body` returned once committed, the body's own `err` after
+   * the rollback, or `err` `STORE_ERROR` when the unit could not be opened or
+   * committed (`store-failed`).
+   * @throws {DebuggenError} `INTERNAL` when `body` returns something that is
+   * not a `Result` — a promise, typically — or throws a programmer error of
+   * this module.
+   *
+   * @example
+   * ```ts
+   * const moved = sessions.transaction(() => {
+   *   const closed = sessions.stopCapture({ captureId });
+   *   return isErr(closed) ? closed : sessions.update(nextRecord);
+   * });
+   * // A refused update leaves the capture window open, exactly as it was.
+   * ```
+   */
+  transaction<T>(body: () => Result<T>): Result<T>;
+
+  /**
    * Stores a new session.
    *
    * The record is validated with `parseSessionRecord` before anything is
-   * written; timestamps are canonicalised to whole milliseconds (the columns are
-   * `STRICT` integers) in the document and the columns alike.
+   * written; timestamps — `createdAt`, `updatedAt` and `cleanup.completedAt` —
+   * are canonicalised to whole milliseconds (the columns are `STRICT` integers)
+   * in the document and the columns alike. The session's cleanup summary row is
+   * written in the same transaction.
    *
    * @param record The new session's record.
    * @returns The record as stored, or `err`: `STORE_ERROR` when the record does
@@ -743,6 +1351,30 @@ export interface SessionsRepo {
   get(id: SessionId): Result<SessionRecord | undefined>;
 
   /**
+   * Reads what the per-session access rule decides on — the session's id and
+   * project root — without reading its document.
+   *
+   * The admission read of a route that needs nothing more of the session than
+   * whether it exists and whose it is: `GET /sessions/:id/modifications`, whose
+   * answer comes from the journal table. One primary-key lookup selecting two
+   * projection columns, so the document — which embeds every modification with
+   * its diff — is neither read by SQLite nor parsed, and a session whose
+   * document no longer parses is still found.
+   *
+   * @param sessionId The session's id.
+   * @returns `ok({ id, projectRoot })`, `ok(undefined)` when no such session
+   * exists, or `err` `STORE_ERROR`: `invalid-argument` for an id that is not a
+   * non-empty string, `corrupt-row` when either column does not hold text.
+   *
+   * @example
+   * ```ts
+   * const target = sessions.getAccessTarget(sessionId);
+   * // target.value → { id, projectRoot }, for requireSessionAccess
+   * ```
+   */
+  getAccessTarget(sessionId: SessionId): Result<StoredAccessTarget | undefined>;
+
+  /**
    * Persists a status the session state machine has decided on.
    *
    * Transition **legality** is owned by `src/sessions/state-machine.ts`, not
@@ -764,8 +1396,10 @@ export interface SessionsRepo {
    * Lists sessions from their indexed projections, most recently updated
    * first (`updated_at DESC, id DESC`), with a `total` over the same filter.
    *
-   * Backs `GET /sessions` and the editor's Sessions tree; `updatedBefore` is how
-   * `./retention.ts` finds purge candidates. Items and total are read inside
+   * Backs `GET /sessions` and the editor's Sessions tree; `./retention.ts`
+   * pages it for the project roots active inside the window, and enumerates
+   * its purge candidates with {@link SessionsRepo.listRetentionCandidates}
+   * instead. Items and total are read inside
    * one transaction, so they describe the same state.
    *
    * @param options Filters and paging; see {@link ListSessionsOptions}.
@@ -776,10 +1410,85 @@ export interface SessionsRepo {
   list(options?: ListSessionsOptions): Result<SessionListPage>;
 
   /**
+   * The most recently updated session in `statuses` whose recorded dev-server
+   * URL satisfies `matches` — how a DevTools panel that names no session is
+   * matched to the session debugging its page's origin.
+   *
+   * Reads the `id`, `dev_server_url` and `updated_at` projections only, never
+   * the `record` document, from the candidates `idx_sessions_status` narrows
+   * the read to, newest first (`updated_at DESC, id DESC`), a bounded page at
+   * a time with a keyset cursor, and stops at the first match. An ended
+   * session's history is therefore never read or parsed to answer it; fetch
+   * the winner with {@link SessionsRepo.get}.
+   *
+   * @param options The statuses, the predicate and the batch size; see
+   * {@link FindByDevServerOptions}.
+   * @returns The id of the newest matching session, `ok(undefined)` when none
+   * matches, or `err` `STORE_ERROR` for an option outside its domain
+   * (`invalid-argument`, `unknown-status`) or an unreadable key column
+   * (`corrupt-row`).
+   */
+  findLatestByDevServer(options: FindByDevServerOptions): Result<SessionId | undefined>;
+
+  /**
+   * Reads one page of session list rows confined to a set of workspace
+   * folders, most recently updated first (`updated_at DESC, id DESC`, so
+   * consecutive pages neither repeat nor skip a session), with the `total` the
+   * folders cover — the query behind `GET /sessions`.
+   *
+   * Exactly two statements, inside one transaction so they describe the same
+   * state: a `COUNT(*)` and a `LIMIT`/`OFFSET` page, both scoped **in SQL** by
+   * range predicates over `project_root` that `idx_sessions_project_root`
+   * serves. The stored document is never read here, by SQLite or in
+   * JavaScript: the page select names no `record` column, and the cleanup
+   * summary comes from the session's `session_cleanup_summaries` row, which
+   * every write path keeps in step with the document (see
+   * {@link SESSION_SUMMARY_COLUMNS}). Each row is validated with protocol's
+   * `sessionListItemSchema`. A row that fails it — an unknown status, a session
+   * without a summary row — is left out and counted, never repaired; the page
+   * still consumes it.
+   *
+   * @param options The folders and the page window; see
+   * {@link ListSessionsWithinFoldersOptions}.
+   * @returns The page, or `err` `STORE_ERROR` for an option outside its domain
+   * (`invalid-argument`) or a store failure.
+   *
+   * @example
+   * ```ts
+   * const page = sessions.listWithinFolders({ folders: ['/work/app'], limit: 100, offset: 0 });
+   * // page.value.items → rows of /work/app and /work/app/**, never /work/app-old
+   * ```
+   */
+  listWithinFolders(options: ListSessionsWithinFoldersOptions): Result<SessionSummaryPage>;
+
+  /**
+   * Reads one page of retention candidates: sessions last updated strictly
+   * before `updatedBefore`, oldest first (`updated_at ASC, rowid ASC`),
+   * strictly after the `after` cursor when one is given.
+   *
+   * The retention sweep's enumeration, and nothing else's. It is a keyset page
+   * rather than an offset page, so the sweep can delete — or keep — each page's
+   * sessions before it reads the next one without shifting, repeating or
+   * skipping a row, and a page's cost does not grow with the backlog: the
+   * order and the seek are both served by `idx_sessions_updated_at`, with no
+   * sort even when many sessions share one `updated_at`. It selects four
+   * columns and no document, runs one indexed `SELECT` with no `COUNT(*)`, and
+   * opens no transaction of its own.
+   *
+   * @param options The cutoff, the cursor and the page size.
+   * @returns At most `limit` candidates (fewer means the last page), or `err`
+   * `STORE_ERROR` for an option outside its domain (`invalid-argument`) or a
+   * row whose projections are unreadable (`corrupt-row`).
+   */
+  listRetentionCandidates(
+    options: ListRetentionCandidatesOptions,
+  ): Result<readonly RetentionCandidate[]>;
+
+  /**
    * Deletes one session and, through the schema's `ON DELETE CASCADE` edges,
-   * everything scoped to it: progress, plans, captures and their telemetry,
-   * panels, analyses, follow-ups, its binding, its request-key secret — and its
-   * modification journal rows.
+   * everything scoped to it: its cleanup summary, progress, plans, captures and
+   * their telemetry, panels, analyses, follow-ups, its binding, its request-key
+   * secret — and its modification journal rows.
    *
    * That cascade is why per-session purging is a single statement, and it only
    * holds because `./db.ts` sets `PRAGMA foreign_keys = ON` on every connection
@@ -817,6 +1526,32 @@ export interface SessionsRepo {
   listProgress(sessionId: SessionId, options?: ListProgressOptions): Result<ProgressEntry[]>;
 
   /**
+   * Reads the **most recent** `limit` lines of a session's progress log, in
+   * insertion order, together with how many lines are stored — what a reopen
+   * replays, bounded by the replay limit rather than by the history's length.
+   *
+   * Two statements inside one transaction, so the tail and the total describe
+   * the same state: `ORDER BY id DESC LIMIT ?` walks
+   * `idx_session_progress_session_id_id` backwards and stops at `limit` rows
+   * (reversed here into append order), and a `COUNT(*)` counts on the same
+   * index. Nothing older than the tail is read.
+   *
+   * @param sessionId The session's id.
+   * @param limit How many of the newest lines to return, a non-negative
+   * integer; `0` answers only the total.
+   * @returns The tail and the total, or `err` `STORE_ERROR` (`invalid-argument`,
+   * `corrupt-row`).
+   *
+   * @example
+   * ```ts
+   * const tail = sessions.listProgressTail(sessionId, 500);
+   * // tail.value.entries → the last ≤ 500 lines, oldest first
+   * // tail.value.total - tail.value.entries.length → how many older lines were left out
+   * ```
+   */
+  listProgressTail(sessionId: SessionId, limit: number): Result<ProgressTail>;
+
+  /**
    * Stores one version of a session's instrumentation plan, keyed by
    * `plan.sessionId` and `plan.planVersion`.
    *
@@ -829,6 +1564,50 @@ export interface SessionsRepo {
    * (`duplicate-plan-version`), `SESSION_NOT_FOUND` when its session does not.
    */
   insertPlan(plan: InstrumentationPlan): Result<InstrumentationPlan>;
+
+  /**
+   * Stores one plan version **and** the session record that mirrors it as one
+   * atomic write, so the `plans` table and `SessionRecord.plans` can never
+   * disagree about the ladder.
+   *
+   * The two halves are read by different consumers — the follow-up stage walks
+   * the `plans` table, the capture stage arms from `SessionRecord.plans` — so a
+   * plan row without its record (or the reverse) would let them act on two
+   * different plan versions. Here {@link SessionsRepo.insertPlan}, `mirror`
+   * and {@link SessionsRepo.update} run inside one `Store.transaction`, and any
+   * refusal from any of them rolls back the whole of it: either both rows are
+   * written or neither is. Called while the caller already holds a
+   * transaction, it runs as a savepoint of that transaction and rolls back only
+   * its own writes.
+   *
+   * One `warn` record — identifiers, the step that refused and the error code,
+   * never a plan or a record — reports a pair that was rolled back.
+   *
+   * @param plan A normalised plan.
+   * @param mirror Builds the session record that accounts for the plan as
+   * stored; see {@link PlanRecordMirror}. Its record must be the plan's own
+   * session.
+   * @returns The plan and the session record as stored, or `err` with nothing
+   * written: `insertPlan`'s refusal (`PLAN_INVALID`, `STORE_ERROR`
+   * `duplicate-plan-version`, `SESSION_NOT_FOUND`), `mirror`'s own `err`,
+   * `STORE_ERROR` (`invalid-argument`) for a mirror that is not a function or
+   * builds another session's record, `update`'s refusal, or `STORE_ERROR` when
+   * the transaction could not be opened or committed.
+   * @throws {DebuggenError} `INTERNAL` on the request-key guard, as for
+   * {@link SessionsRepo.insert}, after the transaction was rolled back.
+   *
+   * @example
+   * ```ts
+   * const stored = sessions.insertPlanWithRecord(plan, (row) =>
+   *   parseSessionRecord({ ...record, plans: [...record.plans, row] }),
+   * );
+   * if (stored.ok) broadcast(stored.value.session);
+   * ```
+   */
+  insertPlanWithRecord(
+    plan: InstrumentationPlan,
+    mirror: PlanRecordMirror,
+  ): Result<StoredPlanWithRecord>;
 
   /**
    * Reads one plan version, validated with the normalised plan schema.
@@ -872,13 +1651,19 @@ export interface SessionsRepo {
    * Refuses while the session already has an open capture: this is the
    * store-side half of the rule that one capture runs at a time (AAP §0.4.2),
    * whose `409 { owningSessionId }` answer across a project is produced by
-   * `src/sessions/manager.ts`. The check and the insert run in one transaction.
+   * `src/sessions/manager.ts`. With {@link StartCaptureInput.projectRoot} it
+   * also refuses while another session of that project holds an open window,
+   * so the store itself never admits a second window on a project whose
+   * caller opted in. Every check and the insert run in one transaction.
    *
-   * @param input The session, plan version and optional id and start time.
+   * @param input The session, plan version, optional id and start time, and
+   * the optional project root that opts in to the project-wide check.
    * @returns The opened capture, or `err`: `CAPTURE_ALREADY_ACTIVE` with
-   * `details.activeCaptureId`, `STORE_ERROR` for an input outside its domain
-   * (`invalid-argument`) or a reused capture id (`duplicate-capture`),
-   * `SESSION_NOT_FOUND` when the session does not exist.
+   * `details.activeCaptureId` — and, for another session's window on the
+   * project, `details.owningSessionId` with reason `project-capture-owned` —
+   * `STORE_ERROR` for an input outside its domain (`invalid-argument`) or a
+   * reused capture id (`duplicate-capture`), `SESSION_NOT_FOUND` when the
+   * session does not exist.
    */
   startCapture(input: StartCaptureInput): Result<StoredCapture>;
 
@@ -913,12 +1698,76 @@ export interface SessionsRepo {
   getActiveCapture(sessionId: SessionId): Result<StoredCapture | undefined>;
 
   /**
+   * Lists every open capture window across all sessions, with each window's
+   * session project root and status — oldest window first.
+   *
+   * One indexed statement (open windows through the partial index over
+   * `stopped_at IS NULL`, their sessions through the primary key), so the
+   * session manager rebuilds its capture-owner index at start-up without
+   * reading, paging or probing any session that holds no open window.
+   *
+   * @returns The open windows, or `err` `STORE_ERROR` (`corrupt-row`) when a
+   * row's columns are unreadable — reported by its identifiers only.
+   */
+  listOpenCaptureWindows(): Result<readonly OpenCaptureWindow[]>;
+
+  /**
    * Reads every capture of a session, oldest first.
    *
    * @param sessionId The session's id.
    * @returns The captures, or `err` `STORE_ERROR` (`corrupt-row`).
    */
   listCaptures(sessionId: SessionId): Result<StoredCapture[]>;
+
+  /**
+   * Reads a session's newest capture by start time — the element
+   * {@link SessionsRepo.listCaptures} would list last — without reading the
+   * rest of the history.
+   *
+   * It exists for the panel-data resolver (`src/panels/data.ts`), which needs
+   * the one capture a query without a named capture reads on every panel node
+   * it serves; listing and parsing every capture and its summary to take the
+   * last one made that cost grow with the session's history. This is one
+   * ordered, indexed row, and a same-millisecond tie resolves to the capture
+   * written later, exactly as the listing orders it. The open capture counts
+   * like any other: while one runs, it is the newest.
+   *
+   * @param sessionId The session's id.
+   * @returns `ok(capture)`, `ok(undefined)` when the session has no capture (or
+   * does not exist), or `err` `STORE_ERROR`: `invalid-argument` for a blank
+   * session id, `corrupt-row` when the newest row no longer parses.
+   */
+  getLatestCapture(sessionId: SessionId): Result<StoredCapture | undefined>;
+
+  /**
+   * Reads which capture one panel of a session was generated from.
+   *
+   * The panel-data route answers a rendered panel's queries from the capture
+   * that panel was generated from, never from whichever capture happens to be
+   * the session's newest: an older panel shown beside a newer, perhaps still
+   * running, capture would otherwise display evidence its findings were never
+   * drawn from. `PanelSpec` carries no capture id, so the link is the
+   * `panels.capture_id` column `./panels-repo.ts` writes from
+   * `insertPanel(spec, { captureId })`. This is a read-only join from the
+   * capture side — see the module overview — and it never writes `panels`.
+   *
+   * The capture is mapped exactly as {@link SessionsRepo.getCapture} maps it,
+   * and must belong to `sessionId` as the panel does; a link to another
+   * session's capture is reported as a corrupt row rather than returned,
+   * because returning it would hand one session's evidence to another's panel.
+   * The same holds for a link naming a capture the table does not hold, which
+   * the `ON DELETE SET NULL` foreign key makes impossible for a store this
+   * build wrote.
+   *
+   * @param sessionId The session the panel must belong to.
+   * @param panelId The panel's id.
+   * @returns `ok({ panel: 'unknown' })` when the session holds no such panel,
+   * `ok({ panel: 'found', capture })` otherwise — `capture` `undefined` when
+   * the panel is linked to no capture — or `err` `STORE_ERROR`:
+   * `invalid-argument` for a blank id, `corrupt-row` for an unreadable capture
+   * row, a link to another session's capture or a dangling link.
+   */
+  getPanelCapture(sessionId: SessionId, panelId: PanelId): Result<PanelCaptureLookup>;
 
   /**
    * Appends a follow-up question to a session's follow-up log.
@@ -930,13 +1779,41 @@ export interface SessionsRepo {
    * panel that answered it) are persisted on the session record through
    * {@link SessionsRepo.update}.
    *
+   * One row per follow-up **attempt**: a record carrying an `attemptId` the
+   * session's log already holds is refused (`SESSION_INVALID_STATE`,
+   * `follow-up-attempt-exists`) — a retry of that attempt goes through
+   * {@link SessionsRepo.replaceFollowUpAttempt}, which rewrites the row it was
+   * first recorded in.
+   *
    * @param sessionId The session the question was asked in.
    * @param record The follow-up as it was asked.
    * @returns The record as stored, or `err`: `STORE_ERROR` when it fails the
    * follow-up schema (`invalid-follow-up`), `SESSION_NOT_FOUND` when the
-   * session does not exist.
+   * session does not exist, `SESSION_INVALID_STATE` when its attempt is
+   * already logged.
    */
   appendFollowUp(sessionId: SessionId, record: FollowUpRecord): Result<FollowUpRecord>;
+
+  /**
+   * Rewrites the `followups` row that recorded `record.attemptId` with
+   * `record` — the in-place retry of a follow-up attempt that failed. The row
+   * keeps its id, and therefore its place in the order the questions were
+   * asked; the `question` / `asked_at` projections are recomputed from the new
+   * document in the same statement, so they cannot disagree with it.
+   *
+   * The row is found by the attempt id inside its JSON document
+   * (`json_extract(record, '$.attemptId')`), never by the question's text
+   * (AAP §0.5.4).
+   *
+   * @param sessionId The session the attempt belongs to.
+   * @param record The retried attempt: the same `attemptId`, its new
+   *   `attempt` counter, question and `askedAt`.
+   * @returns The record as stored, or `err` `STORE_ERROR`: `invalid-follow-up`
+   * when it fails the follow-up schema or carries no `attemptId`,
+   * `follow-up-attempt-not-found` when the session logs no row for the attempt,
+   * `follow-up-attempt-duplicated` when it logs more than one.
+   */
+  replaceFollowUpAttempt(sessionId: SessionId, record: FollowUpRecord): Result<FollowUpRecord>;
 
   /**
    * Reads a session's follow-ups in the order they were asked.
@@ -1502,6 +2379,51 @@ function attempt<T>(
   }
 }
 
+/**
+ * The throw that carries a refusal out of `Store.transaction`, which rolls
+ * back only when its callback throws: a {@link SessionsRepo.transaction}
+ * body's `err`, or the `err` of a later step of one of this module's own
+ * multi-step writes, whose earlier steps must be undone with it.
+ *
+ * Module-private and never allowed to escape: the method that opened the
+ * transaction throws it from inside the callback and catches it again
+ * outside, identified by class, and returns the carried refusal unchanged —
+ * so the caller sees the same code and reason it would have seen from the
+ * refusing step called on its own. It extends `Error` so the throw is an
+ * ordinary exception to every layer it crosses — the store's rollback path
+ * included — and carries no stored content, only the refusal the body built.
+ */
+class TransactionRefusal extends Error {
+  /** The body's refusal, returned to the caller once the rollback has run. */
+  readonly refusal: DebuggenError;
+
+  /**
+   * @param refusal The `err` the transaction body returned.
+   */
+  constructor(refusal: DebuggenError) {
+    super('A sessions repository transaction body refused; its writes are rolled back.');
+    this.name = 'TransactionRefusal';
+    this.refusal = refusal;
+  }
+}
+
+/**
+ * Whether a transaction body answered with a `Result` — an object with a
+ * boolean `ok` — rather than, say, a promise, which would commit before the
+ * work it stands for had run.
+ *
+ * @param value What the body returned.
+ * @returns `true` for a `Result`-shaped value.
+ */
+function isResultShaped(value: unknown): boolean {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    typeof (value as { readonly ok?: unknown }).ok === 'boolean' &&
+    typeof (value as { readonly then?: unknown }).then !== 'function'
+  );
+}
+
 /* -------------------------------------------------------------------------------------------------
  * Row mapping — one helper per table, used by every read path
  * ---------------------------------------------------------------------------------------------- */
@@ -1588,8 +2510,41 @@ function toSessionListItem(row: StoredRow, operation: string): Result<SessionLis
 }
 
 /**
+ * Maps a retention-candidate row to its projection.
+ *
+ * @param row The row, selecting {@link RETENTION_CANDIDATE_COLUMNS}.
+ * @param operation The calling method.
+ * @returns The candidate, or the refusal.
+ */
+function toRetentionCandidate(row: StoredRow, operation: string): Result<RetentionCandidate> {
+  const id = readText(row['id']);
+  const status = readText(row['status']);
+  const updatedAt = readInteger(row['updated_at']);
+  const position = readInteger(row['position']);
+
+  if (
+    id === undefined ||
+    status === undefined ||
+    !isSessionStatus(status) ||
+    updatedAt === undefined ||
+    position === undefined
+  ) {
+    return err(
+      corruptRowError(
+        operation,
+        'sessions',
+        id === undefined ? {} : { [LOG_BINDING_KEYS.sessionId]: id },
+      ),
+    );
+  }
+
+  return ok({ id, status, updatedAt, position });
+}
+
+/**
  * The indexed projections of a session record, derived from it and from
- * nothing else.
+ * nothing else: the `sessions` columns beside `record`, and the three cleanup
+ * facts of its `session_cleanup_summaries` row.
  */
 interface SessionColumns {
   readonly id: string;
@@ -1600,6 +2555,12 @@ interface SessionColumns {
   readonly devServerUrl: string | null;
   readonly createdAt: number;
   readonly updatedAt: number;
+  /** `record.cleanup.status`. */
+  readonly cleanupStatus: CleanupStatus;
+  /** `record.cleanup.completedAt` in whole milliseconds, `null` while absent. */
+  readonly cleanupCompletedAt: number | null;
+  /** `record.cleanup.conflicts.length`. */
+  readonly cleanupConflictCount: number;
 }
 
 /** A validated, canonical session record ready to be written. */
@@ -1654,6 +2615,7 @@ function assertNoSecretFields(record: SessionRecord, operation: string): void {
  * @throws {DebuggenError} `INTERNAL` when a projection is not representable.
  */
 function projectSessionColumns(record: SessionRecord, operation: string): SessionColumns {
+  const { cleanup } = record;
   const columns: SessionColumns = {
     id: record.id,
     projectRoot: record.projectRoot,
@@ -1663,6 +2625,9 @@ function projectSessionColumns(record: SessionRecord, operation: string): Sessio
     devServerUrl: typeof record.devServerUrl === 'string' ? record.devServerUrl : null,
     createdAt: record.createdAt,
     updatedAt: record.updatedAt,
+    cleanupStatus: cleanup.status,
+    cleanupCompletedAt: cleanup.completedAt ?? null,
+    cleanupConflictCount: cleanup.conflicts.length,
   };
 
   const representable =
@@ -1672,7 +2637,10 @@ function projectSessionColumns(record: SessionRecord, operation: string): Sessio
     isSessionStatus(columns.status) &&
     typeof columns.question === 'string' &&
     Number.isSafeInteger(columns.createdAt) &&
-    Number.isSafeInteger(columns.updatedAt);
+    Number.isSafeInteger(columns.updatedAt) &&
+    isCleanupStatus(columns.cleanupStatus) &&
+    (columns.cleanupCompletedAt === null || Number.isSafeInteger(columns.cleanupCompletedAt)) &&
+    Number.isSafeInteger(columns.cleanupConflictCount);
 
   if (!representable) {
     throw programmerError(
@@ -1694,8 +2662,10 @@ function projectSessionColumns(record: SessionRecord, operation: string): Sessio
  * The one write-preparation path for `insert`, `update` and `setStatus`:
  *
  * 1. validate with `parseSessionRecord`;
- * 2. round `createdAt` / `updatedAt` to whole milliseconds, in the document as
- *    in the columns, and re-validate when that changed anything;
+ * 2. round `createdAt`, `updatedAt` and `cleanup.completedAt` to whole
+ *    milliseconds, in the document as in the columns — the last one lands in
+ *    the `STRICT` `INTEGER` column `session_cleanup_summaries.completed_at` —
+ *    and re-validate when that changed anything;
  * 3. refuse a top-level secret-shaped field ({@link assertNoSecretFields});
  * 4. serialise and project.
  *
@@ -1724,9 +2694,21 @@ function prepareSession(record: SessionRecord, operation: string): Result<Prepar
   let canonical = parsed.value;
   const createdAt = toEpochColumn(canonical.createdAt);
   const updatedAt = toEpochColumn(canonical.updatedAt);
+  const { cleanup } = canonical;
+  const completedAt =
+    cleanup.completedAt === undefined ? undefined : toEpochColumn(cleanup.completedAt);
 
-  if (createdAt !== canonical.createdAt || updatedAt !== canonical.updatedAt) {
-    const reparsed = parseSessionRecord({ ...canonical, createdAt, updatedAt });
+  if (
+    createdAt !== canonical.createdAt ||
+    updatedAt !== canonical.updatedAt ||
+    completedAt !== cleanup.completedAt
+  ) {
+    const reparsed = parseSessionRecord({
+      ...canonical,
+      createdAt,
+      updatedAt,
+      cleanup: completedAt === undefined ? cleanup : { ...cleanup, completedAt },
+    });
 
     if (isErr(reparsed)) {
       return err(
@@ -1804,6 +2786,25 @@ function sessionRewriteValues(prepared: PreparedSession): readonly BoundValue[] 
     columns.updatedAt,
     prepared.json,
     columns.id,
+  ];
+}
+
+/**
+ * The bind list of {@link UPSERT_CLEANUP_SUMMARY_SQL}: the session id, then
+ * the three cleanup facts, projected from the same prepared record as the
+ * document written beside them.
+ *
+ * @param prepared The prepared write.
+ * @returns The values to bind.
+ */
+function cleanupSummaryValues(prepared: PreparedSession): readonly BoundValue[] {
+  const { columns } = prepared;
+
+  return [
+    columns.id,
+    columns.cleanupStatus,
+    columns.cleanupCompletedAt,
+    columns.cleanupConflictCount,
   ];
 }
 
@@ -1977,6 +2978,45 @@ function toStoredCapture(row: StoredRow, operation: string): Result<StoredCaptur
 }
 
 /**
+ * Maps a row of {@link SELECT_OPEN_CAPTURE_WINDOWS_SQL} to its open window.
+ *
+ * Every column is checked — the ids non-empty, the status in the session
+ * vocabulary, the start a safe integer — because the capture-owner index is
+ * keyed and filtered by them; a row that fails is reported by its identifiers
+ * only, never by its project root.
+ *
+ * @param row The row, selecting `capture_id`, `session_id`, `started_at`,
+ * `project_root` and `session_status`.
+ * @param operation The calling method.
+ * @returns The window, or the refusal.
+ */
+function toOpenCaptureWindow(row: StoredRow, operation: string): Result<OpenCaptureWindow> {
+  const captureId = readText(row['capture_id']);
+  const sessionId = readText(row['session_id']);
+  const projectRoot = readText(row['project_root']);
+  const sessionStatus = readText(row['session_status']);
+  const startedAt = readInteger(row['started_at']);
+
+  if (
+    !isNonEmptyText(captureId) ||
+    !isNonEmptyText(sessionId) ||
+    !isNonEmptyText(projectRoot) ||
+    sessionStatus === undefined ||
+    !isSessionStatus(sessionStatus) ||
+    startedAt === undefined
+  ) {
+    return err(
+      corruptRowError(operation, 'captures', {
+        ...(isNonEmptyText(sessionId) ? { [LOG_BINDING_KEYS.sessionId]: sessionId } : {}),
+        ...(isNonEmptyText(captureId) ? { [LOG_BINDING_KEYS.captureId]: captureId } : {}),
+      }),
+    );
+  }
+
+  return ok(Object.freeze({ sessionId, projectRoot, sessionStatus, captureId, startedAt }));
+}
+
+/**
  * Maps a `followups` row to its validated record.
  *
  * @param row The row, selecting `id` and `record`.
@@ -2132,6 +3172,168 @@ function sessionListWhere(filter: SessionListFilter): {
   return { clause: terms.length === 0 ? '' : ` WHERE ${terms.join(' AND ')}`, values };
 }
 
+/**
+ * The three values {@link FOLDER_SCOPE_TERM} binds for one folder: the folder
+ * itself, the prefix everything beneath it starts with, and the exclusive upper
+ * bound of that prefix range.
+ *
+ * The filesystem root is its own prefix (`'/'`, never `'//'`), exactly as
+ * `isWithin` treats it.
+ *
+ * @param folder A normalised folder.
+ * @returns `[folder, prefix, upperBound]`.
+ */
+function folderScopeValues(folder: string): readonly [string, string, string] {
+  const prefix = folder.endsWith('/') ? folder : `${folder}/`;
+
+  return [folder, prefix, `${prefix.slice(0, -1)}0`];
+}
+
+/**
+ * Whether `candidate` is `folder` or lies beneath it, by the same text rule
+ * {@link FOLDER_SCOPE_TERM} applies in SQL — used to fold a nested folder
+ * away, so the JavaScript and SQL readings of the scope cannot disagree.
+ *
+ * @param folder A normalised folder.
+ * @param candidate Another normalised folder.
+ * @returns `true` when every root `candidate` covers, `folder` covers too.
+ */
+function coveredByFolder(folder: string, candidate: string): boolean {
+  if (candidate === folder) {
+    return true;
+  }
+
+  const [, prefix] = folderScopeValues(folder);
+
+  return candidate.startsWith(prefix) && candidate.length > prefix.length;
+}
+
+/**
+ * The `WHERE` clause confining the session list to a set of folders, with its
+ * bind list — or `undefined` when the folders select nothing.
+ *
+ * Folders are normalised, deduplicated and sorted, and a folder nested under
+ * another is dropped: it could only repeat sessions its parent already covers.
+ * What remains is padded to a power-of-two width by repeating the first folder
+ * — repeating an `OR` term cannot change which rows match — so the statement
+ * text takes at most nine shapes however many folders an editor announces,
+ * mirroring the fixed-width status filter. The text is built from the constant
+ * term and a count, never from a folder.
+ *
+ * @param folders The folders offered by the caller.
+ * @param operation The calling method, for a refusal's `details`.
+ * @returns The clause (without `WHERE`) and its values, `undefined` for an
+ * empty scope, or the refusal.
+ */
+function folderScopeWhere(
+  folders: readonly string[],
+  operation: string,
+): Result<{ readonly clause: string; readonly values: readonly BoundValue[] } | undefined> {
+  if (!Array.isArray(folders)) {
+    return err(invalidArgumentError(operation, 'folders', 'an array of folder paths'));
+  }
+
+  const normalised = new Set<string>();
+
+  for (const folder of folders) {
+    if (!isNonEmptyText(folder) || folder.includes('\u0000')) {
+      return err(invalidArgumentError(operation, 'folders', 'an array of non-empty folder paths'));
+    }
+
+    normalised.add(normalizePosix(toPosix(folder)));
+  }
+
+  // Sorted, a folder that covers another comes before it (a prefix sorts
+  // first), so one pass keeps exactly the outermost folders.
+  const outermost: string[] = [];
+
+  for (const folder of [...normalised].sort()) {
+    if (!outermost.some((kept) => coveredByFolder(kept, folder))) {
+      outermost.push(folder);
+    }
+  }
+
+  const filler = outermost[0];
+
+  if (filler === undefined) {
+    return ok(undefined);
+  }
+
+  if (outermost.length > MAX_SCOPE_FOLDERS) {
+    return err(
+      invalidArgumentError(
+        operation,
+        'folders',
+        `at most ${String(MAX_SCOPE_FOLDERS)} distinct, non-nested folders`,
+        { folderCount: outermost.length },
+      ),
+    );
+  }
+
+  let width = 1;
+
+  while (width < outermost.length) {
+    width *= 2;
+  }
+
+  const values: BoundValue[] = [];
+
+  for (let slot = 0; slot < width; slot += 1) {
+    values.push(...folderScopeValues(outermost[slot] ?? filler));
+  }
+
+  return ok({
+    clause: Array.from({ length: width }, () => FOLDER_SCOPE_TERM).join(' OR '),
+    values,
+  });
+}
+
+/**
+ * A column value as the list-row schema should judge it: a `bigint` — never
+ * produced by this module's statements — becomes a number while it is safe,
+ * and anything else is passed through for the schema to accept or refuse.
+ *
+ * @param value The raw column value.
+ * @returns The value to validate.
+ */
+function summaryColumn(value: unknown): unknown {
+  return typeof value === 'bigint' ? readInteger(value) : value;
+}
+
+/**
+ * Maps a row selecting {@link SESSION_SUMMARY_COLUMNS} to its session list
+ * row, validated by protocol's `sessionListItemSchema` — the one definition of
+ * that row. A row the schema refuses (an unknown status, a session with no
+ * cleanup summary row, whose cleanup columns the `LEFT JOIN` answers as `NULL`)
+ * yields `undefined` and is reported by the caller as a count; its content goes
+ * nowhere.
+ *
+ * @param row The stored row.
+ * @returns The validated row, or `undefined`.
+ */
+function toSessionSummary(row: StoredRow): SessionSummary | undefined {
+  const completedAt = summaryColumn(row['cleanup_completed_at']);
+  const candidate = {
+    id: row['id'],
+    projectRoot: row['project_root'],
+    projectName: row['project_name'],
+    status: row['status'],
+    question: row['question'],
+    createdAt: summaryColumn(row['created_at']),
+    updatedAt: summaryColumn(row['updated_at']),
+    cleanup: {
+      status: row['cleanup_status'],
+      // `NULL` is how the summary row stores an absent member, and absence is
+      // how the record spells a cleanup that has not completed.
+      ...(completedAt === null || completedAt === undefined ? {} : { completedAt }),
+      conflictCount: summaryColumn(row['cleanup_conflict_count']),
+    },
+  };
+  const parsed = sessionListItemSchema.safeParse(candidate);
+
+  return parsed.success ? parsed.data : undefined;
+}
+
 /* -------------------------------------------------------------------------------------------------
  * The repository
  * ---------------------------------------------------------------------------------------------- */
@@ -2252,6 +3454,58 @@ export function createSessionsRepo(deps: SessionsRepoDeps): SessionsRepo {
   }
 
   // -----------------------------------------------------------------------------------------------
+  // composition
+  // -----------------------------------------------------------------------------------------------
+
+  function transaction<T>(body: () => Result<T>): Result<T> {
+    const operation = 'transaction';
+    // Set only when the body itself refused: that refusal was already reported
+    // by the nested call that built it, so only a failure of the unit — it
+    // could not be opened or committed, or the body threw — is reported here.
+    let refused = false;
+    const outcome = attempt(operation, (): Result<T> => {
+      try {
+        return store.transaction((): Result<T> => {
+          const result = body();
+
+          if (!isResultShaped(result)) {
+            throw programmerError(
+              'A sessions repository transaction body returned something other than a Result; it must run synchronously and answer ok or err.',
+              operation,
+              { reason: 'invalid-transaction-body' },
+            );
+          }
+
+          if (isErr(result)) {
+            // `Store.transaction` rolls back only on a throw; this one undoes
+            // every write the body's nested calls made, then is caught below.
+            throw new TransactionRefusal(result.error);
+          }
+
+          return result;
+        });
+      } catch (thrown) {
+        if (thrown instanceof TransactionRefusal) {
+          refused = true;
+          return err(thrown.refusal);
+        }
+
+        throw thrown;
+      }
+    });
+
+    if (isErr(outcome) && !refused) {
+      reportFailure(
+        'a composed session store change could not be committed',
+        operation,
+        outcome.error,
+      );
+    }
+
+    return outcome;
+  }
+
+  // -----------------------------------------------------------------------------------------------
   // sessions
   // -----------------------------------------------------------------------------------------------
 
@@ -2272,6 +3526,8 @@ export function createSessionsRepo(deps: SessionsRepoDeps): SessionsRepo {
         store.transaction((): Result<SessionRecord> => {
           assertSecretAbsent(prepared.value, operation);
           store.statement(INSERT_SESSION_SQL).run(...sessionRowValues(prepared.value));
+          // The list's projection of the document, in the same transaction.
+          store.statement(UPSERT_CLEANUP_SUMMARY_SQL).run(...cleanupSummaryValues(prepared.value));
 
           return ok(prepared.value.record);
         }),
@@ -2353,6 +3609,10 @@ export function createSessionsRepo(deps: SessionsRepoDeps): SessionsRepo {
 
             assertSecretAbsent(prepared.value, operation);
             store.statement(UPSERT_SESSION_SQL).run(...sessionRowValues(prepared.value));
+            // The list's projection of the document, in the same transaction.
+            store
+              .statement(UPSERT_CLEANUP_SUMMARY_SQL)
+              .run(...cleanupSummaryValues(prepared.value));
 
             return ok({ record: prepared.value.record, created: stamps === undefined });
           },
@@ -2389,6 +3649,43 @@ export function createSessionsRepo(deps: SessionsRepoDeps): SessionsRepo {
         const row = store.statement(SELECT_SESSION_SQL).get(id);
 
         return row === undefined ? ok(undefined) : toSessionRecord(row, operation);
+      },
+      fields,
+    );
+
+    if (isErr(outcome)) {
+      reportFailure('a session could not be read', operation, outcome.error, fields);
+    }
+
+    return outcome;
+  }
+
+  function getAccessTarget(sessionId: SessionId): Result<StoredAccessTarget | undefined> {
+    const operation = 'getAccessTarget';
+    const invalid = sessionIdError(operation, sessionId);
+
+    if (invalid !== undefined) {
+      return err(invalid);
+    }
+
+    const fields = { [LOG_BINDING_KEYS.sessionId]: sessionId };
+    const outcome = attempt(
+      operation,
+      (): Result<StoredAccessTarget | undefined> => {
+        const row = store.statement(SELECT_SESSION_ACCESS_TARGET_SQL).get(sessionId);
+
+        if (row === undefined) {
+          return ok(undefined);
+        }
+
+        const id = readText(row['id']);
+        const projectRoot = readText(row['project_root']);
+
+        if (id === undefined || projectRoot === undefined) {
+          return err(corruptRowError(operation, 'sessions', fields));
+        }
+
+        return ok({ id, projectRoot });
       },
       fields,
     );
@@ -2445,6 +3742,12 @@ export function createSessionsRepo(deps: SessionsRepoDeps): SessionsRepo {
 
             assertSecretAbsent(prepared.value, operation);
             store.statement(REWRITE_SESSION_SQL).run(...sessionRewriteValues(prepared.value));
+            // Rewritten with the document even though a status change leaves
+            // `cleanup` as it was: the summary is written wherever the
+            // document is, so no write path can leave the two apart.
+            store
+              .statement(UPSERT_CLEANUP_SUMMARY_SQL)
+              .run(...cleanupSummaryValues(prepared.value));
 
             return ok({ record: prepared.value.record, previous: current.value.status });
           },
@@ -2555,6 +3858,236 @@ export function createSessionsRepo(deps: SessionsRepoDeps): SessionsRepo {
 
     if (isErr(outcome)) {
       reportFailure('the session list could not be read', operation, outcome.error);
+    }
+
+    return outcome;
+  }
+
+  function findLatestByDevServer(options: FindByDevServerOptions): Result<SessionId | undefined> {
+    const operation = 'findLatestByDevServer';
+    const outcome = attempt(operation, (): Result<SessionId | undefined> => {
+      const { statuses, matches } = options;
+      const batchSize = options.batchSize ?? DEV_SERVER_LOOKUP_BATCH_SIZE;
+
+      if (typeof matches !== 'function') {
+        return err(
+          invalidArgumentError(operation, 'matches', 'a predicate over a stored dev-server URL'),
+        );
+      }
+
+      if (!isIntegerInRange(batchSize, 1, MAX_SESSION_LIST_LIMIT)) {
+        return err(
+          invalidArgumentError(
+            operation,
+            'batchSize',
+            `an integer from 1 to ${String(MAX_SESSION_LIST_LIMIT)}`,
+          ),
+        );
+      }
+
+      const slots = statusFilterSlots(statuses, operation);
+
+      if (isErr(slots)) {
+        return slots;
+      }
+
+      // An empty status filter selects nothing, exactly as in the session list.
+      if (slots.value === undefined) {
+        return ok(undefined);
+      }
+
+      const statusSlots = slots.value;
+      let cursor: { readonly updatedAt: number; readonly id: string } | undefined;
+
+      // Each page is strictly after the previous one's last row, so the walk
+      // ends: either a row matches, or a short page proves there is no more.
+      for (;;) {
+        const rows =
+          cursor === undefined
+            ? store.statement(DEV_SERVER_LOOKUP_FIRST_SQL).all(...statusSlots, batchSize)
+            : store
+                .statement(DEV_SERVER_LOOKUP_NEXT_SQL)
+                .all(...statusSlots, cursor.updatedAt, cursor.updatedAt, cursor.id, batchSize);
+
+        for (const row of rows) {
+          const id = readText(row['id']);
+          const updatedAt = readInteger(row['updated_at']);
+
+          if (id === undefined || updatedAt === undefined) {
+            return err(
+              corruptRowError(
+                operation,
+                'sessions',
+                id === undefined ? { column: 'id' } : { [LOG_BINDING_KEYS.sessionId]: id },
+              ),
+            );
+          }
+
+          cursor = { updatedAt, id };
+          const devServerUrl = readText(row['dev_server_url']);
+
+          if (devServerUrl !== undefined && matches(devServerUrl, id)) {
+            return ok(id);
+          }
+        }
+
+        if (rows.length < batchSize) {
+          return ok(undefined);
+        }
+      }
+    });
+
+    if (isErr(outcome)) {
+      reportFailure('the dev-server session lookup could not be read', operation, outcome.error);
+    } else {
+      logger.debug('dev-server session lookup answered', { matched: outcome.value !== undefined });
+    }
+
+    return outcome;
+  }
+
+  function listWithinFolders(
+    options: ListSessionsWithinFoldersOptions,
+  ): Result<SessionSummaryPage> {
+    const operation = 'listWithinFolders';
+    const outcome = attempt(operation, (): Result<SessionSummaryPage> => {
+      const limit = options.limit ?? DEFAULT_SESSION_LIST_LIMIT;
+      const offset = options.offset ?? 0;
+
+      if (!isIntegerInRange(limit, 0, MAX_SESSION_LIST_LIMIT)) {
+        return err(
+          invalidArgumentError(
+            operation,
+            'limit',
+            `an integer from 0 to ${String(MAX_SESSION_LIST_LIMIT)}`,
+          ),
+        );
+      }
+
+      if (!isIntegerInRange(offset, 0, Number.MAX_SAFE_INTEGER)) {
+        return err(invalidArgumentError(operation, 'offset', 'a non-negative integer'));
+      }
+
+      const scope = folderScopeWhere(options.folders, operation);
+
+      if (isErr(scope)) {
+        return scope;
+      }
+
+      // No folder, no session: answered here rather than widened into "all".
+      if (scope.value === undefined) {
+        return ok({ items: [], total: 0, consumed: 0, unreadable: 0 });
+      }
+
+      const { clause, values } = scope.value;
+
+      // One transaction, so the page and the total describe the same state.
+      return store.transaction((): Result<SessionSummaryPage> => {
+        const counted = store
+          .statement(`SELECT COUNT(*) AS total FROM sessions WHERE ${clause}`)
+          .get(...values);
+        const total = counted === undefined ? undefined : readInteger(counted['total']);
+
+        if (total === undefined) {
+          return err(corruptRowError(operation, 'sessions', { column: 'total' }));
+        }
+
+        // A count-only request, or a window past the end: nothing to read.
+        if (limit === 0 || offset >= total) {
+          return ok({ items: [], total, consumed: 0, unreadable: 0 });
+        }
+
+        const rows = store
+          .statement(
+            `SELECT ${SESSION_SUMMARY_COLUMNS} FROM ${SESSION_SUMMARY_SOURCE} WHERE ${clause} ${SESSION_LIST_ORDER} LIMIT ? OFFSET ?`,
+          )
+          .all(...values, limit, offset);
+        const items: SessionSummary[] = [];
+        let unreadable = 0;
+
+        for (const row of rows) {
+          const item = toSessionSummary(row);
+
+          if (item === undefined) {
+            unreadable += 1;
+          } else {
+            items.push(item);
+          }
+        }
+
+        return ok({ items, total, consumed: rows.length, unreadable });
+      });
+    });
+
+    if (isErr(outcome)) {
+      reportFailure('the scoped session list could not be read', operation, outcome.error);
+    }
+
+    return outcome;
+  }
+
+  function listRetentionCandidates(
+    options: ListRetentionCandidatesOptions,
+  ): Result<readonly RetentionCandidate[]> {
+    const operation = 'listRetentionCandidates';
+    const outcome = attempt(operation, (): Result<readonly RetentionCandidate[]> => {
+      const { updatedBefore, after } = options;
+      const limit = options.limit ?? MAX_SESSION_LIST_LIMIT;
+
+      if (!isFiniteNumber(updatedBefore)) {
+        return err(
+          invalidArgumentError(operation, 'updatedBefore', 'a finite epoch-millisecond number'),
+        );
+      }
+
+      if (!isIntegerInRange(limit, 1, MAX_SESSION_LIST_LIMIT)) {
+        return err(
+          invalidArgumentError(
+            operation,
+            'limit',
+            `an integer from 1 to ${String(MAX_SESSION_LIST_LIMIT)}`,
+          ),
+        );
+      }
+
+      if (after !== undefined) {
+        if (!isFiniteNumber(after.updatedAt)) {
+          return err(
+            invalidArgumentError(operation, 'after.updatedAt', 'a finite epoch-millisecond number'),
+          );
+        }
+
+        if (!Number.isSafeInteger(after.position)) {
+          return err(invalidArgumentError(operation, 'after.position', 'a safe integer'));
+        }
+      }
+
+      // One statement, so the page is a consistent read without a transaction
+      // of its own — and so it never takes the write lock a `BEGIN IMMEDIATE`
+      // would, which matters to a sweep that deletes between pages.
+      const rows =
+        after === undefined
+          ? store.statement(SELECT_RETENTION_CANDIDATES_SQL).all(updatedBefore, limit)
+          : store
+              .statement(SELECT_RETENTION_CANDIDATES_AFTER_SQL)
+              .all(updatedBefore, after.updatedAt, after.position, limit);
+      const candidates: RetentionCandidate[] = [];
+
+      for (const row of rows) {
+        const candidate = toRetentionCandidate(row, operation);
+
+        if (isErr(candidate)) {
+          return candidate;
+        }
+
+        candidates.push(candidate.value);
+      }
+
+      return ok(candidates);
+    });
+
+    if (isErr(outcome)) {
+      reportFailure('the retention candidates could not be read', operation, outcome.error);
     }
 
     return outcome;
@@ -2722,6 +4255,67 @@ export function createSessionsRepo(deps: SessionsRepoDeps): SessionsRepo {
     return outcome;
   }
 
+  function listProgressTail(sessionId: SessionId, limit: number): Result<ProgressTail> {
+    const operation = 'listProgressTail';
+    const fields = { [LOG_BINDING_KEYS.sessionId]: sessionId };
+    const outcome = attempt(
+      operation,
+      (): Result<ProgressTail> => {
+        const invalid = sessionIdError(operation, sessionId);
+
+        if (invalid !== undefined) {
+          return err(invalid);
+        }
+
+        if (!isIntegerInRange(limit, 0, Number.MAX_SAFE_INTEGER)) {
+          return err(invalidArgumentError(operation, 'limit', 'a non-negative integer', fields));
+        }
+
+        // One transaction, so the tail and the total describe the same state.
+        return store.transaction((): Result<ProgressTail> => {
+          const counted = store.statement(COUNT_PROGRESS_SQL).get(sessionId);
+          const total = counted === undefined ? undefined : readInteger(counted['total']);
+
+          if (total === undefined) {
+            return err(corruptRowError(operation, 'session_progress', { column: 'total' }));
+          }
+
+          if (limit === 0 || total === 0) {
+            return ok({ entries: [], total });
+          }
+
+          const rows = store.statement(SELECT_PROGRESS_TAIL_SQL).all(sessionId, limit);
+          const entries: ProgressEntry[] = [];
+
+          // Newest first from the index; reversed into append order.
+          for (const row of rows.toReversed()) {
+            const entry = toProgressEntry(row, operation);
+
+            if (isErr(entry)) {
+              return entry;
+            }
+
+            entries.push(entry.value);
+          }
+
+          return ok({ entries, total });
+        });
+      },
+      fields,
+    );
+
+    if (isErr(outcome)) {
+      reportFailure(
+        'the session progress tail could not be read',
+        operation,
+        outcome.error,
+        fields,
+      );
+    }
+
+    return outcome;
+  }
+
   // -----------------------------------------------------------------------------------------------
   // plans
   // -----------------------------------------------------------------------------------------------
@@ -2790,6 +4384,93 @@ export function createSessionsRepo(deps: SessionsRepoDeps): SessionsRepo {
         ...fields,
         actions: outcome.value.instrumentationTargets.length,
       });
+    }
+
+    return outcome;
+  }
+
+  function insertPlanWithRecord(
+    plan: InstrumentationPlan,
+    mirror: PlanRecordMirror,
+  ): Result<StoredPlanWithRecord> {
+    const operation = 'insertPlanWithRecord';
+    // Filled in as the transaction advances, so the one record of a rollback
+    // names the plan it concerned and the step that refused — ids only.
+    let fields: Readonly<Record<string, unknown>> = {};
+    let step: 'begin' | 'insert' | 'mirror' | 'update' | 'commit' = 'begin';
+
+    const outcome = attempt(operation, (): Result<StoredPlanWithRecord> => {
+      if (typeof mirror !== 'function') {
+        return err(
+          invalidArgumentError(operation, 'mirror', 'a function that builds the session record'),
+        );
+      }
+
+      try {
+        return store.transaction((): Result<StoredPlanWithRecord> => {
+          step = 'insert';
+          const inserted = insertPlan(plan);
+
+          if (isErr(inserted)) {
+            throw new TransactionRefusal(inserted.error);
+          }
+
+          const stored = inserted.value;
+          fields = {
+            [LOG_BINDING_KEYS.sessionId]: stored.sessionId,
+            planVersion: stored.planVersion,
+          };
+          step = 'mirror';
+          const mirrored = mirror(stored);
+
+          if (isErr(mirrored)) {
+            throw new TransactionRefusal(mirrored.error);
+          }
+
+          if (mirrored.value.id !== stored.sessionId) {
+            // Writing another session's record would leave this plan row unaccounted for.
+            throw new TransactionRefusal(
+              invalidArgumentError(
+                operation,
+                'mirror',
+                "a function that builds the record of the plan's own session",
+                fields,
+              ),
+            );
+          }
+
+          step = 'update';
+          const persisted = update(mirrored.value);
+
+          if (isErr(persisted)) {
+            throw new TransactionRefusal(persisted.error);
+          }
+
+          step = 'commit';
+
+          return ok({ plan: stored, session: persisted.value });
+        });
+      } catch (thrown) {
+        // The transaction is rolled back by now. A refusal returns the step's own error; anything
+        // else — an open or commit failure, a mirror that threw — goes on to `attempt`, which
+        // reports it as `STORE_ERROR` (and rethrows a programmer error unchanged).
+        if (thrown instanceof TransactionRefusal) {
+          return err(thrown.refusal);
+        }
+
+        throw thrown;
+      }
+    });
+
+    if (isErr(outcome)) {
+      reportFailure(
+        'a plan and the session record mirroring it were rolled back together; neither was stored',
+        operation,
+        outcome.error,
+        { ...fields, step },
+      );
+    } else {
+      logger.debug('plan and session record stored together', fields);
     }
 
     return outcome;
@@ -2936,6 +4617,10 @@ export function createSessionsRepo(deps: SessionsRepoDeps): SessionsRepo {
         );
       }
 
+      if (input.projectRoot !== undefined && !isNonEmptyText(input.projectRoot)) {
+        return err(invalidArgumentError(operation, 'projectRoot', 'a non-empty string', fields));
+      }
+
       const parsed = captureRecordSchema.safeParse({
         id: input.captureId ?? newCaptureId(),
         planVersion: input.planVersion,
@@ -2992,6 +4677,36 @@ export function createSessionsRepo(deps: SessionsRepoDeps): SessionsRepo {
                 },
               ),
             );
+          }
+
+          // Opt-in project exclusivity, decided in the transaction that
+          // inserts, so no other writer can open a window on the project
+          // between this check and the insert below.
+          if (input.projectRoot !== undefined) {
+            const holder = store
+              .statement(SELECT_PROJECT_ACTIVE_CAPTURE_SQL)
+              .get(input.projectRoot, input.sessionId);
+
+            if (holder !== undefined) {
+              const owningSessionId = readText(holder['session_id']);
+              const heldCaptureId = readText(holder['capture_id']);
+
+              return err(
+                new DebuggenError(
+                  'CAPTURE_ALREADY_ACTIVE',
+                  'Another debugging session is already capturing this project.',
+                  {
+                    hint: 'Stop or end the capture in the other session, then start this capture again.',
+                    details: context(operation, {
+                      [LOG_BINDING_KEYS.sessionId]: input.sessionId,
+                      ...(owningSessionId === undefined ? {} : { owningSessionId }),
+                      ...(heldCaptureId === undefined ? {} : { activeCaptureId: heldCaptureId }),
+                      reason: 'project-capture-owned',
+                    }),
+                  },
+                ),
+              );
+            }
           }
 
           store
@@ -3214,6 +4929,33 @@ export function createSessionsRepo(deps: SessionsRepoDeps): SessionsRepo {
     return outcome;
   }
 
+  function listOpenCaptureWindows(): Result<readonly OpenCaptureWindow[]> {
+    const operation = 'listOpenCaptureWindows';
+    const outcome = attempt(operation, (): Result<readonly OpenCaptureWindow[]> => {
+      const windows: OpenCaptureWindow[] = [];
+
+      for (const row of store.statement(SELECT_OPEN_CAPTURE_WINDOWS_SQL).all()) {
+        const window = toOpenCaptureWindow(row, operation);
+
+        if (isErr(window)) {
+          return window;
+        }
+
+        windows.push(window.value);
+      }
+
+      return ok(Object.freeze(windows));
+    });
+
+    if (isErr(outcome)) {
+      reportFailure('the open capture windows could not be listed', operation, outcome.error);
+    } else {
+      logger.debug('open capture windows listed', { windows: outcome.value.length });
+    }
+
+    return outcome;
+  }
+
   function listCaptures(sessionId: SessionId): Result<StoredCapture[]> {
     const operation = 'listCaptures';
     const fields = { [LOG_BINDING_KEYS.sessionId]: sessionId };
@@ -3250,9 +4992,191 @@ export function createSessionsRepo(deps: SessionsRepoDeps): SessionsRepo {
     return outcome;
   }
 
+  function getLatestCapture(sessionId: SessionId): Result<StoredCapture | undefined> {
+    const operation = 'getLatestCapture';
+    const fields = { [LOG_BINDING_KEYS.sessionId]: sessionId };
+    const outcome = attempt(
+      operation,
+      (): Result<StoredCapture | undefined> => {
+        const invalid = sessionIdError(operation, sessionId);
+
+        if (invalid !== undefined) {
+          return err(invalid);
+        }
+
+        const row = store.statement(SELECT_LATEST_CAPTURE_SQL).get(sessionId);
+
+        return row === undefined ? ok(undefined) : toStoredCapture(row, operation);
+      },
+      fields,
+    );
+
+    if (isErr(outcome)) {
+      reportFailure('the latest capture could not be read', operation, outcome.error, fields);
+    }
+
+    return outcome;
+  }
+
+  function getPanelCapture(sessionId: SessionId, panelId: PanelId): Result<PanelCaptureLookup> {
+    const operation = 'getPanelCapture';
+    const fields = { [LOG_BINDING_KEYS.sessionId]: sessionId, panelId };
+    const outcome = attempt(
+      operation,
+      (): Result<PanelCaptureLookup> => {
+        const invalid =
+          sessionIdError(operation, sessionId) ??
+          (isNonEmptyText(panelId)
+            ? undefined
+            : invalidArgumentError(operation, 'panelId', 'a non-empty panel id string'));
+
+        if (invalid !== undefined) {
+          return err(invalid);
+        }
+
+        const row = store.statement(SELECT_PANEL_CAPTURE_SQL).get(panelId, sessionId);
+
+        if (row === undefined) {
+          return ok({ panel: 'unknown' });
+        }
+
+        const linked = row['panel_capture_id'];
+
+        if (linked === null || linked === undefined) {
+          // Never linked, or linked to a capture retention has since purged:
+          // the schema's ON DELETE SET NULL clears the column in that case.
+          return ok({ panel: 'found', capture: undefined });
+        }
+
+        const key = { [LOG_BINDING_KEYS.sessionId]: sessionId, panelId };
+
+        if (!isNonEmptyText(linked)) {
+          return err(corruptRowError(operation, 'panels', { ...key, column: 'capture_id' }));
+        }
+
+        const scoped = { ...key, [LOG_BINDING_KEYS.captureId]: linked };
+
+        if (row['id'] === null || row['id'] === undefined) {
+          // The LEFT JOIN matched no capture for a non-NULL link. The foreign
+          // key forbids that while it is enforced, so the store was written
+          // without it; answering "no capture" would hide the damage.
+          return err(
+            corruptRowError(operation, 'panels', {
+              ...scoped,
+              column: 'capture_id',
+              mismatch: 'capture-missing',
+            }),
+          );
+        }
+
+        const capture = toStoredCapture(row, operation);
+
+        if (isErr(capture)) {
+          return capture;
+        }
+
+        if (capture.value.sessionId !== sessionId) {
+          // `./panels-repo.ts` refuses such a link when it writes the panel, so
+          // this row was altered afterwards. The capture's own session is not
+          // named: the caller's session is the only one it may learn about.
+          return err(corruptRowError(operation, 'captures', { ...scoped, mismatch: 'session' }));
+        }
+
+        return ok({ panel: 'found', capture: capture.value });
+      },
+      fields,
+    );
+
+    if (isErr(outcome)) {
+      reportFailure("a panel's capture could not be read", operation, outcome.error, fields);
+    }
+
+    return outcome;
+  }
+
   // -----------------------------------------------------------------------------------------------
   // followups
   // -----------------------------------------------------------------------------------------------
+
+  /**
+   * Validates a follow-up offered for storage and prepares its row: the
+   * schema-checked record with `askedAt` normalised to what the column holds,
+   * and its JSON document. Shared by the two writers of `followups`, so an
+   * appended row and a rewritten one are canonicalised identically.
+   */
+  function prepareFollowUp(
+    operation: string,
+    record: FollowUpRecord,
+    fields: Readonly<Record<string, unknown>>,
+  ): Result<{ readonly canonical: FollowUpRecord; readonly json: string }> {
+    const parsed = followUpRecordSchema.safeParse(record);
+
+    if (!parsed.success) {
+      return err(
+        invalidValueError(
+          operation,
+          'A follow-up record offered to the session store does not satisfy the follow-up record contract.',
+          'invalid-follow-up',
+          protocolParseError('STORE_ERROR', 'Invalid follow-up record', parsed.error.issues),
+          fields,
+        ),
+      );
+    }
+
+    let canonical: FollowUpRecord = parsed.data;
+    const askedAt = toEpochColumn(canonical.askedAt);
+
+    if (askedAt !== canonical.askedAt) {
+      const reparsed = followUpRecordSchema.safeParse({ ...canonical, askedAt });
+
+      if (!reparsed.success) {
+        return err(
+          invalidValueError(
+            operation,
+            'A follow-up record offered to the session store has a timestamp outside the range the store can hold.',
+            'invalid-follow-up',
+            protocolParseError('STORE_ERROR', 'Invalid follow-up record', reparsed.error.issues),
+            fields,
+          ),
+        );
+      }
+
+      canonical = reparsed.data;
+    }
+
+    const json = stringifyJson(canonical);
+
+    if (json === undefined) {
+      return err(
+        invalidValueError(
+          operation,
+          'A follow-up record offered to the session store cannot be serialised as JSON.',
+          'invalid-follow-up',
+          undefined,
+          fields,
+        ),
+      );
+    }
+
+    return ok({ canonical, json });
+  }
+
+  /** The ids of the `followups` rows of `sessionId` that record `attemptId`, oldest first. */
+  function followUpRowIdsFor(sessionId: SessionId, attemptId: string): number[] {
+    const ids: number[] = [];
+
+    for (const row of store
+      .statement(SELECT_FOLLOWUP_IDS_BY_ATTEMPT_SQL)
+      .all(sessionId, attemptId)) {
+      const id = readInteger(row['id']);
+
+      if (id !== undefined) {
+        ids.push(id);
+      }
+    }
+
+    return ids;
+  }
 
   function appendFollowUp(sessionId: SessionId, record: FollowUpRecord): Result<FollowUpRecord> {
     const operation = 'appendFollowUp';
@@ -3266,64 +5190,39 @@ export function createSessionsRepo(deps: SessionsRepoDeps): SessionsRepo {
           return err(invalid);
         }
 
-        const parsed = followUpRecordSchema.safeParse(record);
+        const prepared = prepareFollowUp(operation, record, fields);
 
-        if (!parsed.success) {
-          return err(
-            invalidValueError(
-              operation,
-              'A follow-up record offered to the session store does not satisfy the follow-up record contract.',
-              'invalid-follow-up',
-              protocolParseError('STORE_ERROR', 'Invalid follow-up record', parsed.error.issues),
-              fields,
-            ),
-          );
+        if (isErr(prepared)) {
+          return prepared;
         }
 
-        let canonical: FollowUpRecord = parsed.data;
-        const askedAt = toEpochColumn(canonical.askedAt);
+        const { canonical, json } = prepared.value;
 
-        if (askedAt !== canonical.askedAt) {
-          const reparsed = followUpRecordSchema.safeParse({ ...canonical, askedAt });
-
-          if (!reparsed.success) {
+        // Check and insert in one transaction, so two writers cannot both log
+        // the same attempt: one row per attempt is what makes a retry an update.
+        return store.transaction((): Result<FollowUpRecord> => {
+          if (
+            canonical.attemptId !== undefined &&
+            followUpRowIdsFor(sessionId, canonical.attemptId).length > 0
+          ) {
             return err(
-              invalidValueError(
-                operation,
-                'A follow-up record offered to the session store has a timestamp outside the range the store can hold.',
-                'invalid-follow-up',
-                protocolParseError(
-                  'STORE_ERROR',
-                  'Invalid follow-up record',
-                  reparsed.error.issues,
-                ),
-                fields,
+              new DebuggenError(
+                'SESSION_INVALID_STATE',
+                'This follow-up attempt is already recorded for the session.',
+                {
+                  hint: 'Retry an attempt in place with replaceFollowUpAttempt(); a new question needs a new attempt id.',
+                  details: context(operation, { ...fields, reason: 'follow-up-attempt-exists' }),
+                },
               ),
             );
           }
 
-          canonical = reparsed.data;
-        }
+          store
+            .statement(INSERT_FOLLOWUP_SQL)
+            .run(sessionId, canonical.question, canonical.askedAt, json);
 
-        const json = stringifyJson(canonical);
-
-        if (json === undefined) {
-          return err(
-            invalidValueError(
-              operation,
-              'A follow-up record offered to the session store cannot be serialised as JSON.',
-              'invalid-follow-up',
-              undefined,
-              fields,
-            ),
-          );
-        }
-
-        store
-          .statement(INSERT_FOLLOWUP_SQL)
-          .run(sessionId, canonical.question, canonical.askedAt, json);
-
-        return ok(canonical);
+          return ok(canonical);
+        });
       },
       fields,
     );
@@ -3332,6 +5231,98 @@ export function createSessionsRepo(deps: SessionsRepoDeps): SessionsRepo {
       reportFailure('a follow-up could not be stored', operation, outcome.error, fields);
     } else {
       logger.info('follow-up stored', fields);
+    }
+
+    return outcome;
+  }
+
+  function replaceFollowUpAttempt(
+    sessionId: SessionId,
+    record: FollowUpRecord,
+  ): Result<FollowUpRecord> {
+    const operation = 'replaceFollowUpAttempt';
+    const fields = { [LOG_BINDING_KEYS.sessionId]: sessionId };
+    const outcome = attempt(
+      operation,
+      (): Result<FollowUpRecord> => {
+        const invalid = sessionIdError(operation, sessionId);
+
+        if (invalid !== undefined) {
+          return err(invalid);
+        }
+
+        const prepared = prepareFollowUp(operation, record, fields);
+
+        if (isErr(prepared)) {
+          return prepared;
+        }
+
+        const { canonical, json } = prepared.value;
+        const { attemptId } = canonical;
+
+        if (attemptId === undefined) {
+          return err(
+            invalidArgumentError(
+              operation,
+              'record.attemptId',
+              'a follow-up attempt id: only an identified attempt can be retried in place',
+              fields,
+              'invalid-follow-up',
+            ),
+          );
+        }
+
+        return store.transaction((): Result<FollowUpRecord> => {
+          const ids = followUpRowIdsFor(sessionId, attemptId);
+          const [rowId, ...others] = ids;
+
+          if (rowId === undefined) {
+            return err(
+              new DebuggenError(
+                'STORE_ERROR',
+                'The session store logs no follow-up for the attempt being retried.',
+                {
+                  hint: 'The session record and its follow-up log disagree. Report the operation and identifiers with the service log.',
+                  details: context(operation, { ...fields, reason: 'follow-up-attempt-not-found' }),
+                },
+              ),
+            );
+          }
+
+          if (others.length > 0) {
+            return err(
+              new DebuggenError(
+                'STORE_ERROR',
+                'The session store logs the follow-up attempt being retried more than once.',
+                {
+                  hint: 'The session store may have been written by a different build of Debug Generator or altered by hand. Report the operation and identifiers with the service log.',
+                  details: context(operation, {
+                    ...fields,
+                    rows: ids.length,
+                    reason: 'follow-up-attempt-duplicated',
+                  }),
+                },
+              ),
+            );
+          }
+
+          store
+            .statement(UPDATE_FOLLOWUP_SQL)
+            .run(canonical.question, canonical.askedAt, json, rowId, sessionId);
+
+          return ok(canonical);
+        });
+      },
+      fields,
+    );
+
+    if (isErr(outcome)) {
+      reportFailure('a follow-up attempt could not be rewritten', operation, outcome.error, fields);
+    } else {
+      logger.info('follow-up attempt rewritten in place', {
+        ...fields,
+        ...(outcome.value.attempt === undefined ? {} : { attempt: outcome.value.attempt }),
+      });
     }
 
     return outcome;
@@ -3731,15 +5722,22 @@ export function createSessionsRepo(deps: SessionsRepoDeps): SessionsRepo {
   }
 
   return Object.freeze({
+    transaction,
     insert,
     update,
     get,
+    getAccessTarget,
     setStatus,
     list,
+    findLatestByDevServer,
+    listWithinFolders,
+    listRetentionCandidates,
     delete: deleteSession,
     appendProgress,
     listProgress,
+    listProgressTail,
     insertPlan,
+    insertPlanWithRecord,
     getPlan,
     listPlans,
     latestPlanVersion,
@@ -3748,8 +5746,12 @@ export function createSessionsRepo(deps: SessionsRepoDeps): SessionsRepo {
     stopCapture,
     getCapture,
     getActiveCapture,
+    listOpenCaptureWindows,
     listCaptures,
+    getLatestCapture,
+    getPanelCapture,
     appendFollowUp,
+    replaceFollowUpAttempt,
     listFollowUps,
     upsertBinding,
     getBindingByTab,

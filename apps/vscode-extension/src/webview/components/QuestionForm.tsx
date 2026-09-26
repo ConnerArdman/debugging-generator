@@ -6,8 +6,8 @@
  * question and hand it up. Everything that follows — creating the session,
  * running the six pipeline stages, reporting progress — happens elsewhere.
  * `App.tsx` is the only consumer: it maps `onSubmit` onto the `askQuestion`
- * host message and drives `pending`, `disabled`, `unavailable`, `error` and
- * `onRetry` from the session state it receives from the host.
+ * host message and drives `pending`, `disabled`, `unavailable`, `error`,
+ * `onRetry` and `submission` from the session state it receives from the host.
  *
  * ## The question is data, never a decision
  *
@@ -18,13 +18,25 @@
  * rejects. The text is never logged either (AAP 0.5.2): it is the developer's
  * own prose and may name private code, so this module has no `console` call.
  *
- * ## One piece of state
+ * ## The draft, kept until the question is accepted
  *
- * The draft string is the only state here. It is not persisted, not mirrored
- * into the webview state and never sent anywhere except through `onSubmit`, so
- * the host remains the single owner of everything the view shows. It survives
- * the pending and error states because it lives in this component rather than
- * in the field, which is unmounted while those states are shown.
+ * The draft string is the only content held here. It is not persisted, not
+ * mirrored into the webview state and never sent anywhere except through
+ * `onSubmit`, so the host remains the single owner of everything the view
+ * shows. It survives the pending and error states because it lives in this
+ * component rather than in the field, which is unmounted while those states
+ * are shown.
+ *
+ * Submitting does NOT clear it: posting the question, or the service request
+ * behind it, can still fail, and the developer must never have to retype a
+ * question the host did not take. The parent reports how the submission ended
+ * through `submission` — `accepted` clears the draft; `failed` keeps it and
+ * shows a retry hint under the field until the next submit. Each outcome is
+ * applied exactly once, by its `seq`, with React's "adjust state while
+ * rendering" pattern: the last applied `seq` is state and is compared during
+ * render, so a re-render that passes the same outcome again changes nothing
+ * and no effect is needed. An outcome already present when the form mounts
+ * belongs to a submission this instance never made, and is not applied.
  *
  * ## No `<form>` element, on purpose
  *
@@ -44,7 +56,8 @@
  *      and `aria-busy`.
  *   3. `unavailable` — `EmptyState` with this component's own generic wording,
  *      because `EmptyState` ships no default copy.
- *   4. Otherwise the field, the DevTools hint and the submit row.
+ *   4. Otherwise the field, the retry hint when the last submission failed,
+ *      the DevTools hint and the submit row.
  *
  * ## Design system
  *
@@ -52,10 +65,12 @@
  * for the text area, `Button`, `Text`, `Kbd` and the three state components —
  * and every gap and alignment comes from `Stack` (AAP 0.6.4). The two classes
  * this file adds, `dgv-question-form` and `dgv-question-form__hint`, are
- * declared in `../styles.css` against `--dg-*` tokens. The action row is laid
- * out by `Stack`'s own props rather than by `dgv-question-form__actions`: that
- * rule aligns its box's items to the centre, and on a `Stack` block it would
- * centre the row instead of pinning it to the end.
+ * declared in `../styles.css` against `--dg-*` tokens; the retry hint is a
+ * plain `Text` in the design system's `warning` tone and adds no class. The
+ * action row is laid out by `Stack`'s own props rather than by
+ * `dgv-question-form__actions`: that rule aligns its box's items to the
+ * centre, and on a `Stack` block it would centre the row instead of pinning it
+ * to the end.
  *
  * @module apps/vscode-extension/src/webview/components/QuestionForm
  */
@@ -73,6 +88,8 @@ import {
   Text,
 } from '@debuggen/panel-renderer';
 
+import type { SubmissionOutcome } from '../pending-actions';
+
 /**
  * Props of {@link QuestionForm}.
  *
@@ -85,10 +102,21 @@ export interface QuestionFormProps {
    * Raised with the trimmed question when the developer submits a non-blank
    * draft, by the submit button or by Ctrl/Cmd+Enter in the text area. Never
    * raised for an empty or whitespace-only draft, and never while the form is
-   * `disabled`, `pending` or `unavailable`. The draft is cleared after the
-   * callback returns; if the callback throws, the draft is kept.
+   * `disabled`, `pending` or `unavailable`. The draft is kept: it is cleared
+   * only when {@link QuestionFormProps.submission} reports the submission
+   * accepted.
    */
   onSubmit: (question: string) => void;
+
+  /**
+   * How the latest submission ended, from `./pending-actions`. Each distinct
+   * `seq` is applied once: `accepted` clears the draft; `failed` keeps it and
+   * shows a retry hint under the field until the next submit. The parent is
+   * expected to hold `pending` while a submission is in flight, so the draft
+   * cannot change between the submit and its outcome. An outcome already
+   * present when the form mounts is not applied.
+   */
+  submission?: SubmissionOutcome | undefined;
 
   /**
    * The session is mid-pipeline: the field and the submit control stay
@@ -157,6 +185,13 @@ const PENDING_LABEL = 'Submitting your question';
 const ERROR_TITLE = 'Your question could not be processed';
 
 /**
+ * Shown under the field after a submission failed — refused by the host
+ * channel, reported failed by the host, or never acknowledged — until the next
+ * submit. Generic product vocabulary only (AAP 0.5.4).
+ */
+const RETRY_HINT = `Your question was not confirmed, so it is kept here. Press “${SUBMIT_LABEL}” to try again.`;
+
+/**
  * Wording of the unavailable state. `EmptyState` deliberately ships no default
  * copy, so this component owns a generic sentence with no project vocabulary.
  */
@@ -203,7 +238,8 @@ function isSubmitChord(event: KeyboardEvent<HTMLElement>): boolean {
  * @example
  * <QuestionForm
  *   onSubmit={(question) => postToHost({ type: 'askQuestion', question })}
- *   pending={isAsking}
+ *   pending={isPending(pendingActions, 'askQuestion')}
+ *   submission={pendingActions.outcomes.askQuestion}
  *   disabled={isRunning}
  *   unavailable={!canStartSession}
  *   error={failure?.message}
@@ -213,6 +249,7 @@ function isSubmitChord(event: KeyboardEvent<HTMLElement>): boolean {
 export function QuestionForm(props: QuestionFormProps): ReactElement {
   const {
     onSubmit,
+    submission,
     disabled = false,
     unavailable = false,
     pending = false,
@@ -224,8 +261,27 @@ export function QuestionForm(props: QuestionFormProps): ReactElement {
   // Hooks first and unconditionally: every state below renders through the
   // same root, so the draft survives a round trip through pending or error.
   const [draft, setDraft] = useState<string>('');
+  // The `seq` of the last submission outcome applied. Initialised from the
+  // outcome present at mount, which belongs to no submission of this instance.
+  const [appliedSeq, setAppliedSeq] = useState<number | undefined>(submission?.seq);
+  // Whether the last applied outcome was a failure the next submit clears.
+  const [retryHintShown, setRetryHintShown] = useState<boolean>(false);
   const devtoolsHintId = useId();
   const shortcutId = useId();
+  const retryHintId = useId();
+
+  // React's "adjust state while rendering" pattern: a new outcome is applied
+  // here, once per `seq`, and React re-renders before committing, so neither a
+  // stale draft nor a second application ever reaches the screen.
+  if (submission !== undefined && submission.seq !== appliedSeq) {
+    setAppliedSeq(submission.seq);
+    if (submission.status === 'accepted') {
+      setDraft('');
+      setRetryHintShown(false);
+    } else {
+      setRetryHintShown(true);
+    }
+  }
 
   const trimmed = draft.trim();
   // A blank message is no failure worth a state of its own: treated as absent.
@@ -236,15 +292,23 @@ export function QuestionForm(props: QuestionFormProps): ReactElement {
   /**
    * The single submit path, shared by the button and the keyboard chord.
    * Refuses silently when there is nothing to send or the form is inert — the
-   * disabled button already says so — and otherwise hands the trimmed text up
-   * and clears the draft.
+   * disabled button already says so — and otherwise hands the trimmed text up,
+   * keeping the draft until `submission` reports it accepted, and retires the
+   * retry hint of the previous attempt.
+   *
+   * The hint is retired only when it is showing. A no-op `setState` from an
+   * event is not discarded by React: it stays queued and is replayed on the
+   * next render, which would then run after — and undo — the render-time
+   * application of this very submission's `failed` outcome.
    */
   const submit = (): void => {
     if (!canSubmit) {
       return;
     }
     onSubmit(trimmed);
-    setDraft('');
+    if (retryHintShown) {
+      setRetryHintShown(false);
+    }
   };
 
   const handleKeyDown = (event: KeyboardEvent<HTMLElement>): void => {
@@ -278,8 +342,17 @@ export function QuestionForm(props: QuestionFormProps): ReactElement {
           onValueChange={setDraft}
           onKeyDown={handleKeyDown}
           disabled={disabled}
-          aria-describedby={`${devtoolsHintId} ${shortcutId}`}
+          aria-describedby={
+            retryHintShown
+              ? `${retryHintId} ${devtoolsHintId} ${shortcutId}`
+              : `${devtoolsHintId} ${shortcutId}`
+          }
         />
+        {retryHintShown ? (
+          <Text as="p" size="xs" tone="warning" id={retryHintId}>
+            {RETRY_HINT}
+          </Text>
+        ) : null}
         <Text as="p" size="xs" tone="secondary" id={devtoolsHintId} className={HINT_CLASS}>
           {DEVTOOLS_HINT}
         </Text>

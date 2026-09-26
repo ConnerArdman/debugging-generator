@@ -1256,6 +1256,48 @@ describe('the forced tool route serves the calls the schema-constrained route ca
     expectForcedToolCall(transport);
   });
 
+  it.each([
+    'The compiled grammar is too large, which would cause performance issues. Simplify your tool schemas or reduce the number of strict tools.',
+    'Schemas contains too many optional parameters (28), which would make grammar compilation inefficient. Reduce the number of optional parameters in your tool schemas (limit: 24).',
+    'Schema is too complex for compilation.',
+  ])(
+    'falls back when the platform refuses to compile the schema into a grammar: %s',
+    async (report) => {
+      const { provider, transport } = harness({
+        script: {
+          parse: rejects(new ScriptedTransportError(400, report)),
+          create: answers(toolUseAnswer(TOOL_NAME, VALID_ANSWER)),
+        },
+      });
+
+      const attempt = okValue(await provider.generateStructured(answerSchema, makeRequest()));
+
+      // The strict route compiles a grammar and the forced tool route does not,
+      // so the refusal is a reason to ask once more, through the tool.
+      expect(attempt.raw).toEqual(VALID_ANSWER);
+      expect(attempt.value).toEqual(VALID_ANSWER);
+      expect(transport.parseCalls).toHaveLength(1);
+      expectForcedToolCall(transport);
+    },
+  );
+
+  it('does not fall back on a 400 that says nothing about the output format', async () => {
+    const { provider, transport } = harness({
+      script: {
+        parse: rejects(new ScriptedTransportError(400, 'max_tokens: must be a positive integer')),
+        create: answers(toolUseAnswer(TOOL_NAME, VALID_ANSWER)),
+      },
+    });
+
+    const error = errorOf(await provider.generateStructured(answerSchema, makeRequest()));
+
+    expectCodedFailure(error);
+    expect(error.code).toBe('MODEL_UNAVAILABLE');
+    expect(asObject(error.details ?? {}).condition).toBe('refused');
+    expect(transport.parseCalls).toHaveLength(1);
+    expect(transport.createCalls).toHaveLength(0);
+  });
+
   it('falls back when the schema cannot be rendered as an output format', async () => {
     const { provider, transport } = harness({
       script: {
@@ -1439,6 +1481,27 @@ describe('post-parse re-validation keeps a reported value honest', () => {
     // because a rejected answer is exactly the case where an upstream
     // assumption about the payload did not hold.
     expect(serialiseLogs(logs)).not.toContain(BOUND_VIOLATING_ANSWER.label);
+  });
+
+  it('logs a schema that throws with its closed code only, never the thrown message', async () => {
+    const quoted = 'zzq-refinement-quoted-marker';
+    const throwingSchema = answerSchema.superRefine(() => {
+      throw new Error(`the refinement read ${quoted} from the answer`);
+    });
+    const { provider, logs } = harness({
+      script: { parse: answers(structuredAnswer(VALID_ANSWER)) },
+    });
+
+    const attempt = okValue(await provider.generateStructured(throwingSchema, makeRequest()));
+
+    // The answer is still reported for the authoritative loop to judge.
+    expect(attempt.raw).toEqual(VALID_ANSWER);
+    expect(attempt.value).toBeUndefined();
+    const threw = logs.find((record) => record.message.includes('schema threw'));
+    expect(threw?.level).toBe('error');
+    expect(threw?.fields.code).toBe('INTERNAL');
+    expect(threw?.fields.error).toBeUndefined();
+    expect(serialiseLogs(logs)).not.toContain(quoted);
   });
 });
 

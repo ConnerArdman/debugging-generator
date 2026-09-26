@@ -196,6 +196,20 @@ import type { TelemetryRepo } from '../../src/store/telemetry-repo.js';
  * - `pipeline` — a pipeline stage sequence reaching its next state.
  * - `socketClose` — one socket finishing its closing handshake at teardown.
  * - `teardown` — `ServiceHandle.close()` at teardown.
+ * - `lateStart` — after `boot` has expired, the grace a still-running
+ *   `startService` gets to settle before the harness stops waiting for it
+ *   (see {@link settleLateStart}).
+ * - `lateStartClose` — the bound on closing the handle such a late start
+ *   produced. Deliberately shorter than `teardown`: a service that has only
+ *   just bound its port holds no session, client or dev server, so its close
+ *   is quick, and the whole failure path has to fit one hook.
+ *
+ * The failure path of a boot that times out runs inside one 30 s `beforeAll`:
+ * `boot` + `lateStart` + `lateStartClose` = 15 + 3 + 7 = 25 s, which leaves 5 s
+ * for the fixture copy made before the boot and the directory removal after
+ * it. A late start that has not settled (or not closed) by then is not waited
+ * for any longer: its directories are retained, and a continuation removes
+ * them only once its shutdown is confirmed (see {@link releaseAfterLateStart}).
  */
 export const HARNESS_TIMEOUTS = Object.freeze({
   boot: 15_000,
@@ -205,6 +219,8 @@ export const HARNESS_TIMEOUTS = Object.freeze({
   pipeline: 20_000,
   socketClose: 2_000,
   teardown: 12_000,
+  lateStart: 3_000,
+  lateStartClose: 7_000,
 });
 
 /** The name of one {@link HARNESS_TIMEOUTS} entry. */
@@ -305,20 +321,50 @@ function delay(ms: number): Promise<void> {
   });
 }
 
-/** Races `promise` against a timeout that rejects with `describe()`. */
-async function withTimeout<T>(promise: Promise<T>, ms: number, describe: () => string): Promise<T> {
+/** What {@link withinDeadline} observed: the promise's value, or that the deadline came first. */
+type DeadlineOutcome<T> = { readonly done: true; readonly value: T } | { readonly done: false };
+
+/**
+ * Races `promise` against a deadline. Expiry does not reject: it is reported as
+ * `{ done: false }`, so a caller can tell "not yet" apart from "failed" and keep
+ * waiting on the same promise elsewhere — which is what settling a late start
+ * needs. The timer is always cleared, so an early settlement leaves nothing
+ * scheduled.
+ *
+ * `promise` is observed here, so a rejection that arrives after the deadline is
+ * handled rather than surfacing as an unhandled rejection; one that arrives
+ * before it rejects the returned promise.
+ */
+async function withinDeadline<T>(promise: Promise<T>, ms: number): Promise<DeadlineOutcome<T>> {
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<never>((_, rejectTimeout) => {
+  const expired = new Promise<DeadlineOutcome<T>>((resolveExpired) => {
     timer = setTimeout(() => {
-      rejectTimeout(new Error(describe()));
+      resolveExpired({ done: false });
     }, ms);
   });
   try {
-    return await Promise.race([promise, timeout]);
+    return await Promise.race([
+      promise.then((value): DeadlineOutcome<T> => ({ done: true, value })),
+      expired,
+    ]);
   } finally {
     if (timer !== undefined) {
       clearTimeout(timer);
     }
+  }
+}
+
+/**
+ * Invokes a `close()` so that a synchronous throw becomes a rejection: a
+ * teardown step that collects outcomes with `Promise.allSettled` must see every
+ * failure as a settled result, never as an exception that skips the steps
+ * after it.
+ */
+function attemptClose(close: () => Promise<void>): Promise<void> {
+  try {
+    return Promise.resolve(close());
+  } catch (cause) {
+    return Promise.reject(cause instanceof Error ? cause : new Error(describeCause(cause)));
   }
 }
 
@@ -1979,6 +2025,12 @@ export interface HarnessCallOptions {
   readonly token?: string | null | undefined;
   /** The `Origin` header — `chrome-extension://<id>` for a DevTools credential. */
   readonly origin?: string | undefined;
+  /**
+   * The inspected tab a DevTools call acts for, sent as protocol's acting-tab
+   * header — which the service requires on every DevTools session request and
+   * refuses from any other credential. Omitted, no header is sent.
+   */
+  readonly tabId?: number | undefined;
   /** Overrides the `request` timeout for this call. */
   readonly timeoutMs?: number | undefined;
 }
@@ -2411,6 +2463,471 @@ async function removeTempDirectory(path: string, problems: string[]): Promise<vo
 }
 
 /* -------------------------------------------------------------------------------------------------
+ * Teardown and late-start settlement
+ *
+ * Extracted from startHarness so the failure paths — a close that rejects, a
+ * start that outlives its boot timeout — can be driven with fakes in
+ * harness.test.ts instead of by provoking them in a real service.
+ * ---------------------------------------------------------------------------------------------- */
+
+/** A socket as teardown inspects it: only whether it finished closing. */
+export interface ReleasableSocket {
+  /** The `ws` ready state; a released socket is `WebSocket.CLOSED` (`3`). */
+  readonly readyState: number;
+}
+
+/** A WebSocket client as teardown releases it. Every {@link HarnessWsClient} is one. */
+export interface ReleasableWsClient {
+  /** The announced identity, which names the client in a problem line. */
+  readonly identity: Pick<WsClientIdentity, 'client' | 'tabId'>;
+  /** Every socket the client opened; each must be closed once `close()` has settled. */
+  readonly sockets: readonly ReleasableSocket[];
+  /** Closes the client and waits for its sockets. */
+  close(): Promise<void>;
+}
+
+/** A bare socket as teardown releases it. Every {@link HarnessRawSocket} is one. */
+export interface ReleasableRawSocket {
+  /** The underlying socket, which must be closed once `close()` has settled. */
+  readonly socket: ReleasableSocket;
+  /** Closes the socket and waits for it. */
+  close(): Promise<void>;
+}
+
+/** A service as teardown releases it. Every `ServiceHandle` is one. */
+export type ReleasableService = Pick<ServiceHandle, 'close'>;
+
+/** Everything {@link releaseHarnessResources} releases, listed in the order it releases them. */
+export interface HarnessResources {
+  /** The protocol clients, closed first and concurrently. */
+  readonly clients: readonly ReleasableWsClient[];
+  /** The bare sockets, closed next and concurrently. */
+  readonly rawSockets: readonly ReleasableRawSocket[];
+  /** The running service, closed after every socket; `undefined` when none started. */
+  readonly handle: ReleasableService | undefined;
+  /**
+   * Harness-owned temporary directories, removed last and one at a time. Each
+   * must lie inside the operating system's temporary root; anything else is
+   * refused and reported rather than removed.
+   */
+  readonly directories: readonly string[];
+  /** The bound on the service's close. Defaults to `HARNESS_TIMEOUTS.teardown`. */
+  readonly handleCloseTimeoutMs?: number | undefined;
+}
+
+/**
+ * What {@link releaseHarnessResources} did. The directories are removed only
+ * once the service's shutdown is confirmed — its `close()` resolved — because a
+ * service whose close rejected or is still running may keep its store open in
+ * the temporary home, or its listener bound, and removing the sandbox under it
+ * is exactly the orphan the teardown exists to prevent.
+ */
+export interface HarnessRelease {
+  /**
+   * One line per resource not released now: every rejected close, socket left
+   * open, service close that rejected or overran its bound, directory not
+   * removed — and one `retained …` line per directory kept for an unconfirmed
+   * shutdown. Empty when everything was released.
+   */
+  readonly problems: readonly string[];
+  /** The directories kept because the service's shutdown was not confirmed. */
+  readonly retained: readonly string[];
+  /**
+   * Present only when the service's `close()` was still pending at its bound:
+   * resolves once that close settles, having removed the retained directories
+   * if it resolved, or kept them (and reported so) if it rejected. Never
+   * rejects; `undefined` when nothing was deferred.
+   */
+  readonly deferred: Promise<HarnessStopReport> | undefined;
+}
+
+/** Names one protocol client in a teardown problem line: its position, kind and tab. */
+function describeReleasableClient(client: ReleasableWsClient, index: number): string {
+  const tab = client.identity.tabId === undefined ? '' : `, tab ${String(client.identity.tabId)}`;
+  return `WebSocket client #${String(index + 1)} (${client.identity.client}${tab})`;
+}
+
+/** Removes each directory in turn, guarded on its own; every failure becomes one line. */
+async function removeDirectories(
+  directories: readonly string[],
+  problems: string[],
+): Promise<void> {
+  for (const directory of directories) {
+    try {
+      await removeTempDirectory(directory, problems);
+    } catch (cause) {
+      problems.push(`could not remove ${directory}: ${describeCause(cause)}`);
+    }
+  }
+}
+
+/** One `retained …` problem line per directory kept for an unconfirmed shutdown. */
+function retainedLines(directories: readonly string[], reason: string): string[] {
+  return directories.map((directory) => `retained ${toPosix(resolve(directory))}: ${reason}`);
+}
+
+/** A frozen {@link HarnessStopReport} over `problems`. */
+function stopReport(problems: readonly string[]): HarnessStopReport {
+  const frozen = Object.freeze([...problems]);
+  return Object.freeze({ clean: frozen.length === 0, problems: frozen });
+}
+
+/**
+ * Releases a harness's resources in the order the teardown contract names —
+ * protocol clients, bare sockets, the service, then the directories — and
+ * reports every one it could not release.
+ *
+ * Every step runs whatever happened before it: closes are collected with
+ * `Promise.allSettled`, so one rejected close neither aborts the others nor
+ * skips the service close, and each removal is guarded on its own. The result
+ * is therefore a complete inventory — one line per rejected close (naming the
+ * client or raw socket), per socket left open, for a service close that
+ * rejected or overran its bound, and per directory not removed.
+ *
+ * The directories are removed only after a **confirmed** shutdown: no service,
+ * or a `close()` that resolved within its bound. A close that rejected leaves
+ * the service's state unknown, so its directories are retained and reported,
+ * never removed. A close still pending at its bound retains them too, and
+ * {@link HarnessRelease.deferred} removes them once that close resolves.
+ *
+ * @returns What was released, retained and deferred. Never rejects.
+ *
+ * @example Releasing what a partially started harness acquired
+ * ```ts
+ * const release = await releaseHarnessResources({
+ *   clients,
+ *   rawSockets,
+ *   handle,
+ *   directories: [projectContainer, home],
+ * });
+ * if (release.deferred !== undefined) {
+ *   void release.deferred.then(reportDeferredRelease);
+ * }
+ * ```
+ */
+export async function releaseHarnessResources(
+  resources: HarnessResources,
+): Promise<HarnessRelease> {
+  const problems: string[] = [];
+
+  const clientCloses = await Promise.allSettled(
+    resources.clients.map((client) => attemptClose(() => client.close())),
+  );
+  for (const [index, client] of resources.clients.entries()) {
+    const label = describeReleasableClient(client, index);
+    const outcome = clientCloses[index];
+    if (outcome?.status === 'rejected') {
+      problems.push(`closing ${label} failed: ${describeCause(outcome.reason)}`);
+    }
+    for (const socket of client.sockets) {
+      if (socket.readyState !== NodeWebSocket.CLOSED) {
+        problems.push(`${label} still has a socket in readyState ${String(socket.readyState)}`);
+      }
+    }
+  }
+
+  const rawCloses = await Promise.allSettled(
+    resources.rawSockets.map((raw) => attemptClose(() => raw.close())),
+  );
+  for (const [index, raw] of resources.rawSockets.entries()) {
+    const label = `raw socket #${String(index + 1)}`;
+    const outcome = rawCloses[index];
+    if (outcome?.status === 'rejected') {
+      problems.push(`closing ${label} failed: ${describeCause(outcome.reason)}`);
+    }
+    if (raw.socket.readyState !== NodeWebSocket.CLOSED) {
+      problems.push(`${label} is still in readyState ${String(raw.socket.readyState)}`);
+    }
+  }
+
+  // `confirmed` unless the service's close rejected or overran its bound: only
+  // a close that resolved proves nothing it opened can still use the sandbox.
+  let pendingClose: Promise<void> | undefined;
+  let closeRejected = false;
+  const service = resources.handle;
+  if (service !== undefined) {
+    const timeoutMs = resources.handleCloseTimeoutMs ?? HARNESS_TIMEOUTS.teardown;
+    const closing = attemptClose(() => service.close());
+    try {
+      const closed = await withinDeadline(closing, timeoutMs);
+      if (!closed.done) {
+        pendingClose = closing;
+        problems.push(`ServiceHandle.close() did not resolve within ${String(timeoutMs)} ms`);
+      }
+    } catch (cause) {
+      closeRejected = true;
+      problems.push(`ServiceHandle.close() rejected: ${describeCause(cause)}`);
+    }
+  }
+
+  if (!closeRejected && pendingClose === undefined) {
+    await removeDirectories(resources.directories, problems);
+    return Object.freeze({
+      problems: Object.freeze(problems),
+      retained: Object.freeze([]),
+      deferred: undefined,
+    });
+  }
+
+  const retained = Object.freeze([...resources.directories]);
+  if (closeRejected) {
+    problems.push(
+      ...retainedLines(
+        retained,
+        'the service close rejected, so its shutdown is unconfirmed; remove it by hand once the process has exited',
+      ),
+    );
+    return Object.freeze({ problems: Object.freeze(problems), retained, deferred: undefined });
+  }
+
+  problems.push(
+    ...retainedLines(
+      retained,
+      'the service close is still pending; it is removed once that close resolves',
+    ),
+  );
+  const deferred = (pendingClose ?? Promise.resolve())
+    .then(
+      async (): Promise<HarnessStopReport> => {
+        const later: string[] = [];
+        await removeDirectories(retained, later);
+        return stopReport(later);
+      },
+      (cause: unknown): HarnessStopReport =>
+        stopReport([
+          `ServiceHandle.close() rejected after its bound: ${describeCause(cause)}`,
+          ...retainedLines(
+            retained,
+            'the service close rejected, so its shutdown is unconfirmed; remove it by hand once the process has exited',
+          ),
+        ]),
+    )
+    .catch((cause: unknown) =>
+      stopReport([`releasing after the pending service close failed: ${describeCause(cause)}`]),
+    );
+  return Object.freeze({ problems: Object.freeze(problems), retained, deferred });
+}
+
+/** How long {@link settleLateStart} waits, in milliseconds. */
+export interface LateStartOptions {
+  /** How much longer the start may take to settle. `startHarness` uses `HARNESS_TIMEOUTS.lateStart`. */
+  readonly graceMs: number;
+  /**
+   * How long closing the handle a late start produced may take.
+   * `startHarness` uses `HARNESS_TIMEOUTS.lateStartClose`.
+   */
+  readonly closeTimeoutMs: number;
+}
+
+/**
+ * How a late start's whole lifecycle ended, once it has: whether its shutdown
+ * is confirmed, and every failure along the way.
+ */
+export interface LateStartFinish {
+  /**
+   * `true` only for a confirmed shutdown: `startService` refused (it releases
+   * everything it acquired before returning `Err`), or the handle it produced
+   * closed — its `close()` resolved. A start that rejected, or a handle whose
+   * `close()` rejected, leaves the service's state unknown: `false`.
+   */
+  readonly stopped: boolean;
+  /** One line per failure: a late refusal or rejection, or a close that rejected. */
+  readonly problems: readonly string[];
+}
+
+/** What {@link settleLateStart} established about a start that outlived its boot timeout. */
+export interface LateStartSettlement {
+  /**
+   * `true` when the start's shutdown was confirmed within the bounds (see
+   * {@link LateStartFinish.stopped}): nothing it opened can still write into,
+   * or listen from, the sandbox, so the sandbox may be removed now. `false`
+   * when it may still be running — it has not settled, its close is pending,
+   * or it settled without a confirmed shutdown: the sandbox must then be
+   * retained, and {@link releaseAfterLateStart} removes it only if
+   * {@link LateStartSettlement.finished} eventually confirms the shutdown.
+   */
+  readonly stopped: boolean;
+  /**
+   * One line per failure observed within the bounds: a late rejection or
+   * refusal, a close that rejected, or the start or its close overrunning.
+   */
+  readonly problems: readonly string[];
+  /**
+   * Resolves, with no time bound, once the start has settled and any handle it
+   * produced has finished closing. Never rejects; already resolved when the
+   * start settled and closed within the bounds.
+   */
+  readonly finished: Promise<LateStartFinish>;
+}
+
+/** How a start that outlived its boot timeout ended. */
+type LateStartOutcome =
+  | { readonly kind: 'started'; readonly handle: ReleasableService }
+  | { readonly kind: 'refused'; readonly error: DebuggenError }
+  | { readonly kind: 'rejected'; readonly cause: unknown };
+
+/**
+ * Settles a `startService` call that did not resolve within its boot timeout,
+ * so the caller removes the sandbox only once nothing that start opened can
+ * still use it.
+ *
+ * Both a fulfilment and a rejection handler are attached to `starting` before
+ * anything is awaited, and a rejecting `close()` is caught, so no late
+ * rejection is ever unhandled, whenever it arrives. Then:
+ *
+ * - the start is given `graceMs` more to settle, and a handle it produces
+ *   `closeTimeoutMs` to close; a refusal, or a close that resolved, is a
+ *   confirmed shutdown — `stopped`;
+ * - a start that rejected, or a handle whose close rejected, settled without a
+ *   confirmed shutdown — not `stopped`, and its sandbox is never removed;
+ * - a start (or close) that overruns is not waited for — not `stopped` — and
+ *   {@link LateStartSettlement.finished} is the continuation to hang the
+ *   sandbox's removal on: see {@link releaseAfterLateStart}.
+ *
+ * @returns The settlement. Never rejects.
+ *
+ * @example Releasing a sandbox after a start outlived its boot timeout
+ * ```ts
+ * const late = await settleLateStart(starting, {
+ *   graceMs: HARNESS_TIMEOUTS.lateStart,
+ *   closeTimeoutMs: HARNESS_TIMEOUTS.lateStartClose,
+ * });
+ * if (late.stopped) {
+ *   await releaseHarnessResources({ clients: [], rawSockets: [], handle: undefined, directories });
+ * } else {
+ *   void releaseAfterLateStart(late, directories).then(reportDeferredRelease);
+ * }
+ * ```
+ */
+export async function settleLateStart(
+  starting: Promise<Result<ReleasableService, DebuggenError>>,
+  options: LateStartOptions,
+): Promise<LateStartSettlement> {
+  const outcome = starting.then(
+    (late): LateStartOutcome =>
+      isErr(late)
+        ? { kind: 'refused', error: late.error }
+        : { kind: 'started', handle: late.value },
+    (cause: unknown): LateStartOutcome => ({ kind: 'rejected', cause }),
+  );
+  const finished: Promise<LateStartFinish> = outcome
+    .then(async (late): Promise<LateStartFinish> => {
+      if (late.kind === 'refused') {
+        return lateStartFinish(true, [
+          `startService refused to start after its boot timeout (${late.error.code}): ${late.error.message}`,
+        ]);
+      }
+      if (late.kind === 'rejected') {
+        return lateStartFinish(false, [
+          `startService rejected after its boot timeout: ${describeCause(late.cause)}`,
+        ]);
+      }
+      const handle = late.handle;
+      try {
+        await attemptClose(() => handle.close());
+        return lateStartFinish(true, []);
+      } catch (cause) {
+        return lateStartFinish(false, [
+          `the service that started after its boot timeout did not close: ${describeCause(cause)}`,
+        ]);
+      }
+    })
+    .catch((cause: unknown) =>
+      lateStartFinish(false, [`settling the late start failed: ${describeCause(cause)}`]),
+    );
+
+  const settledInGrace = await withinDeadline(outcome, options.graceMs);
+  if (!settledInGrace.done) {
+    return Object.freeze({
+      stopped: false,
+      problems: Object.freeze([
+        `startService had still not settled ${String(options.graceMs)} ms after its boot timeout`,
+      ]),
+      finished,
+    });
+  }
+  const closedInTime = await withinDeadline(finished, options.closeTimeoutMs);
+  if (!closedInTime.done) {
+    return Object.freeze({
+      stopped: false,
+      problems: Object.freeze([
+        `the service that started after its boot timeout did not close within ${String(options.closeTimeoutMs)} ms`,
+      ]),
+      finished,
+    });
+  }
+  return Object.freeze({
+    stopped: closedInTime.value.stopped,
+    problems: closedInTime.value.problems,
+    finished,
+  });
+}
+
+/** A frozen {@link LateStartFinish}. */
+function lateStartFinish(stopped: boolean, problems: readonly string[]): LateStartFinish {
+  return Object.freeze({ stopped, problems: Object.freeze([...problems]) });
+}
+
+/**
+ * The continuation of a late start {@link settleLateStart} could not confirm
+ * stopped in time: waits, with no bound, for the start to finish and its
+ * handle to close, and removes the directories retained for it only when that
+ * shutdown is confirmed. A start that rejected, or a close that rejected,
+ * leaves them in place, each reported as retained.
+ *
+ * @returns Every failure of the late start and of the removal, plus one
+ *   `retained …` line per directory kept. Never rejects.
+ */
+export async function releaseAfterLateStart(
+  settlement: LateStartSettlement,
+  directories: readonly string[],
+): Promise<HarnessStopReport> {
+  const finish = await settlement.finished;
+  if (!finish.stopped) {
+    return stopReport([
+      ...finish.problems,
+      ...retainedLines(
+        directories,
+        'the late service start ended without a confirmed shutdown; remove it by hand once the process has exited',
+      ),
+    ]);
+  }
+  const removal = await releaseHarnessResources({
+    clients: [],
+    rawSockets: [],
+    handle: undefined,
+    directories,
+  });
+  return stopReport([...finish.problems, ...removal.problems]);
+}
+
+/** The `code` of the process warning a problematic deferred release is reported with. */
+const DEFERRED_RELEASE_WARNING_CODE = 'DEBUGGEN_HARNESS_DEFERRED_RELEASE';
+
+/**
+ * Reports the outcome of a detached release — {@link releaseAfterLateStart},
+ * or the {@link HarnessRelease.deferred} removal behind a pending service
+ * close. Nothing awaits either continuation — the suite has already had its
+ * report — so a process warning, which the worker prints to stderr, is the
+ * channel that keeps a retained directory or an unclosed service visible.
+ */
+function reportDeferredRelease(report: HarnessStopReport): void {
+  if (!report.clean) {
+    process.emitWarning(
+      `A deferred integration-harness release finished with problems:\n- ${report.problems.join('\n- ')}`,
+      { code: DEFERRED_RELEASE_WARNING_CODE },
+    );
+  }
+}
+
+/** Hands a release's deferred removal, when there is one, to {@link reportDeferredRelease}. */
+function watchDeferredRelease(release: HarnessRelease): void {
+  if (release.deferred !== undefined) {
+    void release.deferred.then(reportDeferredRelease);
+  }
+}
+
+/* -------------------------------------------------------------------------------------------------
  * startHarness
  * ---------------------------------------------------------------------------------------------- */
 
@@ -2430,7 +2947,20 @@ async function removeTempDirectory(path: string, problems: string[]): Promise<vo
  * Before resolving, the default fixture project is copied and an editor
  * connection announcing it is authenticated, so the next editor HTTP request is
  * already in scope. A boot that fails part-way releases everything it acquired
- * before rethrowing.
+ * before rethrowing; when that release reports problems, the rethrown error
+ * lists them and carries the original failure as its `cause`.
+ *
+ * A `startService` that outlives `HARNESS_TIMEOUTS.boot` is settled with
+ * {@link settleLateStart} before anything is removed. Unless its shutdown is
+ * confirmed within `HARNESS_TIMEOUTS.lateStart` (and its handle's close within
+ * `HARNESS_TIMEOUTS.lateStartClose`), the temporary home and fixture copies are
+ * retained — the error names them — and {@link releaseAfterLateStart} removes
+ * them only once that shutdown is confirmed.
+ *
+ * Teardown ({@link Harness.stop}, and the release after a failed start) removes
+ * the directories only after the service's `close()` resolved; a close that
+ * rejects or overruns retains them and reports each one (see
+ * {@link releaseHarnessResources}).
  *
  * @throws Error When the configuration is refused, the service does not start
  * within `HARNESS_TIMEOUTS.boot`, or the editor connection is not accepted.
@@ -2441,45 +2971,25 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
   const rawSockets: HarnessRawSocket[] = [];
   const projects: FixtureProjectCopy[] = [];
   let handle: ServiceHandle | undefined;
+  // What the boot-timeout path found before the failure reached the catch below.
+  const startProblems: string[] = [];
+  // Set once a still-running late start owns the directories: they are then
+  // removed by its continuation, never by the catch below.
+  let directoriesHandedOver = false;
 
   // Teardown, in the order the contract names: sockets, the service, then the
-  // directories. Never rejects: every failure becomes one line of the report.
-  const releaseAll = async (): Promise<string[]> => {
-    const problems: string[] = [];
-    await Promise.all(clients.map((client) => client.close()));
-    for (const client of clients) {
-      for (const socket of client.sockets) {
-        if (socket.readyState !== NodeWebSocket.CLOSED) {
-          problems.push(
-            `a ${client.identity.client} socket is still in readyState ${String(socket.readyState)}`,
-          );
-        }
-      }
-    }
-    await Promise.all(rawSockets.map((raw) => raw.close()));
-    for (const raw of rawSockets) {
-      if (raw.socket.readyState !== NodeWebSocket.CLOSED) {
-        problems.push(`a raw socket is still in readyState ${String(raw.socket.readyState)}`);
-      }
-    }
-    if (handle !== undefined) {
-      const service = handle;
-      try {
-        await withTimeout(
-          service.close(),
-          HARNESS_TIMEOUTS.teardown,
-          () =>
-            `ServiceHandle.close() did not resolve within ${String(HARNESS_TIMEOUTS.teardown)} ms`,
-        );
-      } catch (cause) {
-        problems.push(describeCause(cause));
-      }
-    }
-    for (const project of projects) {
-      await removeTempDirectory(project.container, problems);
-    }
-    await removeTempDirectory(home, problems);
-    return problems;
+  // directories (only after a confirmed shutdown). Never rejects: every failure
+  // becomes one line of the report, and a removal deferred behind a pending
+  // service close is reported through `watchDeferredRelease` when it finishes.
+  const releaseAll = async (keepDirectories = false): Promise<readonly string[]> => {
+    const release = await releaseHarnessResources({
+      clients,
+      rawSockets,
+      handle,
+      directories: keepDirectories ? [] : [...projects.map((copy) => copy.container), home],
+    });
+    watchDeferredRelease(release);
+    return release.problems;
   };
 
   try {
@@ -2528,22 +3038,33 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
       now,
       provider: typeof options.provider === 'object' ? options.provider : undefined,
     });
-    let started: Result<ServiceHandle, DebuggenError>;
-    try {
-      started = await withTimeout(
-        starting,
-        HARNESS_TIMEOUTS.boot,
-        () => `startService did not resolve within ${String(HARNESS_TIMEOUTS.boot)} ms`,
+    // A rejection within the boot window rejects here and is released below; a
+    // start that outlives it is settled before anything it may use is removed.
+    const booted = await withinDeadline(starting, HARNESS_TIMEOUTS.boot);
+    if (!booted.done) {
+      const bootTimeout = new Error(
+        `startService did not resolve within ${String(HARNESS_TIMEOUTS.boot)} ms`,
       );
-    } catch (cause) {
-      // A start that outlives the timeout must not leave a listener behind.
-      void starting.then(async (late) => {
-        if (!isErr(late)) {
-          await late.value.close();
-        }
+      const late = await settleLateStart(starting, {
+        graceMs: HARNESS_TIMEOUTS.lateStart,
+        closeTimeoutMs: HARNESS_TIMEOUTS.lateStartClose,
       });
-      throw cause;
+      startProblems.push(...late.problems);
+      if (late.stopped) {
+        throw bootTimeout;
+      }
+      // The late start may still be opening the store in `home` or binding its
+      // listener, or it ended without a confirmed shutdown: removing the
+      // sandbox now could pull it out from under a service that still uses it.
+      const retained = [...projects.map((copy) => copy.container), home];
+      directoriesHandedOver = true;
+      void releaseAfterLateStart(late, retained).then(reportDeferredRelease);
+      throw new Error(
+        `${bootTimeout.message}; its temporary directories are retained until its shutdown is confirmed: ${retained.join(', ')}`,
+        { cause: bootTimeout },
+      );
     }
+    const started = booted.value;
     if (isErr(started)) {
       throw new Error(
         `startService refused to start (${started.error.code}): ${started.error.message}`,
@@ -2833,7 +3354,10 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
         try {
           return await waitUntil(
             async () => {
-              const fetched = await client.request('session.get', { params: { id: sessionId } });
+              const fetched = await client.request('session.get', {
+                params: { id: sessionId },
+                tabId: callOptions?.tabId,
+              });
               if (isErr(fetched)) {
                 throw new Error(
                   `session.get was refused (${fetched.error.code}): ${fetched.error.message}`,
@@ -2907,6 +3431,7 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
           params: { id: sessionId },
           body: {},
           timeoutMs: callOptions?.timeoutMs,
+          tabId: callOptions?.tabId,
         });
       },
       stopCapture: async (sessionId, callOptions) => {
@@ -2915,6 +3440,7 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
           params: { id: sessionId },
           body: {},
           timeoutMs: callOptions?.timeoutMs,
+          tabId: callOptions?.tabId,
         });
       },
       endSession: async (sessionId, callOptions) => {
@@ -2923,6 +3449,7 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
           params: { id: sessionId },
           body: {},
           timeoutMs: callOptions?.timeoutMs,
+          tabId: callOptions?.tabId,
         });
       },
 
@@ -2956,7 +3483,13 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
     }
     return harness;
   } catch (cause) {
-    await releaseAll();
-    throw cause;
+    const problems = [...startProblems, ...(await releaseAll(directoriesHandedOver))];
+    if (problems.length === 0) {
+      throw cause;
+    }
+    throw new Error(
+      `${describeCause(cause)}\nReleasing what the failed start had acquired reported:\n- ${problems.join('\n- ')}`,
+      { cause },
+    );
   }
 }

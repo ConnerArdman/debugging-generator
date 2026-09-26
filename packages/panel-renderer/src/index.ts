@@ -59,7 +59,12 @@
  *    variant union — and never has to reach for the element they stand in for.
  *    The sortable, virtualized, keyboard-navigable `DataTable` and the
  *    `EmptyState`/`LoadingState`/`ErrorState` trio that every data-backed view
- *    needs for its three states are part of that set.
+ *    needs for its three states are part of that set. `Badge` also publishes
+ *    `MODIFICATION_STATUS_TONE`, the one domain-to-tone table shared by both
+ *    surfaces: the editor's `ModificationsList` and the panel's
+ *    `SessionSummary` draw the same journal status, and this package is the
+ *    only module both depend on, so the tone of each status is decided here
+ *    once (see `./primitives/Badge`).
  * 3. **The six layout primitives.** `PanelShell`, the theme root and the one
  *    scroll region a panel has; `Section`, `Split` and `Stack`, which are what
  *    the specification's three container node types render to and the only way
@@ -92,8 +97,11 @@
  *    `matchesPanelSelection`, so every view of one event agrees on what is
  *    selected. `useQuery` is the only module in the
  *    library that calls a provider at all, addressing every query to the
- *    session the host places in `PanelSessionContext`. No component here opens
- *    a socket, calls `fetch` or knows a message name (AAP 0.4.2).
+ *    session the host places in `PanelSessionContext`; `stableQueryKey`, the
+ *    key it identifies a request by, is published beside it so that a host's
+ *    provider coalescing identical in-flight requests uses the same definition
+ *    of "the same request". No component here opens a socket, calls `fetch` or
+ *    knows a message name (AAP 0.4.2).
  *
  * ## What is deliberately not re-exported
  *
@@ -179,13 +187,15 @@ export type { InputControlSize, InputProps } from './primitives/Input';
 export { Select } from './primitives/Select';
 export type { SelectControlSize, SelectOption, SelectProps } from './primitives/Select';
 
-export { Badge } from './primitives/Badge';
+export { Badge, MODIFICATION_STATUS_TONE } from './primitives/Badge';
 export type { BadgeProps, BadgeTone, BadgeVariant } from './primitives/Badge';
 
-export { DataTable } from './primitives/DataTable';
+export { DATA_TABLE_COLUMN_TRACKS, DataTable } from './primitives/DataTable';
 export type {
   DataTableCellMeta,
   DataTableColumn,
+  DataTableColumnTrack,
+  DataTableColumnWidth,
   DataTableProps,
   DataTableSort,
   DataTableSortDirection,
@@ -321,6 +331,7 @@ export type {
 } from './host/registry';
 
 export {
+  bindPanelIdentity,
   checkDataQueryResponse,
   createDataProvider,
   createPanelDataProvider,
@@ -371,5 +382,5 @@ export type {
   ViewSelection,
 } from './host/PanelActions';
 
-export { useQuery } from './host/useQuery';
+export { stableQueryKey, useQuery } from './host/useQuery';
 export type { UseQueryOptions, UseQueryResult } from './host/useQuery';

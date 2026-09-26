@@ -49,11 +49,15 @@
  *
  * The panel has one selected event, owned by the panel host and read here
  * through `useViewSelection` (AAP 0.7.3). The commit control is drawn pressed
- * while the commit is that event. A node the reader activated is still marked
- * as the tree's selected row (`aria-selected`, or `aria-current` in a flat
- * listing, with `dg-is-selected`) — but only until the panel's selection
- * changes, so the tree never shows a selection that contradicts the event
- * every other view and the details drawer show.
+ * while the commit is that event. A node the reader activated is marked as the
+ * tree's selected row (`aria-selected`, or `aria-current` in a flat listing,
+ * with `dg-is-selected`) for as long as the panel's selection is the one that
+ * activation left it with: the node's representative render once the host has
+ * recorded the report, or — for a node that names none — the selection it was
+ * activated beside. Any other selection takes the mark away — and a node whose
+ * render was reported does not reclaim it when the panel later returns to the
+ * selection it was activated under — so the tree never shows a selection that
+ * contradicts the event every other view and the details drawer show.
  *
  * ## Privacy (AAP 0.5.2)
  *
@@ -1345,23 +1349,79 @@ function commitEventRefOf(snapshot: ComponentTreeSnapshot | undefined): PanelEve
 }
 
 /**
- * The node a reader activated, together with the panel's selection as it stood
- * at that moment.
+ * The node a reader activated, the panel's selection as it stood at that
+ * moment, and the selection the activation asked the panel for.
  *
- * A node stands for no event (see {@link commitEventRefOf}), so its selected
- * state cannot be the panel's shared selection — but it must not contradict
- * it either. Recording the selection it was made under is what lets the mark
- * give way: the node stays marked only while the panel's selection is still the
- * one it was activated beside, and the moment any view — or this view's own
- * commit control — selects another event, the tree stops claiming a selection
- * of its own.
+ * A node is an aggregate, so its mark is this view's presentation rather than
+ * the panel's shared selection — but it must never contradict that selection.
+ * Two kinds of activation make the rule concrete:
+ *
+ *   - **A node that names a representative render** reports it with
+ *     `onSelectEvent`, and the panel host records the report as the panel's
+ *     new selection. The selection after the click is therefore that render,
+ *     not the one the node was activated under, and the mark has to survive
+ *     exactly that change. `expected` holds the reported reference, normalised
+ *     as the host records one ({@link selectionOfReference}), and the record
+ *     is **pending** until the panel's selection names that event. While it is
+ *     pending the node stays marked only as long as the selection still names
+ *     the event it was activated under: the window in which a host that drives
+ *     the selection itself — the DevTools panel passes its drawer's
+ *     `selectedEventId`, which its store updates a tick later — still shows the
+ *     previous event. The panel host re-derives that previous id without the
+ *     coordinates it was reported with, which is why the window compares the
+ *     event rather than every coordinate ({@link sameSelectedEvent}). Once the
+ *     selection names the expected event the record is **adopted**: `under`
+ *     becomes that observed selection and `expected` is cleared. Any other
+ *     selection first drops the record, so a later return to the pre-click
+ *     selection cannot bring the mark back.
+ *   - **A node that names none** reports nothing and the panel's selection does
+ *     not move, so its record is settled from the start, `expected` unset.
+ *
+ * A settled record — adopted, or made by a node that names no render — keeps
+ * its mark exactly while the panel's selection is still `under`, compared
+ * coordinate by coordinate ({@link sameSelection}): the moment any view, or
+ * this view's own commit control, selects another event, the tree stops
+ * claiming a selection of its own. See {@link settleNodeSelection} and
+ * {@link isNodeSelectionShown}.
  */
 interface NodeSelection {
   /** The activated node's key. */
   readonly key: string;
 
-  /** The panel's selection when the node was activated, `undefined` for none. */
+  /**
+   * The panel's selection the mark lives beside: the one in force when the
+   * node was activated, replaced by the observed expected selection when a
+   * pending record is adopted. `undefined` for "nothing selected".
+   */
   readonly under: PanelSelection | undefined;
+
+  /**
+   * The selection the activation reported — the node's representative render
+   * — while the panel has not yet shown it; `undefined` once adopted, and for
+   * a node that names no render.
+   */
+  readonly expected: PanelSelection | undefined;
+}
+
+/**
+ * The selection a reported reference becomes once a host records it.
+ *
+ * The id plus only the coordinates present, never a key written with an
+ * `undefined` value — the shape the panel host records for every report and
+ * `useViewSelection` keeps outside a host — so the pending record compares
+ * like with like against the selection the panel then holds.
+ *
+ * @param reference The reference the activation reported.
+ * @returns A fresh selection value.
+ */
+function selectionOfReference(reference: PanelEventRef): PanelSelection {
+  const { eventId, traceId, spanId } = reference;
+
+  return {
+    eventId,
+    ...(traceId === undefined ? {} : { traceId }),
+    ...(spanId === undefined ? {} : { spanId }),
+  };
 }
 
 /**
@@ -1381,6 +1441,75 @@ function sameSelection(a: PanelSelection | undefined, b: PanelSelection | undefi
   }
 
   return a.eventId === b.eventId && a.traceId === b.traceId && a.spanId === b.spanId;
+}
+
+/**
+ * Whether two readings of the panel's selection name the same event, whatever
+ * coordinates each carries.
+ *
+ * The event id is a captured event's identity, and it is all a driven host
+ * re-derives for a selection it has not caught up with, so a pending record
+ * (see {@link NodeSelection}) is judged by it: the previous event shown
+ * without the coordinates it was reported with is still the previous event.
+ *
+ * @param a One reading, `undefined` for "nothing selected".
+ * @param b The other.
+ * @returns `true` when both are absent, or both name the same event id.
+ */
+function sameSelectedEvent(a: PanelSelection | undefined, b: PanelSelection | undefined): boolean {
+  if (a === undefined || b === undefined) {
+    return a === b;
+  }
+
+  return a.eventId === b.eventId;
+}
+
+/**
+ * The node record as the panel's current selection leaves it.
+ *
+ * A pending record whose expected event the panel now shows is adopted, with
+ * the observed selection as the one its mark lives beside; one the panel moved
+ * past before showing its expected event is dropped; everything else is
+ * returned as the very same object, so the caller tells a transition by
+ * identity and writes state only when there is one.
+ *
+ * @param record The record held in state, `undefined` when no node was activated.
+ * @param selection The panel's current selection.
+ * @returns The settled record, or `undefined` when none survives.
+ */
+function settleNodeSelection(
+  record: NodeSelection | undefined,
+  selection: PanelSelection | undefined,
+): NodeSelection | undefined {
+  if (record === undefined || record.expected === undefined) {
+    return record;
+  }
+
+  if (sameSelectedEvent(record.expected, selection)) {
+    return { key: record.key, under: selection, expected: undefined };
+  }
+
+  return sameSelectedEvent(record.under, selection) ? record : undefined;
+}
+
+/**
+ * Whether a record's node is drawn as the selected row under `selection`.
+ *
+ * A pending record is shown while the panel still names the event it was
+ * activated under; a settled one while the panel's selection is still, in
+ * every coordinate, the one it lives beside.
+ *
+ * @param record A record already passed through {@link settleNodeSelection}.
+ * @param selection The panel's current selection.
+ * @returns `true` when the node is marked.
+ */
+function isNodeSelectionShown(
+  record: NodeSelection,
+  selection: PanelSelection | undefined,
+): boolean {
+  return record.expected === undefined
+    ? sameSelection(record.under, selection)
+    : sameSelectedEvent(record.under, selection);
 }
 
 /* ---------------------------------------------------------------------------
@@ -1416,9 +1545,9 @@ export function ComponentTree(props: ComponentTreeProps): ReactElement {
   const { node, className } = props;
   const actions = usePanelActions();
   // The panel's selected event: the host's shared selection, or this view's own
-  // last one when no host is mounted. Only the commit control can stand for an
-  // event, so only it is marked by the selection; a node's own mark gives way
-  // to it (see `NodeSelection`).
+  // last one when no host is mounted. The commit control is marked by it
+  // directly; a node's mark follows the selection its activation left the
+  // panel with, and gives way to any other (see `NodeSelection`).
   const { selection, markSelected } = useViewSelection();
   const baseId = useId();
 
@@ -1487,12 +1616,27 @@ export function ComponentTree(props: ComponentTreeProps): ReactElement {
   const rowElements = useRef<Map<string, HTMLDivElement>>(new Map());
 
   // The node drawn as selected: the one last activated, for exactly as long as
-  // the panel's selection is the one it was activated beside. A selection made
-  // anywhere since supersedes it, so the tree never marks a node while the
-  // panel's selection — the event its details drawer shows — is another one.
+  // the panel's selection is the one that activation left it with — the node's
+  // reported render once the host shows it, the previous event until then, or
+  // the selection it was activated beside for a node that names no render. A
+  // selection made anywhere else supersedes it, so the tree never marks a node
+  // while the panel's selection — the event its details drawer shows — is
+  // another one.
+  //
+  // Adjusting state during render, the documented pattern for local state that
+  // describes an input that changed: the settled record is used by THIS render
+  // as well as written back, and the write happens only on a transition, which
+  // `settleNodeSelection` signals by returning a different object. An effect
+  // would paint one frame with the stale record first.
+  const settledNode = settleNodeSelection(selectedNode, selection);
+
+  if (settledNode !== selectedNode) {
+    setSelectedNode(settledNode);
+  }
+
   const selectedKey =
-    selectedNode !== undefined && sameSelection(selectedNode.under, selection)
-      ? selectedNode.key
+    settledNode !== undefined && isNodeSelectionShown(settledNode, selection)
+      ? settledNode.key
       : undefined;
 
   const rows = projection.rows;
@@ -1556,18 +1700,29 @@ export function ComponentTree(props: ComponentTreeProps): ReactElement {
    *
    * The row becomes the active and the selected one. When its node names a
    * representative render, that reference goes to the host exactly as the datum
-   * holds it, with only the coordinates present; a node that never rendered has
-   * none, so the selection stays inside this view and nothing is reported. It
-   * never toggles a branch — disclosure is the toggle's and the arrow keys' —
-   * and never opens a file, which is the chip's and Shift+Enter's.
+   * holds it, with only the coordinates present, and the record expects the
+   * panel's selection to become it — so the row stays marked when the host
+   * records the report (see `NodeSelection`). Like every other event-bearing
+   * view, the reference is also recorded through `markSelected`: a no-op under
+   * a host, and this view's own selection outside one, so a standalone tree
+   * moves its commit control's pressed state exactly as a hosted one does. A
+   * node that never rendered has no reference, so the selection stays inside
+   * this view and nothing is reported. It never toggles a branch — disclosure
+   * is the toggle's and the arrow keys' — and never opens a file, which is the
+   * chip's and Shift+Enter's.
    */
   const selectRow = (row: TreeRow): void => {
-    setActiveKey(row.node.key);
-    setSelectedNode({ key: row.node.key, under: selection });
-
     const reference = representativeEventRefOf(row.node.datum);
 
+    setActiveKey(row.node.key);
+    setSelectedNode({
+      key: row.node.key,
+      under: selection,
+      expected: reference === undefined ? undefined : selectionOfReference(reference),
+    });
+
     if (reference !== undefined) {
+      markSelected(reference);
       actions?.onSelectEvent(reference);
     }
   };

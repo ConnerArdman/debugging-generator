@@ -13,8 +13,24 @@
       "problemMatcher": ["$tsc"]
     },
     {
+      "label": "build: vscode-extension dependencies",
+      "detail": "First step of `build: vscode-extension`: builds, in topological order, every workspace the extension depends on (`{./apps/vscode-extension}^...`: the eight packages and @debuggen/local-service), because the extension build reads their dist/ outputs — esbuild.mjs bundles the service from source against the packages' dist/ exports and copies packages/telemetry/dist/node/register.mjs — and a fresh `pnpm install` builds none of them. The filter is braced, because a bare directory filter with `^...` or `...` does not select dependencies, and strongly quoted so no shell rewrites the braces (PowerShell reads `{…}` as a script block). It is a task of its own so the extension's build keeps its unprefixed output: a run over several projects prefixes every line with `<dir> build: `, which the esbuild and vite problem matchers of `build: vscode-extension` do not match. Errors here stay in this terminal, and a failure stops the chain before the extension builds.",
+      "type": "shell",
+      "command": "pnpm",
+      "args": [
+        "--filter",
+        { "value": "{./apps/vscode-extension}^...", "quoting": "strong" },
+        "run",
+        "build"
+      ],
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "problemMatcher": []
+    },
+    {
       "label": "build: vscode-extension",
-      "detail": "preLaunchTask of the \"Run Extension\" launch configuration. Builds the extension host (esbuild.mjs --production: dist/extension.js, the embedded service, prompts, schema and preload) and the webview (vite: dist/webview/main.{js,css}). Filters by directory because the extension's package name is `debug-generator`: `--filter @debuggen/vscode-extension` matches no project and exits 0 without building anything.",
+      "detail": "preLaunchTask of the \"Run Extension\" launch configuration and first step of `prepare: Extension + Service`. Runs `build: vscode-extension dependencies` first, so the extension's whole workspace dependency closure is built even on a fresh install, then builds the extension host (esbuild.mjs --production: dist/extension.js, the embedded service, prompts, schema and preload) and the webview (vite: dist/webview/main.{js,css}). Filters by directory because the extension's package name is `debug-generator`: `--filter @debuggen/vscode-extension` matches no project and exits 0 without building anything.",
+      "dependsOn": ["build: vscode-extension dependencies"],
       "type": "shell",
       "command": "pnpm",
       "args": ["--filter", "./apps/vscode-extension", "run", "build"],
@@ -52,14 +68,53 @@
     },
     {
       "label": "build: local-service",
-      "detail": "tsup build of @debuggen/local-service to apps/local-service/dist/main.js, which `node dist/main.js` and the Playwright webServer run.",
+      "detail": "tsup build of @debuggen/local-service to apps/local-service/dist/main.js, which `node dist/main.js` and the Playwright webServer run, preceded by its workspace dependency closure in topological order (the seven packages it imports through their dist/ exports, which a fresh `pnpm install` does not build). The filter is braced, because `./apps/local-service...` without braces selects the service alone, and strongly quoted so no shell rewrites the braces.",
       "type": "shell",
       "command": "pnpm",
-      "args": ["--filter", "@debuggen/local-service", "run", "build"],
+      "args": [
+        "--filter",
+        { "value": "{./apps/local-service}...", "quoting": "strong" },
+        "run",
+        "build"
+      ],
       "options": { "cwd": "${workspaceFolder}" },
       "group": "build",
       "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
       "problemMatcher": ["$tsc"]
+    },
+    {
+      "label": "check: service port free",
+      "detail": "Second step of `prepare: Extension + Service`. Exits 1 with an explanation when something already accepts TCP connections where the \"Debug service\" configuration binds: DEBUGGEN_HOST and DEBUGGEN_PORT (defaults 127.0.0.1 and 43117), read from the environment VS Code passes to both, then from apps/local-service/.env without overriding it, as the service's own dotenv load does. Such a listener would make the debugged service fail to bind while the extension talked to the other process; debug an already running service through the \"Extension + attached service\" compound instead. debuggen.serviceUrl must name the same address, as that setting's description requires. The script concatenates strings instead of using template literals, because VS Code reads a dollar sign followed by a brace in task arguments as one of its own variable references.",
+      "type": "process",
+      "command": "node",
+      "args": [
+        "-e",
+        "const TASK = 'check: service port free: '; try { process.loadEnvFile('.env'); } catch (error) { if (error.code !== 'ENOENT') { console.error(TASK + 'cannot read apps/local-service/.env, which the Debug service loads: ' + error.message); process.exit(1); } } const setting = (key) => { const value = (process.env[key] ?? '').trim(); return value === '' ? undefined : value; }; const host = (setting('DEBUGGEN_HOST') ?? '127.0.0.1').replace(/^\\[(.*)\\]$/, '$1'); const rawPort = setting('DEBUGGEN_PORT') ?? '43117'; const port = /^[+-]?\\d+$/.test(rawPort) ? Number.parseInt(rawPort, 10) : Number.NaN; if (!(port >= 1 && port <= 65535)) { console.error(TASK + 'DEBUGGEN_PORT=' + rawPort + ' is not a fixed TCP port from 1 to 65535. The \"Extension + Service\" compound needs the fixed port that debuggen.serviceUrl names; unset DEBUGGEN_PORT for the default 43117.'); process.exit(1); } const address = (host.includes(':') ? '[' + host + ']' : host) + ':' + port; const socket = require('node:net').connect({ host, port }); socket.setTimeout(5000); socket.once('connect', () => { socket.destroy(); console.error(TASK + 'something already accepts connections on ' + address + ', where the \"Debug service\" configuration binds, so the debugged service could not start and the extension would talk to that listener instead. Stop it (a service started from a terminal or by pnpm dev, or the one the Debug Generator extension of another VS Code window started, which ends with that window), or start that service with --inspect and debug it through the \"Extension + attached service\" compound.'); process.exit(1); }); socket.once('timeout', () => { socket.destroy(); console.error(TASK + address + ' neither accepted nor refused a connection within 5 s, so whether the port is free cannot be told.'); process.exit(1); }); socket.once('error', (error) => { const codes = [error.code, ...(error.errors ?? []).map((cause) => cause.code)].filter(Boolean); if (codes.length > 0 && codes.every((code) => code === 'ECONNREFUSED')) { console.log(TASK + address + ' is free for the Debug service.'); process.exit(0); } console.error(TASK + 'cannot probe ' + address + ': ' + (codes.join(', ') || error.message)); process.exit(1); });"
+      ],
+      "options": { "cwd": "${workspaceFolder}/apps/local-service" },
+      "presentation": { "reveal": "silent", "panel": "dedicated", "clear": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "wait: service healthy",
+      "detail": "preLaunchTask of the hidden \"Run Extension (with Debug service)\" configuration, which the \"Extension + Service\" compound starts beside \"Debug service\". Polls GET /health at the address `check: service port free` resolves until the Debug Generator service answers 200 with its health body (version, protocolVersion, pairingAvailable), so the extension activates against the debugged service and its debuggen.autoStartService probe never starts a second service on the same port. Fails after 120 s (DEBUGGEN_HEALTH_WAIT_TIMEOUT_MS, in milliseconds, overrides that bound for this task only); the \"Debug service\" terminal then shows why the service did not start. It concatenates strings for the same reason as `check: service port free`.",
+      "type": "process",
+      "command": "node",
+      "args": [
+        "-e",
+        "const TASK = 'wait: service healthy: '; try { process.loadEnvFile('.env'); } catch (error) { if (error.code !== 'ENOENT') { console.error(TASK + 'cannot read apps/local-service/.env, which the Debug service loads: ' + error.message); process.exit(1); } } const setting = (key) => { const value = (process.env[key] ?? '').trim(); return value === '' ? undefined : value; }; const host = (setting('DEBUGGEN_HOST') ?? '127.0.0.1').replace(/^\\[(.*)\\]$/, '$1'); const rawPort = setting('DEBUGGEN_PORT') ?? '43117'; const port = /^[+-]?\\d+$/.test(rawPort) ? Number.parseInt(rawPort, 10) : Number.NaN; if (!(port >= 1 && port <= 65535)) { console.error(TASK + 'DEBUGGEN_PORT=' + rawPort + ' is not a fixed TCP port from 1 to 65535. The \"Extension + Service\" compound needs the fixed port that debuggen.serviceUrl names; unset DEBUGGEN_PORT for the default 43117.'); process.exit(1); } const rawTimeout = setting('DEBUGGEN_HEALTH_WAIT_TIMEOUT_MS') ?? '120000'; const timeoutMs = /^\\d+$/.test(rawTimeout) ? Number.parseInt(rawTimeout, 10) : Number.NaN; if (!(Number.isSafeInteger(timeoutMs) && timeoutMs >= 1)) { console.error(TASK + 'DEBUGGEN_HEALTH_WAIT_TIMEOUT_MS=' + rawTimeout + ' is not a positive whole number of milliseconds.'); process.exit(1); } const url = 'http://' + (host.includes(':') ? '[' + host + ']' : host) + ':' + port + '/health'; const deadline = Date.now() + timeoutMs; let nextReport = Date.now() + 10000; let last = 'no answer yet'; const probe = () => fetch(url, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(Math.min(2000, timeoutMs)) }).then(async (response) => { if (response.status !== 200) { last = 'HTTP ' + response.status; await response.body?.cancel(); return false; } const body = await response.json(); if (body !== null && typeof body === 'object' && typeof body.version === 'string' && typeof body.protocolVersion === 'string' && body.protocolVersion !== '' && typeof body.pairingAvailable === 'boolean') { console.log(TASK + url + ' answered: Debug Generator service ' + body.version + ', protocol ' + body.protocolVersion + '.'); return true; } last = 'a body that is not the Debug Generator health response'; return false; }).catch((error) => { last = error?.cause?.code ?? error?.name ?? String(error); return false; }); const poll = () => probe().then((healthy) => { if (healthy) { process.exit(0); } const now = Date.now(); if (now >= deadline) { console.error(TASK + url + ' did not answer as the Debug Generator service within ' + timeoutMs + ' ms (last attempt: ' + last + '). The \"Debug service\" terminal shows why the service did not start.'); process.exit(1); } if (now >= nextReport) { nextReport = now + 10000; console.log(TASK + 'still waiting for ' + url + ' (last attempt: ' + last + ').'); } setTimeout(poll, Math.min(500, deadline - now)); }); console.log(TASK + 'waiting up to ' + timeoutMs + ' ms for ' + url + ' to answer.'); poll();"
+      ],
+      "options": { "cwd": "${workspaceFolder}/apps/local-service" },
+      "presentation": { "reveal": "silent", "panel": "dedicated", "clear": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "prepare: Extension + Service",
+      "detail": "preLaunchTask of the \"Extension + Service\" compound, run once before either session starts: `build: vscode-extension` (the extension and its whole workspace dependency closure, which holds every package the tsx-run \"Debug service\" imports through dist/), then `check: service port free`. The first failure stops the compound before anything launches.",
+      "dependsOn": ["build: vscode-extension", "check: service port free"],
+      "dependsOrder": "sequence",
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "problemMatcher": []
     },
     {
       "label": "watch: extension host",

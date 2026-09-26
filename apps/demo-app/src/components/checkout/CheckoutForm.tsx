@@ -1668,10 +1668,10 @@ export function CheckoutForm({
    * alternative to it: what it publishes comes from session storage, storage cannot be read while
    * rendering - the server has none, so the markup would not be the markup the server sent - and
    * there is nothing to subscribe to, because the record only ever changes as a consequence of
-   * this same component submitting. `react-hooks/set-state-in-effect` is therefore suppressed by
-   * name where it applies, with that reason. The cost is one extra render per mount, on a page
-   * that has finished settling, and only for a buyer who has an unresolved attempt to be told
-   * about.
+   * this same component submitting. That is why this effect sets state, the pattern
+   * `react-hooks/set-state-in-effect` exists to question. The cost is one extra render per mount,
+   * on a page that has finished settling, and only for a buyer who has an unresolved attempt to be
+   * told about.
    */
   useEffect(() => {
     const record = readAttemptRecord();
@@ -1686,7 +1686,6 @@ export function CheckoutForm({
       attempt.current = record.idempotencyKey;
       sent.current = record.draft;
       // A hydration-safe read of session storage; see the note above this effect.
-      // eslint-disable-next-line react-hooks/set-state-in-effect -- storage cannot be read in render
       setFailure(INTERRUPTED);
       // Whether a draft came back is logged and the draft is not: it holds the buyer's contact
       // and address, which have no place in a console.

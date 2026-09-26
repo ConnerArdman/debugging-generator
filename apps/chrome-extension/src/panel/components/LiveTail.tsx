@@ -8,9 +8,18 @@
  * The service pushes `telemetry.tail { sessionId, events }` frames (AAP 0.4.2); the service worker
  * relays them to the panel, `../state/connection` hands each one to the store, and the store keeps
  * the newest {@link LIVE_TAIL_MAX_EVENTS} events in its bounded `liveTail` buffer. The composition
- * root reads that buffer and passes it here as `events`. That buffer is this component's only
- * input: it never queries `POST /sessions/:id/panel-data` (that is `PanelView`'s job, through
- * `PanelHost` and the `DataProvider`), never opens a port or a socket, and never writes the store.
+ * root reads that buffer and passes it here as `events`.
+ *
+ * Beside the events the pane shows the capture's notices — the store's bounded `tailNotices`
+ * slice, which records a same-origin navigation of the bound tab while a capture runs (AAP 0.5.5:
+ * "Application reloads mid-session → event log entry 'Page reloaded during capture'; the same
+ * captureId continues"). A root that has them passes them as `notices`; a root that does not is
+ * served from the store through `usePanelStoreSelector`, a read-only subscription to that one
+ * slice, so the entry appears wherever the pane is mounted.
+ *
+ * Those two slices are this component's only inputs: it never queries
+ * `POST /sessions/:id/panel-data` (that is `PanelView`'s job, through `PanelHost` and the
+ * `DataProvider`), never opens a port or a socket, and never writes the store.
  *
  * Two data paths exist in the panel and they must not be confused. A generated panel's nodes are
  * server-paged queries: the service filters, sorts and pages them, and `DataTable` renders a page
@@ -23,8 +32,13 @@
  * Every event was redacted by the service before it was persisted and again before it was tailed
  * (`apps/local-service/src/telemetry/ingest.ts`). This component renders what arrived: it does not
  * re-redact, log, copy or forward an event anywhere. Its only outbound calls are the two explicit
- * actions, the collapse toggle and the retry. Service-authored notices (a reload during capture, and the like)
- * arrive as ordinary events and are rendered like any other; none is composed here (AAP 0.5.5).
+ * actions, the collapse toggle and the retry.
+ *
+ * A capture notice is data, not wording: the store records its kind, capture, tab, document URL
+ * and time, and this component words it ({@link NOTICE_LABELS}). Of the URL only the path is
+ * shown — the origin is the session's own, since a notice is recorded for same-origin navigations
+ * only, and the query and fragment are left out entirely, so a query value that reached the panel
+ * unredacted is still never displayed (AAP 0.5.2 retains the path).
  *
  * ## Why `actions` is an explicit, required prop
  *
@@ -44,6 +58,8 @@
  *   │   └── Badge                       "Streaming", while a capture is running
  *   └── Stack#region                    the stream region, rendered only while expanded
  *       ├── ErrorState                  a stream failure, with retry when the root offers one
+ *       ├── NoticeList                  the capture's notices, newest first, while there are any:
+ *       │   └── Text[role=listitem]     time, the worded notice as a Badge, the document's path
  *       ├── LoadingState | EmptyState   while no event has arrived
  *       └── TailStream                  while the tail holds events:
  *           ├── Toolbar                 search + kind filter + result statements
@@ -68,7 +84,8 @@
  * ## Accessibility
  *
  * - The collapse control is a real `Button` with `aria-expanded`, and its name states what it
- *   toggles and how many events the tail holds, so the collapsed pane is still informative.
+ *   toggles, how many events the tail holds and how many capture notices it shows, so the
+ *   collapsed pane is still informative.
  * - The grid is `DataTable`'s: one Tab stop, roving focus, arrow keys, Enter/Space to select, exact
  *   row and column counts, and `aria-selected` on the row that matches the selected event. Every
  *   chip inside a cell carries `tabIndex={-1}`, as the grid pattern requires.
@@ -76,21 +93,27 @@
  * - No live region is placed over the stream: it can change many times a second and would flood a
  *   screen reader. The count travels in the collapse control's name instead. `LoadingState` and
  *   `ErrorState` keep their own one-shot announcements.
+ * - The capture notices are a labelled list (`role="list"` on the `Text` block, `role="listitem"`
+ *   on each entry — no primitive renders a list, and the roles keep the count and order announced
+ *   without the markers a raw list would draw). The list is not a live region either; how many
+ *   notices exist is part of the collapse control's name, so a collapsed pane still says so.
  *
  * ## Design-system compliance (AAP 0.6.2, 0.6.4)
  *
  * Every visual value resolves through a renderer component — `Section`, `Stack`, `Button`,
  * `Badge`, `Toolbar`, `DataTable`, `Text`, `DurationCell`, `SourceLink`, `EmptyState`,
  * `LoadingState` and `ErrorState` — and so through the `--dg-*` tokens behind them. This file
- * writes no inline style, no length, no colour and no class name of its own; the grid's column
- * tracks are `ch` and `fr` measures in `DataTable`'s own relational vocabulary.
+ * writes no inline style, no length, no colour and no class name of its own; each grid column
+ * declares a `DataTable` width role for its content, which the primitive resolves to a token-built
+ * track.
  *
  * ## Boundaries
  *
- * No transport, no `chrome.*` API, no store writes and no validation, so the pane renders unchanged
- * when the panel document is opened directly as an extension page with `chrome.devtools`
- * undefined. The copy is generic product vocabulary and names nothing from any inspected
- * application (AAP 0.5.4).
+ * No transport, no `chrome.*` API, no store writes and no validation — the one store read is the
+ * `tailNotices` fallback described above, which yields an empty list in a fresh store — so the
+ * pane renders unchanged when the panel document is opened directly as an extension page with
+ * `chrome.devtools` undefined. The copy is generic product vocabulary and names nothing from any
+ * inspected application (AAP 0.5.4).
  *
  * @module apps/chrome-extension/src/panel/components/LiveTail
  */
@@ -124,7 +147,8 @@ import { assertNever } from '@debuggen/shared';
 import { useCallback, useId, useMemo, useRef, useState } from 'react';
 import type { FocusEvent as ReactFocusEvent, ReactElement, ReactNode } from 'react';
 
-import { LIVE_TAIL_MAX_EVENTS } from '../state/session-store';
+import { LIVE_TAIL_MAX_EVENTS, usePanelStoreSelector } from '../state/session-store';
+import type { PanelSnapshot, PanelTailNotice, PanelTailNoticeKind } from '../state/session-store';
 
 // ---------------------------------------------------------------------------
 // Vocabulary reached through the wire type
@@ -213,6 +237,18 @@ const FAILED_STATUS_LABEL = 'error';
 /** Shown in the time column for a timestamp that cannot be formatted. */
 const UNKNOWN_TIME_LABEL = 'unknown';
 
+/** The capture notices' accessible name; it states their order too. */
+const NOTICES_LABEL = 'Capture notices, newest first';
+
+/**
+ * The entry each capture notice kind renders — the developer-facing wording of AAP 0.5.5. Typed
+ * `Record<PanelTailNoticeKind, string>`, so a kind the store adds is a compile error here rather
+ * than an unworded entry.
+ */
+const NOTICE_LABELS: Readonly<Record<PanelTailNoticeKind, string>> = Object.freeze({
+  'page-reloaded': 'Page reloaded during capture',
+});
+
 /** The column headers, left to right. */
 const TIME_HEADER = 'Time';
 const KIND_HEADER = 'Kind';
@@ -253,9 +289,18 @@ function formatClockTime(epochMs: number): string {
   return Number.isFinite(epochMs) ? TIME_FORMAT.format(epochMs) : UNKNOWN_TIME_LABEL;
 }
 
-/** The collapse control's name: what it toggles, and how many events the tail holds. */
-function collapseLabel(collapsed: boolean, count: number): string {
-  return `${collapsed ? SHOW_VERB : HIDE_VERB} ${PANE_SUBJECT} (${formatCount(count)})`;
+/**
+ * The collapse control's name: what it toggles, how many events the tail holds and, when there
+ * are any, how many capture notices it shows — so a collapsed pane still says a notice exists.
+ */
+function collapseLabel(collapsed: boolean, count: number, noticeCount: number): string {
+  const notices =
+    noticeCount <= 0
+      ? ''
+      : noticeCount === 1
+        ? '; 1 notice'
+        : `; ${formatCount(noticeCount)} notices`;
+  return `${collapsed ? SHOW_VERB : HIDE_VERB} ${PANE_SUBJECT} (${formatCount(count)}${notices})`;
 }
 
 /**
@@ -467,10 +512,12 @@ function eventRowKey(event: TelemetryEvent): string {
  * array across the many re-renders a streaming tail causes.
  *
  * No column is sortable: the tail's order is fixed (see the module note) and `DataTable` never
- * re-orders rows itself. Tracks are `ch` minimums sized for their content, with the two text
- * columns sharing the free width, so a narrow pane scrolls inside the grid instead of overlapping
- * cells. Every chip rendered in a cell carries `tabIndex={-1}`: the grid is one Tab stop and its
- * arrow keys reach the chips.
+ * re-orders rows itself. Each width is the `DataTable` role for the column's content, never a
+ * length: the clock time and the duration are formatted `quantity` measurements, the kind chip a
+ * `label`, and the event name and source chip `name`s, which take the larger shares of the free
+ * width. Every role has a non-zero floor, so a narrow pane scrolls inside the grid instead of
+ * overlapping cells. Every chip rendered in a cell carries `tabIndex={-1}`: the grid is one Tab
+ * stop and its arrow keys reach the chips.
  *
  * @param openSource The explicit click-to-source handler every `SourceLink` receives.
  */
@@ -481,7 +528,7 @@ function buildColumns(
     {
       key: 'time',
       header: TIME_HEADER,
-      width: '14ch',
+      width: 'quantity',
       rowHeader: true,
       sortable: false,
       cell: (event) => (
@@ -493,14 +540,14 @@ function buildColumns(
     {
       key: 'kind',
       header: KIND_HEADER,
-      width: '16ch',
+      width: 'label',
       sortable: false,
       cell: (event) => <Badge tone={KIND_TONE[event.kind]}>{event.kind}</Badge>,
     },
     {
       key: 'name',
       header: NAME_HEADER,
-      width: 'minmax(18ch, 3fr)',
+      width: 'name',
       sortable: false,
       cell: (event) => (
         <>
@@ -514,7 +561,7 @@ function buildColumns(
     {
       key: 'duration',
       header: DURATION_HEADER,
-      width: '11ch',
+      width: 'quantity',
       align: 'end',
       sortable: false,
       cell: (event) => <DurationCell ms={event.duration} severity="auto" size="sm" />,
@@ -522,7 +569,7 @@ function buildColumns(
     {
       key: 'source',
       header: SOURCE_HEADER,
-      width: 'minmax(16ch, 2fr)',
+      width: 'name',
       sortable: false,
       cell: (event) =>
         event.source === undefined ? null : (
@@ -530,6 +577,80 @@ function buildColumns(
         ),
     },
   ];
+}
+
+// ---------------------------------------------------------------------------
+// Capture notices
+// ---------------------------------------------------------------------------
+
+/** The store's capture notices. A module-level selector, so its identity never changes. */
+function selectTailNotices(snapshot: PanelSnapshot): readonly PanelTailNotice[] {
+  return snapshot.tailNotices;
+}
+
+/**
+ * The capture notices as the pane presents them: newest first, like the event rows. The store
+ * keeps them in arrival order, so reversing it is the presentation order. Returns `notices` itself
+ * when it is empty, so an empty list keeps a stable identity.
+ */
+function newestNoticesFirst(notices: readonly PanelTailNotice[]): readonly PanelTailNotice[] {
+  return notices.length === 0 ? notices : notices.toReversed();
+}
+
+/**
+ * The part of a notice's URL the pane shows: the path alone (see the module note on privacy), or
+ * `undefined` for a value that does not parse as a URL, whose entry then shows no path.
+ */
+function noticePath(url: string): string | undefined {
+  try {
+    return new URL(url).pathname;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Props of {@link NoticeList}. */
+interface NoticeListProps {
+  /** The capture notices, newest first. */
+  readonly notices: readonly PanelTailNotice[];
+}
+
+/**
+ * The capture notices as a labelled list. Each entry reads, in order: the time the service
+ * stamped it, on the same clock as the event rows; the worded notice, as an `info` badge whose text
+ * carries the meaning; and the new document's path, truncated with its full value on hover.
+ *
+ * The entries are keyed by the notice's id — the reporting frame's own, unique within the list.
+ * They are spaced by a vertical `Stack` at the scale's smallest step, so two consecutive badges
+ * never touch; its wrappers carry no role, so each entry is still a list item of the list.
+ */
+function NoticeList(props: NoticeListProps): ReactElement {
+  return (
+    <Text as="div" size="xs" role="list" aria-label={NOTICES_LABEL}>
+      <Stack gap={1}>
+        {props.notices.map((notice) => {
+          const path = noticePath(notice.url);
+          return (
+            <Text key={notice.id} as="div" size="xs" role="listitem">
+              <Stack direction="horizontal" gap={2} align="center" wrap>
+                <Text size="xs" numeric>
+                  {formatClockTime(notice.ts)}
+                </Text>
+                <Badge tone="info" variant="soft">
+                  {NOTICE_LABELS[notice.kind]}
+                </Badge>
+                {path === undefined ? null : (
+                  <Text size="xs" tone="secondary" truncate title={path}>
+                    {path}
+                  </Text>
+                )}
+              </Stack>
+            </Text>
+          );
+        })}
+      </Stack>
+    </Text>
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -867,10 +988,11 @@ function TailStream(props: TailStreamProps): ReactElement {
  * Props of {@link LiveTail}.
  *
  * Everything arrives from the composition root: the store's tail buffer and capture flag, the
- * collapsed flag the root keeps as presentation-only state, the panel's actions and selection, and
- * an optional stream failure with its retry. Every optional member states `| undefined` explicitly
- * because `exactOptionalPropertyTypes` is on repository-wide and a root forwarding a value it may
- * not have must stay legal.
+ * collapsed flag the root keeps as presentation-only state, the panel's actions and selection, the
+ * capture notices (read from the store when the root omits them), and an optional stream failure
+ * with its retry. Every optional member states `| undefined` explicitly because
+ * `exactOptionalPropertyTypes` is on repository-wide and a root forwarding a value it may not have
+ * must stay legal.
  */
 export interface LiveTailProps {
   /**
@@ -904,6 +1026,13 @@ export interface LiveTailProps {
    */
   droppedCount?: number | undefined;
 
+  /**
+   * The capture's notices (`PanelSnapshot.tailNotices`), oldest first, as the store keeps them.
+   * Rendered newest first above the stream body; never mutated. Omitted, the pane reads the
+   * store's `tailNotices` slice itself (see the module note).
+   */
+  notices?: readonly PanelTailNotice[] | undefined;
+
   /** A failure of the stream itself, rendered as an error state — never as an empty stream. */
   error?: { message: string } | undefined;
 
@@ -916,7 +1045,8 @@ export interface LiveTailProps {
 
 /**
  * Renders the live tail: the always-visible header bar with the collapse control, and — while
- * expanded — the stream region with its failure, loading, empty or filtered-grid body.
+ * expanded — the stream region with its failure, the capture notices, and its loading, empty or
+ * filtered-grid body.
  *
  * @param props The props documented on {@link LiveTailProps}.
  * @returns The pane.
@@ -926,6 +1056,7 @@ export interface LiveTailProps {
  * <LiveTail
  *   events={snapshot.liveTail}
  *   droppedCount={snapshot.liveTailDropped}
+ *   notices={snapshot.tailNotices}
  *   capturing={snapshot.capture.active}
  *   collapsed={tailCollapsed}
  *   onToggleCollapsed={toggleTail}
@@ -942,10 +1073,17 @@ export function LiveTail(props: LiveTailProps): ReactElement {
     actions,
     selected,
     droppedCount,
+    notices,
     error,
     onRetry,
     className,
   } = props;
+
+  // The root's notices when it passes them, the store's otherwise. The hook runs either way, as a
+  // hook must; selecting the slice itself keeps its reference, so it re-renders the pane only when
+  // the store's notices change.
+  const storeNotices = usePanelStoreSelector(selectTailNotices);
+  const shownNotices = notices ?? storeNotices;
 
   const regionId = useId();
   const [searchText, setSearchText] = useState('');
@@ -962,6 +1100,7 @@ export function LiveTail(props: LiveTailProps): ReactElement {
   // tailed batch, many times a second, and the grid's virtualizer should see a new row array only
   // when the rows actually changed — and a new column array never, while the handler is stable.
   const tail = useMemo(() => newestFirstUnique(events), [events]);
+  const orderedNotices = useMemo(() => newestNoticesFirst(shownNotices), [shownNotices]);
   const offered = useMemo(() => offeredKinds(tail, kindFilter), [tail, kindFilter]);
   const options = useMemo(() => kindOptions(offered), [offered]);
   const columns = useMemo(() => buildColumns(openSource), [openSource]);
@@ -1066,7 +1205,7 @@ export function LiveTail(props: LiveTailProps): ReactElement {
           aria-controls={collapsed ? undefined : regionId}
           onClick={onToggleCollapsed}
         >
-          {collapseLabel(collapsed, count)}
+          {collapseLabel(collapsed, count, orderedNotices.length)}
         </Button>
         {capturing ? (
           <Badge tone="info" variant="soft">
@@ -1077,6 +1216,7 @@ export function LiveTail(props: LiveTailProps): ReactElement {
       {collapsed ? null : (
         <Stack id={regionId} gap={2}>
           {failure}
+          {orderedNotices.length === 0 ? null : <NoticeList notices={orderedNotices} />}
           {content}
         </Stack>
       )}

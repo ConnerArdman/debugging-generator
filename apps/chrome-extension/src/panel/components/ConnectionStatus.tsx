@@ -12,23 +12,33 @@
  *                        nothing for the developer to do;
  *   not-paired           the pill and a "Pair…" control that asks the composition root to open
  *                        `PairDialog` (AAP 0.5.6);
- *   service-not-running  the pill and, when the composition root supplies one, the command that
- *                        starts the local service, rendered through `Code` so it can be copied.
+ *   service-not-running  the pill and a visible recovery line (AAP 0.7.3, "Service not running
+ *                        with the start command"): always the VS Code action, named by its
+ *                        command-palette title "Debug Generator: Start Local Service", and, when
+ *                        the composition root supplies one, the shell command that starts the
+ *                        local service, rendered verbatim through `Code` so it can be copied.
  *
  * When the inspected tab navigated away from the session's origin (a `tab-left` binding), the
  * notice built by `formatTabLeftMessage(origin)` is rendered beside the pill. Every state also
- * carries a one-sentence explanation and recovery hint in a `Tooltip`.
+ * carries a one-sentence explanation and recovery hint in a `Tooltip`; the hint restates the
+ * recovery line rather than replacing it, because a tooltip is reachable only on demand and a
+ * developer whose service is down must see the remedy without hovering.
  *
  * ## Wording
  *
  * The status labels and the "Tab left ‹origin›" sentence are imported from
  * `../../shared/messages` and never re-authored here: the service worker's connection pushes and
  * `panelConnectionStatus()` speak the same vocabulary, and a second copy would drift from it. The
- * only copy in this file is generic product vocabulary — the pairing control's label, the lead-in
- * of the start command and the tooltip hints — naming VS Code commands by their contributed
- * titles and nothing from any inspected application (AAP 0.5.4). `../../shared/messages` exports
- * no start-command constant, so the command arrives as the optional `serviceStartCommand` prop and
- * nothing is rendered in its place when it is absent; no command or URL is composed here.
+ * only copy in this file is generic product vocabulary — the pairing control's label, the
+ * service-down recovery sentence and the tooltip hints — naming VS Code commands by their
+ * contributed titles and nothing from any inspected application (AAP 0.5.4). The start-service
+ * action is named by its full command-palette title, category plus title as
+ * `apps/vscode-extension/package.json` contributes them, which is the string a developer types
+ * into the palette. `../../shared/messages` exports no start-command constant, so the shell
+ * command arrives as the optional `serviceStartCommand` prop; when it is absent or blank the
+ * recovery line still names the VS Code action and simply ends there, so the service-down state
+ * is never left without a visible remedy. The command is displayed as given: nothing here
+ * parses, composes or extends a command or a URL.
  *
  * ## Accessibility (AAP 0.6.4)
  *
@@ -45,6 +55,10 @@
  *   through `aria-labelledby` (a `status` role takes no name from its content), and the hint
  *   reaches assistive technology through the `aria-describedby` the `Tooltip` merges onto it. The
  *   tooltip bubble renders outside the live region, so opening it is not announced as a change.
+ * - **The recovery line is read, not re-announced.** The service-down sentence sits beside the
+ *   live region, outside it, as plain text in document order: the region announces the change to
+ *   "Service not running", and the remedy is there to be read without being spoken again on
+ *   every status push.
  * - **The pairing control is a real button.** A renderer `Button` (`type="button"`) with
  *   `aria-haspopup="dialog"` and, when the owner reports it, `aria-expanded` for the dialog's
  *   visibility. Every focus shows the renderer's token ring from its global `:focus-visible` rule.
@@ -66,16 +80,22 @@
  * intent callback: the one-time code is typed into `PairDialog`, the credential is kept by the
  * service worker in `chrome.storage.local`, and neither ever passes through this file.
  *
- * @example Wiring from the composition root:
+ * @example Wiring from the composition root, with the shell command the developer can run
+ * instead of the VS Code action (omit `serviceStartCommand` and the line names the VS Code
+ * action alone):
  * ```tsx
  * const connection = usePanelConnection();
  * <ConnectionStatus
  *   status={connection.status}
  *   binding={connection.binding}
  *   serviceUrl={connection.serviceUrl}
+ *   serviceStartCommand="node apps/local-service/dist/main.js"
  *   pairingDialogOpen={pairOpen}
  *   onRequestPairing={() => setPairOpen(true)}
  * />
+ * // In the service-not-running state this renders, beside the "Service not running" pill:
+ * // Start it from VS Code with Debug Generator: Start Local Service, or run
+ * // `node apps/local-service/dist/main.js` from the Debug Generator repository root.
  * ```
  *
  * @module apps/chrome-extension/src/panel/components/ConnectionStatus
@@ -97,17 +117,31 @@ import type { PanelConnectionSlice } from '../state/session-store';
 /** The label of the control that asks the composition root to open the pairing dialog. */
 const PAIR_ACTION_LABEL = 'Pair…';
 
-/** The lead-in rendered before the service's start command. */
-const START_COMMAND_LEAD = 'Start it with';
+/**
+ * The command-palette title of the VS Code command that starts the local service
+ * (`debuggen.startService`): the category and title `apps/vscode-extension/package.json`
+ * contributes, joined the way the palette shows them. Rendered unquoted and emphasised in the
+ * visible recovery line, and quoted in the tooltip hint, where it sits inside a plain sentence.
+ */
+const START_SERVICE_PALETTE_TITLE = 'Debug Generator: Start Local Service';
+
+/** The words before the palette title in the service-down recovery line. */
+const START_SERVICE_LEAD = 'Start it from VS Code with';
+
+/** The words between the palette title and the shell command, when a command is supplied. */
+const START_COMMAND_LEAD = ', or run';
+
+/** The words after the shell command, which close the recovery sentence. */
+const START_COMMAND_TRAIL = 'from the Debug Generator repository root.';
+
+/** The punctuation that closes the recovery sentence when no shell command is supplied. */
+const START_SERVICE_TRAIL = '.';
 
 /** How the hints name the service the panel talks to. */
 const SERVICE_NAME = 'the local Debug Generator service';
 
 /** The contributed title of the VS Code command that issues a one-time pairing code. */
 const PAIR_COMMAND_TITLE = '“Pair Chrome DevTools Panel”';
-
-/** The contributed title of the VS Code command that starts the local service. */
-const START_SERVICE_COMMAND_TITLE = '“Start Local Service”';
 
 /** The message of the render-time guard for a status outside the imported vocabulary. */
 const UNHANDLED_STATUS_MESSAGE = 'Unhandled panel connection status';
@@ -167,8 +201,11 @@ export interface ConnectionStatusProps {
   pairingDialogOpen?: boolean | undefined;
 
   /**
-   * The command that starts the local service, shown through `Code` beside the
-   * `service-not-running` pill. Nothing is rendered in its place when it is absent or blank.
+   * The shell command that starts the local service, shown verbatim (surrounding whitespace
+   * trimmed) through `Code` in the `service-not-running` recovery line, as the alternative to the
+   * VS Code action. Never parsed, composed or extended here. The VS Code "Debug Generator: Start
+   * Local Service" action renders regardless: absent or blank, the recovery line names that
+   * action alone.
    */
   serviceStartCommand?: string | undefined;
 
@@ -228,9 +265,13 @@ function bindingNotice(binding: PanelBindingState | undefined): string | undefin
 /**
  * The tooltip hint for a status: what the state means and how to recover from it.
  *
+ * For `service-not-running` the hint restates the visible recovery line — the same palette
+ * title, and the shell command only when that line shows one — so the two never disagree; the
+ * line, not the hint, is what carries the remedy (see {@link renderRecoveryAction}).
+ *
  * @param status The pill's state.
  * @param serviceUrl The service base URL the worker is trying, when known and non-blank.
- * @param hasStartCommand Whether the start command is rendered beside the pill.
+ * @param hasStartCommand Whether the recovery line beside the pill shows a shell command.
  * @returns One or two plain sentences; never interactive content.
  */
 function describeStatus(
@@ -247,9 +288,10 @@ function describeStatus(
     case 'not-paired':
       return `This panel is not paired with the local service yet. Run ${PAIR_COMMAND_TITLE} in VS Code, then choose ${PAIR_ACTION_LABEL} and enter the one-time code it shows.`;
     case 'service-not-running': {
+      const action = `Run “${START_SERVICE_PALETTE_TITLE}” in VS Code`;
       const remedy = hasStartCommand
-        ? `Run ${START_SERVICE_COMMAND_TITLE} in VS Code or the start command shown here`
-        : `Run ${START_SERVICE_COMMAND_TITLE} in VS Code`;
+        ? `${action}, or run the command shown beside this status from the Debug Generator repository root`
+        : action;
       return `${capitalize(service)} is not answering. ${remedy}; this panel reconnects automatically once it is up.`;
     }
     default:
@@ -265,10 +307,22 @@ function capitalize(text: string): string {
 /**
  * The control or detail a status renders beside the pill, if any.
  *
+ * `service-not-running` always renders its recovery line, so the remedy is visible rather than
+ * tooltip-only (AAP 0.7.3). It is one inline `Text` run, so the sentence wraps as prose inside
+ * the header's wrapping `Stack` and its punctuation stays attached to the words it follows:
+ *
+ *   without a command  Start it from VS Code with **Debug Generator: Start Local Service**.
+ *   with a command     Start it from VS Code with **Debug Generator: Start Local Service**, or
+ *                      run `‹command›` from the Debug Generator repository root.
+ *
+ * The palette title is a nested `Text` at the medium weight and primary tone, so it stands out
+ * from the secondary-tone sentence through tokens alone; the command is a `Code` fragment so it
+ * reads, and copies, as the literal it is.
+ *
  * @param status The pill's state.
  * @param onRequestPairing The pairing intent callback.
  * @param pairingDialogOpen The dialog's visibility, when the owner reports it.
- * @param startCommand The non-blank start command, when supplied.
+ * @param startCommand The non-blank shell command that starts the service, when supplied.
  * @returns The recovery affordance, or `null` when the state needs none.
  */
 function renderRecoveryAction(
@@ -296,13 +350,20 @@ function renderRecoveryAction(
         </Button>
       );
     case 'service-not-running':
-      return startCommand === undefined ? null : (
-        <Stack direction="horizontal" gap={1} align="baseline" wrap>
-          <Text size="sm" tone="secondary">
-            {START_COMMAND_LEAD}
+      return (
+        <Text size="sm" tone="secondary">
+          {START_SERVICE_LEAD}{' '}
+          <Text size="sm" tone="primary" weight="medium">
+            {START_SERVICE_PALETTE_TITLE}
           </Text>
-          <Code size="sm">{startCommand}</Code>
-        </Stack>
+          {startCommand === undefined ? (
+            START_SERVICE_TRAIL
+          ) : (
+            <>
+              {START_COMMAND_LEAD} <Code size="sm">{startCommand}</Code> {START_COMMAND_TRAIL}
+            </>
+          )}
+        </Text>
       );
     default:
       return assertNever(status, UNHANDLED_STATUS_MESSAGE);

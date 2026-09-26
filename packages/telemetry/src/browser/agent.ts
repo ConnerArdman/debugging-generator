@@ -71,18 +71,67 @@
  * again, which is deliberate: code patched during the session may still be
  * loaded in the page, and an inert helper serves it at zero cost.
  *
- * **Only the extension can drive either transition.** `agent.config` reaches
- * {@link applyConfig} from one place — `./transport.js`'s inbound channel — and
- * that channel is authenticated: every frame the bridge posts carries a
- * per-document secret the agent minted and disclosed over a `CustomEvent`
- * inside the `document_start` window, before any script the page loads has run
- * (see `./transport.ts`'s handshake section, which is where both sides of it
- * are defined). A page script can still post a frame that satisfies every
- * structural check — its own window, its own origin, the published source tag,
- * the current channel version, a known frame type — and it is dropped for want
- * of the token, so neither arming a signal nor tearing a live capture down is
- * something page script can do. Nothing in this file re-checks that; the guard
- * belongs to the module that owns the channel, and this one treats a delivered
+ * **Only the extension drives either transition — against page scripts.**
+ * `agent.config` reaches {@link applyConfig} from one place —
+ * `./transport.js`'s inbound channel — and that channel is private: its frames
+ * travel as events on a detached DOM node the transport created at
+ * `document_start` and handed to the bridge, once, in answer to the bridge's
+ * handshake request, before any script the page loads has run (see
+ * `./transport.ts`'s overview, which is where both sides of it are defined).
+ * Nothing is carried on `window`, so a page script can neither read a frame nor
+ * inject one: a forged `agent.config` posted or dispatched on the page's own
+ * window never reaches this module, and neither arming a signal nor tearing a
+ * live capture down is something a page script can do.
+ *
+ * Nor can a page script reach the code that handles a delivered frame. This
+ * bundle shares the page's realm, so any built-in it calls after
+ * `document_start` is whatever the page has since put there; the control path
+ * therefore decides nothing with one. The transport's subscriber delivery, and
+ * this module's {@link handleInbound}, {@link parseConfig}, {@link applyConfig},
+ * {@link arm} and {@link disarm} decisions, run only on intrinsics
+ * `./transport.ts` captured at evaluation, null-prototype records and
+ * operators over this module's own frozen tables (see that module's "Core
+ * intrinsics and page-proof primitives"). No replaced `Array.from`, `Set` or
+ * `Map` method, iterator, `Array.prototype.some`/`filter`/`push`,
+ * `Array.isArray`, `Number.isSafeInteger` or `Function.prototype.call` is ever
+ * handed one of those functions or the configuration, or asked a question
+ * whose answer decides whether the agent arms, which capture it stamps or
+ * which hooks it attaches. Nothing published on `globalThis.__DEBUGGEN__`
+ * leads to them, and the IIFE puts no module export on any global.
+ *
+ * The limits are stated in the same place, and they are real:
+ *
+ * - **Code that ran before the agent** — another extension's MAIN-world
+ *   `document_start` script, an automation init script — is as privileged in
+ *   the page as the agent and is not something any in-page channel can
+ *   exclude.
+ * - **The signal producers' in-page hooks.** The producers
+ *   (`./interaction.ts`, `./react.ts`, `./fetch.ts`, `./perf.ts`,
+ *   `./errors.ts`, `./state.ts`, `./continuation.ts`, `./dom-target.ts`)
+ *   install listeners, observers and patches through the page's built-ins
+ *   when they are attached, and reset through them; a page that rewrites
+ *   those built-ins can keep a signal from attaching, or stop or distort what
+ *   it records. The failure is contained and reported as that producer's,
+ *   and the decision to arm or disarm is unaffected.
+ * - **Document lifecycle events.** The `pagehide`, `pageshow` and
+ *   `visibilitychange` listeners do not tell a synthetic event from a real
+ *   one, so a page that dispatches its own `pagehide` gets an early flush and
+ *   releases element description (the one document-scoped family) until the
+ *   next `pageshow`. No capture-scoped signal is affected.
+ * - **Timers and the console.** The single React re-check is scheduled with
+ *   the page's `setTimeout`, which is therefore handed a callback that can
+ *   only re-check for React and re-announce `agent.ready`. When the service
+ *   sets `debug: true`, {@link debugLog} writes through the page's
+ *   `console.debug`, which receives a data summary of a decision already
+ *   made — the ids it carries are the ones `__DEBUGGEN__.config` publishes.
+ * - **The page's own behaviour.** A page script can still drive
+ *   `__DEBUGGEN__.span`, replace the diagnostic copy of the configuration
+ *   published there (which nothing reads back), and cause real interactions,
+ *   renders and requests.
+ *
+ * What this agent reports is evidence about the page's behaviour, never a
+ * tamper-proof measurement. Nothing in this file re-checks the channel; the
+ * guard belongs to the module that owns it, and this one treats a delivered
  * frame's *payload* as untrusted data exactly as it always has
  * ({@link parseConfig} reads it structurally and {@link publishedConfig} is
  * what reaches the page-visible global).
@@ -99,10 +148,12 @@
  * Two races shape the rest of this file, and both are the Chrome extension's
  * doing rather than accidents:
  *
- * - **The bridge may not be listening yet.** The MAIN-world agent and the
- *   isolated-world bridge are two content scripts injected at the same moment,
- *   with no guaranteed relative order. `./transport.js` therefore buffers, and
- *   a `bridge.ready` frame is the cue to re-announce.
+ * - **The bridge may not be listening yet.** The MAIN-world agent is injected
+ *   first and announces itself before the isolated-world bridge has asked for
+ *   the channel, and the bridge's runtime port comes and goes with the service
+ *   worker. `./transport.js` therefore dispatches nothing until the handshake,
+ *   buffers events while the bridge is away and keeps a batch the bridge did
+ *   not claim, and a `bridge.ready` frame is the cue to re-announce.
  * - **A configuration can arrive at any time.** After a same-origin
  *   navigation, `apps/chrome-extension/src/background/agent-control.ts`
  *   re-sends the live `agent.config` so the same `captureId` continues across
@@ -202,14 +253,19 @@ import {
 } from './span-helper.js';
 import { attachState, detachState, isStateAttached, resetStateCounters } from './state.js';
 import {
+  appendValue,
   boundControlText,
   configureTransport,
+  createNullRecord,
+  defineOwnValue,
   emit,
   flush,
+  isArrayValue,
   nowEpochMs,
   postControl,
   reportProducerFailure,
   resetTransport,
+  serializeFrameJson,
   subscribe,
 } from './transport.js';
 import type { BridgeInboundMessage, EventDraft, ProducerFailureSource } from './transport.js';
@@ -646,6 +702,15 @@ const HOOK_BINDINGS: Readonly<Record<HookName, HookBinding>> = Object.freeze({
   },
 });
 
+/*
+ * The two tables below are derived once, while the bundle is evaluated at
+ * `document_start` — before any script the page loads, so the `filter` that
+ * builds them is still the platform's. From then on they, {@link HOOK_FLAGS},
+ * {@link HOOK_NAMES}, {@link HOOK_ALIASES} and every `requestedBy` list are
+ * frozen arrays that the control path reads only by index (see "The control
+ * path runs on nothing the page can replace" below).
+ */
+
 /** The families armed and released with a capture, in attach order. */
 const CAPTURE_HOOK_NAMES: readonly HookName[] = Object.freeze(
   HOOK_NAMES.filter((name) => HOOK_BINDINGS[name].scope === 'capture'),
@@ -750,8 +815,14 @@ let componentTreeRefusalReported = false;
  * hook every time it is asked, and re-attempting on each re-sent
  * configuration would reset that module's counters and re-report the same
  * unavailable signal for the life of the capture.
+ *
+ * A null-prototype membership record (`name in failedHooks`), replaced rather
+ * than cleared: membership here decides whether {@link arm} attempts a hook,
+ * and a `Set` answers through `Set.prototype.has`/`add`/`clear`, which a page
+ * can replace to make every genuine configuration skip — or throw on — the
+ * hooks it asked for.
  */
-const failedHooks = new Set<HookName>();
+let failedHooks: Partial<Record<HookName, true>> = createNullRecord();
 
 /**
  * Hooks already announced as unreleased, for the current capture.
@@ -765,8 +836,10 @@ const failedHooks = new Set<HookName>();
  * Cleared when the capture changes rather than on disarm — which is what makes
  * "once per capture" true across the disarm that ends the capture and any
  * repeat of it — so the next capture on this document announces afresh.
+ *
+ * A null-prototype membership record, for the reason {@link failedHooks} is.
  */
-const reportedUnreleasedHooks = new Set<HookName>();
+let reportedUnreleasedHooks: Partial<Record<HookName, true>> = createNullRecord();
 
 /**
  * The `pagehide` listener, once registered.
@@ -930,9 +1003,12 @@ function readLocationHref(): string {
  *
  * Arrays are rejected: every record this module reads is a keyed bag, and an
  * array reaching one of them is a malformed frame rather than an empty bag.
+ * The array test is `./transport.js`'s captured `Array.isArray`: the page's
+ * own answers "yes" to anything once replaced, which would make every genuine
+ * configuration parse as "no record" — the disarm request.
  */
 function readRecord(value: unknown): Record<string, unknown> | undefined {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+  if (typeof value !== 'object' || value === null || isArrayValue(value)) {
     return undefined;
   }
   return value as Record<string, unknown>;
@@ -943,9 +1019,27 @@ function readString(value: unknown): string | undefined {
   return typeof value === 'string' && value.length > 0 ? value : undefined;
 }
 
-/** A positive, finite, safe integer, or `undefined`. */
+/**
+ * `Number.MAX_SAFE_INTEGER`, read while the bundle is evaluated.
+ *
+ * The property itself is neither writable nor configurable, but the `Number`
+ * binding it is read through is a page global like any other.
+ */
+const MAX_SAFE_INTEGER = Number.MAX_SAFE_INTEGER;
+
+/**
+ * A positive, finite, safe integer, or `undefined`.
+ *
+ * Operators only — `Number.isSafeInteger` is the page's to replace, and one
+ * that answers `false` would silently drop every tree bound the service sent.
+ * `value % 1 === 0` holds exactly for finite integers (for `NaN` and the
+ * infinities it is `NaN`), so together with the range test this is
+ * `Number.isSafeInteger(value) && value > 0`.
+ */
 function readPositiveInteger(value: unknown): number | undefined {
-  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined;
+  return typeof value === 'number' && value > 0 && value <= MAX_SAFE_INTEGER && value % 1 === 0
+    ? value
+    : undefined;
 }
 
 /**
@@ -962,6 +1056,40 @@ function readFlag(value: unknown): boolean {
 /*
  * ---------------------------------------------------------------------------
  * Configuration parsing
+ *
+ * The control path runs on nothing the page can replace.
+ *
+ * Everything from here to {@link handleInbound} — parsing a configuration,
+ * deciding which families it asks for, arming, disarming and announcing what
+ * could not be done — runs after the page's own scripts, in the page's realm.
+ * `./transport.ts` ("Core intrinsics and page-proof primitives") explains what
+ * that exposes: a replaced `Array.prototype.some` can answer "no hook
+ * requested" to every genuine configuration, a replaced array iterator can
+ * make an attach loop attach nothing, a replaced `Set.prototype.clear` can
+ * throw out of the arming sequence, and any of them is handed whatever the
+ * agent passes it. So this module's side of the path follows the same rules:
+ *
+ * - **Tables are frozen arrays read by index.** {@link HOOK_FLAGS},
+ *   {@link HOOK_NAMES}, {@link HOOK_ALIASES}, {@link CAPTURE_HOOK_NAMES} and
+ *   every `requestedBy` list, walked with `for (let i = 0; …)`: no iterator,
+ *   no `some`, `filter`, `map`, `reverse` or spread.
+ * - **State is null-prototype records.** The parsed configuration's `hooks`,
+ *   the membership records {@link failedHooks} and
+ *   {@link reportedUnreleasedHooks}, and every intermediate record, come from
+ *   `createNullRecord()` — never a `Set` or `Map`, and never an ordinary
+ *   object an `Object.prototype` accessor could intercept a write to.
+ * - **Lists are filled with `appendValue()`**, which defines each element
+ *   rather than calling `push`.
+ * - **What is left is captured or an operator.** `Array.isArray` through
+ *   `isArrayValue()`, the safe-integer test as arithmetic, strings joined with
+ *   `+`.
+ * - **The payload is null-prototype all the way down.** `./transport.ts`
+ *   revives every record of an accepted frame onto a null prototype, so a
+ *   read of a missing key, and `in`, see only what the bridge sent.
+ *
+ * What still runs on the page's built-ins is named in {@link applyConfig}:
+ * the producers' own attach, detach and reset code, which this module calls
+ * but does not own.
  * ---------------------------------------------------------------------------
  */
 
@@ -969,10 +1097,11 @@ function readFlag(value: unknown): boolean {
  * Lift the three protocol fields out of a relayed payload.
  *
  * @param record The payload as an object, or `undefined` when it was not one.
- * @returns The structural mirror, with only the keys that were present.
+ * @returns The structural mirror, with only the keys that were present, on a
+ * null prototype so a field left out stays absent.
  */
 function readInboundConfig(record: Record<string, unknown> | undefined): InboundAgentConfig {
-  const config: InboundAgentConfig = {};
+  const config = createNullRecord<InboundAgentConfig>();
   if (record === undefined) {
     return config;
   }
@@ -999,11 +1128,17 @@ function readInboundConfig(record: Record<string, unknown> | undefined): Inbound
  * is fully populated before the assertion reads it. Writing the seven keys out
  * by hand instead would let a flag added to the vocabulary be silently missing
  * from a record built this way.
+ *
+ * On a null prototype and walked by index: this record is what {@link arm}
+ * reads to decide which families a configuration asks for.
  */
 function flagRecord(predicate: (flag: HookFlag) => boolean): Record<HookFlag, boolean> {
-  const state: Partial<Record<HookFlag, boolean>> = {};
-  for (const flag of HOOK_FLAGS) {
-    state[flag] = predicate(flag);
+  const state = createNullRecord<Partial<Record<HookFlag, boolean>>>();
+  for (let index = 0; index < HOOK_FLAGS.length; index += 1) {
+    const flag = HOOK_FLAGS[index];
+    if (flag !== undefined) {
+      state[flag] = predicate(flag);
+    }
   }
   return state as Record<HookFlag, boolean>;
 }
@@ -1014,13 +1149,40 @@ function flagRecord(predicate: (flag: HookFlag) => boolean): Record<HookFlag, bo
  * The family counterpart of {@link flagRecord}, and total for the same reason.
  * Used for the state snapshot {@link getAgentState} publishes, which reports
  * all eight families rather than only the ones a capture happened to ask for.
+ * An ordinary object — it is handed to diagnostics and tests, which may
+ * compare it strictly — whose members are defined rather than assigned, so an
+ * `Object.prototype` setter cannot keep one out of it.
  */
 function familyRecord(predicate: (name: HookName) => boolean): Record<HookName, boolean> {
   const state: Partial<Record<HookName, boolean>> = {};
-  for (const name of HOOK_NAMES) {
-    state[name] = predicate(name);
+  for (let index = 0; index < HOOK_NAMES.length; index += 1) {
+    const name = HOOK_NAMES[index];
+    if (name !== undefined) {
+      defineOwnValue(state, name, predicate(name));
+    }
   }
   return state as Record<HookName, boolean>;
+}
+
+/**
+ * Whether any alias of one flag is set to exactly `true` in a relayed record.
+ *
+ * The indexed form of `HOOK_ALIASES[flag].some(…)`: that call would hand the
+ * page's `Array.prototype.some` both the alias list and a closure over the
+ * relayed hooks, and let its answer decide whether the signal is armed.
+ *
+ * @param hooks The relayed `hooks` record.
+ * @param flag The flag.
+ */
+function isFlagSet(hooks: Record<string, unknown>, flag: HookFlag): boolean {
+  const aliases = HOOK_ALIASES[flag];
+  for (let index = 0; index < aliases.length; index += 1) {
+    const alias = aliases[index];
+    if (alias !== undefined && readFlag(hooks[alias])) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /**
@@ -1066,16 +1228,22 @@ function parseConfig(payload: unknown): ParsedAgentConfig {
   const hooksRecord = config.hooks;
 
   const hooks = flagRecord((flag) =>
-    hooksRecord === undefined
-      ? false
-      : HOOK_ALIASES[flag].some((alias) => readFlag(hooksRecord[alias])),
+    hooksRecord === undefined ? false : isFlagSet(hooksRecord, flag),
   );
+
+  const enabled: HookFlag[] = [];
+  for (let index = 0; index < HOOK_FLAGS.length; index += 1) {
+    const flag = HOOK_FLAGS[index];
+    if (flag !== undefined && hooks[flag]) {
+      appendValue(enabled, flag);
+    }
+  }
 
   return {
     sessionId: readString(config.sessionId),
     captureId: readString(config.captureId),
     hooks,
-    enabled: HOOK_FLAGS.filter((flag) => hooks[flag]),
+    enabled,
     debug: readFlag(record?.['debug']),
     tree: readTreeBounds(record),
   };
@@ -1091,9 +1259,9 @@ function parseConfig(payload: unknown): ParsedAgentConfig {
  * unchanged, for any page script to read back. Nothing in this bundle ever read
  * them, so the mirror gave an attacker no capability; what it gave was a
  * page-writable, page-readable slot inside the agent's own published surface,
- * which is not a thing a diagnostic should be. `./transport.js`'s handshake now
- * keeps a page-forged frame from reaching this module at all, and this
- * projection is the second half of the same argument: even a legitimate
+ * which is not a thing a diagnostic should be. `./transport.js`'s private
+ * channel now keeps a page-forged frame from reaching this module at all, and
+ * this projection is the second half of the same argument: even a legitimate
  * configuration is published as the decisions this module *took*, never as the
  * bytes it was handed.
  *
@@ -1109,16 +1277,37 @@ function parseConfig(payload: unknown): ParsedAgentConfig {
  * - **A copy, not a view.** `hooks`, `enabled` and `tree` are rebuilt rather
  *   than referenced, so a page that mutates `__DEBUGGEN__.config.tree.maxNodes`
  *   is mutating its own copy and not the bounds {@link arm} stored.
+ * - **Built on the control path's rules.** Ordinary objects, because the
+ *   value is for the page and its console, but copied by index from the frozen
+ *   flag table with every member defined rather than assigned — no spread (an
+ *   array spread runs the page's iterator, and a throwing one would abort the
+ *   configuration it was publishing).
  *
  * @param config The configuration as {@link parseConfig} read it.
  * @returns The value to publish, safe to hand to a page-visible global.
  */
 function publishedConfig(config: ParsedAgentConfig): PublishedAgentConfig {
+  const hooks: Partial<Record<HookFlag, boolean>> = {};
+  for (let index = 0; index < HOOK_FLAGS.length; index += 1) {
+    const flag = HOOK_FLAGS[index];
+    if (flag !== undefined) {
+      defineOwnValue(hooks, flag, config.hooks[flag]);
+    }
+  }
+
+  const enabled: HookFlag[] = [];
+  for (let index = 0; index < config.enabled.length; index += 1) {
+    const flag = config.enabled[index];
+    if (flag !== undefined) {
+      appendValue(enabled, flag);
+    }
+  }
+
   return {
     sessionId: config.sessionId ?? null,
     captureId: config.captureId ?? null,
-    hooks: { ...config.hooks },
-    enabled: [...config.enabled],
+    hooks: hooks as Record<HookFlag, boolean>,
+    enabled,
     debug: config.debug,
     tree: {
       maxNodes: config.tree.maxNodes ?? null,
@@ -1159,7 +1348,19 @@ function isHookAttached(name: HookName): boolean {
  */
 function isHookRequested(name: HookName, hooks: Readonly<Record<HookFlag, boolean>>): boolean {
   const binding = HOOK_BINDINGS[name];
-  return binding.scope === 'capture' && binding.requestedBy.some((flag) => hooks[flag]);
+  if (binding.scope !== 'capture') {
+    return false;
+  }
+  // By index over the frozen list, never `requestedBy.some(…)`: this answer is
+  // the arming decision itself.
+  const flags = binding.requestedBy;
+  for (let index = 0; index < flags.length; index += 1) {
+    const flag = flags[index];
+    if (flag !== undefined && hooks[flag]) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /**
@@ -1261,7 +1462,33 @@ function detachHook(name: HookName): void {
 
 /** The armed families, in {@link HOOK_NAMES} order. */
 function attachedHookNames(): HookName[] {
-  return HOOK_NAMES.filter((name) => isHookAttached(name));
+  const attached: HookName[] = [];
+  for (let index = 0; index < HOOK_NAMES.length; index += 1) {
+    const name = HOOK_NAMES[index];
+    if (name !== undefined && isHookAttached(name)) {
+      appendValue(attached, name);
+    }
+  }
+  return attached;
+}
+
+/**
+ * The members of a hook list joined with `', '`, for a diagnostic sentence.
+ *
+ * `Array.prototype.join` is the page's; this is the same text built with `+`.
+ *
+ * @param names The names, in order.
+ * @returns The joined text; empty for an empty list.
+ */
+function joinNames(names: readonly string[]): string {
+  let text = '';
+  for (let index = 0; index < names.length; index += 1) {
+    const name = names[index];
+    if (name !== undefined) {
+      text += index === 0 ? name : `, ${name}`;
+    }
+  }
+  return text;
 }
 
 /**
@@ -1274,8 +1501,11 @@ function attachedHookNames(): HookName[] {
  * than failing the sequence.
  */
 function attachDocumentHooks(): void {
-  for (const name of DOCUMENT_HOOK_NAMES) {
-    attachHook(name);
+  for (let index = 0; index < DOCUMENT_HOOK_NAMES.length; index += 1) {
+    const name = DOCUMENT_HOOK_NAMES[index];
+    if (name !== undefined) {
+      attachHook(name);
+    }
   }
 }
 
@@ -1288,8 +1518,11 @@ function attachDocumentHooks(): void {
  * document comes back.
  */
 function detachDocumentHooks(): void {
-  for (const name of [...DOCUMENT_HOOK_NAMES].reverse()) {
-    detachHook(name);
+  for (let index = DOCUMENT_HOOK_NAMES.length - 1; index >= 0; index -= 1) {
+    const name = DOCUMENT_HOOK_NAMES[index];
+    if (name !== undefined) {
+      detachHook(name);
+    }
   }
 }
 
@@ -1379,20 +1612,28 @@ interface UnavailableSignal {
  * applies.
  */
 function enabledSignalNames(): HookFlag[] {
-  const attached = new Set<HookFlag>();
+  const attached = createNullRecord<Partial<Record<HookFlag, true>>>();
 
-  for (const name of HOOK_NAMES) {
-    const signal = HOOK_SIGNALS[name];
-    if (signal !== undefined && isHookAttached(name)) {
-      attached.add(signal);
+  for (let index = 0; index < HOOK_NAMES.length; index += 1) {
+    const name = HOOK_NAMES[index];
+    const signal = name === undefined ? undefined : HOOK_SIGNALS[name];
+    if (name !== undefined && signal !== undefined && isHookAttached(name)) {
+      attached[signal] = true;
     }
   }
 
   if (componentTreeRequested && isHookAttached('react')) {
-    attached.add('componentTree');
+    attached.componentTree = true;
   }
 
-  return HOOK_FLAGS.filter((flag) => attached.has(flag));
+  const signals: HookFlag[] = [];
+  for (let index = 0; index < HOOK_FLAGS.length; index += 1) {
+    const flag = HOOK_FLAGS[index];
+    if (flag !== undefined && flag in attached) {
+      appendValue(signals, flag);
+    }
+  }
+  return signals;
 }
 
 /**
@@ -1411,12 +1652,24 @@ function reportUnavailableSignals(entries: readonly UnavailableSignal[]): void {
     return;
   }
 
+  const signals: string[] = [];
+  const unavailable: UnavailableSignal[] = [];
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index];
+    if (entry !== undefined) {
+      appendValue(signals, entry.signal);
+      // A copy, as before: object spread copies own data properties without
+      // calling anything the page can replace.
+      appendValue(unavailable, { ...entry });
+    }
+  }
+
   postControl('agent.error', {
     code: 'hooks-unavailable',
-    message: `the page agent could not enable: ${entries.map((entry) => entry.signal).join(', ')}`,
+    message: `the page agent could not enable: ${joinNames(signals)}`,
     sessionId: armedSessionId ?? null,
     captureId: armedCaptureId ?? null,
-    unavailable: entries.map((entry) => ({ ...entry })),
+    unavailable,
     enabled: enabledSignalNames(),
   });
 }
@@ -1437,16 +1690,24 @@ function reportUnavailableFamilies(failures: readonly HookName[]): void {
     return;
   }
 
+  const families: { family: HookName; reason: string; hint: string }[] = [];
+  for (let index = 0; index < failures.length; index += 1) {
+    const family = failures[index];
+    if (family !== undefined) {
+      appendValue(families, {
+        family,
+        reason: HOOK_FAILED_REASON,
+        hint: HOOK_UNAVAILABLE_HINTS[family],
+      });
+    }
+  }
+
   postControl('agent.error', {
     code: 'agent-family-unavailable',
-    message: `the page agent could not arm: ${failures.join(', ')}`,
+    message: `the page agent could not arm: ${joinNames(failures)}`,
     sessionId: armedSessionId ?? null,
     captureId: armedCaptureId ?? null,
-    families: failures.map((family) => ({
-      family,
-      reason: HOOK_FAILED_REASON,
-      hint: HOOK_UNAVAILABLE_HINTS[family],
-    })),
+    families,
     enabled: enabledSignalNames(),
   });
 }
@@ -1464,13 +1725,21 @@ function reportUnavailableHooks(failures: readonly HookName[]): void {
   const signals: UnavailableSignal[] = [];
   const families: HookName[] = [];
 
-  for (const name of failures) {
-    const signal = HOOK_SIGNALS[name];
-    if (signal === undefined) {
-      families.push(name);
+  for (let index = 0; index < failures.length; index += 1) {
+    const name = failures[index];
+    if (name === undefined) {
       continue;
     }
-    signals.push({ signal, reason: HOOK_FAILED_REASON, hint: HOOK_UNAVAILABLE_HINTS[name] });
+    const signal = HOOK_SIGNALS[name];
+    if (signal === undefined) {
+      appendValue(families, name);
+      continue;
+    }
+    appendValue(signals, {
+      signal,
+      reason: HOOK_FAILED_REASON,
+      hint: HOOK_UNAVAILABLE_HINTS[name],
+    });
   }
 
   reportUnavailableSignals(signals);
@@ -1569,30 +1838,44 @@ const HOOK_UNRELEASED_HINTS: Readonly<Record<HookName, string>> = Object.freeze(
  * or that still hold a registration, are announced.
  */
 function reportUnreleasedHooks(candidates: readonly HookName[]): void {
-  const unreleased = candidates.filter(
-    (name) => (isHookAttached(name) || hookHasResidue(name)) && !reportedUnreleasedHooks.has(name),
-  );
+  const unreleased: HookName[] = [];
+  for (let index = 0; index < candidates.length; index += 1) {
+    const name = candidates[index];
+    if (
+      name !== undefined &&
+      (isHookAttached(name) || hookHasResidue(name)) &&
+      !(name in reportedUnreleasedHooks)
+    ) {
+      appendValue(unreleased, name);
+    }
+  }
 
   if (unreleased.length === 0) {
     return;
   }
 
-  for (const name of unreleased) {
-    reportedUnreleasedHooks.add(name);
-  }
-
-  postControl('agent.error', {
-    code: 'hooks-not-released',
-    message: `the page agent could not release: ${unreleased.join(', ')}`,
-    sessionId: armedSessionId ?? null,
-    captureId: armedCaptureId ?? null,
-    unreleased: unreleased.map((signal) => ({
+  const entries: { signal: HookName; reason: string; hint: string }[] = [];
+  for (let index = 0; index < unreleased.length; index += 1) {
+    const signal = unreleased[index];
+    if (signal === undefined) {
+      continue;
+    }
+    reportedUnreleasedHooks[signal] = true;
+    appendValue(entries, {
       signal,
       reason: isHookAttached(signal)
         ? 'the hook still reports itself attached after detach'
         : 'the hook stopped observing but the page kept a registration it could not remove',
       hint: HOOK_UNRELEASED_HINTS[signal],
-    })),
+    });
+  }
+
+  postControl('agent.error', {
+    code: 'hooks-not-released',
+    message: `the page agent could not release: ${joinNames(unreleased)}`,
+    sessionId: armedSessionId ?? null,
+    captureId: armedCaptureId ?? null,
+    unreleased: entries,
     enabled: attachedHookNames(),
   });
 }
@@ -1644,9 +1927,11 @@ function reactIsRegistered(): boolean {
  * Post an `agent.ready` frame describing this document.
  *
  * Posted unconditionally, including when the bridge has not announced itself:
- * `./transport.js` sends a control frame straight to the window regardless of
- * its buffering state, and a frame posted before the bridge's listener existed
- * is simply lost — which is what `bridge.ready` re-announcement covers.
+ * `./transport.js` dispatches a control frame on the channel regardless of its
+ * buffering state, dispatches nothing at all before the bridge has asked for
+ * the channel (the announcement made at `document_start` is one of those), and
+ * counts a frame the bridge did not claim as lost — all of which is what the
+ * `bridge.ready` re-announcement covers.
  *
  * **The payload is exactly these five fields, and nothing may be added to it
  * here.** AAP 0.4.2 defines `agent.ready` as
@@ -1775,12 +2060,13 @@ function subscribeToBridge(): void {
 /**
  * Re-establish the inbound channel after a transport reset.
  *
- * `resetTransport()` clears the transport's subscriber set and removes its
- * `message` listener, which is exactly the "hold nothing" state a disarm asks
- * for — and would also leave the agent deaf to the next `agent.config`. The
- * stale unsubscribe is dropped and the dormant channel is re-made, so a second
- * capture on the same document is possible; the transport marks the bridge
- * present again on the first frame it accepts.
+ * `resetTransport()` clears the transport's subscriber registry and removes its
+ * listener on the channel node, which is exactly the "hold nothing" state a
+ * disarm asks for — and would also leave the agent deaf to the next
+ * `agent.config`. The stale unsubscribe is dropped and the listener re-made on
+ * the same, document-scoped node the bridge already holds, so a second capture
+ * on the same document is possible without a second handshake; the transport
+ * marks the bridge present again on the first frame it accepts.
  */
 function resubscribeToBridge(): void {
   unsubscribeBridge = undefined;
@@ -1916,29 +2202,44 @@ const MAX_TREE_WALK_NODES = 50_000;
  * Iterative rather than recursive because the input is a tree whose depth is
  * bounded by a value the *service* chose: a recursive count would put that
  * number on the page's call stack.
+ *
+ * It runs inside {@link disarm}, so it follows the control path's rules: the
+ * pending nodes are a chain of null-prototype links rather than an array
+ * (`push`/`pop` would hand every node to the page), children are recognised
+ * with the captured `Array.isArray` and walked by index.
  */
 function countTreeNodes(root: ComponentTreeNode): number {
-  let count = 0;
-  const stack: ComponentTreeNode[] = [root];
+  interface PendingNode {
+    node: ComponentTreeNode;
+    next: PendingNode | undefined;
+  }
 
-  while (stack.length > 0) {
-    const node = stack.pop();
-    if (node === undefined) {
-      break;
-    }
+  const first = createNullRecord<PendingNode>();
+  first.node = root;
+  first.next = undefined;
+
+  let count = 0;
+  let pending: PendingNode | undefined = first;
+  while (pending !== undefined) {
+    const { node } = pending;
+    pending = pending.next;
 
     count += 1;
     if (count >= MAX_TREE_WALK_NODES) {
       break;
     }
 
-    const children = node.children;
-    if (!Array.isArray(children)) {
+    const children: unknown = node.children;
+    if (!isArrayValue(children)) {
       continue;
     }
-    for (const child of children) {
+    for (let index = 0; index < children.length; index += 1) {
+      const child = children[index];
       if (typeof child === 'object' && child !== null) {
-        stack.push(child);
+        const link = createNullRecord<PendingNode>();
+        link.node = child as ComponentTreeNode;
+        link.next = pending;
+        pending = link;
       }
     }
   }
@@ -1946,11 +2247,18 @@ function countTreeNodes(root: ComponentTreeNode): number {
   return count;
 }
 
-/** `JSON.stringify`, behind a guard, returning `undefined` on any refusal. */
+/**
+ * The tree as JSON text, behind a guard, returning `undefined` on any refusal.
+ *
+ * Rendered by `./transport.js`'s `serializeFrameJson`, the serializer every
+ * frame goes through, never by `JSON.stringify`: the text travels inside an
+ * attribute of a frame the agent dispatches, and a `toJSON` the page installed
+ * on `Object.prototype` would otherwise read the tree and choose that text.
+ */
 function serializeTree(tree: ComponentTreeNode): string | undefined {
   try {
-    const text = JSON.stringify(tree);
-    return typeof text === 'string' && text.length > 0 ? text : undefined;
+    const text = serializeFrameJson(tree);
+    return text.length > 0 ? text : undefined;
   } catch {
     // Unreachable for a tree `./react.ts` built — it carries primitives and
     // arrays only — and guarded because this runs at capture stop.
@@ -2211,11 +2519,13 @@ function maybeEmitComponentTreeSnapshot(trigger: string, bounds: TreeBounds): bo
  *    module's own `armedCaptureId`, and the transport's session and capture,
  *    are written after steps 1 and 2 rather than before them — the ordering is
  *    a safety property. Everything before this point leaves the outgoing
- *    capture's identity in force, so a step that failed would abort the
- *    transition with nothing mis-attributed and with `armedCaptureId` still
- *    naming the old capture, which makes the next `agent.config` — the same one
- *    the service worker re-sends — retry the whole transition instead of
- *    treating it as already done. Publishing first would leave the transport
+ *    capture's identity in force. The resets of step 1 are the producers' own
+ *    code and run on the page's built-ins (a `Map` or `Set` cleared through
+ *    its prototype), so each runs in its own guard: one that throws is
+ *    reported as that producer's failure and costs only its per-capture
+ *    counters. Aborting instead would hand a page that broke one such method a
+ *    veto over every capture on the document, since the re-sent configuration
+ *    would fail the same way each time. Publishing first would leave the transport
  *    stamping capture B while a producer was still recording under capture A's
  *    generation, which is the leak steps 1 and 2 exist to close. The transport
  *    is still told before any hook attaches, which is what that ordering
@@ -2248,27 +2558,34 @@ function maybeEmitComponentTreeSnapshot(trigger: string, bounds: TreeBounds): bo
  * own `is…Attached()` predicates and against {@link armedCaptureId}, never
  * against a diff of the raw payload, so the same configuration applied twice
  * changes nothing and a subset detaches exactly the families it dropped.
+ *
+ * Every decision here runs on the control path's rules (see "Configuration
+ * parsing"): the family lists are walked by index, membership lives in
+ * null-prototype records, and the lists handed to the reports are filled with
+ * `appendValue()`. What the page's built-ins can still affect is what each
+ * producer's own `attach`/`detach`/reset does with them — see
+ * {@link applyConfig}.
  */
 function arm(config: ParsedAgentConfig): void {
   const captureChanged = config.captureId !== armedCaptureId;
 
   if (captureChanged) {
-    failedHooks.clear();
-    reportedUnreleasedHooks.clear();
+    failedHooks = createNullRecord();
+    reportedUnreleasedHooks = createNullRecord();
     componentTreeRefusalReported = false;
     // Requests already on the wire belong to the capture that has just ended,
     // so they are reported to it first — as in-flight snapshots, while the
     // transport still stamps the outgoing capture (see step 1 of this
     // function's documentation). `reportInFlightRequests` never throws.
-    reportInFlightRequests();
+    resetProducer('fetch', reportInFlightRequests);
     // Nothing detaches here — the developer is still capturing requests, and
     // `./fetch.js` keeps both patches installed — so the producer generation is
     // advanced instead, which makes every in-flight record stale: no event, no
     // continuation settle, no counter movement.
-    advanceFetchGeneration();
-    resetReactCounters();
-    resetStateCounters();
-    resetContinuations();
+    resetProducer('fetch', advanceFetchGeneration);
+    resetProducer('react', resetReactCounters);
+    resetProducer('state', resetStateCounters);
+    resetProducer(undefined, resetContinuations);
   }
 
   // The capture identity goes in with the arming, not just the `true`: the
@@ -2308,38 +2625,54 @@ function arm(config: ParsedAgentConfig): void {
   // document. Every producer's `detach()` is documented idempotent and
   // non-throwing, so asking twice costs nothing and is the only way the
   // retained cleanup is ever completed.
+  //
+  // Walked backwards by index over the frozen list: detach order is the
+  // reverse of attach order (see {@link disarm}).
   const released: HookName[] = [];
-  for (const name of reversedHookNames()) {
-    if (!isHookRequested(name, config.hooks)) {
+  for (let index = CAPTURE_HOOK_NAMES.length - 1; index >= 0; index -= 1) {
+    const name = CAPTURE_HOOK_NAMES[index];
+    if (name !== undefined && !isHookRequested(name, config.hooks)) {
       detachHook(name);
-      released.push(name);
+      appendValue(released, name);
     }
   }
 
   const failures: HookName[] = [];
-  for (const name of CAPTURE_HOOK_NAMES) {
-    if (!isHookRequested(name, config.hooks) || isHookAttached(name) || failedHooks.has(name)) {
+  for (let index = 0; index < CAPTURE_HOOK_NAMES.length; index += 1) {
+    const name = CAPTURE_HOOK_NAMES[index];
+    if (
+      name === undefined ||
+      !isHookRequested(name, config.hooks) ||
+      isHookAttached(name) ||
+      name in failedHooks
+    ) {
       continue;
     }
     if (!attachHook(name)) {
-      failedHooks.add(name);
-      failures.push(name);
+      failedHooks[name] = true;
+      appendValue(failures, name);
     }
   }
 
   // Both announcements are made here, after the attach loop, so that the
   // `enabled` list each frame carries is what the capture is actually
   // continuing with (AAP 0.5.5's "Continuing with: ‹enabled list›") rather
-  // than a mid-arm snapshot taken before the new hooks were armed.
-  reportUnreleasedHooks(released);
-  reportUnavailableHooks(failures);
+  // than a mid-arm snapshot taken before the new hooks were armed. Each in its
+  // own guard: the capture is armed by now, and a report that could not be
+  // assembled must not stop the next one.
+  attempt(() => {
+    reportUnreleasedHooks(released);
+  });
+  attempt(() => {
+    reportUnavailableHooks(failures);
+  });
 
   // The tree is taken at capture stop, so a request that cannot be met is
   // worth saying now: the developer is about to reproduce their problem, and
   // "the tree is missing" is not something to learn from an empty panel node
   // afterwards.
   if (componentTreeRequested && !isHookAttached('react')) {
-    reportComponentTreeRefused();
+    attempt(reportComponentTreeRefused);
   }
 
   debugLog('armed', {
@@ -2397,16 +2730,25 @@ function arm(config: ParsedAgentConfig): void {
  * the installed hook, the inert helper, element description, the bridge
  * subscription and the flush listeners — none of which observes the
  * developer's application.
+ *
+ * Returning to dormant is the transition a page would most like to prevent
+ * (or to force), so every step before the reset stands in its own guard and
+ * the whole sequence runs on the control path's rules (see "Configuration
+ * parsing"): nothing a page replaced can stop the transport from being reset
+ * or {@link armedCaptureId} from being cleared.
  */
 function disarm(): void {
   const wasArmed = armedCaptureId !== undefined;
 
-  maybeEmitComponentTreeSnapshot('capture-stop', treeBounds);
+  attempt(() => {
+    maybeEmitComponentTreeSnapshot('capture-stop', treeBounds);
+  });
 
   // Requests still on the wire, reported to the capture that is ending before
   // anything detaches or resets: see step 2 of this function's documentation.
-  // `reportInFlightRequests` never throws.
-  reportInFlightRequests();
+  // `reportInFlightRequests` never throws; the guard is for the producer's
+  // own use of the page's built-ins.
+  resetProducer('fetch', reportInFlightRequests);
 
   try {
     flush();
@@ -2418,9 +2760,13 @@ function disarm(): void {
   // Every hook, whatever it says about itself: see the same loop in
   // {@link arm} for why an unattached hook is still asked to detach. A
   // producer holding residue from a teardown the page refused reports itself
-  // unattached, and this call is its only chance to try again.
-  for (const name of reversedHookNames()) {
-    detachHook(name);
+  // unattached, and this call is its only chance to try again. Reverse attach
+  // order, by index over the frozen list.
+  for (let index = CAPTURE_HOOK_NAMES.length - 1; index >= 0; index -= 1) {
+    const name = CAPTURE_HOOK_NAMES[index];
+    if (name !== undefined) {
+      detachHook(name);
+    }
   }
 
   // Before `resetTransport()` below, and deliberately: a family still holding
@@ -2428,15 +2774,19 @@ function disarm(): void {
   // developer's page, and the frame that says so is only useful if it still
   // carries the session and capture it belongs to. Every capture-scoped family
   // is a candidate here because a detach was asked of every one of them.
-  reportUnreleasedHooks(CAPTURE_HOOK_NAMES);
+  attempt(() => {
+    reportUnreleasedHooks(CAPTURE_HOOK_NAMES);
+  });
 
   resetSpanStack();
   setSpanHelperEnabled(false);
-  configureTransport({ enabled: false });
+  // Every field stated, so the transport reads three own properties and none
+  // is left for a prototype accessor to answer.
+  configureTransport({ sessionId: undefined, captureId: undefined, enabled: false });
   resetTransport();
   resubscribeToBridge();
 
-  failedHooks.clear();
+  failedHooks = createNullRecord();
   armedSessionId = undefined;
   armedCaptureId = undefined;
   componentTreeRequested = false;
@@ -2455,15 +2805,47 @@ function disarm(): void {
 }
 
 /**
- * The capture-scoped families in detach order.
+ * Run one producer's per-capture reset in its own guard, and say so if it
+ * fails.
  *
- * A fresh array, because {@link CAPTURE_HOOK_NAMES} is frozen — and
- * capture-scoped only, because the document-scoped families are released by
- * {@link detachDocumentHooks} when the document goes away rather than when a
- * capture ends.
+ * The resets {@link arm} and {@link disarm} call — clearing a request registry,
+ * a render-count map, a transition budget — are the producers' own code and
+ * reach the page's `Map`/`Set` methods. A page that made one of those throw
+ * must cost that producer its per-capture state, reported as a
+ * `producer-failure` frame, and never the transition itself (see step 3 of
+ * {@link arm}).
+ *
+ * @param source The producer the failure is reported under, or `undefined`
+ * for a family with no producer source (see {@link HOOK_FAILURE_SOURCES}).
+ * @param reset The producer's reset, called directly.
  */
-function reversedHookNames(): HookName[] {
-  return [...CAPTURE_HOOK_NAMES].reverse();
+function resetProducer(source: ProducerFailureSource | undefined, reset: () => unknown): void {
+  try {
+    reset();
+  } catch (error) {
+    if (source !== undefined) {
+      reportProducerFailure(source, 'capture-reset', error);
+    }
+  }
+}
+
+/**
+ * Run one step of an arm or a disarm that must not stop the steps after it.
+ *
+ * For the announcements, which assemble frames: a failure there is a report
+ * lost, and a transition left half-done because a report could not be built
+ * would be the worse outcome by far. The step is called directly — never
+ * through `Function.prototype.call` — and whatever it throws is contained.
+ *
+ * @param step The step.
+ */
+function attempt(step: () => void): void {
+  try {
+    step();
+  } catch {
+    // Contained: the step's own reporting is what failed, and the transition
+    // it belongs to carries on.
+  }
 }
 
 /*
@@ -2488,6 +2870,40 @@ function reversedHookNames(): HookName[] {
  *
  * Never throws. A malformed payload disarms, and a failure inside one step
  * cannot prevent the others.
+ *
+ * **Who can call this.** Only the extension, through the bridge, and tests.
+ * The one production caller is {@link handleInbound}. It runs only for a frame
+ * `./transport.js` accepted on the private channel, which later page scripts
+ * cannot observe, inject into or replay, and only through that module's
+ * subscriber registry: a null-prototype linked list walked with a plain loop
+ * and called directly. No page-replaceable built-in (`Array.from`, a `Set`
+ * method or iterator, `Function.prototype.call`, …) ever receives this
+ * function, {@link handleInbound} or the parsed payload. Nothing published on
+ * `globalThis.__DEBUGGEN__` reaches it. That object carries the span helper's
+ * `span`, `version`, `describeTarget` and the diagnostic `config` data, and no
+ * path from any of them leads here, to {@link arm} or to {@link disarm}. The
+ * IIFE build (`esbuild.agent.mjs`) sets no `globalName`, so this module's
+ * exports are not on any global either.
+ *
+ * **What a later page script cannot change.** Whether this config arms or
+ * disarms, which capture it names, and which hooks it asks for. Parsing and
+ * the arm/disarm decisions follow the rules in "Configuration parsing" above:
+ * frozen tables read by index, null-prototype state, intrinsics captured at
+ * evaluation, and operators.
+ *
+ * **Residual — what the page can still do.** The signal producers
+ * (interaction, React, fetch, performance, errors, state) install their
+ * listeners, observers and patches through the page's own built-ins when they
+ * are armed, and reset their counters the same way. A page that rewrites those
+ * built-ins can stop a signal from attaching, or stop or distort what it
+ * records. Such a failure is contained: it is reported as that producer's
+ * failure and does not change what the config asked for. Separately, the
+ * published diagnostic copy is written onto the page-visible helper object, so
+ * the page can read or replace that copy. Nothing in the agent reads it back.
+ * The module overview names the remaining limits — synthetic document
+ * lifecycle events and the React re-check timer — and none of them changes
+ * what a config asked for. Code that ran before this bundle evaluated is
+ * outside every guarantee here.
  *
  * @param payload The frame's payload, verbatim and untrusted.
  */
@@ -2514,9 +2930,15 @@ export function applyConfig(payload: unknown): void {
     // never been configured still publishes nothing at all, which is the
     // dormancy probe (`typeof __DEBUGGEN__.config === 'undefined'`) — this is
     // the only call site, and it is reached only from an `agent.config`.
-    setSpanHelperConfig(publishedConfig(config));
+    //
+    // Guarded on its own: the helper lives on a page-visible global, so a
+    // hostile accessor there must cost the diagnostic copy, never the arm or
+    // disarm that follows.
+    attempt(() => {
+      setSpanHelperConfig(publishedConfig(config));
+    });
 
-    announceReactIfNewlyDetected();
+    attempt(announceReactIfNewlyDetected);
 
     if (config.captureId === undefined || config.enabled.length === 0) {
       disarm();
@@ -2576,6 +2998,16 @@ export function getAgentState(): {
  * independently of the page's loaded bundle, so an agent will see frame types
  * it was written before.
  *
+ * **Delivery.** Reached only from `./transport.js`'s fan-out, for a frame
+ * received on the private channel node. That fan-out walks a null-prototype
+ * linked list and calls each handler directly. This function is registered
+ * through `subscribe()` and never passed to a page-replaceable built-in, so a
+ * later page script cannot obtain it and call it with a forged `agent.config`.
+ * The payload it receives is a null-prototype object tree, built by the
+ * transport's captured `JSON.parse` reviver, so every property read below
+ * sees own data only. Dispatch is a `switch` on a string: no built-in decides
+ * which branch runs.
+ *
  * @param message A frame `./transport.js`'s guard has already accepted.
  */
 function handleInbound(message: BridgeInboundMessage): void {
@@ -2619,7 +3051,7 @@ function handleInbound(message: BridgeInboundMessage): void {
         return;
     }
   } catch {
-    // A frame can never break the page's `message` dispatch, and
+    // A frame can never break the bridge's dispatch on the channel node, and
     // `./transport.js` calls every subscriber inside its own guard as well.
   }
 }
@@ -2769,10 +3201,11 @@ function bootstrap(): void {
   // during the remaining steps is honoured rather than dropped.
   installed = true;
 
-  // Step 3 — open the inbound channel, then announce. In that order: a
-  // `bridge.ready` posted between the two would otherwise be missed, and an
-  // announcement is worth making even when the bridge has not started yet,
-  // because the bridge's own arrival re-triggers it.
+  // Step 3 — open the inbound channel, then announce. In that order: the
+  // subscription is what creates the channel node and installs the listener
+  // the bridge's handshake request must find — the bridge is injected right
+  // after this bundle — and an announcement made before that request is simply
+  // not dispatched, because the bridge's own `bridge.ready` re-triggers it.
   try {
     subscribeToBridge();
   } catch {

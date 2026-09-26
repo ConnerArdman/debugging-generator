@@ -12,7 +12,7 @@
  * The scan is AST-aware rather than a grep: product source is parsed with ts-morph and matched on
  * syntax nodes, so an identifier, an import specifier and a string literal are told apart.
  *
- * THREE VIOLATION CLASSES, EIGHT RULE IDS
+ * FOUR VIOLATION CLASSES, ELEVEN RULE IDS
  *
  *   A. references into the demo application
  *      `demo-import`             an import, `export ... from`, `import()` or `require()` whose
@@ -38,6 +38,25 @@
  *                                question-derived expression, `RegExp.prototype.test` applied to
  *                                one, or an equality comparison between one and a string literal.
  *
+ *   D. demo knowledge in repository tooling (the same policy, over raw text)
+ *      `tooling-identifier-text` a policy identifier as a whole word anywhere in a tooling file:
+ *                                a configuration file at the repository root (by extension, or a
+ *                                named dot-file such as `.editorconfig`, `.gitignore` or
+ *                                `.prettierignore`), or a file under `scripts/`, `.github/` or
+ *                                `.vscode/` (`CODEOWNERS` included). Comments count, because
+ *                                comments are where tooling records what it knows: a lint
+ *                                exception that lists demo files is demo knowledge however it is
+ *                                written, and `docs/DEMO.md` is the one place that may say where
+ *                                the demo's defects live (AAP 0.7.2, 0.8.5).
+ *      `tooling-route-text`      the same for route paths.
+ *      `tooling-demo-file`       a path in a tooling file that names one concrete file of the demo:
+ *                                `apps/demo-app/<dir>/.../<file>` resolving to a regular file, or a
+ *                                glob whose last segment is a file name matching one, such as
+ *                                `apps/demo-app/app/items/*\/page.tsx`. The tree, its directories,
+ *                                its root-level workspace configuration and globs ending in a
+ *                                wildcard (`apps/demo-app/src/**\/*.tsx`) stay allowed: that is
+ *                                how tooling configures the demo as a workspace.
+ *
  *   plus, independent of any file:
  *      `policy-stale`            the committed policy is not, byte for byte, what `--update` would
  *                                produce from the demo corpus: a different vocabulary, different
@@ -58,10 +77,12 @@
  * after which `--update` is re-run and both files are reviewed together.
  *
  * LIMITS OF THE HEURISTICS -- READ BEFORE TIGHTENING OR LOOSENING ANYTHING
- *   * Comments are not scanned in source files. Only string literals, template chunks and
- *     identifier nodes are, because only those can reach runtime behaviour. Prose in a `.ts` file
- *     that mentions a demo route is therefore allowed, while the same prose in a prompt, a
- *     Markdown file or a deterministic template is not -- those are inputs to generation.
+ *   * Comments are not scanned in product source files. Only string literals, template chunks and
+ *     identifier nodes are, because only those can reach runtime behaviour. Prose in a product
+ *     `.ts` file that mentions a demo route is therefore allowed, while the same prose in a prompt,
+ *     a Markdown file or a deterministic template is not -- those are inputs to generation -- and
+ *     neither is it in repository tooling, whose comments are where knowledge of the demo's
+ *     internals would otherwise be written down outside `docs/DEMO.md`.
  *   * Question taint tracking is intra-file and one assignment deep (with a small fixpoint so a
  *     chain of aliases in the same file is still caught). It is tuned for zero false positives on
  *     legitimate code: `question.length === 0` does not fire, because `.length` is not a
@@ -70,6 +91,13 @@
  *     is not caught here; the behavioural tests are what close that gap.
  *   * Policy matching is literal and case-sensitive. There is no pattern facility, by design: an
  *     approximate rule would either fail honest product code or quietly stop matching.
+ *   * `tooling-demo-file` sees only the demo tree spelled out literally in tooling text, optionally
+ *     after `/`, `./` or `../` segments. A path assembled from pieces (`path.join(demo, 'src')`),
+ *     encoded or reached from another root is not seen, and a path that resolves to nothing on
+ *     disk is not a finding -- the rule asks which demo files tooling pins, and only a present
+ *     `apps/demo-app` can answer that. Trailing punctuation and a `:line` or `#L` location are
+ *     dropped only when the longer form does not exist, symbolic links are never followed, and
+ *     brace alternatives spanning a `/` are not expanded.
  *
  * STALENESS IS ENFORCED WHENEVER THE CORPUS IS PRESENT
  * The policy is defined as (demo harvest) minus (fixture harvest) minus (allowlist), so the demo
@@ -110,23 +138,33 @@
  * skipped when `apps/demo-app` is absent, and when the harvest could read only part of it.
  *
  * THE SCAN FAILS CLOSED
- * A gate that returns success while part of the product tree went unexamined proves nothing, so
+ * A gate that returns success while part of what it covers went unexamined proves nothing, so
  * nothing is ever "skipped". A directory that cannot be read, a file that cannot be read, parsed or
  * decoded as text, a file above MAX_FILE_BYTES, and a symbolic link that would otherwise have been
  * scanned are all recorded as {@link ScanFailure} and stop the gate with exit code 2 -- distinct
  * from the exit code 1 that reports violations, because an incomplete scan is an environment
  * problem rather than a verdict. The corpus harvest fails the same way: a partial harvest would
  * silently rewrite the policy, so `--update` refuses to write and a normal run refuses to judge
- * staleness. A run that scanned nothing at all fails too, because a clean result over an empty set
- * is not evidence. An absent tree is the one benign case and stays an informational note: this
- * script runs on clones where a surface has not landed yet.
+ * staleness. A run that scanned no product file at all fails too, because a clean result over an
+ * empty set is not evidence. The tooling pass fails closed on the same terms, and so does its demo
+ * path resolution: a demo entry that cannot be inspected or listed while resolving a path named
+ * in tooling is a scan failure, never a pass. An absent tree is
+ * the one benign case and stays an informational note: this script runs on clones where a surface
+ * has not landed yet.
  *
  * Usage:  node scripts/check-no-hardcoding.mjs [--update] [--json] [--help]
  * Exits:  0 clean | 1 violations found or policy stale | 2 usage error, environment error, or a
  *         scan that could not read part of the tree.
  */
 
-import { readdirSync, readFileSync, lstatSync, statSync, writeFileSync } from 'node:fs';
+import {
+  readdirSync,
+  readFileSync,
+  lstatSync,
+  realpathSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import process from 'node:process';
@@ -163,8 +201,10 @@ export const FIXTURE_TREE = 'tests/fixtures/sample-next-app';
 /**
  * Product trees scanned as source. `tests/e2e/**`, `tests/browser/**`, `tests/fixtures/**`,
  * `docs/**`, `apps/demo-app/**` and `scripts/**` are deliberately absent: the first five
- * legitimately name demo symbols (AAP 0.4.2), and `scripts/` holds the policy file itself, which
- * contains every forbidden token by construction and would fail the gate on sight.
+ * legitimately name demo symbols (AAP 0.4.2), and `scripts/` is repository tooling rather than
+ * product. Tooling is not exempt, it is scanned differently: {@link TOOLING_TREES} and the
+ * repository root are matched as raw text by the class D pass, with the policy file excluded by
+ * exact path because it contains every forbidden token by construction.
  *
  * @type {readonly string[]}
  */
@@ -191,6 +231,69 @@ const STRUCTURED_TREES = Object.freeze([
   'apps/local-service/prompts',
   'packages/model-provider/src/deterministic',
 ]);
+
+/**
+ * Repository-tooling trees scanned recursively by the class D pass, alongside the regular files at
+ * the repository root. They hold the build, lint, test and editor configuration and the guard
+ * scripts, which sit above every workspace and are exactly where knowledge of the demo's internals
+ * would be written down if it were written anywhere but `docs/DEMO.md` -- a lint exception listing
+ * demo files, a CI step naming a demo route. Only the root is read non-recursively: the workspace
+ * directories below it are the product trees and the corpora, which other rules own.
+ *
+ * @type {readonly string[]}
+ */
+export const TOOLING_TREES = Object.freeze(['scripts', '.github', '.vscode']);
+
+/** Extensions read as repository tooling, at the root and under {@link TOOLING_TREES}. */
+const TOOLING_EXTENSIONS = Object.freeze([
+  '.js',
+  '.mjs',
+  '.cjs',
+  '.ts',
+  '.mts',
+  '.cts',
+  '.json',
+  '.yaml',
+  '.yml',
+]);
+
+/**
+ * Configuration files read as repository tooling by name, because an extension cannot identify
+ * them: `.editorconfig`, `.gitignore`, `.prettierignore` and the other dot-files at the root, and
+ * `CODEOWNERS` under `.github/`. They configure editors, git, the formatter, the package manager
+ * and review routing per path, so a demo file named in one is demo knowledge in tooling like any
+ * other.
+ *
+ * The set is closed on purpose. The pass lists the work tree, not the index, so reading every
+ * dot-file would also read a developer's untracked `.env` - credentials, printed in a snippet on a
+ * hit - and fail the gate on an operating system's binary folder metadata. Only names the
+ * repository itself uses are listed; a new kind of tooling file is added here when it is added to
+ * the repository.
+ *
+ * @type {readonly string[]}
+ */
+const TOOLING_FILE_NAMES = Object.freeze([
+  '.editorconfig',
+  '.env.example',
+  '.gitattributes',
+  '.gitignore',
+  '.node-version',
+  '.npmrc',
+  '.nvmrc',
+  '.prettierignore',
+  'CODEOWNERS',
+]);
+
+/**
+ * Tooling files never read, by exact repository-relative path. The lockfile is generated by pnpm
+ * and names nothing an author wrote. The policy lists every forbidden token by construction, so it
+ * would fail the gate on sight. The allowlist beside it is scanned like any other tooling file: it
+ * may list only generic vocabulary, every entry it lists is subtracted from the matchers before
+ * any text is compared, and a demo name that reached its prose is a finding like anywhere else.
+ *
+ * @type {ReadonlySet<string>}
+ */
+const TOOLING_EXCLUDED_FILES = Object.freeze(new Set(['pnpm-lock.yaml', POLICY_FILE]));
 
 /**
  * Directory names pruned during every walk, at any depth, before anything is read and whatever the
@@ -312,6 +415,9 @@ export const RULE_IDS = Object.freeze([
   'policy-identifier-text',
   'policy-route-text',
   'question-branch',
+  'tooling-identifier-text',
+  'tooling-route-text',
+  'tooling-demo-file',
   'policy-stale',
 ]);
 
@@ -329,6 +435,9 @@ const RULE_HINTS = Object.freeze({
     'a prompt, manifest or template may not name demo routes; describe the shape of the answer and let the pipeline supply the evidence',
   'question-branch':
     'the question must flow into Stage 1 understanding and reach the model as data; it may never select an output through control flow',
+  'tooling-identifier-text': `repository tooling may not name demo symbols, in code or in comments; express a tooling exception by workspace (${DEMO_TREE}) or by rule, never by demo file or symbol -- where the demo's defects live is documented only in docs/DEMO.md`,
+  'tooling-route-text': `repository tooling may not name demo routes, in code or in comments; express a tooling exception by workspace (${DEMO_TREE}) or by rule, never by demo route -- where the demo's defects live is documented only in docs/DEMO.md`,
+  'tooling-demo-file': `repository tooling may not name a file of the demo application, in code or in comments, nor pin one with a glob; express a tooling exception by workspace (${DEMO_TREE}, a directory in it, or a glob ending in a wildcard such as ${DEMO_TREE}/src/**/*.tsx) or by rule, never by demo file -- where the demo's defects live is documented only in docs/DEMO.md`,
   'policy-stale': `regenerate with \`${PNPM_UPDATE_COMMAND}\` and commit ${POLICY_FILE} for review`,
 });
 
@@ -365,8 +474,11 @@ const RULE_HINTS = Object.freeze({
  *                            from malformed syntax rather than throwing, so this covers an
  *                            ordinary syntax error: the tree standing in for the file is partial,
  *                            and the unparsed region went unexamined.
- *   `no-subject`             the run found nothing at all to scan, so its success would say
- *                            nothing about anything. Recorded against `.` rather than a path.
+ *   `no-subject`             the run found no product source or structured text to scan, so its
+ *                            success would say nothing about the product. Repository tooling
+ *                            alone is not a subject: the gate exists for the product, and a
+ *                            clean tooling pass over a root holding no product proves nothing
+ *                            about it. Recorded against `.` rather than a path.
  *
  * @typedef {object} ScanFailure
  * @property {string} path Repository-relative POSIX path, or `.` for a whole-run precondition.
@@ -447,9 +559,10 @@ const RULE_HINTS = Object.freeze({
  * @property {string} root Absolute repository root the check ran against.
  * @property {Finding[]} findings Ordered by file, then line, then column, then rule.
  * @property {StaleReport|null} stale `null` when no comparison was possible.
- * @property {number} filesScanned Source and structured files actually read.
+ * @property {number} filesScanned Source, structured and tooling files actually read.
  * @property {number} sourceFilesScanned Source files parsed with ts-morph.
  * @property {number} structuredFilesScanned Structured-text files read.
+ * @property {number} toolingFilesScanned Repository-tooling files read by the class D pass.
  * @property {ScanFailure[]} failures Everything the scan could not examine; a non-empty list means
  *   the gate could not be performed and the exit code is {@link EXIT_ERROR}.
  * @property {string[]} notes Informational lines: absent trees, corpus state, defensive warnings.
@@ -842,9 +955,10 @@ function walkFiles(absoluteDir, accept, skippedDirectories, root) {
 }
 
 /**
- * Whether a file name belongs to a test suite. Tests inside product packages legitimately name
- * demo symbols -- `scripts/check-no-hardcoding.test.mjs` itself asserts on a deliberate cheat --
- * so they are excluded from the scan (AAP 0.5.4 scans product source "excluding tests").
+ * Whether a file name belongs to a test suite. Tests inside product packages and beside the guard
+ * scripts legitimately name demo symbols -- `scripts/check-no-hardcoding.test.mjs` itself asserts
+ * on a deliberate cheat -- so every pass excludes them (AAP 0.5.4 scans product source "excluding
+ * tests").
  *
  * @param {string} name Base name.
  * @returns {boolean}
@@ -854,8 +968,9 @@ function isTestFileName(name) {
 }
 
 /**
- * Whether a repository-relative path sits in a tree the scan must never enter, whatever the tree
- * it was reached from.
+ * Whether a repository-relative path sits in a tree the product passes must never enter, whatever
+ * the tree it was reached from. `scripts/` is here because it is not product; the class D pass
+ * reads it as repository tooling instead (see {@link TOOLING_TREES}).
  *
  * @param {string} relPath
  * @returns {boolean}
@@ -1246,7 +1361,7 @@ export function loadAllowlist(root = DEFAULT_ROOT) {
  * Identifier boundaries are `(?<![A-Za-z0-9_$])` / `(?![A-Za-z0-9_$])` rather than `\b`, which
  * behaves identically for plain names and additionally refuses to match inside a name containing
  * `$` or `_`. Alternatives are sorted longest-first so the most specific entry wins at a given
- * position, which keeps `/api/cart/items` from being reported as `/api/cart`.
+ * position, which keeps `/api/widgets/archive` from being reported as `/api/widgets`.
  *
  * @typedef {object} PolicyMatchers
  * @property {ReadonlySet<string>} identifierNames Exact identifier-node matches.
@@ -1459,7 +1574,7 @@ function stringPartOf(tsMorph, node) {
  *
  * Relative specifiers are resolved against the containing file; a bare specifier is matched against
  * the demo's package name; anything else is normalised against the repository root as well, so both
- * `'../../apps/demo-app/app/api/checkout/route.ts'` and `'apps/demo-app'` are caught. Existence on
+ * `'../../apps/demo-app/app/api/widgets/route.ts'` and `'apps/demo-app'` are caught. Existence on
  * disk is never consulted: the violation is the product *naming* the demo, not resolvability.
  *
  * @param {string} specifier
@@ -1480,7 +1595,7 @@ function referencesDemo(specifier, fromFile) {
   }
   // Both interpretations are tried, as AAP 0.5.4 requires: relative to the containing file, and
   // relative to the repository root. The second strips leading `./` and `../` segments, so
-  // `'../../apps/demo-app/app/api/checkout/route.ts'` is caught from any depth -- a literal that
+  // `'../../apps/demo-app/app/api/widgets/route.ts'` is caught from any depth -- a literal that
   // spells the demo tree out is a violation however many levels precede it.
   const fileRelative = path.posix.normalize(
     path.posix.join(path.posix.dirname(fromFile), specifier),
@@ -2141,15 +2256,756 @@ function readPolicyDocument(root) {
 }
 
 /**
- * Synchronous policy load, used by {@link scanStructuredText}, which needs no AST and is therefore
- * synchronous itself. {@link loadPolicy} is the asynchronous public form; both read the same file
- * through the same validation.
+ * Synchronous policy load, used by {@link scanStructuredText} and {@link scanTooling}, which need
+ * no AST and are therefore synchronous themselves. {@link loadPolicy} is the asynchronous public
+ * form; both read the same file through the same validation.
  *
  * @param {string} root
  * @returns {Policy}
  */
 function loadPolicySync(root) {
   return readPolicyDocument(root).policy;
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * the repository-tooling pass (class D)
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * Whether a file is repository tooling the class D pass reads: a tooling extension or one of the
+ * {@link TOOLING_FILE_NAMES}, not a test suite, and not one of {@link TOOLING_EXCLUDED_FILES}.
+ *
+ * @param {string} relPath Repository-relative POSIX path.
+ * @param {string} name Base name.
+ * @returns {boolean}
+ */
+function isToolingFile(relPath, name) {
+  return (
+    (TOOLING_EXTENSIONS.includes(path.extname(name)) || TOOLING_FILE_NAMES.includes(name)) &&
+    !isTestFileName(name) &&
+    !TOOLING_EXCLUDED_FILES.has(relPath)
+  );
+}
+
+/**
+ * The tooling files directly at the repository root. The root is listed but never descended: the
+ * directories below it are the product trees, the corpora, the documentation and the tooling
+ * trees, and each of those is scanned -- or deliberately not -- by its own rule.
+ *
+ * The listing fails closed on the same terms as {@link walkFiles}: a root that cannot be listed, a
+ * symbolic link where a tooling file would have been read, and a non-regular entry with a tooling
+ * name are each recorded rather than passed over. A directory, or a link or special file with a
+ * name this pass does not read, hides nothing from it and is ignored.
+ *
+ * @param {string} root Absolute repository root.
+ * @returns {{ files: string[], failures: ScanFailure[] }}
+ */
+function listRootToolingFiles(root) {
+  /** @type {string[]} */
+  const files = [];
+  /** @type {ScanFailure[]} */
+  const failures = [];
+  /** @type {import('node:fs').Dirent[]} */
+  let entries;
+  try {
+    entries = readdirSync(root, { withFileTypes: true });
+  } catch (error) {
+    failures.push({
+      path: '.',
+      reason: 'unreadable-directory',
+      detail: `could not be listed (${describeError(error)}); the tooling files at the repository root went unscanned`,
+    });
+    return { files, failures };
+  }
+  for (const entry of entries) {
+    if (entry.isDirectory() || !isToolingFile(entry.name, entry.name)) {
+      continue;
+    }
+    const absolute = path.join(root, entry.name);
+    if (entry.isSymbolicLink()) {
+      failures.push({
+        path: entry.name,
+        reason: 'symlink-not-followed',
+        detail:
+          'is a symbolic link where a scanned tooling file was expected, and links are never followed; replace it with a regular file',
+      });
+      continue;
+    }
+    if (entry.isFile()) {
+      files.push(absolute);
+      continue;
+    }
+    failures.push({
+      path: entry.name,
+      reason: 'not-a-regular-file',
+      detail: 'is not a regular file, so its contents could not be examined',
+    });
+  }
+  return { files: files.sort(), failures };
+}
+
+/**
+ * Every repository-tooling file the class D pass reads: the root-level files, then everything
+ * under {@link TOOLING_TREES} with the same extensions and {@link TOOLING_FILE_NAMES}, pruning
+ * {@link SKIPPED_DIRECTORIES}.
+ *
+ * @param {string} root Absolute repository root.
+ * @returns {{ files: string[], notes: string[], failures: ScanFailure[] }} Tooling files, a note per
+ *   absent tree, and everything the listing could not cover.
+ */
+function listToolingFiles(root) {
+  const rootListing = listRootToolingFiles(root);
+  /** @type {Set<string>} */
+  const files = new Set(rootListing.files);
+  /** @type {string[]} */
+  const notes = [];
+  /** @type {ScanFailure[]} */
+  const failures = [...rootListing.failures];
+
+  for (const tree of TOOLING_TREES) {
+    const absolute = path.join(root, tree);
+    const classified = classifyDirectory(root, absolute);
+    if (classified.state === 'absent') {
+      notes.push(`skipped ${tree}: not present in this checkout`);
+      continue;
+    }
+    if (classified.state === 'failed') {
+      failures.push(classified.failure);
+      continue;
+    }
+    const walked = walkFiles(absolute, isToolingFile, SKIPPED_DIRECTORIES, root);
+    for (const file of walked.files) {
+      files.add(file);
+    }
+    failures.push(...walked.failures);
+  }
+
+  return { files: [...files].sort(), notes, failures };
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * class D: concrete demo files named in repository tooling (`tooling-demo-file`)
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * A path token naming the demo tree in raw tooling text: optional `./` and `../` segments, the
+ * tree itself, then an optional tail of path characters.
+ *
+ * The left boundary refuses a token that continues a longer name (`foo-apps/demo-app`,
+ * `x.apps/demo-app`), while a `/` may precede it, so `${workspaceFolder}/apps/demo-app/...`, an
+ * absolute path and a repository URL are all seen. The right boundary refuses a sibling such as
+ * `apps/demo-app-v2`. The tail stops at whitespace, a quote, a backtick, `<`, `>`, `|`, `\` and a
+ * comma, except that a balanced `{...}` group is kept whole, commas included, so a brace glob is
+ * one token. Parentheses and brackets are path characters: Next.js route groups and dynamic
+ * segments (`(group)`, `[id]`) are directory names. The pattern is built from {@link DEMO_TREE},
+ * so this file's own source spells no demo path out.
+ *
+ * Group 1 is the relative prefix; group 2 is the tail, starting at its `/`, empty for the bare tree.
+ */
+const DEMO_PATH_TOKEN = new RegExp(
+  String.raw`(?<![\w$@.\-])((?:\.{1,2}/)*)${escapeRegExp(DEMO_TREE)}(?![\w$@\-]|\.[\w$@\-])((?:/(?:\{[^\s'"\x60{}]*\}|[^\s'"\x60<>|\\{},])*)?)`,
+  'g',
+);
+
+/** Whether a path segment holds a glob metacharacter, which makes it a pattern, not a name. */
+const GLOB_METACHARACTER = /[*?[{]/;
+
+/**
+ * Punctuation that commonly trails a path written in prose or code -- the end of a sentence, a
+ * clause, a closing parenthesis or bracket, a closing quote. It is removed from a token only when
+ * the longer form does not exist, because a demo directory may legitimately end in one (a route
+ * group such as `app/(group)`). A comma needs no entry: outside a brace group it already ends the
+ * token. Quotes and backticks end a token too; they stay listed so that stripping does not depend
+ * on {@link DEMO_PATH_TOKEN} excluding them.
+ *
+ * @type {ReadonlySet<string>}
+ */
+const TRAILING_PATH_PUNCTUATION = Object.freeze(
+  new Set(['.', ':', ';', '!', ')', ']', "'", '"', '`']),
+);
+
+/** A source location after a file name, `:12`, `:12:5`, `#L12` or `#L12-L20`. */
+const SOURCE_LOCATION_SUFFIX = /(?::\d+(?::\d+)?|#L\d+(?:-L?\d+)?)$/;
+
+/**
+ * Every demo path token in `text`, with a non-empty tail.
+ *
+ * @param {string} text
+ * @returns {{ index: number, prefix: string, rest: string }[]} `index` is the offset of the token
+ *   (its relative prefix included) and `rest` its tail below the demo tree, without the leading `/`.
+ */
+function findDemoPathTokens(text) {
+  /** @type {{ index: number, prefix: string, rest: string }[]} */
+  const tokens = [];
+  DEMO_PATH_TOKEN.lastIndex = 0;
+  for (let hit = DEMO_PATH_TOKEN.exec(text); hit !== null; hit = DEMO_PATH_TOKEN.exec(text)) {
+    const rest = (hit[2] ?? '').slice(1);
+    if (rest.length > 0) {
+      tokens.push({ index: hit.index, prefix: hit[1] ?? '', rest });
+    }
+  }
+  return tokens;
+}
+
+/**
+ * The forms of a token's tail worth resolving, longest first: the tail as written, then with each
+ * trailing punctuation character removed in turn, and, after any of those that ends in a source
+ * location, the same form without it. The resolver stops at the first form that resolves to
+ * anything, which is what "only when the longer form does not exist" means in practice.
+ *
+ * @param {string} rest
+ * @returns {string[]}
+ */
+function demoPathForms(rest) {
+  /** @type {string[]} */
+  const forms = [];
+  const add = (/** @type {string} */ form) => {
+    if (form.length > 0 && !forms.includes(form)) {
+      forms.push(form);
+    }
+  };
+  let current = rest;
+  for (;;) {
+    add(current);
+    add(current.replace(SOURCE_LOCATION_SUFFIX, ''));
+    if (!TRAILING_PATH_PUNCTUATION.has(current.slice(-1))) {
+      return forms;
+    }
+    current = current.slice(0, -1);
+  }
+}
+
+/**
+ * Index of the `}` closing the `{` at `open`, counting nested groups, or -1 when it is unbalanced.
+ *
+ * @param {string} text
+ * @param {number} open
+ * @returns {number}
+ */
+function closingBrace(text, open) {
+  let depth = 0;
+  for (let index = open; index < text.length; index += 1) {
+    if (text[index] === '{') {
+      depth += 1;
+    } else if (text[index] === '}') {
+      depth -= 1;
+      if (depth === 0) {
+        return index;
+      }
+    }
+  }
+  return -1;
+}
+
+/**
+ * Split a brace group's body on the commas that are not inside a nested group.
+ *
+ * @param {string} body
+ * @returns {string[]}
+ */
+function braceAlternatives(body) {
+  /** @type {string[]} */
+  const alternatives = [];
+  let depth = 0;
+  let start = 0;
+  for (let index = 0; index < body.length; index += 1) {
+    const character = body[index];
+    if (character === '{') {
+      depth += 1;
+    } else if (character === '}') {
+      depth -= 1;
+    } else if (character === ',' && depth === 0) {
+      alternatives.push(body.slice(start, index));
+      start = index + 1;
+    }
+  }
+  alternatives.push(body.slice(start));
+  return alternatives;
+}
+
+/**
+ * Regular-expression source for one glob path segment: `*`, `?`, a `[...]` class (negated with `!`
+ * or `^`) and `{a,b}` alternatives, which may nest. Anything else, an unclosed `[` or `{` included,
+ * is literal.
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+function globFragment(text) {
+  let source = '';
+  for (let index = 0; index < text.length; index += 1) {
+    const character = text[index] ?? '';
+    if (character === '*') {
+      source += '[^/]*';
+      continue;
+    }
+    if (character === '?') {
+      source += '[^/]';
+      continue;
+    }
+    if (character === '[') {
+      // A `]` directly after the opening bracket is a member, as in every glob dialect.
+      const close = text.indexOf(']', index + 2);
+      const body = close === -1 ? '' : text.slice(index + 1, close);
+      const negated = body.startsWith('!') || body.startsWith('^');
+      const members = negated ? body.slice(1) : body;
+      if (members.length > 0) {
+        source += `[${negated ? '^' : ''}${members.replace(/[\\\]^[]/g, '\\$&')}]`;
+        index = close;
+        continue;
+      }
+    }
+    if (character === '{') {
+      const close = closingBrace(text, index);
+      const alternatives = close === -1 ? [] : braceAlternatives(text.slice(index + 1, close));
+      if (alternatives.length > 1) {
+        source += `(?:${alternatives.map(globFragment).join('|')})`;
+        index = close;
+        continue;
+      }
+    }
+    source += escapeRegExp(character);
+  }
+  return source;
+}
+
+/**
+ * Compile one glob path segment. A wildcard does not match a leading `.` unless the segment itself
+ * starts with one, which is how the linters and test runners configuring this repository read a
+ * glob. A segment that compiles to an invalid expression (a reversed range such as `[z-a]`) is
+ * matched literally rather than thrown out of the gate.
+ *
+ * @param {string} segment
+ * @returns {RegExp}
+ */
+function globSegmentPattern(segment) {
+  const guard = segment.startsWith('.') ? '' : String.raw`(?!\.)`;
+  try {
+    return new RegExp(`^${guard}${globFragment(segment)}$`);
+  } catch {
+    return new RegExp(`^${escapeRegExp(segment)}$`);
+  }
+}
+
+/**
+ * How one demo path token resolved against the demo tree.
+ *
+ * @typedef {object} DemoPathResolution
+ * @property {'file'|'allowed'|'none'|'failed'|'unresolved'} kind `file` when the token names a
+ *   concrete demo file, which is the finding; `allowed` for a directory, a workspace-root entry, a
+ *   path through a pruned directory or `..`, a symbolic link and a glob whose last segment is a
+ *   wildcard; `none` when no form resolves to anything; `failed` when resolving hit a path that
+ *   could not be inspected, recorded as a {@link ScanFailure}; `unresolved` when the demo tree is
+ *   absent from this checkout.
+ * @property {string} form The form of the tail that decided the outcome.
+ * @property {boolean} glob Whether that form was matched as a pattern.
+ */
+
+/**
+ * Resolves the demo path tokens found in repository tooling against `apps/demo-app`, for one run.
+ *
+ * Nothing is ever followed or read: every entry is examined with `lstat`, directories are listed
+ * only to match a glob segment, and a symbolic link -- the file itself or a directory on the way
+ * to it -- ends the resolution as `allowed` rather than being traversed. Each distinct tail is
+ * resolved once, and every `lstat` and listing is cached, so a token repeated across the tooling
+ * costs nothing after its first sighting. A path that exists but cannot be inspected, and a
+ * directory that cannot be listed, are {@link ScanFailure}s: the gate cannot say whether tooling
+ * names a demo file it could not look at.
+ */
+class DemoFileResolver {
+  /**
+   * @param {string} root Absolute repository root.
+   */
+  constructor(root) {
+    this.root = root;
+    this.demoRoot = path.join(root, DEMO_TREE);
+    /** @type {'directory'|'absent'|'failed'|null} */
+    this.demoState = null;
+    /** @type {Map<string, DemoPathResolution>} */
+    this.resolutions = new Map();
+    /** @type {Map<string, ReturnType<typeof statEntry>>} */
+    this.stats = new Map();
+    /** @type {Map<string, string[]|null>} */
+    this.listings = new Map();
+    /** @type {Map<string, RegExp>} */
+    this.patterns = new Map();
+    /** @type {ScanFailure[]} */
+    this.failures = [];
+    /** Distinct tails that needed the demo tree while it was absent. */
+    this.unresolved = 0;
+  }
+
+  /**
+   * @param {string} rest A token's tail below the demo tree.
+   * @param {string} fromFile Tooling file the token was first seen in, for a failure's detail.
+   * @returns {DemoPathResolution}
+   */
+  resolve(rest, fromFile) {
+    const cached = this.resolutions.get(rest);
+    if (cached !== undefined) {
+      return cached;
+    }
+    const resolution = this.resolveForms(rest, fromFile);
+    this.resolutions.set(rest, resolution);
+    return resolution;
+  }
+
+  /**
+   * @param {string} rest
+   * @param {string} fromFile
+   * @returns {DemoPathResolution}
+   */
+  resolveForms(rest, fromFile) {
+    for (const form of demoPathForms(rest)) {
+      const segments = form.split('/').filter((segment) => segment !== '' && segment !== '.');
+      // A workspace-root entry (package.json, tsconfig.json, .env.example, a top-level directory)
+      // is workspace configuration; `..` leaves the tree; a pruned directory holds no source.
+      if (
+        segments.length < 2 ||
+        segments.some((segment) => segment === '..' || SKIPPED_CORPUS_DIRECTORIES.has(segment))
+      ) {
+        return { kind: 'allowed', form, glob: false };
+      }
+      const state = this.demoTreeState();
+      if (state !== 'directory') {
+        if (state === 'absent') {
+          this.unresolved += 1;
+        }
+        return { kind: state === 'absent' ? 'unresolved' : 'failed', form, glob: false };
+      }
+      const outcome = this.classify(segments, form, fromFile);
+      if (outcome.kind !== 'none') {
+        return outcome;
+      }
+    }
+    return { kind: 'none', form: rest, glob: false };
+  }
+
+  /**
+   * The demo tree's own state, classified once. A tree that exists but is not a readable directory
+   * is a failure, recorded the first time a token needs it.
+   *
+   * @returns {'directory'|'absent'|'failed'}
+   */
+  demoTreeState() {
+    if (this.demoState === null) {
+      const classified = classifyDirectory(this.root, this.demoRoot);
+      if (classified.state === 'failed') {
+        this.failures.push(classified.failure);
+      }
+      this.demoState = classified.state;
+    }
+    return this.demoState;
+  }
+
+  /**
+   * @param {string[]} segments The form's path segments below the demo tree.
+   * @param {string} form
+   * @param {string} fromFile
+   * @returns {DemoPathResolution}
+   */
+  classify(segments, form, fromFile) {
+    const context = { failed: false, fromFile };
+    // The literal path comes first, so a bracketed dynamic segment (`[id]`) that exists on disk is
+    // resolved as the name it is, not as a character class.
+    const literal = this.literalEntry(segments, context);
+    if (context.failed) {
+      return { kind: 'failed', form, glob: false };
+    }
+    if (literal !== 'missing') {
+      return { kind: literal === 'file' ? 'file' : 'allowed', form, glob: false };
+    }
+    if (!segments.some((segment) => GLOB_METACHARACTER.test(segment))) {
+      return { kind: 'none', form, glob: false };
+    }
+    // A glob whose last segment is a wildcard selects a kind of file, which is how tooling
+    // configures the demo as a workspace; one whose last segment is a name pins that file.
+    if (GLOB_METACHARACTER.test(segments[segments.length - 1] ?? '')) {
+      return { kind: 'allowed', form, glob: true };
+    }
+    if (this.globMatchesFile(segments, context)) {
+      return { kind: 'file', form, glob: true };
+    }
+    return { kind: context.failed ? 'failed' : 'none', form, glob: true };
+  }
+
+  /**
+   * `lstat` through the cache. A path that exists but cannot be inspected is recorded once, and
+   * marks every resolution that meets it as failed. A name longer than the filesystem accepts
+   * (`ENAMETOOLONG`, as a long run of text after the demo tree produces) is missing rather than
+   * failed: no entry can have it, so it hides nothing.
+   *
+   * @param {string} absolute
+   * @param {{ failed: boolean, fromFile: string }} context
+   * @param {'unreadable-file'|'unreadable-directory'} reason
+   * @returns {import('node:fs').Stats|null} `null` when the path is missing or uninspectable.
+   */
+  inspect(absolute, context, reason) {
+    let entry = this.stats.get(absolute);
+    if (entry === undefined) {
+      entry = statEntry(absolute);
+      if (
+        'error' in entry &&
+        /** @type {{ code?: unknown }} */ (entry.error).code === 'ENAMETOOLONG'
+      ) {
+        entry = { missing: true };
+      }
+      this.stats.set(absolute, entry);
+      if ('error' in entry) {
+        this.failures.push({
+          path: relative(this.root, absolute),
+          reason,
+          detail: `could not be inspected (${describeError(entry.error)}) while resolving a demo path named in ${context.fromFile}; make it readable and re-run -- the gate cannot say whether tooling names a demo file it cannot see`,
+        });
+      }
+    }
+    if ('error' in entry) {
+      context.failed = true;
+      return null;
+    }
+    return 'stat' in entry ? entry.stat : null;
+  }
+
+  /**
+   * The names of the real, non-pruned subdirectories of `directory`, listed once. Symbolic links
+   * are not directories here, so a glob never descends through one.
+   *
+   * @param {string} directory
+   * @param {{ failed: boolean, fromFile: string }} context
+   * @returns {string[]}
+   */
+  subdirectories(directory, context) {
+    let listing = this.listings.get(directory);
+    if (listing === undefined) {
+      try {
+        listing = readdirSync(directory, { withFileTypes: true })
+          .filter((entry) => entry.isDirectory() && !SKIPPED_CORPUS_DIRECTORIES.has(entry.name))
+          .map((entry) => entry.name)
+          .sort();
+      } catch (error) {
+        listing = null;
+        this.failures.push({
+          path: relative(this.root, directory),
+          reason: 'unreadable-directory',
+          detail: `could not be listed (${describeError(error)}) while matching a demo path glob named in ${context.fromFile}; make it readable and re-run`,
+        });
+      }
+      this.listings.set(directory, listing);
+    }
+    if (listing === null) {
+      context.failed = true;
+      return [];
+    }
+    return listing;
+  }
+
+  /**
+   * What the literal path is, walked one segment at a time so that no symbolic link on the way is
+   * followed.
+   *
+   * @param {string[]} segments
+   * @param {{ failed: boolean, fromFile: string }} context
+   * @returns {'file'|'other'|'missing'} `other` for a directory, a link or a special file.
+   */
+  literalEntry(segments, context) {
+    let current = this.demoRoot;
+    for (let index = 0; index < segments.length; index += 1) {
+      current = path.join(current, segments[index] ?? '');
+      const last = index === segments.length - 1;
+      const stat = this.inspect(
+        current,
+        context,
+        last ? 'unreadable-file' : 'unreadable-directory',
+      );
+      if (stat === null) {
+        return 'missing';
+      }
+      if (last) {
+        return stat.isFile() ? 'file' : 'other';
+      }
+      if (stat.isSymbolicLink()) {
+        return 'other';
+      }
+      if (!stat.isDirectory()) {
+        return 'missing';
+      }
+    }
+    return 'missing';
+  }
+
+  /**
+   * Whether a glob whose last segment is a literal name matches at least one regular file. Only
+   * the glob's literal directory prefix is entered directly; below it, directories are listed and
+   * matched segment by segment, pruned names and links excluded, and the walk stops at the first
+   * match.
+   *
+   * @param {string[]} segments
+   * @param {{ failed: boolean, fromFile: string }} context
+   * @returns {boolean}
+   */
+  globMatchesFile(segments, context) {
+    const firstPattern = segments.findIndex((segment) => GLOB_METACHARACTER.test(segment));
+    let directory = this.demoRoot;
+    for (const segment of segments.slice(0, firstPattern)) {
+      directory = path.join(directory, segment);
+      const stat = this.inspect(directory, context, 'unreadable-directory');
+      if (stat === null || !stat.isDirectory()) {
+        return false;
+      }
+    }
+    return this.matchFrom(directory, segments, firstPattern, context);
+  }
+
+  /**
+   * @param {string} directory Absolute directory matched so far.
+   * @param {string[]} segments
+   * @param {number} index Segment to match inside `directory`.
+   * @param {{ failed: boolean, fromFile: string }} context
+   * @returns {boolean}
+   */
+  matchFrom(directory, segments, index, context) {
+    const segment = segments[index] ?? '';
+    if (index === segments.length - 1) {
+      // The last segment is a literal file name: that is what makes this glob pin a file.
+      const stat = this.inspect(path.join(directory, segment), context, 'unreadable-file');
+      return stat !== null && stat.isFile();
+    }
+    if (segment === '**') {
+      if (this.matchFrom(directory, segments, index + 1, context)) {
+        return true;
+      }
+      return this.subdirectories(directory, context).some(
+        (child) =>
+          !child.startsWith('.') &&
+          this.matchFrom(path.join(directory, child), segments, index, context),
+      );
+    }
+    if (!GLOB_METACHARACTER.test(segment)) {
+      const next = path.join(directory, segment);
+      const stat = this.inspect(next, context, 'unreadable-directory');
+      return (
+        stat !== null && stat.isDirectory() && this.matchFrom(next, segments, index + 1, context)
+      );
+    }
+    const pattern = this.patterns.get(segment) ?? globSegmentPattern(segment);
+    this.patterns.set(segment, pattern);
+    return this.subdirectories(directory, context).some(
+      (child) =>
+        pattern.test(child) &&
+        this.matchFrom(path.join(directory, child), segments, index + 1, context),
+    );
+  }
+}
+
+/**
+ * Class D: apply the policy to the raw text of repository tooling -- the configuration files at
+ * the repository root and everything under `scripts/`, `.github/` and `.vscode/`.
+ *
+ * Tooling is matched as text, never parsed, and comments count. Unlike product source, tooling
+ * cannot leak demo knowledge into runtime behaviour, but it can record it: a lint exception keyed
+ * on demo files, a CI step naming a demo route, a guard whose comments describe where a defect
+ * lives. Any of those puts the demo's internals somewhere other than `docs/DEMO.md` (AAP 0.7.2,
+ * 0.8.5), so an exception tooling needs has to be expressed by workspace or by rule instead.
+ * `apps/demo-app` itself is not policy vocabulary, which is what lets tooling configure the demo
+ * workspace as a whole.
+ *
+ * A path is demo knowledge as much as a name is, so the same text is also searched for paths
+ * under `apps/demo-app` (`tooling-demo-file`). The tree itself, a directory in it, an entry at its
+ * root (package.json, tsconfig.json, .env.example and the other workspace configuration) and a
+ * glob whose last segment is a wildcard configure the demo as a workspace and are allowed. A path
+ * that resolves, without following a symbolic link, to a regular file below the root, and a glob
+ * whose last segment is a file name matching at least one such file, pin one demo file and are
+ * reported. A path that resolves to nothing is not a finding here. The heuristic sees only the
+ * demo tree spelled out literally: a path assembled from pieces (`path.join(demo, 'src', ...)`)
+ * or encoded is not seen, brace alternatives spanning a `/` are not expanded, and an absent
+ * `apps/demo-app` leaves every token unresolved, which the run reports as a note.
+ *
+ * @param {string} [root] Absolute repository root.
+ * @param {Policy} [policy] Policy to enforce; loaded from `root` when omitted.
+ * @param {{ allowlist?: Allowlist|null, matchers?: PolicyMatchers }} [options]
+ * @returns {{ findings: Finding[], filesScanned: number, failures: ScanFailure[], notes: string[] }}
+ */
+export function scanTooling(root = DEFAULT_ROOT, policy, options = {}) {
+  const effectivePolicy = policy ?? loadPolicySync(root);
+  const matchers =
+    options.matchers ??
+    compileMatchers(
+      effectivePolicy,
+      options.allowlist === undefined ? loadAllowlist(root) : options.allowlist,
+    );
+
+  const { files, notes, failures } = listToolingFiles(root);
+  const collector = new FindingCollector();
+  const demoFiles = new DemoFileResolver(root);
+  let filesScanned = 0;
+
+  for (const absolute of files) {
+    const file = relative(root, absolute);
+    const read = readTextFile(absolute, file);
+    if ('failure' in read) {
+      failures.push(read.failure);
+      continue;
+    }
+    filesScanned += 1;
+    /** @type {FileContext} */
+    const context = { file, text: read.text, starts: lineStarts(read.text), questionExempt: false };
+
+    for (const token of findDemoPathTokens(read.text)) {
+      const resolution = demoFiles.resolve(token.rest, file);
+      if (resolution.kind !== 'file') {
+        continue;
+      }
+      const at = locate(context, token.index);
+      const match = `${token.prefix}${DEMO_TREE}/${resolution.form}`;
+      collector.add({
+        rule: 'tooling-demo-file',
+        file,
+        line: at.line,
+        column: at.column,
+        match,
+        message: resolution.glob
+          ? `repository tooling pins a demo file with the glob ${JSON.stringify(match)}`
+          : `repository tooling names the demo file ${JSON.stringify(match)}`,
+        hint: RULE_HINTS['tooling-demo-file'],
+        snippet: at.snippet,
+      });
+    }
+
+    for (const hit of findMatches(matchers.identifierPattern, read.text)) {
+      const at = locate(context, hit.index);
+      collector.add({
+        rule: 'tooling-identifier-text',
+        file,
+        line: at.line,
+        column: at.column,
+        match: hit.match,
+        message: `repository tooling names the demo identifier ${JSON.stringify(hit.match)}`,
+        hint: RULE_HINTS['tooling-identifier-text'],
+        snippet: at.snippet,
+      });
+    }
+    for (const hit of findMatches(matchers.routePattern, read.text)) {
+      const at = locate(context, hit.index);
+      collector.add({
+        rule: 'tooling-route-text',
+        file,
+        line: at.line,
+        column: at.column,
+        match: hit.match,
+        message: `repository tooling names the demo route path ${JSON.stringify(hit.match)}`,
+        hint: RULE_HINTS['tooling-route-text'],
+        snippet: at.snippet,
+      });
+    }
+  }
+
+  failures.push(...demoFiles.failures);
+  if (demoFiles.unresolved > 0) {
+    notes.push(
+      `tooling-demo-file not checked: ${DEMO_TREE} is not present in this checkout, so ${pluralize(demoFiles.unresolved, 'path')} below it named in repository tooling could not be resolved`,
+    );
+  }
+  return { findings: collector.findings, filesScanned, failures, notes };
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -2177,7 +3033,7 @@ export function camelTokens(name) {
 /**
  * The filter AAP 0.5.4 specifies for the harvest: keep only identifiers with two or more camel-case
  * tokens, drop anything shorter than four characters, and drop all-caps constants with no camel
- * boundary. `ProductCard`, `useCartSummary` and `apiClient` qualify; `Product`, `Cart` and `GET`
+ * boundary. `WidgetCard`, `useWidgetSummary` and `apiClient` qualify; `Product`, `Cart` and `GET`
  * do not, which is why the generic ones live in the allowlist instead.
  *
  * @param {string} name
@@ -2377,8 +3233,8 @@ function normalizeRoutePath(value) {
     return null;
   }
   // A literal ending in a template hole or a concatenation leaves the last segment incomplete; keep
-  // the complete prefix so `/api/products/` in `` `/api/products/${slug}` `` becomes
-  // `/api/products`, which the App Router directory harvest also yields.
+  // the complete prefix so `/api/widgets/` in `` `/api/widgets/${slug}` `` becomes
+  // `/api/widgets`, which the App Router directory harvest also yields.
   return path.posix.normalize(trimmed);
 }
 
@@ -2951,7 +3807,8 @@ function describeFailures(failures, limit = 6) {
 }
 
 /**
- * Run the whole gate: both scans, then the policy staleness comparison.
+ * Run the whole gate: the product-source, structured-text and repository-tooling scans, then the
+ * policy staleness comparison.
  *
  * The result's exit code is {@link EXIT_ERROR} whenever anything went unexamined, even if no
  * violation was found and even if the policy is in step: an incomplete scan is not a verdict.
@@ -2984,15 +3841,18 @@ export async function check(root = DEFAULT_ROOT, options = {}) {
 
   const source = await scanProductSource(absoluteRoot, policy, { matchers });
   const structured = scanStructuredText(absoluteRoot, policy, { matchers });
+  const tooling = scanTooling(absoluteRoot, policy, { matchers });
   /** @type {Finding[]} */
-  const findings = [...source.findings, ...structured.findings];
-  notes.push(...source.notes, ...structured.notes);
+  const findings = [...source.findings, ...structured.findings, ...tooling.findings];
+  notes.push(...source.notes, ...structured.notes, ...tooling.notes);
 
   /** @type {ScanFailure[]} */
-  const failures = [...source.failures, ...structured.failures];
+  const failures = [...source.failures, ...structured.failures, ...tooling.failures];
 
-  // An absent tree is benign, but a run in which *nothing* was scanned has no subject at all: it
-  // would report "0 violations" over an empty set and satisfy the gate by inspecting nothing.
+  // An absent tree is benign, but a run in which no *product* file was scanned has no subject at
+  // all: it would report "0 violations" over an empty set and satisfy the gate by inspecting
+  // nothing. Tooling files do not count towards the subject -- every root carries the policy
+  // artifacts beside the gate, so counting them would let a root with no product in it pass.
   if (source.filesScanned + structured.filesScanned === 0) {
     failures.push({
       path: '.',
@@ -3046,9 +3906,10 @@ export async function check(root = DEFAULT_ROOT, options = {}) {
     root: absoluteRoot,
     findings,
     stale,
-    filesScanned: source.filesScanned + structured.filesScanned,
+    filesScanned: source.filesScanned + structured.filesScanned + tooling.filesScanned,
     sourceFilesScanned: source.filesScanned,
     structuredFilesScanned: structured.filesScanned,
+    toolingFilesScanned: tooling.filesScanned,
     failures: normalizedFailures,
     notes,
   };
@@ -3140,7 +4001,7 @@ export function renderReport(result) {
     lines.push(`${LOG_PREFIX}: corpus ${result.stale.corpus.state}: ${result.stale.corpus.reason}`);
   }
   lines.push(
-    `${LOG_PREFIX}: ${pluralize(result.filesScanned, 'file')} scanned (${result.sourceFilesScanned} source, ${result.structuredFilesScanned} structured), ${pluralize(result.findings.length, 'violation')}, ${pluralize(result.failures.length, 'unexaminable path')}`,
+    `${LOG_PREFIX}: ${pluralize(result.filesScanned, 'file')} scanned (${result.sourceFilesScanned} source, ${result.structuredFilesScanned} structured, ${result.toolingFilesScanned} tooling), ${pluralize(result.findings.length, 'violation')}, ${pluralize(result.failures.length, 'unexaminable path')}`,
   );
   return `${lines.join('\n')}\n`;
 }
@@ -3217,6 +4078,16 @@ function helpText() {
     '     question-branch         a string search method called on the question, a regular',
     '                             expression tested against it, an equality comparison with a',
     '                             string literal, or a switch over it with string cases',
+    '  D. demo knowledge in repository tooling, from the same policy',
+    '     tooling-identifier-text a demo identifier as a whole word anywhere in the raw text of a',
+    '                             tooling file, comments included',
+    '     tooling-route-text      a demo route path anywhere in the raw text of a tooling file,',
+    '                             comments included',
+    `     tooling-demo-file       a path under ${DEMO_TREE} in the raw text of a tooling file that`,
+    '                             resolves to one of its files below the workspace root, or a glob',
+    '                             whose last segment is a file name matching one; the tree, its',
+    '                             directories, its root-level configuration and globs ending in a',
+    '                             wildcard stay allowed, and a path naming nothing is not reported',
     '  and, independent of any file',
     '     policy-stale            the committed policy is not, byte for byte, what --update would',
     '                             produce: a different vocabulary, different metadata, entries out',
@@ -3227,9 +4098,9 @@ function helpText() {
     'The scan fails closed',
     '  A directory that cannot be listed, a file that cannot be read, parsed or decoded as text, a',
     '  file above the size this scan reads whole, a symbolic link that would otherwise have been',
-    '  scanned, and a run that found nothing to scan at all stop the gate with exit code 2. Nothing',
-    '  is skipped: a tree that went unexamined is reported as such rather than counted as clean. An',
-    '  absent tree is the one benign case and is reported as an informational line.',
+    '  scanned, and a run that found no product file to scan at all stop the gate with exit code 2.',
+    '  Nothing is skipped: a tree that went unexamined is reported as such rather than counted as',
+    '  clean. An absent tree is the one benign case and is reported as an informational line.',
     '',
     'Scanned as source (AST)',
     ...PRODUCT_TREES.map((tree) => `  ${tree}`),
@@ -3239,10 +4110,20 @@ function helpText() {
     ...STRUCTURED_TREES.map((tree) => `  ${tree} (every file)`),
     `  ${STRUCTURED_EXTENSIONS.join(', ')} anywhere under the source trees above`,
     '',
+    'Scanned as repository tooling (raw content, so comments count)',
+    `  ${TOOLING_EXTENSIONS.join(' ')} files at the repository root (not recursively),`,
+    '  and files named',
+    `    ${TOOLING_FILE_NAMES.slice(0, 5).join(' ')}`,
+    `    ${TOOLING_FILE_NAMES.slice(5).join(' ')}`,
+    ...TOOLING_TREES.map((tree) => `  ${tree}/ (the same extensions and names, recursively)`),
+    '  A tooling exception is expressed by workspace or rule, never by demo file or symbol: where',
+    "  the demo's defects live is documented only in docs/DEMO.md. Demo paths are resolved with",
+    '  lstat and never through a symbolic link; only a path spelled out literally is seen.',
+    '',
     'Never scanned',
     `  ${DEMO_TREE} (the corpus), tests/** and docs/** (they legitimately name demo symbols),`,
-    '  scripts/** (the policy itself contains every forbidden token by construction),',
-    '  test suites inside product packages, and build output.',
+    `  ${POLICY_FILE} (it lists every forbidden token by construction),`,
+    '  pnpm-lock.yaml (generated), test suites anywhere, and build output.',
     '',
     'Exemption',
     `  ${QUESTION_EXEMPT_FILE} may use the class C constructs in its`,
@@ -3345,10 +4226,41 @@ export async function main(argv = [], root = DEFAULT_ROOT) {
   }
 }
 
-const invokedPath = process.argv[1];
-if (
-  invokedPath !== undefined &&
-  import.meta.url === pathToFileURL(path.resolve(invokedPath)).href
-) {
+/**
+ * `file` with every symbolic link resolved, or merely made absolute when it cannot be resolved.
+ *
+ * @param {string} file
+ * @returns {string}
+ */
+function canonicalPath(file) {
+  try {
+    return realpathSync(file);
+  } catch {
+    return path.resolve(file);
+  }
+}
+
+/**
+ * Whether this module is the process entry point, so importing it (the suite, other tooling) never
+ * runs the command line.
+ *
+ * Both sides are canonicalized. Node reports `import.meta.url` as a real path but leaves
+ * `process.argv[1]` as typed, so comparing the two as they come makes a run through any symbolic
+ * link -- a symlinked checkout, a linked workspace, macOS's `/tmp` -- skip `main` entirely and exit
+ * 0 without printing a word: a gate that passes without looking, which is the one outcome it
+ * exists to rule out. `scripts/check-no-residual-instrumentation.mjs` guards its entry point the
+ * same way.
+ *
+ * @returns {boolean}
+ */
+function isEntryPoint() {
+  const entry = process.argv[1];
+  if (entry === undefined || entry === '') {
+    return false;
+  }
+  return canonicalPath(fileURLToPath(import.meta.url)) === canonicalPath(entry);
+}
+
+if (isEntryPoint()) {
   process.exitCode = await main(process.argv.slice(2));
 }

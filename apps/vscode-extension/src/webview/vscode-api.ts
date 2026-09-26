@@ -1,12 +1,14 @@
 /**
  * The webview's only channel to the outside: a bridge over `acquireVsCodeApi()` to the extension
  * host. It opens no WebSocket, calls no `fetch` and imports no extension API — the host owns every
- * connection to the local service. Every inbound frame is checked with `isHostToWebviewMessage`
- * before anything sees it, every outbound frame is typed by `WebviewToHostMessage`, and the only
- * thing persisted is presentational UI state: never a question, telemetry, a token or a code.
+ * connection to the local service. Every inbound frame is parsed with `parseHostToWebviewMessage`
+ * — the discriminant, the member's exact key set and every field, the whole snapshot included —
+ * and only the validated copy it rebuilds is routed; every outbound frame is typed by
+ * `WebviewToHostMessage`; and the only thing persisted is presentational UI state: never a
+ * question, telemetry, a token or a code.
  */
 
-import { isHostToWebviewMessage } from '../webview-messages';
+import { parseHostToWebviewMessage } from '../webview-messages';
 import type { HostToWebviewMessage, WebviewToHostMessage } from '../webview-messages';
 
 // ---------------------------------------------------------------------------
@@ -94,9 +96,14 @@ function isVsCodeWebviewApi(value: unknown): value is VsCodeWebviewApi {
 export type HostMessageHandler = (message: HostToWebviewMessage) => void;
 
 /**
- * How many validated messages are held while nothing is subscribed. The host pushes whole
- * snapshots, so the newest `state` always supersedes an older one and dropping the oldest entry
- * when the buffer is full never loses the current state.
+ * How many validated messages are held while nothing is subscribed.
+ *
+ * The buffer never loses the current state, by two rules in {@link bufferHostMessage}: the host
+ * pushes whole snapshots, so a newer `state` removes any buffered one it supersedes; and when the
+ * buffer is full, the oldest **non-`state`** message is evicted, never the snapshot. At most one
+ * `state` is therefore ever held, it keeps its arrival position among the notifications, and a
+ * burst of notices, pairing or focus frames before React subscribes can only displace older
+ * notifications.
  */
 const MAX_BUFFERED_HOST_MESSAGES = 16;
 
@@ -116,22 +123,20 @@ const bufferedMessages: HostToWebviewMessage[] = [];
 
 /** The single `message` listener: drops anything outside the contract, routes the rest. */
 function receiveFromHost(event: MessageEvent<unknown>): void {
-  const data = event.data;
-  // The schema predicate is the guard. A webview has no stable origin to compare against, and a
-  // frame outside the contract is dropped without being logged or stored.
-  if (!isHostToWebviewMessage(data)) {
+  // The parser is the guard. A webview has no stable origin to compare against, and a frame
+  // outside the contract — a partial snapshot included — is dropped without being logged or
+  // stored. What is routed is the parser's rebuilt copy, never `event.data` itself.
+  const parsed = parseHostToWebviewMessage(event.data);
+  if (!parsed.ok) {
     return;
   }
-  routeHostMessage(data);
+  routeHostMessage(parsed.message);
 }
 
 /** Buffers `message` when nothing is subscribed, otherwise delivers it to every subscriber. */
 function routeHostMessage(message: HostToWebviewMessage): void {
   if (subscriptions.size === 0) {
-    if (bufferedMessages.length >= MAX_BUFFERED_HOST_MESSAGES) {
-      bufferedMessages.shift();
-    }
-    bufferedMessages.push(message);
+    bufferHostMessage(message);
     return;
   }
   // Iterate a snapshot: a handler that subscribes during delivery waits for the next message, and
@@ -141,6 +146,36 @@ function routeHostMessage(message: HostToWebviewMessage): void {
       deliver(subscription.handler, message);
     }
   }
+}
+
+/**
+ * Holds `message` until the first subscriber registers, without ever losing the latest snapshot
+ * (see {@link MAX_BUFFERED_HOST_MESSAGES}).
+ *
+ * 1. A `state` supersedes every buffered `state`: those are removed, and the new one is appended
+ *    in its arrival position.
+ * 2. When the buffer is full, the oldest non-`state` message makes room. Only with a buffer that
+ *    holds nothing but a snapshot is there no notification to evict; the incoming notification is
+ *    then the one dropped, because the snapshot outranks it.
+ *
+ * Delivery stays in arrival order: nothing is reordered, only removed.
+ */
+function bufferHostMessage(message: HostToWebviewMessage): void {
+  if (message.type === 'state') {
+    for (let index = bufferedMessages.length - 1; index >= 0; index -= 1) {
+      if (bufferedMessages[index]?.type === 'state') {
+        bufferedMessages.splice(index, 1);
+      }
+    }
+  }
+  if (bufferedMessages.length >= MAX_BUFFERED_HOST_MESSAGES) {
+    const oldestNotification = bufferedMessages.findIndex((held) => held.type !== 'state');
+    if (oldestNotification === -1) {
+      return;
+    }
+    bufferedMessages.splice(oldestNotification, 1);
+  }
+  bufferedMessages.push(message);
 }
 
 /**

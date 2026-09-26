@@ -11,7 +11,8 @@
  *     capturing class and is always accompanied by a text label, referenced by both controls;
  *   - the event-count ruling: no digit is ever rendered, because the editor never receives the
  *     telemetry stream (AAP 0.4.2, 0.5.4);
- *   - the "Reproduce the issue now." prompt while armed and not yet capturing;
+ *   - the "Reproduce the issue now." prompt while armed and not yet capturing, and "Reproduce the
+ *     issue again." instead when the armed capture was requested by a follow-up (AAP 0.4.2);
  *   - the states of AAP 0.5.5 and their precedence (error > pending > unavailable > controls);
  *   - focus following the action across the pending state, without stealing it;
  *   - the design-system shape: no heading, no inline style, the root block class composed with
@@ -36,6 +37,7 @@ const START_NAME = 'Start capture';
 const STOP_NAME = 'Stop capture';
 const RETRY_NAME = 'Capture again';
 const ARMED_PROMPT = 'Reproduce the issue now.';
+const FOLLOW_UP_ARMED_PROMPT = 'Reproduce the issue again.';
 const PENDING_TEXT = 'Updating the capture…';
 const UNAVAILABLE_MESSAGE = 'Capture becomes available once instrumentation is ready.';
 
@@ -422,6 +424,49 @@ describe('CaptureControls — arming prompt', () => {
       const { container, unmount } = render(<CaptureControls {...state} />);
       expect(screen.queryByText(ARMED_PROMPT)).toBeNull();
       expect(getStateRegion(container).textContent).toBe('Not capturing');
+      unmount();
+    }
+  });
+
+  it('asks the developer to reproduce the issue again for a follow-up capture', () => {
+    const { container } = render(
+      <CaptureControls {...readyProps({ armed: true, followUpCapture: true })} />,
+    );
+
+    expect(screen.getByText(FOLLOW_UP_ARMED_PROMPT)).toBeTruthy();
+    expect(screen.queryByText(ARMED_PROMPT)).toBeNull();
+    expect(getStateRegion(container).textContent).toBe('Ready to capture');
+  });
+
+  it('says "now" for the first capture and "again" only for a follow-up capture', () => {
+    const firstCapture: CaptureControlsProps[] = [
+      readyProps({ armed: true }),
+      readyProps({ armed: true, followUpCapture: false }),
+      readyProps({ armed: true, followUpCapture: undefined }),
+    ];
+    for (const state of firstCapture) {
+      const { unmount } = render(<CaptureControls {...state} />);
+      expect(screen.getByText(ARMED_PROMPT)).toBeTruthy();
+      expect(screen.queryByText(FOLLOW_UP_ARMED_PROMPT)).toBeNull();
+      unmount();
+    }
+
+    const { rerender } = render(<CaptureControls {...readyProps({ armed: true })} />);
+    expect(screen.getByText(ARMED_PROMPT)).toBeTruthy();
+    rerender(<CaptureControls {...readyProps({ armed: true, followUpCapture: true })} />);
+    expect(screen.getByText(FOLLOW_UP_ARMED_PROMPT)).toBeTruthy();
+    expect(screen.queryByText(ARMED_PROMPT)).toBeNull();
+  });
+
+  it('shows no follow-up prompt while capturing or while not armed', () => {
+    const noPrompt: CaptureControlsProps[] = [
+      capturingProps({ armed: true, followUpCapture: true }),
+      readyProps({ armed: false, followUpCapture: true }),
+    ];
+    for (const state of noPrompt) {
+      const { unmount } = render(<CaptureControls {...state} />);
+      expect(screen.queryByText(FOLLOW_UP_ARMED_PROMPT)).toBeNull();
+      expect(screen.queryByText(ARMED_PROMPT)).toBeNull();
       unmount();
     }
   });

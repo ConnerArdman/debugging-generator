@@ -64,6 +64,7 @@ import {
 } from '@debuggen/model-provider';
 import { panelSpecSchema, type PanelSpec } from '@debuggen/panel-schema';
 import {
+  FOLLOW_UP_ATTEMPT_ID_PREFIX,
   PROGRESS_STAGES,
   analysisResultSchema,
   sessionRecordSchema,
@@ -76,6 +77,7 @@ import {
 import {
   DebuggenError,
   err,
+  newId,
   ok,
   type DebuggenErrorCode,
   type LogFields,
@@ -120,6 +122,10 @@ import {
   type PipelineOrchestratorDeps,
   type StageOverrides,
 } from './orchestrator.js';
+// The one value imported from a stage module: AAP §0.5.5's pure empty-capture
+// rule, so a faked capture stage can report the verdict the real rule reaches.
+// It is a pure function — no stage runs, and every stage is still overridden.
+import { classifyCaptureEmptiness } from './stages/capture.js';
 
 /* -------------------------------------------------------------------------------------------------
  * Types derived from the orchestrator's own ports — never restated, never imported from a stage
@@ -164,6 +170,14 @@ const SESSION_ID = 'session-orchestrator-suite';
 const PROJECT_ROOT = '/workspace/ledger-tool';
 const FIXED_EPOCH_MS = 1_767_225_600_000;
 const CAPTURE_ID = 'capture-orchestrator-suite';
+
+/**
+ * A fresh follow-up attempt id, minted as the route and the editor view mint
+ * one: every follow-up these cases ask is a new question with its own id.
+ */
+function nextAttemptId(): string {
+  return newId(FOLLOW_UP_ATTEMPT_ID_PREFIX);
+}
 
 /**
  * Tokens planted in every place a log record must never reach: the question,
@@ -535,6 +549,18 @@ function modelUnavailable(stage?: ProgressStage): DebuggenError {
   });
 }
 
+/** The store's refusal to keep a session-record patch, as the manager returns it. */
+function recordWriteRefused(): DebuggenError {
+  return subsystemError('STORE_ERROR', 'The session record could not be written.');
+}
+
+/** The fields of every warn record the orchestrator logged about one mirrored record field. */
+function mirrorWarnings(records: readonly LoggedRecord[], field: keyof SessionPatch): LogFields[] {
+  return records
+    .filter((record) => record.level === 'warn' && record.fields['field'] === field)
+    .map((record) => record.fields);
+}
+
 /** Two signals an install could not enable, and the degradation sentences the service built for them. */
 const UNAVAILABLE: readonly UnavailableSignal[] = Object.freeze([
   {
@@ -808,7 +834,10 @@ interface TransitionRecord {
   readonly context: SessionTransitionContext | undefined;
 }
 
-/** What a test scripts on the manager: a refusal of a transition, or of opening a capture window. */
+/**
+ * What a test scripts on the manager: a refusal of a transition, of a record
+ * patch (the store failing to keep a mirror), or of opening a capture window.
+ */
 interface ManagerScript {
   refuseTransition:
     | ((
@@ -817,7 +846,15 @@ interface ManagerScript {
         context: SessionTransitionContext | undefined,
       ) => DebuggenError | undefined)
     | undefined;
+  /** Answers the error a patch is refused with — nothing is stored — or `undefined` to apply it. */
+  refusePatch: ((patch: SessionPatch) => DebuggenError | undefined) | undefined;
   startCaptureError: DebuggenError | undefined;
+  /**
+   * The error a stop is refused with — the store refusing the closure and the
+   * status commit together, so the window stays open and the status
+   * `capturing` — or `undefined` to close the window.
+   */
+  stopCaptureError: DebuggenError | undefined;
 }
 
 /** The recording session manager and everything it recorded. */
@@ -829,6 +866,8 @@ interface FakeManager {
   /** Every plan version recorded through `recordPlan`, in order. */
   readonly recordedPlans: InstrumentationPlan[];
   readonly followUpQuestions: string[];
+  /** The attempt id of every `appendFollowUp` call, in order. */
+  readonly followUpAttemptIds: string[];
   readonly script: ManagerScript;
   current(): SessionRecord;
 }
@@ -849,18 +888,31 @@ function notFound(sessionId: string): DebuggenError {
  * and the capture methods open and close the window. Every stored mutation is
  * re-validated against protocol's session schema, so an artifact the
  * orchestrator mirrors wrongly fails the test.
+ *
+ * `aliases` are further session ids the manager answers with the same stored
+ * record: to the orchestrator, whose per-session bookkeeping is keyed by the
+ * id it is asked about, they are further live sessions of the same project.
  */
 function fakeManager(
   initial: SessionRecord,
   progress: SessionProgress,
   state: SharedState,
+  aliases: ReadonlySet<string> = new Set(),
 ): FakeManager {
   let record = initial;
+  /** Whether `sessionId` names the stored record, directly or through an alias. */
+  const answers = (sessionId: string): boolean => sessionId === record.id || aliases.has(sessionId);
   const transitions: TransitionRecord[] = [];
   const patches: SessionPatch[] = [];
   const recordedPlans: InstrumentationPlan[] = [];
   const followUpQuestions: string[] = [];
-  const script: ManagerScript = { refuseTransition: undefined, startCaptureError: undefined };
+  const followUpAttemptIds: string[] = [];
+  const script: ManagerScript = {
+    refuseTransition: undefined,
+    refusePatch: undefined,
+    startCaptureError: undefined,
+    stopCaptureError: undefined,
+  };
 
   const store = (next: Partial<SessionRecord>): SessionRecord => {
     record = sessionRecordSchema.parse({ ...record, ...next, updatedAt: record.updatedAt + 1 });
@@ -869,7 +921,7 @@ function fakeManager(
 
   const members = {
     get: (sessionId: string): Result<SessionRecord | undefined, DebuggenError> =>
-      ok(sessionId === record.id ? record : undefined),
+      ok(answers(sessionId) ? record : undefined),
 
     transitionTo: (
       sessionId: string,
@@ -877,7 +929,7 @@ function fakeManager(
       context?: SessionTransitionContext,
     ): Promise<Result<SessionRecord, DebuggenError>> => {
       state.timeline.push(`transition:${to}`);
-      if (sessionId !== record.id) {
+      if (!answers(sessionId)) {
         return Promise.resolve(err(notFound(sessionId)));
       }
       const from = record.status;
@@ -898,8 +950,12 @@ function fakeManager(
       sessionId: string,
       patch: SessionPatch,
     ): Promise<Result<SessionRecord, DebuggenError>> => {
-      if (sessionId !== record.id) {
+      if (!answers(sessionId)) {
         return Promise.resolve(err(notFound(sessionId)));
+      }
+      const refusal = script.refusePatch?.(patch);
+      if (refusal !== undefined) {
+        return Promise.resolve(err(refusal));
       }
       patches.push(patch);
       return Promise.resolve(ok(store(patch as Partial<SessionRecord>)));
@@ -909,7 +965,7 @@ function fakeManager(
       sessionId: string,
       input: RecordPlanInput,
     ): Promise<Result<RecordedPlan, DebuggenError>> => {
-      if (sessionId !== record.id) {
+      if (!answers(sessionId)) {
         return Promise.resolve(err(notFound(sessionId)));
       }
       const plan = instrumentationPlanSchema.parse({
@@ -925,19 +981,21 @@ function fakeManager(
     appendFollowUp: (
       sessionId: string,
       question: string,
+      attemptId: string,
     ): Promise<Result<SessionRecord, DebuggenError>> => {
       followUpQuestions.push(question);
-      return Promise.resolve(sessionId === record.id ? ok(record) : err(notFound(sessionId)));
+      followUpAttemptIds.push(attemptId);
+      return Promise.resolve(answers(sessionId) ? ok(record) : err(notFound(sessionId)));
     },
 
     recordFollowUpOutcome: (sessionId: string): Promise<Result<SessionRecord, DebuggenError>> =>
-      Promise.resolve(sessionId === record.id ? ok(record) : err(notFound(sessionId))),
+      Promise.resolve(answers(sessionId) ? ok(record) : err(notFound(sessionId))),
 
     startCapture: (
       sessionId: string,
     ): Promise<Result<{ readonly captureId: string }, DebuggenError>> => {
       state.timeline.push('startCapture');
-      if (sessionId !== record.id) {
+      if (!answers(sessionId)) {
         return Promise.resolve(err(notFound(sessionId)));
       }
       if (script.startCaptureError !== undefined) {
@@ -957,8 +1015,11 @@ function fakeManager(
       options: StopCaptureOptions,
     ): Promise<Result<CaptureRecord, DebuggenError>> => {
       state.timeline.push(`stopCapture:${options.next}`);
+      if (script.stopCaptureError !== undefined) {
+        return Promise.resolve(err(script.stopCaptureError));
+      }
       const open = record.captures.at(-1);
-      if (sessionId !== record.id || open === undefined || open.stoppedAt !== undefined) {
+      if (!answers(sessionId) || open === undefined || open.stoppedAt !== undefined) {
         return Promise.resolve(
           err(new DebuggenError('SESSION_INVALID_STATE', 'No capture window is open.')),
         );
@@ -975,6 +1036,7 @@ function fakeManager(
     patches,
     recordedPlans,
     followUpQuestions,
+    followUpAttemptIds,
     script,
     current: () => record,
   };
@@ -1027,6 +1089,8 @@ interface HarnessOptions {
   readonly script?: Partial<HarnessScript>;
   /** Offers `evaluateReadiness` on the instrumentation double. */
   readonly evaluateReadiness?: Mock<EvaluateReadinessFn>;
+  /** Further session ids the manager answers with the suite's one record (see `fakeManager`). */
+  readonly sessionAliases?: readonly string[];
 }
 
 /** The names of the tripwired collaborators the orchestrator only hands on (or reads narrowly). */
@@ -1075,7 +1139,12 @@ function harness(options: HarnessOptions = {}): Harness {
   const state: SharedState = { origin: 'orchestrator', timeline: [] };
   const { timeline } = state;
   const progress = recordingProgress(state, progressCalls);
-  const manager = fakeManager(sessionRecord(options.session), progress, state);
+  const manager = fakeManager(
+    sessionRecord(options.session),
+    progress,
+    state,
+    new Set(options.sessionAliases),
+  );
   const sessions = manager.wire.value;
   const code = codeHandles();
   const script: HarnessScript = {
@@ -1354,7 +1423,11 @@ function harness(options: HarnessOptions = {}): Harness {
     // recorded, then takes the one path through the orchestrator's seams.
     followUp: vi.fn<Stages['followUp']['run']>(async (context, input: FollowUpInput) => {
       timeline.push('stage:followUp');
-      const appended = await sessions.appendFollowUp(context.sessionId, input.followUpQuestion);
+      const appended = await sessions.appendFollowUp(
+        context.sessionId,
+        input.followUpQuestion,
+        input.attemptId,
+      );
       if (!appended.ok) {
         return err(appended.error);
       }
@@ -1814,6 +1887,22 @@ describe('run: bookkeeping', () => {
     expect(captureClosings).toHaveLength(1);
   });
 
+  it('keeps the modifications mirror best-effort: the journal is authoritative, so a refused mirror is logged and the run still reaches ready', async () => {
+    const h = harness();
+    const refused = recordWriteRefused();
+    h.manager.script.refusePatch = (patch) =>
+      patch.modifications !== undefined ? refused : undefined;
+
+    const outcome = expectOk(await h.orchestrator.run({ sessionId: SESSION_ID }));
+
+    expect(outcome).toMatchObject({ status: 'ready', appliedModifications: 1 });
+    expect(transitionRequests(h, 'failed')).toBe(0);
+    expect(h.manager.current().modifications).toEqual([]);
+    expect(mirrorWarnings(h.records, 'modifications')).toEqual([
+      expect.objectContaining({ field: 'modifications', code: 'STORE_ERROR' }),
+    ]);
+  });
+
   it('refuses a session that is not startable, and one whose instrumentation is still installed, without moving it', async () => {
     const notStartable = harness({ session: { status: 'ready' } });
     const installed = harness({ session: { status: 'failed' } });
@@ -1968,7 +2057,11 @@ const FAILURE_CASES: readonly FailureCase[] = [
     arrange: toGenerated,
     fail: (h, error) => {
       h.stages.followUp.mockResolvedValueOnce(err(error));
-      return h.orchestrator.followUp({ sessionId: SESSION_ID, question: 'Why did it run twice?' });
+      return h.orchestrator.followUp({
+        sessionId: SESSION_ID,
+        attemptId: nextAttemptId(),
+        question: 'Why did it run twice?',
+      });
     },
     later: (h) => [h.panelGenerator.regenerate, h.stages.analyze, h.stages.generatePanel],
     analysesAdded: [],
@@ -2190,6 +2283,62 @@ describe('failure contract: generated needs both validated artifacts', () => {
     expect(h.stages.analyze).not.toHaveBeenCalled();
     expect(transitionRequests(h, 'generated')).toBe(0);
   });
+
+  it('files an analysis the session record could not keep under analyze: Stage 6 never runs and generated is never asked for', async () => {
+    const h = harness();
+    await toCapturing(h);
+    const refused = recordWriteRefused();
+    h.manager.script.refusePatch = (patch) => (patch.analyses !== undefined ? refused : undefined);
+
+    const error = expectErr(await h.orchestrator.completeCapture({ sessionId: SESSION_ID }));
+
+    expect(error).toBe(refused);
+    expect(h.manager.current().status).toBe('failed');
+    expect(failuresOf(h)).toEqual([
+      { stage: 'analyze', code: 'STORE_ERROR', message: refused.message },
+    ]);
+    expect(failedRows(h)).toHaveLength(1);
+    expect(transitionRequests(h, 'generated')).toBe(0);
+    expect(h.stages.generatePanel).not.toHaveBeenCalled();
+    expect(h.manager.current().analyses).toEqual([]);
+    expect(h.manager.current().panelIds).toEqual([]);
+    expect(mirrorWarnings(h.records, 'analyses')).toEqual([
+      expect.objectContaining({ field: 'analyses', code: 'STORE_ERROR' }),
+    ]);
+
+    // The retry path of AAP §0.5.5: once the store keeps the record again, the
+    // stopped capture resumes and both artifacts reach the record exactly once.
+    h.manager.script.refusePatch = undefined;
+    expectOk(await h.orchestrator.completeCapture({ sessionId: SESSION_ID }));
+
+    expect(h.manager.current().status).toBe('generated');
+    expect(h.manager.current().analyses.map((entry) => entry.id)).toEqual([analysisOf(1).id]);
+    expect(h.manager.current().panelIds).toEqual([PANEL_V1.id]);
+    expect(transitionRequests(h, 'generated')).toBe(1);
+  });
+
+  it('files a panel the session record could not keep under generate-panel, and never generates', async () => {
+    const h = harness();
+    await toCapturing(h);
+    const refused = recordWriteRefused();
+    h.manager.script.refusePatch = (patch) => (patch.panelIds !== undefined ? refused : undefined);
+
+    const error = expectErr(await h.orchestrator.completeCapture({ sessionId: SESSION_ID }));
+
+    expect(error).toBe(refused);
+    expect(h.manager.current().status).toBe('failed');
+    expect(failuresOf(h)).toEqual([
+      { stage: 'generate-panel', code: 'STORE_ERROR', message: refused.message },
+    ]);
+    expect(failedRows(h)).toHaveLength(1);
+    expect(transitionRequests(h, 'generated')).toBe(0);
+    expect(h.stages.generatePanel).toHaveBeenCalledTimes(1);
+    expect(h.manager.current().analyses.map((entry) => entry.id)).toEqual([analysisOf(1).id]);
+    expect(h.manager.current().panelIds).toEqual([]);
+    expect(mirrorWarnings(h.records, 'panelIds')).toEqual([
+      expect.objectContaining({ field: 'panelIds', code: 'STORE_ERROR' }),
+    ]);
+  });
 });
 
 /* =================================================================================================
@@ -2261,9 +2410,21 @@ describe('capture', () => {
   it('never authors display text: it sends stage boundaries only, leaving titles to the emitter', async () => {
     const h = harness();
     await toGenerated(h);
-    expectOk(await h.orchestrator.followUp({ sessionId: SESSION_ID, question: 'Why twice?' }));
+    expectOk(
+      await h.orchestrator.followUp({
+        sessionId: SESSION_ID,
+        attemptId: nextAttemptId(),
+        question: 'Why twice?',
+      }),
+    );
     h.script.followUpPath = 'new-capture';
-    expectOk(await h.orchestrator.followUp({ sessionId: SESSION_ID, question: 'Why again?' }));
+    expectOk(
+      await h.orchestrator.followUp({
+        sessionId: SESSION_ID,
+        attemptId: nextAttemptId(),
+        question: 'Why again?',
+      }),
+    );
 
     const own = orchestratorRows(h);
     expect(own.length).toBeGreaterThan(0);
@@ -2327,6 +2488,48 @@ describe('capture', () => {
       expect(h.manager.current().panelIds).toEqual([]);
     },
   );
+
+  it('sends an interaction question captured with the interaction hook off back to ready, never to generated', async () => {
+    // The faked stage reports the real rule's verdict: the pure classifier over
+    // a capture that recorded requests only, armed — like every fake completion
+    // here — with the dormant hooks, so the interaction hook was off. Before
+    // AAP §0.5.5 was enforced independently of the hook, this capture was
+    // "evidence" and the run reached `generated` without a reproduction.
+    const requestsOnly = {
+      eventCount: EVIDENCE_SUMMARY.eventCount,
+      kindCounts: { ...EVIDENCE_SUMMARY.kindCounts, fetch: EVIDENCE_SUMMARY.eventCount },
+    };
+    const emptiness = classifyCaptureEmptiness(requestsOnly, UNDERSTANDING, {
+      agentHooks: DORMANT_AGENT_HOOK_CONFIG,
+    });
+    expect(emptiness).toMatchObject({
+      empty: true,
+      reason: 'no-interaction',
+      interactionRequired: true,
+      interactionHookArmed: false,
+    });
+    const h = harness({ script: { emptiness, summary: EVIDENCE_SUMMARY } });
+    await toCapturing(h);
+
+    const result = expectOk(await h.orchestrator.completeCapture({ sessionId: SESSION_ID }));
+
+    expect(result).toEqual({
+      captureId: CAPTURE_ID,
+      summary: EVIDENCE_SUMMARY,
+      emptyCapture: true,
+    });
+    expect(h.manager.current().status).toBe('ready');
+    expect(statusesOf(h)).not.toContain('analyzing');
+    expect(statusesOf(h)).not.toContain('generated');
+    expect(h.stages.analyze).not.toHaveBeenCalled();
+    expect(h.stages.generatePanel).not.toHaveBeenCalled();
+    expect(failedRows(h)).toEqual([]);
+    expect(orchestratorRows(h).at(-1)).toMatchObject({
+      method: 'stageCompleted',
+      stage: 'capture',
+      message: EMPTY_CAPTURE_MESSAGE,
+    });
+  });
 
   it('returns a capture conflict unchanged — owningSessionId intact for the 409 — and arms nothing', async () => {
     const h = harness();
@@ -2409,6 +2612,103 @@ describe('capture', () => {
     expect(h.manager.wire.calls.filter((call) => call.member === 'transitionTo')).toEqual([]);
     expect(failedRows(h)).toEqual([]);
     expect(orchestratorRows(h)).toEqual([]);
+    expect(h.instrumentation.armCapture).not.toHaveBeenCalled();
+  });
+
+  it('arms the producers of a window left open again when the store refuses both its stop and the move to failed', async () => {
+    const h = harness();
+    await toCapturing(h);
+    const refused = new DebuggenError(
+      'STORE_ERROR',
+      'The session store could not complete an operation.',
+      { details: { reason: 'store-failed' } },
+    );
+    h.manager.script.stopCaptureError = refused;
+    h.manager.script.refuseTransition = (_from, to) => (to === 'failed' ? refused : undefined);
+    const armsBefore = h.instrumentation.armCapture.mock.calls.length;
+    const timelineMark = h.timeline.length;
+
+    const error = expectErr(await h.orchestrator.completeCapture({ sessionId: SESSION_ID }));
+
+    // The failure the operation reports is the store's, unchanged, and nothing moved.
+    expect(error).toBe(refused);
+    const record = h.manager.current();
+    expect(record.status).toBe('capturing');
+    expect(record.captures.at(-1)).toMatchObject({ id: CAPTURE_ID, planVersion: 1 });
+    expect(record.captures.at(-1)?.stoppedAt).toBeUndefined();
+    expect(transitionRequests(h, 'failed')).toBe(1);
+    expect(transitionRequests(h, 'generated')).toBe(0);
+    expect(h.stages.analyze).not.toHaveBeenCalled();
+
+    // Disarmed for the stop, then armed again for the same, still-open window.
+    expect(h.instrumentation.armCapture.mock.calls.slice(armsBefore)).toEqual([
+      [
+        {
+          sessionId: SESSION_ID,
+          captureId: CAPTURE_ID,
+          projectRoot: PROJECT_ROOT,
+          plan: record.plans.find((plan) => plan.planVersion === 1),
+        },
+      ],
+    ]);
+    expectInOrder(h.timeline.slice(timelineMark), [
+      'stage:complete',
+      'disarmCapture',
+      'stopCapture:analyzing',
+      'transition:failed',
+      'armCapture',
+    ]);
+    expect(
+      h.records.filter(
+        (entry) =>
+          entry.level === 'info' &&
+          entry.message.includes('producers were armed again') &&
+          entry.fields['captureId'] === CAPTURE_ID,
+      ),
+    ).toHaveLength(1);
+  });
+
+  it('arms nothing when the stop is refused but the move to failed closes the window', async () => {
+    const h = harness();
+    await toCapturing(h);
+    h.manager.script.stopCaptureError = new DebuggenError(
+      'STORE_ERROR',
+      'The session store could not complete an operation.',
+    );
+    const armsBefore = h.instrumentation.armCapture.mock.calls.length;
+
+    expectErr(await h.orchestrator.completeCapture({ sessionId: SESSION_ID }));
+
+    expect(h.manager.current().status).toBe('failed');
+    expect(failuresOf(h).map((failure) => failure.stage)).toEqual(['capture']);
+    expect(h.instrumentation.armCapture.mock.calls.slice(armsBefore)).toEqual([]);
+  });
+
+  it('logs a re-arm the instrumentation layer refuses and still reports the original failure', async () => {
+    const h = harness();
+    await toCapturing(h);
+    const refused = new DebuggenError(
+      'STORE_ERROR',
+      'The session store could not complete an operation.',
+    );
+    h.manager.script.stopCaptureError = refused;
+    h.manager.script.refuseTransition = (_from, to) => (to === 'failed' ? refused : undefined);
+    h.instrumentation.armCapture.mockReturnValueOnce(
+      err(new DebuggenError('TRANSPORT_DISCONNECTED', 'The page agent could not be armed.')),
+    );
+
+    const error = expectErr(await h.orchestrator.completeCapture({ sessionId: SESSION_ID }));
+
+    expect(error).toBe(refused);
+    expect(h.manager.current().status).toBe('capturing');
+    expect(
+      h.records.filter(
+        (entry) =>
+          entry.level === 'warn' &&
+          entry.message.includes('could not be armed again') &&
+          entry.fields['code'] === 'TRANSPORT_DISCONNECTED',
+      ),
+    ).toHaveLength(1);
   });
 
   it('resumes the stored capture of a session left failed after analysis, without closing it again', async () => {
@@ -2450,6 +2750,7 @@ describe('followUp', () => {
     const outcome = expectOk(
       await h.orchestrator.followUp({
         sessionId: SESSION_ID,
+        attemptId: nextAttemptId(),
         question: `Why did it run twice ${SENTINELS.followUp}?`,
       }),
     );
@@ -2494,11 +2795,15 @@ describe('followUp', () => {
     const h = harness();
     await toGenerated(h);
     const question = `Why did it run twice ${SENTINELS.followUp}?`;
+    const attemptId = nextAttemptId();
 
-    expectOk(await h.orchestrator.followUp({ sessionId: SESSION_ID, question }));
+    expectOk(await h.orchestrator.followUp({ sessionId: SESSION_ID, attemptId, question }));
 
     const [context, input] = h.stages.followUp.mock.calls[0] ?? [];
     expect(input?.followUpQuestion).toBe(question);
+    // The attempt id reaches the stage — and through it the manager — untouched.
+    expect(input?.attemptId).toBe(attemptId);
+    expect(h.manager.followUpAttemptIds).toEqual([attemptId]);
     expect(context?.followUpQuestion).toBe(question);
     expect(context?.question).toBe(h.manager.current().question);
     expect(context?.code).toBe(h.code);
@@ -2512,7 +2817,13 @@ describe('followUp', () => {
     await toGenerated(h);
     const manifestReads = h.promptVersions.mock.calls.length;
 
-    expectOk(await h.orchestrator.followUp({ sessionId: SESSION_ID, question: 'Why twice?' }));
+    expectOk(
+      await h.orchestrator.followUp({
+        sessionId: SESSION_ID,
+        attemptId: nextAttemptId(),
+        question: 'Why twice?',
+      }),
+    );
 
     expect(MANIFEST.followup).not.toBe('v001');
     expect(manifestReads).toBe(1);
@@ -2538,7 +2849,11 @@ describe('followUp', () => {
       };
 
       const outcome = expectOk(
-        await h.orchestrator.followUp({ sessionId: SESSION_ID, question: 'Why again?' }),
+        await h.orchestrator.followUp({
+          sessionId: SESSION_ID,
+          attemptId: nextAttemptId(),
+          question: 'Why again?',
+        }),
       );
 
       expect(outcome).toMatchObject({
@@ -2605,7 +2920,11 @@ describe('followUp', () => {
     const transitionsBefore = h.manager.transitions.length;
 
     const error = expectErr(
-      await h.orchestrator.followUp({ sessionId: SESSION_ID, question: 'Why again?' }),
+      await h.orchestrator.followUp({
+        sessionId: SESSION_ID,
+        attemptId: nextAttemptId(),
+        question: 'Why again?',
+      }),
     );
 
     expect(error).toBe(failure);
@@ -2635,13 +2954,98 @@ describe('followUp', () => {
     const h = harness({ session: { status: 'ready' } });
 
     const error = expectErr(
-      await h.orchestrator.followUp({ sessionId: SESSION_ID, question: 'Why?' }),
+      await h.orchestrator.followUp({
+        sessionId: SESSION_ID,
+        attemptId: nextAttemptId(),
+        question: 'Why?',
+      }),
     );
 
     expect(error.code).toBe('SESSION_INVALID_STATE');
     expect(h.stages.followUp).not.toHaveBeenCalled();
     expect(h.codeIndex.load).not.toHaveBeenCalled();
     expect(h.manager.wire.calls.filter((call) => call.member === 'transitionTo')).toEqual([]);
+  });
+
+  it.each([
+    {
+      kind: 'already answered',
+      reason: 'follow-up-attempt-answered',
+      ladder: (attemptId: string): SessionRecord['followUps'] => [
+        {
+          question: 'Why twice?',
+          askedAt: FIXED_EPOCH_MS,
+          attemptId,
+          attempt: 1,
+          needsNewCapture: false,
+        },
+      ],
+    },
+    {
+      kind: 'followed by a later follow-up',
+      reason: 'follow-up-attempt-superseded',
+      ladder: (attemptId: string): SessionRecord['followUps'] => [
+        { question: 'Why twice?', askedAt: FIXED_EPOCH_MS, attemptId, attempt: 1 },
+        {
+          question: 'Why again?',
+          askedAt: FIXED_EPOCH_MS + 1,
+          attemptId: nextAttemptId(),
+          attempt: 1,
+        },
+      ],
+    },
+  ])(
+    'refuses an attempt $kind before any stage, progress row or status change',
+    async ({ reason, ladder }) => {
+      const attemptId = nextAttemptId();
+      const h = harness({ session: { status: 'failed', followUps: ladder(attemptId) } });
+
+      const error = expectErr(
+        await h.orchestrator.followUp({ sessionId: SESSION_ID, attemptId, question: 'Why twice?' }),
+      );
+
+      expect(error.code).toBe('SESSION_INVALID_STATE');
+      expect(error.details?.['reason']).toBe(reason);
+      // A duplicate runs nothing and files nothing: the session is as it was.
+      expect(h.stages.followUp).not.toHaveBeenCalled();
+      expect(h.codeIndex.load).not.toHaveBeenCalled();
+      expect(h.manager.followUpAttemptIds).toEqual([]);
+      expect(h.manager.wire.calls.filter((call) => call.member === 'transitionTo')).toEqual([]);
+      expect(failedRows(h)).toEqual([]);
+      expect(h.manager.current().status).toBe('failed');
+    },
+  );
+
+  it('admits a retry of the latest unanswered attempt and hands the stage its own id', async () => {
+    const attemptId = nextAttemptId();
+    const h = harness({
+      session: {
+        followUps: [{ question: 'Why twice?', askedAt: FIXED_EPOCH_MS, attemptId, attempt: 1 }],
+      },
+    });
+    await toGenerated(h);
+
+    expectOk(
+      await h.orchestrator.followUp({ sessionId: SESSION_ID, attemptId, question: 'Why twice?' }),
+    );
+
+    expect(h.stages.followUp).toHaveBeenCalledTimes(1);
+    expect(h.stages.followUp.mock.calls[0]?.[1].attemptId).toBe(attemptId);
+    expect(h.manager.followUpAttemptIds).toEqual([attemptId]);
+  });
+
+  it('refuses a malformed attempt id before any stage runs', async () => {
+    const h = harness();
+    await toGenerated(h);
+
+    const error = expectErr(
+      await h.orchestrator.followUp({ sessionId: SESSION_ID, attemptId: '', question: 'Why?' }),
+    );
+
+    expect(error.code).toBe('PROTOCOL_INVALID_MESSAGE');
+    expect(error.details?.['reason']).toBe('follow-up-attempt-invalid');
+    expect(h.stages.followUp).not.toHaveBeenCalled();
+    expect(h.manager.current().status).toBe('generated');
   });
 
   it('returns a refusal the stage raises before choosing a path unchanged, leaving the session generated', async () => {
@@ -2653,7 +3057,11 @@ describe('followUp', () => {
     h.stages.followUp.mockResolvedValueOnce(err(refusal));
 
     const error = expectErr(
-      await h.orchestrator.followUp({ sessionId: SESSION_ID, question: ' ' }),
+      await h.orchestrator.followUp({
+        sessionId: SESSION_ID,
+        attemptId: nextAttemptId(),
+        question: ' ',
+      }),
     );
 
     expect(error).toBe(refusal);
@@ -2661,6 +3069,54 @@ describe('followUp', () => {
     expect(transitionRequests(h, 'failed')).toBe(0);
     expect(failedRows(h)).toEqual([]);
   });
+
+  it.each([
+    {
+      field: 'analyses',
+      stage: 'analyze',
+      analysesAfter: [analysisOf(1).id],
+      panelIdsAfter: [PANEL_V1.id],
+    },
+    {
+      field: 'panelIds',
+      stage: 'generate-panel',
+      analysesAfter: [analysisOf(1).id, analysisOf(2).id],
+      panelIdsAfter: [PANEL_V1.id],
+    },
+  ] as const)(
+    'existing-evidence: a regenerated artifact the record could not keep ($field) fails $stage and never reaches generated again',
+    async ({ field, stage, analysesAfter, panelIdsAfter }) => {
+      const h = harness();
+      await toGenerated(h);
+      const transitionsBefore = h.manager.transitions.length;
+      const refused = recordWriteRefused();
+      h.manager.script.refusePatch = (patch) => (patch[field] !== undefined ? refused : undefined);
+
+      const error = expectErr(
+        await h.orchestrator.followUp({
+          sessionId: SESSION_ID,
+          attemptId: nextAttemptId(),
+          question: 'Why twice?',
+        }),
+      );
+
+      expect(error).toBe(refused);
+      expect(
+        h.manager.transitions.slice(transitionsBefore).map((entry) => `${entry.from}→${entry.to}`),
+      ).toEqual(['generated→analyzing', 'analyzing→failed']);
+      // Only the capture's own `analyzing → generated` was ever asked for.
+      expect(transitionRequests(h, 'generated')).toBe(1);
+      expect(h.manager.current().status).toBe('failed');
+      expect(failuresOf(h)).toEqual([{ stage, code: 'STORE_ERROR', message: refused.message }]);
+      expect(failedRows(h)).toHaveLength(1);
+      const record = h.manager.current();
+      expect(record.analyses.map((entry) => entry.id)).toEqual(analysesAfter);
+      expect(record.panelIds).toEqual(panelIdsAfter);
+      expect(mirrorWarnings(h.records, field)).toEqual([
+        expect.objectContaining({ field, code: 'STORE_ERROR' }),
+      ]);
+    },
+  );
 });
 
 /* =================================================================================================
@@ -2780,7 +3236,11 @@ describe('concurrency, cancellation and lifecycle', () => {
       await h.orchestrator.run({ sessionId: SESSION_ID }),
       await h.orchestrator.beginCapture({ sessionId: SESSION_ID }),
       await h.orchestrator.completeCapture({ sessionId: SESSION_ID }),
-      await h.orchestrator.followUp({ sessionId: SESSION_ID, question: 'Why?' }),
+      await h.orchestrator.followUp({
+        sessionId: SESSION_ID,
+        attemptId: nextAttemptId(),
+        question: 'Why?',
+      }),
     ];
     seconds.forEach((second, index) => {
       const error = expectErr(second);
@@ -2831,7 +3291,14 @@ describe('concurrency, cancellation and lifecycle', () => {
     expectOk(await h.orchestrator.run({ sessionId: SESSION_ID, signal }));
     expectOk(await h.orchestrator.beginCapture({ sessionId: SESSION_ID, signal }));
     expectOk(await h.orchestrator.completeCapture({ sessionId: SESSION_ID, signal }));
-    expectOk(await h.orchestrator.followUp({ sessionId: SESSION_ID, question: 'Why?', signal }));
+    expectOk(
+      await h.orchestrator.followUp({
+        sessionId: SESSION_ID,
+        attemptId: nextAttemptId(),
+        question: 'Why?',
+        signal,
+      }),
+    );
 
     const received: Readonly<Record<string, readonly (AbortSignal | undefined)[]>> = {
       codeIndex: h.codeIndex.load.mock.calls.map((call) => call[1]?.signal),
@@ -2959,7 +3426,11 @@ describe('concurrency, cancellation and lifecycle', () => {
       await h.orchestrator.run({ sessionId: SESSION_ID }),
       await h.orchestrator.beginCapture({ sessionId: SESSION_ID }),
       await h.orchestrator.completeCapture({ sessionId: SESSION_ID }),
-      await h.orchestrator.followUp({ sessionId: SESSION_ID, question: 'Why?' }),
+      await h.orchestrator.followUp({
+        sessionId: SESSION_ID,
+        attemptId: nextAttemptId(),
+        question: 'Why?',
+      }),
     ];
     for (const result of refused) {
       expect(expectErr(result).details?.['reason']).toBe('orchestrator-disposed');
@@ -2981,6 +3452,131 @@ describe('concurrency, cancellation and lifecycle', () => {
   });
 });
 
+/** A second live session of the suite's project, answered by the manager with the same record. */
+const OTHER_SESSION_ID = 'session-orchestrator-suite-other';
+
+describe('code-index handle lifetime', () => {
+  it('keeps a live session’s handles across its operations and releases them, once, when the session is released', async () => {
+    const h = harness();
+    await toGenerated(h);
+    expectOk(
+      await h.orchestrator.followUp({
+        sessionId: SESSION_ID,
+        attemptId: nextAttemptId(),
+        question: 'Why twice?',
+      }),
+    );
+
+    // run, completeCapture and followUp each asked for the handles; each got the same bundle back.
+    expect(h.codeIndex.load).toHaveBeenCalledTimes(3);
+    expect(h.stages.analyze.mock.calls[0]?.[0].code).toBe(h.code);
+    expect(h.stages.followUp.mock.calls[0]?.[0].code).toBe(h.code);
+    expect(h.codeIndex.invalidate).not.toHaveBeenCalled();
+
+    h.orchestrator.releaseSession(SESSION_ID);
+    expect(h.codeIndex.invalidate.mock.calls).toEqual([[PROJECT_ROOT]]);
+
+    h.orchestrator.releaseSession(SESSION_ID);
+    h.orchestrator.releaseSession('session-unknown');
+    await h.orchestrator.dispose();
+    h.orchestrator.releaseSession(SESSION_ID);
+    expect(h.codeIndex.invalidate.mock.calls).toEqual([[PROJECT_ROOT]]);
+  });
+
+  it('releases a ready session’s handles with the session, and forgets its remembered readiness verdict', async () => {
+    const h = harness();
+    await toReady(h);
+    expect(h.codeIndex.invalidate).not.toHaveBeenCalled();
+
+    h.orchestrator.releaseSession(SESSION_ID);
+
+    expect(h.codeIndex.invalidate.mock.calls).toEqual([[PROJECT_ROOT]]);
+    // A capture armed afterwards is no longer handed the install's verdict.
+    expectOk(await h.orchestrator.beginCapture({ sessionId: SESSION_ID }));
+    expect(h.stages.arm.mock.calls.at(-1)?.[1]).toEqual({});
+  });
+
+  it('keeps a project’s handles while another live session of it holds them, and releases them with the last', async () => {
+    const h = harness({ sessionAliases: [OTHER_SESSION_ID] });
+    await toGenerated(h);
+    expectOk(
+      await h.orchestrator.followUp({
+        sessionId: OTHER_SESSION_ID,
+        attemptId: nextAttemptId(),
+        question: 'Why twice?',
+      }),
+    );
+
+    h.orchestrator.releaseSession(SESSION_ID);
+    expect(h.codeIndex.invalidate).not.toHaveBeenCalled();
+
+    h.orchestrator.releaseSession(OTHER_SESSION_ID);
+    expect(h.codeIndex.invalidate.mock.calls).toEqual([[PROJECT_ROOT]]);
+  });
+
+  it.each(['load', 'observeReadiness'] as const)(
+    'defers the release of a session released mid-operation (blocked at %s) until that operation settles',
+    async (blockedAt) => {
+      const h = harness();
+      await toGenerated(h);
+      const entered = deferred();
+      const unblock = deferred();
+      if (blockedAt === 'load') {
+        h.codeIndex.load.mockImplementationOnce(async () => {
+          entered.resolve();
+          await unblock.promise;
+          return ok(h.code);
+        });
+      } else {
+        h.observeReadiness.mockImplementationOnce(async () => {
+          entered.resolve();
+          await unblock.promise;
+          return ok({});
+        });
+      }
+
+      const pending = h.orchestrator.followUp({
+        sessionId: SESSION_ID,
+        attemptId: nextAttemptId(),
+        question: 'Why twice?',
+      });
+      await entered.promise;
+      h.orchestrator.releaseSession(SESSION_ID);
+      expect(h.orchestrator.activeRun(SESSION_ID)).toBe('followup');
+      expect(h.codeIndex.invalidate).not.toHaveBeenCalled();
+
+      unblock.resolve();
+      expectOk(await pending);
+
+      expect(h.orchestrator.activeRun(SESSION_ID)).toBeUndefined();
+      expect(h.codeIndex.invalidate.mock.calls).toEqual([[PROJECT_ROOT]]);
+      // The settled operation recorded no new hold: nothing is left to release.
+      h.orchestrator.releaseSession(SESSION_ID);
+      await h.orchestrator.dispose();
+      expect(h.codeIndex.invalidate.mock.calls).toEqual([[PROJECT_ROOT]]);
+    },
+  );
+
+  it('logs, and never throws, when the index port fails to release a project', async () => {
+    const h = harness();
+    await toReady(h);
+    h.codeIndex.invalidate.mockImplementationOnce(() => {
+      throw new Error('index port exploded');
+    });
+
+    expect(() => {
+      h.orchestrator.releaseSession(SESSION_ID);
+    }).not.toThrow();
+
+    expect(h.codeIndex.invalidate).toHaveBeenCalledTimes(1);
+    expect(
+      h.records.filter(
+        (record) => record.level === 'warn' && record.fields['code'] === 'CODE_INDEX_FAILED',
+      ),
+    ).toHaveLength(1);
+  });
+});
+
 /* =================================================================================================
  * 7. The model boundary and privacy
  * ============================================================================================== */
@@ -2989,9 +3585,21 @@ describe('model boundary and privacy', () => {
   it('never calls the model, the context builder or the analysis collaborators itself across the lifecycle', async () => {
     const h = harness();
     await toGenerated(h);
-    expectOk(await h.orchestrator.followUp({ sessionId: SESSION_ID, question: 'Why twice?' }));
+    expectOk(
+      await h.orchestrator.followUp({
+        sessionId: SESSION_ID,
+        attemptId: nextAttemptId(),
+        question: 'Why twice?',
+      }),
+    );
     h.script.followUpPath = 'new-capture';
-    expectOk(await h.orchestrator.followUp({ sessionId: SESSION_ID, question: 'Why again?' }));
+    expectOk(
+      await h.orchestrator.followUp({
+        sessionId: SESSION_ID,
+        attemptId: nextAttemptId(),
+        question: 'Why again?',
+      }),
+    );
 
     expect(providerCalls).toEqual([]);
     const handedOn: readonly TripwireName[] = [
@@ -3029,6 +3637,7 @@ describe('model boundary and privacy', () => {
     expectOk(
       await h.orchestrator.followUp({
         sessionId: SESSION_ID,
+        attemptId: nextAttemptId(),
         question: `Why did it run twice ${SENTINELS.followUp}?`,
       }),
     );
@@ -3047,6 +3656,7 @@ describe('model boundary and privacy', () => {
     expectErr(
       await h.orchestrator.followUp({
         sessionId: SESSION_ID,
+        attemptId: nextAttemptId(),
         question: `And once more ${SENTINELS.followUp}?`,
       }),
     );

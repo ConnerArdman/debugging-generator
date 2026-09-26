@@ -131,7 +131,12 @@ import { Badge } from '../primitives/Badge';
 import { Button } from '../primitives/Button';
 import { Code } from '../primitives/Code';
 import { DataTable } from '../primitives/DataTable';
-import type { DataTableCellMeta, DataTableColumn, DataTableSort } from '../primitives/DataTable';
+import type {
+  DataTableCellMeta,
+  DataTableColumn,
+  DataTableColumnWidth,
+  DataTableSort,
+} from '../primitives/DataTable';
 import { DurationCell } from '../primitives/DurationCell';
 import { EmptyState } from '../primitives/EmptyState';
 import { ErrorState } from '../primitives/ErrorState';
@@ -505,59 +510,50 @@ const COLUMN_KEY = Object.freeze({
 });
 
 /**
- * The grid track of each column, keyed like {@link COLUMN_KEY}.
+ * The width ROLE of each column, keyed like {@link COLUMN_KEY}.
  *
- * Every track is `minmax(<floor>, <share>)`. The share is the column's
- * proportion of spare width. The floor is what makes the grid scroll: `DataTable`
- * adds up the floors to get the grid's minimum inline size, so a panel narrower
- * than that scrolls horizontally with every column still readable. With a
- * `minmax(0, …)` track the grid had no minimum. In a narrow panel each column
- * shrank to its padding, a chip then covered the next column's value, and the
- * caller stack spilled outside its cell.
+ * A role names what a column holds, never how wide it is: `DataTable` resolves
+ * each one through `DATA_TABLE_COLUMN_TRACKS` to a grid track built from the
+ * `--dg-column-min-*` floor and `--dg-column-share-*` share tokens, so this
+ * table, every other visualization table and both extension surfaces agree on
+ * how wide a statement or a duration is, and no length is chosen here
+ * (AAP 0.6.4). Each column takes the smallest role whose floor keeps its
+ * content readable, in the vocabulary every table shares:
  *
- * A floor is written in `ch` of the table's own type: every row, and the grid
- * summing the floors, resolves `ch` against the same font. A `px` or `rem`
- * track would be a hardcoded value (AAP 0.6.4). Each floor is sized, in the
- * browser, to the column's header (plus the sort glyph where the column sorts)
- * or to its widest ordinary value, whichever is wider, including the cell's
- * inline padding, plus at least one character to spare:
+ *   statement   text      the identity column: long free text that wraps and
+ *                         never clips, so the widest share of spare width goes
+ *                         to it and its length does not set the floor
+ *   system      label     a short categorical chip — `postgresql`, or the
+ *                         aggregate's `(unknown system)` label at its widest
+ *   executions  count     an integer tally, sortable
+ *   durations   quantity  a formatted measurement with its unit, such as
+ *                         `940.50 ms` or `12.345 s`; the total sorts
+ *   rows        count     an integer tally
+ *   callers     name      a list of caller source chips, each showing its
+ *                         caller's name beside its execution count. A longer
+ *                         name ellipsizes inside its chip, and the chip's
+ *                         tooltip still carries the full location
  *
- *   statement  32ch  enough statement to read before it wraps; the text wraps
- *                    and never clips, so its length does not set the floor
- *   system     17ch  the aggregate's `(unknown system)` label in its chip,
- *                    about 16ch with padding and the widest value this column
- *                    shows; `postgresql` needs 11ch
- *   executions 12ch  the sorted header with its glyph, about 11ch; a grouped
- *                    count such as `12,345` is narrower
- *   durations  13ch  `Average time`, about 11.5ch, and a precise duration such
- *                    as `940.50 ms` or `12.345 s`, about 10ch
- *   rows       9ch   a grouped count such as `12,345`, about 8ch; the `Rows`
- *                    header is 6ch
- *   callers    30ch  a caller chip showing roughly twenty characters of its
- *                    name next to its whole execution count. A longer name
- *                    ellipsizes inside the chip, and its tooltip still carries
- *                    the full location
- *
- * The shares are the ones the columns had before they had floors, so a wide
- * panel lays out as it did. The floors plus the gaps between columns come to
- * about 1 050 CSS pixels, measured, which a 1280-pixel window holds without
- * scrolling.
- *
- * The floor is a fixed length, never content-based (`auto`, `min-content`), and
- * that is deliberate: the header row and each data row are separate grid
- * containers, so a track sized from one row's content would stop sitting under
- * its own header.
+ * Every role has a non-zero floor, and `DataTable` sums the floors into the
+ * grid's minimum inline size (`--dgc-min-inline`), so a panel narrower than the
+ * sum scrolls horizontally with every column still readable. A floorless
+ * `minmax(0, …)` track let each column shrink to its padding in a narrow
+ * panel, where a chip then covered the next column's value and the caller
+ * stack spilled outside its cell. And every role track is a token floor and a
+ * ratio rather than a content-based size (`auto`, `min-content`): the header
+ * row and each data row are separate grid containers, so a track sized from one
+ * row's content would stop sitting under its own header.
  */
-const COLUMN_TRACK = Object.freeze({
-  statement: 'minmax(32ch, 3fr)',
-  system: 'minmax(17ch, 0.9fr)',
-  executions: 'minmax(12ch, 0.7fr)',
-  totalDuration: 'minmax(13ch, 0.8fr)',
-  averageDuration: 'minmax(13ch, 0.8fr)',
-  maxDuration: 'minmax(13ch, 0.8fr)',
-  rowCount: 'minmax(9ch, 0.7fr)',
-  callers: 'minmax(30ch, 2fr)',
-});
+const COLUMN_WIDTH = Object.freeze({
+  statement: 'text',
+  system: 'label',
+  executions: 'count',
+  totalDuration: 'quantity',
+  averageDuration: 'quantity',
+  maxDuration: 'quantity',
+  rowCount: 'count',
+  callers: 'name',
+} satisfies Record<keyof typeof COLUMN_KEY, DataTableColumnWidth>);
 
 /**
  * Which ordering a header activation asks the data layer for.
@@ -1399,11 +1395,11 @@ function renderDetail(
 /**
  * The eight columns, left to right.
  *
- * Each track is the column's entry in {@link COLUMN_TRACK}: a share of the
- * spare width above a `ch` floor. The floor lets a narrow panel scroll
- * horizontally without squeezing a column below what its header and values
- * need. Numeric columns align to the end so their last digits line up down the
- * column.
+ * Each column's width is its role in {@link COLUMN_WIDTH}, which `DataTable`
+ * resolves to a token-built track: a share of the spare width above a floor
+ * that lets a narrow panel scroll horizontally without squeezing a column below
+ * what its content needs. Numeric columns align to the end so their last digits
+ * line up down the column.
  *
  * Only the two columns the closed sort vocabulary can actually order are
  * sortable, and each declares the one direction its ordering runs in.
@@ -1423,20 +1419,20 @@ function buildColumns(
     {
       key: COLUMN_KEY.statement,
       header: HEADER.statement,
-      width: COLUMN_TRACK.statement,
+      width: COLUMN_WIDTH.statement,
       rowHeader: true,
       cell: (group, _rowIndex, meta) => renderStatementCell(group, meta, onToggle),
     },
     {
       key: COLUMN_KEY.system,
       header: HEADER.system,
-      width: COLUMN_TRACK.system,
+      width: COLUMN_WIDTH.system,
       cell: (group) => renderSystemCell(group),
     },
     {
       key: COLUMN_KEY.executions,
       header: HEADER.executions,
-      width: COLUMN_TRACK.executions,
+      width: COLUMN_WIDTH.executions,
       align: 'end',
       sortable: true,
       defaultSortDirection: 'desc',
@@ -1445,7 +1441,7 @@ function buildColumns(
     {
       key: COLUMN_KEY.totalDuration,
       header: HEADER.totalDuration,
-      width: COLUMN_TRACK.totalDuration,
+      width: COLUMN_WIDTH.totalDuration,
       align: 'end',
       sortable: true,
       defaultSortDirection: 'desc',
@@ -1461,7 +1457,7 @@ function buildColumns(
     {
       key: COLUMN_KEY.averageDuration,
       header: HEADER.averageDuration,
-      width: COLUMN_TRACK.averageDuration,
+      width: COLUMN_WIDTH.averageDuration,
       align: 'end',
       cell: (group) => (
         <DurationCell
@@ -1475,7 +1471,7 @@ function buildColumns(
     {
       key: COLUMN_KEY.maxDuration,
       header: HEADER.maxDuration,
-      width: COLUMN_TRACK.maxDuration,
+      width: COLUMN_WIDTH.maxDuration,
       align: 'end',
       cell: (group) => (
         <DurationCell
@@ -1489,14 +1485,14 @@ function buildColumns(
     {
       key: COLUMN_KEY.rowCount,
       header: HEADER.rowCount,
-      width: COLUMN_TRACK.rowCount,
+      width: COLUMN_WIDTH.rowCount,
       align: 'end',
       cell: (group) => renderRowCountCell(group),
     },
     {
       key: COLUMN_KEY.callers,
       header: HEADER.callers,
-      width: COLUMN_TRACK.callers,
+      width: COLUMN_WIDTH.callers,
       cell: (group) => renderCallersCell(group),
     },
   ];

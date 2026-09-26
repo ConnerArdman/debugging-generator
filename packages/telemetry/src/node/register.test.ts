@@ -17,11 +17,13 @@
  * 2. **Whatever it installs, it gives back.** The active path is driven with an
  *    injected environment, `connect: false` or a fake socket, and a stubbed
  *    `fetch`, so no service, socket or network is needed; its teardown is then
- *    asserted to leave no provider, no propagator, no patch and no helper. A
- *    failure injected part-way through the installation must leave the same
- *    clean process *synchronously*, before the `failed` result exists, because
- *    the normal caller of that result is a module evaluation that awaits
- *    nothing.
+ *    asserted to leave no provider, no propagator, no patch and no helper —
+ *    and to leave the one effect it documents as staying, the
+ *    `AsyncLocalStorage` context manager `register()` installed, in place and
+ *    inert. A failure injected part-way through the installation must leave
+ *    the same clean process *synchronously*, before the `failed` result exists,
+ *    because the normal caller of that result is a module evaluation that
+ *    awaits nothing.
  *
  * The credential is asserted absent from every log line and every reported
  * reason on every path.
@@ -53,7 +55,15 @@ import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { EventEmitter } from 'node:events';
 
-import { context, diag, propagation, ProxyTracerProvider, trace } from '@opentelemetry/api';
+import {
+  context,
+  createContextKey,
+  diag,
+  propagation,
+  ProxyTracerProvider,
+  ROOT_CONTEXT,
+  trace,
+} from '@opentelemetry/api';
 import { isWrapped } from '@opentelemetry/instrumentation';
 import { PgInstrumentation } from '@opentelemetry/instrumentation-pg';
 import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
@@ -132,13 +142,13 @@ const HELPER_GLOBAL_PROPERTY = spanHelperModule.DEBUGGEN_GLOBAL_KEY;
 const CAPTURE_ID = `${ID_PREFIXES.capture}_${'c'.repeat(16)}`;
 
 /** The one symbol the armed capture's plan patched. */
-const PLANNED_SYMBOL = 'applyPromotions';
+const PLANNED_SYMBOL = 'plotEphemeris';
 
 /** A symbol no plan in this suite patched. */
-const UNPLANNED_SYMBOL = 'computeShipping';
+const UNPLANNED_SYMBOL = 'estimateAirmass';
 
 /** The project-relative file the planned symbol's patch declares. */
-const PLANNED_FILE = 'src/server/services/pricing.service.ts';
+const PLANNED_FILE = 'src/lib/astronomy/ephemeris.ts';
 
 /** The line the planned symbol's patch declares. */
 const PLANNED_LINE = 42;
@@ -707,6 +717,44 @@ describe('installPreload() with a valid launch environment', () => {
     expect(logger.entries.some((entry) => entry.message === 'preload shut down')).toBe(true);
     expect(logger.entries.filter((entry) => entry.level === 'warn')).toEqual([]);
     expect(logger.text()).not.toContain(PRELOAD_TOKEN);
+  });
+
+  it('leaves only the inert AsyncLocalStorage context manager behind after teardown', async () => {
+    const probeKey = createContextKey('register-test-context-probe');
+    /** @returns What the global context manager carries into a `context.with` callback. */
+    const carried = (): unknown =>
+      context.with(ROOT_CONTEXT.setValue(probeKey, 'carried'), () =>
+        context.active().getValue(probeKey),
+      );
+
+    // The positive control: the API's no-op manager carries nothing, so a
+    // later 'carried' can only come from the manager `register()` installed.
+    expect(carried()).toBeUndefined();
+
+    const result = expectInstalled(
+      install({ env: launchEnv(), connect: false, logger: new RecordingLogger() }),
+    );
+    expect(carried()).toBe('carried');
+
+    // A tracer resolved and used while the preload is installed, the way
+    // Next.js caches its own: its proxy is bound to the SDK tracer from here on.
+    const cached = trace.getTracer('register-test-cached');
+    cached.startSpan('while-installed').end();
+
+    await result.shutdown();
+
+    // The one process-global effect of `register()` the teardown deliberately
+    // leaves: the manager is still the global one and still carries values.
+    expect(carried()).toBe('carried');
+
+    // And it is inert: it holds no active context of this module's, and neither
+    // the cached tracer nor a fresh one records a span through it.
+    expect(context.active()).toBe(ROOT_CONTEXT);
+    expect(trace.getActiveSpan()).toBeUndefined();
+    const afterTeardown = cached.startSpan('after-teardown');
+    expect(afterTeardown.isRecording()).toBe(false);
+    afterTeardown.end();
+    expectNoGlobalTracing();
   });
 
   it('opens the control socket on the derived URL, sends the credential only there, and closes it', async () => {

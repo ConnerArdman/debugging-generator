@@ -52,9 +52,15 @@
  *    outside-the-vocabulary `fetch` methods; the global receivers; paired and
  *    unpaired `XMLHttpRequest`; the client-wrapper rule and, just as
  *    importantly, its negative cases (`registry.get(3)`,
- *    `lookup.delete(key)`); concatenated, variable and substitution-free
- *    targets; the 200-character cap on recorded source text; and the owner
- *    cascade's fallbacks to the `symbol` and `file` nodes.
+ *    `lookup.delete(key)`); the forwarding-wrapper rule, followed across an
+ *    import, which identifies the forwarded parameter and the locals built
+ *    from it by their **binding**, never their spelling — a re-declaration in
+ *    a block, a nested closure's parameter list or a `catch` clause, or a
+ *    different local of the same name, makes no wrapper, while a closure that
+ *    captures the parameter still does, and every candidate's own `fetch`
+ *    stays a node; concatenated, variable and substitution-free targets; the
+ *    200-character cap on recorded source text; and the owner cascade's
+ *    fallbacks to the `symbol` and `file` nodes.
  * 4. **Robustness, purity and determinism** — two runs are deeply equal and
  *    identically ordered; a module the parser could not read in full yields an
  *    `IndexDiagnostic` rather than a throw, quotes no source, and costs no
@@ -1820,11 +1826,172 @@ describe('apiCallsExtractor: the client-wrapper rule', () => {
   });
 });
 
+/** The forwarding-wrapper project's module of scope cases. */
+const SCOPES_MODULE = 'src/scopes.ts';
+
+/**
+ * One wrapper candidate of {@link SCOPES_MODULE} and the exported caller that
+ * passes it a path-like literal.
+ */
+interface ScopeCase {
+  /** The candidate function. Its own `fetch` is a node of its own either way. */
+  readonly candidate: string;
+
+  /** The exported function that calls the candidate with {@link ScopeCase.url}. */
+  readonly caller: string;
+
+  /** The literal the caller passes, which is a request's target only if the candidate forwards. */
+  readonly url: string;
+
+  /**
+   * Whether the candidate's `fetch` URL argument reads the candidate's *own*
+   * first parameter — that binding, not merely that spelling.
+   */
+  readonly forwards: boolean;
+}
+
+/**
+ * The scope cases of the forwarding-wrapper rule, one per candidate of
+ * {@link SCOPES_SOURCE}.
+ *
+ * Each candidate spells its first parameter `path` and passes *a* `path` (or a
+ * local built from one) to `fetch`, so a rule that compared spellings would
+ * call all eight of them wrappers. Only four read the parameter itself:
+ *
+ * - **Not forwarders** — the name is re-declared by a block `const`, by a
+ *   nested closure's own parameter, or by a `catch` clause, before the `fetch`
+ *   reads it; or a local `url` is built from the parameter in one block while
+ *   the `fetch` reads a different, block-scoped `url` holding a literal.
+ * - **Forwarders** — a nested closure captures the parameter; a local declared
+ *   inside a nested closure is built from it; a shorthand object property
+ *   (`{ path }`) carries it through a local; and a local `url` is built from it
+ *   while an unrelated, earlier block declares a `url` of its own.
+ */
+const SCOPE_CASES: readonly ScopeCase[] = Object.freeze([
+  {
+    candidate: 'blockShadowed',
+    caller: 'viaBlockShadowed',
+    url: '/scratch/block-shadowed',
+    forwards: false,
+  },
+  {
+    candidate: 'closureShadowed',
+    caller: 'viaClosureShadowed',
+    url: '/scratch/closure-shadowed',
+    forwards: false,
+  },
+  {
+    candidate: 'catchShadowed',
+    caller: 'viaCatchShadowed',
+    url: '/scratch/catch-shadowed',
+    forwards: false,
+  },
+  {
+    candidate: 'localShadowed',
+    caller: 'viaLocalShadowed',
+    url: '/scratch/local-shadowed',
+    forwards: false,
+  },
+  { candidate: 'captured', caller: 'viaCaptured', url: '/scratch/captured', forwards: true },
+  {
+    candidate: 'closureLocal',
+    caller: 'viaClosureLocal',
+    url: '/scratch/closure-local',
+    forwards: true,
+  },
+  { candidate: 'shorthand', caller: 'viaShorthand', url: '/scratch/shorthand', forwards: true },
+  { candidate: 'outerLocal', caller: 'viaOuterLocal', url: '/scratch/outer-local', forwards: true },
+]);
+
+/**
+ * The exact source text of a scope case's call — the key its expected
+ * position is derived from, as {@link CALL_TEXTS} is for the corpus.
+ *
+ * @param scope The case.
+ * @returns The call as {@link SCOPES_SOURCE} writes it.
+ */
+function scopeCallTextOf(scope: ScopeCase): string {
+  return `${scope.candidate}('${scope.url}')`;
+}
+
+/**
+ * The candidates of {@link SCOPE_CASES}, written out, followed by one exported
+ * caller per case. The callers are generated from the table, so the literal a
+ * case asserts on is the literal the module passes.
+ */
+const SCOPES_SOURCE = [
+  'declare const origin: string;',
+  'declare const list: readonly string[];',
+  'declare function retry<T>(attempt: () => Promise<T>): Promise<T>;',
+  '',
+  'export function blockShadowed(path: string) {',
+  '  {',
+  "    const path = '/scratch/block-literal';",
+  '    return fetch(path);',
+  '  }',
+  '}',
+  '',
+  'export function closureShadowed(path: string) {',
+  '  return list.map((path) => fetch(path));',
+  '}',
+  '',
+  'export function catchShadowed(path: string) {',
+  '  try {',
+  '    return JSON.parse(path);',
+  '  } catch (path) {',
+  '    return fetch(String(path));',
+  '  }',
+  '}',
+  '',
+  'export function localShadowed(path: string) {',
+  '  if (path.length > 0) {',
+  '    const url = `${origin}${path}`;',
+  '    void url;',
+  '  }',
+  '  {',
+  "    const url = '/scratch/local-literal';",
+  '    return fetch(url);',
+  '  }',
+  '}',
+  '',
+  'export function captured(path: string) {',
+  '  return retry(() => fetch(path));',
+  '}',
+  '',
+  'export function closureLocal(path: string) {',
+  '  const go = () => {',
+  '    const url = `${origin}${path}`;',
+  '    return fetch(url);',
+  '  };',
+  '  return go();',
+  '}',
+  '',
+  'export function shorthand(path: string) {',
+  '  const target = { path };',
+  '  return fetch(target.path);',
+  '}',
+  '',
+  'export function outerLocal(path: string) {',
+  '  {',
+  "    const url = '/scratch/unrelated-literal';",
+  '    void url;',
+  '  }',
+  '  const url = `${origin}${path}`;',
+  '  return fetch(url);',
+  '}',
+  '',
+  ...SCOPE_CASES.map(
+    (scope) => `export function ${scope.caller}() { return ${scopeCallTextOf(scope)}; }`,
+  ),
+  '',
+].join('\n');
+
 /**
  * A project's own HTTP client function, recognised by forwarding its first
- * parameter into a `fetch` URL — never by its name. Three consumers: a caller
- * in the same module, a caller importing it, and callers of look-alikes that
- * do not forward (which must yield no node).
+ * parameter into a `fetch` URL — never by its name. Four consumers: a caller
+ * in the same module, a caller importing it, callers of look-alikes that do
+ * not forward (which must yield no node), and the scope cases of
+ * {@link SCOPES_MODULE}, where only the parameter's *binding* counts.
  */
 const FORWARDING_MODULES: Readonly<Record<string, string>> = Object.freeze({
   'src/client.ts': [
@@ -1855,6 +2022,7 @@ const FORWARDING_MODULES: Readonly<Record<string, string>> = Object.freeze({
     "export function remote() { return send('/scratch/imported'); }",
     '',
   ].join('\n'),
+  [SCOPES_MODULE]: SCOPES_SOURCE,
 });
 
 /** The forwarding-wrapper project, built on first use. */
@@ -1899,6 +2067,60 @@ describe('apiCallsExtractor: the forwarding-wrapper rule', () => {
     expect(nodeBySymbol(nodes, 'send').data.dynamic).toBe(true);
     expect(nodeBySymbol(nodes, 'pinned').data.url).toBe('/scratch/pinned');
     expect(nodes).toHaveLength(3);
+  });
+
+  it('identifies the parameter by its binding, so a shadowing re-declaration makes no wrapper', () => {
+    const nodes = apiCallsOf(scratchProject(forwarding, 'forwarding'), SCOPES_MODULE);
+    const symbols = nodes.map((node) => node.symbol);
+    const urls = nodes.map((node) => node.data.url);
+
+    // Each of these `fetch` calls reads a binding merely *spelled* like the
+    // parameter — a block `const`, a closure's own parameter, a `catch`
+    // binding — or a local other than the one built from it, so the caller's
+    // literal never reaches the request. Recording the caller would hand
+    // `../route-map.ts` a literal to join to a route with full confidence: a
+    // fabricated edge.
+    for (const scope of SCOPE_CASES.filter((candidate) => !candidate.forwards)) {
+      expect(symbols, `${scope.caller} must not be a call site`).not.toContain(scope.caller);
+      expect(urls, `${scope.url} must not be recorded`).not.toContain(scope.url);
+    }
+  });
+
+  it('still recognises a wrapper whose closure, nested local or shorthand property reads the parameter', () => {
+    const nodes = apiCallsOf(scratchProject(forwarding, 'forwarding'), SCOPES_MODULE);
+
+    for (const scope of SCOPE_CASES.filter((candidate) => candidate.forwards)) {
+      const node = nodeBySymbol(nodes, scope.caller);
+      const expected = positionAt(
+        SCOPES_SOURCE,
+        soleOffsetOf(SCOPES_SOURCE, scopeCallTextOf(scope)),
+      );
+
+      // Recorded at the call site, where the literal is written, exactly as a
+      // wrapper that reads its parameter directly is.
+      expect(node.name).toBe(scope.candidate);
+      expect(node.data.url).toBe(scope.url);
+      expect(node.data.dynamic).toBe(false);
+      expect(node.data.urlExpression).toBeUndefined();
+      expect(node.data.method).toBeUndefined();
+      expect({ line: node.line, column: node.column }).toStrictEqual(expected);
+    }
+  });
+
+  it('leaves the fetch inside every candidate a node of its own, whichever way the verdict went', () => {
+    const nodes = apiCallsOf(scratchProject(forwarding, 'forwarding'), SCOPES_MODULE);
+
+    for (const scope of SCOPE_CASES) {
+      const own = nodeBySymbol(nodes, scope.candidate);
+
+      expect(own.name).toBe('fetch');
+      expect(own.data.dynamic).toBe(true);
+    }
+    // Eight candidates' own `fetch` calls plus the four forwarding callers: the
+    // rule adds call sites and removes none, and neither a shadowed candidate's
+    // caller nor a helper call (`retry`, `list.map`, `JSON.parse`, `go()`) is
+    // claimed.
+    expect(nodes.map(describeNode)).toHaveLength(12);
   });
 });
 

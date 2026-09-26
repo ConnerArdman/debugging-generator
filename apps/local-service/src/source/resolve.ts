@@ -27,11 +27,16 @@
  *    `@debuggen/instrumentation`'s `wrap-template.ts` writes into the patched
  *    file (`PATCH_META_KEYS`: `file`, `line`, `column`, `symbol`), which the
  *    span helper of either tier turns into the only `TelemetryEvent.source`
- *    stamped `resolvedBy: 'patch'`. A `ModificationRecord` carries no
- *    position; its job here is **corroboration** — proof that this session
- *    really instrumented that file. An uncorroborated patch stamp is refused
- *    rather than trusted at confidence 1, and the item falls through to the
- *    later routes.
+ *    stamped `resolvedBy: 'patch'`. That stamp is a **claim**: the browser
+ *    span helper is a page global any page script can call with a `meta` of
+ *    its choosing. So the claim is kept only when the session's modification
+ *    journal proves the exact position — some in-force record's unified
+ *    `diff` adds a line carrying the very `meta` literal the patcher's own
+ *    `buildSpanMetaLiteral` produces for the claimed file, line, column and
+ *    symbol. Naming a file the session instrumented is not enough, a claim on
+ *    a kind no patch emits is refused outright, and a refused claim falls
+ *    through to the later routes, which compute their own location, rather
+ *    than being trusted at confidence 1.
  * 2. **`route-map`** — `http.server` and `route.handler` spans, resolved by
  *    `@debuggen/code-analysis`'s route map from the span's route pattern or
  *    URL. The matched `RouteEntry.location` (or its per-method handler
@@ -61,12 +66,14 @@
  *
  * ## Routes 2–4 are delegations
  *
- * Nothing here parses a stack, fetches a chunk, reads a source map, matches a
- * URL against a route tree or walks the AST. The route map, the code queries
- * and the stack resolver arrive injected (the index is built elsewhere and
- * never inside the resolver), and their answers are used as they come — this
- * module only chooses between them, narrows ambiguous candidates with runtime
- * evidence, and validates the result.
+ * Nothing here parses a stack, reads a source map, matches a URL against a
+ * route tree or walks the AST. The route map, the code queries and the stack
+ * resolver arrive injected (the index is built elsewhere and never inside the
+ * resolver), and their answers are used as they come — this module only
+ * chooses between them, narrows ambiguous candidates with runtime evidence,
+ * and validates the result. The one byte-level read is
+ * {@link createSourceMapScopes}': it digests the chunk `fetchSourceMap`
+ * requests, to know whether a map it kept still describes that chunk.
  *
  * ## An unresolvable item yields no location rather than a guess
  *
@@ -99,11 +106,21 @@
  *
  * ## Consumers
  *
- * `src/main.ts` wires {@link createSourceResolver}; `src/telemetry/ingest.ts`
- * and `src/telemetry/attribute.ts` decorate events at ingest,
- * `src/panels/data.ts` fills locations on panel-data rows,
- * `src/analysis/facts.ts` resolves suggested locations for hypotheses, and
- * `src/pipeline/**` resolves the selected target.
+ * One production path calls this module today. `src/main.ts`
+ * `createIngestSourceLocator` is the source-location port of telemetry ingest
+ * (step 7½ of `src/telemetry/ingest.ts`): per batch it creates a resolver
+ * with {@link createSourceResolver} over the batch's session and calls
+ * {@link SourceResolver.resolveEvents} under ingest's locate budget, feeding
+ * it the cross-batch caches below ({@link createCorroborationCache},
+ * {@link createSourceMapScopes}). Ingest writes each location into the event
+ * before it is stored, so the store, the live tail and every later panel-data
+ * read carry it; none of them calls the resolver.
+ *
+ * {@link SourceResolver.resolveEvent} and {@link SourceResolver.resolveTarget}
+ * are public API with no production caller — `resolveEvents` is built on
+ * the same per-item resolution `resolveEvent` exposes, and `resolveTarget` is
+ * the `react-owner` entry for a selected DOM element. Both are exercised by
+ * this module's colocated suite.
  *
  * @module
  */
@@ -113,8 +130,10 @@ import {
   DB_DRIVERS,
   DEFAULT_MAX_FRAMES,
   DEFAULT_MAX_MAPS,
+  DEFAULT_MAX_MAP_BYTES,
   HTTP_METHOD_NAMES,
   createSourceMapCache,
+  fetchSourceMap,
   resolveStack,
 } from '@debuggen/code-analysis';
 import type {
@@ -125,13 +144,17 @@ import type {
   CodePathEndpoint,
   CodeQueries,
   DbDriver,
+  FetchSourceMapOptions,
   HttpMethodName,
   RouteEntry,
   RouteMap,
   SourceMapCache,
+  SourceMapDocument,
+  SourceMapLookup,
 } from '@debuggen/code-analysis';
 import {
   PATCH_META_KEYS,
+  buildSpanMetaLiteral,
   isOpenModificationStatus,
   parseSelectedTarget,
 } from '@debuggen/instrumentation';
@@ -148,17 +171,21 @@ import {
   isWindowsAbsolute,
   noopLogger,
   normalizePosix,
+  nowEpochMs,
   ok,
   parseSourceLocation,
   resolveWithinProject,
   toPosix,
 } from '@debuggen/shared';
 import type { Logger, Result, SourceLocation, SourceResolvedBy } from '@debuggen/shared';
+import { sha256Hex } from '@debuggen/shared/node';
 import {
   KIND_ATTRIBUTE_KEYS,
   MAX_CALLER_LOOKUP_HOPS,
+  MAX_PREVIEW_LENGTH,
   QUERY_KINDS,
   TELEMETRY_KINDS,
+  TRUNCATION_SUFFIX,
   parseTelemetryEvent,
 } from '@debuggen/telemetry';
 import type {
@@ -235,6 +262,42 @@ const KIND = Object.freeze({
   httpServer: 'http.server' satisfies TelemetryKind,
   routeHandler: 'route.handler' satisfies TelemetryKind,
 });
+
+/**
+ * The kinds a reversible patch can emit, and therefore the only kinds a
+ * `patch` claim is considered on.
+ *
+ * `function` alone: the wrapper `wrap-template.ts` writes calls the span
+ * helper, and both tiers' helpers report that call as a `function` span — the
+ * browser helper sets the kind itself, the Node helper marks its spans
+ * `function` and `convert.ts` derives a patch location for that kind only. A
+ * server-span action is the same wrap on a server entry point, so it adds no
+ * kind. A patch stamp, or forwarded patch `meta`, on any other kind was not
+ * written by a patch and is refused with `kind-not-patchable`.
+ */
+const PATCH_KINDS: readonly TelemetryKind[] = Object.freeze([KIND.function]);
+
+/**
+ * The prefix of a unified diff's hunk header (`@@ -a,b +c,d @@`). Every line
+ * after the first one is a hunk body line, so the file header above it — whose
+ * `+++ <file>` line is not an added line — is never read as content.
+ */
+const DIFF_HUNK_HEADER_PREFIX = '@@';
+
+/** The prefix of an added line inside a unified diff hunk. */
+const DIFF_ADDED_LINE_PREFIX = '+';
+
+/**
+ * The shortest `symbol` a span helper's bound leaves behind, in UTF-16 units.
+ *
+ * Both tiers bound a location's `symbol` to `MAX_PREVIEW_LENGTH` and mark the
+ * cut with `TRUNCATION_SUFFIX` — the browser counting code points, the Node
+ * converter counting UTF-16 units and dropping a high surrogate at the cut —
+ * while the patcher accepts symbols up to its own, longer bound. A bounded
+ * symbol is therefore never shorter than one unit below the bound; a shorter
+ * one ending in the suffix was not cut by a span helper and is taken whole.
+ */
+const MIN_BOUNDED_SYMBOL_LENGTH = MAX_PREVIEW_LENGTH - 1;
 
 /**
  * The kinds the `route-map` route applies to: every kind whose declared
@@ -350,8 +413,8 @@ export const SOURCE_ROUTE_ORDER: readonly SourceResolvedBy[] = Object.freeze(
  *
  * Supplied through {@link SourceResolverDeps.limits}; an override may only
  * **lower** a cap (a non-positive, non-integer or larger value keeps the
- * default), because these bounds protect the ingest path and the panel-data
- * path from a pathological trace or index, and raising one is never what a
+ * default), because these bounds protect the ingest path — and any later
+ * caller — from a pathological trace or index, and raising one is never what a
  * caller needs to be correct.
  */
 export interface SourceResolveLimits {
@@ -387,8 +450,21 @@ export interface SourceResolveLimits {
   /** Route patterns and paths tried for one request span. */
   readonly maxRouteCandidates: number;
 
-  /** Events resolved by one {@link SourceResolver.resolveEvents} call; the largest panel-data page. */
+  /**
+   * Events resolved by one {@link SourceResolver.resolveEvents} call — the
+   * telemetry transport's per-batch ceiling, so an ingest batch is never cut
+   * short; beyond it events are left unresolved.
+   */
   readonly maxBatchEvents: number;
+
+  /**
+   * Events of one {@link SourceResolver.resolveEvents} call resolved at the
+   * same time. Most routes answer from memory, but the source-map route waits
+   * on the dev server (up to `fetchSourceMap`'s own timeout per chunk), so a
+   * strictly serial batch would add those waits up; a small pool overlaps them
+   * while keeping the dev server from being asked for dozens of chunks at once.
+   */
+  readonly maxConcurrentEvents: number;
 }
 
 /**
@@ -409,6 +485,7 @@ export const SOURCE_RESOLVE_LIMITS: SourceResolveLimits = Object.freeze({
   maxDbCandidates: 64,
   maxRouteCandidates: 8,
   maxBatchEvents: 5_000,
+  maxConcurrentEvents: 4,
 });
 
 /**
@@ -421,8 +498,12 @@ export const SOURCE_RESOLVE_LIMITS: SourceResolveLimits = Object.freeze({
  * - `symbol-not-found` — the index holds nothing under the runtime name.
  * - `ambiguous` — several indistinguishable declarations answer; none is
  *   chosen.
- * - `not-corroborated` — a patch stamp names a file no modification record of
- *   the session instrumented.
+ * - `not-corroborated` — no in-force modification record of the session adds
+ *   the exact patch `meta` literal a patch stamp claims: the file was never
+ *   instrumented, or the claimed line, column or symbol is not what the patch
+ *   wrote, or the record's diff was clipped before the literal.
+ * - `kind-not-patchable` — a patch stamp or patch `meta` arrived on a kind no
+ *   patch emits (only `function` spans carry one).
  * - `no-initiator-stack` — a request span carries no call-site stack.
  * - `dev-server-unknown` — the source-map route has no dev-server origin to pin
  *   its fetches to, so it does not fetch at all.
@@ -432,6 +513,11 @@ export const SOURCE_RESOLVE_LIMITS: SourceResolveLimits = Object.freeze({
  *   carries a stamp from a different route.
  * - `aborted` — the call was cancelled; reported in an `Err`'s
  *   `details.reason`, never as an unresolved outcome.
+ * - `budget-expired` — the call's time budget
+ *   ({@link SourceResolveOptions.budget}) ran out before a route answered.
+ *   Unlike `aborted` it is an unresolved outcome, never an `Err`: a budget asks
+ *   for the answers found so far, so the item is left without a location and
+ *   the rest of the call stands. It is never recorded on an attempt.
  */
 export const SOURCE_RESOLUTION_MISS_REASONS = Object.freeze([
   'no-applicable-route',
@@ -439,12 +525,14 @@ export const SOURCE_RESOLUTION_MISS_REASONS = Object.freeze([
   'symbol-not-found',
   'ambiguous',
   'not-corroborated',
+  'kind-not-patchable',
   'no-initiator-stack',
   'dev-server-unknown',
   'unmapped-frame',
   'outside-project',
   'invalid-location',
   'aborted',
+  'budget-expired',
 ] as const);
 
 /** One member of {@link SOURCE_RESOLUTION_MISS_REASONS}. */
@@ -460,6 +548,7 @@ export type SourceResolutionMissReason = (typeof SOURCE_RESOLUTION_MISS_REASONS)
 const MISS_REASON_PRIORITY: readonly SourceResolutionMissReason[] = Object.freeze([
   'ambiguous',
   'not-corroborated',
+  'kind-not-patchable',
   'outside-project',
   'invalid-location',
   'unmapped-frame',
@@ -478,19 +567,57 @@ const MISS_REASON_PRIORITY: readonly SourceResolutionMissReason[] = Object.freez
 export type MaybePromise<T> = T | Promise<T>;
 
 /**
+ * The facts of one modification record the `patch` route corroborates with:
+ * which file, in which status, since when.
+ *
+ * A `Pick` of `@debuggen/instrumentation`'s {@link ModificationRecord} rather
+ * than a restated shape, and the same `Pick` the store's metadata-only read
+ * (`ModificationCorroboration` in `src/store/modifications-repo.ts`) answers,
+ * so both follow the upstream record. A full record satisfies it too.
+ */
+export type ModificationCorroboration = Pick<ModificationRecord, 'file' | 'status' | 'appliedAt'>;
+
+/**
+ * One modification record's patch evidence: the facts of
+ * {@link ModificationCorroboration} and the diff whose added lines show which
+ * position and symbol the patch wrote.
+ *
+ * Also a `Pick` of the upstream record, and the same `Pick` the store's
+ * per-file read (`ModificationPatchEvidence` in
+ * `src/store/modifications-repo.ts`) answers. The `patch` route reads it only
+ * for a file the metadata already found in force (see `corroborates`).
+ */
+export type ModificationPatchEvidence = Pick<
+  ModificationRecord,
+  'file' | 'status' | 'appliedAt' | 'diff'
+>;
+
+/**
  * The narrow view of the modification journal the `patch` route corroborates
  * against.
  *
- * `createModificationsRepo` in `src/store/modifications-repo.ts` satisfies it
- * structurally (its `listBySession` takes an optional filter as a second
- * argument and returns a mutable array), as does the instrumentation package's
- * `ModificationJournal`. The resolver only reads: it never updates a record.
+ * `src/main.ts` wires it, through {@link createCorroborationCache}, over two
+ * reads of `src/store/modifications-repo.ts`: `listCorroborationsBySession`,
+ * which reads the three columns of {@link ModificationCorroboration} and never
+ * a record's diff, and `listPatchEvidenceBySessionFile`, which reads the diffs
+ * of one file's records only. The resolver only reads: it never updates a
+ * record.
  */
 export interface ModificationCorroborationPort {
-  /** Every modification record of one session, in any status. */
+  /** The corroboration facts of every modification record of one session, in any status. */
   listBySession(
     sessionId: string,
-  ): MaybePromise<Result<readonly ModificationRecord[], DebuggenError>>;
+  ): MaybePromise<Result<readonly ModificationCorroboration[], DebuggenError>>;
+
+  /**
+   * The patch evidence of one session's records of one file, in any status —
+   * `file` exactly as the journal stores it (a spelling
+   * {@link listBySession} answered).
+   */
+  listPatchEvidence(
+    sessionId: string,
+    file: string,
+  ): MaybePromise<Result<readonly ModificationPatchEvidence[], DebuggenError>>;
 }
 
 /**
@@ -519,8 +646,9 @@ export interface ParentEventPort {
 }
 
 /**
- * Everything the resolver may reach, injected by `src/main.ts` (one resolver
- * per session project and code-index generation).
+ * Everything the resolver may reach, injected by `src/main.ts`, which creates
+ * one resolver per ingest batch over that batch's session project, its loaded
+ * code index and the cross-batch caches (see "Consumers" in the module notes).
  *
  * Every code-analysis handle is optional: an index that has not been built yet
  * is a legitimate state, and the routes that need one answer
@@ -554,12 +682,27 @@ export interface SourceResolverDeps {
   readonly fetchImpl?: typeof fetch | undefined;
 
   /**
-   * A cross-call source-map cache. Absent means one fresh cache per
-   * {@link SourceResolver.resolveEvent} call and one per
-   * {@link SourceResolver.resolveEvents} batch, so a dev server's rebuilt
-   * chunk is never mapped through a stale document.
+   * A cross-call source-map cache, keyed as `fetchSourceMap` keys it (by map
+   * URL). Absent means one fresh cache per {@link SourceResolver.resolveEvent}
+   * call and one per {@link SourceResolver.resolveEvents} batch, so a dev
+   * server's rebuilt chunk is never mapped through a stale document. A cache
+   * passed here is trusted on its key alone, so `src/main.ts` passes none: it
+   * shares maps across batches through {@link SourceResolverDeps.sourceMapLookup} instead, whose
+   * store is bound to the chunk's content.
    */
   readonly sourceMapCache?: SourceMapCache | undefined;
+
+  /**
+   * The chunk lookup the source-map route hands `resolveStack` as its
+   * `fetchSourceMapImpl`. Absent, nothing is handed on and `resolveStack`
+   * uses `fetchSourceMap` itself. `src/main.ts` passes a
+   * {@link createSourceMapScopes} scope's per-batch lookup
+   * ({@link SourceMapScope.forBatch}), which reads each chunk once per batch
+   * and reuses a parsed map across batches only while the chunk's content is
+   * unchanged — so a map is fetched and parsed once per build of its chunk,
+   * never once per batch and never past a rebuild.
+   */
+  readonly sourceMapLookup?: typeof fetchSourceMap | undefined;
 
   /** The stack resolver; `resolveStack` from `@debuggen/code-analysis` unless a test injects one. */
   readonly resolveStackImpl?: typeof resolveStack | undefined;
@@ -581,10 +724,38 @@ export interface SourceResolverDeps {
   readonly signal?: AbortSignal | undefined;
 }
 
-/** Per-call options. */
+/**
+ * Per-call options.
+ *
+ * The two signals mean different things, and a caller picks the one it means:
+ *
+ * - {@link signal} **cancels**: the caller no longer wants any answer (the
+ *   service is shutting down), so an aborted call is an `Err` with
+ *   `details.reason: 'aborted'` and whatever was found is discarded.
+ * - {@link budget} **ends the search**: the caller wants what has been found
+ *   by then (ingest must store and tail a batch while it is still live). No new
+ *   item is started once it fires, work in flight sees it through the same
+ *   signals the routes forward to `resolveStack` and the source-map fetch, and
+ *   every item without an answer is `unresolved` with `budget-expired`. The
+ *   call itself stays `Ok`.
+ *
+ * @example
+ * ```ts
+ * const budget = AbortSignal.timeout(1_500);
+ * const page = await resolver.resolveEvents(events, { budget });
+ * // page.ok — holding every location found within the budget
+ * ```
+ */
 export interface SourceResolveOptions {
   /** Cancels this call; checked between routes and between batch items. */
   readonly signal?: AbortSignal | undefined;
+
+  /**
+   * Ends this call's search when it aborts, answering what was found so far
+   * (see the interface notes). Checked between routes and before each batch
+   * item, and forwarded to the work in flight.
+   */
+  readonly budget?: AbortSignal | undefined;
 }
 
 /**
@@ -594,7 +765,8 @@ export interface SourceResolveOptions {
  * - `miss` — the route applied and found nothing (see `reason`).
  * - `skipped` — the route does not apply to this item.
  * - `rejected` — the route found a candidate and refused it (containment,
- *   schema, or an uncorroborated patch stamp).
+ *   schema, an uncorroborated patch stamp, or a patch claim on a kind no patch
+ *   emits).
  *
  * A route may record more than one attempt: a refused pre-stamped location
  * followed by the route's own computation.
@@ -626,18 +798,19 @@ export type SourceResolution =
     };
 
 /**
- * The resolver handle `src/main.ts` wires and the ingest, panel-data, analysis
- * and pipeline modules consume. Every method answers a `Result` and never
+ * The resolver handle. Its one production caller is `src/main.ts`'s ingest
+ * source-location port, through {@link SourceResolver.resolveEvents}; see
+ * "Consumers" in the module notes. Every method answers a `Result` and never
  * throws.
  */
 export interface SourceResolver {
   /**
-   * Resolves one captured event.
+   * Resolves one captured event, with a fresh per-call scope.
    *
-   * Used by `src/telemetry/{ingest,attribute}.ts` to decorate an event that
-   * arrived without `source`, and by `src/analysis/facts.ts` for the event a
-   * hypothesis cites. `Err` only for a malformed event, a cancelled call or a
-   * failed store port.
+   * Public API with no production caller yet: ingest resolves whole batches
+   * through {@link SourceResolver.resolveEvents}, which applies this same
+   * per-event resolution to each item. `Err` only for a malformed event, a
+   * cancelled call or a failed store port.
    */
   resolveEvent(
     event: ResolvableEvent,
@@ -648,7 +821,8 @@ export interface SourceResolver {
    * Resolves a selected element through its React owner chain (the
    * `react-owner` route, the only one a DOM target can use).
    *
-   * Used by `src/pipeline/**` when Stage 1 is given a selected target.
+   * Public API with no production caller yet: nothing in the service resolves
+   * a selected target through this module today.
    */
   resolveTarget(
     target: SelectedTarget,
@@ -656,15 +830,18 @@ export interface SourceResolver {
   ): Promise<Result<SourceResolution, DebuggenError>>;
 
   /**
-   * Resolves a page of events, keyed by `TelemetryEvent.id`, holding only the
+   * Resolves a batch of events, keyed by `TelemetryEvent.id`, holding only the
    * events that resolved (in input order).
    *
-   * Used by `src/panels/data.ts` to put source links on panel-data rows. One
-   * source-map cache, one modification list per session and the page's own
-   * events (as parent spans) are shared across the batch; a malformed event is
-   * skipped rather than failing the page, while a cancelled call or a failed
-   * store port fails it. At most {@link SourceResolveLimits.maxBatchEvents}
-   * events are resolved.
+   * Called by `src/main.ts`'s ingest source-location port for every ingest
+   * batch (step 7½), before the batch is stored. One source-map cache, one
+   * modification read per session and the batch's own events (as parent
+   * spans) are shared across it, and at most
+   * {@link SourceResolveLimits.maxConcurrentEvents} events are resolved at
+   * once. A malformed event is skipped rather than failing the batch, a
+   * `budget` that fires answers with what was found so far, and a cancelled
+   * call or a failed store port fails it. At most
+   * {@link SourceResolveLimits.maxBatchEvents} events are resolved.
    */
   resolveEvents(
     events: readonly ResolvableEvent[],
@@ -763,6 +940,7 @@ interface ResolverEnv {
   readonly modifications: ModificationCorroborationPort;
   readonly events: ParentEventPort | undefined;
   readonly fetchImpl: typeof fetch | undefined;
+  readonly sourceMapLookup: typeof fetchSourceMap | undefined;
   readonly resolveStack: typeof resolveStack;
   readonly devServerOrigin: string | undefined;
   readonly logger: Logger;
@@ -775,13 +953,36 @@ interface ResolverEnv {
  */
 interface ResolveScope {
   readonly sourceMapCache: SourceMapCache;
-  /** Modification records already read, by session id. */
-  readonly modificationsBySession: Map<string, readonly ModificationRecord[]>;
+  /**
+   * The modification read of each session, by session id — the **promise**,
+   * not its value, so the concurrent items of one batch share a single read
+   * instead of each starting its own before the first has answered.
+   */
+  readonly modificationsBySession: Map<
+    string,
+    Promise<Result<readonly ModificationCorroboration[], DebuggenError>>
+  >;
+  /**
+   * The patch evidence of each `(session, stored file)` pair, by that pair —
+   * the promise, like {@link modificationsBySession}, so the claims of one
+   * batch against one patched file share a single diff read.
+   */
+  readonly patchEvidence: Map<
+    string,
+    Promise<Result<readonly ModificationPatchEvidence[], DebuggenError>>
+  >;
   /** The batch's own events by `(sessionId, spanId)`, consulted before the store. */
   readonly batchEvents: ReadonlyMap<string, ResolvableEvent>;
   /** Parent spans already read from the store; `null` records a span that never arrived. */
   readonly parentCache: Map<string, ResolvableEvent | null>;
-  /** Every signal that cancels this call. */
+  /** Every signal that cancels this call: an abort is an `Err`. */
+  readonly cancellation: readonly AbortSignal[];
+  /** The call's time budget: an abort leaves the remaining items `budget-expired`. */
+  readonly budget: AbortSignal | undefined;
+  /**
+   * Every signal work in flight must stop for — {@link cancellation} and
+   * {@link budget} together — as forwarded to `resolveStack`.
+   */
   readonly signals: readonly AbortSignal[];
 }
 
@@ -982,7 +1183,7 @@ function routeLocation(entry: RouteEntry, method: HttpMethodName | undefined): S
   return byMethod ?? entry.location;
 }
 
-/** Every cancelling signal of a call, in precedence order. */
+/** Every cancelling signal of a call, in precedence order. The budget is not one of them. */
 function signalsFor(
   deps: SourceResolverDeps,
   options: SourceResolveOptions | undefined,
@@ -1011,13 +1212,23 @@ function isAborted(signals: readonly AbortSignal[]): boolean {
   return signals.some((signal) => signal.aborted);
 }
 
+/** The reason a cancelled call's `Err` carries in `details.reason`. */
+const ABORTED_REASON: SourceResolutionMissReason = 'aborted';
+
+/** The reason an item the budget cut short is left unresolved with. */
+const BUDGET_EXPIRED_REASON: SourceResolutionMissReason = 'budget-expired';
+
 /** The error a cancelled call answers with. */
 function abortedError(): DebuggenError {
-  const reason: SourceResolutionMissReason = 'aborted';
   return new DebuggenError('INTERNAL', 'Source resolution was cancelled before it finished.', {
     hint: 'Nothing was changed; request the source locations again.',
-    details: { reason },
+    details: { reason: ABORTED_REASON },
   });
+}
+
+/** Whether an error is the one {@link abortedError} builds (or a route reported as it). */
+function isAbortedError(error: DebuggenError): boolean {
+  return error.details?.['reason'] === ABORTED_REASON;
 }
 
 /** The reason that best explains an unresolved item, from its attempts. */
@@ -1053,6 +1264,7 @@ function mergeLimits(overrides: Partial<SourceResolveLimits> | undefined): Sourc
     maxDbCandidates: lowered('maxDbCandidates', 1),
     maxRouteCandidates: lowered('maxRouteCandidates', 1),
     maxBatchEvents: lowered('maxBatchEvents', 1),
+    maxConcurrentEvents: lowered('maxConcurrentEvents', 1),
   });
 }
 
@@ -1211,22 +1423,32 @@ async function callPort<T>(
   return isErr(settled) ? settled : settled.value;
 }
 
-/** The session's modification records, read once per call or batch. */
-async function modificationsFor(
+/**
+ * The session's modification records, read once per call or batch.
+ *
+ * The read is memoised as a promise the moment it starts, so the concurrent
+ * items of a batch await the one read rather than racing to start their own. A
+ * failed read is forgotten once it settles: it fails the item that met it, and
+ * an item started later may try again.
+ */
+function modificationsFor(
   env: ResolverEnv,
   scope: ResolveScope,
   sessionId: string,
-): Promise<Result<readonly ModificationRecord[], DebuggenError>> {
-  const cached = scope.modificationsBySession.get(sessionId);
-  if (cached !== undefined) {
-    return ok(cached);
+): Promise<Result<readonly ModificationCorroboration[], DebuggenError>> {
+  const pending = scope.modificationsBySession.get(sessionId);
+  if (pending !== undefined) {
+    return pending;
   }
-  const listed = await callPort(() => env.modifications.listBySession(sessionId));
-  if (isErr(listed)) {
-    return listed;
-  }
-  scope.modificationsBySession.set(sessionId, listed.value);
-  return listed;
+  // `callPort` never rejects, so neither does the bookkeeping chained on it.
+  const read = callPort(() => env.modifications.listBySession(sessionId));
+  scope.modificationsBySession.set(sessionId, read);
+  void read.then((listed) => {
+    if (isErr(listed) && scope.modificationsBySession.get(sessionId) === read) {
+      scope.modificationsBySession.delete(sessionId);
+    }
+  });
+  return read;
 }
 
 /**
@@ -1285,31 +1507,268 @@ function patchMetaCandidate(event: ResolvableEvent): LocationCandidate | undefin
 }
 
 /**
- * Whether this session's journal proves `file` was instrumented when `event`
- * ran.
+ * The text a journaled diff must add for `claim` to be corroborated: the
+ * `meta` object literal that `buildSpanMetaLiteral` — the patcher's own
+ * builder, so these bytes cannot drift from the bytes a patch writes — produces
+ * for the claim's file, line, column and symbol.
  *
- * A record in an open status — `pending`, `applied`, `failed` or `conflict`,
- * i.e. every non-reverted status — corroborates. So does a `reverted` record
- * applied no later than the span started: cleanup restores the file but the
- * record still proves the patch existed when the span ran, which is what keeps
- * a reopened session's stored function spans at patch precision instead of
- * silently degrading them. Paths are compared in normalised project-relative
- * form; a record whose file is not one never matches.
+ * A symbol a span helper bounded (see {@link MIN_BOUNDED_SYMBOL_LENGTH}) cannot
+ * be restated whole, so for one the literal is cut just before the symbol's
+ * closing quote: file, line and column must still match exactly, and the kept
+ * prefix must still be how the written symbol begins. `symbol` is the last key
+ * of `PATCH_META_KEYS` and is emitted as a double-quoted string, so that quote
+ * is the literal's last one.
+ *
+ * @param claim A vetted `patch` location.
+ * @returns The text to find, or `undefined` when no patch could have written
+ * the claim: it names no symbol (the template always writes one), or a value
+ * the template itself refuses to emit.
  */
-function corroborates(
-  records: readonly ModificationRecord[],
-  file: string,
+function expectedPatchMeta(claim: SourceLocation): string | undefined {
+  const symbol = claim.symbol;
+  if (symbol === undefined) {
+    return undefined;
+  }
+  const bounded = symbol.length >= MIN_BOUNDED_SYMBOL_LENGTH && symbol.endsWith(TRUNCATION_SUFFIX);
+  const literal = buildSpanMetaLiteral({
+    file: claim.file,
+    line: claim.line,
+    column: claim.column,
+    symbol: bounded ? symbol.slice(0, -TRUNCATION_SUFFIX.length) : symbol,
+  });
+  if (!literal.ok) {
+    return undefined;
+  }
+  if (!bounded) {
+    return literal.value;
+  }
+  const closingQuote = literal.value.lastIndexOf('"');
+  return closingQuote > 0 ? literal.value.slice(0, closingQuote) : undefined;
+}
+
+/**
+ * The added lines of a unified diff, without their `+` prefix.
+ *
+ * Only hunk bodies are read. The lines before the first hunk header are the
+ * file header (`Index:`, the rule, `--- <file>`, `+++ <file>`), and every line
+ * inside a hunk carries a one-character prefix, so `+` there marks an added
+ * line even when the added text itself begins with `++`. A diff the patcher
+ * clipped at the journal's bound ends in its truncation notice, which is no
+ * added line, so a literal the clip cut short is simply absent.
+ */
+function addedLinesOf(diff: string): readonly string[] {
+  const added: string[] = [];
+  let inHunk = false;
+  for (const line of diff.split('\n')) {
+    if (line.startsWith(DIFF_HUNK_HEADER_PREFIX)) {
+      inHunk = true;
+    } else if (inHunk && line.startsWith(DIFF_ADDED_LINE_PREFIX)) {
+      added.push(line.slice(DIFF_ADDED_LINE_PREFIX.length));
+    }
+  }
+  return Object.freeze(added);
+}
+
+/**
+ * The added lines of every patch-evidence record already split, by record
+ * identity. The corroboration cache hands every batch of one capture window
+ * the same records, so a diff is split once per journal read rather than once
+ * per patch-stamped event.
+ */
+const evidenceAddedLines = new WeakMap<ModificationPatchEvidence, readonly string[]>();
+
+/** {@link addedLinesOf} a record's diff, split at most once per record. */
+function addedLinesOfEvidence(record: ModificationPatchEvidence): readonly string[] {
+  const held = evidenceAddedLines.get(record);
+  if (held !== undefined) {
+    return held;
+  }
+  const added = addedLinesOf(record.diff);
+  evidenceAddedLines.set(record, added);
+  return added;
+}
+
+/**
+ * Whether a record was in force when `event` ran: an open status (`pending`,
+ * `applied`, `failed` or `conflict`, i.e. every non-reverted status), or
+ * `reverted` but applied no later than the span started — cleanup restores
+ * the file but the record still proves the patch existed when the span ran,
+ * which is what keeps a reopened session's stored function spans at patch
+ * precision instead of silently degrading them.
+ */
+function inForceAt(
+  record: Pick<ModificationCorroboration, 'status' | 'appliedAt'>,
   event: ResolvableEvent,
 ): boolean {
-  return records.some((record) => {
-    if (!isSafeRelativePath(record.file) || normalizePosix(record.file) !== file) {
-      return false;
+  return (
+    isOpenModificationStatus(record.status) ||
+    (record.status === REVERTED_STATUS && record.appliedAt <= event.startTime)
+  );
+}
+
+/**
+ * Whether this session's journal proves a patch wrote exactly `claim`'s
+ * position and symbol, and that the patch was in force when `event` ran.
+ *
+ * Answered in two steps, so a claim the metadata alone refutes never reads a
+ * diff:
+ *
+ * 1. **The metadata index** ({@link indexCorroborations}), built once per
+ *    journal read from file, status and applied time, must hold a record of
+ *    the claim's file that was in force when the span ran ({@link inForceAt}).
+ *    Paths are compared in normalised project-relative form; a record whose
+ *    file is not one never matches. Its cost does not grow with the session's
+ *    history.
+ * 2. **The patch evidence** of that file — the diffs of its records, read
+ *    through {@link ModificationCorroborationPort.listPatchEvidence} only now
+ *    and at most once per scope — must hold an in-force record whose diff
+ *    **adds** a line carrying {@link expectedPatchMeta}'s text: the literal the
+ *    patcher wrote for that file, line, column and symbol. A claim naming an
+ *    instrumented file with an invented line, column or symbol finds no such
+ *    line, and neither does one checked against a diff clipped before the
+ *    literal; both fall through to the routes that compute their own location.
+ *
+ * @param env The resolver's collaborators; its journal answers step 2.
+ * @param scope The call's scope, which shares each evidence read.
+ * @param index The session's metadata index.
+ * @param claim The vetted `patch` location.
+ * @param event The span the claim arrived on.
+ * @returns `ok(true)` only when some record proves the claim, or the
+ * journal's failure.
+ */
+async function corroborates(
+  env: ResolverEnv,
+  scope: ResolveScope,
+  index: CorroborationIndex,
+  claim: SourceLocation,
+  event: ResolvableEvent,
+): Promise<Result<boolean, DebuggenError>> {
+  const entry = index.get(claim.file);
+  if (
+    entry === undefined ||
+    !(
+      entry.open ||
+      (entry.earliestRevertedAt !== undefined && entry.earliestRevertedAt <= event.startTime)
+    )
+  ) {
+    return ok(false);
+  }
+  const expected = expectedPatchMeta(claim);
+  if (expected === undefined) {
+    return ok(false);
+  }
+  for (const stored of entry.storedAs) {
+    const evidence = await patchEvidenceFor(env, scope, event.sessionId, stored);
+    if (isErr(evidence)) {
+      return evidence;
     }
-    if (isOpenModificationStatus(record.status)) {
-      return true;
+    const proven = evidence.value.some(
+      (record) =>
+        isSafeRelativePath(record.file) &&
+        normalizePosix(record.file) === claim.file &&
+        inForceAt(record, event) &&
+        addedLinesOfEvidence(record).some((line) => line.includes(expected)),
+    );
+    if (proven) {
+      return ok(true);
     }
-    return record.status === REVERTED_STATUS && record.appliedAt <= event.startTime;
+  }
+  return ok(false);
+}
+
+/**
+ * The patch evidence of one session's records of one stored file, read once
+ * per scope: the promise is kept, so concurrent claims share it, and a failed
+ * read is forgotten so the next batch reads again.
+ */
+function patchEvidenceFor(
+  env: ResolverEnv,
+  scope: ResolveScope,
+  sessionId: string,
+  file: string,
+): Promise<Result<readonly ModificationPatchEvidence[], DebuggenError>> {
+  const key = `${sessionId}\u0000${file}`;
+  const pending = scope.patchEvidence.get(key);
+  if (pending !== undefined) {
+    return pending;
+  }
+  // `callPort` never rejects, so neither does the bookkeeping chained on it.
+  const read = callPort(() => env.modifications.listPatchEvidence(sessionId, file));
+  scope.patchEvidence.set(key, read);
+  void read.then((listed) => {
+    if (isErr(listed) && scope.patchEvidence.get(key) === read) {
+      scope.patchEvidence.delete(key);
+    }
   });
+  return read;
+}
+
+/** What a session's journal metadata proves about one file, as {@link corroborates} asks it. */
+interface FileCorroboration {
+  /** Some record of the file is in an open (non-reverted) status. */
+  readonly open: boolean;
+  /** The earliest `appliedAt` among the file's reverted records, if it has any. */
+  readonly earliestRevertedAt: number | undefined;
+  /**
+   * The file as the journal stores it — every distinct spelling that
+   * normalises to this key — which is what the patch-evidence read is asked
+   * for.
+   */
+  readonly storedAs: readonly string[];
+}
+
+/** A session's journal facts by normalised project-relative file. */
+type CorroborationIndex = ReadonlyMap<string, FileCorroboration>;
+
+/**
+ * Indexes of the journal lists already indexed, by list identity. The
+ * corroboration cache hands every batch of one capture window the same list,
+ * so the list is walked once per journal read rather than once per batch —
+ * and never once per patch-stamped event, which is what made a long-lived
+ * session's history cost O(records × stamped events) on the ingest path.
+ */
+const corroborationIndexes = new WeakMap<
+  readonly ModificationCorroboration[],
+  CorroborationIndex
+>();
+
+/**
+ * The per-file index of a session's journal facts, built in one pass. A record
+ * whose file is not a safe project-relative path indexes nothing, so it never
+ * corroborates.
+ */
+function indexCorroborations(records: readonly ModificationCorroboration[]): CorroborationIndex {
+  const held = corroborationIndexes.get(records);
+  if (held !== undefined) {
+    return held;
+  }
+  const index = new Map<string, FileCorroboration>();
+  for (const record of records) {
+    if (!isSafeRelativePath(record.file)) {
+      continue;
+    }
+    const file = normalizePosix(record.file);
+    const previous = index.get(file) ?? {
+      open: false,
+      earliestRevertedAt: undefined,
+      storedAs: [],
+    };
+    const reverted = record.status === REVERTED_STATUS;
+    index.set(file, {
+      open: previous.open || isOpenModificationStatus(record.status),
+      earliestRevertedAt:
+        reverted &&
+        (previous.earliestRevertedAt === undefined ||
+          record.appliedAt < previous.earliestRevertedAt)
+          ? record.appliedAt
+          : previous.earliestRevertedAt,
+      storedAs: previous.storedAs.includes(record.file)
+        ? previous.storedAs
+        : [...previous.storedAs, record.file],
+    });
+  }
+  corroborationIndexes.set(records, index);
+  return index;
 }
 
 /**
@@ -1317,10 +1776,15 @@ function corroborates(
  * (confidence 1).
  *
  * Candidates are the pre-stamped `source` (the span helper's) and the raw patch
- * `meta` attributes, in that order. Each must pass {@link vet} **and** be
- * corroborated by the session's modification records; an uncorroborated stamp
- * is `rejected` with `not-corroborated`, and resolution falls through to the
- * later routes rather than keeping an unverified confidence of 1.
+ * `meta` attributes, in that order — both producer claims. A claim on a kind
+ * outside {@link PATCH_KINDS} is `rejected` with `kind-not-patchable` before the
+ * journal is read. Otherwise each candidate must pass {@link vet} **and** be
+ * {@link corroborates corroborated} — its exact file, line, column and symbol
+ * found in the `meta` literal an in-force modification record's diff adds;
+ * an uncorroborated claim is `rejected` with `not-corroborated`, and resolution
+ * falls through to the later routes rather than keeping an unverified
+ * confidence of 1. A claimed `endLine` is never kept: the `meta` literal
+ * carries none, so the journal cannot prove one.
  */
 const patchRoute: RouteImpl = async (env, scope, subject) => {
   if (subject.type !== 'event') {
@@ -1339,16 +1803,21 @@ const patchRoute: RouteImpl = async (env, scope, subject) => {
   if (candidates.length === 0) {
     return ok([SKIPPED]);
   }
+  if (!PATCH_KINDS.includes(event.kind)) {
+    return ok([rejected('kind-not-patchable')]);
+  }
 
   const steps: RouteStep[] = [];
   const tried = new Set<string>();
   for (const candidate of candidates) {
-    const vetted = vet(env, candidate, 'patch');
+    const vetted = vet(env, { ...candidate, endLine: undefined }, 'patch');
     if (!vetted.accepted) {
       steps.push(rejected(vetted.reason));
       continue;
     }
-    const key = positionKey(vetted.location);
+    // The symbol is part of what the journal must prove, so two claims at one
+    // position that name different symbols are two claims.
+    const key = `${positionKey(vetted.location)}\u0000${vetted.location.symbol ?? ''}`;
     if (tried.has(key)) {
       continue;
     }
@@ -1358,7 +1827,17 @@ const patchRoute: RouteImpl = async (env, scope, subject) => {
     if (isErr(records)) {
       return records;
     }
-    if (corroborates(records.value, vetted.location.file, event)) {
+    const proven = await corroborates(
+      env,
+      scope,
+      indexCorroborations(records.value),
+      vetted.location,
+      event,
+    );
+    if (isErr(proven)) {
+      return proven;
+    }
+    if (proven.value) {
       steps.push(hit(vetted.location));
       return ok(steps);
     }
@@ -1921,6 +2400,9 @@ const sourceMapRoute: RouteImpl = async (env, scope, subject) => {
         devServerOrigin: env.devServerOrigin,
         cache: scope.sourceMapCache,
         fetchImpl: env.fetchImpl,
+        // Only an injected lookup is handed on: without one, `resolveStack`
+        // keeps the package's own pinned `fetchSourceMap`.
+        ...(env.sourceMapLookup === undefined ? {} : { fetchSourceMapImpl: env.sourceMapLookup }),
         maxFrames: env.limits.maxStackFrames,
         maxMaps: env.limits.maxSourceMaps,
         signal,
@@ -2065,8 +2547,15 @@ function attemptOf(route: SourceResolvedBy, step: RouteStep): SourceResolutionAt
 
 /**
  * Resolves one subject: every route in {@link SOURCE_ROUTE_ORDER}, short-
- * circuiting on the first hit, with the cancelling signals checked before
- * each route.
+ * circuiting on the first hit, with the cancelling signals and then the budget
+ * checked before each route.
+ *
+ * Cancellation wins over the budget when both have fired: a cancelled call
+ * wants no answer at all. A budget that fired first ends the search with the
+ * item `unresolved` as `budget-expired` — a later route might have placed it,
+ * so the reasons of the attempts made so far would not explain the miss. A hit
+ * a route produced before the budget fired is still returned: the budget asks
+ * for what was found, and that was found.
  */
 async function resolveSubject(
   env: ResolverEnv,
@@ -2076,8 +2565,15 @@ async function resolveSubject(
   const attempted: SourceResolutionAttempt[] = [];
 
   for (const route of SOURCE_ROUTE_ORDER) {
-    if (isAborted(scope.signals)) {
+    if (isAborted(scope.cancellation)) {
       return err(abortedError());
+    }
+    if (scope.budget?.aborted === true) {
+      return ok({
+        status: 'unresolved',
+        reason: BUDGET_EXPIRED_REASON,
+        attempted: Object.freeze(attempted),
+      });
     }
     const steps = await runRoute(env, scope, subject, route);
     if (isErr(steps)) {
@@ -2103,6 +2599,94 @@ async function resolveSubject(
   });
 }
 
+/** What {@link resolveBatch} made of a batch's items. */
+interface BatchOutcome {
+  /** Each item's location by its position in the batch, `undefined` where none was found. */
+  readonly locations: readonly (SourceLocation | undefined)[];
+  /** Items left without a location, those the budget cut short or never started included. */
+  readonly unresolved: number;
+  /** Items the budget cut short or never started. */
+  readonly budgetExpired: number;
+  /** The first genuine fault met — a cancelled call or a failed port — which fails the batch. */
+  readonly failure?: DebuggenError;
+}
+
+/**
+ * Resolves a batch's items on a pool of at most `maxConcurrentEvents` workers
+ * sharing one scope, answering in item order whatever order they finish in.
+ *
+ * Why a pool: the source-map route waits on the dev server, up to
+ * `fetchSourceMap`'s own timeout for each distinct chunk, and a serial loop
+ * adds those waits up across a batch of hundreds of events. The workers share
+ * the scope's source-map cache, its memoised journal read and the batch's own
+ * events as parent spans, and the pool is small so the loopback dev server is
+ * never asked for dozens of chunks at once.
+ *
+ * Each worker takes the next unstarted item until none remain. It stops taking
+ * items once the budget fires (the items it never started count as
+ * `budget-expired`), and every worker stops at the first genuine fault. An
+ * `aborted` answer met while only the budget — not a cancelling signal — has
+ * fired is the budget cutting that item short, and is counted as such rather
+ * than failing the batch.
+ */
+async function resolveBatch(
+  env: ResolverEnv,
+  scope: ResolveScope,
+  items: readonly ResolvableEvent[],
+): Promise<BatchOutcome> {
+  const locations = new Array<SourceLocation | undefined>(items.length).fill(undefined);
+  let next = 0;
+  let unresolved = 0;
+  let budgetExpired = 0;
+  let failure: DebuggenError | undefined;
+
+  const budgetOnly = (): boolean =>
+    scope.budget?.aborted === true && !isAborted(scope.cancellation);
+
+  const work = async (): Promise<void> => {
+    while (failure === undefined && next < items.length) {
+      if (budgetOnly()) {
+        return;
+      }
+      const index = next;
+      next += 1;
+      const event = items[index];
+      if (event === undefined) {
+        return;
+      }
+      const resolution = await resolveSubject(env, scope, { type: 'event', event });
+      if (isErr(resolution)) {
+        if (isAbortedError(resolution.error) && budgetOnly()) {
+          unresolved += 1;
+          budgetExpired += 1;
+          continue;
+        }
+        failure ??= resolution.error;
+        return;
+      }
+      if (resolution.value.status === 'resolved') {
+        locations[index] = resolution.value.location;
+      } else {
+        unresolved += 1;
+        if (resolution.value.reason === BUDGET_EXPIRED_REASON) {
+          budgetExpired += 1;
+        }
+      }
+    }
+  };
+
+  const width = Math.min(env.limits.maxConcurrentEvents, items.length);
+  await Promise.all(Array.from({ length: width }, work));
+
+  const unstarted = items.length - next;
+  return {
+    locations,
+    unresolved: unresolved + unstarted,
+    budgetExpired: budgetExpired + unstarted,
+    ...(failure === undefined ? {} : { failure }),
+  };
+}
+
 /** The ids-and-reasons-only log fields of one resolution. */
 function resolutionFields(subject: Subject, resolution: SourceResolution): Record<string, unknown> {
   const about =
@@ -2125,15 +2709,739 @@ function resolutionFields(subject: Subject, resolution: SourceResolution): Recor
 }
 
 /* -------------------------------------------------------------------------------------------------
+ * Cross-batch caches
+ *
+ * A resolver's own scope lives for one call. Ingest calls the resolver once
+ * per batch, many times a second during a capture, so what is worth keeping
+ * across batches is kept here, outside any resolver, by the adapter that
+ * creates them (`src/main.ts`). Each cache is bounded, never throws and never
+ * keeps a failure longer than it takes to try again.
+ * ---------------------------------------------------------------------------------------------- */
+
+/** How long a corroboration read is reused by default, in milliseconds. */
+export const CORROBORATION_CACHE_TTL_MS = 10_000;
+
+/** How many `(session, capture)` reads a corroboration cache keeps by default. */
+export const CORROBORATION_CACHE_MAX_ENTRIES = 64;
+
+/** `value` when it is a positive finite number, otherwise `fallback`. */
+function positiveOr(value: number | undefined, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+/** `value` when it is a positive safe integer, otherwise `fallback`. */
+function positiveIntegerOr(value: number | undefined, fallback: number): number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : fallback;
+}
+
+/**
+ * A clock that never throws: a reading that throws or is not finite is
+ * replaced by the last good one, which only makes a time-based cache keep an
+ * entry a little longer.
+ */
+function steadyClock(clock: () => number): () => number {
+  let last = 0;
+  return () => {
+    try {
+      const reading = clock();
+      if (Number.isFinite(reading)) {
+        last = reading;
+      }
+    } catch {
+      // Fall through to the last good reading.
+    }
+    return last;
+  };
+}
+
+/** Removes the oldest entries of an insertion-ordered map until it holds at most `max`. */
+function trimOldest<K, V>(entries: Map<K, V>, max: number): void {
+  while (entries.size > max) {
+    const oldest = entries.keys().next();
+    if (oldest.done === true) {
+      return;
+    }
+    entries.delete(oldest.value);
+  }
+}
+
+/** What {@link createCorroborationCache} is built from. */
+export interface CorroborationCacheOptions {
+  /** The journal read on a miss — in production the store's metadata-only read. */
+  readonly journal: ModificationCorroborationPort;
+  /**
+   * How long a successful read is reused, in milliseconds; defaults to
+   * {@link CORROBORATION_CACHE_TTL_MS}. A value that is not a positive finite
+   * number keeps the default.
+   */
+  readonly ttlMs?: number | undefined;
+  /**
+   * How many `(session, capture)` reads are kept; defaults to
+   * {@link CORROBORATION_CACHE_MAX_ENTRIES}. The oldest read is dropped first.
+   */
+  readonly maxEntries?: number | undefined;
+  /** The clock the TTL is measured on, in epoch milliseconds; defaults to `nowEpochMs`. */
+  readonly now?: (() => number) | undefined;
+}
+
+/** A cross-batch cache of corroboration reads, one per `(session, capture)`. */
+export interface CorroborationCache {
+  /**
+   * The journal as one capture window sees it: a
+   * {@link ModificationCorroborationPort} whose reads are shared by every
+   * batch of that capture while they are fresh.
+   *
+   * @param captureId The capture window the batch was attributed to.
+   * @returns The port to hand the resolver as its `modifications`.
+   */
+  forCapture(captureId: string): ModificationCorroborationPort;
+}
+
+/**
+ * Creates a cache that lets the batches of one capture window share one
+ * journal read instead of making one each.
+ *
+ * ## Why `(session, capture)` is the key
+ *
+ * The `patch` route asks whether this session instrumented a file when a span
+ * ran. The records that answer it are the active plan's: the installer
+ * journals them before a capture window opens, and a follow-up plan that
+ * patches more installs its delta and then opens a **new** capture, whose id is
+ * a new key and therefore a fresh read. Within one capture, the record changes
+ * that can happen — an applied patch becoming a `conflict`, or `reverted` at
+ * cleanup — do not change the verdict (an open status corroborates, and so
+ * does a revert applied before the span), so a read made earlier in the window
+ * answers every later batch of it the same way. The TTL bounds what the key
+ * cannot see, such as a record appended while the window is open.
+ *
+ * ## What is kept
+ *
+ * A read in flight is shared by every caller of its key. A successful read is
+ * kept for the TTL, measured from when it started. A failed read is never
+ * kept: the batch that met it counts the failure and the next batch reads
+ * again. At most `maxEntries` keys are held, the oldest dropped first.
+ *
+ * @param options The journal, and optionally the TTL, bound and clock.
+ * @returns The cache. It never throws; its ports answer a `Result` and never reject.
+ *
+ * @example
+ * ```ts
+ * const corroborations = createCorroborationCache({
+ *   journal: {
+ *     listBySession: (id) => modifications.listCorroborationsBySession(id),
+ *     listPatchEvidence: (id, file) => modifications.listPatchEvidenceBySessionFile(id, file),
+ *   },
+ * });
+ * const resolver = createSourceResolver({
+ *   projectRoot,
+ *   modifications: corroborations.forCapture(attribution.captureId),
+ * });
+ * ```
+ */
+export function createCorroborationCache(options: CorroborationCacheOptions): CorroborationCache {
+  const ttlMs = positiveOr(options.ttlMs, CORROBORATION_CACHE_TTL_MS);
+  const maxEntries = positiveIntegerOr(options.maxEntries, CORROBORATION_CACHE_MAX_ENTRIES);
+  const readClock = steadyClock(options.now ?? nowEpochMs);
+  const journal = options.journal;
+
+  /** One key's read: the shared promise, when it started and whether it succeeded. */
+  interface Entry<T> {
+    readonly read: Promise<Result<T, DebuggenError>>;
+    readonly startedAt: number;
+    succeeded: boolean;
+  }
+
+  /**
+   * One key's shared read in `entries`: the held one while it is in flight or
+   * fresh, else a new one started with `start`.
+   */
+  function sharedRead<T>(
+    entries: Map<string, Entry<T>>,
+    key: string,
+    start: () => MaybePromise<Result<T, DebuggenError>>,
+  ): Promise<Result<T, DebuggenError>> {
+    const at = readClock();
+    const held = entries.get(key);
+    if (held !== undefined) {
+      const age = at - held.startedAt;
+      if (!held.succeeded || (age >= 0 && age < ttlMs)) {
+        return held.read;
+      }
+      entries.delete(key);
+    }
+
+    const read = callPort(start);
+    const entry: Entry<T> = { read, startedAt: at, succeeded: false };
+    entries.set(key, entry);
+    trimOldest(entries, maxEntries);
+    // `callPort` never rejects, so neither does this bookkeeping.
+    void read.then((listed) => {
+      if (entries.get(key) !== entry) {
+        return;
+      }
+      if (isErr(listed)) {
+        entries.delete(key);
+      } else {
+        entry.succeeded = true;
+      }
+    });
+    return read;
+  }
+
+  /** The metadata reads, by `(session, capture)`. */
+  const facts = new Map<string, Entry<readonly ModificationCorroboration[]>>();
+  /**
+   * The patch-evidence reads, by `(session, capture, file)`, under the same
+   * TTL and bound: one patched file's diffs are read once per capture window.
+   */
+  const evidence = new Map<string, Entry<readonly ModificationPatchEvidence[]>>();
+
+  return Object.freeze({
+    forCapture: (captureId: string): ModificationCorroborationPort =>
+      Object.freeze({
+        listBySession: (sessionId: string) =>
+          sharedRead(facts, `${sessionId}\u0000${captureId}`, () =>
+            journal.listBySession(sessionId),
+          ),
+        listPatchEvidence: (sessionId: string, file: string) =>
+          sharedRead(evidence, `${sessionId}\u0000${captureId}\u0000${file}`, () =>
+            journal.listPatchEvidence(sessionId, file),
+          ),
+      }),
+  });
+}
+
+/**
+ * How many source-map scopes a {@link createSourceMapScopes} registry keeps by
+ * default.
+ *
+ * A scope holds parsed map documents, which for a development build run to
+ * megabytes each, so this bound is what keeps a service that has seen many
+ * page reloads and captures from holding every one's maps. A developer
+ * reproduces an issue in one or two live documents during one capture at a
+ * time; a document that was reloaded away, or a capture that has stopped, is
+ * idle, and four scopes leave room for a second tab and the scopes a reload or
+ * a new capture has just replaced.
+ */
+export const SOURCE_MAP_SCOPES_MAX = 4;
+
+/**
+ * How long, by default, an unused source-map scope is kept, in milliseconds:
+ * long enough to keep a capture's scope across a pause in its traffic, short
+ * enough that the maps of a reloaded-away document or a finished capture are
+ * released within minutes.
+ */
+export const SOURCE_MAP_SCOPE_IDLE_MS = 5 * 60_000;
+
+/** How many parsed map documents, and remembered failures, one scope keeps by default. */
+export const SOURCE_MAP_SCOPE_MAX_ENTRIES = 32;
+
+/** How long, by default, a failed chunk lookup is answered from memory, in milliseconds. */
+export const SOURCE_MAP_FAILURE_TTL_MS = 10_000;
+
+/**
+ * What one source-map scope hands a resolver as {@link SourceResolverDeps}
+ * `sourceMapLookup`; see {@link createSourceMapScopes} for what it keeps.
+ */
+export interface SourceMapScope {
+  /**
+   * `fetchSourceMap` over this scope's verified map store. Every call reads the
+   * chunk again; a parsed map is reused only while the chunk's content is the
+   * content the map was parsed for. Concurrent calls for one chunk share one
+   * read, and a failure is answered from memory for the failure TTL.
+   */
+  readonly lookup: typeof fetchSourceMap;
+  /**
+   * {@link lookup} with a memo for one batch: the first call for a chunk reads
+   * it, and later calls through the same returned function answer from that
+   * read. Take a fresh one per batch — `src/main.ts` takes one per ingest
+   * batch — so no answer outlives the batch that read it.
+   */
+  forBatch(): typeof fetchSourceMap;
+}
+
+/** What {@link createSourceMapScopes} is built from; every option has a default. */
+export interface SourceMapScopesOptions {
+  /**
+   * The most scopes held; defaults to {@link SOURCE_MAP_SCOPES_MAX}. The least
+   * recently used scope is dropped first.
+   */
+  readonly maxScopes?: number | undefined;
+  /** How long an unused scope is kept; defaults to {@link SOURCE_MAP_SCOPE_IDLE_MS}. */
+  readonly idleMs?: number | undefined;
+  /**
+   * The most parsed documents, and the most remembered failures, one scope
+   * holds; defaults to {@link SOURCE_MAP_SCOPE_MAX_ENTRIES}. The least recently
+   * written is dropped first.
+   */
+  readonly maxEntriesPerScope?: number | undefined;
+  /** How long a failed lookup is answered from memory; defaults to {@link SOURCE_MAP_FAILURE_TTL_MS}. */
+  readonly failureTtlMs?: number | undefined;
+  /** The clock scopes and failures expire on, in epoch milliseconds; defaults to `nowEpochMs`. */
+  readonly now?: (() => number) | undefined;
+  /** The lookup every call runs; `fetchSourceMap` from `@debuggen/code-analysis` unless a test injects one. */
+  readonly fetchSourceMapImpl?: typeof fetchSourceMap | undefined;
+}
+
+/** A bounded registry of {@link SourceMapScope}s, keyed by the caller. */
+export interface SourceMapScopes {
+  /**
+   * The scope for `key`, created on first use and kept while it is used.
+   *
+   * @param key What the caller scopes maps by; `src/main.ts` uses the dev
+   * server origin, the capture and the producing page document (see
+   * {@link createSourceMapScopes}).
+   * @returns The scope's verified lookup and its per-batch memo.
+   */
+  scopeFor(key: string): SourceMapScope;
+}
+
+/** The answer a caller whose own signal ended its wait receives; never memoised. */
+function lookupCancelledError(): DebuggenError {
+  return new DebuggenError('DEV_SERVER_UNAVAILABLE', 'The source-map lookup was cancelled.', {
+    hint: 'Nothing was changed; the lookup is made again on the next request.',
+    details: { reason: ABORTED_REASON },
+  });
+}
+
+/** A lookup that threw or rejected, which `fetchSourceMap` itself never does. */
+function lookupFailedError(): DebuggenError {
+  return new DebuggenError('DEV_SERVER_UNAVAILABLE', 'The source-map lookup failed.', {
+    hint: 'The lookup is made again once the failure has expired.',
+    details: { reason: 'request-failed' },
+  });
+}
+
+/** The canonical origin of a dev-server pin, or the pin itself when it does not parse. */
+function pinKey(devServerOrigin: string): string {
+  try {
+    return new URL(devServerOrigin).origin;
+  } catch {
+    return String(devServerOrigin);
+  }
+}
+
+/**
+ * Waits for a shared lookup unless the caller's own signal fires first. Only
+ * this caller stops waiting; the shared lookup runs on for everyone else.
+ */
+function awaitLookup(
+  shared: Promise<Result<SourceMapLookup, DebuggenError>>,
+  signal: AbortSignal | undefined,
+): Promise<Result<SourceMapLookup, DebuggenError>> {
+  if (signal === undefined) {
+    return shared;
+  }
+  if (signal.aborted) {
+    return Promise.resolve(err(lookupCancelledError()));
+  }
+  return new Promise((resolve) => {
+    const onAbort = (): void => {
+      resolve(err(lookupCancelledError()));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    // A shared lookup never rejects (see `verifiedLookup`).
+    void shared.then((result) => {
+      signal.removeEventListener('abort', onAbort);
+      resolve(result);
+    });
+  });
+}
+
+/** What {@link readChunkBody} made of a chunk response. */
+type ChunkRead =
+  /** The whole body, within the bound, and its SHA-256. */
+  | { readonly kind: 'digested'; readonly bytes: Uint8Array<ArrayBuffer>; readonly digest: string }
+  /** The body passed the bound: the bytes read so far, so `fetchSourceMap` refuses it as it always does. */
+  | { readonly kind: 'oversized'; readonly bytes: Uint8Array<ArrayBuffer> }
+  /** Nothing was read: not a success, a declared length past the bound, or no body stream. */
+  | { readonly kind: 'unread' };
+
+/** Whether `value` is a body stream this module can read (a real `fetch` body always is). */
+function isBodyStream(value: unknown): value is ReadableStream<unknown> {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    typeof (value as { getReader?: unknown }).getReader === 'function'
+  );
+}
+
+/** A response's declared `Content-Length`, or `undefined` when it declares none it can be held to. */
+function declaredLength(response: Response): number | undefined {
+  try {
+    const raw = response.headers.get('content-length');
+    const declared = raw === null ? Number.NaN : Number(raw);
+    return Number.isFinite(declared) && declared >= 0 ? declared : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The parts of a body, in order, as one array. */
+function joinParts(parts: readonly Uint8Array[], total: number): Uint8Array<ArrayBuffer> {
+  const joined = new Uint8Array(total);
+  let offset = 0;
+  for (const part of parts) {
+    joined.set(part, offset);
+    offset += part.byteLength;
+  }
+  return joined;
+}
+
+/**
+ * Reads a chunk response's body once, bounded by `maxBytes`, and digests it.
+ *
+ * Only a success is read, and only through its body stream; anything else is
+ * left `unread` for `fetchSourceMap` to judge as it always does. The read ends
+ * when `signal` — the request's own, which `fetchSourceMap` bounds by its
+ * request timeout — fires, and a read that fails, is cancelled or meets a
+ * non-binary part rejects: `fetchSourceMap` reports that as the transport
+ * failure it is, and a truncated body is never digested as if it were whole.
+ */
+async function readChunkBody(
+  response: Response,
+  maxBytes: number,
+  signal: AbortSignal | null | undefined,
+): Promise<ChunkRead> {
+  const status: unknown = response.status;
+  if (typeof status !== 'number' || status < 200 || status >= 300) {
+    return { kind: 'unread' };
+  }
+  const declared = declaredLength(response);
+  if (declared !== undefined && declared > maxBytes) {
+    return { kind: 'unread' };
+  }
+  const body: unknown = response.body;
+  if (!isBodyStream(body)) {
+    return { kind: 'unread' };
+  }
+  if (signal?.aborted === true) {
+    throw new Error('the chunk request ended before its body was read');
+  }
+
+  const reader = body.getReader();
+  let ended = false;
+  const onAbort = (): void => {
+    ended = true;
+    reader.cancel().catch(() => undefined);
+  };
+  signal?.addEventListener('abort', onAbort, { once: true });
+  try {
+    const parts: Uint8Array[] = [];
+    let total = 0;
+    for (;;) {
+      const next = await reader.read();
+      if (ended) {
+        throw new Error('the chunk request ended before its body was read');
+      }
+      if (next.done) {
+        const bytes = joinParts(parts, total);
+        return { kind: 'digested', bytes, digest: sha256Hex(bytes) };
+      }
+      const part: unknown = next.value;
+      if (!(part instanceof Uint8Array)) {
+        await reader.cancel().catch(() => undefined);
+        throw new Error('the chunk body carried a non-binary part');
+      }
+      parts.push(part);
+      total += part.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => undefined);
+        return { kind: 'oversized', bytes: joinParts(parts, total) };
+      }
+    }
+  } finally {
+    signal?.removeEventListener('abort', onAbort);
+  }
+}
+
+/** A response carrying `bytes` in place of the original's consumed body, with its status and headers. */
+function reserved(original: Response, bytes: Uint8Array<ArrayBuffer>): Response {
+  let headers: Headers;
+  try {
+    headers = new Headers(original.headers);
+  } catch {
+    headers = new Headers();
+  }
+  // The re-served body is decoded and exactly `bytes` long.
+  headers.delete('content-length');
+  headers.delete('content-encoding');
+  const statusText: unknown = original.statusText;
+  return new Response(bytes, {
+    status: original.status,
+    statusText: typeof statusText === 'string' ? statusText : '',
+    headers,
+  });
+}
+
+/**
+ * Creates a registry of source-map scopes that outlive one resolver call, so a
+ * chunk's map is fetched and parsed once per build of the chunk instead of
+ * once per batch.
+ *
+ * ## What a scope keeps, and why a kept map is never stale
+ *
+ * `fetchSourceMap` always fetches the chunk first — only the chunk can say
+ * where its map is — and keys a parsed map by its URL (an inline map by the
+ * chunk URL), which a dev server keeps when it rebuilds the chunk. A map kept
+ * under that key alone would go on mapping a rebuilt chunk through its old
+ * map, so a scope verifies content instead of trusting a key or a clock:
+ *
+ * - every lookup reads the chunk again: the scope hands `fetchSourceMap` a
+ *   `fetch` that reads the first response — the chunk — within
+ *   `fetchSourceMap`'s own size bound, digests it (SHA-256) and hands the same
+ *   bytes on;
+ * - a parsed map is kept together with the digest of the chunk it was read
+ *   for, and is reused only by a lookup whose chunk has that digest. A chunk
+ *   rebuilt by the product's own patch, or by a developer's edit applied by
+ *   hot module replacement, has different bytes: its kept map is dropped and
+ *   its map is read and parsed again on the first lookup after the rebuild,
+ *   with no window in which the old map is used;
+ * - concurrent lookups of one chunk share one read, started **without** any
+ *   caller's signal and bounded by `fetchSourceMap`'s request timeout; each
+ *   caller races it against its own signal, so one batch's budget or
+ *   cancellation ends that batch's wait and never poisons the next;
+ * - a failure is kept for `failureTtlMs`, so a dev server that is down is not
+ *   asked again for every batch, and is asked again soon after;
+ * - {@link SourceMapScope.forBatch} adds a memo for one batch, so a batch reads
+ *   each chunk once however many of its events point into it. The batch's
+ *   events ran before the batch arrived, so the batch's own read is never
+ *   older than the code they ran.
+ *
+ * What a scope spares is the map — the larger request and the costly parse.
+ * The chunk request is what knowing a kept map is current costs.
+ *
+ * ## Why `src/main.ts` keys scopes by capture and document
+ *
+ * The key is the dev-server origin, the capture and the page document
+ * (`producerId`, minted per document — AAP §0.2.3), so maps are never shared
+ * across documents, and idle expiry and the scope bound release the maps of
+ * documents and captures that are gone.
+ *
+ * @param options The bounds, the failure TTL, the clock and the lookup.
+ * @returns The registry. Neither it nor its lookups throw; a lookup never rejects.
+ *
+ * @example
+ * ```ts
+ * const sourceMaps = createSourceMapScopes();
+ * const scope = sourceMaps.scopeFor(`${devServerUrl}\u0000${captureId}\u0000${event.producerId}`);
+ * const resolver = createSourceResolver({
+ *   projectRoot,
+ *   modifications,
+ *   devServerOrigin: devServerUrl,
+ *   sourceMapLookup: scope.forBatch(),
+ * });
+ * ```
+ */
+export function createSourceMapScopes(options: SourceMapScopesOptions = {}): SourceMapScopes {
+  const maxScopes = positiveIntegerOr(options.maxScopes, SOURCE_MAP_SCOPES_MAX);
+  const idleMs = positiveOr(options.idleMs, SOURCE_MAP_SCOPE_IDLE_MS);
+  const maxEntries = positiveIntegerOr(options.maxEntriesPerScope, SOURCE_MAP_SCOPE_MAX_ENTRIES);
+  const failureTtlMs = positiveOr(options.failureTtlMs, SOURCE_MAP_FAILURE_TTL_MS);
+  const readClock = steadyClock(options.now ?? nowEpochMs);
+  const underlying = options.fetchSourceMapImpl ?? fetchSourceMap;
+
+  function newScope(): SourceMapScope {
+    /** Parsed maps by `fetchSourceMap`'s cache key, each with the digest of the chunk it was read for. */
+    const documents = new Map<
+      string,
+      { readonly document: SourceMapDocument; readonly digest: string }
+    >();
+    /** Lookups in flight, shared by concurrent callers of one chunk. */
+    const inFlight = new Map<string, Promise<Result<SourceMapLookup, DebuggenError>>>();
+    /** Failed lookups, answered from memory until they expire. */
+    const failures = new Map<
+      string,
+      { readonly result: Result<SourceMapLookup, DebuggenError>; readonly settledAt: number }
+    >();
+
+    /**
+     * One verified lookup: `fetchSourceMap` over a `fetch` that digests the
+     * chunk, and a view of `documents` that answers only for that digest.
+     * Resolves, never rejects.
+     */
+    function verifiedLookup(
+      chunkUrl: string,
+      given: FetchSourceMapOptions,
+    ): Promise<Result<SourceMapLookup, DebuggenError>> {
+      const baseFetch = given.fetchImpl ?? globalThis.fetch;
+      const maxBytes = Math.floor(positiveOr(given.maxBytes, DEFAULT_MAX_MAP_BYTES));
+      /** The chunk's digest once read; `undefined` until then, or when it could not be taken. */
+      let digest: string | undefined;
+      let chunkRequested = false;
+
+      const digestingFetch: typeof fetch = async (input, init) => {
+        const response = await baseFetch(input, init);
+        // The chunk is `fetchSourceMap`'s first request; its map, when a
+        // second request is needed at all, the second.
+        if (chunkRequested) {
+          return response;
+        }
+        chunkRequested = true;
+        const read = await readChunkBody(response, maxBytes, init?.signal);
+        if (read.kind === 'unread') {
+          return response;
+        }
+        if (read.kind === 'digested') {
+          digest = read.digest;
+        }
+        return reserved(response, read.bytes);
+      };
+
+      const view: SourceMapCache = {
+        get(key: string): SourceMapDocument | undefined {
+          const held = documents.get(key);
+          if (held === undefined) {
+            return undefined;
+          }
+          if (digest !== undefined && held.digest === digest) {
+            return held.document;
+          }
+          // The chunk is not the one this map was read for: a rebuild.
+          documents.delete(key);
+          return undefined;
+        },
+        set(key: string, document: SourceMapDocument): void {
+          documents.delete(key);
+          if (digest === undefined) {
+            return;
+          }
+          documents.set(key, { document, digest });
+          trimOldest(documents, maxEntries);
+        },
+        delete: (key: string): boolean => documents.delete(key),
+        clear: (): void => {
+          documents.clear();
+        },
+        get size(): number {
+          return documents.size;
+        },
+      };
+
+      return Promise.resolve()
+        .then(() =>
+          underlying(chunkUrl, {
+            devServerOrigin: given.devServerOrigin,
+            fetchImpl: digestingFetch,
+            maxBytes: given.maxBytes,
+            timeoutMs: given.timeoutMs,
+            cache: view,
+            logger: given.logger,
+          }),
+        )
+        .catch((): Result<SourceMapLookup, DebuggenError> => err(lookupFailedError()));
+    }
+
+    const lookup: typeof fetchSourceMap = (chunkUrl, given) => {
+      try {
+        const signal = given.signal;
+        if (signal?.aborted === true) {
+          return Promise.resolve(err(lookupCancelledError()));
+        }
+        const key = `${pinKey(given.devServerOrigin)}\u0000${String(chunkUrl)}`;
+
+        const shared = inFlight.get(key);
+        if (shared !== undefined) {
+          return awaitLookup(shared, signal);
+        }
+        const failed = failures.get(key);
+        if (failed !== undefined) {
+          const at = readClock();
+          // A clock that stepped back ends a failure's life rather than extending it.
+          if (at >= failed.settledAt && at - failed.settledAt < failureTtlMs) {
+            return Promise.resolve(failed.result);
+          }
+          failures.delete(key);
+        }
+
+        const started = verifiedLookup(String(chunkUrl), given);
+        inFlight.set(key, started);
+        void started.then((result) => {
+          if (inFlight.get(key) === started) {
+            inFlight.delete(key);
+          }
+          if (!result.ok) {
+            failures.delete(key);
+            failures.set(key, { result, settledAt: readClock() });
+            trimOldest(failures, maxEntries);
+          }
+        });
+        return awaitLookup(started, signal);
+      } catch {
+        return Promise.resolve(err(lookupFailedError()));
+      }
+    };
+
+    const forBatch = (): typeof fetchSourceMap => {
+      const answered = new Map<string, Promise<Result<SourceMapLookup, DebuggenError>>>();
+      return (chunkUrl, given) => {
+        try {
+          const { signal, ...unsignalled } = given;
+          if (signal?.aborted === true) {
+            return Promise.resolve(err(lookupCancelledError()));
+          }
+          const key = `${pinKey(given.devServerOrigin)}\u0000${String(chunkUrl)}`;
+          let read = answered.get(key);
+          if (read === undefined) {
+            // Memoised without the caller's signal, so one caller's
+            // cancellation is never another caller's answer.
+            read = lookup(chunkUrl, unsignalled);
+            answered.set(key, read);
+          }
+          return awaitLookup(read, signal);
+        } catch {
+          return Promise.resolve(err(lookupFailedError()));
+        }
+      };
+    };
+
+    return Object.freeze({ lookup, forBatch });
+  }
+
+  /** One scope and when it was last handed out. */
+  interface Held {
+    readonly scope: SourceMapScope;
+    usedAt: number;
+  }
+  const scopes = new Map<string, Held>();
+
+  function scopeFor(key: string): SourceMapScope {
+    const at = readClock();
+    for (const [heldKey, held] of scopes) {
+      // A clock that stepped back ends an idle period rather than extending it.
+      if (at < held.usedAt || at - held.usedAt >= idleMs) {
+        scopes.delete(heldKey);
+      }
+    }
+
+    const held = scopes.get(key);
+    if (held !== undefined) {
+      scopes.delete(key);
+      held.usedAt = at;
+      scopes.set(key, held);
+      return held.scope;
+    }
+
+    const scope = newScope();
+    scopes.set(key, { scope, usedAt: at });
+    trimOldest(scopes, maxScopes);
+    return scope;
+  }
+
+  return Object.freeze({ scopeFor });
+}
+
+/* -------------------------------------------------------------------------------------------------
  * The factory
  * ---------------------------------------------------------------------------------------------- */
 
 /**
- * Creates the source resolver for one project and one code-index generation.
+ * Creates a source resolver over one project and the code index it was given.
  *
- * Wired by `src/main.ts` once the session's project is known (and re-created
- * when its index is rebuilt); consumed by `src/telemetry/{ingest,attribute}.ts`,
- * `src/panels/data.ts`, `src/analysis/facts.ts` and `src/pipeline/**`.
+ * Called by `src/main.ts`'s ingest source-location port once per ingest batch,
+ * over the batch's session project and code index, with the cross-batch
+ * corroboration cache and source-map scope; its `resolveEvents` is the one
+ * method called in production (see "Consumers" in the module notes).
  * Construction does no work and opens nothing: every handle is injected, and
  * the resolver only reads through them.
  *
@@ -2151,14 +3459,18 @@ function resolutionFields(subject: Subject, resolution: SourceResolution): Recor
  *   queries,
  *   routeMap,
  *   graph,
- *   modifications: modificationsRepo,
+ *   modifications: corroborations.forCapture(attribution.captureId),
  *   events: telemetryRepo,
  *   devServerOrigin: session.devServerUrl,
+ *   sourceMapLookup: scope.forBatch(),
  *   logger,
  * });
- * const resolution = await resolver.resolveEvent(event);
- * if (resolution.ok && resolution.value.status === 'resolved') {
- *   decorated = { ...event, source: resolution.value.location };
+ * const located = await resolver.resolveEvents(batch, { budget });
+ * if (located.ok) {
+ *   decorated = batch.map((event) => {
+ *     const source = located.value.get(event.id);
+ *     return source === undefined ? event : { ...event, source };
+ *   });
  * }
  * ```
  */
@@ -2171,6 +3483,7 @@ export function createSourceResolver(deps: SourceResolverDeps): SourceResolver {
     modifications: deps.modifications,
     events: deps.events,
     fetchImpl: deps.fetchImpl,
+    sourceMapLookup: deps.sourceMapLookup,
     resolveStack: deps.resolveStackImpl ?? resolveStack,
     devServerOrigin: deps.devServerOrigin,
     logger: subsystemLogger(deps.logger ?? noopLogger, LOG_SUBSYSTEM),
@@ -2191,13 +3504,20 @@ export function createSourceResolver(deps: SourceResolverDeps): SourceResolver {
   const newScope = (
     options: SourceResolveOptions | undefined,
     batchEvents: ReadonlyMap<string, ResolvableEvent>,
-  ): ResolveScope => ({
-    sourceMapCache: deps.sourceMapCache ?? createSourceMapCache(),
-    modificationsBySession: new Map(),
-    batchEvents,
-    parentCache: new Map(),
-    signals: signalsFor(deps, options),
-  });
+  ): ResolveScope => {
+    const cancellation = signalsFor(deps, options);
+    const budget = options?.budget;
+    return {
+      sourceMapCache: deps.sourceMapCache ?? createSourceMapCache(),
+      modificationsBySession: new Map(),
+      patchEvidence: new Map(),
+      batchEvents,
+      parentCache: new Map(),
+      cancellation,
+      budget,
+      signals: budget === undefined ? cancellation : [...cancellation, budget],
+    };
+  };
 
   const noBatch: ReadonlyMap<string, ResolvableEvent> = new Map();
 
@@ -2267,30 +3587,38 @@ export function createSourceResolver(deps: SourceResolverDeps): SourceResolver {
       }
     }
 
-    const scope = newScope(options, batchEvents);
-    const located = new Map<string, SourceLocation>();
-    let unresolved = 0;
+    // Each event id is resolved once: a replayed element carries the same
+    // event, so a second resolution could only repeat the first.
+    const seen = new Set<string>();
+    const items: ResolvableEvent[] = [];
     for (const event of valid) {
-      if (located.has(event.id)) {
-        continue;
-      }
-      const resolution = await resolveSubject(env, scope, { type: 'event', event });
-      if (isErr(resolution)) {
-        return resolution;
-      }
-      if (resolution.value.status === 'resolved') {
-        located.set(event.id, resolution.value.location);
-      } else {
-        unresolved += 1;
+      if (!seen.has(event.id)) {
+        seen.add(event.id);
+        items.push(event);
       }
     }
+
+    const scope = newScope(options, batchEvents);
+    const outcome = await resolveBatch(env, scope, items);
+    if (outcome.failure !== undefined) {
+      return err(outcome.failure);
+    }
+
+    const located = new Map<string, SourceLocation>();
+    items.forEach((event, index) => {
+      const location = outcome.locations[index];
+      if (location !== undefined) {
+        located.set(event.id, location);
+      }
+    });
 
     env.logger.debug('source resolution batch finished', {
       events: events.length,
       considered: considered.length,
       invalid,
       resolved: located.size,
-      unresolved,
+      unresolved: outcome.unresolved,
+      budgetExpired: outcome.budgetExpired,
     });
     return ok(located);
   }

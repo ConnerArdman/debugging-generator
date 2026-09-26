@@ -58,6 +58,7 @@ import {
   parseUrlParts,
   redactQueryString,
   redactStackUrls,
+  redactTextUrls,
   redactUrl,
   type UrlParts,
 } from './url.js';
@@ -1372,6 +1373,90 @@ describe('redactStackUrls', () => {
 
     expect(redactStackUrls(line)).toBe(line);
     expect(scrub(line)).not.toContain(credential);
+  });
+});
+
+describe('redactTextUrls', () => {
+  it('masks the query of a standalone absolute URL exactly as redactUrl does', () => {
+    const link = 'http://127.0.0.1:3000/reset?coupon=QQZZ7&step=2#confirmVVBB';
+
+    expect(redactTextUrls(link)).toBe(redactUrl(link));
+    expect(redactTextUrls(link)).toBe('http://127.0.0.1:3000/reset?coupon=?&step=?#?');
+  });
+
+  it('masks an origin-relative query inside prose and keeps the sentence around it', () => {
+    const text = 'Visit /reset?coupon=QQZZ7 now, or /orders?id=WWXX9.';
+
+    expect(redactTextUrls(text)).toBe('Visit /reset?coupon=? now, or /orders?id=?.');
+  });
+
+  it('masks a query inside an attribute selector and keeps the selector shape', () => {
+    expect(redactTextUrls('main > a[href="/p?id=QQZZ7&ref=WWXX9"]')).toBe(
+      'main > a[href="/p?id=?&ref=?"]',
+    );
+    expect(redactTextUrls("a[href='?page=QQZZ7']")).toBe("a[href='?page=?']");
+  });
+
+  it('masks bare relative and query-only references, and a fragment after them', () => {
+    expect(redactTextUrls('see p?id=QQZZ7#sectionVVBB')).toBe('see p?id=?#?');
+    expect(redactTextUrls('?token=QQZZ7&flag')).toBe('?token=?&flag');
+    expect(redactTextUrls('/a?b=QQZZ7#')).toBe('/a?b=?#');
+  });
+
+  it('keeps sentence punctuation that closes a query rather than belonging to it', () => {
+    expect(redactTextUrls('(open /p?id=QQZZ7)')).toBe('(open /p?id=?)');
+    expect(redactTextUrls('Try /p?id=QQZZ7!')).toBe('Try /p?id=?!');
+    expect(redactTextUrls('/p?a=QQZZ7; /q?b=WWXX9,')).toBe('/p?a=?; /q?b=?,');
+  });
+
+  it('leaves text with no name=value pair after a ? unchanged', () => {
+    for (const text of ['Why? Because.', 'Save changes?', '?flag', 'a?b', 'x = y ? 1 : 2', '']) {
+      expect(redactTextUrls(text), text).toBe(text);
+    }
+  });
+
+  it('anchors at the ? that opens the pairs', () => {
+    expect(redactTextUrls('a?b?c=QQZZ7')).toBe('a?b?c=?');
+    expect(redactTextUrls('Why? a=QQZZ7')).toBe('Why? a=QQZZ7');
+  });
+
+  it('leaves no query value anywhere in the text, for every token the guard examines', () => {
+    const text =
+      'Links: https://api.example.test/v1/search?term=ZZTOP42&cursor=YYKK13 and /api/users?email=someone%40example.test';
+    const redacted = redactTextUrls(text);
+
+    for (const raw of ['ZZTOP42', 'YYKK13', 'someone%40example.test']) {
+      expect(redacted).not.toContain(raw);
+    }
+    for (const token of redacted.split(/\s+/)) {
+      expectOnlyMaskedValues(token);
+    }
+  });
+
+  it('is idempotent', () => {
+    for (const text of [
+      'Visit /reset?coupon=QQZZ7 and https://x.test/a?b=1#top.',
+      'a[href="/p?id=QQZZ7"]',
+      '?token=QQZZ7&flag',
+    ]) {
+      const once = redactTextUrls(text);
+      expect(redactTextUrls(once), text).toBe(once);
+    }
+  });
+
+  it('masks userinfo of an embedded absolute URL, like the stack pass it builds on', () => {
+    const redacted = redactTextUrls(
+      `see ${['http', '://', 'demo', ':', 'pw', '@', 'host.example.test/p'].join('')}`,
+    );
+
+    expect(redacted).toBe(`see http://${REDACTION_MARKER}@host.example.test/p`);
+  });
+
+  it('never throws, whatever it is given', () => {
+    for (const value of [undefined, null, 42, true, { href: '/p?id=1' }, ['?a=1']]) {
+      expect(() => redactTextUrls(value)).not.toThrow();
+      expect(typeof redactTextUrls(value)).toBe('string');
+    }
   });
 });
 

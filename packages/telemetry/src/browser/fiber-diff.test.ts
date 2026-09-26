@@ -576,8 +576,8 @@ function structuralSnapshot(value: unknown, seen: WeakSet<object> = new WeakSet(
 /**
  * Collects `typeof` for every leaf of a diff result.
  *
- * The transport is `window.postMessage` to the isolated-world bridge and then
- * JSON over a WebSocket, and the event schema's attribute refinement rejects a
+ * The transport is JSON text on the private page channel to the isolated-world
+ * bridge and then JSON over a WebSocket, and the event schema's attribute refinement rejects a
  * function or a symbol outright. Asserting the leaf vocabulary is how this
  * suite proves a diff can make that journey: a `function`, `symbol`,
  * `undefined` or `bigint` leaf would be dropped or rejected downstream.

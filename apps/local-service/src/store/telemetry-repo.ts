@@ -81,8 +81,11 @@
  *   attempted here: a recursive SQL ordering would duplicate that logic in a
  *   second language, and it would be wrong in the one case that matters, where
  *   a server span's clock reads slightly earlier than the browser span that
- *   caused it (AAP 0.2.3 records a per-producer offset as informational rather
- *   than aligning the clocks).
+ *   caused it. AAP 0.2.3 aligns no clocks: each producer's own estimate of its
+ *   offset from the server that answered it travels on its events as
+ *   `clockOffsetMs`, is stored in the `clock_offset_ms` column and summarised
+ *   per producer by {@link TelemetryRepo.listProducerClockOffsets}, and is
+ *   never added to `start_time` or `duration`.
  *
  * `compareEventsCanonical` in that same module is the in-memory twin of
  * {@link CANONICAL_ORDER_BY}, and the two agree key for key. They also agree on
@@ -100,6 +103,12 @@
  * `REAL`: the producers emit sub-millisecond doubles and a correlated cross-tier
  * timeline is only correct if that precision round-trips unrounded. Nothing here
  * rounds either value.
+ *
+ * `clock_offset_ms` (schema version 5, added by `./migrations.ts`) projects the
+ * event's optional `clockOffsetMs` — `NULL` when the producer reported none, and
+ * for every row written before that version — so the per-producer clock
+ * diagnostic is one grouped read. Reads that rebuild events never consult it:
+ * the field round-trips through the `event` document like every other.
  *
  * `ingest_seq` is `INTEGER PRIMARY KEY AUTOINCREMENT`, so the database assigns
  * it and never reuses a value — not even after a retention purge, which is what
@@ -156,6 +165,7 @@
  */
 
 import { Buffer } from 'node:buffer';
+import type { DatabaseSync } from 'node:sqlite';
 import { setImmediate as yieldToEventLoop } from 'node:timers/promises';
 
 import {
@@ -166,13 +176,15 @@ import {
 } from '@debuggen/panel-schema';
 import type { DataQuerySort, IdResolution } from '@debuggen/panel-schema';
 import { DebuggenError, err, isErr, noopLogger, ok } from '@debuggen/shared';
-import type { CaptureId, Logger, Result, SessionId } from '@debuggen/shared';
+import type { CaptureId, Logger, ProducerId, Result, SessionId } from '@debuggen/shared';
 import {
+  CLOCK_OFFSET_BOUND_MS,
   FETCH_ATTRIBUTE_KEYS,
   RENDER_ATTRIBUTE_KEYS,
   SERVICE_ASSIGNED_ATTRIBUTE_KEYS,
   TELEMETRY_KINDS,
   TELEMETRY_TIERS,
+  isClockOffsetMs,
   isTelemetryKind,
   isTelemetryTier,
   parseTelemetryEvent,
@@ -662,6 +674,71 @@ export const DEFAULT_PURGE_BATCH_SIZE = 5000;
  */
 export const MAX_PURGE_BATCH_SIZE = DEFAULT_PURGE_BATCH_SIZE;
 
+/**
+ * How many captures the producer-loss ledger remembers at once: **512**
+ * (see {@link TelemetryRepo.beginProducerLossAccounting} and
+ * {@link TelemetryRepo.recordProducerLoss}).
+ *
+ * The ledger is the service's in-process tally of events a producer reported
+ * discarding before delivery — the page agent's 5 000-event buffer
+ * overflowing while its bridge was away (AAP §0.5.5). It lives in memory
+ * rather than in a table because the durable record of a loss is the capture
+ * summary's `coverage.producerDroppedEvents`, which the capture stage writes
+ * when it closes the window, and the store has no in-place capture update to
+ * accumulate into.
+ *
+ * Being in memory, it can only vouch for what it saw, so it says when it
+ * cannot: a capture is **accounted** only while the entry the capture stage
+ * began when it opened the window is still held. A service restart before the
+ * stop, or the eviction of that entry, leaves the capture unaccounted, and its
+ * coverage is then never reported complete.
+ *
+ * The capture stage releases an entry when it closes the window, so the
+ * entries held are the open captures — one per project at most — plus the
+ * loss reports that named a capture with no begun entry, and the begun entries
+ * of windows the session manager closed on another path (the session ended,
+ * was cancelled or failed mid-capture), which nothing reads again. When the
+ * bound is passed, the least recently touched of the unbegun entries is
+ * forgotten first, and the least recently touched begun entry only once no
+ * unbegun entry is left — a capture that then reads as unaccounted, which is
+ * the truthful answer for one the ledger can no longer vouch for.
+ */
+export const PRODUCER_LOSS_LEDGER_CAPACITY = 512;
+
+/**
+ * How many captures the ingest arrival tracker behind
+ * {@link TelemetryRepo.captureWatermark} remembers at once: **512**.
+ *
+ * The capture stage's stop barrier (AAP §0.5.5) reads a capture's watermark
+ * every hundred milliseconds on the service's one event loop, so the read is
+ * an in-memory lookup rather than a `COUNT(*)` over every row the capture
+ * holds — a cost that would grow with the very captures the barrier waits
+ * longest on. `insertMany` advances the tracker after its transaction commits.
+ *
+ * The entries held are the captures ingest has written to since they were
+ * last released: the capture stage releases one when it closes the window
+ * (through {@link TelemetryRepo.releaseProducerLoss}), so the open captures
+ * dominate. Past the bound, the capture written to least recently is
+ * forgotten. Forgetting is safe for what the tracker is for — change
+ * detection: an arrival always carries an `ingest_seq` above every earlier
+ * one, so a forgotten capture that receives another batch still reads as
+ * moved, and one that receives none reads as standing still.
+ */
+export const CAPTURE_ARRIVAL_TRACKER_CAPACITY = 512;
+
+/**
+ * The most producers {@link TelemetryRepo.listProducerClockOffsets} reports for
+ * one call: **1 000**.
+ *
+ * A producer is one page document or one dev-server process within one
+ * capture, so a session normally has a handful — one per page load and one per
+ * server restart while a capture runs. The bound keeps a pathological session
+ * (a page reloading in a loop through a long capture) from turning a diagnostic
+ * read into an unbounded result. The earliest-reporting producers are kept, the
+ * rest are left out and the truncation is reported at `warn`.
+ */
+export const MAX_PRODUCER_CLOCK_OFFSETS = 1_000;
+
 /* -------------------------------------------------------------------------------------------------
  * Statement text
  *
@@ -681,7 +758,8 @@ const TABLE = 'telemetry_events';
  *
  * `ingest_seq` is absent because the database assigns it. The flat columns are
  * projections of the `event` document kept in step with it on the one write
- * path, so a filter or an ordering never has to walk JSON.
+ * path, so a filter or an ordering never has to walk JSON. `clock_offset_ms`
+ * exists from schema version 5, which every store this build opens is at.
  */
 const INSERT_COLUMNS: readonly string[] = Object.freeze([
   'id',
@@ -697,6 +775,7 @@ const INSERT_COLUMNS: readonly string[] = Object.freeze([
   'duration',
   'producer_id',
   'seq',
+  'clock_offset_ms',
   'request_key',
   'event',
 ]);
@@ -782,6 +861,89 @@ WHERE session_id = ? AND capture_id = ?
 GROUP BY trace_id
 ORDER BY first_start ASC, trace_id ASC`;
 
+/**
+ * The order {@link SELECT_FIRST_TRACE_ID_SQL} and its capture form take a
+ * scope's events in: `start_time`, then the arrival number that can never tie.
+ *
+ * `ingest_seq` is the table's `INTEGER PRIMARY KEY` — the rowid alias — which
+ * every index carries as its implicit last key, so an index whose trailing
+ * columns end in `start_time` delivers exactly this order with no sort:
+ * `idx_telemetry_events_session_id_capture_id_start_time` for one capture, and
+ * `idx_telemetry_events_session_id_start_time_ingest_seq`, which names the
+ * arrival number explicitly, for a whole session. The same key sequence as
+ * {@link PURGE_ORDER_BY}, written out so the lookup's order is not coupled to
+ * the purge's.
+ */
+const FIRST_EVENT_ORDER_BY = 'start_time ASC, ingest_seq ASC';
+
+/**
+ * The trace of a session's earliest event, in `start_time` then arrival-number
+ * order: one ordered index probe that stops at the first entry. Binds the
+ * session id.
+ *
+ * Planned as `SEARCH telemetry_events USING INDEX
+ * idx_telemetry_events_session_id_start_time_ingest_seq (session_id=?)` with no
+ * temporary B-tree, with or without `ANALYZE` statistics: the probe reads one
+ * index entry and one row however many events share the session's earliest
+ * instant, so its cost grows with neither the number of traces nor the number
+ * of events.
+ *
+ * The tie rule is arrival order, which is deterministic and total because
+ * `ingest_seq` is never reused. It picks the same trace as
+ * {@link SELECT_TRACE_IDS_SQL}'s first entry whenever the earliest instant
+ * belongs to one trace; the two differ only when several traces share that
+ * exact `start_time`, where the listing breaks the tie by trace id and this
+ * probe by which of those events arrived first. No row means the session
+ * holds no event.
+ */
+const SELECT_FIRST_TRACE_ID_SQL = `SELECT trace_id FROM ${TABLE}
+WHERE session_id = ?
+ORDER BY ${FIRST_EVENT_ORDER_BY}
+LIMIT 1`;
+
+/**
+ * {@link SELECT_FIRST_TRACE_ID_SQL}, narrowed to one capture. Binds the session
+ * id, then the capture id.
+ *
+ * Planned as `SEARCH telemetry_events USING INDEX
+ * idx_telemetry_events_session_id_capture_id_start_time (session_id=? AND
+ * capture_id=?)` with no temporary B-tree: the index's implicit rowid key
+ * orders the capture's entries by `start_time` and then `ingest_seq`, so the
+ * first entry of the equality range is the answer. Same tie rule, same cost.
+ */
+const SELECT_FIRST_TRACE_ID_BY_CAPTURE_SQL = `SELECT trace_id FROM ${TABLE}
+WHERE session_id = ? AND capture_id = ?
+ORDER BY ${FIRST_EVENT_ORDER_BY}
+LIMIT 1`;
+
+/**
+ * How many rows one capture holds and the highest arrival number among them:
+ * {@link TelemetryRepo.captureStamp}. Binds the session id, then the capture
+ * id.
+ *
+ * `ingest_seq` is the table's `INTEGER PRIMARY KEY`, so every entry of
+ * `idx_telemetry_events_session_id_capture_id_start_time` carries it: the count
+ * and the maximum are one covering range read of the capture's index entries,
+ * with no row fetched and no document parsed. `COALESCE` answers `0` for an
+ * empty capture, below every number `AUTOINCREMENT` assigns.
+ */
+const SELECT_CAPTURE_STAMP_SQL = `SELECT COUNT(*) AS total, COALESCE(MAX(ingest_seq), 0) AS max_seq
+FROM ${TABLE}
+WHERE session_id = ? AND capture_id = ?`;
+
+/**
+ * The connection's data version: {@link TelemetryRepo.captureGeneration}'s
+ * witness of every commit made by **another** connection.
+ *
+ * SQLite changes the value this pragma answers on a connection whenever a
+ * different connection — in this process or another — has committed a change
+ * to the database since the connection last asked, and leaves it unchanged
+ * for the connection's own commits. It reads the database header, never a
+ * table, so it costs the same whatever the store holds. The same-connection
+ * half of the story is the write ledger ({@link WriteLedger}).
+ */
+const DATA_VERSION_SQL = 'PRAGMA data_version';
+
 /** How many rows of each kind a session holds. */
 const COUNT_BY_KIND_SQL = `SELECT kind, COUNT(*) AS total FROM ${TABLE}
 WHERE session_id = ?
@@ -794,6 +956,58 @@ GROUP BY kind`;
 
 /** How many rows one session holds, for the retention report. */
 const COUNT_BY_SESSION_SQL = `SELECT COUNT(*) AS total FROM ${TABLE} WHERE session_id = ?`;
+
+/**
+ * The per-producer clock-offset read of {@link TelemetryRepo.listProducerClockOffsets},
+ * over the rows `scope` selects. Binds the scope's values, then the row limit.
+ *
+ * One row per `(capture_id, producer_id)` among the rows that carry an offset,
+ * earliest-reporting producer first. The inner grouped read computes the
+ * distinct tiers, the range, the count and the first and last arrival numbers;
+ * the join then reads the offset of the group's **last** arrival — the latest
+ * estimate that producer reported — back through the primary key. SQLite's
+ * bare-column rule for `MAX()` cannot serve instead: it holds only for a query
+ * with exactly one `MIN` or `MAX` aggregate, and this one has several.
+ *
+ * `first_ingest_seq ASC` is a total order, because arrival numbers are unique
+ * and no two groups can share a first one, and `ingest_seq` is the table's
+ * rowid, so the join is one point read per group.
+ *
+ * @param scope A fixed `WHERE` term from this module — never a value.
+ * @returns The statement text.
+ */
+function producerClockOffsetsSql(scope: string): string {
+  return `SELECT reporting.capture_id, reporting.producer_id, reporting.tiers,
+  latest.clock_offset_ms AS clock_offset_ms,
+  reporting.min_clock_offset_ms, reporting.max_clock_offset_ms,
+  reporting.reporting_events, reporting.first_ingest_seq, reporting.last_ingest_seq
+FROM (
+  SELECT capture_id, producer_id,
+    json_group_array(DISTINCT tier) AS tiers,
+    MIN(clock_offset_ms) AS min_clock_offset_ms,
+    MAX(clock_offset_ms) AS max_clock_offset_ms,
+    COUNT(*) AS reporting_events,
+    MIN(ingest_seq) AS first_ingest_seq,
+    MAX(ingest_seq) AS last_ingest_seq
+  FROM ${TABLE}
+  WHERE ${scope} AND clock_offset_ms IS NOT NULL
+  GROUP BY capture_id, producer_id
+) AS reporting
+JOIN ${TABLE} AS latest ON latest.ingest_seq = reporting.last_ingest_seq
+ORDER BY reporting.first_ingest_seq ASC
+LIMIT ?`;
+}
+
+/** {@link producerClockOffsetsSql} over one session. Binds the session id, then the limit. */
+const SELECT_PRODUCER_CLOCK_OFFSETS_SQL = producerClockOffsetsSql('session_id = ?');
+
+/**
+ * {@link producerClockOffsetsSql} over one capture of one session. Binds the
+ * session id, the capture id, then the limit.
+ */
+const SELECT_PRODUCER_CLOCK_OFFSETS_BY_CAPTURE_SQL = producerClockOffsetsSql(
+  'session_id = ? AND capture_id = ?',
+);
 
 /**
  * The order every purge batch is taken in: `start_time`, then the arrival
@@ -917,6 +1131,21 @@ const CAPTURE_TERM = 'capture_id = ?';
 const RESIDUAL_CAPTURE_TERM = '+capture_id = ?';
 
 /**
+ * One page of a capture window's rows for its summary, in canonical order:
+ * {@link TelemetryRepo.pageCaptureForSummary}. Binds the session id, the
+ * capture id, the page size and the offset.
+ *
+ * Served from `idx_telemetry_events_session_id_capture_id_start_time`, the
+ * capture page's own index, like `listByCapture`'s rows — but without the
+ * `COUNT(*)` a row page runs beside its rows: the summary walk pages a capture
+ * in small steps, and a count over the whole window on every step would cost
+ * more than the step itself on a large capture.
+ */
+const SELECT_CAPTURE_SUMMARY_PAGE_SQL = `SELECT ${SELECTED} FROM ${TABLE}
+WHERE ${SESSION_TERM} AND ${CAPTURE_TERM}
+ORDER BY ${CANONICAL_ORDER_BY} LIMIT ? OFFSET ?`;
+
+/**
  * Selects the subset of a column's values that a session holds.
  *
  * Used for both existence lookups, so the two cannot drift on scoping or on
@@ -965,6 +1194,40 @@ function groupRowsSql(groupBy: TelemetryGroupKey, clause: string): string {
   return `SELECT ${SELECTED}, ${key} AS group_key FROM ${TABLE}
 WHERE ${clause} AND ${key} IS NOT NULL
 ORDER BY ingest_seq ASC`;
+}
+
+/**
+ * Counts every row a filtered read selects.
+ *
+ * The one count text both {@link TelemetryRepo.query} (for a page's `total`)
+ * and {@link TelemetryRepo.scanEvents} (for its limit check) run, so the two
+ * describe one filter by construction and share one cached statement per
+ * clause.
+ *
+ * @param clause The `WHERE` clause from the filter planner: column names and
+ * placeholders only.
+ * @returns The statement text; binds the filter values only.
+ */
+function countRowsSql(clause: string): string {
+  return `SELECT COUNT(*) AS total FROM ${TABLE} WHERE ${clause}`;
+}
+
+/**
+ * Reads every row a filtered read selects in the panel-data `start_asc` order,
+ * {@link PANEL_START_ASC_ORDER_BY}: the one ordered statement of
+ * {@link TelemetryRepo.scanEvents}.
+ *
+ * No `OFFSET`: the scan is one traversal, bounded by a `LIMIT` one row past the
+ * caller's ceiling, so a selection that grew past that ceiling after it was
+ * counted is noticed rather than cut short silently.
+ *
+ * @param clause The `WHERE` clause from the filter planner: column names and
+ * placeholders only.
+ * @returns The statement text; binds the filter values, then the row bound.
+ */
+function scanRowsSql(clause: string): string {
+  return `SELECT ${SELECTED} FROM ${TABLE} WHERE ${clause}
+ORDER BY ${PANEL_START_ASC_ORDER_BY} LIMIT ?`;
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -1211,6 +1474,46 @@ export interface TelemetryPage {
 }
 
 /**
+ * The narrowing a {@link TelemetryRepo.scanEvents} call accepts: every
+ * {@link TelemetryQuery} filter field, and none of the ordering and paging
+ * fields — a scan is always the whole selection in one fixed order.
+ *
+ * Derived rather than restated so a filter field added to the query is
+ * scannable in the same edit.
+ */
+export type TelemetryScanFilter = Omit<TelemetryQuery, 'sort' | 'groupBy' | 'limit' | 'offset'>;
+
+/** The whole of a filtered selection, or the honest statement that it was too large. */
+export interface TelemetryScan {
+  /**
+   * Every selected event in `start_time ASC, id ASC` order
+   * ({@link PANEL_START_ASC_ORDER_BY}); empty when `complete` is false.
+   */
+  readonly rows: TelemetryEvent[];
+
+  /**
+   * How many rows the filter selects.
+   *
+   * When `complete`, the rows the scan read — `rows.length` plus
+   * {@link TelemetryScan.skipped} — so the three always agree. When not, the
+   * count that exceeded the ceiling, or, when the selection grew past the
+   * ceiling between the count and the read, the rows the read met before it
+   * stopped: a lower bound either way, and never a claim of completeness.
+   */
+  readonly total: number;
+
+  /** True exactly when `rows` holds every selected event, i.e. the selection is within `maxRows`. */
+  readonly complete: boolean;
+
+  /**
+   * Rows left out because they no longer validate; absent when none, and
+   * always absent from an incomplete scan. The same skip-and-report rule as
+   * {@link TelemetryPage.skipped}.
+   */
+  readonly skipped?: number;
+}
+
+/**
  * A grouped read: the same narrowing as {@link TelemetryQuery}, over the groups
  * the filtered rows form under one key.
  *
@@ -1350,6 +1653,253 @@ export interface DeleteOlderThanOptions {
   readonly batchSize?: number | undefined;
 }
 
+/**
+ * A fingerprint of one capture's stored events: what
+ * {@link TelemetryRepo.captureStamp} returns.
+ *
+ * Two readings of the same capture are equal exactly when the capture holds the
+ * same rows at both, and its {@link CaptureEventStamp.count} says how many
+ * events those are — which is what a coverage check needs: whether a capture
+ * summary, computed when the capture stopped, still describes every event the
+ * store holds. It is not what a cache of the capture's aggregates is validated
+ * with; reading it counts the capture's index entries on every call, and
+ * {@link CaptureGeneration} answers "has anything changed?" without reading a
+ * telemetry row. A stamp is a function of the rows, so equal rows give equal
+ * stamps; that differing rows always give differing stamps follows from how
+ * the table is written:
+ *
+ * - `ingest_seq` is `AUTOINCREMENT` and never reused, not even after a purge,
+ *   so every row inserted into the capture carries a number above every number
+ *   the table has ever assigned — an insert that is still stored always raises
+ *   {@link CaptureEventStamp.maxIngestSeq};
+ * - rows are never updated in place, so the only other change is a delete,
+ *   and a delete not offset by an insert always lowers
+ *   {@link CaptureEventStamp.count}.
+ *
+ * A stamp is a fingerprint and not a version number: compare two stamps for
+ * equality, never for order.
+ */
+export interface CaptureEventStamp {
+  /** How many events the capture holds, `0` for an empty capture. */
+  readonly count: number;
+
+  /**
+   * The highest arrival number among the capture's events, `0` for an empty
+   * capture — below every number the store assigns.
+   */
+  readonly maxIngestSeq: number;
+}
+
+/**
+ * Where one capture's stored events stand, as far as this connection can
+ * observe without reading them: what {@link TelemetryRepo.captureGeneration}
+ * returns.
+ *
+ * **Compare two generations for equality only**, never for order: a caller
+ * keeps an aggregate computed from a capture's events together with the
+ * generation it read *before* reading those events, and reuses the aggregate
+ * exactly while a fresh reading is equal to it, field for field.
+ *
+ * Equality is sound — equal generations mean the capture holds the rows it
+ * held — because every way the capture's rows can change moves a field:
+ *
+ * - **Another connection's commit** — the dev-server's, a second service's, a
+ *   manual edit — moves {@link CaptureGeneration.dataVersion}, whatever it
+ *   changed.
+ * - **This connection's writes to `telemetry_events` all go through this
+ *   repository**, and each is recorded in the connection's write ledger, which
+ *   every repository over the connection shares: a batch of
+ *   {@link TelemetryRepo.insertMany} that stored at least one row of the
+ *   capture moves {@link CaptureGeneration.writes}, and a purge batch of
+ *   {@link TelemetryRepo.deleteBySession} or {@link TelemetryRepo.deleteOlderThan}
+ *   that deleted at least one row, of any capture, moves
+ *   {@link CaptureGeneration.purges}.
+ * - **The one other same-connection change is a foreign-key cascade**, which
+ *   deletes a whole capture's or session's events together with the
+ *   `captures` or `sessions` row. The ids those rows carry are minted and never
+ *   reused, so the stale generation of a deleted capture can never validate a
+ *   read of a live one.
+ *
+ * An insert made inside a transaction the caller opened is not known to be
+ * committed when the batch returns, and a rollback on this connection moves
+ * neither `dataVersion` nor the ledger; so such an insert is stamped again the
+ * first time a generation is read once no transaction is open, which
+ * invalidates anything computed while its outcome was pending.
+ */
+export interface CaptureGeneration {
+  /** `PRAGMA data_version` of the connection: moves when another connection commits. */
+  readonly dataVersion: number;
+
+  /** The ledger value of the latest purge batch on this connection that deleted rows, 0 when none. */
+  readonly purges: number;
+
+  /** The ledger value of the latest insert of rows into this capture on this connection, 0 when none. */
+  readonly writes: number;
+}
+
+/**
+ * How far ingest has advanced into one capture window (AAP §0.5.5): what
+ * {@link TelemetryRepo.captureWatermark} answers and what the capture stage's
+ * stop barrier compares between two polls.
+ *
+ * It counts **arrivals**: the rows `insertMany` committed for the capture
+ * through this repository instance since the tracker began holding it
+ * ({@link CAPTURE_ARRIVAL_TRACKER_CAPACITY}). It is a change detector, not a
+ * measure of what the store holds — a purge does not lower it, and a restarted
+ * service starts it at zero — so the summary's `coverage.storedEvents` comes
+ * from the stored rows instead. A new row raises both numbers; a replay the
+ * store suppressed as an identical event raises neither, because it is not
+ * new evidence.
+ */
+export interface CaptureIngestWatermark {
+  /** How many rows this repository committed for the capture while tracking it. */
+  readonly eventCount: number;
+  /** The highest `ingest_seq` among those rows, or `0` when none arrived. */
+  readonly lastIngestSeq: number;
+}
+
+/**
+ * One producer's report that it discarded events before they could be
+ * delivered — the `droppedCount` a page-agent batch carries after its bounded
+ * buffer overflowed while the bridge was away (AAP §0.5.5). What
+ * {@link TelemetryRepo.recordProducerLoss} accumulates.
+ */
+export interface ProducerLossReport {
+  /** The session the batch was attributed to. */
+  readonly sessionId: SessionId;
+  /** The capture window the batch was attributed to. */
+  readonly captureId: CaptureId;
+  /** The reporting producer, when known: an identifier for the log record, never part of the key. */
+  readonly producerId?: ProducerId | undefined;
+  /** How many events the producer discarded since its previous report: a whole number from `0`. */
+  readonly droppedEvents: number;
+}
+
+/**
+ * What the producer-loss ledger knows about one capture: what
+ * {@link TelemetryRepo.producerLoss} answers (AAP §0.5.5).
+ */
+export interface ProducerLossTotal {
+  /**
+   * How many events the producers reported discarding for the capture, as
+   * this process received the reports — exact when {@link accounted}, and
+   * otherwise only a lower bound (`0` included).
+   */
+  readonly droppedEvents: number;
+  /**
+   * Whether the ledger has tracked the capture since its window opened in this
+   * process and never forgot it — the only case in which
+   * {@link droppedEvents} is the whole loss. `false` after a service restart
+   * that fell between the window opening and this read, after the capture's
+   * entry was evicted or released, and for a capture no window-opening began.
+   */
+  readonly accounted: boolean;
+}
+
+/** Which page {@link TelemetryRepo.pageCaptureForSummary} reads. Both fields are required. */
+export interface CaptureSummaryPageOptions {
+  /**
+   * How many rows to read: a whole number, clamped to
+   * {@link TELEMETRY_QUERY_MAX_LIMIT}. `0` reads nothing and is terminal.
+   */
+  readonly limit: number;
+  /** How many rows of the capture, in canonical order, to skip first: a whole number. */
+  readonly offset: number;
+}
+
+/**
+ * One page of a capture window's stored events, read for the capture summary
+ * (AAP §0.5.5), with what the capture stage needs to bound the read by size as
+ * well as by count.
+ *
+ * Deliberately its own shape rather than a {@link TelemetryPage} with one more
+ * field: a row page is mapped onto a strict panel-data response, and a size
+ * the panel surface never shows does not belong on it.
+ */
+export interface CaptureSummaryPage {
+  /** The page's readable events, in canonical order ({@link CANONICAL_ORDER_BY}). */
+  readonly rows: TelemetryEvent[];
+  /** How many stored rows the page read, readable or not: `rows.length + skipped`. */
+  readonly rowsRead: number;
+  /** How many of those rows no longer validate and were left out (reported at `warn`). */
+  readonly skipped: number;
+  /**
+   * The stored size of every row read, unreadable ones included: the summed
+   * length, in UTF-16 code units, of their JSON `event` documents — the
+   * characters the store actually holds for them, measured on the strings the
+   * read already returned rather than by a second query.
+   */
+  readonly storedChars: number;
+  /**
+   * The offset to ask for next: present whenever the page came back full, and
+   * **absent** when it came back short, which is the capture's end. A capture
+   * whose last row closes a full page therefore answers one more, empty page,
+   * which is terminal. Present, it is always greater than the page's offset.
+   */
+  readonly nextOffset?: number;
+}
+
+/**
+ * The clock offsets one producer reported within one capture — the
+ * informational per-producer `clockOffsetMs` of AAP 0.2.3, as the store holds
+ * it.
+ *
+ * Every offset is `server clock − producer clock` in whole milliseconds, as the
+ * producer's `ClockOffsetEstimator` (`@debuggen/telemetry`) computed it: a
+ * positive value means the server's clock is ahead of the producer's. Only the
+ * events that carried an offset are summarised; a producer that reported none
+ * has no entry.
+ */
+export interface ProducerClockOffset {
+  /** The capture window the producer's events were attributed to. */
+  readonly captureId: CaptureId;
+
+  /** The page document or dev-server process that reported the offsets. */
+  readonly producerId: ProducerId;
+
+  /**
+   * The distinct tiers of the reporting events, in `TELEMETRY_TIERS` order —
+   * `browser` for a page agent; `server` and `db` for a preload.
+   */
+  readonly tiers: readonly TelemetryTier[];
+
+  /**
+   * The offset on the producer's latest reporting event (its highest
+   * `ingestSeq`): the estimate the producer held most recently, and the one
+   * a reader should compare its timestamps by.
+   */
+  readonly clockOffsetMs: number;
+
+  /** The smallest offset any reporting event carried. */
+  readonly minClockOffsetMs: number;
+
+  /**
+   * The largest offset any reporting event carried. A spread between this and
+   * {@link ProducerClockOffset.minClockOffsetMs} well beyond the header's
+   * one-second resolution means the producer's estimate restarted — its clock
+   * moved relative to the server's during the capture.
+   */
+  readonly maxClockOffsetMs: number;
+
+  /** How many stored events of this producer carried an offset. */
+  readonly reportingEvents: number;
+
+  /** The arrival number of the first reporting event. */
+  readonly firstIngestSeq: number;
+
+  /** The arrival number of the latest reporting event. */
+  readonly lastIngestSeq: number;
+}
+
+/** Narrowing for {@link TelemetryRepo.listProducerClockOffsets}. */
+export interface ProducerClockOffsetOptions {
+  /**
+   * Restrict the summary to one capture window of the session. Absent means
+   * every capture; an empty string is refused, as every blank narrowing is.
+   */
+  readonly captureId?: CaptureId | undefined;
+}
+
 /* -------------------------------------------------------------------------------------------------
  * The repository's contract
  * ---------------------------------------------------------------------------------------------- */
@@ -1410,6 +1960,10 @@ export interface TelemetryRepo {
    * - `stored-event-unreadable` — the stored row no longer reconstructs, so the
    *   replay cannot be confirmed.
    *
+   * Once the transaction has returned, the rows it inserted — never the
+   * replays it skipped — advance each capture's ingest watermark
+   * ({@link TelemetryRepo.captureWatermark}); a refused batch advances none.
+   *
    * @param events The batch, in producer order. An empty batch is a successful
    * no-op that does not touch the database.
    * @returns The stored events with their arrival numbers, plus the insert and
@@ -1438,6 +1992,54 @@ export interface TelemetryRepo {
    * `limit` or `offset`, a non-finite `minDuration`).
    */
   query(filter: TelemetryQuery): Result<TelemetryPage, DebuggenError>;
+
+  /**
+   * Reads the **whole** filtered selection in one traversal, or says it is
+   * larger than `maxRows` without reading it — the full-slice read behind the
+   * panel-data aggregates.
+   *
+   * A render, request, query or metric aggregate is only true when it is
+   * computed over every selected event, so its input must be either complete
+   * or declared incomplete. Walking {@link TelemetryRepo.query} pages for that
+   * input costs a `COUNT(*)` per page plus an `OFFSET` that re-walks every
+   * earlier row, so the walk grows quadratically with the capture. This runs
+   * at most two statements instead:
+   *
+   * 1. one `COUNT(*)` over the filter's `WHERE` clause — the identical text
+   *    `query` counts with — and, when the count exceeds `maxRows`, nothing
+   *    else: the answer is `{ rows: [], total: count, complete: false }`;
+   * 2. otherwise one `SELECT … ORDER BY start_time ASC, id ASC LIMIT maxRows + 1`
+   *    with no `OFFSET`, consumed row by row and reconstructed in chunks of at
+   *    most {@link TELEMETRY_QUERY_MAX_LIMIT} raw rows, so the raw rows are
+   *    never all held at once. Should more than `maxRows` rows arrive — another
+   *    connection wrote between the two statements — the read stops and the
+   *    scan answers incomplete with the rows it met as `total`.
+   *
+   * The rows are those, and in the order, of every `query({ ...filter, sort:
+   * 'start_asc' })` page concatenated. A stored row that no longer validates
+   * is skipped, counted in {@link TelemetryScan.skipped} and reported once at
+   * `warn` by arrival number alone, as a page's is.
+   *
+   * @example
+   * ```ts
+   * const slice = telemetry.scanEvents({ sessionId, captureId, kinds: ['render'] }, 50_000);
+   * if (slice.ok && slice.value.complete) {
+   *   const stats = aggregateRenders(slice.value.rows);
+   * }
+   * ```
+   *
+   * @param filter What to match — the filter fields of {@link TelemetryQuery}.
+   * A filter narrowed to nothing (an empty `kinds` or `tiers` list) is
+   * answered `{ rows: [], total: 0, complete: true }` without a statement.
+   * @param maxRows The most rows the caller will take; a non-negative safe
+   * integer. `0` counts only: the scan is complete exactly when the selection
+   * is empty.
+   * @returns The scan, or the refusal: the filter refusals of
+   * {@link TelemetryRepo.query} (a blank session or narrowing, an unknown kind
+   * or tier, a non-finite `minDuration`), or `STORE_ERROR` with reason
+   * `invalid-max-rows`.
+   */
+  scanEvents(filter: TelemetryScanFilter, maxRows: number): Result<TelemetryScan, DebuggenError>;
 
   /**
    * Reads one page of the groups a session's filtered events form under one
@@ -1505,6 +2107,31 @@ export interface TelemetryRepo {
   ): Result<TelemetryPage, DebuggenError>;
 
   /**
+   * One page of a capture window's events in canonical order, for the capture
+   * summary — the bounded read behind the capture stage's summary walk (AAP
+   * §0.5.5).
+   *
+   * Each page reports the stored size of the rows it read beside the rows, so
+   * the walk can stop at a size ceiling as well as a count ceiling: attributes
+   * are open JSON, and a count alone does not bound how much memory the events
+   * of one summary hold. No `COUNT(*)` of the window runs per page (see
+   * {@link CaptureSummaryPage.nextOffset}); the caller that needs the window's
+   * exact size asks {@link TelemetryRepo.countByKind} once.
+   *
+   * @param sessionId The session that owns the capture.
+   * @param captureId The capture window.
+   * @param options The page size and offset, in rows.
+   * @returns The page, or `STORE_ERROR` for a blank session or capture id
+   * (`blank-session-id`, `blank-capture-id`) or a `limit` or `offset` that is
+   * not a whole number (`invalid-limit`, `invalid-offset`).
+   */
+  pageCaptureForSummary(
+    sessionId: SessionId,
+    captureId: CaptureId,
+    options: CaptureSummaryPageOptions,
+  ): Result<CaptureSummaryPage, DebuggenError>;
+
+  /**
    * Every event sharing one request grouping key.
    *
    * The indexed read behind duplicate-request detection: the occurrences of one
@@ -1555,6 +2182,40 @@ export interface TelemetryRepo {
   listTraceIds(sessionId: SessionId, captureId?: CaptureId): Result<string[], DebuggenError>;
 
   /**
+   * The trace of the scope's earliest event, taking events in `start_time`
+   * order and then in arrival (`ingest_seq`) order — without listing any other
+   * trace.
+   *
+   * The rule is deterministic and total, because arrival numbers are never
+   * reused. It names the same trace as {@link TelemetryRepo.listTraceIds}'s
+   * first entry whenever the scope's earliest instant belongs to one trace, and
+   * differs from it only on an exact `start_time` tie between traces: the
+   * listing breaks that tie by trace id, this lookup by which of the tied
+   * events arrived first. After a purge removes the earliest rows, the answer
+   * moves to the trace of the earliest arrival among the rows that remain.
+   *
+   * It exists for the panel-data `trace` source, whose default trace (a query
+   * naming none, for a capture whose summary names no primary trace) is this
+   * one: the listing groups and sorts every trace of the capture and answers
+   * them all, only for one to be kept. This is one ordered index probe with
+   * `LIMIT 1` — the capture index for a capture, the session's
+   * `(session_id, start_time, ingest_seq)` index for a whole session — so its
+   * cost grows with neither the number of traces nor the number of events,
+   * including events tied at the earliest instant.
+   *
+   * @param sessionId The session that owns the evidence.
+   * @param captureId Narrow to one capture; absent, every capture of the
+   * session is considered, as the listing does.
+   * @returns The trace id, `undefined` when there is no event to take one
+   * from, or the refusal of {@link TelemetryRepo.listTraceIds}: `STORE_ERROR`
+   * with reason `blank-session-id` or `blank-filter`.
+   */
+  firstTraceId(
+    sessionId: SessionId,
+    captureId?: CaptureId,
+  ): Result<string | undefined, DebuggenError>;
+
+  /**
    * How many events of each kind a session holds, zero-filled over the whole
    * kind vocabulary.
    *
@@ -1568,6 +2229,87 @@ export interface TelemetryRepo {
     sessionId: SessionId,
     captureId?: CaptureId,
   ): Result<Record<TelemetryKind, number>, DebuggenError>;
+
+  /**
+   * The {@link CaptureEventStamp} of one capture: its event count and the
+   * highest arrival number among its events.
+   *
+   * It exists for the panel-data resolver's coverage checks: the count is how
+   * many events the capture holds, which is what tells a stored capture
+   * summary that still covers every event from one that retention or further
+   * ingest has left behind. It is not the validator of the resolver's cached
+   * aggregates — that is {@link TelemetryRepo.captureGeneration}, which reads
+   * no telemetry row. One covering index read; no row is fetched and no
+   * document parsed, but its cost grows with the capture's size.
+   *
+   * @param sessionId The session that owns the capture.
+   * @param captureId The capture, which must be named.
+   * @returns The stamp — `{ count: 0, maxIngestSeq: 0 }` for a capture holding
+   * no event, including one this session does not own — or `STORE_ERROR` with
+   * reason `blank-session-id` or `blank-capture-id`.
+   */
+  captureStamp(
+    sessionId: SessionId,
+    captureId: CaptureId,
+  ): Result<CaptureEventStamp, DebuggenError>;
+
+  /**
+   * The {@link CaptureGeneration} of one capture: what a cache of the
+   * capture's aggregates is validated with, without recounting the capture.
+   *
+   * One `PRAGMA data_version` and two lookups in the connection's write
+   * ledger; no telemetry row, index entry or document is read, so the cost is
+   * the same for an empty capture and for one of a million events. That is
+   * what lets the panel-data resolver check its cache on every node of every
+   * panel request. Compare two generations for equality only — see
+   * {@link CaptureGeneration} for why equality is sound.
+   *
+   * @example
+   * ```ts
+   * const generation = unwrap(telemetry.captureGeneration(sessionId, captureId));
+   * const cached = cache.get(captureId);
+   * if (cached !== undefined && sameGeneration(cached.generation, generation)) {
+   *   return cached.aggregates;
+   * }
+   * // Read the events after taking the generation, then cache under it.
+   * ```
+   *
+   * @param sessionId The session that owns the capture.
+   * @param captureId The capture, which must be named.
+   * @returns The generation — `writes: 0` for a capture this connection has
+   * stored nothing into — or `STORE_ERROR` with reason `blank-session-id` or
+   * `blank-capture-id`, the refusals of {@link TelemetryRepo.captureStamp}.
+   */
+  captureGeneration(
+    sessionId: SessionId,
+    captureId: CaptureId,
+  ): Result<CaptureGeneration, DebuggenError>;
+
+  /**
+   * The clock offsets each producer of a session reported — the informational
+   * clock diagnostic of AAP 0.2.3.
+   *
+   * One entry per `(captureId, producerId)` whose stored events carry a
+   * `clockOffsetMs`, ordered by the arrival of each producer's first reporting
+   * event, at most {@link MAX_PRODUCER_CLOCK_OFFSETS} of them (the rest are
+   * left out and reported at `warn`). Read from the `clock_offset_ms` column,
+   * which every stored event's offset is projected into; rows written before
+   * schema version 5, and events a producer created before its first usable
+   * sample, carry none and are not counted.
+   *
+   * What it answers is whether two producers' timestamps can be compared at
+   * the precision a timeline draws them. Nothing here, or anywhere else in the
+   * service, applies an offset to an event's times.
+   *
+   * @param sessionId The session whose producers to summarise. A session the
+   * store does not hold answers with an empty list, as every session read does.
+   * @param options Narrow to one capture window.
+   * @returns The summaries, or the refusal for a blank session or capture id.
+   */
+  listProducerClockOffsets(
+    sessionId: SessionId,
+    options?: ProducerClockOffsetOptions,
+  ): Result<readonly ProducerClockOffset[], DebuggenError>;
 
   /**
    * Which of `ids` the session actually holds as event ids — **the subset, not
@@ -1631,6 +2373,106 @@ export interface TelemetryRepo {
 
   /** How many events one session holds, so `./retention.ts` can report what it removed. */
   countBySession(sessionId: SessionId): Result<number, DebuggenError>;
+
+  /**
+   * The ingest watermark of one capture window: how many rows arrived for it
+   * and the highest arrival number among them, read from the bounded
+   * in-memory arrival tracker ({@link CAPTURE_ARRIVAL_TRACKER_CAPACITY}) that
+   * `insertMany` advances after each commit — no statement runs, so the read
+   * costs the same whatever the capture holds.
+   *
+   * The capture stage's stop barrier (AAP §0.5.5) polls it after disarming the
+   * producers and closes the window only once it has stopped moving, so the
+   * batches the producers flush on disarm — and any already in flight — are
+   * attributed to the capture that recorded them rather than lost. It sees the
+   * arrivals of this repository instance only, which is why ingest and the
+   * capture stage share the one instance `src/main.ts` builds.
+   *
+   * @param sessionId The session that owns the capture.
+   * @param captureId The capture window.
+   * @returns The watermark — `{ eventCount: 0, lastIngestSeq: 0 }` for a
+   * capture nothing arrived for while tracked, or one this session does not
+   * own — or the refusal for a blank id.
+   */
+  captureWatermark(
+    sessionId: SessionId,
+    captureId: CaptureId,
+  ): Result<CaptureIngestWatermark, DebuggenError>;
+
+  /**
+   * Starts accounting for one capture window's producer loss, in the bounded
+   * in-process ledger described at {@link PRODUCER_LOSS_LEDGER_CAPACITY}.
+   *
+   * The capture stage calls it as soon as the session manager has opened the
+   * window, and only then is the capture **accounted**
+   * ({@link ProducerLossTotal.accounted}): from that moment every loss report
+   * ingest attributes to the capture reaches this entry. A capture id is fresh
+   * when its window opens, so a report recorded for it before this call
+   * arrived after the opening too and is kept. Calling it again for a capture
+   * already accounted changes nothing.
+   *
+   * @param sessionId The session that owns the capture.
+   * @param captureId The capture window just opened.
+   * @returns `Ok`, or `STORE_ERROR` for a blank id (`blank-session-id`,
+   * `blank-capture-id`).
+   */
+  beginProducerLossAccounting(
+    sessionId: SessionId,
+    captureId: CaptureId,
+  ): Result<void, DebuggenError>;
+
+  /**
+   * Adds one producer-loss report to the capture's running total.
+   *
+   * The ingest path calls it for a batch that carries a loss count, after
+   * attributing the batch; the capture stage reads the total back through
+   * {@link TelemetryRepo.producerLoss} when it closes the window and records it
+   * in the summary's coverage, which is the persisted record of the loss. A
+   * report of `0` changes nothing. The total saturates at
+   * `Number.MAX_SAFE_INTEGER` rather than losing precision.
+   *
+   * A report for a capture whose accounting was never begun in this process —
+   * the service restarted while the window was open — or whose entry was
+   * evicted or released is still recorded, as a partial entry: its total is a
+   * lower bound, and the capture reads as not accounted.
+   *
+   * @param report The capture, the optional producer and the discarded count.
+   * @returns The capture's running total after the report, or `STORE_ERROR`
+   * for a blank session, capture or producer id (`blank-session-id`,
+   * `blank-capture-id`, `blank-filter`) or a count that is not a whole number
+   * from zero within the safe-integer range (`invalid-dropped-count`); a
+   * refused report changes nothing.
+   */
+  recordProducerLoss(report: ProducerLossReport): Result<number, DebuggenError>;
+
+  /**
+   * The producer-loss total of one capture, and whether it is the whole loss.
+   *
+   * @param sessionId The session that owns the capture.
+   * @param captureId The capture window.
+   * @returns The total with its {@link ProducerLossTotal.accounted} verdict —
+   * `{ droppedEvents: 0, accounted: false }` for a capture the ledger holds no
+   * entry for — or the refusal for a blank id.
+   */
+  producerLoss(
+    sessionId: SessionId,
+    captureId: CaptureId,
+  ): Result<ProducerLossTotal, DebuggenError>;
+
+  /**
+   * Forgets one capture's producer-loss entry and its ingest arrivals
+   * ({@link TelemetryRepo.captureWatermark}), once the capture stage has closed
+   * the window and persisted the total in the summary's coverage. Releasing is
+   * what keeps the bounded ledger and the bounded arrival tracker holding open
+   * captures rather than finished ones. Releasing a capture neither holds
+   * changes nothing.
+   *
+   * @param sessionId The session that owns the capture.
+   * @param captureId The capture window just closed.
+   * @returns `Ok`, or `STORE_ERROR` for a blank id (`blank-session-id`,
+   * `blank-capture-id`).
+   */
+  releaseProducerLoss(sessionId: SessionId, captureId: CaptureId): Result<void, DebuggenError>;
 
   /**
    * Deletes every event of one session, in bounded batches of
@@ -1762,7 +2604,10 @@ interface PagePlan {
  */
 const SQLITE_CONSTRAINT_FOREIGNKEY = 787;
 
-/** A `CHECK` constraint refused the row — for this table, the `tier` list. */
+/**
+ * A `CHECK` constraint refused the row — for this table, the `tier` list or the
+ * `clock_offset_ms` bound (schema version 5).
+ */
 const SQLITE_CONSTRAINT_CHECK = 275;
 
 /**
@@ -1800,10 +2645,13 @@ function context(
  *
  * Classifies the two constraint failures a caller can still provoke with a
  * schema-valid event — an attribution no session or capture row holds, and a
- * `tier` outside the column's `CHECK` list — so both user interfaces can say
- * something specific, and falls back to `DebuggenError.from` for everything
- * else (a closed handle, a disk failure, a statement this build cannot
- * prepare).
+ * value outside a column `CHECK` (the `tier` list, or the `clock_offset_ms`
+ * bound of a store whose bound differs from this build's) — so both user
+ * interfaces can say something specific, and falls back to
+ * `DebuggenError.from` for everything else (a closed handle, a disk failure, a
+ * statement this build cannot prepare). The two `CHECK`s share one extended
+ * result code, and the classification never reads the message text, so the
+ * refusal names both.
  *
  * @param operation The repository method that failed.
  * @param cause Whatever was caught.
@@ -1831,11 +2679,15 @@ function storeOperationError(
   }
 
   if (errcode === SQLITE_CONSTRAINT_CHECK) {
-    return new DebuggenError('STORE_ERROR', 'A telemetry event names a tier the store refuses.', {
-      hint: `A stored event's tier must be one of: ${TELEMETRY_TIERS.join(', ')}.`,
-      details: context(operation, { ...details, reason: 'unknown-tier' }),
-      cause,
-    });
+    return new DebuggenError(
+      'STORE_ERROR',
+      'A telemetry event names a tier or a clock offset the store refuses.',
+      {
+        hint: `A stored event's tier must be one of: ${TELEMETRY_TIERS.join(', ')}; its clock offset, when present, must be a whole number of milliseconds within ±${String(CLOCK_OFFSET_BOUND_MS)}.`,
+        details: context(operation, { ...details, reason: 'column-check' }),
+        cause,
+      },
+    );
   }
 
   const error = DebuggenError.from(cause, 'STORE_ERROR');
@@ -1968,7 +2820,7 @@ function corruptColumnError(operation: string, column: string): DebuggenError {
  *
  * Every public method goes through this, which is what makes the contract's
  * "expected failures come back as `err`, never as an exception" guarantee true
- * in one place rather than at seventeen call sites.
+ * in one place rather than at nineteen call sites.
  *
  * An already-coded {@link DebuggenError} is returned **unchanged**, and that is
  * load-bearing rather than tidy. Two kinds of failure arrive that way: the ones
@@ -2048,6 +2900,82 @@ function changesOf(result: { readonly changes: number | bigint }): number {
 }
 
 /**
+ * One connection's record of its own writes to `telemetry_events`: the
+ * same-connection half of {@link CaptureGeneration}.
+ *
+ * `PRAGMA data_version` only moves for **other** connections' commits, so a
+ * connection learns of its own writes from this ledger instead. Every value it
+ * records is a fresh `counter` value, so no two recorded writes share one and
+ * a recorded value never comes back after it has been replaced.
+ */
+interface WriteLedger {
+  /** The last value handed out; each stamp is one above it. Monotonic for the connection's lifetime. */
+  counter: number;
+
+  /** The stamp of the latest purge batch that deleted at least one row, `0` when none has. */
+  lastPurge: number;
+
+  /** The stamp of the latest batch that stored at least one row of a capture, by {@link captureKey}. */
+  readonly lastWrite: Map<string, number>;
+
+  /**
+   * Captures written by a batch that ran inside a transaction the caller
+   * opened, whose commit was still pending when the batch returned. Each is
+   * stamped again once no transaction is open (see
+   * {@link TelemetryRepo.captureGeneration}), because a rollback on this
+   * connection would otherwise leave the ledger describing rows that are gone.
+   */
+  readonly unsettled: Set<string>;
+}
+
+/**
+ * Every live connection's ledger, keyed by the connection itself.
+ *
+ * Module-level rather than per repository, so every repository built over one
+ * {@link Store} — `src/main.ts`'s, a suite's second one, a recording proxy —
+ * records into and reads from the same ledger; keyed weakly, so a closed and
+ * dropped connection takes its ledger with it.
+ */
+const WRITE_LEDGERS = new WeakMap<DatabaseSync, WriteLedger>();
+
+/**
+ * The ledger of one connection, created empty on first use.
+ *
+ * @param db The connection, as {@link Store.db} exposes it.
+ * @returns Its ledger.
+ */
+function ledgerOf(db: DatabaseSync): WriteLedger {
+  const existing = WRITE_LEDGERS.get(db);
+
+  if (existing !== undefined) {
+    return existing;
+  }
+
+  const created: WriteLedger = {
+    counter: 0,
+    lastPurge: 0,
+    lastWrite: new Map(),
+    unsettled: new Set(),
+  };
+
+  WRITE_LEDGERS.set(db, created);
+
+  return created;
+}
+
+/**
+ * The next value of a ledger's counter, consumed.
+ *
+ * @param ledger The connection's ledger.
+ * @returns A value no earlier stamp of this ledger holds.
+ */
+function nextStamp(ledger: WriteLedger): number {
+  ledger.counter += 1;
+
+  return ledger.counter;
+}
+
+/**
  * Reads an integer column, accepting the `bigint` a handle configured to read
  * big integers would hand back.
  *
@@ -2071,6 +2999,73 @@ function readInteger(value: unknown): number | undefined {
  */
 function isWholeNumber(value: number): boolean {
   return Number.isSafeInteger(value) && value >= 0;
+}
+
+/**
+ * Reads a column holding a clock offset, accepting only what the event schema
+ * and the column `CHECK` accept.
+ *
+ * @param value The raw column value.
+ * @returns The offset, or `undefined` when the column holds anything but a
+ * whole number of milliseconds within `±CLOCK_OFFSET_BOUND_MS`.
+ */
+function readClockOffset(value: unknown): number | undefined {
+  const offset = readInteger(value);
+
+  return offset !== undefined && isClockOffsetMs(offset) ? offset : undefined;
+}
+
+/**
+ * Reads a column holding a count or an arrival number: a positive integer.
+ *
+ * @param value The raw column value.
+ * @returns The number, or `undefined` when the column holds anything else.
+ */
+function readPositiveInteger(value: unknown): number | undefined {
+  const number = readInteger(value);
+
+  return number !== undefined && isWholeNumber(number) && number > 0 ? number : undefined;
+}
+
+/**
+ * Reads the distinct tiers `json_group_array(DISTINCT tier)` collected, in
+ * `TELEMETRY_TIERS` order.
+ *
+ * The aggregate's element order is unspecified, so the vocabulary's order is
+ * imposed here rather than trusted from SQLite.
+ *
+ * @param value The raw column value: a JSON array of tier names.
+ * @returns The tiers, or `undefined` when the value is not a non-empty JSON
+ * array of vocabulary members.
+ */
+function readTiers(value: unknown): readonly TelemetryTier[] | undefined {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+
+  let parsed: unknown;
+
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    return undefined;
+  }
+
+  if (!Array.isArray(parsed) || parsed.length === 0) {
+    return undefined;
+  }
+
+  const present = new Set<TelemetryTier>();
+
+  for (const member of parsed as readonly unknown[]) {
+    if (!isTelemetryTier(member)) {
+      return undefined;
+    }
+
+    present.add(member);
+  }
+
+  return Object.freeze(TELEMETRY_TIERS.filter((tier) => present.has(tier)));
 }
 
 /**
@@ -2150,6 +3145,9 @@ function insertValues(event: TelemetryEvent, document: string): readonly BoundVa
     event.duration,
     event.producerId,
     event.seq,
+    // Projected exactly as the producer stamped it — validated, never
+    // re-derived — and `NULL` when the event carries no offset.
+    event.clockOffsetMs ?? null,
     requestKeyOf(event),
     document,
   ];
@@ -2679,6 +3677,65 @@ function requireSession(sessionId: SessionId, operation: string): DebuggenError 
 }
 
 /**
+ * Refuses a call that must name a capture and named none.
+ *
+ * The type already requires the id; this is the guard for a JavaScript caller
+ * and for a value threaded through an optional chain, which would otherwise
+ * reach the binding as `undefined` and fail as an opaque store error rather
+ * than as the caller's mistake.
+ *
+ * @param captureId The capture id as given.
+ * @param operation The calling method.
+ * @returns The refusal, or `undefined` when the id is usable.
+ */
+function requireCapture(
+  captureId: CaptureId | undefined,
+  operation: string,
+): DebuggenError | undefined {
+  if (captureId === undefined || captureId.length === 0) {
+    return argumentError(
+      operation,
+      'A telemetry read named no capture.',
+      'This read is about one capture window; pass the id of the capture whose events it covers.',
+      'blank-capture-id',
+    );
+  }
+
+  return undefined;
+}
+
+/**
+/**
+ * The key one capture is filed under in a {@link WriteLedger}, the
+ * producer-loss ledger and the arrival tracker.
+ *
+ * A JSON tuple rather than a joined string, so no pair of ids — however a
+ * JavaScript caller shaped them — can collide with another pair.
+ *
+ * @param sessionId The owning session.
+ * @param captureId The capture window.
+ * @returns The key.
+ */
+function captureKey(sessionId: string, captureId: string): string {
+  return JSON.stringify([sessionId, captureId]);
+}
+
+/** The watermark of a capture the arrival tracker holds nothing for. */
+const NO_ARRIVALS: CaptureIngestWatermark = Object.freeze({ eventCount: 0, lastIngestSeq: 0 });
+
+/** One capture's entry in the producer-loss ledger ({@link PRODUCER_LOSS_LEDGER_CAPACITY}). */
+interface ProducerLossEntry {
+  /** The running total of discarded events reported for the capture in this process. */
+  readonly droppedEvents: number;
+  /**
+   * Whether {@link TelemetryRepo.beginProducerLossAccounting} created or
+   * adopted the entry when the capture's window opened — what makes the total
+   * the whole loss rather than a lower bound.
+   */
+  readonly begun: boolean;
+}
+
+/**
  * The error for an event id the table already holds under **another** session.
  *
  * `id` is globally unique in the table, so a replay conflicting on it is
@@ -2956,9 +4013,20 @@ function zeroFilledKindCounts(): Record<TelemetryKind, number> {
  * handle exists, so the suite exercises the real DDL, the real pragmas and the
  * real migration ladder.
  *
- * The repository holds no state of its own beyond its dependencies: statements
- * live in the store's cache, and every method is a pure function of the
- * database's contents.
+ * The repository holds three pieces of state of its own, all bounded and in
+ * memory. The connection's write ledger behind
+ * {@link TelemetryRepo.captureGeneration} is kept per connection rather than
+ * per repository (see {@link WriteLedger}), so two repositories over one store
+ * agree. The producer-loss ledger ({@link PRODUCER_LOSS_LEDGER_CAPACITY}) and
+ * the ingest arrival tracker behind {@link TelemetryRepo.captureWatermark}
+ * ({@link CAPTURE_ARRIVAL_TRACKER_CAPACITY}) are kept per repository. That is
+ * why the ingest path that writes events and records losses and the capture
+ * stage that reads them back must share the one instance `src/main.ts` builds.
+ * A second instance over the same store — a restarted service — starts with
+ * both empty: it reports every capture opened before it as unaccounted, and
+ * its watermarks count only the arrivals it commits itself. Beyond that,
+ * statements live in the store's cache, and every other method is a pure
+ * function of the database's contents.
  *
  * @param deps The store, and optionally a logger.
  * @returns The repository.
@@ -2984,6 +4052,108 @@ export function createTelemetryRepo(deps: TelemetryRepoDeps): TelemetryRepo {
     [LOG_BINDING_KEYS.subsystem]: SUBSYSTEM,
     [REPO_BINDING_KEY]: REPO,
   });
+  // Shared with every other repository over this connection: see WriteLedger.
+  const ledger = ledgerOf(store.db);
+
+  /**
+   * The producer-loss ledger: capture key → its entry. A `Map` iterates in
+   * insertion order, and an entry is re-inserted whenever it is begun or
+   * reported on, so iteration visits the least recently touched capture first
+   * — the order {@link evictProducerLoss} forgets them in.
+   * `node:sqlite` and this repository run on the one event-loop thread, so no
+   * lock is needed.
+   */
+  const producerLossLedger = new Map<string, ProducerLossEntry>();
+
+  /**
+   * Brings the ledger back within {@link PRODUCER_LOSS_LEDGER_CAPACITY}: the
+   * least recently touched **unbegun** entry goes first, since it could never
+   * make a capture accounted, and the least recently touched begun one — a
+   * capture that then reads as unaccounted — only when no unbegun entry is
+   * left.
+   *
+   * @returns How many entries were forgotten, and how many of them were begun.
+   */
+  function evictProducerLoss(): { readonly evicted: number; readonly evictedAccounted: number } {
+    let evicted = 0;
+    let evictedAccounted = 0;
+
+    while (producerLossLedger.size > PRODUCER_LOSS_LEDGER_CAPACITY) {
+      let victim: string | undefined;
+
+      for (const [key, entry] of producerLossLedger) {
+        if (!entry.begun) {
+          victim = key;
+          break;
+        }
+      }
+
+      // Every entry is an open capture's: the least recently touched goes.
+      victim ??= producerLossLedger.keys().next().value;
+
+      if (victim === undefined) {
+        break;
+      }
+
+      if (producerLossLedger.get(victim)?.begun === true) {
+        evictedAccounted += 1;
+      }
+
+      producerLossLedger.delete(victim);
+      evicted += 1;
+    }
+
+    return { evicted, evictedAccounted };
+  }
+
+  /**
+   * The ingest arrival tracker: capture key → the watermark of the rows
+   * `insertMany` committed for it ({@link CAPTURE_ARRIVAL_TRACKER_CAPACITY}).
+   * Re-inserted on every committed batch that names the capture, so iteration
+   * visits the capture written to least recently first — the one
+   * {@link recordArrivals} forgets once the bound is passed.
+   */
+  const arrivalTracker = new Map<string, CaptureIngestWatermark>();
+
+  /**
+   * Advances the arrival tracker by one committed batch, then restores its
+   * bound. Called only after the batch's transaction has returned, so a batch
+   * that rolled back never moves a watermark.
+   *
+   * @param committed Per capture key, how many rows the batch inserted and the
+   * highest arrival number among them.
+   * @returns How many captures were forgotten to stay within the bound.
+   */
+  function recordArrivals(committed: ReadonlyMap<string, CaptureIngestWatermark>): number {
+    for (const [key, batch] of committed) {
+      const previous = arrivalTracker.get(key) ?? NO_ARRIVALS;
+
+      arrivalTracker.delete(key);
+      arrivalTracker.set(
+        key,
+        Object.freeze({
+          // Saturating, as every running total in this repository is.
+          eventCount: Math.min(Number.MAX_SAFE_INTEGER, previous.eventCount + batch.eventCount),
+          lastIngestSeq: Math.max(previous.lastIngestSeq, batch.lastIngestSeq),
+        }),
+      );
+    }
+
+    let evicted = 0;
+
+    while (arrivalTracker.size > CAPTURE_ARRIVAL_TRACKER_CAPACITY) {
+      const oldest = arrivalTracker.keys().next().value;
+
+      if (oldest === undefined) {
+        break;
+      }
+
+      arrivalTracker.delete(oldest);
+      evicted += 1;
+    }
+
+    return evicted;
+  }
 
   /**
    * The one read path: plan the filter, count over it, page over it, and
@@ -3036,9 +4206,7 @@ export function createTelemetryRepo(deps: TelemetryRepoDeps): TelemetryRepo {
 
       // One count over the identical WHERE clause, so `total` and `rows` can
       // never describe different filters.
-      const countRow = store
-        .statement(`SELECT COUNT(*) AS total FROM ${TABLE} WHERE ${clause}`)
-        .get(...values);
+      const countRow = store.statement(countRowsSql(clause)).get(...values);
       const total = readInteger(countRow?.['total']);
 
       if (total === undefined) {
@@ -3152,6 +4320,13 @@ ORDER BY ${ordering} LIMIT ? OFFSET ?`,
         }
 
         const removed = store.transaction(() => deleteBatch(batchSize));
+
+        // Committed: the batch ran at the outermost level, since a purge
+        // inside a caller's transaction was refused above. Only a batch that
+        // removed a row is a change a cached aggregate must notice.
+        if (removed > 0) {
+          ledger.lastPurge = nextStamp(ledger);
+        }
 
         batches += 1;
         deleted += removed;
@@ -3291,6 +4466,15 @@ ORDER BY ${ordering} LIMIT ? OFFSET ?`,
           const insert = store.statement(INSERT_SQL);
           const lookup = store.statement(SELECT_STORED_BY_ID_SQL);
           const ownerLookup = store.statement(SELECT_CAPTURE_OWNER_SQL);
+          // The ledger keys of the captures that received at least one row.
+          // Filled inside the transaction and only recorded once it returns,
+          // so a batch that rolled back records nothing.
+          const writtenCaptures = new Set<string>();
+
+          // Per capture, the rows this batch inserted and their highest
+          // arrival number — the arrival tracker's input. Gathered inside the
+          // transaction, applied only once it has returned.
+          const arrived = new Map<string, CaptureIngestWatermark>();
 
           // One transaction for the whole batch, and one prepared statement
           // reused per row: an ingest batch is the hot path of a running
@@ -3367,16 +4551,46 @@ ORDER BY ${ordering} LIMIT ? OFFSET ?`,
 
               inserted += 1;
               stored.push({ ...event, ingestSeq });
+              // A replay was skipped above, so only a new row is an arrival.
+              const key = captureKey(event.sessionId, event.captureId);
+              const sofar = arrived.get(key) ?? NO_ARRIVALS;
+
+              writtenCaptures.add(key);
+              arrived.set(key, {
+                eventCount: sofar.eventCount + 1,
+                lastIngestSeq: Math.max(sofar.lastIngestSeq, ingestSeq),
+              });
             }
 
             return { events: stored, inserted, skipped };
           });
+
+          // A transaction still open now is the caller's: this batch was a
+          // savepoint inside it, and its rows commit or roll back with it.
+          const commitPending = store.db.isTransaction;
+
+          // A replay that stored nothing leaves the ledger as it was: the
+          // capture's rows did not change.
+          for (const key of writtenCaptures) {
+            ledger.lastWrite.set(key, nextStamp(ledger));
+
+            if (commitPending) {
+              ledger.unsettled.add(key);
+            }
+          }
+
+          // Committed — or, when a caller runs this inside its own
+          // transaction, released to it; an enclosing rollback after this
+          // point leaves the watermark ahead of the store, which the barrier
+          // reads as movement and so only ever waits longer for.
+          const arrivalsEvicted = recordArrivals(arrived);
 
           logger.debug('stored a telemetry batch', {
             operation,
             batchSize,
             inserted: result.inserted,
             skipped: result.skipped,
+            ...(arrivalsEvicted > 0 ? { arrivalsEvicted } : {}),
           });
 
           return ok(result);
@@ -3388,6 +4602,134 @@ ORDER BY ${ordering} LIMIT ? OFFSET ?`,
     query(filter) {
       // The panel-data surface: ordered by the sort's key, then the event id.
       return readPage(filter, 'query', PANEL_ORDERING_BY_SORT);
+    },
+
+    scanEvents(filter, maxRows) {
+      const operation = 'scanEvents';
+
+      return attempt<TelemetryScan>(operation, () => {
+        // The filter first, through the planner `query` uses, so a scan and a
+        // page refuse the same filters with the same reasons.
+        const plan = buildFilter(filter, operation);
+
+        if (isErr(plan)) {
+          return plan;
+        }
+
+        if (!isWholeNumber(maxRows)) {
+          return err(
+            argumentError(
+              operation,
+              'A telemetry scan named a row ceiling that is not a whole number of rows.',
+              'Pass an integer of zero or more: the most events the caller will take from one scan.',
+              'invalid-max-rows',
+            ),
+          );
+        }
+
+        if (plan.value.kind === 'nothing') {
+          // No statement, for the reason readPage gives: an empty `IN ()` list
+          // is a syntax error, and the selection is empty by definition.
+          return ok({ rows: [], total: 0, complete: true });
+        }
+
+        const { clause, values } = plan.value;
+        const total = readInteger(store.statement(countRowsSql(clause)).get(...values)?.['total']);
+
+        if (total === undefined) {
+          return err(corruptColumnError(operation, 'total'));
+        }
+
+        if (total > maxRows) {
+          // Larger than the caller will hold: answered from the count alone,
+          // without reading or parsing a row.
+          logger.debug('a telemetry scan exceeded its row ceiling', { operation, total, maxRows });
+
+          return ok({ rows: [], total, complete: false });
+        }
+
+        if (maxRows === 0) {
+          // The count-only request, and the count is zero.
+          return ok({ rows: [], total: 0, complete: true });
+        }
+
+        const events: TelemetryEvent[] = [];
+        const skipped: number[] = [];
+        let pending: StoredRow[] = [];
+        let met = 0;
+
+        // Reconstructs the buffered raw rows and releases them, so at most one
+        // chunk of raw rows is alive at a time however large the selection.
+        const drain = (): DebuggenError | undefined => {
+          const read = readEvents(pending, operation);
+
+          pending = [];
+
+          if (isErr(read)) {
+            return read.error;
+          }
+
+          events.push(...read.value.events);
+          skipped.push(...read.value.skipped);
+
+          return undefined;
+        };
+
+        // One ordered traversal, bounded one row past the ceiling. Leaving the
+        // loop early — the ceiling crossed, or a column failure — returns the
+        // iterator, which resets the statement.
+        for (const row of store.statement(scanRowsSql(clause)).iterate(...values, maxRows + 1)) {
+          met += 1;
+
+          if (met > maxRows) {
+            // Another connection stored rows between the count and this read:
+            // the selection is larger than the caller will hold after all.
+            logger.debug('a telemetry scan outgrew its row ceiling while it read', {
+              operation,
+              counted: total,
+              met,
+              maxRows,
+            });
+
+            return ok({ rows: [], total: met, complete: false });
+          }
+
+          pending.push(row);
+
+          if (pending.length === TELEMETRY_QUERY_MAX_LIMIT) {
+            const failure = drain();
+
+            if (failure !== undefined) {
+              return err(failure);
+            }
+          }
+        }
+
+        const failure = drain();
+
+        if (failure !== undefined) {
+          return err(failure);
+        }
+
+        if (skipped.length > 0) {
+          // The arrival numbers and nothing else, as on a row page (AAP 0.5.2).
+          logger.warn('skipped telemetry rows that no longer match the event schema', {
+            operation,
+            skipped: skipped.length,
+            ingestSeqs: skipped,
+          });
+        }
+
+        // `met` rather than the count: rows another connection removed between
+        // the two statements were never read, and `total` must agree with
+        // `rows` plus `skipped`.
+        return ok({
+          rows: events,
+          total: met,
+          complete: true,
+          ...(skipped.length > 0 ? { skipped: skipped.length } : {}),
+        });
+      });
     },
 
     queryGroups(query) {
@@ -3483,6 +4825,89 @@ ORDER BY ${ordering} LIMIT ? OFFSET ?`,
       return readPage({ ...options, sessionId, captureId }, 'listByCapture');
     },
 
+    pageCaptureForSummary(sessionId, captureId, options) {
+      const operation = 'pageCaptureForSummary';
+
+      return attempt<CaptureSummaryPage>(operation, () => {
+        const refusal =
+          requireSession(sessionId, operation) ?? requireCapture(captureId, operation);
+
+        if (refusal !== undefined) {
+          return err(refusal);
+        }
+
+        const { limit: requestedLimit, offset } = options;
+
+        if (!isWholeNumber(requestedLimit)) {
+          return err(
+            argumentError(
+              operation,
+              'A capture summary page named a page size that is not a whole number of rows.',
+              'Pass an integer of zero or more.',
+              'invalid-limit',
+            ),
+          );
+        }
+
+        if (!isWholeNumber(offset)) {
+          return err(
+            argumentError(
+              operation,
+              'A capture summary page named an offset that is not a whole number of rows.',
+              'Pass an integer of zero or more; 0 starts at the first row of the capture.',
+              'invalid-offset',
+            ),
+          );
+        }
+
+        // Clamped rather than refused, the policy of every row page.
+        const limit = Math.min(requestedLimit, TELEMETRY_QUERY_MAX_LIMIT);
+
+        if (limit === 0) {
+          return ok({ rows: [], rowsRead: 0, skipped: 0, storedChars: 0 });
+        }
+
+        const rows = store
+          .statement(SELECT_CAPTURE_SUMMARY_PAGE_SQL)
+          .all(sessionId, captureId, limit, offset);
+
+        // The size of what was read, taken from the documents the read already
+        // holds — unreadable rows included, since they were read all the same.
+        let storedChars = 0;
+
+        for (const row of rows) {
+          const document = row['event'];
+
+          if (typeof document === 'string') {
+            storedChars += document.length;
+          }
+        }
+
+        const read = readEvents(rows, operation);
+
+        if (isErr(read)) {
+          return read;
+        }
+
+        if (read.value.skipped.length > 0) {
+          // The arrival numbers and nothing else, as on a row page (AAP 0.5.2).
+          logger.warn('skipped telemetry rows that no longer match the event schema', {
+            operation,
+            skipped: read.value.skipped.length,
+            ingestSeqs: read.value.skipped,
+          });
+        }
+
+        return ok({
+          rows: read.value.events,
+          rowsRead: rows.length,
+          skipped: read.value.skipped.length,
+          storedChars,
+          ...(rows.length === limit ? { nextOffset: offset + rows.length } : {}),
+        });
+      });
+    },
+
     listByRequestKey(sessionId, requestKey, options) {
       return readPage({ ...options, sessionId, requestKey }, 'listByRequestKey');
     },
@@ -3534,6 +4959,39 @@ ORDER BY ${ordering} LIMIT ? OFFSET ?`,
         }
 
         return ok(traceIds);
+      });
+    },
+
+    firstTraceId(sessionId, captureId) {
+      const operation = 'firstTraceId';
+
+      return attempt(operation, () => {
+        const refusal =
+          requireSession(sessionId, operation) ?? refuseBlank(captureId, 'captureId', operation);
+
+        if (refusal !== undefined) {
+          return err(refusal);
+        }
+
+        const row =
+          captureId === undefined
+            ? store.statement(SELECT_FIRST_TRACE_ID_SQL).get(sessionId)
+            : store.statement(SELECT_FIRST_TRACE_ID_BY_CAPTURE_SQL).get(sessionId, captureId);
+
+        // `LIMIT 1` answers no row when the scope holds no event.
+        if (row === undefined) {
+          return ok(undefined);
+        }
+
+        const traceId = row['trace_id'];
+
+        // `trace_id` is NOT NULL, so anything but text — NULL included — is a
+        // row this build did not write.
+        if (typeof traceId !== 'string') {
+          return err(corruptColumnError(operation, 'trace_id'));
+        }
+
+        return ok(traceId);
       });
     },
 
@@ -3592,6 +5050,169 @@ ORDER BY ${ordering} LIMIT ? OFFSET ?`,
       });
     },
 
+    captureStamp(sessionId, captureId) {
+      const operation = 'captureStamp';
+
+      return attempt(operation, () => {
+        const refusal =
+          requireSession(sessionId, operation) ?? requireCapture(captureId, operation);
+
+        if (refusal !== undefined) {
+          return err(refusal);
+        }
+
+        const row = store.statement(SELECT_CAPTURE_STAMP_SQL).get(sessionId, captureId);
+        const count = readInteger(row?.['total']);
+        const maxIngestSeq = readInteger(row?.['max_seq']);
+
+        if (count === undefined || !isWholeNumber(count)) {
+          return err(corruptColumnError(operation, 'total'));
+        }
+
+        if (maxIngestSeq === undefined || !isWholeNumber(maxIngestSeq)) {
+          return err(corruptColumnError(operation, 'ingest_seq'));
+        }
+
+        return ok({ count, maxIngestSeq });
+      });
+    },
+
+    captureGeneration(sessionId, captureId) {
+      const operation = 'captureGeneration';
+
+      return attempt(operation, () => {
+        const refusal =
+          requireSession(sessionId, operation) ?? requireCapture(captureId, operation);
+
+        if (refusal !== undefined) {
+          return err(refusal);
+        }
+
+        // Prepared first: `Store.statement` is what refuses a closed handle
+        // with the store's own coded error, before the connection is touched.
+        const row = store.statement(DATA_VERSION_SQL).get();
+
+        if (ledger.unsettled.size > 0 && !store.db.isTransaction) {
+          // The transaction those batches ran inside has ended, committed or
+          // rolled back: either way the captures' rows may differ from what a
+          // generation read while it was open described, so each is stamped
+          // anew and every such generation stops validating.
+          for (const key of ledger.unsettled) {
+            ledger.lastWrite.set(key, nextStamp(ledger));
+          }
+
+          ledger.unsettled.clear();
+        }
+
+        const dataVersion = readInteger(row?.['data_version']);
+
+        if (dataVersion === undefined || !Number.isSafeInteger(dataVersion)) {
+          return err(corruptColumnError(operation, 'data_version'));
+        }
+
+        return ok({
+          dataVersion,
+          purges: ledger.lastPurge,
+          writes: ledger.lastWrite.get(captureKey(sessionId, captureId)) ?? 0,
+        });
+      });
+    },
+
+    listProducerClockOffsets(sessionId, options) {
+      const operation = 'listProducerClockOffsets';
+
+      return attempt<readonly ProducerClockOffset[]>(operation, () => {
+        // Read inside `attempt`, so even a malformed options value from a
+        // JavaScript caller answers with a `Result` rather than a throw.
+        const captureId = options?.captureId;
+        const refusal =
+          requireSession(sessionId, operation) ?? refuseBlank(captureId, 'captureId', operation);
+
+        if (refusal !== undefined) {
+          return err(refusal);
+        }
+
+        // One row past the bound, so a truncation is known rather than guessed.
+        const fetchLimit = MAX_PRODUCER_CLOCK_OFFSETS + 1;
+        const rows =
+          captureId === undefined
+            ? store.statement(SELECT_PRODUCER_CLOCK_OFFSETS_SQL).all(sessionId, fetchLimit)
+            : store
+                .statement(SELECT_PRODUCER_CLOCK_OFFSETS_BY_CAPTURE_SQL)
+                .all(sessionId, captureId, fetchLimit);
+
+        const offsets: ProducerClockOffset[] = [];
+
+        for (const row of rows.slice(0, MAX_PRODUCER_CLOCK_OFFSETS)) {
+          const rowCaptureId = row['capture_id'];
+          const producerId = row['producer_id'];
+
+          if (typeof rowCaptureId !== 'string' || rowCaptureId.length === 0) {
+            return err(corruptColumnError(operation, 'capture_id'));
+          }
+
+          if (typeof producerId !== 'string' || producerId.length === 0) {
+            return err(corruptColumnError(operation, 'producer_id'));
+          }
+
+          const tiers = readTiers(row['tiers']);
+
+          if (tiers === undefined) {
+            return err(corruptColumnError(operation, 'tier'));
+          }
+
+          const clockOffsetMs = readClockOffset(row['clock_offset_ms']);
+          const minClockOffsetMs = readClockOffset(row['min_clock_offset_ms']);
+          const maxClockOffsetMs = readClockOffset(row['max_clock_offset_ms']);
+
+          if (
+            clockOffsetMs === undefined ||
+            minClockOffsetMs === undefined ||
+            maxClockOffsetMs === undefined
+          ) {
+            return err(corruptColumnError(operation, 'clock_offset_ms'));
+          }
+
+          const reportingEvents = readPositiveInteger(row['reporting_events']);
+
+          if (reportingEvents === undefined) {
+            return err(corruptColumnError(operation, 'reporting_events'));
+          }
+
+          const firstIngestSeq = readPositiveInteger(row['first_ingest_seq']);
+          const lastIngestSeq = readPositiveInteger(row['last_ingest_seq']);
+
+          if (firstIngestSeq === undefined || lastIngestSeq === undefined) {
+            return err(corruptColumnError(operation, 'ingest_seq'));
+          }
+
+          offsets.push(
+            Object.freeze({
+              captureId: rowCaptureId,
+              producerId,
+              tiers,
+              clockOffsetMs,
+              minClockOffsetMs,
+              maxClockOffsetMs,
+              reportingEvents,
+              firstIngestSeq,
+              lastIngestSeq,
+            }),
+          );
+        }
+
+        if (rows.length > MAX_PRODUCER_CLOCK_OFFSETS) {
+          logger.warn('more producers reported a clock offset than one read lists', {
+            operation,
+            [LOG_BINDING_KEYS.sessionId]: sessionId,
+            listed: MAX_PRODUCER_CLOCK_OFFSETS,
+          });
+        }
+
+        return ok(Object.freeze(offsets));
+      });
+    },
+
     existingEventIds(sessionId, ids, captureId) {
       return existingValues('id', 'existingEventIds', sessionId, ids, captureId);
     },
@@ -3632,6 +5253,182 @@ ORDER BY ${ordering} LIMIT ? OFFSET ?`,
         }
 
         return ok(total);
+      });
+    },
+
+    captureWatermark(sessionId, captureId) {
+      const operation = 'captureWatermark';
+
+      return attempt(operation, () => {
+        const refusal =
+          requireSession(sessionId, operation) ?? requireCapture(captureId, operation);
+
+        if (refusal !== undefined) {
+          return err(refusal);
+        }
+
+        // No statement: the tracker is advanced by `insertMany` after each
+        // commit, so this read costs one lookup however much the capture holds.
+        return ok(arrivalTracker.get(captureKey(sessionId, captureId)) ?? NO_ARRIVALS);
+      });
+    },
+
+    recordProducerLoss(report) {
+      const operation = 'recordProducerLoss';
+
+      return attempt(operation, () => {
+        const { sessionId, captureId, producerId, droppedEvents } = report;
+        const refusal =
+          requireSession(sessionId, operation) ??
+          requireCapture(captureId, operation) ??
+          refuseBlank(producerId, 'producerId', operation);
+
+        if (refusal !== undefined) {
+          return err(refusal);
+        }
+
+        if (!isWholeNumber(droppedEvents)) {
+          return err(
+            argumentError(
+              operation,
+              'A producer-loss report carried a count that is not a number of events.',
+              'Report the discarded events as a whole number from 0 within the safe-integer range.',
+              'invalid-dropped-count',
+            ),
+          );
+        }
+
+        const key = captureKey(sessionId, captureId);
+        const previous = producerLossLedger.get(key);
+
+        if (droppedEvents === 0) {
+          return ok(previous?.droppedEvents ?? 0);
+        }
+
+        // Saturating, so a total can never lose precision past the safe range.
+        const total = Math.min(
+          Number.MAX_SAFE_INTEGER,
+          (previous?.droppedEvents ?? 0) + droppedEvents,
+        );
+        // A capture with no begun entry — accounting never began in this
+        // process, or its entry was forgotten — is recorded as a partial
+        // entry: a lower bound that never makes the capture accounted.
+        const begun = previous?.begun === true;
+
+        // Re-inserted so the capture becomes the most recently touched, then
+        // the bound is restored.
+        producerLossLedger.delete(key);
+        producerLossLedger.set(key, { droppedEvents: total, begun });
+
+        const { evicted, evictedAccounted } = evictProducerLoss();
+
+        logger.info('recorded a producer loss report', {
+          operation,
+          [LOG_BINDING_KEYS.sessionId]: sessionId,
+          [LOG_BINDING_KEYS.captureId]: captureId,
+          ...(producerId === undefined ? {} : { producerId }),
+          droppedEvents,
+          total,
+          accounted: begun,
+          ...(evicted > 0 ? { evicted } : {}),
+          ...(evictedAccounted > 0 ? { evictedAccounted } : {}),
+        });
+
+        return ok(total);
+      });
+    },
+
+    producerLoss(sessionId, captureId) {
+      const operation = 'producerLoss';
+
+      return attempt<ProducerLossTotal>(operation, () => {
+        const refusal =
+          requireSession(sessionId, operation) ?? requireCapture(captureId, operation);
+
+        if (refusal !== undefined) {
+          return err(refusal);
+        }
+
+        const entry = producerLossLedger.get(captureKey(sessionId, captureId));
+
+        return ok(
+          Object.freeze({
+            droppedEvents: entry?.droppedEvents ?? 0,
+            accounted: entry?.begun === true,
+          }),
+        );
+      });
+    },
+
+    beginProducerLossAccounting(sessionId, captureId) {
+      const operation = 'beginProducerLossAccounting';
+
+      return attempt<void>(operation, () => {
+        const refusal =
+          requireSession(sessionId, operation) ?? requireCapture(captureId, operation);
+
+        if (refusal !== undefined) {
+          return err(refusal);
+        }
+
+        const key = captureKey(sessionId, captureId);
+        const previous = producerLossLedger.get(key);
+
+        // Adopted rather than reset: a capture id is fresh when its window
+        // opens, so a report already recorded for it arrived after the opening.
+        producerLossLedger.delete(key);
+        producerLossLedger.set(key, { droppedEvents: previous?.droppedEvents ?? 0, begun: true });
+
+        const { evicted, evictedAccounted } = evictProducerLoss();
+
+        logger.debug('began producer loss accounting for a capture', {
+          operation,
+          [LOG_BINDING_KEYS.sessionId]: sessionId,
+          [LOG_BINDING_KEYS.captureId]: captureId,
+          ...(previous === undefined ? {} : { adopted: previous.droppedEvents }),
+          ...(evicted > 0 ? { evicted } : {}),
+          ...(evictedAccounted > 0 ? { evictedAccounted } : {}),
+        });
+
+        if (evictedAccounted > 0) {
+          // Only reachable with more begun entries than the bound: each
+          // evicted capture now reads as unaccounted, which is the truthful
+          // answer, whether its window is still open or was closed elsewhere.
+          logger.warn('forgot the producer loss accounting of a begun capture', {
+            operation,
+            evictedAccounted,
+            capacity: PRODUCER_LOSS_LEDGER_CAPACITY,
+          });
+        }
+
+        return ok(undefined);
+      });
+    },
+
+    releaseProducerLoss(sessionId, captureId) {
+      const operation = 'releaseProducerLoss';
+
+      return attempt<void>(operation, () => {
+        const refusal =
+          requireSession(sessionId, operation) ?? requireCapture(captureId, operation);
+
+        if (refusal !== undefined) {
+          return err(refusal);
+        }
+
+        const key = captureKey(sessionId, captureId);
+        const released = producerLossLedger.delete(key);
+        const releasedArrivals = arrivalTracker.delete(key);
+
+        logger.debug('released the producer loss accounting of a capture', {
+          operation,
+          [LOG_BINDING_KEYS.sessionId]: sessionId,
+          [LOG_BINDING_KEYS.captureId]: captureId,
+          released,
+          releasedArrivals,
+        });
+
+        return ok(undefined);
       });
     },
 

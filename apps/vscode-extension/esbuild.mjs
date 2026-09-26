@@ -20,13 +20,24 @@
  *                `node24`, every npm dependency and workspace package inlined
  *                (that workspace's own tsup build leaves all of them external,
  *                so copying its `dist/main.js` would need its `node_modules`).
- *                Beside it: `dist/service/package.json` = `{"type":"module"}`
- *                (the bundle relies on `import.meta.url` and this workspace is
- *                CommonJS), the versioned prompt tree copied verbatim to
- *                `dist/service/prompts/` (the host passes that directory as
- *                `DEBUGGEN_PROMPTS_DIR`), and the store DDL copied to the two
- *                paths `src/store/db.ts` probes relative to its module URL —
- *                `dist/service/schema.sql` and `dist/service/store/schema.sql`.
+ *                The store DDL is INLINED, never shipped as a file:
+ *                `apps/local-service/src/store/schema.sql` is substituted as
+ *                one JSON string literal for the build-time identifier
+ *                {@link EMBEDDED_SCHEMA_SQL_IDENTIFIER} (esbuild `define`),
+ *                which that workspace's `src/store/db.ts` reads through
+ *                `embeddedSchemaSql()` and its `main()` hands to
+ *                `startService({ inlineSchemaSql })`, so the installed service
+ *                migrates its store without reading a `.sql` file. The build
+ *                proves it: the identifier must be gone from the bundle, the
+ *                DDL's text must be in it, and no `*.sql` file may exist
+ *                under `dist/service/`, which is removed and rebuilt as a
+ *                whole on every run (it is wholly this script's output, so
+ *                nothing stale survives `--no-clean` or `--watch`).
+ *                Beside the bundle: `dist/service/package.json` =
+ *                `{"type":"module"}` (the bundle relies on `import.meta.url`
+ *                and this workspace is CommonJS) and the versioned prompt tree
+ *                copied verbatim to `dist/service/prompts/` (the host passes
+ *                that directory as `DEBUGGEN_PROMPTS_DIR`).
  *   3. preload   `packages/telemetry/dist/node/register.mjs` (+ its `.map`)
  *                copied byte for byte, SHA-256 verified, to
  *                `dist/telemetry/node/register.mjs` — the path the service's
@@ -54,6 +65,15 @@
  *                in place, beside `node_modules`); `@debuggen/*` and whatever
  *                they import are inlined, for the same ESM-only reason as the
  *                host; `vscode` and `mocha` come from the test runner.
+ *                Beside them, `test/probe/installed-extension-probe.ts` ->
+ *                `dist/test/probe/installed-extension-probe.js`: the companion
+ *                extension the packaged-VSIX suite copies out of the workspace
+ *                and loads beside the INSTALLED extension in an isolated
+ *                window. It runs where no `node_modules` exists, so it is
+ *                bundled like the host — CommonJS, `node20`, only `vscode`
+ *                external, everything else inlined — and audited the same way.
+ *                `.vscode-test.mjs` globs `dist/test/suite/` only, so the probe
+ *                is never run as a suite.
  *
  * These directory names are a contract with `src/extension.ts` (which resolves
  * every embedded path from `context.extensionUri`), `src/service/process.ts`,
@@ -134,11 +154,12 @@ export const LAYOUT = Object.freeze({
   serviceOut: 'dist/service/main.js',
   serviceManifest: 'dist/service/package.json',
   servicePrompts: 'dist/service/prompts',
-  serviceSchema: Object.freeze(['dist/service/store/schema.sql', 'dist/service/schema.sql']),
   preloadOut: 'dist/telemetry/node/register.mjs',
   preloadVendor: 'dist/telemetry/node_modules',
   testSuiteSrc: 'test/suite',
   testSuiteOut: 'dist/test/suite',
+  testProbeSrc: 'test/probe/installed-extension-probe.ts',
+  testProbeOut: 'dist/test/probe/installed-extension-probe.js',
   stagedLicense: 'LICENSE',
   icon: 'media/icon.png',
 });
@@ -151,6 +172,33 @@ export const INPUTS = Object.freeze({
   preload: 'packages/telemetry/dist/node/register.mjs',
   license: 'LICENSE',
 });
+
+/**
+ * The build-time identifier the service bundle's store DDL is substituted for
+ * (esbuild `define`). A contract with `apps/local-service/src/store/db.ts`,
+ * which declares it and reads it through `embeddedSchemaSql()`; rename it in
+ * both files or not at all — {@link verifyEmbeddedSchema} fails the build when
+ * it survives in the bundle.
+ */
+export const EMBEDDED_SCHEMA_SQL_IDENTIFIER = '__DEBUGGEN_EMBEDDED_SCHEMA_SQL__';
+
+/**
+ * The shortest DDL line {@link verifyEmbeddedSchema} looks for in the bundle:
+ * long enough that finding it verbatim proves the literal is the DDL, rather
+ * than a fragment such as `);` that any bundle contains.
+ */
+const MIN_VERIFIED_DDL_LINE_CHARS = 20;
+
+/**
+ * A DDL line esbuild prints unchanged whichever literal form it picks for the
+ * DDL — a quoted string with `\n` escapes, or (as esbuild 0.28 does for this
+ * multi-line text) a template literal with real line breaks: printable ASCII
+ * only (esbuild escapes everything else) and none of the characters a form
+ * may escape or quote with — `'`, `"`, `` ` ``, `\` and `$`. Such a line
+ * appears verbatim in the bundle in either form.
+ */
+const VERBATIM_LITERAL_LINE = /^[\x20-\x7e]+$/;
+const LITERAL_ESCAPED_CHARACTER = /['"`\\$]/;
 
 /** The command that produces the preload artefact; named in its hint. */
 const PRELOAD_BUILD_COMMAND = 'pnpm --filter @debuggen/telemetry build';
@@ -246,17 +294,20 @@ export const USAGE = `Usage: node esbuild.mjs [--production] [--watch] [--tests]
 Builds the Debug Generator VS Code extension into dist/:
   host      ${LAYOUT.hostEntry} -> ${LAYOUT.hostOut}  (CommonJS, node20, only "vscode" external)
   service   ${INPUTS.serviceEntry} -> ${LAYOUT.serviceOut}  (ESM, node24, fully bundled)
-            + ${LAYOUT.serviceManifest}, ${LAYOUT.servicePrompts}/, ${LAYOUT.serviceSchema.join(', ')}
+            + ${LAYOUT.serviceManifest}, ${LAYOUT.servicePrompts}/; ${INPUTS.schema} inlined
+              into the bundle as a string (${EMBEDDED_SCHEMA_SQL_IDENTIFIER}), no .sql file ships
   preload   ${INPUTS.preload} -> ${LAYOUT.preloadOut}  (byte-for-byte copy)
             + its runtime dependency closure in ${LAYOUT.preloadVendor}/
   tests     ${LAYOUT.testSuiteSrc}/**/*.test.ts -> ${LAYOUT.testSuiteOut}/**/*.test.js  (with --tests)
+            + ${LAYOUT.testProbeSrc} -> ${LAYOUT.testProbeOut}  (CommonJS, node20, only "vscode" external)
 
 Flags:
   --production  external sourcemaps without sources, NODE_ENV=production, warnings fail the
                 build, load checks of the service and preload, strict artefact verification
-  --watch       rebuild the host (and the tests with --tests) on change; the service, prompts,
-                DDL and preload are built once at start; never removes dist/
-  --tests       also build the extension-host test suites
+  --watch       rebuild the host (and the tests with --tests) on change; the service (with its
+                inlined DDL), prompts and preload are built once at start; never removes dist/
+                (dist/service/ is always rebuilt whole)
+  --tests       also build the extension-host test suites and the packaged-VSIX probe
   --package     also stage ${LAYOUT.stagedLicense} from the repository root, check ${LAYOUT.icon} and
                 verify every artefact this script owns (vsce runs this as vscode:prepublish)
   --no-clean    keep the existing dist/ instead of removing it first
@@ -499,20 +550,31 @@ export function hostBuildOptions(mode) {
 }
 
 /**
- * Target 2, the embedded coordination service, bundled from source.
+ * Target 2, the embedded coordination service, bundled from source, with the
+ * store DDL substituted for {@link EMBEDDED_SCHEMA_SQL_IDENTIFIER} as one JSON
+ * string literal.
  *
  * @param {BuildMode} mode
+ * @param {string} schemaSql the text of `apps/local-service/src/store/schema.sql`
  * @returns {import('esbuild').BuildOptions}
+ * @throws {ExtensionBuildError} when `schemaSql` is not a non-empty string
  */
-export function serviceBuildOptions(mode) {
+export function serviceBuildOptions(mode, schemaSql) {
+  if (typeof schemaSql !== 'string' || schemaSql.trim().length === 0) {
+    throw new ExtensionBuildError(
+      'serviceBuildOptions() needs the store DDL text to embed in the service bundle.',
+    );
+  }
+  const common = commonOptions(mode);
   return {
-    ...commonOptions(mode),
+    ...common,
     entryPoints: [fromRepo(INPUTS.serviceEntry)],
     outfile: fromExtension(LAYOUT.serviceOut),
     format: 'esm',
     target: 'node24',
     packages: 'bundle',
     banner: { js: SERVICE_BANNER },
+    define: { ...common.define, [EMBEDDED_SCHEMA_SQL_IDENTIFIER]: JSON.stringify(schemaSql) },
   };
 }
 
@@ -592,6 +654,27 @@ export function testBuildOptions(mode, entryPoints) {
     mainFields: ['module', 'main'],
     external: ['vscode', 'mocha'],
     plugins: [externalizeRuntimeResolvablePackages()],
+  };
+}
+
+/**
+ * Target 4, the packaged-VSIX probe: one self-contained CommonJS bundle. It is
+ * copied out of the workspace and loaded as an extension of its own, where no
+ * `node_modules` exists, so — unlike the suites — nothing but `vscode` stays
+ * external, and {@link externalizeRuntimeResolvablePackages} does not apply.
+ *
+ * @param {BuildMode} mode
+ * @returns {import('esbuild').BuildOptions}
+ */
+export function probeBuildOptions(mode) {
+  return {
+    ...commonOptions(mode),
+    entryPoints: [fromExtension(LAYOUT.testProbeSrc)],
+    outfile: fromExtension(LAYOUT.testProbeOut),
+    format: 'cjs',
+    target: 'node20',
+    mainFields: ['module', 'main'],
+    external: ['vscode'],
   };
 }
 
@@ -808,7 +891,9 @@ function stagePrompts() {
 }
 
 /**
- * Check the session-store DDL exists and is the store schema.
+ * Check the session-store DDL exists and is the store schema. It is a
+ * precondition of every run (see {@link preflight}) because its text is what
+ * the service bundle embeds ({@link serviceBuildOptions}).
  *
  * @returns {{ source: string, text: string }}
  * @throws {ExtensionBuildError} exit 2 when it is missing or unusable
@@ -830,22 +915,83 @@ function checkSchema() {
 }
 
 /**
- * Place the session-store DDL where `apps/local-service/src/store/db.ts`
- * probes for it relative to its module URL. Inside the bundle that URL is
- * `dist/service/main.js`, so the probe's two candidates — `./schema.sql` (the
- * `tsx` layout) and `./store/schema.sql` (the bundled layout) — become the two
- * destinations below; writing both keeps the service able to migrate its
- * database whichever candidate the loader tries first.
+ * Every `*.sql` file below `root`, root-relative; `[]` when `root` is absent.
  *
- * @returns {void}
+ * @param {string} root absolute directory
+ * @returns {string[]}
+ */
+function sqlFilesUnder(root) {
+  return isDirectory(root)
+    ? listFiles(root).filter((file) => file.toLowerCase().endsWith('.sql'))
+    : [];
+}
+
+/**
+ * Fail when any `*.sql` file exists under `dist/service/`: the store DDL ships
+ * inside the service bundle only, so a file beside it is a stray copy the
+ * installed service must never come to depend on.
+ *
  * @throws {ExtensionBuildError}
  */
-function stageSchema() {
-  const { source, text } = checkSchema();
-  for (const destination of LAYOUT.serviceSchema) {
-    copyVerified(source, fromExtension(destination));
+function assertNoSqlBesideService() {
+  const shipped = sqlFilesUnder(path.dirname(fromExtension(LAYOUT.serviceOut)));
+  if (shipped.length > 0) {
+    throw new ExtensionBuildError(
+      `dist/service/ holds SQL file(s) the VSIX must not ship: ${shipped.join(', ')}.`,
+      { hint: 'The store DDL is inlined into the service bundle; nothing may copy it beside it.' },
+    );
   }
-  report('schema', `${LAYOUT.serviceSchema.join(', ')} (${formatBytes(Buffer.byteLength(text))})`);
+}
+
+/**
+ * Prove the service bundle carries the store DDL inline and nothing else does:
+ * {@link EMBEDDED_SCHEMA_SQL_IDENTIFIER} no longer occurs in
+ * `dist/service/main.js` (esbuild substituted every reference), every DDL line
+ * of at least {@link MIN_VERIFIED_DDL_LINE_CHARS} characters that esbuild
+ * prints unchanged inside a string literal ({@link VERBATIM_LITERAL_LINE})
+ * occurs verbatim in it, and no `*.sql` file exists under `dist/service/`.
+ *
+ * @param {string} schemaSql the DDL text the bundle was built with
+ * @returns {number} how many DDL lines were found verbatim
+ * @throws {ExtensionBuildError}
+ */
+function verifyEmbeddedSchema(schemaSql) {
+  const bundleFile = fromExtension(LAYOUT.serviceOut);
+  const hint = `Check the "define" of serviceBuildOptions() and embeddedSchemaSql() in apps/local-service/src/store/db.ts, then rebuild with "${EXTENSION_BUILD_COMMAND}".`;
+  const bundle = fs.readFileSync(bundleFile, 'utf8');
+  if (bundle.includes(EMBEDDED_SCHEMA_SQL_IDENTIFIER)) {
+    throw new ExtensionBuildError(
+      `${LAYOUT.serviceOut} still references ${EMBEDDED_SCHEMA_SQL_IDENTIFIER}: the store DDL was not substituted, so the installed service would look for a schema.sql file that does not ship.`,
+      { hint },
+    );
+  }
+  const lines = [
+    ...new Set(
+      schemaSql
+        .split(/\r?\n/)
+        .filter(
+          (line) =>
+            line.length >= MIN_VERIFIED_DDL_LINE_CHARS &&
+            VERBATIM_LITERAL_LINE.test(line) &&
+            !LITERAL_ESCAPED_CHARACTER.test(line),
+        ),
+    ),
+  ];
+  if (lines.length === 0) {
+    throw new ExtensionBuildError(
+      `${INPUTS.schema} has no line of ${MIN_VERIFIED_DDL_LINE_CHARS}+ plain ASCII characters, so its presence in ${LAYOUT.serviceOut} cannot be verified.`,
+      { hint: 'Keep at least one plain CREATE TABLE line in the store DDL.' },
+    );
+  }
+  const absent = lines.filter((line) => !bundle.includes(line));
+  if (absent.length > 0) {
+    throw new ExtensionBuildError(
+      `${LAYOUT.serviceOut} lacks ${absent.length} of the ${lines.length} verifiable lines of ${INPUTS.schema}: the store DDL is not embedded.`,
+      { hint, detail: absent.slice(0, 5).join('\n') },
+    );
+  }
+  assertNoSqlBesideService();
+  return lines.length;
 }
 
 // ---------------------------------------------------------------------------
@@ -897,8 +1043,11 @@ async function buildHost(mode) {
 }
 
 /**
- * Target 2: bundle the coordination service with every dependency inlined,
- * audit that nothing but Node built-ins stayed external, and write the ESM
+ * Target 2: remove `dist/service/` as a whole (it is this script's output
+ * alone, so no stale bundle, prompt or SQL file can survive `--no-clean` or
+ * `--watch`), bundle the coordination service with every dependency and the
+ * store DDL inlined, audit that nothing but Node built-ins stayed external,
+ * prove the DDL is embedded ({@link verifyEmbeddedSchema}), and write the ESM
  * marker manifest beside it.
  *
  * @param {BuildMode} mode
@@ -906,15 +1055,19 @@ async function buildHost(mode) {
  */
 async function buildService(mode) {
   checkServiceEntry();
-  const result = await runBuild('service', serviceBuildOptions(mode), mode);
+  const { text: schemaSql } = checkSchema();
+  fs.rmSync(path.dirname(fromExtension(LAYOUT.serviceOut)), { recursive: true, force: true });
+  const result = await runBuild('service', serviceBuildOptions(mode, schemaSql), mode);
   auditExternals('service', result.metafile, []);
+  const verifiedLines = verifyEmbeddedSchema(schemaSql);
   const manifest = fromExtension(LAYOUT.serviceManifest);
   fs.mkdirSync(path.dirname(manifest), { recursive: true });
   fs.writeFileSync(manifest, SERVICE_PACKAGE_JSON, { mode: 0o644 });
   const size = fs.statSync(fromExtension(LAYOUT.serviceOut)).size;
   report(
     'service',
-    `${LAYOUT.serviceOut} (${formatBytes(size)}, ESM, node24) + ${LAYOUT.serviceManifest}`,
+    `${LAYOUT.serviceOut} (${formatBytes(size)}, ESM, node24) + ${LAYOUT.serviceManifest}; ` +
+      `${INPUTS.schema} inlined (${formatBytes(Buffer.byteLength(schemaSql))}, ${verifiedLines} lines verified, no .sql file)`,
   );
 }
 
@@ -1395,17 +1548,36 @@ function checkTestSuites() {
   return entries;
 }
 
+/** @throws {ExtensionBuildError} exit 2 when the packaged-VSIX probe source is missing */
+function checkTestProbe() {
+  requireEntry(
+    fromExtension(LAYOUT.testProbeSrc),
+    'packaged-VSIX probe',
+    `Restore apps/vscode-extension/${LAYOUT.testProbeSrc}; test/suite/packaged-vsix.test.ts loads it beside the installed extension.`,
+  );
+}
+
 /**
- * Target 4: bundle each suite to `dist/test/suite/<name>.test.js`.
+ * Target 4: bundle each suite to `dist/test/suite/<name>.test.js`, then the
+ * packaged-VSIX probe to its own self-contained bundle, audited like the host.
+ * Both output directories are replaced as a whole, so no stale bundle
+ * survives a rename.
  *
  * @param {BuildMode} mode
  * @returns {Promise<void>}
  */
 async function buildTests(mode) {
   const entries = checkTestSuites();
+  checkTestProbe();
   fs.rmSync(fromExtension(LAYOUT.testSuiteOut), { recursive: true, force: true });
   await runBuild('test suite', testBuildOptions(mode, entries), mode);
   report('tests', `${LAYOUT.testSuiteOut}/ (${entries.length} suites, CommonJS, node20)`);
+
+  fs.rmSync(path.dirname(fromExtension(LAYOUT.testProbeOut)), { recursive: true, force: true });
+  const probe = await runBuild('test probe', probeBuildOptions(mode), mode);
+  auditExternals('test probe', probe.metafile, ['vscode']);
+  const size = fs.statSync(fromExtension(LAYOUT.testProbeOut)).size;
+  report('probe', `${LAYOUT.testProbeOut} (${formatBytes(size)}, CommonJS, node20)`);
 }
 
 // ---------------------------------------------------------------------------
@@ -1496,17 +1668,19 @@ export function ownedArtifacts(options) {
     LAYOUT.serviceOut,
     LAYOUT.serviceManifest,
     `${LAYOUT.servicePrompts}/manifest.json`,
-    ...LAYOUT.serviceSchema,
     LAYOUT.preloadOut,
+    ...(options.tests ? [LAYOUT.testProbeOut] : []),
     ...(options.package ? [LAYOUT.stagedLicense] : []),
   ];
 }
 
 /**
- * Verify every owned artefact exists and is non-empty, that the service
- * marker says ESM, that suites were emitted under `--tests`, and — in
- * production — that the service bundle and the preload each load with every
- * module resolved inside their own directory.
+ * Verify every owned artefact exists and is non-empty (the packaged-VSIX probe
+ * among them under `--tests`), that nothing staged beside the service is a
+ * `*.sql` file (the DDL ships inside the bundle only), that the service marker
+ * says ESM, that suites were emitted under `--tests`, and — in production —
+ * that the service bundle and the preload each load with every module resolved
+ * inside their own directory.
  *
  * @param {CliOptions} options
  * @throws {ExtensionBuildError}
@@ -1523,6 +1697,7 @@ function verifyArtifacts(options) {
       { hint },
     );
   }
+  assertNoSqlBesideService();
   const marker = readJson(fromExtension(LAYOUT.serviceManifest));
   if (typeof marker !== 'object' || marker === null || marker.type !== 'module') {
     throw new ExtensionBuildError(`${LAYOUT.serviceManifest} does not declare "type": "module".`, {
@@ -1570,7 +1745,7 @@ function cleanDist() {
 
 /**
  * Check every input the requested run needs before anything is removed or
- * written, so a missing prompt tree, DDL, preload, suite, license or icon
+ * written, so a missing prompt tree, DDL, preload, suite, probe, license or icon
  * stops the run with `dist/` untouched instead of half rebuilt.
  *
  * @param {CliOptions} options
@@ -1584,6 +1759,7 @@ function preflight(options) {
   checkPreload();
   if (options.tests) {
     checkTestSuites();
+    checkTestProbe();
   }
   if (options.package) {
     checkLicense();
@@ -1592,8 +1768,10 @@ function preflight(options) {
 }
 
 /**
- * Target 2 and 3 plus their assets: everything under `dist/service/` and
- * `dist/telemetry/`.
+ * Target 2 and 3 plus their assets: everything under `dist/service/` (the
+ * bundle with its inlined DDL, its manifest, the prompts) and
+ * `dist/telemetry/`. The service goes first because it replaces
+ * `dist/service/` as a whole.
  *
  * @param {BuildMode} mode
  * @returns {Promise<void>}
@@ -1601,7 +1779,6 @@ function preflight(options) {
 async function buildEmbedded(mode) {
   await buildService(mode);
   stagePrompts();
-  stageSchema();
   await stagePreload();
 }
 
@@ -1641,10 +1818,11 @@ export async function build(options) {
 
 /**
  * esbuild plugin that prints one status line per watch rebuild and audits the
- * host bundle's externals after every successful one.
+ * externals of a bundle that may leave only `vscode` external (the host and
+ * the packaged-VSIX probe) after every successful one.
  *
  * @param {string} label
- * @param {boolean} auditHost whether to audit the externals of this build
+ * @param {boolean} auditHost whether to audit the externals of this build against `['vscode']`
  * @returns {import('esbuild').Plugin}
  */
 function watchStatus(label, auditHost) {
@@ -1683,11 +1861,12 @@ function watchStatus(label, auditHost) {
 }
 
 /**
- * `--watch`: build the embedded service, prompts, DDL and preload once (so an
- * Extension Development Host can start the service from `dist/`), then keep
- * rebuilding the host — and the suites under `--tests` — on every change until
- * interrupted. `dist/` is never removed. Suites added while watching are
- * picked up on the next start.
+ * `--watch`: build the embedded service (with its inlined DDL), prompts and
+ * preload once (so an Extension Development Host can start the service from
+ * `dist/`), then keep rebuilding the host — and the suites and the probe under
+ * `--tests` — on every change until interrupted. `dist/` is never removed;
+ * `dist/service/` is rebuilt whole at start, so a DDL edit takes effect on the
+ * next start. Suites added while watching are picked up on the next start.
  *
  * @param {CliOptions} options
  * @returns {Promise<void>}
@@ -1711,11 +1890,19 @@ async function watch(options) {
         plugins: [...(suiteOptions.plugins ?? []), watchStatus('tests', false)],
       }),
     );
+    // The probe keeps the host's externals contract (only `vscode`), so it is
+    // audited after every rebuild exactly as the host is.
+    contexts.push(
+      await esbuild.context({
+        ...probeBuildOptions(mode),
+        plugins: [watchStatus('probe', true)],
+      }),
+    );
   }
   await Promise.all(contexts.map((context) => context.watch()));
   report(
     'watch',
-    `watching ${options.tests ? 'host and test suites' : 'host'}; press Ctrl+C to stop`,
+    `watching ${options.tests ? 'host, test suites and probe' : 'host'}; press Ctrl+C to stop`,
   );
 
   const stop = () => {

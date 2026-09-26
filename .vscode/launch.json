@@ -22,6 +22,27 @@
       }
     },
     {
+      "name": "Run Extension (with Debug service)",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": [
+        "--extensionDevelopmentPath=${workspaceFolder}/apps/vscode-extension",
+        "${workspaceFolder}/apps/demo-app"
+      ],
+      "env": {
+        "DEBUGGEN_PROVIDER": "deterministic"
+      },
+      "outFiles": ["${workspaceFolder}/apps/vscode-extension/dist/**/*.js", "!**/node_modules/**"],
+      "sourceMaps": true,
+      "skipFiles": ["<node_internals>/**"],
+      "preLaunchTask": "wait: service healthy",
+      "presentation": {
+        "hidden": true,
+        "group": "1-extension",
+        "order": 2
+      }
+    },
+    {
       "name": "Debug service",
       "type": "node",
       "request": "launch",
@@ -93,7 +114,8 @@
   "compounds": [
     {
       "name": "Extension + Service",
-      "configurations": ["Debug service", "Run Extension"],
+      "configurations": ["Debug service", "Run Extension (with Debug service)"],
+      "preLaunchTask": "prepare: Extension + Service",
       "stopAll": true,
       "presentation": {
         "group": "0-compound",

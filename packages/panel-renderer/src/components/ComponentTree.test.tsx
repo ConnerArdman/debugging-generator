@@ -31,6 +31,14 @@
  *     in the toolbar, and only when the capture recorded it. Every half is
  *     asserted, because a fabricated coordinate in an evidence drawer is worse
  *     than an absent one.
+ *   - **A node's mark survives its own report.** The panel host records the
+ *     reported render as the panel's selection, so the selection after a click
+ *     is not the one the node was activated under. The shared-selection cases
+ *     drive that transition — through a harness that records reports as the
+ *     host does, and through the real `PanelHost`, both self-kept and driven by
+ *     `selectedEventId` a step behind — and assert the clicked row stays marked,
+ *     that any other selection takes the mark away, and that a return to the
+ *     pre-click selection does not bring it back.
  *   - **Selecting is not disclosing.** A click on a row and Enter/Space select
  *     it and never toggle it; the toggle, ArrowRight/ArrowLeft and the toolbar
  *     disclose, and are asserted to keep doing so.
@@ -94,7 +102,12 @@
  * @see ../host/useQuery for the loading/empty/error machine they drive.
  */
 
-import type { ComponentTreeNode as ComponentTreeNodeSpec, DataQuery } from '@debuggen/panel-schema';
+import { PANEL_SPEC_VERSION } from '@debuggen/panel-schema';
+import type {
+  ComponentTreeNode as ComponentTreeNodeSpec,
+  DataQuery,
+  PanelSpec,
+} from '@debuggen/panel-schema';
 import { DebuggenError } from '@debuggen/shared';
 import type { SourceLocation } from '@debuggen/shared';
 import { COMPONENT_TREE_NODE_ID_PREFIX } from '@debuggen/telemetry';
@@ -106,12 +119,15 @@ import type {
 } from '@debuggen/telemetry';
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { useMemo, useState } from 'react';
+import type { ReactElement } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Mock } from 'vitest';
 
 import { DataProviderContext, PanelSessionContext, createDataProvider } from '../host/DataProvider';
 import type { DataProvider, DataQueryResolver, DataQueryResponse } from '../host/DataProvider';
-import { PanelActionsContext, PanelSelectionContext } from '../host/PanelActions';
+import { PanelActionsContext, PanelSelectionContext, usePanelActions } from '../host/PanelActions';
+import { PanelHost } from '../host/PanelHost';
 import type {
   PanelActions,
   PanelEventRef,
@@ -3073,6 +3089,347 @@ describe('ComponentTree shared selection', () => {
     // With no host to share with, the view records the commit itself: the
     // control is pressed, and the node it had marked gives way to it.
     expect(commit.getAttribute('aria-pressed')).toBe('true');
+    expect(selectedRowNames()).toEqual([]);
+  });
+
+  it('records a node’s render outside a host, so the commit control lets go of it', async () => {
+    const stub = resolvingProvider(COMMITTED_SNAPSHOT);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+    await screen.findByRole('tree');
+
+    const commit = (): HTMLElement => screen.getByRole('button', { name: SHOW_COMMIT_NAME });
+
+    await user.click(commit());
+    expect(commit().getAttribute('aria-pressed')).toBe('true');
+
+    // Like every other event-bearing view, the tree records the render it
+    // reported as its own selection: the node is marked, and the commit is no
+    // longer the selected event — the two never claim the selection together.
+    await user.click(rowNamed('ExampleBranch'));
+    expect(selectedRowNames()).toEqual(['ExampleBranch']);
+    expect(commit().getAttribute('aria-pressed')).toBe('false');
+
+    // A node that names no render records nothing, so the selection it was
+    // activated beside stays in force and the commit stays unpressed.
+    await user.click(rowNamed('ExampleAside'));
+    expect(selectedRowNames()).toEqual(['ExampleAside']);
+    expect(commit().getAttribute('aria-pressed')).toBe('false');
+  });
+
+  /*
+   * The transition a fixed context value never shows: a host that records the
+   * reported render as the panel's selection, so the selection after a click
+   * is not the one the node was activated under.
+   */
+
+  /** The event the panel had selected before a node was activated. */
+  const PRIOR_EVENT_ID = 'event-example-prior';
+
+  /** An unrelated event another view — or the surface — selects afterwards. */
+  const ELSEWHERE_EVENT_ID = 'event-example-elsewhere';
+
+  /** The accessible names of the two controls {@link OtherView} draws. */
+  const SELECT_PRIOR_NAME = 'Select the prior event';
+  const SELECT_ELSEWHERE_NAME = 'Select another event';
+
+  /**
+   * A second view of the same panel, reduced to what these cases need: two
+   * controls that report an event through the shared action context, exactly
+   * as any other view's activation does.
+   *
+   * @returns The two controls.
+   */
+  function OtherView(): ReactElement {
+    const actions = usePanelActions();
+
+    return (
+      <div>
+        <button
+          type="button"
+          onClick={() => {
+            actions?.onSelectEvent({ eventId: PRIOR_EVENT_ID });
+          }}
+        >
+          {SELECT_PRIOR_NAME}
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            actions?.onSelectEvent({ eventId: ELSEWHERE_EVENT_ID });
+          }}
+        >
+          {SELECT_ELSEWHERE_NAME}
+        </button>
+      </div>
+    );
+  }
+
+  /** What {@link RecordingHost} is mounted with. */
+  interface RecordingHostProps {
+    /** The provider to resolve the tree's query. */
+    readonly provider: DataProvider;
+
+    /** The spies every report reaches after it has been recorded. */
+    readonly spies: ActionSpies;
+
+    /** The panel's selection before any gesture, `undefined` for none. */
+    readonly initial: PanelSelection | undefined;
+  }
+
+  /**
+   * The panel host's selection wiring and nothing else. It holds the panel's
+   * shared selection, provides it through `PanelSelectionContext`, and records
+   * every reported reference as the new selection — the id plus only the
+   * coordinates present, as `PanelHost` records one — before the spy hears it.
+   * The tree and {@link OtherView} share it, as two views of one panel do.
+   *
+   * @param props See {@link RecordingHostProps}.
+   * @returns The contexts, the tree and the second view.
+   */
+  function RecordingHost(props: RecordingHostProps): ReactElement {
+    const { provider, spies, initial } = props;
+    const [selection, setSelection] = useState<PanelSelection | undefined>(initial);
+    const actions = useMemo<PanelActions>(
+      () => ({
+        onSelectEvent: (ref: PanelEventRef) => {
+          setSelection({
+            eventId: ref.eventId,
+            ...(ref.traceId === undefined ? {} : { traceId: ref.traceId }),
+            ...(ref.spanId === undefined ? {} : { spanId: ref.spanId }),
+          });
+          spies.onSelectEvent(ref);
+        },
+        onOpenSource: spies.onOpenSource,
+        onExpand: spies.onExpand,
+        onFilterChange: spies.onFilterChange,
+      }),
+      [spies],
+    );
+    const selectionState = useMemo(() => ({ selection }), [selection]);
+
+    return (
+      <DataProviderContext.Provider value={provider}>
+        <PanelSessionContext.Provider value={PANEL_SESSION_ID}>
+          <PanelActionsContext.Provider value={actions}>
+            <PanelSelectionContext.Provider value={selectionState}>
+              <ComponentTree node={makeNode()} />
+              <OtherView />
+            </PanelSelectionContext.Provider>
+          </PanelActionsContext.Provider>
+        </PanelSessionContext.Provider>
+      </DataProviderContext.Provider>
+    );
+  }
+
+  /**
+   * A validated panel whose layout is this node alone, for the cases that
+   * mount the real `PanelHost`. Its summary registers are empty, so the head
+   * carries no evidence chip that could select anything.
+   *
+   * @returns A fresh specification.
+   */
+  function treePanel(): PanelSpec {
+    return {
+      version: PANEL_SPEC_VERSION,
+      id: 'panel-example-tree',
+      sessionId: PANEL_SESSION_ID,
+      panelVersion: 1,
+      title: 'Panel under test',
+      summary: { observed: [], likelyCauses: [] },
+      layout: [makeNode()],
+    };
+  }
+
+  /**
+   * The real panel host around {@link treePanel}, with its selection driven by
+   * the surface — the way the DevTools panel passes its drawer's event, which
+   * its store updates a step after the report.
+   *
+   * @param spec The panel to draw; the same object across a case's renders.
+   * @param provider The provider to resolve the tree's query.
+   * @param actions The actions every report reaches.
+   * @param selectedEventId The surface's selected event, `null` for none.
+   * @returns The element tree.
+   */
+  function drivenPanel(
+    spec: PanelSpec,
+    provider: DataProvider,
+    actions: PanelActions,
+    selectedEventId: string | null,
+  ): ReactElement {
+    return (
+      <PanelHost
+        spec={spec}
+        dataProvider={provider}
+        actions={actions}
+        selectedEventId={selectedEventId}
+      />
+    );
+  }
+
+  it('keeps a node marked when the host records the render it reported', async () => {
+    const stub = resolvingProvider(COMMITTED_SNAPSHOT);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    render(
+      <RecordingHost
+        provider={stub.provider}
+        spies={spies}
+        initial={{ eventId: PRIOR_EVENT_ID }}
+      />,
+    );
+    await screen.findByRole('tree');
+
+    await user.click(rowNamed('ExampleBranch'));
+
+    // The host heard the render and made it the panel's selection, and the row
+    // that reported it is still the tree's selected one, by attribute and class.
+    expect(spies.onSelectEvent.mock.calls).toEqual([[BRANCH_RENDER_REF]]);
+    const branch = rowNamed('ExampleBranch');
+    expect(branch.getAttribute('aria-selected')).toBe('true');
+    expect(branch.classList.contains('dg-is-selected')).toBe(true);
+    expect(selectedRowNames()).toEqual(['ExampleBranch']);
+
+    // Another view selects another event: the mark gives way.
+    await user.click(screen.getByRole('button', { name: SELECT_ELSEWHERE_NAME }));
+    expect(selectedRowNames()).toEqual([]);
+
+    // A return to the selection the node was activated under does not bring
+    // it back: that selection is not the event the node reported.
+    await user.click(screen.getByRole('button', { name: SELECT_PRIOR_NAME }));
+    expect(selectedRowNames()).toEqual([]);
+  });
+
+  it('keeps a flat listing’s row current when the host records the render it reported', async () => {
+    const stub = resolvingProvider(
+      snapshotWithOrigin('flat', { roots: UNIFORM_STRUCTURE, maxDepth: 0 }),
+    );
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    render(<RecordingHost provider={stub.provider} spies={spies} initial={undefined} />);
+    await screen.findByRole('list', { name: LIST_NAME });
+
+    await user.click(labelOf(rowNamed('ExampleBranch', 'listitem')));
+
+    expect(spies.onSelectEvent.mock.calls).toEqual([[BRANCH_RENDER_REF]]);
+    const current = rowNamed('ExampleBranch', 'listitem');
+    expect(current.getAttribute('aria-current')).toBe('true');
+    expect(current.classList.contains('dg-is-selected')).toBe(true);
+
+    await user.click(screen.getByRole('button', { name: SELECT_ELSEWHERE_NAME }));
+
+    const released = rowNamed('ExampleBranch', 'listitem');
+    expect(released.hasAttribute('aria-current')).toBe(false);
+    expect(released.classList.contains('dg-is-selected')).toBe(false);
+  });
+
+  it('keeps a node marked inside the panel host, and releases it to any other selection', async () => {
+    const stub = resolvingProvider(COMMITTED_SNAPSHOT);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    render(<PanelHost spec={treePanel()} dataProvider={stub.provider} actions={spies.actions} />);
+    await screen.findByRole('tree');
+
+    const commit = (): HTMLElement => screen.getByRole('button', { name: SHOW_COMMIT_NAME });
+
+    // The host records the node's render as the panel's selection, and the
+    // node keeps its mark through it.
+    await user.click(rowNamed('ExampleBranch'));
+    expect(spies.onSelectEvent.mock.calls).toEqual([[BRANCH_RENDER_REF]]);
+    expect(rowNamed('ExampleBranch').getAttribute('aria-selected')).toBe('true');
+    expect(selectedRowNames()).toEqual(['ExampleBranch']);
+    expect(commit().getAttribute('aria-pressed')).toBe('false');
+
+    // This view's own commit control selects another event: the node lets go.
+    await user.click(commit());
+    expect(commit().getAttribute('aria-pressed')).toBe('true');
+    expect(selectedRowNames()).toEqual([]);
+
+    // Activated while the commit is selected, the node is marked as soon as
+    // its render is the panel's selection…
+    await user.click(rowNamed('ExampleBranch'));
+    expect(commit().getAttribute('aria-pressed')).toBe('false');
+    expect(selectedRowNames()).toEqual(['ExampleBranch']);
+
+    // …and a return to the commit, the selection it was activated under, does
+    // not bring the mark back.
+    await user.click(commit());
+    expect(commit().getAttribute('aria-pressed')).toBe('true');
+    expect(selectedRowNames()).toEqual([]);
+  });
+
+  it('keeps a node marked while a driving surface catches up, then follows the surface', async () => {
+    const stub = resolvingProvider(COMMITTED_SNAPSHOT);
+    const spies = makeActions();
+    const user = userEvent.setup();
+    const spec = treePanel();
+
+    const { rerender } = render(drivenPanel(spec, stub.provider, spies.actions, PRIOR_EVENT_ID));
+    await screen.findByRole('tree');
+
+    // The report reaches the surface, whose drawer has not moved yet: the panel
+    // still selects the previous event, and the node stays marked meanwhile.
+    await user.click(rowNamed('ExampleBranch'));
+    expect(spies.onSelectEvent.mock.calls).toEqual([[BRANCH_RENDER_REF]]);
+    expect(selectedRowNames()).toEqual(['ExampleBranch']);
+
+    // The surface catches up with the render the node reported.
+    rerender(drivenPanel(spec, stub.provider, spies.actions, BRANCH_RENDER_EVENT_ID));
+    expect(rowNamed('ExampleBranch').getAttribute('aria-selected')).toBe('true');
+    expect(selectedRowNames()).toEqual(['ExampleBranch']);
+
+    // A second node, activated while the surface shows the first one's render.
+    // Until the surface catches up, the host re-derives that render by its id
+    // alone — without the span and trace the branch reported — and the node
+    // must stay marked through that window too.
+    await user.click(screen.getByRole('button', { name: EXPAND_ALL_NAME }));
+    await waitFor(() => {
+      expect(rowNames()).toEqual([...EXPANDED_ROW_NAMES]);
+    });
+    await user.click(labelOf(rowNamed('ExampleLeaf')));
+    expect(spies.onSelectEvent).toHaveBeenLastCalledWith({ eventId: LEAF_RENDER_EVENT_ID });
+    expect(selectedRowNames()).toEqual(['ExampleLeaf']);
+
+    rerender(drivenPanel(spec, stub.provider, spies.actions, LEAF_RENDER_EVENT_ID));
+    expect(selectedRowNames()).toEqual(['ExampleLeaf']);
+
+    // The surface moves elsewhere: the mark goes, and a return to the event the
+    // leaf was activated under does not bring it back.
+    rerender(drivenPanel(spec, stub.provider, spies.actions, ELSEWHERE_EVENT_ID));
+    expect(selectedRowNames()).toEqual([]);
+
+    rerender(drivenPanel(spec, stub.provider, spies.actions, BRANCH_RENDER_EVENT_ID));
+    expect(selectedRowNames()).toEqual([]);
+  });
+
+  it('drops a node’s mark for good when a driving surface selects another event first', async () => {
+    const stub = resolvingProvider(COMMITTED_SNAPSHOT);
+    const spies = makeActions();
+    const user = userEvent.setup();
+    const spec = treePanel();
+
+    const { rerender } = render(drivenPanel(spec, stub.provider, spies.actions, PRIOR_EVENT_ID));
+    await screen.findByRole('tree');
+
+    await user.click(rowNamed('ExampleBranch'));
+    expect(selectedRowNames()).toEqual(['ExampleBranch']);
+
+    // The surface selects another event, never the render the node reported.
+    rerender(drivenPanel(spec, stub.provider, spies.actions, ELSEWHERE_EVENT_ID));
+    expect(selectedRowNames()).toEqual([]);
+
+    // Back to the event the node was activated under: the mark stays gone,
+    // and so it does when the surface clears its selection altogether.
+    rerender(drivenPanel(spec, stub.provider, spies.actions, PRIOR_EVENT_ID));
+    expect(selectedRowNames()).toEqual([]);
+
+    rerender(drivenPanel(spec, stub.provider, spies.actions, null));
     expect(selectedRowNames()).toEqual([]);
   });
 });

@@ -24,10 +24,16 @@
  *   never equals the stored key. That last comparison is the one that fails if
  *   the order were inverted, because a key computed after masking still looks
  *   plausible.
- * - **Attribution.** Browser batches belong to the session bound to the tab,
- *   server batches to the capture owner of the credential's scoped project, and
- *   only inside an open capture window; everything else is dropped under the
- *   closed `DROP_REASONS` vocabulary, as a count.
+ * - **Attribution.** Browser batches belong to the session bound to the tab the
+ *   frame acts for — its envelope `tabId`, else a single-tab connection's hello
+ *   tab — server batches to the capture owner of the credential's scoped
+ *   project, and only inside an open capture window; everything else is dropped
+ *   under the closed `DROP_REASONS` vocabulary, as a count. A relayed frame
+ *   whose acting tab cannot be established, holds no live binding this
+ *   credential made, or carries a stale session routing key is refused whole
+ *   with `TAB_NOT_BOUND` before ingest — one credential and one multiplexing
+ *   connection carry every inspected tab, so the connection's other tab is
+ *   never substituted.
  * - **`ingestSeq`.** Store-assigned, strictly increasing across batches and
  *   producers, untouched by an idempotent replay, and the final tie-break of a
  *   deterministic canonical order.
@@ -73,7 +79,7 @@ import { readFileSync } from 'node:fs';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { isMessageOfType } from '@debuggen/protocol';
-import type { ProtocolMessage, SessionRecord } from '@debuggen/protocol';
+import type { CreateEnvelopeOptions, ProtocolMessage, SessionRecord } from '@debuggen/protocol';
 import { isErr, newEventId, newProducerId, newSpanId, newTraceId } from '@debuggen/shared';
 import {
   DEFAULT_DUPLICATE_WINDOW_MS,
@@ -106,7 +112,7 @@ import {
   readFixtureJson,
   startHarness,
 } from './harness.js';
-import type { CapturedLogRecord, Harness, HarnessWsClient } from './harness.js';
+import type { CapturedLogRecord, DevtoolsCredential, Harness, HarnessWsClient } from './harness.js';
 
 /* -------------------------------------------------------------------------------------------------
  * Fixture names and suite constants
@@ -120,6 +126,9 @@ const EXPECTED_FIXTURE = 'ingest-redaction-expected.json';
 
 /** The inspected tab the DevTools client speaks for. */
 const TAB_ID = 4_217;
+
+/** The same credential's second inspected tab, bound to a session of another project. */
+const SECOND_TAB_ID = 4_218;
 
 /** The pattern of one sentinel token as it appears in the committed input. */
 const SENTINEL_TOKEN_PATTERN = /\{\{[A-Z0-9_]+\}\}/gu;
@@ -737,6 +746,8 @@ interface SuiteState {
   readonly sessionId: string;
   readonly devServerUrl: string;
   readonly devtools: HarnessWsClient;
+  /** The credential `devtools` presented: the one every tab of the extension shares. */
+  readonly devtoolsCredential: DevtoolsCredential;
   readonly editor: HarnessWsClient;
   readonly serverAgent: HarnessWsClient;
   readonly serverToken: string;
@@ -803,6 +814,23 @@ async function relay(events: readonly TelemetryEventIngress[]): Promise<readonly
   expect(outcome.sent.ok, 'the telemetry.event frame was written').toBe(true);
   expect(outcome.settled, 'the service processed the frame before the barrier').toBe(true);
   return outcome.errors.map((error) => error.code);
+}
+
+/**
+ * Relays a batch over `client` under explicit envelope options — the acting
+ * `tabId` a multiplexing connection names per frame, a session routing key —
+ * and returns the codes of the `error` replies the frame drew, read after the
+ * ordering barrier.
+ */
+async function relayAs(
+  client: HarnessWsClient,
+  events: readonly TelemetryEventIngress[],
+  options: CreateEnvelopeOptions,
+): Promise<readonly string[]> {
+  const receipt = client.send('telemetry.event', { events: [...events] }, options);
+  expect(isErr(receipt.result), 'the telemetry.event frame was written').toBe(false);
+  expect(await client.flush(), 'the service processed the frame before the barrier').toBe(true);
+  return client.errorsFor(receipt.id).map((error) => error.code);
 }
 
 /** How many rows the whole `telemetry_events` table holds, across every session. */
@@ -992,7 +1020,9 @@ beforeAll(async () => {
   );
   const devServerUrl = session.devServerUrl;
 
-  const { client: devtools } = await harness.connectDevtools({ tabId: TAB_ID });
+  const { client: devtools, credential: devtoolsCredential } = await harness.connectDevtools({
+    tabId: TAB_ID,
+  });
   const bound = await harness.bindTab(devtools, {
     tabId: TAB_ID,
     url: devServerUrl,
@@ -1040,6 +1070,7 @@ beforeAll(async () => {
     sessionId: session.id,
     devServerUrl,
     devtools,
+    devtoolsCredential,
     editor,
     serverAgent,
     serverToken,
@@ -1808,6 +1839,198 @@ describe('inside the capture window', () => {
     });
   });
 
+  describe('one credential, one multiplexing connection, two tabs', () => {
+    /** What the second tab's setup establishes. */
+    interface SecondTab {
+      /** A connection of the shared credential whose hello names no tab, as the MV3 worker opens it. */
+      readonly mux: HarnessWsClient;
+      /** The session of another project, bound to {@link SECOND_TAB_ID}. */
+      readonly sessionId: string;
+      /** That session's open capture. */
+      readonly captureId: string;
+    }
+
+    let second: SecondTab | undefined;
+
+    /** The second tab's state, or a failure naming the setup that did not run. */
+    function secondOf(): SecondTab {
+      if (second === undefined) {
+        throw new Error('The second tab was not set up.');
+      }
+      return second;
+    }
+
+    /** Requires that none of `batch` was stored, in any session. */
+    function expectNoneStored(batch: readonly TelemetryEventIngress[]): void {
+      for (const event of batch) {
+        expect(rawRow(event.id), `${event.id} was not stored`).toBeUndefined();
+      }
+    }
+
+    beforeAll(async () => {
+      const { harness, devtoolsCredential } = current();
+      // Captures are exclusive per project, so the second tab's session belongs
+      // to a copy of its own, readied and captured exactly like the first.
+      const other = await harness.copyFixtureProject();
+      const launched = recordResponse(await harness.launchDevServer(other.root));
+      if (isErr(launched)) {
+        throw new Error(`The second dev server did not launch: ${launched.error.message}`);
+      }
+      const session = recordResponse(
+        await harness.createSession({
+          projectRoot: other.root,
+          question: 'Why is the report slow to load?',
+        }),
+      );
+
+      // Exactly like the MV3 service worker: the credential the first tab's
+      // connection presented, a hello naming no tab, every frame naming its own.
+      const mux = await harness.ws({
+        client: 'devtools',
+        token: devtoolsCredential.token,
+        origin: devtoolsCredential.origin,
+      });
+      if (!mux.authenticated || mux.identity.tabId !== undefined) {
+        throw new Error(`The multiplexing connection was not accepted: ${mux.describe()}`);
+      }
+      const bound = await harness.bindTab(mux, {
+        tabId: SECOND_TAB_ID,
+        url: session.devServerUrl,
+        origin: new URL(session.devServerUrl).origin,
+      });
+      if (isErr(bound)) {
+        throw new Error(
+          `The second tab was not bound (${bound.error.code}): ${bound.error.message}`,
+        );
+      }
+      const ready = mux.send(
+        'agent.ready',
+        {
+          tabId: SECOND_TAB_ID,
+          documentId: assemble('doc-', randomHex(8)),
+          producerId: newProducerId(),
+          url: session.devServerUrl,
+          installedBeforeReact: true,
+          reactDetected: true,
+        },
+        { tabId: SECOND_TAB_ID },
+      );
+      if (!(await mux.flush()) || mux.errorsFor(ready.id).length > 0) {
+        throw new Error(`agent.ready for the second tab was refused: ${mux.describe()}`);
+      }
+      await harness.ws({
+        client: 'server-agent',
+        projectRoot: other.root,
+        token: harness.issueServerAgentCredential(other.root).token,
+      });
+      await harness.editor(other.root);
+
+      const settled = await harness.waitForSession(
+        session.id,
+        (record: SessionRecord) => record.status === 'ready' || record.status === 'failed',
+      );
+      if (settled.status !== 'ready') {
+        throw new Error(`The second session settled in "${settled.status}" instead of "ready".`);
+      }
+      const started = recordResponse(await harness.startCapture(session.id));
+      if (isErr(started)) {
+        throw new Error(
+          `The second capture did not start (${started.error.code}): ${started.error.message}`,
+        );
+      }
+      second = { mux, sessionId: session.id, captureId: started.value.captureId };
+    });
+
+    it('refuses a frame naming no tab on a connection whose hello named none, storing nothing', async () => {
+      const { harness } = current();
+      const rowsBefore = tableRowCount();
+      const mark = harness.logger.records.length;
+      const batch = freshCopies(BROWSER_EVENTS);
+
+      expect(
+        await relayAs(secondOf().mux, batch, {}),
+        'never the connection’s "primary" tab',
+      ).toEqual(['TAB_NOT_BOUND']);
+      expect(tableRowCount()).toBe(rowsBefore);
+      expect(dropRecords(mark), 'refused before ingest: no drop is recorded').toEqual([]);
+      expectNoneStored(batch);
+    });
+
+    it('stores a frame under the capture of the tab it names, and none of it under the other tab’s', async () => {
+      const { sessionId } = current();
+      const { mux, sessionId: secondSession, captureId: secondCapture } = secondOf();
+
+      const toSecond = freshCopies(BROWSER_EVENTS);
+      expect(await relayAs(mux, toSecond, { tabId: SECOND_TAB_ID })).toEqual([]);
+      const firstCapture = storedEvents();
+      for (const event of toSecond) {
+        expect(rawRow(event.id), `${event.id} belongs to the second tab's capture`).toMatchObject({
+          sessionId: secondSession,
+          captureId: secondCapture,
+        });
+        expect(firstCapture.has(event.id), `${event.id} is not in the first tab's capture`).toBe(
+          false,
+        );
+      }
+
+      // The same connection acting for the first tab reaches the first tab's capture.
+      const toFirst = freshCopies(BROWSER_EVENTS);
+      expect(await relayAs(mux, toFirst, { tabId: TAB_ID })).toEqual([]);
+      for (const event of toFirst) {
+        expect(rawRow(event.id), `${event.id} belongs to the first tab's capture`).toMatchObject({
+          sessionId,
+          captureId: captureIdOf(),
+        });
+      }
+    });
+
+    it('refuses a frame whose session routing key is not its tab’s binding, storing nothing', async () => {
+      const { sessionId } = current();
+      const rowsBefore = tableRowCount();
+      const batch = freshCopies(BROWSER_EVENTS);
+
+      expect(
+        await relayAs(secondOf().mux, batch, { tabId: SECOND_TAB_ID, sessionId }),
+        'a stale key is never re-attributed to the tab’s current session',
+      ).toEqual(['TAB_NOT_BOUND']);
+      expect(tableRowCount()).toBe(rowsBefore);
+      expectNoneStored(batch);
+    });
+
+    it('refuses a single-tab connection naming another tab, storing nothing', async () => {
+      const { devtools } = current();
+      const rowsBefore = tableRowCount();
+      const batch = freshCopies(BROWSER_EVENTS);
+
+      expect(
+        await relayAs(devtools, batch, { tabId: SECOND_TAB_ID }),
+        'a connection that announced a tab acts only for that tab',
+      ).toEqual(['TAB_NOT_BOUND']);
+      expect(tableRowCount()).toBe(rowsBefore);
+      expectNoneStored(batch);
+    });
+
+    it('refuses another credential naming a tab this credential bound, storing nothing', async () => {
+      const { harness } = current();
+      const stranger = harness.issueDevtoolsCredential();
+      const foreign = await harness.ws({
+        client: 'devtools',
+        token: stranger.token,
+        origin: stranger.origin,
+      });
+      const rowsBefore = tableRowCount();
+      const batch = freshCopies(BROWSER_EVENTS);
+
+      for (const tabId of [TAB_ID, SECOND_TAB_ID]) {
+        expect(await relayAs(foreign, batch, { tabId }), `tab ${String(tabId)}`).toEqual([
+          'TAB_NOT_BOUND',
+        ]);
+      }
+      expect(tableRowCount()).toBe(rowsBefore);
+      expectNoneStored(batch);
+    });
+  });
+
   describe('attribution and refusals', () => {
     it('refuses a batch naming another project, a descendant or a prefix sibling, storing nothing', async () => {
       const { harness, projectRoot, serverToken } = current();
@@ -1901,7 +2124,7 @@ describe('inside the capture window', () => {
       expect(tableRowCount(), 'never truncated, never partially stored').toBe(rowsBefore);
     });
 
-    it('drops a batch from a tab whose binding ended under no-binding, storing nothing', async () => {
+    it('refuses a batch from a tab whose binding ended with TAB_NOT_BOUND, storing nothing', async () => {
       const { harness, devtools } = current();
       const unbind = devtools.send('session.unbind', { tabId: TAB_ID });
       expect(await devtools.flush()).toBe(true);
@@ -1913,16 +2136,23 @@ describe('inside the capture window', () => {
       const mark = harness.logger.records.length;
       const batch = freshCopies(BROWSER_EVENTS);
 
-      expect(await relay(batch)).toEqual([]);
-      expect(dropReasonsSince(mark)).toEqual(['no-binding']);
-      expect(dropRecords(mark).map((record) => record.fields.received)).toEqual([batch.length]);
+      // No live binding means no session to attribute to: the frame is refused
+      // whole before ingest, so no drop record is written for it either.
+      expect(await relay(batch)).toEqual(['TAB_NOT_BOUND']);
+      expect(dropRecords(mark)).toEqual([]);
       expect(tableRowCount()).toBe(rowsBefore);
+      for (const event of batch) {
+        expect(rawRow(event.id), `${event.id} was not stored`).toBeUndefined();
+      }
     });
 
     it('reports every drop as a count under the closed DROP_REASONS vocabulary, never as event content', () => {
       const drops = dropRecords();
       const observed = new Set(drops.map((record) => record.fields.reason));
-      expect([...observed].sort()).toEqual(['no-active-capture', 'no-binding']);
+      // A relayed frame whose tab has no live binding is refused by the route
+      // before ingest runs, so the only drops this file provokes are the
+      // out-of-window and out-of-scope ones.
+      expect([...observed].sort()).toEqual(['no-active-capture']);
 
       // Content a drop record must never carry: names, trace ids and every
       // string value the batches held.

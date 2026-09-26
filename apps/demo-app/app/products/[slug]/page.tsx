@@ -45,25 +45,32 @@
  * The two are kept apart deliberately: "there is nothing at this address" is a statement about the
  * address, and an unreachable database is not.
  *
- * WHERE "IS THERE A PRODUCT HERE?" IS DECIDED, AND WHY IT IS NOT IN THE RENDER ALONE
- * `generateMetadata` decides it, because metadata resolution is the last point at which the
- * document's head is still open. Ask the render alone, and the answer can arrive too late for the
- * head: whenever Next.js has already written the streaming shell, a `notFound()` thrown from the
- * render swaps the markup for `app/not-found.tsx` while the tab still says `Product details`.
- * Raised while the metadata is being resolved, the same call makes Next.js resolve the whole head
- * under the not-found convention instead, so the tab, the `next-error` marker and `robots:
- * noindex` all describe what the reader is actually looking at.
+ * WHERE "IS THERE A PRODUCT HERE?" IS DECIDED
+ * In two places, for the two halves of the answer.
  *
- * The status line is the other half of that answer, and it depends on this segment not sitting
- * behind a Suspense boundary. Next.js marks a response 404 only when the not-found signal escapes
- * the shell of the render - it is the `renderToStream` failure path that sets the status - and any
- * boundary between the shell and this segment absorbs the signal before it gets there, including
- * the one raised here, which Next.js rethrows from the metadata outlet it renders beside the page.
- * The storefront therefore declares its loading boundary inside the `app/(catalog)` route group,
- * around the catalog page that waits for a query, rather than at the root where it would also
- * cover this route: with nothing between the shell and this segment, the signal escapes and the
- * response carries the not-found document with a 404 status line, which is what an uptime monitor,
- * a CDN and an automated test read.
+ * The status line is decided before this file runs. This segment renders inside the root loading
+ * boundary, `app/loading.tsx`, and a response streamed through a Suspense boundary has sent its
+ * `200` before anything here can raise a not-found signal - Next.js marks a response 404 only when
+ * that signal escapes the shell of the render, and the boundary absorbs it first. So `proxy.ts`
+ * looks the slug up ahead of rendering, with the same slug schema this file parses with, and
+ * rewrites an address no product owns to the not-found route, which answers with a 404 status
+ * line - what an uptime monitor, a CDN and an automated test read.
+ *
+ * The document is decided by `generateMetadata`, because Next.js resolves a page's metadata as one
+ * unit. Ask the render alone, and the answer arrives after the loading boundary has flushed the
+ * shell: a `notFound()` thrown from the render swaps the markup for `app/not-found.tsx` while the
+ * tab still says `Product details`. Raised while the metadata is being resolved, the same call
+ * makes Next.js resolve that unit under the not-found convention instead, so the tab, the
+ * `next-error` marker and `robots: noindex` all describe what the reader is actually looking at.
+ *
+ * This file's own `notFound()` calls are the render's guarantee rather than a copy of the proxy's
+ * check. They answer the cases the proxy cannot settle - a lookup that fell through because the
+ * proxy could not read the database, and a product removed between the proxy's read and this one
+ * - and in those cases the not-found page is streamed under the `200` already sent, marked
+ * `robots: noindex`, which is Next.js's documented answer once a body has started. (A dotted
+ * segment never reaches this file either: the proxy leaves it alone because `/products/<name>.svg`
+ * is where the product artwork is served from, and one that names no file is rewritten to the
+ * not-found route, with a 404, by the `afterFiles` rewrite in `next.config.ts`.)
  *
  * The render keeps its own parse and its own failure path all the same - it is the code that types
  * the slug and the code that answers an infrastructure fault - and the two never disagree, because
@@ -120,9 +127,10 @@ interface Props {
  * It names the page rather than the product, even though the product's own name would title the
  * tab more precisely, and that is unchanged: this route exists to be a clean example of one
  * interaction's work, and the one title it delivers is a property of the page, not of the row
- * behind it. A slug no product owns is not titled from here at all - it never reaches this
- * value, because `generateMetadata` answers it with `notFound()` and `app/not-found.tsx` supplies
- * its own "Page not found".
+ * behind it. A slug no product owns is not titled from here at all: `proxy.ts` rewrites its address
+ * to the not-found route before this file runs, and one that reaches this file anyway is answered
+ * by `generateMetadata` with `notFound()` - either way `app/not-found.tsx` supplies its own "Page
+ * not found".
  */
 const PAGE_TITLE = 'Product details';
 
@@ -162,15 +170,20 @@ const PRODUCT_FOR_SLUG = cache(async (slug: string): Promise<ProductDetail> =>
 /**
  * The document head for this route, and the point at which a missing product stops being one.
  *
- * Next.js resolves this pass while the head is still open, which is the only reason the decision
- * is here rather than in the render alone: thrown from the render, `notFound()` arrives after the
- * loading boundary has flushed the shell, and the not-found markup is served under this page's own
- * title. Raised here, it makes the head the not-found page's head. The three answers below are the
- * route's contract:
+ * It does not decide the status line. This route renders inside the root loading boundary, so
+ * `proxy.ts` sets the 404 for an address no product owns before rendering begins, and a missing
+ * product reaches this pass only when the proxy could not settle it - its lookup fell through, or
+ * the product was removed between its read and this one.
+ *
+ * Next.js resolves this pass as one unit, which is the only reason the decision is here rather than
+ * in the render alone: thrown from the render, `notFound()` arrives after the loading boundary has
+ * flushed the shell, and the not-found markup is served under this page's own title. Raised here,
+ * it makes the head the not-found page's head. The three answers below are the route's contract:
  *
  *   - a segment the slug schema rejects, and a slug the endpoint reports as `NOT_FOUND`, both call
  *     `notFound()`, so the response carries `app/not-found.tsx` under its own "Page not found"
- *     title, with the `next-error` and `robots: noindex` markers Next.js writes for it;
+ *     title, with the `next-error` and `robots: noindex` markers Next.js writes for it - streamed
+ *     under the `200` the loading boundary has already sent;
  *   - anything else that goes wrong reading the product - an unreachable database, a driver
  *     refusal, an address this deployment cannot establish - is not a statement about the address
  *     and must not be dressed up as one. It is caught here and the page's ordinary title is
@@ -212,10 +225,10 @@ const FAILURE_TITLE = 'This product could not be loaded';
  * The sentence under that heading.
  *
  * It is fixed, and no part of the caught failure reaches it. The one failure this read raises on
- * purpose - the product does not exist - is answered with a 404 before this sentence is reached,
- * so everything that gets here is a bug, a driver refusal or an unreachable database, whose
- * message may name a host, a statement or a path. A reader can act on "try again"; none of those
- * tells them anything, and all of them would put the server's internals on a public page.
+ * purpose - the product does not exist - is answered with the not-found page before this sentence
+ * is reached, so everything that gets here is a bug, a driver refusal or an unreachable database,
+ * whose message may name a host, a statement or a path. A reader can act on "try again"; none of
+ * those tells them anything, and all of them would put the server's internals on a public page.
  */
 const LOAD_FAILURE = 'We could not load this product just now. Please try again in a moment.';
 
@@ -241,9 +254,11 @@ export default async function ProductDetailPage({ params }: Props): Promise<Reac
   // A segment the schema rejects is answered with the not-found page rather than with a 400.
   // Nothing was asked of the database, and a reader who followed a truncated or hand-edited link
   // is told the page is not there, which is true and is the same answer they get for a slug that
-  // is merely unknown. `generateMetadata` has already refused the same segments, so this is the
-  // render's own guarantee rather than the reader's only protection: it is what types the slug for
-  // the read below, and what keeps this component correct on its own terms.
+  // is merely unknown. `proxy.ts` has already rewritten such segments to the not-found route (a
+  // dotted one is left to `public/` and to the rewrite in `next.config.ts`), and
+  // `generateMetadata` refuses them too, so this is the render's own guarantee rather than the
+  // reader's only protection: it is what types the slug for the read below, and what keeps this
+  // component correct on its own terms.
   if (!requested.success) {
     notFound();
   }
@@ -261,10 +276,13 @@ export default async function ProductDetailPage({ params }: Props): Promise<Reac
     // `notFound` signals by throwing, so it is called from the catch rather than from the block
     // above: called inside the `try`, its control-flow error would be caught here and a missing
     // product would render as a failure instead of as a missing page. The endpoint reports a slug
-    // no product owns as `NOT_FOUND`, which is the same statement the service made directly. The
-    // metadata pass has already answered this request with the not-found page by the time the
-    // render is reached; this stays because the render's answer must not depend on that pass, and
-    // because the call is still the right one to make here - only later than the head needs it.
+    // no product owns as `NOT_FOUND`, which is the same statement the service made directly. Such a
+    // slug normally never gets here - `proxy.ts` rewrites its address to the not-found route before
+    // rendering - and when one does, because the proxy's lookup fell through or the product was
+    // removed after it, the metadata pass has already answered the request with the not-found page
+    // by the time the render is reached. This stays because the render's answer must depend on
+    // neither, and because the call is still the right one to make here - only later than the head
+    // needs it.
     if (error instanceof StorefrontApiError && error.code === 'NOT_FOUND') {
       notFound();
     }

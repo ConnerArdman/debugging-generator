@@ -75,9 +75,15 @@
  *    own body, directly or through a local binding, *and* whose first argument
  *    is path-like. That is what a project's own HTTP client function is —
  *    `request('/x', { method: 'POST' })` — recognised by what the function
- *    does rather than by what it is called. The literal path is recorded at
- *    the call site, where it is written, so the site joins to its route; the
- *    `fetch` inside the wrapper stays a node of its own with a dynamic target.
+ *    does rather than by what it is called. The parameter, and every local a
+ *    URL is built through, is identified by its **binding** — the compiler's
+ *    symbol for the declaration a name refers to — and never by its spelling:
+ *    a re-declaration of the same name in a block, a `catch` clause or a
+ *    nested function's parameter list is a binding of its own and never
+ *    counts, while a nested closure that captures the parameter reads the
+ *    parameter itself and does. The literal path is recorded at the call
+ *    site, where it is written, so the site joins to its route; the `fetch`
+ *    inside the wrapper stays a node of its own with a dynamic target.
  *
  * The wrapper rule is deliberately generic, and its one known consequence is
  * that a server-side router registration written with the same shape
@@ -245,13 +251,19 @@
  *
  * ## Contract
  *
- * - **Abstract-syntax-tree first, no type resolution.** Every judgement is
- *   syntactic. Nothing calls the type checker, resolves a module specifier or
- *   reads a second file — which is what lets the corpus, whose dependencies
- *   are never installed, still yield a complete call-site inventory. The
- *   consequence is stated rather than hidden: a handler imported from another
- *   module cannot own a call site in *this* one (it has none), and a wrapper's
- *   receiver is recorded as written rather than resolved to a client.
+ * - **Abstract-syntax-tree first; symbols for shape 4 only.** Every judgement
+ *   is syntactic except shape 4's, which asks the compiler's symbol resolution
+ *   two questions within the analysed project: which function a callee is,
+ *   across an import to another of the project's modules, and which names in
+ *   that function read its first parameter. No type is inferred, nothing
+ *   outside the project (a declaration file, a dependency) is ever judged a
+ *   wrapper, and a callee or a name the checker cannot resolve is declined as
+ *   an ordinary call or a read of nothing — which is what lets the corpus,
+ *   whose dependencies are never installed, still yield a complete call-site
+ *   inventory. The consequence is stated rather than hidden: a handler
+ *   imported from another module cannot own a call site in *this* one (it has
+ *   none), and a client wrapper's receiver is recorded as written rather than
+ *   resolved to a client.
  * - **Reads no other extractor's output.** The sibling naming rules the edge
  *   depends on are reproduced here as small local helpers, which is the only
  *   coupling point and is kept explicit; `ExtractorResult` is additive and
@@ -296,12 +308,14 @@ import { Node, SyntaxKind } from 'ts-morph';
 import type {
   CallExpression,
   ExportAssignment,
+  Identifier,
   JsxAttribute,
   NewExpression,
   ObjectLiteralExpression,
   ParameterDeclaration,
   SourceFile,
   Statement,
+  Symbol as BindingSymbol,
   VariableDeclaration,
 } from 'ts-morph';
 
@@ -1355,10 +1369,16 @@ function fetchMethodOf(init: Node | undefined): FetchMethod {
  * ---------------------------------------------------------------------------------------------- */
 
 /**
- * How many local `const` bindings are followed from a `fetch` URL argument
- * back to the wrapper's parameter: `const url = `${base}${path}``, then
- * `fetch(url)` is one hop. Two covers a URL assembled in two steps without
- * turning the check into general data-flow analysis.
+ * How many local variables are followed from a `fetch` URL argument back to
+ * the wrapper's parameter: `const url = `${base}${path}``, then `fetch(url)`,
+ * is one hop.
+ *
+ * A hop goes to the declaration the name actually binds to (see
+ * {@link localInitializersOf}): a `const`, `let` or `var` declared with a
+ * plain identifier and an initializer, anywhere inside the wrapper — nested
+ * closures included — and what is followed is that initializer. Two hops cover
+ * a URL assembled in two steps without turning the check into general
+ * data-flow analysis, so a later reassignment of the variable is not tracked.
  */
 const MAX_FORWARDING_HOPS = 2;
 
@@ -1394,12 +1414,64 @@ function functionLikeOf(declaration: Node): Node | undefined {
 }
 
 /**
- * The name of a function's first parameter, when it is a plain identifier.
+ * The binding an identifier names, as the compiler resolved it: the symbol of
+ * the declaration that name refers to in the scope it is written in.
+ *
+ * This is what makes shape 4 lexical rather than textual. A block `const`, a
+ * `catch` clause and a nested function's parameter that re-declare a name each
+ * declare a symbol of their own, so a read of the re-declared name resolves to
+ * that symbol and not to the parameter it shadows; a closure that *captures*
+ * the parameter resolves to the parameter's own symbol.
+ *
+ * One position needs the other half of the answer. The name of a shorthand
+ * property (`{ path }`) is at once the new object's property and a read of the
+ * variable it copies, and the compiler answers the *property* for the name, so
+ * the property's value symbol is asked for instead.
+ *
+ * A lookup the compiler cannot answer — or one that throws, which the program
+ * of a broken project may — yields `undefined`, and every caller reads that as
+ * "a binding this module cannot vouch for": never the parameter, never
+ * followed.
+ *
+ * @param identifier An identifier inside a wrapper candidate.
+ * @returns The binding's symbol, or `undefined` when it cannot be resolved.
+ */
+function bindingOf(identifier: Identifier): BindingSymbol | undefined {
+  try {
+    const parent = identifier.getParent();
+
+    return Node.isShorthandPropertyAssignment(parent) &&
+      parent.getNameNode().compilerNode === identifier.compilerNode
+      ? parent.getValueSymbol()
+      : identifier.getSymbol();
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Whether two symbols are one binding.
+ *
+ * Compared on the compiler's own symbol, because that is the identity the
+ * checker guarantees; a ts-morph wrapper is a cache entry over it, and one
+ * symbol is not promised a single wrapper.
+ *
+ * @param left One binding.
+ * @param right The other.
+ * @returns `true` when both name the same declaration.
+ */
+function isSameBinding(left: BindingSymbol, right: BindingSymbol): boolean {
+  return left.compilerSymbol === right.compilerSymbol;
+}
+
+/**
+ * The binding of a function's first parameter, when it is a plain identifier.
  *
  * @param fn A function-like node from {@link functionLikeOf}.
- * @returns The parameter name, or `undefined` for none or a destructuring pattern.
+ * @returns The parameter's symbol, or `undefined` for no parameter, a
+ * destructuring pattern, or a symbol the compiler cannot resolve.
  */
-function firstParameterName(fn: Node): string | undefined {
+function firstParameterBindingOf(fn: Node): BindingSymbol | undefined {
   if (
     !Node.isFunctionDeclaration(fn) &&
     !Node.isMethodDeclaration(fn) &&
@@ -1409,13 +1481,17 @@ function firstParameterName(fn: Node): string | undefined {
     return undefined;
   }
   const nameNode = fn.getParameters()[0]?.getNameNode();
-  return nameNode !== undefined && Node.isIdentifier(nameNode) ? nameNode.getText() : undefined;
+  return nameNode !== undefined && Node.isIdentifier(nameNode) ? bindingOf(nameNode) : undefined;
 }
 
 /**
  * Whether an identifier is written in a *name* position — a property name after
  * a dot, a property assignment's key — where it names a member rather than
  * reading a binding.
+ *
+ * A fast path, not the rule: such a name resolves to a property symbol, which
+ * is never the parameter's, so skipping it only spares a symbol lookup.
+ * Whether a name reads the parameter is decided by {@link bindingOf}.
  *
  * @param identifier The identifier.
  * @returns `true` when it does not read a binding.
@@ -1435,33 +1511,74 @@ function isNamePosition(identifier: Node): boolean {
 }
 
 /**
- * The initializer of a local `const`/`let` binding named `name` inside `fn`.
+ * Whether a node lies inside a function: the function itself or any node
+ * beneath it, nested closures included.
  *
- * @param fn The wrapper function.
- * @param name The binding name.
- * @returns The initializer, or `undefined` when there is no such binding.
+ * Compared on the compiler's nodes, for the reason {@link isSameBinding}
+ * compares the compiler's symbols.
+ *
+ * @param node The node.
+ * @param fn The function.
+ * @returns `true` when `fn` is `node` or one of its ancestors.
  */
-function localInitializerOf(fn: Node, name: string): Node | undefined {
-  for (const declaration of fn.getDescendantsOfKind(SyntaxKind.VariableDeclaration)) {
-    const nameNode = declaration.getNameNode();
-    if (Node.isIdentifier(nameNode) && nameNode.getText() === name) {
-      return declaration.getInitializer();
+function isInside(node: Node, fn: Node): boolean {
+  for (let current: Node | undefined = node; current !== undefined; current = current.getParent()) {
+    if (current.compilerNode === fn.compilerNode) {
+      return true;
     }
   }
-  return undefined;
+  return false;
 }
 
 /**
- * Whether an expression reads the binding `name`, directly or through at most
- * `hops` local bindings of the wrapper.
+ * The initializers a hop may follow from a binding: those of its declarations
+ * that are local variables of the wrapper.
+ *
+ * A declaration qualifies when it is a `const`, `let` or `var` declared with a
+ * plain identifier and an initializer, and lies inside `fn` — at any depth, so
+ * a local of a nested closure that builds the URL from the captured parameter
+ * is followed. Everything else declines: a destructured name, a declaration
+ * without an initializer (a `catch` clause's binding is one), a parameter, a
+ * function, an import, and any declaration outside the wrapper. `var` is the
+ * one binding that can carry several declarations, and each qualifying one is
+ * returned.
+ *
+ * @param binding The symbol an identifier resolved to.
+ * @param fn The wrapper function.
+ * @returns The initializers, in declaration order; empty when none qualifies.
+ */
+function localInitializersOf(binding: BindingSymbol, fn: Node): readonly Node[] {
+  const initializers: Node[] = [];
+  for (const declaration of binding.getDeclarations()) {
+    if (!Node.isVariableDeclaration(declaration) || !Node.isIdentifier(declaration.getNameNode())) {
+      continue;
+    }
+    const initializer = declaration.getInitializer();
+    if (initializer !== undefined && isInside(declaration, fn)) {
+      initializers.push(initializer);
+    }
+  }
+  return initializers;
+}
+
+/**
+ * Whether an expression reads the wrapper's first parameter, directly or
+ * through at most `hops` local variables of the wrapper.
+ *
+ * An identifier reads the parameter exactly when {@link bindingOf} resolves it
+ * to the parameter's own symbol; its spelling is irrelevant. An identifier
+ * bound to anything else is followed, while hops remain, through
+ * {@link localInitializersOf} — the declaration it actually binds to, never the
+ * first declaration that happens to share its name. One whose binding cannot
+ * be resolved reads nothing.
  *
  * @param expression The `fetch` URL argument, or an initializer it leads to.
- * @param name The wrapper's first parameter.
+ * @param parameter The binding of the wrapper's first parameter.
  * @param fn The wrapper function.
- * @param hops How many more local bindings may be followed.
+ * @param hops How many more local variables may be followed.
  * @returns `true` when the parameter reaches the expression.
  */
-function readsBinding(expression: Node, name: string, fn: Node, hops: number): boolean {
+function readsBinding(expression: Node, parameter: BindingSymbol, fn: Node, hops: number): boolean {
   const identifiers = Node.isIdentifier(expression)
     ? [expression]
     : expression.getDescendantsOfKind(SyntaxKind.Identifier);
@@ -1469,24 +1586,64 @@ function readsBinding(expression: Node, name: string, fn: Node, hops: number): b
     if (isNamePosition(identifier)) {
       continue;
     }
-    const text = identifier.getText();
-    if (text === name) {
+    const binding = bindingOf(identifier);
+    if (binding === undefined) {
+      continue;
+    }
+    if (isSameBinding(binding, parameter)) {
       return true;
     }
-    if (hops > 0) {
-      const initializer = localInitializerOf(fn, text);
-      if (initializer !== undefined && readsBinding(initializer, name, fn, hops - 1)) {
-        return true;
-      }
+    if (
+      hops > 0 &&
+      localInitializersOf(binding, fn).some((initializer) =>
+        readsBinding(initializer, parameter, fn, hops - 1),
+      )
+    ) {
+      return true;
     }
   }
   return false;
 }
 
 /**
+ * Judges a function afresh: whether any `fetch` in its body, nested closures
+ * included, is given a URL that reads the function's first parameter.
+ *
+ * A failure anywhere in the judgement — the tree or the checker throwing on a
+ * project it cannot fully read — is a verdict of "not a wrapper": this is a
+ * classification, and a call through a function it cannot vouch for is an
+ * ordinary call.
+ *
+ * @param fn A function-like node from {@link functionLikeOf}.
+ * @returns `true` when the function is a forwarding wrapper.
+ */
+function judgeForwarding(fn: Node): boolean {
+  try {
+    const parameter = firstParameterBindingOf(fn);
+    return (
+      parameter !== undefined &&
+      fn.getDescendantsOfKind(SyntaxKind.CallExpression).some((call) => {
+        const url = call.getArguments()[0];
+        return (
+          isFetchCallee(call.getExpression()) &&
+          url !== undefined &&
+          readsBinding(url, parameter, fn, MAX_FORWARDING_HOPS)
+        );
+      })
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Whether a function forwards its first parameter into the URL of a `fetch`
  * call in its own body — the defining property of a project's own HTTP client
  * function, and a property of the code rather than of any name.
+ *
+ * "Its first parameter" is that parameter's binding, not its spelling (see
+ * {@link bindingOf}), and each verdict is judged once per declaration and kept
+ * in {@link forwardingVerdicts}.
  *
  * @param fn A function-like node from {@link functionLikeOf}.
  * @returns `true` when the function is a forwarding wrapper.
@@ -1496,17 +1653,7 @@ function forwardsToFetch(fn: Node): boolean {
   if (known !== undefined) {
     return known;
   }
-  const name = firstParameterName(fn);
-  const verdict =
-    name !== undefined &&
-    fn.getDescendantsOfKind(SyntaxKind.CallExpression).some((call) => {
-      const url = call.getArguments()[0];
-      return (
-        isFetchCallee(call.getExpression()) &&
-        url !== undefined &&
-        readsBinding(url, name, fn, MAX_FORWARDING_HOPS)
-      );
-    });
+  const verdict = judgeForwarding(fn);
   forwardingVerdicts.set(fn, verdict);
   return verdict;
 }

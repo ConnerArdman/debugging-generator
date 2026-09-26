@@ -1,8 +1,10 @@
 /**
  * The message folder's registry: the complete `type → payload schema` map the
  * envelope's discriminated union is built from, the ordered vocabulary of
- * WebSocket message types, the separate map of the five HTTP operation names
- * this folder also owns, and the whole folder's public surface in one place.
+ * WebSocket message types and the named constant every application boundary
+ * uses for each of them ({@link MESSAGE_TYPE}), the separate map of the five
+ * HTTP operation names this folder also owns, and the whole folder's public
+ * surface in one place.
  *
  * Eleven domain modules sit beside this one, each holding the payload schemas
  * of one part of the protocol (AAP §0.2.5). Each of them also exports a small
@@ -44,9 +46,11 @@
  * ## Why the registry exists at all
  *
  * So that adding a message is two lines in one domain module — the schema and
- * its entry in that module's map — plus one line here, the type name in
- * {@link MESSAGE_TYPES}; and so that **forgetting the second line is a compile
- * error**. {@link MessageRegistryIsComplete} asserts that the registry's key set
+ * its entry in that module's map — plus two lines here, the named constant in
+ * {@link MESSAGE_TYPE} and its place in {@link MESSAGE_TYPES}; and so that
+ * **forgetting any of them is a compile error**
+ * ({@link MessageTypeConstantsAreComplete} covers the pair here).
+ * {@link MessageRegistryIsComplete} asserts that the registry's key set
  * and {@link MessageType} are mutually assignable, so a schema with no type name
  * and a type name with no schema each fail `tsc -b` in this file. Without that
  * assertion the mistake would surface as a frame the envelope silently refuses
@@ -65,8 +69,9 @@
  * from, so everything the three surfaces need arrives here first: the handshake
  * constants ({@link WS_CLOSE_UNAUTHORIZED}, {@link CLIENT_HELLO_TIMEOUT_MS}),
  * the closed vocabularies ({@link CLIENT_KINDS}, {@link PROGRESS_STAGES},
- * {@link PROGRESS_STATUSES}, {@link BINDING_REASONS}), every payload schema,
- * every inferred payload type and every total `parse…` helper.
+ * {@link PROGRESS_STATUSES}, {@link BINDING_REASONS},
+ * {@link SOURCE_RESULT_STATUSES}), every payload schema, every inferred payload
+ * type and every total `parse…` helper.
  *
  * The names are enumerated rather than forwarded with `export *`, for the
  * reason `packages/model-provider/src/providers/index.ts` enumerates its own:
@@ -497,25 +502,66 @@ export { parsePanelGeneratedPayload } from './panel.js';
 export type { PanelGeneratedPayload, PanelSpecTypePreserved } from './panel.js';
 
 /* -------------------------------------------------------------------------------------------------
- * messages/source — the hop that makes every runtime item clickable
+ * messages/source — the hop that makes every runtime item clickable, and its answer
  * ---------------------------------------------------------------------------------------------- */
 
 /**
- * The `source.open` payload schema and this domain's registry entry: see
+ * The source-navigation vocabulary and deadlines: see `./source.js`.
+ *
+ * {@link SOURCE_RESULT_STATUSES} is the closed set of outcomes a `source.open`
+ * can have — `opened`, `no-editor`, `failed` — and the two timeouts are the
+ * service's wait for an editor's answer ({@link SOURCE_OPEN_EDITOR_TIMEOUT_MS})
+ * and the DevTools side's wait for the service's
+ * ({@link SOURCE_OPEN_RESULT_TIMEOUT_MS}), declared together because the second
+ * must exceed the first.
+ */
+export {
+  SOURCE_OPEN_EDITOR_TIMEOUT_MS,
+  SOURCE_OPEN_RESULT_TIMEOUT_MS,
+  SOURCE_RESULT_STATUSES,
+} from './source.js';
+
+/**
+ * The source-navigation payload schemas and this domain's registry entry: see
  * `./source.js`.
  *
- * An already-resolved project location travelling from the DevTools panel to
- * the editor. Containment is decided by the service and again, independently, by
- * the editor's URI handler — never here, because this package has no project
- * root and no filesystem (AAP §0.2.3, §0.5.6).
+ * `source.open` is an already-resolved project location travelling from the
+ * DevTools panel to the editor; `source.result` is the answer, correlated by
+ * `ref` to the `source.open` it settles, from the editor to the service and
+ * from the service to the panel. Containment is decided by the service and
+ * again, independently, by the editor's URI handler — never here, because this
+ * package has no project root and no filesystem (AAP §0.2.3, §0.5.6).
  */
-export { SOURCE_MESSAGE_PAYLOADS, sourceOpenPayloadSchema } from './source.js';
+export {
+  SOURCE_MESSAGE_PAYLOADS,
+  sourceOpenPayloadSchema,
+  sourceResultPayloadSchema,
+} from './source.js';
 
-/** The `source.open` parse helper: see `./source.js`. */
-export { parseSourceOpenPayload } from './source.js';
+/** The source-navigation parse helpers: see `./source.js`. */
+export { parseSourceOpenPayload, parseSourceResultPayload } from './source.js';
 
-/** The `source.open` inferred type: see `./source.js`. */
-export type { SourceOpenPayload } from './source.js';
+/**
+ * The editor-open URI, the fallback for a `no-editor` answer: see `./source.js`.
+ *
+ * {@link EDITOR_OPEN_URI} names its scheme, authority, path and parameters once
+ * for the panel that opens it and the extension handler that receives it, and
+ * {@link buildEditorOpenUri} builds it from a validated location.
+ */
+export { EDITOR_OPEN_URI, buildEditorOpenUri } from './source.js';
+
+/**
+ * The source-navigation inferred types, and this module's compile-time drift
+ * assertion.
+ *
+ * @internal `SourceResultDriftAssertions`
+ */
+export type {
+  SourceOpenPayload,
+  SourceResultDriftAssertions,
+  SourceResultPayload,
+  SourceResultStatus,
+} from './source.js';
 
 /* -------------------------------------------------------------------------------------------------
  * messages/target — the element-selection round trip
@@ -539,8 +585,28 @@ export {
 /** The target-domain parse helpers: see `./target.js`. */
 export { parseTargetRequestPayload, parseTargetSelectedPayload } from './target.js';
 
+/**
+ * The target-domain verdict helpers and their vocabulary: see `./target.js`.
+ *
+ * The two questions the service's verdict on a `target.selected` frame turns
+ * on, answered once for the service that refuses or records a selection and
+ * the panel that waits for the outcome: whether a session's recorded target is
+ * the descriptor that was sent (`sameSelectedTarget`), and whether a
+ * descriptor is of the bound tab's current document
+ * (`compareSelectionDocument`, answering in `SELECTION_DOCUMENT_VERDICTS`).
+ */
+export {
+  SELECTION_DOCUMENT_VERDICTS,
+  compareSelectionDocument,
+  sameSelectedTarget,
+} from './target.js';
+
 /** The target-domain inferred types: see `./target.js`. */
-export type { TargetRequestPayload, TargetSelectedPayload } from './target.js';
+export type {
+  SelectionDocumentVerdict,
+  TargetRequestPayload,
+  TargetSelectedPayload,
+} from './target.js';
 
 /* -------------------------------------------------------------------------------------------------
  * messages/cleanup — the end-of-session guarantee, reported
@@ -635,16 +701,92 @@ export const MESSAGE_PAYLOAD_SCHEMAS = Object.freeze({
 } as const) satisfies Readonly<Record<MessageType, ZodType>>;
 
 /**
- * The twenty-five WebSocket message types of this protocol, in the order
+ * The twenty-six WebSocket message types of this protocol, each under a named
+ * constant: the identifiers the three runnable surfaces send, subscribe to,
+ * build envelopes with and switch on, instead of repeating the wire string at
+ * every boundary.
+ *
+ * This object is where each name is spelled, once. Twenty-five names are
+ * verbatim from AAP §0.4.2 — the dot spellings, and the hyphen in
+ * `'server-agent.config'` — and ten of them are the user's own names for these
+ * messages. The twenty-sixth, `'source.result'`, is the answer to
+ * `'source.open'`, named in that message's domain so a click on a source link
+ * is acknowledged end to end instead of being reported done when a frame was
+ * merely queued. A single character of drift is a frame one process sends and
+ * another refuses, so every other statement of the vocabulary is derived from
+ * here: {@link MESSAGE_TYPES} lists these constants in discriminant order,
+ * {@link MessageType} is derived from that tuple, and the envelope's union from
+ * both.
+ *
+ * A key is its wire name in upper snake case — `.` and `-` become `_` — so the
+ * identifier is predictable from the name (`'server-agent.config'` is
+ * `SERVER_AGENT_CONFIG`) and a reader can go from a frame in a log to the
+ * constant without a lookup table. `../__tests__/messages.test.ts` checks that
+ * correspondence for every entry, which is also what stops two keys from naming
+ * one message; {@link MessageTypeConstantsAreComplete} proves the values are
+ * exactly {@link MessageType}.
+ *
+ * `as const` inside `Object.freeze` keeps every value's literal type, so a
+ * constant types exactly as its string would: `send(MESSAGE_TYPE.SOURCE_OPEN,
+ * payload)` checks `payload` against `source.open`'s schema,
+ * `case MESSAGE_TYPE.AGENT_READY:` narrows a `ProtocolMessage` to
+ * `MessageByType<'agent.ready'>`, and a switch with a case for every constant
+ * still reaches `assertNever` exhaustively. Frozen, so no consumer can rename a
+ * message at run time.
+ *
+ * @example Sending, subscribing and dispatching by name
+ * ```ts
+ * import { MESSAGE_TYPE } from '@debuggen/protocol';
+ *
+ * client.send(MESSAGE_TYPE.SESSION_BIND, { tabId, url, origin });
+ * client.on(MESSAGE_TYPE.SESSION_UPDATED, (message) => render(message.payload.session));
+ *
+ * switch (message.type) {
+ *   case MESSAGE_TYPE.TELEMETRY_EVENT:
+ *     return ingest(message.payload.events);
+ *   // …
+ * }
+ * ```
+ */
+export const MESSAGE_TYPE = Object.freeze({
+  CLIENT_HELLO: 'client.hello',
+  AGENT_READY: 'agent.ready',
+  AGENT_CONFIG: 'agent.config',
+  SERVER_AGENT_CONFIG: 'server-agent.config',
+  SESSION_BIND: 'session.bind',
+  SESSION_BOUND: 'session.bound',
+  TAB_NAVIGATED: 'tab.navigated',
+  SESSION_UNBIND: 'session.unbind',
+  SESSION_CREATED: 'session.created',
+  SESSION_UPDATED: 'session.updated',
+  SESSION_PROGRESS: 'session.progress',
+  ANALYSIS_COMPLETED: 'analysis.completed',
+  CAPTURE_STARTED: 'capture.started',
+  CAPTURE_STOPPED: 'capture.stopped',
+  INSTRUMENTATION_PLAN: 'instrumentation.plan',
+  INSTRUMENTATION_READY: 'instrumentation.ready',
+  INSTRUMENTATION_FAILED: 'instrumentation.failed',
+  TELEMETRY_EVENT: 'telemetry.event',
+  TELEMETRY_TAIL: 'telemetry.tail',
+  PANEL_GENERATED: 'panel.generated',
+  SOURCE_OPEN: 'source.open',
+  SOURCE_RESULT: 'source.result',
+  TARGET_REQUEST: 'target.request',
+  TARGET_SELECTED: 'target.selected',
+  CLEANUP_COMPLETED: 'cleanup.completed',
+  ERROR: 'error',
+} as const);
+
+/**
+ * The twenty-six WebSocket message types of this protocol, in the order
  * `../envelope.ts` builds its discriminated union in.
  *
- * Every name is verbatim from AAP §0.4.2 — the dot spellings, and the hyphen in
- * `'server-agent.config'` — and ten of them are the user's own names for these
- * messages. A single character of drift here is a frame one process sends and
- * another refuses, so the vocabulary is declared once, in this tuple, and every
- * other statement of it in the product is derived from it: the union's
- * discriminant, {@link MessageType}, the service's client router and both
- * extension clients' typed `on(type, handler)` subscriptions.
+ * Built from {@link MESSAGE_TYPE}'s constants rather than from strings, so the
+ * tuple fixes the *order* of the vocabulary and the constants its *spelling*:
+ * no name is written twice in this package. Every other statement of it in the
+ * product is derived from these two: the union's discriminant,
+ * {@link MessageType}, the service's client router and both extension clients'
+ * typed `on(type, handler)` subscriptions.
  *
  * The order is the domain order of the registry above, read top to bottom:
  *
@@ -659,7 +801,7 @@ export const MESSAGE_PAYLOAD_SCHEMAS = Object.freeze({
  *    `instrumentation.failed`;
  * 6. telemetry — `telemetry.event`, `telemetry.tail`;
  * 7. the generated panel — `panel.generated`;
- * 8. source navigation — `source.open`;
+ * 8. source navigation — `source.open`, `source.result`;
  * 9. element selection — `target.request`, `target.selected`;
  * 10. cleanup — `cleanup.completed`;
  * 11. the generic failure reply — `error`.
@@ -676,35 +818,36 @@ export const MESSAGE_PAYLOAD_SCHEMAS = Object.freeze({
  * it to build a union whose members are known at compile time.
  */
 export const MESSAGE_TYPES = [
-  'client.hello',
-  'agent.ready',
-  'agent.config',
-  'server-agent.config',
-  'session.bind',
-  'session.bound',
-  'tab.navigated',
-  'session.unbind',
-  'session.created',
-  'session.updated',
-  'session.progress',
-  'analysis.completed',
-  'capture.started',
-  'capture.stopped',
-  'instrumentation.plan',
-  'instrumentation.ready',
-  'instrumentation.failed',
-  'telemetry.event',
-  'telemetry.tail',
-  'panel.generated',
-  'source.open',
-  'target.request',
-  'target.selected',
-  'cleanup.completed',
-  'error',
+  MESSAGE_TYPE.CLIENT_HELLO,
+  MESSAGE_TYPE.AGENT_READY,
+  MESSAGE_TYPE.AGENT_CONFIG,
+  MESSAGE_TYPE.SERVER_AGENT_CONFIG,
+  MESSAGE_TYPE.SESSION_BIND,
+  MESSAGE_TYPE.SESSION_BOUND,
+  MESSAGE_TYPE.TAB_NAVIGATED,
+  MESSAGE_TYPE.SESSION_UNBIND,
+  MESSAGE_TYPE.SESSION_CREATED,
+  MESSAGE_TYPE.SESSION_UPDATED,
+  MESSAGE_TYPE.SESSION_PROGRESS,
+  MESSAGE_TYPE.ANALYSIS_COMPLETED,
+  MESSAGE_TYPE.CAPTURE_STARTED,
+  MESSAGE_TYPE.CAPTURE_STOPPED,
+  MESSAGE_TYPE.INSTRUMENTATION_PLAN,
+  MESSAGE_TYPE.INSTRUMENTATION_READY,
+  MESSAGE_TYPE.INSTRUMENTATION_FAILED,
+  MESSAGE_TYPE.TELEMETRY_EVENT,
+  MESSAGE_TYPE.TELEMETRY_TAIL,
+  MESSAGE_TYPE.PANEL_GENERATED,
+  MESSAGE_TYPE.SOURCE_OPEN,
+  MESSAGE_TYPE.SOURCE_RESULT,
+  MESSAGE_TYPE.TARGET_REQUEST,
+  MESSAGE_TYPE.TARGET_SELECTED,
+  MESSAGE_TYPE.CLEANUP_COMPLETED,
+  MESSAGE_TYPE.ERROR,
 ] as const;
 
 /**
- * One of the twenty-five names in {@link MESSAGE_TYPES}: the discriminant of
+ * One of the twenty-six names in {@link MESSAGE_TYPES}: the discriminant of
  * every frame this protocol carries.
  *
  * Derived from the tuple rather than written out, so the type and the runtime
@@ -793,10 +936,11 @@ export type HttpOnlyPayloadName = (typeof HTTP_ONLY_PAYLOAD_NAMES)[number];
 /* -------------------------------------------------------------------------------------------------
  * The compile-time guards
  *
- * Three properties of the two registries above are proved here, by the compiler,
- * at the point the registries are assembled: the WebSocket registry covers
- * exactly the twenty-five message types, the HTTP-only names overlap the message
- * types nowhere, and the HTTP-only tuple and map name the same five operations.
+ * Four properties of the registries above are proved here, by the compiler, at
+ * the point the registries are assembled: the WebSocket registry covers exactly
+ * the twenty-six message types, the named constants are exactly those types,
+ * the HTTP-only names overlap the message types nowhere, and the HTTP-only tuple
+ * and map name the same five operations.
  * Each is a type-level assertion with no runtime representation — the runtime
  * half of the same guarantees, over `Object.keys`, belongs to
  * `../__tests__/messages.test.ts`.
@@ -853,7 +997,7 @@ export type MessageRegistryIsComplete = AssertTrue<
 >;
 
 /**
- * Compile-time proof that {@link MESSAGE_TYPES} still lists twenty-five names —
+ * Compile-time proof that {@link MESSAGE_TYPES} still lists twenty-six names —
  * the one property {@link MessageRegistryIsComplete} cannot see.
  *
  * That assertion compares a *key set* with a *union*, and both are blind to a
@@ -865,20 +1009,46 @@ export type MessageRegistryIsComplete = AssertTrue<
  * message about the union rather than about the tuple. A dropped name that
  * happened to be a duplicate would hide the same way.
  *
- * So the count is asserted here, against the number AAP §0.4.2 specifies. It is
- * the one figure in this file not derived from something else, which makes it
- * the one that has to be maintained: adding a twenty-sixth message means
- * updating this literal in the same edit as the tuple, and the failure is a
- * compile error in this file, naming this line. The runtime half — twenty-five
- * distinct keys in {@link MESSAGE_PAYLOAD_SCHEMAS}, in this order — belongs to
+ * So the count is asserted here: the twenty-five messages AAP §0.4.2 specifies,
+ * plus `source.result`, the answer to `source.open`. It is the one figure in
+ * this file not derived from something else, which makes it the one that has to
+ * be maintained: adding a twenty-seventh message means updating this literal in
+ * the same edit as the tuple, and the failure is a compile error in this file,
+ * naming this line. The runtime half — twenty-six distinct keys in
+ * {@link MESSAGE_PAYLOAD_SCHEMAS}, in this order — belongs to
  * `../__tests__/messages.test.ts`.
  *
  * Exported for the reason {@link MessageRegistryIsComplete} is.
  *
  * @internal
  */
-export type MessageTypeCountIsTwentyFive = AssertTrue<
-  (typeof MESSAGE_TYPES)['length'] extends 25 ? true : false
+export type MessageTypeCountIsTwentySix = AssertTrue<
+  (typeof MESSAGE_TYPES)['length'] extends 26 ? true : false
+>;
+
+/**
+ * Compile-time proof that the values of {@link MESSAGE_TYPE} are exactly the
+ * names of {@link MessageType} — every message has a named constant, and every
+ * named constant is a message.
+ *
+ * {@link MESSAGE_TYPES} is built from the constants, so a constant cannot name a
+ * message the tuple lacks unless someone adds it to the object and forgets the
+ * tuple. That constant would still type-check at every `send` and `case` that
+ * used it — its value is a string literal — while the envelope's union had no
+ * member for it, and the frame would be refused at run time by the peer. The
+ * mutual assignability below turns that forgotten tuple line into a compile
+ * error in this file.
+ *
+ * Two keys naming one message is invisible to this assertion (the value union
+ * is unchanged); the key-equals-upper-snake-name check in
+ * `../__tests__/messages.test.ts` is what rules that out.
+ *
+ * Exported for the reason {@link MessageRegistryIsComplete} is.
+ *
+ * @internal
+ */
+export type MessageTypeConstantsAreComplete = AssertTrue<
+  MutuallyAssignable<(typeof MESSAGE_TYPE)[keyof typeof MESSAGE_TYPE], MessageType>
 >;
 
 /**

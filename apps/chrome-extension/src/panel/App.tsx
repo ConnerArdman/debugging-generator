@@ -24,9 +24,11 @@
  * keys every query effect and memo on them — reads the store's snapshot, and
  * composes the ten panel components. It holds no copy of any session, panel,
  * analysis, capture, live-tail, selection or target state: the store is the only
- * state container. The two `useState` hooks below are presentation-only and
- * duplicate nothing — whether the developer dismissed the pairing dialog, and
- * whether the live tail is collapsed.
+ * state container; the worker's reload offer is read from `./state/connection`,
+ * which holds it. The `useState` hooks below are presentation-only and
+ * duplicate nothing — whether the developer dismissed the pairing dialog,
+ * whether the live tail is collapsed, and whether the reload notice's own
+ * consent is in flight.
  *
  * ## Layout (AAP 0.7.3)
  *
@@ -37,6 +39,7 @@
  * ├── PairDialog                             while the connection says "Not paired"
  * ├── Split                                  the body and the right drawer
  * │   ├── <main>                             lastError notice · EmptyPanel, or
+ * │   │                                      the reload notice (while offered) +
  * │   │                                      SessionSummary + PanelView (PanelHost)
  * │   └── <aside> → Section (card)           EventDetails — only while an event is selected
  * └── <section> "Live event tail"            LiveTail, with its own collapse Button
@@ -48,6 +51,24 @@
  * chrome around it resolves the `--dg-*` tokens because `./theme` applied the
  * theme attribute to the document root before first paint; the same theme is
  * forwarded to `PanelHost` so both roots always render one token set.
+ *
+ * ## The pairing dialog is modal
+ *
+ * `PairDialog` declares `aria-modal="true"`, and this file makes that true: while
+ * the dialog is open, every other region — the `<header>` (through `Header`'s
+ * `inert` prop), `<main>`, the drawer's `<aside>` and the live tail's
+ * `<section>` — carries the native `inert` attribute, so nothing behind the
+ * dialog can be focused, clicked or reached by assistive technology. `Split`
+ * renders only non-interactive pane wrappers around `<main>` and `<aside>`, and
+ * no title here, so those two cover it. The dialog itself is a direct child of
+ * the top-level `Stack`, outside every inert subtree; its own focus containment
+ * catches focus that is moved programmatically. The renderer ships no overlay
+ * primitive, so the dialog stays an in-flow card directly under the header —
+ * modality comes from the inert background, not from a scrim.
+ *
+ * Focus on close lands on what opened the dialog — the connection pill's
+ * "Pair…" control, whose `<header>` stops being inert in the same commit that
+ * removes the dialog — or on `<main>` when the dialog opened by itself.
  *
  * ## States (AAP 0.7.3, 0.5.5)
  *
@@ -61,6 +82,13 @@
  * - **Panel present** — `PanelView` → `PanelHost`, with the layout exactly as it
  *   was generated. `meta.fallback` is a legitimate success: `PanelHost` renders
  *   its own fallback banner, and nothing here reads the flag.
+ * - **Page not observable** — the worker offers the one-click reload because
+ *   the inspected page's agent is missing or its hook arrived after React: a
+ *   notice above the summary states why and offers "Reload page", whose
+ *   activation is the developer's consent; while the worker reloads and waits
+ *   for the new document's agent, the action is unavailable and busy.
+ * - **Capture held by another session** — the start failure names the owning
+ *   session and says how to release it.
  * - **Unbound, or the tab navigated away** — `ConnectionStatus` renders the
  *   binding line through `formatTabLeftMessage`; nothing here words it.
  * - **Not paired / service not running / reconnecting** — the pill's own
@@ -69,17 +97,57 @@
  * Every state renders with `chrome.devtools` undefined, which is how the browser
  * suite opens the panel page directly as an extension page: the element-target
  * controls then render unavailable with an explanatory tooltip (`TargetPicker`),
- * and nothing throws.
+ * and nothing throws. This file is the one that detects the host: it tells
+ * `TargetPicker` whether DevTools is present and whether a session is bound to
+ * the inspected tab, and the picker reads no `chrome` global of its own.
  *
  * ## Commands never reject
  *
- * `CaptureControls` and `TargetPicker` hold their control busy while a returned
- * promise is pending and re-raise a rejection, which in an extension page is an
- * unhandled rejection. So every command below catches its own failure, surfaces
- * it through the store's non-blocking `lastError` — rendered as an error state,
- * never as analysis — and resolves. Each is a module-level function that reads
- * the store and the session at call time, so its identity is stable for the
- * life of the document and no dependency array is involved.
+ * `CaptureControls` and the reload notice hold their control busy while a
+ * returned promise is pending. Every command below catches its own failure,
+ * surfaces it through the store's non-blocking `lastError` — rendered as an
+ * error state, never as analysis — and resolves. Each is a module-level
+ * function that reads the store and the session at call time, so its identity
+ * is stable for the life of the document and no dependency array is involved.
+ * Anything a `CaptureControls` callback throws or rejects with anyway reaches
+ * its required `onActionError` reporter, and `TargetPicker` hands a failure to
+ * its `onActionError` sink; both route it into the same `lastError` notice, so
+ * even an unexpected failure is presented rather than escaping as an
+ * unhandled rejection.
+ *
+ * ## "Use selected element" is bounded end to end
+ *
+ * The inspected page answers the `$0` evaluation, and the page is untrusted:
+ * any script on it can replace the agent's `describeTarget`. So the answer
+ * passes the shared bounded parser of `../shared/messages` — the one the
+ * devtools page applies to the same answer — **before** anything is shown or
+ * sent, and a refused answer is reported, never displayed. The evaluation
+ * itself settles exactly once: with an answer, with a failure, after
+ * {@link SELECTION_DESCRIBE_TIMEOUT_MS}, when the inspected tab loads a new
+ * document (a reload or a navigation, even to the same URL), when its binding
+ * changes (another origin, the tab closed, the session ended) or when the panel
+ * unmounts — so the control can never stay busy forever and a late answer from
+ * an old document is never adopted. What the header shows of a target is a
+ * display copy with credential shapes redacted from every page-controlled
+ * field and URL query values masked (AAP 0.5.2); the store keeps, and the
+ * worker receives, the bounded descriptor itself.
+ *
+ * ## Service not running (AAP 0.7.3)
+ *
+ * `ConnectionStatus` always names the VS Code "Debug Generator: Start Local
+ * Service" action beside the "Service not running" pill; this file supplies the
+ * shell alternative, {@link SERVICE_START_COMMAND}, which is how the README
+ * starts the service by hand from the repository root.
+ *
+ * ## The drawer's parent chain
+ *
+ * The drawer states the selected event's lineage explicitly — a trace root, a
+ * complete chain, a parent that is not part of the capture, a search that
+ * stopped at its page budget, a loop, or a failed lookup — never an omitted
+ * section. Ancestors come from stored or streamed events only: the live tail,
+ * then the event's stored trace, which the data provider's `resolveEvent`
+ * pages within a budget per pass that the drawer can continue (see
+ * {@link EventDrawer}).
  *
  * ## Boundaries
  *
@@ -94,24 +162,23 @@
  * - No visual value: every gap is a `SpaceStep`, the drawer's width is a unitless
  *   `Split` pane weight, and every element with an appearance is a renderer
  *   primitive. The raw elements are the landmarks no primitive renders:
- *   `<main>`, `<aside>` and the live tail's `<section>`.
+ *   `<main>`, `<aside>` and the live tail's `<section>`; their only attributes
+ *   beyond landmark semantics and focus management are `inert` while the
+ *   pairing dialog is open.
  *
  * @module apps/chrome-extension/src/panel/App
  */
 
 import {
   Button,
-  DataProviderContext,
   ErrorState,
   LoadingState,
-  PanelSessionContext,
   Section,
   Split,
   Stack,
-  useQuery,
+  Text,
 } from '@debuggen/panel-renderer';
-import { DATA_QUERY_MAX_LIMIT } from '@debuggen/panel-schema';
-import type { DataQuery, EventRef } from '@debuggen/panel-schema';
+import type { EventRef } from '@debuggen/panel-schema';
 import type {
   ErrorPayload,
   ProgressStage,
@@ -120,19 +187,31 @@ import type {
   TelemetryEvent,
 } from '@debuggen/protocol';
 import { DebuggenError, assertNever } from '@debuggen/shared';
-import type { DebuggenErrorCode, SessionId } from '@debuggen/shared';
+import type { CaptureId, DebuggenErrorCode, SessionId } from '@debuggen/shared';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { KeyboardEvent as ReactKeyboardEvent, ReactElement } from 'react';
 
-import type { PanelConnectionStatus, PortRequestPayloads } from '../shared/messages';
+import { PAGE_RELOAD_ACTION_LABEL, parseSelectedTargetDescriptor } from '../shared/messages';
+import type {
+  PanelBindingState,
+  PanelConnectionStatus,
+  PanelReloadReason,
+  PanelReloadState,
+  PortRequestPayloads,
+} from '../shared/messages';
 
 import { createPanelActions } from './actions';
 import type { DevtoolsPanelActions } from './actions';
 import { CaptureControls } from './components/CaptureControls';
+import type { CaptureAction } from './components/CaptureControls';
 import { ConnectionStatus } from './components/ConnectionStatus';
 import { EmptyPanel } from './components/EmptyPanel';
 import { EventDetails } from './components/EventDetails';
-import type { EventDetailsError, EventDetailsStatus } from './components/EventDetails';
+import type {
+  EventAncestry,
+  EventDetailsError,
+  EventDetailsStatus,
+} from './components/EventDetails';
 import { Header } from './components/Header';
 import { LiveTail } from './components/LiveTail';
 import { PairDialog } from './components/PairDialog';
@@ -140,13 +219,26 @@ import { PanelView } from './components/PanelView';
 import type { PanelViewError, PanelViewStatus } from './components/PanelView';
 import { SessionSummary } from './components/SessionSummary';
 import { TargetPicker } from './components/TargetPicker';
-import { createPanelDataProvider } from './data-provider';
+import type { TargetPickerAction } from './components/TargetPicker';
+import {
+  buildEventParentChain,
+  createPanelDataProvider,
+  EVENT_RESOLUTION_MAX_EVENTS,
+} from './data-provider';
+import type {
+  PanelDataProvider,
+  PanelEventResolution,
+  PanelEventResolveOptions,
+} from './data-provider';
 import {
   getPanelConnection,
+  getPanelReloadState,
   onPortDisconnect,
   panelRequest,
+  panelRequestOwningSessionId,
   readInspectedTabId,
   startPanelConnection,
+  usePanelReloadState,
 } from './state/connection';
 import {
   getPanelSnapshot,
@@ -155,6 +247,7 @@ import {
   setLastError,
   setPendingTarget,
   setPickerActive,
+  subscribePanelStore,
   usePanelSnapshot,
 } from './state/session-store';
 import type { PanelInstrumentationFailure, PanelProgressEntry } from './state/session-store';
@@ -231,7 +324,47 @@ const FAILURE_LEADS = Object.freeze({
   captureStop: 'Could not stop the capture',
   pick: 'Could not change picker mode',
   useSelected: 'Could not use the selected element',
+  reloadPage: 'Could not reload the page',
 } as const);
+
+/**
+ * The reload notice's sentence for each reason the worker offers the reload
+ * (AAP §0.7.1 Group 2: readiness "asks for a one-click reload"). Keyed by the
+ * reason union, so a reason added to the contract is a compile error here
+ * rather than a notice with nothing to say.
+ */
+const PAGE_RELOAD_NOTICES: Readonly<Record<PanelReloadReason, string>> = Object.freeze({
+  'agent-missing':
+    'This page was opened before the Debug Generator extension was enabled, so its agent is not running in it. Reload it to continue.',
+  'hook-after-react':
+    'React loaded on this page before the Debug Generator hook, so its renders cannot be observed. Reload it to continue.',
+});
+
+/** The reload notice's sentence while the consented reload runs. */
+const PAGE_RELOADING_NOTICE =
+  'Reloading the page. The panel continues once the Debug Generator agent reports from it.';
+
+/** The reload control's label while the consented reload runs — the visible busy cue. */
+const PAGE_RELOADING_LABEL = 'Reloading page…';
+
+/**
+ * What follows the service's message when another session holds the project's
+ * capture (AAP §0.4.2: `capture.start` "answers `409 { owningSessionId }`"):
+ * the owner named, and the way out. {@link captureOwnerSentence} places the
+ * owner's id, in parentheses, between `lead` and `rest`.
+ */
+const CAPTURE_HELD_BY_OTHER_SESSION = Object.freeze({
+  lead: 'Another Debug Generator session',
+  rest: "holds this project's capture. Stop or end that session's capture, then start again.",
+} as const);
+
+/** The same sentence when the session named as the owner is this panel's own. */
+const CAPTURE_HELD_BY_THIS_SESSION =
+  "This session already holds this project's capture. Stop it before starting another.";
+
+/** Why the page reload could not be requested: this document inspects no page. */
+const NO_INSPECTED_PAGE_REASON =
+  'this panel is not inspecting a page. Open DevTools on the application tab, then reload from the Debug Generator panel.';
 
 /** Why a command that needs a session could not run: the panel shows none. */
 const NO_SESSION_REASON =
@@ -243,6 +376,16 @@ const EVENT_NOT_FOUND: EventDetailsError = Object.freeze({
   hint: 'Select the event again from the panel, or retry once the capture has been stored.',
 });
 
+/**
+ * The shell command that starts the local Debug Generator service, shown by
+ * `ConnectionStatus` beside the "Service not running" pill as the alternative
+ * to the VS Code "Debug Generator: Start Local Service" action. It is the
+ * README's manual start (run from the repository root, so the service reads
+ * the root `.env`), and it names the product's own build output — nothing from
+ * any inspected application (AAP 0.5.4).
+ */
+const SERVICE_START_COMMAND = 'node apps/local-service/dist/main.js';
+
 /** Why "Use selected element" could not describe the Elements panel's selection. */
 const SELECTION_NOT_DESCRIBED =
   'the element selected in the Elements panel could not be described. Select an element on a page the Debug Generator agent is running on (reload the page if it was open before the extension), then try again.';
@@ -251,17 +394,137 @@ const SELECTION_NOT_DESCRIBED =
 const DEVTOOLS_UNAVAILABLE = 'Chrome DevTools is not available to this panel.';
 
 /**
+ * The longest "Use selected element" waits for the inspected page to answer
+ * the `$0` evaluation, in milliseconds. A page that is navigating, compiling a
+ * Fast Refresh update or blocked by a long task can hold the answer; past this
+ * bound the control settles with {@link SELECTION_TIMED_OUT} instead of
+ * staying busy. The devtools page bounds its own background evaluation of the
+ * same expression more tightly, because nobody is waiting on that one; this
+ * one answers a press, so it allows a slow page a little longer.
+ */
+const SELECTION_DESCRIBE_TIMEOUT_MS = 5_000;
+
+/** Why "Use selected element" gave up on an evaluation that never answered. */
+const SELECTION_TIMED_OUT = `the inspected page did not describe its selected element within ${String(SELECTION_DESCRIBE_TIMEOUT_MS / 1_000)} seconds.`;
+
+/** What to do after an evaluation timed out. */
+const SELECTION_TIMED_OUT_HINT =
+  'Wait for the page to finish loading, select the element in the Elements panel again, then try again.';
+
+/** Why "Use selected element" stopped: the inspected tab's binding changed while it ran. */
+const SELECTION_PAGE_CHANGED =
+  'the inspected page changed while its selected element was being described. Select the element again in the Elements panel, then try again.';
+
+/** Why "Use selected element" discarded a description: the panel now shows another session. */
+const SELECTION_SESSION_CHANGED =
+  'the panel switched to another session while the element was being described. Try again for the session on screen.';
+
+/**
+ * The mask a displayed URL's query values and fragment take — AAP 0.5.2: URL
+ * query parameter values are "replaced with `?` per key for display and
+ * storage", keys and path retained. The same convention the telemetry
+ * redaction layer and the service worker apply to the URLs they handle.
+ */
+const DISPLAY_URL_MASK = '?';
+
+/** What a credential in a displayed field is replaced with; the product's redaction marker. */
+const DISPLAY_REDACTION_MARKER = '[redacted]';
+
+/** Base64url and opaque token body characters. */
+const DISPLAY_TOKEN_CHARS = '[A-Za-z0-9_-]';
+
+/**
+ * A credential prefix must start a token: the `sk-` inside a hyphenated class
+ * name or word (`desk-…`, `task-…`) is not a key prefix, and a selector must
+ * not be rewritten for one.
+ */
+const DISPLAY_TOKEN_START = '(?<![A-Za-z0-9_-])';
+
+/** One credential shape the header masks, and what replaces it. */
+interface DisplayRedactionRule {
+  /** A global pattern with only bounded or single-class quantifiers, so matching stays linear. */
+  readonly pattern: RegExp;
+  /** The replacement; `$1` keeps a captured scheme word or URL scheme. */
+  readonly replacement: string;
+}
+
+/**
+ * The credential shapes of the product's deny list (AAP 0.5.2, the rules of
+ * `packages/telemetry/src/redaction/rules.ts`) — private-key delimiters,
+ * connection-string userinfo, bearer credentials, JWT-shaped tokens and the
+ * `sk-`/`sk-ant-`/`ghp_`/`github_pat_`/`AKIA` provider prefixes — restated for
+ * display, because this workspace does not load the telemetry runtime
+ * (AAP 0.2.2 limits that edge to the agent bundle). Every prefix is assembled
+ * from pieces, as the repository's own secret gate assembles its patterns, so
+ * this file carries no contiguous credential prefix for that gate to report.
+ */
+const DISPLAY_CREDENTIAL_RULES: readonly DisplayRedactionRule[] = Object.freeze([
+  {
+    pattern: new RegExp('-{5}BEGIN [A-Z0-9 ]{0,40}' + 'PRIVATE' + ' KEY' + '(?: BLOCK)?-{5}', 'g'),
+    replacement: DISPLAY_REDACTION_MARKER,
+  },
+  {
+    pattern: /\b([a-z][a-z0-9+.-]{0,31}:\/\/)[^/\s:@]{1,256}:[^/\s@]{1,256}@/gi,
+    replacement: `$1${DISPLAY_REDACTION_MARKER}@`,
+  },
+  {
+    pattern: /\b(bearer)\s+[A-Za-z0-9._~+/=-]{8,}/gi,
+    replacement: `$1 ${DISPLAY_REDACTION_MARKER}`,
+  },
+  {
+    pattern: new RegExp(
+      DISPLAY_TOKEN_START +
+        'ey' +
+        'J' +
+        DISPLAY_TOKEN_CHARS +
+        '{8,}\\.' +
+        DISPLAY_TOKEN_CHARS +
+        '{4,}(?:\\.' +
+        DISPLAY_TOKEN_CHARS +
+        '*)?',
+      'g',
+    ),
+    replacement: DISPLAY_REDACTION_MARKER,
+  },
+  {
+    pattern: new RegExp(
+      DISPLAY_TOKEN_START +
+        '(?:' +
+        ['s' + 'k-(?:ant-)?' + DISPLAY_TOKEN_CHARS + '{16,}', 'gh' + 'p_[A-Za-z0-9_]{16,}'].join(
+          '|',
+        ) +
+        '|' +
+        ['git' + 'hub_pat_[A-Za-z0-9_]{16,}', 'AK' + 'IA[0-9A-Z]{12,}'].join('|') +
+        ')',
+      'g',
+    ),
+    replacement: DISPLAY_REDACTION_MARKER,
+  },
+]);
+
+/**
+ * A dense run of 16 or more token characters in free text: the shape of an
+ * opaque secret no prefix identifies. A single character class with only a
+ * lower bound, so matching is linear on any input.
+ */
+const DENSE_RUN_PATTERN = /[A-Za-z0-9_+/=.~-]{16,}/g;
+
+/** A decimal digit: a dense run carrying one is treated as a secret, not as a long word. */
+const DIGIT_PATTERN = /[0-9]/;
+
+/**
  * The expression "Use selected element" evaluates in the inspected page with
  * `chrome.devtools.inspectedWindow.eval`.
  *
  * `$0` is DevTools' handle on the Elements panel's current selection, and
  * `describeTarget` is the function the MAIN-world telemetry agent publishes on
  * its helper global exactly so that this evaluation can reach it: it returns
- * the five-field, already-redacted `SelectedTarget` descriptor, or nothing when
- * the selection is not an element or the agent is not attached. The expression
- * answers `null` in every case where there is no descriptor, because
- * `inspectedWindow.eval` transports JSON-compliant values only and `undefined`
- * is not one.
+ * the five-field `SelectedTarget` descriptor, or nothing when the selection is
+ * not an element or the agent is not attached. The expression answers `null` in
+ * every case where there is no descriptor, because `inspectedWindow.eval`
+ * transports JSON-compliant values only and `undefined` is not one. Whatever
+ * it answers is untrusted — the page can replace the helper — and is parsed by
+ * `parseSelectedTargetDescriptor` before use.
  */
 const DESCRIBE_SELECTION_EXPRESSION = [
   '(function () {',
@@ -281,11 +544,6 @@ const DESCRIBE_SELECTION_EXPRESSION = [
 /** Whether a value is a non-null, non-array object whose members can be read. */
 function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-/** Whether a value is a string with at least one non-whitespace character. */
-function isFilledString(value: unknown): value is string {
-  return typeof value === 'string' && value.trim() !== '';
 }
 
 /**
@@ -343,6 +601,41 @@ function failurePayload(
 /** Surface a failed command through the store's non-blocking `lastError`. */
 function reportFailure(lead: string, cause: unknown, fallbackCode: DebuggenErrorCode): void {
   setLastError(failurePayload(lead, cause, fallbackCode));
+}
+
+/**
+ * The sentence that names the session holding the project's capture.
+ *
+ * @param owningSessionId The owner the service's conflict named.
+ * @param sessionId The session this panel asked to capture for.
+ */
+function captureOwnerSentence(owningSessionId: SessionId, sessionId: SessionId): string {
+  return owningSessionId === sessionId
+    ? CAPTURE_HELD_BY_THIS_SESSION
+    : `${CAPTURE_HELD_BY_OTHER_SESSION.lead} (${owningSessionId}) ${CAPTURE_HELD_BY_OTHER_SESSION.rest}`;
+}
+
+/**
+ * The store record of a "Start capture" that failed: the generic record of
+ * {@link failurePayload}, or — when the service refused because a session
+ * already holds the project's capture — that record with the owner named and
+ * `ref` set to the owner's id, since the owning session is what this error is
+ * about and `ref` is the payload's correlation field.
+ *
+ * @param sessionId The session the start was requested for.
+ * @param cause What the `capture.start` request rejected with.
+ */
+function captureStartFailurePayload(sessionId: SessionId, cause: unknown): ErrorPayload {
+  const failure = failurePayload(FAILURE_LEADS.captureStart, cause, 'TRANSPORT_DISCONNECTED');
+  const owningSessionId = panelRequestOwningSessionId(cause);
+  if (owningSessionId === undefined) {
+    return failure;
+  }
+  return Object.freeze({
+    code: failure.code,
+    message: `${failure.message} ${captureOwnerSentence(owningSessionId, sessionId)}`,
+    ref: owningSessionId,
+  });
 }
 
 /**
@@ -441,65 +734,253 @@ function generationStatus(status: SessionStatus | undefined): PanelViewStatus {
 }
 
 /**
- * The `SelectedTarget` an evaluation of {@link DESCRIBE_SELECTION_EXPRESSION}
- * answered, or `undefined` when it answered anything else.
+ * A page-controlled display field with every credential shape of
+ * {@link DISPLAY_CREDENTIAL_RULES} replaced, everything else kept byte for
+ * byte — which is what keeps a selector naming the element it named.
  *
- * The value crossed from the inspected page, which this extension does not
- * control, so it is checked field by field and rebuilt with exactly the five
- * keys of the descriptor: `selector`, `tagName`, the optional `text`,
- * `componentChain` (nearest first, possibly empty) and `url`. Bounds and
- * character rules are the service's schema's to enforce; a descriptor it
- * refuses comes back as a typed failure.
+ * A display guard, not the product's redaction layer. The agent already
+ * scrubbed its descriptor through `packages/telemetry/src/redaction/` and the
+ * service redacts before it stores or sends anything, but the panel cannot rely
+ * on either for what it paints: the answer came from a page that may have
+ * replaced the agent's helper.
  *
- * @param value What the evaluation returned.
+ * @param value A bounded single-line field of the descriptor.
  */
-function toSelectedTarget(value: unknown): SelectedTarget | undefined {
-  if (!isRecord(value)) {
-    return undefined;
+function redactCredentials(value: string): string {
+  let output = value;
+  for (const rule of DISPLAY_CREDENTIAL_RULES) {
+    output = output.replace(rule.pattern, rule.replacement);
   }
-  const { selector, tagName, text, componentChain, url } = value;
-  if (!isFilledString(selector) || !isFilledString(tagName) || !isFilledString(url)) {
-    return undefined;
-  }
-  if (!Array.isArray(componentChain)) {
-    return undefined;
-  }
-  const entries: readonly unknown[] = componentChain;
-  const chain: string[] = [];
-  for (const name of entries) {
-    if (!isFilledString(name)) {
-      return undefined;
-    }
-    chain.push(name);
-  }
-  if (text !== undefined && !isFilledString(text)) {
-    return undefined;
-  }
-  return text === undefined
-    ? { selector, tagName, componentChain: chain, url }
-    : { selector, tagName, text, componentChain: chain, url };
+  return output;
 }
 
-/** Whether two descriptors name the same element on the same document. */
-function sameTargetIdentity(left: SelectedTarget, right: SelectedTarget): boolean {
-  return (
-    left.selector === right.selector && left.url === right.url && left.tagName === right.tagName
+/**
+ * Element text as the header shows it: {@link redactCredentials}, then every
+ * dense run of 16 or more token characters that carries a digit — an opaque
+ * secret no prefix identifies — replaced by the redaction marker. A long word
+ * without a digit is left alone, so ordinary labels read unchanged.
+ *
+ * @param text The descriptor's `text`, already a bounded single line.
+ */
+function redactDisplayText(text: string): string {
+  return redactCredentials(text).replace(DENSE_RUN_PATTERN, (run) =>
+    DIGIT_PATTERN.test(run) ? DISPLAY_REDACTION_MARKER : run,
   );
 }
 
 /**
- * Evaluate {@link DESCRIBE_SELECTION_EXPRESSION} in the inspected page.
- *
- * Resolves with the descriptor, or `undefined` when the selection could not be
- * described; rejects with a typed failure when DevTools is not available or the
- * evaluation itself failed. Never throws synchronously.
+ * One `key=value` query pair as the header shows it: the key with its
+ * credential shapes redacted, the value masked; a bare flag and an empty value
+ * keep their form.
  */
-function describeSelectedElement(): Promise<SelectedTarget | undefined> {
-  return new Promise((resolve, reject) => {
+function maskQueryPair(pair: string): string {
+  const separator = pair.indexOf('=');
+  if (separator === -1) {
+    return redactCredentials(pair);
+  }
+  const key = redactCredentials(pair.slice(0, separator));
+  return separator === pair.length - 1 ? `${key}=` : `${key}=${DISPLAY_URL_MASK}`;
+}
+
+/**
+ * A descriptor URL as the header shows it, following the product's URL
+ * redaction (AAP 0.5.2; `packages/telemetry/src/redaction/url.ts`): scheme,
+ * host and port kept; userinfo replaced whole by the redaction marker, keeping
+ * the `@`; the path kept with its credential shapes redacted; every query key
+ * kept in order with its credential shapes redacted and every value replaced by
+ * {@link DISPLAY_URL_MASK}; a non-empty fragment masked. A value that does not
+ * parse — which the shared parser never lets through — shows as the redaction
+ * marker rather than verbatim.
+ *
+ * @param url The descriptor's `url`, as the page or the service supplied it.
+ */
+function maskUrlForDisplay(url: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return DISPLAY_REDACTION_MARKER;
+  }
+  const userinfo =
+    parsed.username !== '' || parsed.password !== '' ? `${DISPLAY_REDACTION_MARKER}@` : '';
+  const query =
+    parsed.search.length > 1
+      ? `?${parsed.search.slice(1).split('&').map(maskQueryPair).join('&')}`
+      : '';
+  const fragment = parsed.hash.length > 1 ? `#${DISPLAY_URL_MASK}` : '';
+  const path = redactCredentials(parsed.pathname);
+  return `${parsed.protocol}//${userinfo}${parsed.host}${path}${query}${fragment}`;
+}
+
+/**
+ * The target the header shows: the descriptor bounded by the shared parser —
+ * so a confirmed target relayed from the service is held to the same bounds as
+ * an optimistic pick — with every page-controlled field prepared for display:
+ * credential shapes redacted from the selector, the tag name and each
+ * component name ({@link redactCredentials}), from the text together with
+ * opaque dense runs ({@link redactDisplayText}), and the URL masked
+ * ({@link maskUrlForDisplay}). Nothing else is rewritten: the selector and the
+ * chain identify the element, and a selector changed for any other reason
+ * could name a different one.
+ *
+ * @param target The pending pick, or the session's confirmed target.
+ * @returns The display copy, or `undefined` when there is none or it is refused.
+ */
+function toDisplayTarget(target: SelectedTarget | undefined): SelectedTarget | undefined {
+  const bounded = target === undefined ? undefined : parseSelectedTargetDescriptor(target);
+  if (bounded === undefined) {
+    return undefined;
+  }
+  const shown = {
+    selector: redactCredentials(bounded.selector),
+    tagName: redactCredentials(bounded.tagName),
+    componentChain: bounded.componentChain.map(redactCredentials),
+    url: maskUrlForDisplay(bounded.url),
+  };
+  return bounded.text === undefined ? shown : { ...shown, text: redactDisplayText(bounded.text) };
+}
+
+/**
+ * A comparable identity of the inspected tab's binding: it changes when the
+ * tab navigates (a new URL), leaves the session's origin, closes or is unbound
+ * — every event after which an in-flight description of `$0` describes a page
+ * that is no longer the one the developer is looking at.
+ *
+ * @param binding The store's binding state.
+ */
+function bindingIdentity(binding: PanelBindingState): string {
+  switch (binding.kind) {
+    case 'unbound':
+      return 'unbound';
+    case 'bound':
+      return `bound\n${binding.sessionId}\n${String(binding.tabId)}\n${binding.url}`;
+    case 'tab-left':
+      return `tab-left\n${binding.origin}\n${binding.sessionId ?? ''}`;
+    default:
+      return assertNever(binding, 'Unhandled binding state in the panel');
+  }
+}
+
+/**
+ * Whether two descriptors are the same selection: all five fields equal, the
+ * component chain element-wise and in order. Exact, because both sides are the
+ * very descriptor this panel set as pending, so the pick it retracts is the
+ * one it sent and never a later pick of the same element whose text or chain
+ * differs.
+ */
+function sameTargetIdentity(left: SelectedTarget, right: SelectedTarget): boolean {
+  return (
+    left.selector === right.selector &&
+    left.url === right.url &&
+    left.tagName === right.tagName &&
+    left.text === right.text &&
+    left.componentChain.length === right.componentChain.length &&
+    left.componentChain.every((name, index) => name === right.componentChain[index])
+  );
+}
+
+/**
+ * Whether an `inspectedWindow.eval` callback's second argument reports a
+ * failure: an `isError` record (the evaluation could not run) or an
+ * `isException` record (the expression threw). Anything else — `undefined` on
+ * success, as Chrome passes it — is a success.
+ */
+function isEvalFailure(exceptionInfo: unknown): boolean {
+  return (
+    isRecord(exceptionInfo) &&
+    (exceptionInfo.isError === true || exceptionInfo.isException === true)
+  );
+}
+
+/** Why an in-flight description of `$0` was abandoned before it settled. */
+type DescriptionCancellation =
+  /**
+   * The page being described is no longer the page on screen: the inspected
+   * tab loaded a new document (a same-URL reload included), or its binding
+   * changed because it navigated, left, closed or was unbound.
+   */
+  | 'page-changed'
+  /** A newer description replaced this one. */
+  | 'superseded'
+  /** The panel unmounted; nothing is left to report to. */
+  | 'unmounted';
+
+/** How one description of `$0` settled. */
+type DescriptionOutcome =
+  | { readonly kind: 'described'; readonly target: SelectedTarget }
+  | { readonly kind: 'failed'; readonly error: DebuggenError }
+  | { readonly kind: 'cancelled'; readonly reason: DescriptionCancellation };
+
+/** The description in flight, while there is one; cancelling settles it at once. */
+let activeDescription: { readonly cancel: (reason: DescriptionCancellation) => void } | undefined;
+
+/**
+ * Settle the description in flight, if any, as cancelled. Called when the
+ * inspected tab loads a new document, when its binding changes, and when the
+ * panel unmounts.
+ *
+ * @param reason Why it is abandoned.
+ */
+function cancelActiveDescription(reason: DescriptionCancellation): void {
+  activeDescription?.cancel(reason);
+}
+
+/** A failed description, classified as the agent not being able to answer. */
+function descriptionFailure(message: string, hint?: string): DescriptionOutcome {
+  return {
+    kind: 'failed',
+    error: new DebuggenError('AGENT_NOT_READY', message, hint === undefined ? {} : { hint }),
+  };
+}
+
+/**
+ * Evaluate {@link DESCRIBE_SELECTION_EXPRESSION} in the inspected page and
+ * parse the answer with the shared bounded descriptor parser.
+ *
+ * Settles exactly once, and never rejects or throws: with the bounded
+ * descriptor; with a typed failure when DevTools is absent, the evaluation
+ * errored or threw, the answer was refused, or no answer arrived within
+ * {@link SELECTION_DESCRIBE_TIMEOUT_MS}; or as cancelled through
+ * {@link cancelActiveDescription}. Whichever comes first wins, and a late
+ * callback after that is ignored. Starting a description supersedes one still
+ * in flight.
+ *
+ * No options are passed to `eval`: `useContentScriptContext` would select the
+ * ISOLATED world, where neither `$0` nor the agent's helper exists.
+ */
+function describeSelectedElement(): Promise<DescriptionOutcome> {
+  return new Promise<DescriptionOutcome>((resolve) => {
     if (!isDevtoolsAvailable()) {
-      reject(new DebuggenError('AGENT_NOT_READY', DEVTOOLS_UNAVAILABLE));
+      resolve(descriptionFailure(DEVTOOLS_UNAVAILABLE));
       return;
     }
+    let settled = false;
+    // `settle` and `cancel` run only after `timer` below is initialised: the
+    // timer, the eval callback and a cancellation are all later events, and
+    // the synchronous `catch` runs after the timer was scheduled.
+    const handle = {
+      cancel: (reason: DescriptionCancellation): void => {
+        settle({ kind: 'cancelled', reason });
+      },
+    };
+    const settle = (outcome: DescriptionOutcome): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      window.clearTimeout(timer);
+      if (activeDescription === handle) {
+        activeDescription = undefined;
+      }
+      resolve(outcome);
+    };
+
+    cancelActiveDescription('superseded');
+    activeDescription = handle;
+    const timer = window.setTimeout(() => {
+      settle(descriptionFailure(SELECTION_TIMED_OUT, SELECTION_TIMED_OUT_HINT));
+    }, SELECTION_DESCRIBE_TIMEOUT_MS);
+
     try {
       chrome.devtools.inspectedWindow.eval<unknown>(
         DESCRIBE_SELECTION_EXPRESSION,
@@ -507,31 +988,104 @@ function describeSelectedElement(): Promise<SelectedTarget | undefined> {
           result: unknown,
           exceptionInfo?: chrome.devtools.inspectedWindow.EvaluationExceptionInfo,
         ) => {
-          if (exceptionInfo !== undefined) {
-            reject(new DebuggenError('AGENT_NOT_READY', SELECTION_NOT_DESCRIBED));
+          if (isEvalFailure(exceptionInfo)) {
+            settle(descriptionFailure(SELECTION_NOT_DESCRIBED));
             return;
           }
-          resolve(toSelectedTarget(result));
+          const target = parseSelectedTargetDescriptor(result);
+          settle(
+            target === undefined
+              ? descriptionFailure(SELECTION_NOT_DESCRIBED)
+              : { kind: 'described', target },
+          );
         },
       );
     } catch (cause: unknown) {
-      reject(DebuggenError.from(cause, 'AGENT_NOT_READY'));
+      settle({ kind: 'failed', error: DebuggenError.from(cause, 'AGENT_NOT_READY') });
     }
   });
 }
 
 /**
- * The query that resolves the drawer's selected event: every stored event of
- * the selection's trace when its trace is known — one query yields the event
- * and its whole ancestry — and otherwise the first page of the capture's
- * events. The page is the largest the protocol permits, so a trace fits in one.
- *
- * @param traceId The selection's trace, when known.
+ * DevTools' "the inspected window navigated to a new page" event, when this
+ * document has one: `chrome.devtools.network.onNavigated`, which fires for
+ * every new document of the inspected tab — a reload and a navigation to the
+ * very same URL included. `undefined` outside DevTools, or where the host
+ * exposes no such event; read structurally, so it never throws.
  */
-function eventResolutionQuery(traceId: string | undefined): DataQuery & { source: 'events' } {
-  return traceId === undefined
-    ? { source: 'events', limit: DATA_QUERY_MAX_LIMIT }
-    : { source: 'events', filter: { traceId }, limit: DATA_QUERY_MAX_LIMIT };
+function readInspectedNavigationEvent(): chrome.events.Event<(url: string) => void> | undefined {
+  try {
+    const devtools = readDevtools();
+    if (!isRecord(devtools) || !isRecord(devtools.network)) {
+      return undefined;
+    }
+    const event = devtools.network.onNavigated;
+    return isRecord(event) &&
+      typeof event.addListener === 'function' &&
+      typeof event.removeListener === 'function'
+      ? chrome.devtools.network.onNavigated
+      : undefined;
+  } catch {
+    // A DevTools API that throws on access is as absent as one that is missing.
+    return undefined;
+  }
+}
+
+/**
+ * Call `onNavigated` when the inspected tab loads a new document, until the
+ * returned function stops watching. A no-op pair outside DevTools.
+ *
+ * @param onNavigated What to do on the next navigation.
+ * @returns The function that removes the listener; safe to call once.
+ */
+function watchInspectedNavigation(onNavigated: () => void): () => void {
+  const event = readInspectedNavigationEvent();
+  if (event === undefined) {
+    return () => undefined;
+  }
+  const listener = (): void => {
+    onNavigated();
+  };
+  try {
+    event.addListener(listener);
+  } catch {
+    // A listener DevTools refused cannot fire; the evaluation's deadline still bounds the wait.
+    return () => undefined;
+  }
+  return () => {
+    try {
+      event.removeListener(listener);
+    } catch {
+      // The DevTools context is already gone, and its listeners with it.
+    }
+  };
+}
+
+/**
+ * Describe `$0` for the session on screen, abandoning the evaluation the
+ * moment the page being described stops being the page on screen: when the
+ * inspected tab loads a new document — DevTools' navigation event, which fires
+ * for a reload and for a navigation to the same URL, so a late answer from the
+ * old document is never adopted for the new one — and when the tab's binding
+ * changes, which a different origin, the tab closing or the session ending all
+ * do.
+ */
+async function describeForCurrentBinding(): Promise<DescriptionOutcome> {
+  const startedFor = bindingIdentity(getPanelSnapshot().connection.binding);
+  const stopWatchingBinding = subscribePanelStore(() => {
+    if (bindingIdentity(getPanelSnapshot().connection.binding) !== startedFor) {
+      cancelActiveDescription('page-changed');
+    }
+  });
+  const stopWatchingNavigation = watchInspectedNavigation(() => {
+    cancelActiveDescription('page-changed');
+  });
+  try {
+    return await describeSelectedElement();
+  } finally {
+    stopWatchingNavigation();
+    stopWatchingBinding();
+  }
 }
 
 /** The event with `eventId` in `events`, or `undefined`. */
@@ -543,40 +1097,72 @@ function findEvent(
 }
 
 /**
- * The selected event's ancestors, from the trace root to its immediate parent,
- * built only from stored events — never synthesised from `parentSpanId` alone.
- *
- * A root event answers an empty chain. When an ancestor is missing from
- * `pool` (a partial page, or a parent that never arrived), the chain cannot be
- * stated from the root and `undefined` is answered, so the drawer omits the
- * section rather than presenting a fragment as the whole lineage.
- *
- * @param event The selected event.
- * @param pool Stored events to look ancestors up in.
+ * Where walking up from the selected event through its recorded parents
+ * stopped. `ancestors` always runs from the topmost ancestor found down to the
+ * event's immediate parent — the order `EventAncestry` carries.
  */
-function buildParentChain(
-  event: TelemetryEvent,
-  pool: readonly TelemetryEvent[],
-): readonly TelemetryEvent[] | undefined {
+type ChainWalk =
+  | { readonly kind: 'complete'; readonly ancestors: readonly TelemetryEvent[] }
+  | {
+      readonly kind: 'broken';
+      /** The first span id on the way up that no event in the pool carries. */
+      readonly missingSpanId: string;
+      readonly ancestors: readonly TelemetryEvent[];
+    }
+  | { readonly kind: 'cycle'; readonly ancestors: readonly TelemetryEvent[] };
+
+/**
+ * The spans of `traceId` in `pools`, keyed by span id. The first event seen for
+ * a span wins, so the stored capture — passed first — outranks the live tail.
+ *
+ * @param traceId The trace whose spans are indexed; other traces are skipped.
+ * @param pools Event lists, in priority order.
+ */
+function indexTraceSpans(
+  traceId: string,
+  pools: readonly (readonly TelemetryEvent[])[],
+): ReadonlyMap<string, TelemetryEvent> {
   const bySpan = new Map<string, TelemetryEvent>();
-  for (const candidate of pool) {
-    if (candidate.traceId === event.traceId && !bySpan.has(candidate.spanId)) {
-      bySpan.set(candidate.spanId, candidate);
+  for (const pool of pools) {
+    for (const candidate of pool) {
+      if (candidate.traceId === traceId && !bySpan.has(candidate.spanId)) {
+        bySpan.set(candidate.spanId, candidate);
+      }
     }
   }
-  const chain: TelemetryEvent[] = [];
+  return bySpan;
+}
+
+/**
+ * Walk from `event` up through its recorded parents, using only events that
+ * were actually stored or streamed — the chain is never synthesised from
+ * `parentSpanId` alone.
+ *
+ * @param event The selected event.
+ * @param bySpan The event's trace, indexed by {@link indexTraceSpans}.
+ * @returns A complete chain for a trace root reached (empty for a root event),
+ * the first missing span with the chain below it, or a loop.
+ */
+function walkAncestors(
+  event: TelemetryEvent,
+  bySpan: ReadonlyMap<string, TelemetryEvent>,
+): ChainWalk {
+  const upward: TelemetryEvent[] = [];
   const visited = new Set<string>([event.spanId]);
   let parentSpanId = event.parentSpanId;
   while (parentSpanId !== undefined) {
+    if (visited.has(parentSpanId)) {
+      return { kind: 'cycle', ancestors: upward.reverse() };
+    }
     const parent = bySpan.get(parentSpanId);
-    if (parent === undefined || visited.has(parentSpanId)) {
-      return undefined;
+    if (parent === undefined) {
+      return { kind: 'broken', missingSpanId: parentSpanId, ancestors: upward.reverse() };
     }
     visited.add(parentSpanId);
-    chain.push(parent);
+    upward.push(parent);
     parentSpanId = parent.parentSpanId;
   }
-  return chain.reverse();
+  return { kind: 'complete', ancestors: upward.reverse() };
 }
 
 /*
@@ -590,7 +1176,11 @@ function buildParentChain(
  * ===========================================================================
  */
 
-/** "Start capture": the worker calls the service's capture-start route for the session. */
+/**
+ * "Start capture": the worker calls the service's capture-start route for the
+ * session. A refusal because another session holds the project's capture
+ * names that session ({@link captureStartFailurePayload}).
+ */
 async function startCapture(): Promise<void> {
   const sessionId = requireSession(FAILURE_LEADS.captureStart);
   if (sessionId === undefined) {
@@ -601,7 +1191,7 @@ async function startCapture(): Promise<void> {
     // push, which is what the store records; the answer itself adds nothing.
     await panelRequest('capture.start', { sessionId });
   } catch (cause: unknown) {
-    reportFailure(FAILURE_LEADS.captureStart, cause, 'TRANSPORT_DISCONNECTED');
+    setLastError(captureStartFailurePayload(sessionId, cause));
   }
 }
 
@@ -620,9 +1210,125 @@ async function stopCapture(): Promise<void> {
 }
 
 /**
+ * One period of picker mode being on, and which route armed it: `panel` when
+ * "Pick element" turned it on (and {@link togglePicker} arms it), `service`
+ * when the service's relayed `target.request` did (and
+ * {@link armServiceRequestedPicker} arms it). Compared by identity, so a late
+ * answer is only ever applied to the activation that asked.
+ */
+interface PickerActivation {
+  readonly armedBy: 'panel' | 'service';
+}
+
+/**
+ * The picker-mode activation on screen, or `undefined` while picker mode is
+ * off. Owned by {@link followPickerMode}, which clears it whenever the store's
+ * `target.pickRequested` is off, and claimed by {@link togglePicker} before it
+ * turns picker mode on — which is what arms each activation exactly once.
+ */
+let currentPickerActivation: PickerActivation | undefined;
+
+/** Why a service-requested picker mode ended: the worker answered it inactive. */
+const PICKER_NOT_ENTERED =
+  'the inspected page did not enter picker mode. Reload the application page, or select the element in the Elements panel and press "Use selected element".';
+
+/**
+ * Arm the picker mode the service asked for — the relayed `target.request`
+ * that turned the store's `pickRequested` on (AAP §0.4.2: it "asks the panel to
+ * enter picker mode"). The panel is the one arming authority, so this sends the
+ * same `target.pick { enabled: true }` "Pick element" sends; the worker arms
+ * nothing on its own.
+ *
+ * On a refusal (`AGENT_NOT_READY` when no page agent is connected), an inactive
+ * answer or a lost request, picker mode is left again — while this activation
+ * is still the one on screen for the same session — and the failure is
+ * surfaced through `lastError`, so a request that armed nothing never looks
+ * armed (AAP §0.5.5). Never rejects.
+ *
+ * @param activation The activation {@link followPickerMode} opened for it.
+ */
+async function armServiceRequestedPicker(activation: PickerActivation): Promise<void> {
+  const sessionId = getSessionId();
+  const stillOn = (): boolean =>
+    currentPickerActivation === activation &&
+    getSessionId() === sessionId &&
+    getPanelSnapshot().target.pickRequested;
+  const leavePickerMode = (cause: unknown): void => {
+    if (!stillOn()) {
+      return;
+    }
+    setPickerActive(false);
+    reportFailure(FAILURE_LEADS.pick, cause, 'AGENT_NOT_READY');
+  };
+
+  if (sessionId === undefined) {
+    leavePickerMode(new DebuggenError('TAB_NOT_BOUND', NO_SESSION_REASON));
+    return;
+  }
+  try {
+    const { active } = await panelRequest('target.pick', { sessionId, enabled: true });
+    if (!active) {
+      leavePickerMode(new DebuggenError('AGENT_NOT_READY', PICKER_NOT_ENTERED));
+    }
+  } catch (cause: unknown) {
+    leavePickerMode(cause);
+  }
+}
+
+/**
+ * The store listener behind service-requested picker mode: picker mode turned
+ * off closes the current activation; picker mode on with no activation open is
+ * the service's request — "Pick element" claims its activation before it turns
+ * picker mode on — so one is opened and armed. Idempotent per store state, so
+ * a repeated notification or a StrictMode re-subscription arms nothing twice.
+ */
+function followPickerMode(): void {
+  if (!getPanelSnapshot().target.pickRequested) {
+    currentPickerActivation = undefined;
+    return;
+  }
+  if (currentPickerActivation !== undefined) {
+    return;
+  }
+  const activation: PickerActivation = { armedBy: 'service' };
+  currentPickerActivation = activation;
+  void armServiceRequestedPicker(activation);
+}
+
+/**
+ * Follow the store's picker mode for the life of the panel: returns the
+ * unsubscribe, for an effect's cleanup. The current state is applied at once,
+ * so a request the store recorded before the panel mounted is armed too.
+ */
+function watchPickerMode(): () => void {
+  const unsubscribe = subscribePanelStore(followPickerMode);
+  followPickerMode();
+  return unsubscribe;
+}
+
+/**
+ * `CaptureControls`' root reporter: a start or stop callback that threw or
+ * rejected despite catching its own failures above is presented through the
+ * same non-blocking notice, under the lead of the action that failed, and never
+ * escapes as an unhandled rejection.
+ *
+ * @param cause What the callback threw or rejected with.
+ * @param action The capture action that failed.
+ */
+function reportCaptureActionError(cause: unknown, action: CaptureAction): void {
+  reportFailure(
+    action === 'start' ? FAILURE_LEADS.captureStart : FAILURE_LEADS.captureStop,
+    cause,
+    'INTERNAL',
+  );
+}
+
+/**
  * "Pick element": toggle picker mode. The new state is shown at once through
  * the store, relayed as the worker's `target.pick` request, and corrected to
  * the worker's answer — or restored — while nothing else has changed it since.
+ * Turning it on claims the activation first, so the store listener that arms a
+ * service-requested picker mode does not arm this one a second time.
  */
 async function togglePicker(): Promise<void> {
   const sessionId = requireSession(FAILURE_LEADS.pick);
@@ -631,6 +1337,9 @@ async function togglePicker(): Promise<void> {
   }
   const wasActive = getPanelSnapshot().target.pickRequested;
   const enabled = !wasActive;
+  if (enabled) {
+    currentPickerActivation = { armedBy: 'panel' };
+  }
   setPickerActive(enabled);
 
   // Whether the optimistic state is still the one on screen for this session:
@@ -654,8 +1363,21 @@ async function togglePicker(): Promise<void> {
 /**
  * "Use selected element": describe the Elements panel's `$0` through the page
  * agent, show it at once as the optimistic target, and forward it as the
- * worker's `target.selected` request. A refusal clears the optimistic target
- * again, while it is still the one on screen.
+ * worker's `target.selected` request.
+ *
+ * The pick stays pending — `TargetPicker` renders busy — until the worker
+ * answers with the service's verdict, not merely the send: acceptance is the
+ * `session.updated` carrying the pick, which the store reconciles into the
+ * confirmed target; a refusal (`TAB_NOT_BOUND` for a stale or foreign pick) or
+ * a lost frame (`TRANSPORT_DISCONNECTED`) rejects. A rejection clears the
+ * optimistic target again only while it is still the one on screen — same
+ * session, and the pending target is this exact pick.
+ *
+ * Nothing is shown before the answer passed the shared bounded parser: an
+ * answer it refuses, an evaluation that failed or timed out, and one abandoned
+ * because the page changed are each reported through `lastError` and leave
+ * the target as it was. A description the panel unmounted or superseded is
+ * dropped silently — nobody is waiting for it.
  */
 async function adoptSelectedElement(): Promise<void> {
   const sessionId = requireSession(FAILURE_LEADS.useSelected);
@@ -663,32 +1385,44 @@ async function adoptSelectedElement(): Promise<void> {
     return;
   }
 
-  let target: SelectedTarget | undefined;
-  try {
-    target = await describeSelectedElement();
-  } catch (cause: unknown) {
-    reportFailure(FAILURE_LEADS.useSelected, cause, 'AGENT_NOT_READY');
+  const outcome = await describeForCurrentBinding();
+  if (outcome.kind === 'cancelled') {
+    if (outcome.reason === 'page-changed') {
+      setLastError(
+        Object.freeze({
+          code: 'AGENT_NOT_READY',
+          message: `${FAILURE_LEADS.useSelected}: ${SELECTION_PAGE_CHANGED}`,
+        }),
+      );
+    }
     return;
   }
-  if (target === undefined) {
+  if (outcome.kind === 'failed') {
+    reportFailure(FAILURE_LEADS.useSelected, outcome.error, 'AGENT_NOT_READY');
+    return;
+  }
+  if (getSessionId() !== sessionId) {
     setLastError(
       Object.freeze({
-        code: 'AGENT_NOT_READY',
-        message: `${FAILURE_LEADS.useSelected}: ${SELECTION_NOT_DESCRIBED}`,
+        code: 'TAB_NOT_BOUND',
+        message: `${FAILURE_LEADS.useSelected}: ${SELECTION_SESSION_CHANGED}`,
       }),
     );
     return;
   }
 
-  const picked = target;
+  const picked = outcome.target;
   setPendingTarget(picked);
-  const withdraw = (): void => {
+  // Whether this pick is still the optimistic target on screen: a confirmed
+  // record, the session ending or a rebind may have moved it on.
+  const stillPending = (): boolean => {
     const pending = getPanelSnapshot().target.pending;
-    if (
-      getSessionId() === sessionId &&
-      pending !== undefined &&
-      sameTargetIdentity(pending, picked)
-    ) {
+    return (
+      getSessionId() === sessionId && pending !== undefined && sameTargetIdentity(pending, picked)
+    );
+  };
+  const withdraw = (): void => {
+    if (stillPending()) {
       setPendingTarget(undefined);
     }
   };
@@ -702,6 +1436,14 @@ async function adoptSelectedElement(): Promise<void> {
         new DebuggenError('TRANSPORT_DISCONNECTED', 'the service did not accept the element.'),
         'TRANSPORT_DISCONNECTED',
       );
+      return;
+    }
+    // Accepted. The confirming `session.updated` normally reached the store
+    // first and cleared the pick; when the worker confirmed it by reading the
+    // session back, this panel never saw that record, so it re-reads it too
+    // and the confirmed target replaces the pick.
+    if (stillPending()) {
+      reloadSessionState();
     }
   } catch (cause: unknown) {
     withdraw();
@@ -710,12 +1452,29 @@ async function adoptSelectedElement(): Promise<void> {
 }
 
 /**
+ * `TargetPicker`'s error sink: a failure one of its callbacks raised despite
+ * catching its own, surfaced through `lastError` under that control's lead.
+ * Never throws, which is the contract `onActionError` states.
+ *
+ * @param action The control whose callback failed.
+ * @param cause What it threw or rejected with.
+ */
+function reportTargetActionFailure(action: TargetPickerAction, cause: unknown): void {
+  reportFailure(
+    action === 'pick' ? FAILURE_LEADS.pick : FAILURE_LEADS.useSelected,
+    cause,
+    'INTERNAL',
+  );
+}
+
+/**
  * `PairDialog`'s submit: redeem the one-time code through the worker, which
  * keeps the credential it receives. Rejects with the worker's typed failure so
  * the dialog shows it in place — the dialog owns that promise and never lets
  * it escape — and resolves on `{ paired: true }`.
  *
- * @param code The trimmed, non-empty code the developer typed.
+ * @param code The well-formed code the developer typed, normalised by the
+ * dialog (trimmed and upper-cased).
  */
 async function submitPairingCode(
   code: PortRequestPayloads['pair.complete']['code'],
@@ -726,6 +1485,56 @@ async function submitPairingCode(
 /** Re-read the session from the service: the failure notice's retry. */
 function reloadSessionState(): void {
   getPanelConnection().resync();
+}
+
+/**
+ * Whether a `page.reload` request is in flight — the synchronous guard that
+ * keeps a second activation, dispatched before any re-render or worker push
+ * has landed, from sending a second consent.
+ */
+let pageReloadInFlight = false;
+
+/**
+ * "Reload page": the developer's one-click consent to reload the inspected
+ * page so its agent can observe it. The worker performs the reload with
+ * `chrome.tabs.reload` and answers once the new document's agent reported
+ * (AAP §0.7.1 Group 2).
+ *
+ * The request **is** the consent, so it is sent only while the worker's offer
+ * says `offered` — read at call time — at most one at a time, and naming this
+ * panel's inspected tab, the only tab the worker may reload for it. The
+ * answer's readiness needs no handling here: the offer (`reloading`, then
+ * `not-needed` or a renewed `offered`) and the session's progress arrive as
+ * pushes. Never rejects; a failure is surfaced through `lastError`.
+ */
+async function reloadInspectedPage(): Promise<void> {
+  if (pageReloadInFlight || getPanelReloadState().kind !== 'offered') {
+    return;
+  }
+  const sessionId = requireSession(FAILURE_LEADS.reloadPage);
+  if (sessionId === undefined) {
+    return;
+  }
+  // The consent names the page it was given for — this panel's own inspected
+  // tab — so the worker can refuse it for any other tab.
+  const tabId = readInspectedTabId(readDevtools);
+  if (tabId === undefined) {
+    setLastError(
+      Object.freeze({
+        code: 'TAB_NOT_BOUND',
+        message: `${FAILURE_LEADS.reloadPage}: ${NO_INSPECTED_PAGE_REASON}`,
+      }),
+    );
+    return;
+  }
+  pageReloadInFlight = true;
+  try {
+    await panelRequest('page.reload', { sessionId, tabId });
+  } catch (cause: unknown) {
+    reportFailure(FAILURE_LEADS.reloadPage, cause, 'AGENT_NOT_READY');
+  } finally {
+    pageReloadInFlight = false;
+  }
 }
 
 /** Dismiss the non-blocking failure notice. */
@@ -739,75 +1548,599 @@ function dismissLastError(): void {
  * ===========================================================================
  */
 
-/** Props of {@link EventDrawer}. */
-interface EventDrawerProps {
-  /** The store's selection: the event the drawer explains. */
-  readonly selected: EventRef;
-  /** The store's bounded live tail, consulted before the stored capture answers. */
-  readonly liveTail: readonly TelemetryEvent[];
-  /** The panel's actions, passed explicitly: the drawer renders outside `PanelHost`. */
-  readonly actions: DevtoolsPanelActions;
+/**
+ * The capture the store shows — the running capture, or the most recent one
+ * after it stopped — for the data provider's `getCaptureId`.
+ *
+ * Module-level, so its identity is stable and the provider reads the store at
+ * call time: a new capture changes this without changing the session, and the
+ * provider keys every request and every cached trace by it, so a query under
+ * a new capture never joins, and is never answered by, one of the old.
+ */
+function readCaptureId(): CaptureId | undefined {
+  return getPanelSnapshot().capture.captureId;
 }
 
 /**
- * Resolves the store's selected `EventRef` to a stored event and renders
- * `EventDetails` for it.
+ * Whether the provider's trace cache may answer for `sessionId` — its
+ * `canServeCached` (AAP 0.5.6: a devtools client reads panel data only for the
+ * session bound to its tab).
+ *
+ * True only while the panel is connected to the service **and** its inspected
+ * tab is bound to exactly that session. An unbound tab, a tab that navigated
+ * away, a lost or unpaired connection, or a binding to another session all
+ * answer `false`, which empties the cache and sends the lookup to the service,
+ * the authority on the tab's binding. Read from the store at call time, never
+ * remembered.
+ *
+ * @param sessionId The session the lookup is addressed to.
+ */
+function canServeCachedTrace(sessionId: SessionId): boolean {
+  const { connection } = getPanelSnapshot();
+  return (
+    connection.status === 'connected' &&
+    connection.binding.kind === 'bound' &&
+    connection.binding.sessionId === sessionId
+  );
+}
+
+/** A count or a position as the drawer writes it: grouped digits, nothing else. */
+function formatCount(value: number): string {
+  return value.toLocaleString('en-US');
+}
+
+/** A lookup whose find pass stopped at its page budget. */
+type ExhaustedResolution = Extract<PanelEventResolution, { readonly status: 'budget-exhausted' }>;
+
+/**
+ * The drawer's error when the find pass stopped at its page budget without
+ * reaching the selected event. The capture may hold it further on, so this is
+ * never worded as "missing": it names the range of stored events read — the
+ * pass's own offsets, one-based — and the hint says that Retry continues from
+ * the first one it did not read. Numbers only: nothing from the capture or the
+ * selection is interpolated.
+ *
+ * @param resolution The `budget-exhausted` answer.
+ */
+function searchExhaustedError(resolution: ExhaustedResolution): EventDetailsError {
+  const first = formatCount(resolution.searchedFrom + 1);
+  const last = formatCount(resolution.resumeOffset);
+  const scope =
+    resolution.scope === 'trace'
+      ? "of the selected event's trace"
+      : "of this session's stored capture";
+  return Object.freeze({
+    message: `The search for the selected event read stored events ${first}–${last} ${scope} without reaching it, the most this drawer reads at once (${formatCount(EVENT_RESOLUTION_MAX_EVENTS)}); the capture may hold it further on.`,
+    hint: `Retry continues the search from stored event ${formatCount(resolution.resumeOffset + 1)}.`,
+  });
+}
+
+/** The control that continues a stopped ancestry search from where it stopped. */
+const CHAIN_CONTINUE_LABEL = 'Continue the ancestry search';
+
+/** Props of {@link EventDrawer}; exported, like the component, for the unit suite. */
+export interface EventDrawerProps {
+  /** The store's selection: the event the drawer explains. */
+  readonly selected: EventRef;
+  /** The store's bounded live tail, consulted before the stored capture. */
+  readonly liveTail: readonly TelemetryEvent[];
+  /** The panel's actions, passed explicitly: the drawer renders outside `PanelHost`. */
+  readonly actions: DevtoolsPanelActions;
+  /**
+   * The panel's one data provider, passed explicitly for the same reason; its
+   * `resolveEvent` reads the stored capture.
+   */
+  readonly dataProvider: PanelDataProvider;
+  /**
+   * The session the selection belongs to — the one the generated panel's
+   * queries are addressed to — or `undefined` when the panel shows none, in
+   * which case a stored lookup rejects with `TAB_NOT_BOUND`.
+   */
+  readonly sessionId: string | undefined;
+}
+
+/**
+ * Where the drawer's next lookup continues a pass the last one stopped at its
+ * page budget: the **find** pass from the first offset it did not read, or the
+ * **ancestry** pass on top of the trace pool it collected — with the event it
+ * found, which the drawer keeps showing while the search continues.
+ */
+type DrawerResume =
+  | { readonly kind: 'find'; readonly from: number }
+  | {
+      readonly kind: 'ancestry';
+      readonly from: number;
+      readonly event: TelemetryEvent;
+      readonly trace: readonly TelemetryEvent[];
+    };
+
+/**
+ * The drawer's retry state, tagged with the selection it was asked for (see
+ * {@link drawerSelectionKey}): a retry or a continuation never outlives the
+ * selection, session or trace it belongs to.
+ */
+interface DrawerAttempt {
+  readonly selection: string;
+  /** Moves on every retry and every continuation, so each is a new lookup. */
+  readonly attempt: number;
+  /** The pass to continue; `undefined` for a lookup from the start. */
+  readonly resume: DrawerResume | undefined;
+}
+
+/** What a stored lookup settled with. */
+type StoredLookupOutcome =
+  | { readonly kind: 'resolved'; readonly resolution: PanelEventResolution }
+  | { readonly kind: 'failed'; readonly error: DebuggenError };
+
+/**
+ * A settled stored lookup, tagged with the request it answers (see
+ * {@link storedLookupKey}), so that a settlement for an earlier selection,
+ * session, attempt or resumption is never rendered for the current one.
+ */
+interface StoredLookup {
+  readonly key: string;
+  readonly outcome: StoredLookupOutcome;
+}
+
+/**
+ * A shown event's ancestry search that stopped at its page budget before the
+ * chain was complete: `resume` continues it. `EventDetails` states the chain
+ * as incomplete; the drawer adds the control that continues the search.
+ */
+interface ChainGap {
+  readonly kind: 'stopped';
+  readonly resume: DrawerResume;
+}
+
+/**
+ * What a settled lookup contributes: a stored event with its lineage — and,
+ * when a pass stopped at its budget, how to continue it — or the error to
+ * show, with how its retry proceeds.
+ */
+type StoredView =
+  | {
+      readonly kind: 'event';
+      readonly event: TelemetryEvent;
+      /** The event's lineage, for `EventDetails`' `ancestry` prop. */
+      readonly ancestry: EventAncestry;
+      readonly gap: ChainGap | undefined;
+    }
+  | {
+      readonly kind: 'error';
+      readonly error: EventDetailsError;
+      /** The continuation a Retry performs; `undefined` restarts the lookup. */
+      readonly resume: DrawerResume | undefined;
+    };
+
+/**
+ * The identity of one selection: the session, the event and the trace the
+ * lookup is narrowed to. Compared only; it holds the session id, so it is
+ * never shown or logged.
+ */
+function drawerSelectionKey(
+  sessionId: string | undefined,
+  eventId: string,
+  traceId: string | undefined,
+): string {
+  return JSON.stringify([sessionId ?? null, eventId, traceId ?? null]);
+}
+
+/**
+ * The identity of one stored lookup: everything it depends on — the
+ * selection, the attempt, and the pass and offset it resumes. Compared only.
+ */
+function storedLookupKey(
+  selection: string,
+  attempt: number,
+  resume: DrawerResume | undefined,
+): string {
+  return JSON.stringify([
+    selection,
+    attempt,
+    resume === undefined ? null : [resume.kind, resume.from],
+  ]);
+}
+
+/** The attempt after `previous`, counted within `selection` only. */
+function nextAttempt(previous: DrawerAttempt | undefined, selection: string): number {
+  return previous?.selection === selection ? previous.attempt + 1 : 1;
+}
+
+/** The provider options a lookup runs with: its signal, and the pass it resumes. */
+function resolveOptionsFor(
+  resume: DrawerResume | undefined,
+  signal: AbortSignal,
+): PanelEventResolveOptions {
+  if (resume === undefined) {
+    return { signal };
+  }
+  return resume.kind === 'find'
+    ? { signal, resumeFrom: resume.from }
+    : { signal, resumeAncestry: { from: resume.from, trace: resume.trace } };
+}
+
+/**
+ * The lineage the walk from `event` found in `pool`, in `EventDetails`'
+ * vocabulary: complete (empty for a trace root), a loop, or broken at the
+ * first missing span — `incomplete` when a pass stopped at its budget and
+ * continuing may still find it (`eventsRead` stored events of the trace were
+ * read), `missing` when the whole trace was read without it.
+ *
+ * @param event The event whose lineage is stated.
+ * @param pools Stored and streamed events of its trace, in priority order.
+ * @param stoppedAfter When the ancestry pass stopped at its budget, how many
+ * stored events of the trace it read; `undefined` when it read them all.
+ */
+function lineageOf(
+  event: TelemetryEvent,
+  pools: readonly (readonly TelemetryEvent[])[],
+  stoppedAfter: number | undefined,
+): EventAncestry {
+  const walk = walkAncestors(event, indexTraceSpans(event.traceId, pools));
+  switch (walk.kind) {
+    case 'complete':
+      return { state: 'complete', ancestors: walk.ancestors };
+    case 'cycle':
+      return { state: 'cycle', ancestors: walk.ancestors };
+    case 'broken':
+      return stoppedAfter === undefined
+        ? { state: 'missing', missingSpanId: walk.missingSpanId, ancestors: walk.ancestors }
+        : {
+            state: 'incomplete',
+            missingSpanId: walk.missingSpanId,
+            ancestors: walk.ancestors,
+            eventsRead: stoppedAfter,
+          };
+    default:
+      return assertNever(walk, 'Unhandled ancestor walk outcome');
+  }
+}
+
+/**
+ * The drawer's reading of a settled lookup.
+ *
+ * A found event's lineage is walked over its stored trace pool together with
+ * the live tail — both hold real, captured events of the trace, so an ancestor
+ * the store has not been asked for yet but the tail already streamed completes
+ * the chain ({@link lineageOf}). A chain the ancestry pass could not complete
+ * within its budget is stated as incomplete and carries the continuation
+ * ({@link ChainGap}); one whose whole trace was read is stated as missing.
+ *
+ * @param outcome What the lookup settled with.
+ * @param liveTail The store's live tail, to complete the chain from.
+ */
+function storedView(outcome: StoredLookupOutcome, liveTail: readonly TelemetryEvent[]): StoredView {
+  if (outcome.kind === 'failed') {
+    return { kind: 'error', error: outcome.error, resume: undefined };
+  }
+  const { resolution } = outcome;
+  switch (resolution.status) {
+    case 'found': {
+      const stopped =
+        resolution.budgetExhausted && resolution.ancestryResumeOffset !== undefined
+          ? resolution.ancestryResumeOffset
+          : undefined;
+      const ancestry = lineageOf(
+        resolution.event,
+        [resolution.trace, liveTail],
+        stopped === undefined ? undefined : resolution.trace.length,
+      );
+      const gap: ChainGap | undefined =
+        stopped === undefined || ancestry.state === 'complete' || ancestry.state === 'cycle'
+          ? undefined
+          : {
+              kind: 'stopped',
+              resume: {
+                kind: 'ancestry',
+                from: stopped,
+                event: resolution.event,
+                trace: resolution.trace,
+              },
+            };
+      return { kind: 'event', event: resolution.event, ancestry, gap };
+    }
+    case 'not-found':
+      return { kind: 'error', error: EVENT_NOT_FOUND, resume: undefined };
+    case 'budget-exhausted':
+      return {
+        kind: 'error',
+        error: searchExhaustedError(resolution),
+        resume: { kind: 'find', from: resolution.resumeOffset },
+      };
+    default:
+      return assertNever(resolution, 'Unhandled event resolution in the drawer');
+  }
+}
+
+/** Props of {@link ChainContinueControl}. */
+interface ChainContinueControlProps {
+  /** The stopped ancestry pass. */
+  readonly gap: ChainGap;
+  /** Continues it. */
+  readonly onContinue: (resume: DrawerResume) => void;
+}
+
+/**
+ * The control beneath the details that continues an ancestry search which
+ * stopped at its page budget — `EventDetails` states the chain as incomplete,
+ * with how many stored events were read. A renderer `Button` only.
+ */
+function ChainContinueControl(props: ChainContinueControlProps): ReactElement {
+  const { gap, onContinue } = props;
+  return (
+    <Button
+      variant="secondary"
+      size="sm"
+      onClick={() => {
+        onContinue(gap.resume);
+      }}
+    >
+      {CHAIN_CONTINUE_LABEL}
+    </Button>
+  );
+}
+
+/**
+ * Resolves the store's selected `EventRef` to an event and its parent chain,
+ * and renders `EventDetails` for it — exported for the unit suite, which
+ * drives it over a real {@link createPanelDataProvider}.
  *
  * The selection is only a pointer — an event id with the trace and span it
- * belongs to — so the event itself is looked up in two places: the live tail,
- * which answers at once for an event that just streamed in, and the session's
- * stored capture, queried through the renderer's own `useQuery` against the
- * provider and session contexts this component is mounted under. The stored
- * trace also supplies the parent chain. The drawer is loading only while
- * neither source has the event, and an error only when the stored capture
- * answered without it or could not be reached — never an empty drawer
- * presented as if nothing were selected (AAP 0.5.5).
+ * belongs to — so the event is looked up in two places:
+ *
+ * 1. **The live tail**, which answers at once for an event that just streamed
+ *    in. When the tail holds the event *and* its complete ancestry, the drawer
+ *    is answered from it alone and the stored capture is not read at all.
+ * 2. **The stored capture**, through the provider's `resolveEvent`, which
+ *    pages the capture — narrowed to the event's trace when the selection or
+ *    the tail knows it — however far into it the event and its ancestors lie:
+ *    each pass within a page budget of its own, and a pass that spends it
+ *    resumable from where it stopped. Repeated selections of one trace are
+ *    answered from the provider's bounded, authorised cache. The lookup runs
+ *    in an effect whose `AbortController` is aborted when the selection, the
+ *    session, the attempt or the resumption changes and on unmount, and a
+ *    settlement is rendered only for the request it answers.
+ *
+ * States: the event from the tail while the stored lookup runs; loading while
+ * neither source has it; the lookup's typed failure; "not in the stored
+ * capture" when the whole scan missed it; and a distinct "stopped searching"
+ * error naming the range of stored events read, whose Retry **continues** the
+ * search from the first event it did not read — while a Retry after any other
+ * failure restarts the lookup. Never an empty drawer presented as if nothing
+ * were selected (AAP 0.5.5).
+ *
+ * The parent chain is always stated, through `EventDetails`' `ancestry`: a
+ * trace root, the complete chain, a loop, a parent the whole stored trace does
+ * not hold (`missing`), an ancestry search that stopped at its budget
+ * (`incomplete`, with a control beneath the details that continues it — see
+ * {@link ChainGap}), a lookup still running (`loading`), or — for an event the
+ * live tail shows — a stored lookup that failed (`error`, with its retry). A
+ * missing chain is never presented as complete.
+ *
+ * @param props See {@link EventDrawerProps}.
  */
-function EventDrawer(props: EventDrawerProps): ReactElement {
-  const { selected, liveTail, actions } = props;
+export function EventDrawer(props: EventDrawerProps): ReactElement {
+  const { selected, liveTail, actions, dataProvider, sessionId } = props;
   const { eventId } = selected;
 
   const fromTail = useMemo(() => findEvent(liveTail, eventId), [liveTail, eventId]);
+  const tailChain = useMemo(
+    () => (fromTail === undefined ? undefined : buildEventParentChain(fromTail, liveTail)),
+    [fromTail, liveTail],
+  );
+  // The tail holds the event and its complete ancestry: nothing to look up.
+  const tailSuffices = tailChain !== undefined;
   const traceId = selected.traceId ?? fromTail?.traceId;
-  const query = useMemo(() => eventResolutionQuery(traceId), [traceId]);
-  const stored = useQuery(query);
 
-  const storedEvents = stored.status === 'success' ? stored.data : undefined;
-  const event = findEvent(storedEvents, eventId) ?? fromTail;
-  const parentChain = useMemo(
-    () => (event === undefined ? undefined : buildParentChain(event, storedEvents ?? liveTail)),
-    [event, storedEvents, liveTail],
+  // Retries and continuations belong to the selection they were asked for; a
+  // new selection, session or trace starts over from the first stored event.
+  const selection = drawerSelectionKey(sessionId, eventId, traceId);
+  const [attemptState, setAttemptState] = useState<DrawerAttempt | undefined>(undefined);
+  const current = attemptState?.selection === selection ? attemptState : undefined;
+  const attempt = current?.attempt ?? 0;
+  const resume = current?.resume;
+  const restart = useCallback(() => {
+    setAttemptState((previous) => ({
+      selection,
+      attempt: nextAttempt(previous, selection),
+      resume: undefined,
+    }));
+  }, [selection]);
+  const continueFrom = useCallback(
+    (next: DrawerResume) => {
+      setAttemptState((previous) => ({
+        selection,
+        attempt: nextAttempt(previous, selection),
+        resume: next,
+      }));
+    },
+    [selection],
   );
 
+  const [lookup, setLookup] = useState<StoredLookup | undefined>(undefined);
+  const key = storedLookupKey(selection, attempt, resume);
+
+  useEffect(() => {
+    if (tailSuffices) {
+      return undefined;
+    }
+    const controller = new AbortController();
+    const target = traceId === undefined ? { eventId } : { eventId, traceId };
+    dataProvider.resolveEvent(sessionId, target, resolveOptionsFor(resume, controller.signal)).then(
+      (resolution) => {
+        if (!controller.signal.aborted) {
+          setLookup({ key, outcome: { kind: 'resolved', resolution } });
+        }
+      },
+      (cause: unknown) => {
+        if (!controller.signal.aborted) {
+          setLookup({
+            key,
+            outcome: {
+              kind: 'failed',
+              error: DebuggenError.from(cause, 'TRANSPORT_DISCONNECTED'),
+            },
+          });
+        }
+      },
+    );
+    return () => {
+      controller.abort();
+    };
+  }, [dataProvider, sessionId, eventId, traceId, key, resume, tailSuffices]);
+
+  // Only the settlement of the current request counts; an earlier one — for
+  // another selection, session, attempt or resumption — reads as "still
+  // resolving".
+  const outcome = lookup !== undefined && lookup.key === key ? lookup.outcome : undefined;
+  const settled = useMemo(
+    () => (outcome === undefined ? undefined : storedView(outcome, liveTail)),
+    [outcome, liveTail],
+  );
+
+  let event: TelemetryEvent | undefined = fromTail;
+  let ancestry: EventAncestry | undefined;
+  let onRetryAncestry: (() => void) | undefined;
   let status: EventDetailsStatus = 'idle';
   let error: EventDetailsError | undefined;
-  if (event === undefined) {
-    if (stored.status === 'loading') {
+  let onRetry: (() => void) | undefined;
+  let gap: ChainGap | undefined;
+  if (tailSuffices) {
+    ancestry = { state: 'complete', ancestors: tailChain };
+  } else if (settled === undefined) {
+    // The current lookup is still running. An ancestry continuation keeps the
+    // event it continues for on screen; a tail event is shown as it is.
+    if (fromTail === undefined && resume?.kind === 'ancestry') {
+      event = resume.event;
+      ancestry = { state: 'loading' };
+    } else if (fromTail === undefined) {
       status = 'loading';
     } else {
+      ancestry = { state: 'loading' };
+    }
+  } else if (settled.kind === 'event') {
+    event = settled.event;
+    ancestry = settled.ancestry;
+    gap = settled.gap;
+  } else {
+    // The stored lookup failed, or stopped before finding the event. Its
+    // Retry continues a stopped search and restarts any other.
+    const { resume: retryResume } = settled;
+    const retry =
+      retryResume === undefined
+        ? restart
+        : () => {
+            continueFrom(retryResume);
+          };
+    if (fromTail === undefined) {
       status = 'error';
-      error =
-        stored.status === 'error' && stored.error !== undefined ? stored.error : EVENT_NOT_FOUND;
+      error = settled.error;
+      onRetry = retry;
+    } else {
+      // The tail shows the event; the stored capture could not supply the
+      // ancestors the tail lacks, which the parent chain states with the retry.
+      ancestry = { state: 'error', error: settled.error };
+      onRetryAncestry = retry;
     }
   }
 
   return (
-    <EventDetails
-      event={event}
-      parentChain={parentChain}
-      status={status}
-      error={error}
-      onRetry={status === 'error' ? stored.retry : undefined}
-      onOpenSource={actions.onOpenSource}
-      onSelectEvent={actions.onSelectEvent}
-      onClose={actions.clearSelectedEvent}
-    />
+    <>
+      <EventDetails
+        event={event}
+        ancestry={ancestry}
+        onRetryAncestry={onRetryAncestry}
+        status={status}
+        error={error}
+        onRetry={onRetry}
+        onOpenSource={actions.onOpenSource}
+        onSelectEvent={actions.onSelectEvent}
+        onClose={actions.clearSelectedEvent}
+      />
+      {gap === undefined || event === undefined || status !== 'idle' ? null : (
+        <ChainContinueControl gap={gap} onContinue={continueFrom} />
+      )}
+    </>
   );
 }
 
 /*
  * ===========================================================================
- * Section F — the composition root
+ * Section F — the page reload notice
+ * ===========================================================================
+ */
+
+/** Props of {@link PageReloadNotice}. */
+interface PageReloadNoticeProps {
+  /** The worker's offer, whenever it is anything but `not-needed`. */
+  readonly reload: Exclude<PanelReloadState, { readonly kind: 'not-needed' }>;
+}
+
+/**
+ * Why the inspected page must be reloaded, and the one-click action that
+ * reloads it — shown while the worker offers the reload or performs it.
+ *
+ * While `offered`, the sentence names the reason and the control's visible
+ * label and accessible name are exactly {@link PAGE_RELOAD_ACTION_LABEL}, the
+ * name the browser suite drives the consent through. From the activation
+ * until the worker's offer moves on, and throughout `reloading`, the control
+ * is unavailable: it stays focusable (`aria-disabled` with a guarded handler,
+ * as `CaptureControls` does, so the control a keyboard user activated keeps
+ * focus) and reports `aria-busy`; during `reloading` its label becomes
+ * {@link PAGE_RELOADING_LABEL}. A second activation is refused by the
+ * rendered state, by this component's synchronous guard, and, independently,
+ * by {@link reloadInspectedPage}'s own guard.
+ *
+ * Renderer primitives only — `Stack`, `Text`, `Button` — so every value
+ * resolves through the `--dg-*` tokens (AAP 0.6.4); the copy is generic
+ * product vocabulary (AAP 0.5.4).
+ */
+function PageReloadNotice(props: PageReloadNoticeProps): ReactElement {
+  const { reload } = props;
+  // Presentation-only: this notice's own consent is in flight. It covers the
+  // moment between the activation and the worker's `reloading` push.
+  const [requesting, setRequesting] = useState(false);
+  // Synchronous re-entry guard, set before the command runs and cleared when
+  // it settles: a second activation dispatched before the busy render commits
+  // is refused here, so it can neither send a request nor — by settling at
+  // once — release the busy state the first activation holds.
+  const inFlightRef = useRef(false);
+  const reloading = reload.kind === 'reloading';
+  const unavailable = requesting || reloading;
+
+  const handleReload = (): void => {
+    if (unavailable || inFlightRef.current) {
+      return;
+    }
+    inFlightRef.current = true;
+    setRequesting(true);
+    void reloadInspectedPage().then(() => {
+      inFlightRef.current = false;
+      setRequesting(false);
+    });
+  };
+
+  return (
+    <Stack direction="vertical" gap={2} align="start">
+      <Text as="p" role="status">
+        {reload.kind === 'offered' ? PAGE_RELOAD_NOTICES[reload.reason] : PAGE_RELOADING_NOTICE}
+      </Text>
+      <Button
+        variant="secondary"
+        size="sm"
+        aria-disabled={unavailable ? true : undefined}
+        aria-busy={unavailable ? true : undefined}
+        onClick={handleReload}
+      >
+        {reloading ? PAGE_RELOADING_LABEL : PAGE_RELOAD_ACTION_LABEL}
+      </Button>
+    </Stack>
+  );
+}
+
+/*
+ * ===========================================================================
+ * Section G — the composition root
  * ===========================================================================
  */
 
@@ -857,19 +2190,35 @@ export function App(props: AppProps): ReactElement {
   // The connection's lifetime is the panel's. `startPanelConnection` counts
   // references and defers its teardown to the end of the microtask, so
   // StrictMode's mount-unmount-mount leaves one port and one hydration.
+  // An element description still waiting on the inspected page is abandoned
+  // with the panel, so no evaluation outlives the document that awaits it.
   useEffect(() => {
     const connection = startPanelConnection();
     return () => {
+      cancelActiveDescription('unmounted');
       connection.stop();
     };
   }, []);
+
+  // Picker mode the service requests (a relayed `target.request`) is armed by
+  // this panel, exactly as "Pick element" arms it, and left again with the
+  // reason when arming fails. Subscribed to the store rather than keyed on a
+  // rendered value, so no rise and fall between two renders is missed.
+  useEffect(() => watchPickerMode(), []);
 
   // Built once. Both are pure factories over module-stable functions that read
   // the live port and the live session at call time, so one instance serves the
   // document across every reconnect and rebind — and their stable identities
   // are what keep `PanelHost`'s query effects and memoized views from re-running.
   const dataProvider = useMemo(
-    () => createPanelDataProvider({ request: panelRequest, getSessionId, onPortDisconnect }),
+    () =>
+      createPanelDataProvider({
+        request: panelRequest,
+        getSessionId,
+        getCaptureId: readCaptureId,
+        canServeCached: canServeCachedTrace,
+        onPortDisconnect,
+      }),
     [],
   );
   const actions = useMemo(
@@ -888,6 +2237,7 @@ export function App(props: AppProps): ReactElement {
   const devtoolsAvailable = useMemo(() => isDevtoolsAvailable(), []);
 
   const snapshot = usePanelSnapshot();
+  const reload = usePanelReloadState();
   const {
     connection,
     session,
@@ -903,6 +2253,14 @@ export function App(props: AppProps): ReactElement {
     lastError,
   } = snapshot;
 
+  // What the header shows of the session's target: the optimistic pick while
+  // it awaits confirmation, otherwise the confirmed one — as a bounded display
+  // copy, derived rather than stored, so the store keeps only the descriptor
+  // itself. The picker's two controls need a session bound to this tab.
+  const shownTarget = target.pending ?? session?.target;
+  const displayTarget = useMemo(() => toDisplayTarget(shownTarget), [shownTarget]);
+  const sessionBound = connection.binding.kind === 'bound';
+
   // Presentation-only state, duplicating nothing in the store: the pairing
   // dialog dismissed for the current connection episode, and the tail's
   // disclosure. `lastChangeAt` moves on every connection change, so a
@@ -912,7 +2270,14 @@ export function App(props: AppProps): ReactElement {
 
   const pairDialogOpen =
     connection.status === 'not-paired' && pairDismissedAt !== connection.lastChangeAt;
+  // What held focus when the developer asked for the pairing dialog — the
+  // connection pill's "Pair…" control. Recorded here, in the click handler and
+  // before the header turns inert, so the opener is known however the platform
+  // treats focus on an element that becomes inert; the close effect below
+  // returns focus to it and forgets it.
+  const pairOpenerRef = useRef<Element | null>(null);
   const openPairDialog = useCallback(() => {
+    pairOpenerRef.current = document.activeElement;
     setPairDismissedAt(undefined);
   }, []);
   const closePairDialog = useCallback(() => {
@@ -962,16 +2327,24 @@ export function App(props: AppProps): ReactElement {
     [clearSelectedEvent],
   );
 
-  // The pairing dialog restores focus to whatever held it before it opened; an
-  // automatically opened dialog had no opener, so focus that would otherwise
-  // fall to the document body lands on the panel body instead.
+  // Focus when the pairing dialog closes. `PairDialog` first returns focus to
+  // the element it found focused on open; this effect's cleanup runs after it
+  // (a child's effects are torn down before its parent's) and settles the
+  // rest: when focus still sits on the document body, it goes to the opener
+  // recorded above — no longer inert, because the header's `inert` was removed
+  // in the same commit that removed the dialog — and, for a dialog that opened
+  // by itself, to the panel body. `restoreFocus` leaves focus alone once it
+  // rests anywhere else, so the two never contend.
   useEffect(() => {
     if (!pairDialogOpen) {
+      // Closed: an opener recorded for an earlier dialog must not outlive it.
+      pairOpenerRef.current = null;
       return undefined;
     }
+    const opener = pairOpenerRef.current;
     const main = mainRef.current;
     return () => {
-      restoreFocus(null, main);
+      restoreFocus(opener, main);
     };
   }, [pairDialogOpen]);
 
@@ -995,14 +2368,17 @@ export function App(props: AppProps): ReactElement {
         ref={drawerRef}
         tabIndex={-1}
         aria-label={DRAWER_LABEL}
+        inert={pairDialogOpen}
         onKeyDown={handleDrawerKeyDown}
       >
         <Section variant="card">
-          <DataProviderContext.Provider value={dataProvider}>
-            <PanelSessionContext.Provider value={querySessionId}>
-              <EventDrawer selected={selectedEvent} liveTail={liveTail} actions={actions} />
-            </PanelSessionContext.Provider>
-          </DataProviderContext.Provider>
+          <EventDrawer
+            selected={selectedEvent}
+            liveTail={liveTail}
+            actions={actions}
+            dataProvider={dataProvider}
+            sessionId={querySessionId}
+          />
         </Section>
       </aside>
     );
@@ -1015,17 +2391,21 @@ export function App(props: AppProps): ReactElement {
             status={connection.status}
             binding={connection.binding}
             serviceUrl={connection.serviceUrl}
+            serviceStartCommand={SERVICE_START_COMMAND}
             pairingDialogOpen={pairDialogOpen}
             onRequestPairing={openPairDialog}
           />
         }
         targetPicker={
           <TargetPicker
-            target={target.pending ?? session?.target}
+            target={displayTarget}
             pickerActive={target.pickRequested}
+            busy={target.pending !== undefined}
             onPick={togglePicker}
             onUseSelected={adoptSelectedElement}
             devtoolsAvailable={devtoolsAvailable}
+            sessionBound={sessionBound}
+            onActionError={reportTargetActionFailure}
           />
         }
         captureControls={
@@ -1035,15 +2415,19 @@ export function App(props: AppProps): ReactElement {
             eventCount={capture.eventCount}
             onStartCapture={startCapture}
             onStopCapture={stopCapture}
+            onActionError={reportCaptureActionError}
             disabledReason={captureDisabledReason(connection.status)}
           />
         }
         sessionTitle={session?.question}
         sessionStatus={sessionStatus}
+        inert={pairDialogOpen}
       />
 
       {/* Directly under the header, so the dialog is in view the moment the
-          connection reports "Not paired", whatever the body holds below it. */}
+          connection reports "Not paired", whatever the body holds below it.
+          The only region never made inert: every sibling below and the header
+          above carry `inert` while it is open. */}
       <PairDialog
         open={pairDialogOpen}
         onClose={closePairDialog}
@@ -1052,7 +2436,7 @@ export function App(props: AppProps): ReactElement {
       />
 
       <Split weights={drawerOpen ? DRAWER_PANE_WEIGHTS : undefined} align="start">
-        <main ref={mainRef} tabIndex={-1}>
+        <main ref={mainRef} tabIndex={-1} inert={pairDialogOpen}>
           <Stack direction="vertical" gap={3}>
             {lastError === undefined ? null : (
               <Stack direction="vertical" gap={2} align="start">
@@ -1070,6 +2454,10 @@ export function App(props: AppProps): ReactElement {
 
             {hasSession ? (
               <>
+                {/* Above the summary: until the page is reloaded, nothing below
+                    can be observed on it. */}
+                {reload.kind === 'not-needed' ? null : <PageReloadNotice reload={reload} />}
+
                 <SessionSummary
                   session={session}
                   progress={progress}
@@ -1113,7 +2501,7 @@ export function App(props: AppProps): ReactElement {
       </Split>
 
       {hasSession ? (
-        <section aria-label={LIVE_TAIL_REGION_LABEL}>
+        <section aria-label={LIVE_TAIL_REGION_LABEL} inert={pairDialogOpen}>
           <LiveTail
             events={liveTail}
             droppedCount={liveTailDropped}

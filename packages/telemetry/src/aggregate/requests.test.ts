@@ -2962,6 +2962,603 @@ describe('aggregateRequests in-flight snapshots', () => {
 
 /*
  * ---------------------------------------------------------------------------
+ * The resource-timing join at scale
+ *
+ * `./requests.ts` finds each occurrence's entry with binary searches, skip
+ * pointers and a range minimum instead of scanning every candidate its URL
+ * holds, because the service feeds the `requests` source tens of thousands of
+ * events and the scan made the duplicate-request case — many requests to one
+ * URL — quadratic. The index is an optimisation only if it changes nothing, so
+ * this section holds it to two things:
+ *
+ * - **The pairing of the scan it replaced.** {@link referenceJoin} is that
+ *   scan, restated rule for rule: identity buckets sorted by start then id, the
+ *   transport rank that rejects a foreign stated type, the timing window, the
+ *   nearest start, the smallest id, and the first-met entry on a full tie.
+ *   Seeded captures — few URLs, both identities, stated, unstated and foreign
+ *   initiator types, shared start times, overlapping windows, zero tolerance,
+ *   pending requests, requests that report their own size, entries sharing an
+ *   id, and a family of magnitudes at which distinct starts round to one
+ *   distance — must produce the reference's transfer fields on every
+ *   occurrence and the reference's claims and bytes on every group.
+ * - **The cost it promises.** Twenty-five thousand requests to one URL against
+ *   twenty-five thousand entries, spaced and all at one instant, must join in
+ *   well under {@link JOIN_VOLUME_BOUND_MS}, each request claiming exactly one
+ *   entry of its own. The scan needed about 25 000² candidate visits for it.
+ *
+ * The generator is a seeded PRNG rather than `Math.random`, so a failing seed
+ * reproduces exactly and names itself in the assertion message.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The resolved identity of {@link ITEMS_PATH} in the cases below. */
+const ABSOLUTE_ITEMS_URL = `${RESOURCE_FIXTURE_ORIGIN}${ITEMS_PATH}`;
+
+/** The resolved identity of {@link THINGS_PATH}. */
+const ABSOLUTE_THINGS_URL = `${RESOURCE_FIXTURE_ORIGIN}${THINGS_PATH}`;
+
+/**
+ * The `initiator.type` Resource Timing reports for each request kind, as the
+ * module's header states it. Restated rather than imported: the reference must
+ * not share a single line with the implementation it checks.
+ */
+const REFERENCE_INITIATOR_TYPE_BY_KIND = new Map<TelemetryKind, string>([
+  ['fetch', 'fetch'],
+  ['xhr', 'xmlhttprequest'],
+]);
+
+/** How many seeded captures the differential case compares. */
+const DIFFERENTIAL_CAPTURE_COUNT = 500;
+
+/** Requests, and entries, in each high-volume case. */
+const JOIN_VOLUME = 25_000;
+
+/**
+ * The time a high-volume join must finish inside, in milliseconds.
+ *
+ * Generous on purpose — a loaded CI runner must not fail it — and still two
+ * orders of magnitude below what the per-occurrence scan took for the same
+ * capture.
+ */
+const JOIN_VOLUME_BOUND_MS = 3_000;
+
+/** The transfer fields the join publishes on one occurrence. */
+interface JoinOutcome {
+  readonly transferEventId: EventId | undefined;
+  readonly transferredBytes: number | undefined;
+  readonly transferSource: RequestOccurrence['transferSource'];
+}
+
+/** The outcome of an occurrence the join left alone. */
+const NO_JOIN: JoinOutcome = {
+  transferEventId: undefined,
+  transferredBytes: undefined,
+  transferSource: undefined,
+};
+
+/** A resource entry as the reference scan holds it. */
+interface ReferenceCandidate {
+  readonly eventId: EventId;
+  readonly startTime: number;
+  readonly initiatorType: string | undefined;
+  readonly bytes: number;
+  claimed: boolean;
+}
+
+/** A non-blank string attribute: the only shape a URL or a type is read in. */
+function nonBlankAttribute(event: TelemetryEvent, key: string): string | undefined {
+  const value = event.attributes[key];
+  return typeof value === 'string' && value.trim().length > 0 ? value : undefined;
+}
+
+/** Code-unit order, the order the module compares every id in. */
+function compareCodeUnits(left: string, right: string): number {
+  if (left === right) {
+    return 0;
+  }
+  return left < right ? -1 : 1;
+}
+
+/** Start time, then id: the order of a bucket and of the occurrences. */
+function compareStartThenId(
+  left: { readonly startTime: number; readonly id: string },
+  right: { readonly startTime: number; readonly id: string },
+): number {
+  if (left.startTime !== right.startTime) {
+    return left.startTime < right.startTime ? -1 : 1;
+  }
+  return compareCodeUnits(left.id, right.id);
+}
+
+/**
+ * The join as a scan of every candidate — the implementation `./requests.ts`
+ * replaced — restated for differential testing.
+ *
+ * Deliberately naive, O(requests × entries) and written for obviousness. It is
+ * fed only the generated captures below, whose events are well formed and
+ * whose spans are all distinct, so no snapshot is superseded and every
+ * attribute can be read directly.
+ *
+ * @returns each request event's transfer fields, by event id.
+ */
+function referenceJoin(
+  events: readonly TelemetryEvent[],
+  toleranceMs: number,
+): Map<EventId, JoinOutcome> {
+  const buckets = new Map<string, ReferenceCandidate[]>();
+  for (const event of events) {
+    if (event.kind !== RESOURCE_ENTRY_EVENT_KIND) {
+      continue;
+    }
+    const entryType = event.attributes[ENTRY_TYPE_ATTRIBUTE];
+    if (entryType !== undefined && entryType !== RESOURCE_ENTRY_TYPE) {
+      continue;
+    }
+    const url = nonBlankAttribute(event, URL_ATTRIBUTE);
+    const bytes = readExposedTransferSize(event);
+    if (url === undefined || bytes === undefined) {
+      continue;
+    }
+    const bucket = buckets.get(url) ?? [];
+    bucket.push({
+      eventId: event.id,
+      startTime: event.startTime,
+      initiatorType: nonBlankAttribute(event, INITIATOR_TYPE_ATTRIBUTE),
+      bytes,
+      claimed: false,
+    });
+    buckets.set(url, bucket);
+  }
+  for (const bucket of buckets.values()) {
+    bucket.sort((left, right) =>
+      compareStartThenId(
+        { startTime: left.startTime, id: left.eventId },
+        { startTime: right.startTime, id: right.eventId },
+      ),
+    );
+  }
+
+  const requests = events
+    .filter((event) => REQUEST_KINDS.includes(event.kind))
+    .sort(compareStartThenId);
+
+  const outcomes = new Map<EventId, JoinOutcome>();
+  for (const request of requests) {
+    if (request.attributes[REQUEST_IN_FLIGHT_ATTRIBUTE] === true) {
+      outcomes.set(request.id, NO_JOIN);
+      continue;
+    }
+
+    const startTime = request.startTime;
+    const endTime = roundMs(startTime + roundMs(Math.max(0, request.duration)));
+    const earliest = startTime - toleranceMs;
+    const latest = endTime + toleranceMs;
+    const expected = REFERENCE_INITIATOR_TYPE_BY_KIND.get(request.kind);
+    const resolved = nonBlankAttribute(request, RESOURCE_TIMING_URL_ATTRIBUTE);
+    const written = nonBlankAttribute(request, URL_ATTRIBUTE);
+    const identities: string[] = [];
+    if (resolved !== undefined) {
+      identities.push(resolved);
+    }
+    if (written !== undefined && written !== resolved) {
+      identities.push(written);
+    }
+
+    let best: ReferenceCandidate | undefined;
+    let bestRank: readonly [number, number] | undefined;
+    for (const identity of identities) {
+      for (const candidate of buckets.get(identity) ?? []) {
+        if (candidate.claimed || candidate.startTime < earliest || candidate.startTime > latest) {
+          continue;
+        }
+        if (
+          expected !== undefined &&
+          candidate.initiatorType !== undefined &&
+          candidate.initiatorType !== expected
+        ) {
+          continue;
+        }
+        const rank: readonly [number, number] = [
+          candidate.initiatorType === expected ? 0 : 1,
+          Math.abs(candidate.startTime - startTime),
+        ];
+        if (
+          bestRank === undefined ||
+          rank[0] < bestRank[0] ||
+          (rank[0] === bestRank[0] && rank[1] < bestRank[1]) ||
+          (rank[0] === bestRank[0] &&
+            rank[1] === bestRank[1] &&
+            best !== undefined &&
+            compareCodeUnits(candidate.eventId, best.eventId) < 0)
+        ) {
+          best = candidate;
+          bestRank = rank;
+        }
+      }
+    }
+    if (best !== undefined) {
+      best.claimed = true;
+    }
+
+    const own = readExposedTransferSize(request);
+    let transferSource: JoinOutcome['transferSource'];
+    if (own !== undefined) {
+      transferSource = 'request';
+    } else if (best !== undefined) {
+      transferSource = 'resource-timing';
+    }
+    outcomes.set(request.id, {
+      transferEventId: best?.eventId,
+      transferredBytes: own ?? best?.bytes,
+      transferSource,
+    });
+  }
+  return outcomes;
+}
+
+/** Every occurrence's transfer fields as the module published them, by event id. */
+function publishedJoinOutcomes(groups: readonly RequestGroup[]): Map<EventId, JoinOutcome> {
+  const outcomes = new Map<EventId, JoinOutcome>();
+  for (const group of groups) {
+    for (const occurrence of group.occurrences) {
+      outcomes.set(occurrence.eventId, {
+        transferEventId: occurrence.transferEventId,
+        transferredBytes: occurrence.transferredBytes,
+        transferSource: occurrence.transferSource,
+      });
+    }
+  }
+  return outcomes;
+}
+
+/** A map's entries ordered by key, so two maps compare independently of insertion order. */
+function entriesByKey<T>(map: ReadonlyMap<string, T>): (readonly [string, T])[] {
+  return [...map.entries()].sort(([left], [right]) => compareCodeUnits(left, right));
+}
+
+/**
+ * mulberry32: a 32-bit seeded PRNG, uniform on `[0, 1)`. Small, fast and
+ * fully determined by its seed, which is all a differential generator needs.
+ */
+function seededRandom(seed: number): () => number {
+  let state = seed >>> 0;
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let mixed = state;
+    mixed = Math.imul(mixed ^ (mixed >>> 15), mixed | 1);
+    mixed ^= mixed + Math.imul(mixed ^ (mixed >>> 7), mixed | 61);
+    return ((mixed ^ (mixed >>> 14)) >>> 0) / 4_294_967_296;
+  };
+}
+
+/** One element of `items`, drawn by `random`. */
+function choose<T>(random: () => number, items: readonly T[]): T {
+  return elementAt(items, Math.floor(random() * items.length), 'a generator choice');
+}
+
+/** A seeded Fisher–Yates permutation of `items`. */
+function seededShuffle<T>(random: () => number, items: readonly T[]): T[] {
+  const shuffled = [...items];
+  for (let index = shuffled.length - 1; index > 0; index -= 1) {
+    const other = Math.floor(random() * (index + 1));
+    const current = elementAt(shuffled, index, 'a shuffled event');
+    shuffled[index] = elementAt(shuffled, other, 'a shuffled event');
+    shuffled[other] = current;
+  }
+  return shuffled;
+}
+
+/**
+ * Request starts of the magnitude family in which distinct candidate starts
+ * round to one distance: `-1` and `1` sit a distance of exactly `1` from every
+ * start in `1e-20 … 5e-20`, because the subtraction rounds away the
+ * difference between them.
+ */
+const COLLAPSING_REQUEST_STARTS = [-1, 1, 2] as const;
+
+/** Entry starts of the same family, near-equal and exactly representable alike. */
+const COLLAPSING_ENTRY_STARTS = [1e-20, 2e-20, 3e-20, 5e-20, -1, 1, 2, 3, 1 + Number.EPSILON];
+
+/** The initiator types an entry may state; `''` stands for "states none". */
+const GENERATED_INITIATOR_TYPES = ['', '', 'fetch', 'xmlhttprequest', 'link', 'script'] as const;
+
+/** One seeded capture and the tolerance its aggregation runs under. */
+interface GeneratedJoinCapture {
+  readonly events: readonly TelemetryEvent[];
+  /** The options handed to the module; the tolerance is sometimes left to its default. */
+  readonly options: RequestAggregateOptions;
+  /** The tolerance those options resolve to, for the reference. */
+  readonly toleranceMs: number;
+}
+
+/** The URL `written` resolves to: relative paths gain the fixture origin. */
+function absoluteUrlOf(written: string): string {
+  return written.startsWith('/') ? `${RESOURCE_FIXTURE_ORIGIN}${written}` : written;
+}
+
+/**
+ * A random capture shaped to reach every branch of the join.
+ *
+ * A quarter of the seeds draw from the magnitude family above; the rest use
+ * epoch milliseconds on a 2.5 ms grid, so starts coincide often, windows
+ * overlap, and a tolerance of zero or one leaves some entries just outside.
+ */
+function generateJoinCapture(seed: number): GeneratedJoinCapture {
+  const random = seededRandom(seed);
+  const collapsing = random() < 0.25;
+  const requestStart = (): number =>
+    collapsing
+      ? choose(random, COLLAPSING_REQUEST_STARTS)
+      : BASE_TIME + Math.floor(random() * 24) * 2.5 + choose(random, [0, 0, 0.25]);
+  const entryStart = (): number =>
+    collapsing
+      ? choose(random, COLLAPSING_ENTRY_STARTS)
+      : BASE_TIME - 10 + Math.floor(random() * 32) * 2.5 + choose(random, [0, 0, 0.25]);
+  const duration = (): number =>
+    collapsing ? choose(random, [0, 1]) : choose(random, [0, 1, 2.5, 7.5, 20]);
+  const toleranceMs = collapsing
+    ? choose(random, [0, 1, 2])
+    : choose(random, [0, 1, 5, DEFAULT_RESOURCE_TIMING_TOLERANCE_MS]);
+  // Half the default-tolerance captures omit the option, so the no-options
+  // path is compared as well as the stated one.
+  const leaveToleranceToDefault =
+    toleranceMs === DEFAULT_RESOURCE_TIMING_TOLERANCE_MS && random() < 0.5;
+
+  const requestKeys = [opaqueRequestKey('d1'), opaqueRequestKey('d2'), opaqueRequestKey('d3')];
+  const writtenUrls = [ITEMS_PATH, THINGS_PATH, ABSOLUTE_ITEMS_URL, ABSOLUTE_THINGS_URL];
+  const events: TelemetryEvent[] = [];
+
+  const requestCount = 1 + Math.floor(random() * 30);
+  for (let index = 0; index < requestCount; index += 1) {
+    const written = choose(random, writtenUrls);
+    const resolvedRoll = random();
+    let resolved: string | undefined;
+    if (resolvedRoll < 0.55) {
+      resolved = absoluteUrlOf(written);
+    } else if (resolvedRoll < 0.7) {
+      resolved = choose(random, [ABSOLUTE_ITEMS_URL, ABSOLUTE_THINGS_URL]);
+    }
+    const overrides: RequestEventOverrides = {
+      kind: choose(random, REQUEST_KINDS),
+      url: written,
+      requestKey: choose(random, requestKeys),
+      startTime: requestStart(),
+      duration: duration(),
+      ...(random() < 0.2 ? { transferSize: Math.floor(random() * 4000) } : {}),
+      extraAttributes: resolved === undefined ? {} : { [RESOURCE_TIMING_URL_ATTRIBUTE]: resolved },
+    };
+    events.push(random() < 0.15 ? makeInFlightEvent(overrides) : makeRequestEvent(overrides));
+  }
+
+  const entryIds: EventId[] = [];
+  const entryCount = Math.floor(random() * 41);
+  for (let index = 0; index < entryCount; index += 1) {
+    const reusedId = entryIds.length > 0 && random() < 0.06 ? choose(random, entryIds) : undefined;
+    const stated = choose(random, GENERATED_INITIATOR_TYPES);
+    const exposedRoll = random();
+    const entry = makeResourceEvent({
+      url: choose(random, [...writtenUrls, ABSOLUTE_ITEMS_URL]),
+      startTime: entryStart(),
+      transferSize: Math.floor(random() * 5000),
+      ...(exposedRoll < 0.85 ? { transferSizeExposed: true } : {}),
+      ...(exposedRoll >= 0.85 && exposedRoll < 0.95 ? { transferSizeExposed: false } : {}),
+      ...(stated === '' ? {} : { initiatorType: stated }),
+      ...(random() < 0.03 ? { entryType: PAINT_ENTRY_TYPE } : {}),
+      ...(reusedId === undefined ? {} : { id: reusedId }),
+    });
+    entryIds.push(entry.id);
+    events.push(entry);
+  }
+
+  return {
+    events: seededShuffle(random, events),
+    options: {
+      maxOccurrencesPerGroup: Number.MAX_SAFE_INTEGER,
+      ...(leaveToleranceToDefault ? {} : { resourceTimingToleranceMs: toleranceMs }),
+    },
+    toleranceMs,
+  };
+}
+
+describe('aggregateRequests resource-timing join at scale', () => {
+  it('pairs every occurrence exactly as a scan of every candidate would, across seeded captures', () => {
+    let joinedByTiming = 0;
+    let joinedByOwnSize = 0;
+    let leftUnjoined = 0;
+
+    for (let seed = 1; seed <= DIFFERENTIAL_CAPTURE_COUNT; seed += 1) {
+      const capture = generateJoinCapture(seed);
+      const requestCount = capture.events.filter((event) =>
+        REQUEST_KINDS.includes(event.kind),
+      ).length;
+
+      const groups = aggregateRequests(capture.events, capture.options);
+      const expected = referenceJoin(capture.events, capture.toleranceMs);
+
+      expect(totalCount(groups), `seed ${String(seed)}: occurrences`).toBe(requestCount);
+      expect(
+        entriesByKey(publishedJoinOutcomes(groups)),
+        `seed ${String(seed)}: occurrence transfer fields`,
+      ).toStrictEqual(entriesByKey(expected));
+
+      for (const group of groups) {
+        expect(group.occurrencesTruncated).toBe(false);
+        const outcomes = group.occurrences.map((occurrence) => expected.get(occurrence.eventId));
+        const claims = [
+          ...new Set(outcomes.flatMap((outcome) => outcome?.transferEventId ?? [])),
+        ].sort(compareCodeUnits);
+        const sizes = outcomes.flatMap((outcome) => outcome?.transferredBytes ?? []);
+        const where = `seed ${String(seed)}: group ${group.id}`;
+
+        expect(group.transferEventIds ?? [], `${where} claims`).toStrictEqual(claims);
+        expect(group.transferredBytes, `${where} bytes`).toBe(
+          sizes.length === 0 ? undefined : Math.round(sizes.reduce((sum, size) => sum + size, 0)),
+        );
+      }
+
+      for (const outcome of expected.values()) {
+        if (outcome.transferSource === 'resource-timing') {
+          joinedByTiming += 1;
+        } else if (outcome.transferSource === 'request') {
+          joinedByOwnSize += 1;
+        } else {
+          leftUnjoined += 1;
+        }
+      }
+    }
+
+    // The generator is not vacuous: every outcome the join can reach occurred.
+    expect(joinedByTiming).toBeGreaterThan(DIFFERENTIAL_CAPTURE_COUNT);
+    expect(joinedByOwnSize).toBeGreaterThan(0);
+    expect(leftUnjoined).toBeGreaterThan(0);
+  });
+
+  it('breaks a distance tie by event id even between distinct starts that round to one distance', () => {
+    // From a start of 1 ms, entries starting at 1e-20 ms and 2e-20 ms are both
+    // exactly 1 ms away once the subtraction is rounded, although their starts
+    // differ. The scan saw a tie there and took the smaller event id, so the
+    // index must too — rather than the entry nearest the split by position.
+    expect(Math.abs(1e-20 - 1)).toBe(Math.abs(2e-20 - 1));
+    expect(Math.abs(1e-20 + 1)).toBe(Math.abs(2e-20 + 1));
+
+    const smallerId = nextEventId();
+    const largerId = nextEventId();
+    expect(compareCodeUnits(smallerId, largerId)).toBe(-1);
+
+    // Left of the request's start, the larger id sits nearer the split.
+    const left = onlyGroup(
+      aggregateRequests(
+        [
+          makeRequestEvent({
+            requestKey: opaqueRequestKey('t1'),
+            url: ITEMS_PATH,
+            startTime: 1,
+            duration: 0,
+          }),
+          makeResourceEvent({ id: smallerId, url: ITEMS_PATH, startTime: 1e-20, transferSize: 11 }),
+          makeResourceEvent({ id: largerId, url: ITEMS_PATH, startTime: 2e-20, transferSize: 22 }),
+        ],
+        { resourceTimingToleranceMs: 1 },
+      ),
+    );
+    expect(occurrenceAt(left, 0).transferEventId).toBe(smallerId);
+    expect(left.transferredBytes).toBe(11);
+
+    // Right of it, mirrored: the larger id starts first after the split.
+    const right = onlyGroup(
+      aggregateRequests(
+        [
+          makeRequestEvent({
+            requestKey: opaqueRequestKey('t2'),
+            url: ITEMS_PATH,
+            startTime: -1,
+            duration: 0,
+          }),
+          makeResourceEvent({ id: largerId, url: ITEMS_PATH, startTime: 1e-20, transferSize: 33 }),
+          makeResourceEvent({ id: smallerId, url: ITEMS_PATH, startTime: 2e-20, transferSize: 44 }),
+        ],
+        { resourceTimingToleranceMs: 2 },
+      ),
+    );
+    expect(occurrenceAt(right, 0).transferEventId).toBe(smallerId);
+    expect(right.transferredBytes).toBe(44);
+  });
+
+  it(
+    'joins 25 000 overlapping requests to one URL against 25 000 entries, each claiming its own',
+    { timeout: 60_000 },
+    () => {
+      // Requests issued every 2 ms that each stay open until the capture ends
+      // — polls or streams to one URL — so every entry that starts after a
+      // request lies inside its window, and the scan had every one of them to
+      // rank. Request i starts 0.5 ms before entry i and the entries before it
+      // are already claimed, so i must take exactly i.
+      const requestKey = opaqueRequestKey('v1');
+      const openForMs = JOIN_VOLUME * 2;
+      const requests: TelemetryEvent[] = [];
+      const entries: TelemetryEvent[] = [];
+      let expectedBytes = 0;
+      for (let index = 0; index < JOIN_VOLUME; index += 1) {
+        const startTime = BASE_TIME + index * 2;
+        const transferSize = 100 + (index % 900);
+        expectedBytes += transferSize;
+        requests.push(
+          makeRequestEvent({
+            requestKey,
+            url: ITEMS_PATH,
+            startTime,
+            duration: openForMs - index * 2,
+            extraAttributes: { [RESOURCE_TIMING_URL_ATTRIBUTE]: ABSOLUTE_ITEMS_URL },
+          }),
+        );
+        entries.push(
+          makeResourceEvent({
+            url: ABSOLUTE_ITEMS_URL,
+            startTime: startTime + 0.5,
+            transferSize,
+            transferSizeExposed: true,
+            initiatorType: 'fetch',
+          }),
+        );
+      }
+      const events = [...entries].reverse().concat(requests);
+
+      const startedAt = performance.now();
+      const groups = aggregateRequests(events, { maxOccurrencesPerGroup: JOIN_VOLUME });
+      const elapsedMs = performance.now() - startedAt;
+
+      expect(elapsedMs).toBeLessThan(JOIN_VOLUME_BOUND_MS);
+      const group = onlyGroup(groups);
+      expect(group.count).toBe(JOIN_VOLUME);
+      expect(group.occurrences.map((occurrence) => occurrence.transferEventId)).toStrictEqual(
+        idsOf(entries),
+      );
+      expect(new Set(group.transferEventIds).size).toBe(JOIN_VOLUME);
+      expect(group.transferredBytes).toBe(expectedBytes);
+    },
+  );
+
+  it(
+    'joins 25 000 simultaneous requests to one URL against 25 000 entries, smallest id first',
+    { timeout: 60_000 },
+    () => {
+      // The degenerate burst: every request and every entry at one instant, so
+      // every entry is equally close to every request and only the event id
+      // decides. Requests are joined in id order and each takes the smallest
+      // unclaimed entry id, so the pairing is the two id orders side by side.
+      const requestKey = opaqueRequestKey('v2');
+      const requests: TelemetryEvent[] = [];
+      const entries: TelemetryEvent[] = [];
+      for (let index = 0; index < JOIN_VOLUME; index += 1) {
+        requests.push(
+          makeRequestEvent({ requestKey, url: ITEMS_PATH, startTime: BASE_TIME, duration: 0 }),
+        );
+        entries.push(
+          makeResourceEvent({ url: ITEMS_PATH, startTime: BASE_TIME, transferSize: 1 + index }),
+        );
+      }
+      const events = requests.concat([...entries].reverse());
+
+      const startedAt = performance.now();
+      const groups = aggregateRequests(events, { maxOccurrencesPerGroup: JOIN_VOLUME });
+      const elapsedMs = performance.now() - startedAt;
+
+      expect(elapsedMs).toBeLessThan(JOIN_VOLUME_BOUND_MS);
+      const group = onlyGroup(groups);
+      expect(group.count).toBe(JOIN_VOLUME);
+      expect(group.occurrences.map((occurrence) => occurrence.eventId)).toStrictEqual(
+        idsOf(requests),
+      );
+      expect(group.occurrences.map((occurrence) => occurrence.transferEventId)).toStrictEqual(
+        idsOf(entries),
+      );
+      expect(new Set(group.transferEventIds).size).toBe(JOIN_VOLUME);
+    },
+  );
+});
+
+/*
+ * ---------------------------------------------------------------------------
  * The committed capture fixture
  *
  * `packages/telemetry/test/fixtures/capture-batch.json` is this package's

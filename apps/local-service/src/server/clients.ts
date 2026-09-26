@@ -52,6 +52,13 @@
  * new connection presents the same credential, the binding's traffic follows
  * it without any re-bind. One service-worker connection may carry several tabs.
  *
+ * `boundBy` is therefore a credential, not a tab: every tab one paired
+ * extension inspects presents the same digest. Routing on it is sound — the
+ * connection carrying the credential is the one that can reach the tab — but
+ * *authorizing* on it alone is not, so every DevTools action names its acting
+ * tab and `./auth.ts`'s `requireBoundSession` also requires the binding's
+ * `tabId` to be that tab.
+ *
  * When a bind displaces another binding, or a tab is unbound, the released
  * binding's connection stays eligible for **binding announcements** about that
  * session for a short window ({@link RELEASED_BINDING_NOTICE_WINDOW_MS}), so
@@ -316,8 +323,11 @@ export interface ClientSocket {
  * are the hello's announcements, kept as facts about the connection: an
  * editor's announced root is informational (its principal's workspace folders
  * decide), a server agent's must agree with its credential's project, and a
- * DevTools connection's tab id is only a lookup hint — tab traffic follows the
- * bindings its credential makes.
+ * DevTools connection's tab id marks it a single-tab connection — `ws.ts` and
+ * the telemetry route then refuse any frame from it that acts for another tab —
+ * while tab traffic still follows the bindings its credential makes. The MV3
+ * service worker announces no tab: it multiplexes every tab and names the
+ * acting tab on each frame instead.
  */
 export interface ClientRegistration {
   readonly kind: ClientKind;
@@ -581,7 +591,12 @@ export interface ClientRegistry {
    * {@link broadcast}, restricted to `kinds`. `agent` is carried by the bound
    * tab's DevTools connection; `server-agent` never receives session fan-out.
    *
-   * @returns How many connections received the frame.
+   * @returns How many connections received the frame. The count is the
+   * delivery receipt `../telemetry/live-tail.ts` relies on (its
+   * `TailBroadcaster` narrows the session port to this `number`): 0 — when the
+   * session's bound tab has no online DevTools connection, no tab is bound, the
+   * frame is refused, or the registry is closed — keeps a `telemetry.tail`
+   * frame queued for a retry, so it must never be reported as delivered.
    */
   broadcastToKinds(
     sessionId: string,
@@ -809,6 +824,12 @@ export type TabBindingViewIsAuthTabBinding = AssertTrue<
  * (AAP §0.7.1). Restated here only as the target of the conformance check in
  * {@link createClientRegistry}: the port's declaring module sits above this
  * one, and importing it would invert the layering.
+ *
+ * The `void` results are the manager's port verbatim. The registry's own
+ * {@link ClientRegistry} signatures answer a `number`, which is what also makes
+ * it `../telemetry/live-tail.ts`'s `TailBroadcaster` (the same port with the
+ * count as a delivery receipt); `../main.ts` hands the registry to both, and the
+ * compiler checks each hand-off there.
  */
 interface SessionBroadcastPort {
   broadcast(sessionId: string, message: ProtocolMessage): void;

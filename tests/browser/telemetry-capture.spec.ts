@@ -26,9 +26,12 @@
  *    test asserts the reloaded document's own `navigation` event (`navigation.type` = `reload`),
  *    the entry the panel's event log actually shows for the reload.
  * 4. **A page that was open before the extension.** Such a page carries no agent, so readiness
- *    cannot be met; the service asks the developer to reload, exactly one reload happens only once
- *    that request is surfaced, and afterwards the session reaches `ready`, the new document
- *    reports `installedBeforeReact: true`, and a capture yields the trace shape of test 2.
+ *    cannot be met; the service asks the developer to reload and the panel offers its own reload
+ *    action, and nothing reloads the page — no document load, no `chrome.tabs.reload` from the
+ *    worker — until the developer clicks that action. The click is the consent: the worker makes
+ *    exactly one `chrome.tabs.reload`, of the inspected tab, and afterwards the session reaches
+ *    `ready`, the new document reports `installedBeforeReact: true`, the offer is withdrawn, and a
+ *    capture yields the trace shape of test 2.
  *
  * ## Where every expectation comes from
  *
@@ -44,9 +47,12 @@
  *   values fixed points of `redactUrl`/`redactStackUrls`, no key of `DROPPED_ATTRIBUTE_KEYS` at any
  *   depth, denied header values equal to `REDACTION_MARKER`, no value matching a pattern rule of
  *   `findDeniedRules`, and a planted cookie value and query-parameter value found nowhere.
- * - **Agent frames** are observed in the page itself: an init script records the frames the agent
- *   posts on the page channel (`AGENT_SOURCE_TAG`), which is unauthenticated in that direction by
- *   design, so `agent.ready` is read exactly as the bridge relays it.
+ * - **Agent frames** are observed in the page itself: an init script — which Chromium runs before
+ *   every content script, so it is exactly the "code that ran before the agent" the page channel's
+ *   threat model names as out of reach (docs/SECURITY.md, section 9.1) — listens for the agent's
+ *   handshake offer on `window`, keeps the private channel node it carries, and records every
+ *   agent frame dispatched on that node without ever claiming one, so `agent.ready` is read
+ *   exactly as the bridge relays it. No page script that starts after `document_start` can do this.
  *
  * ## How the "already open" state of test 4 is provoked
  *
@@ -58,10 +64,22 @@
  * its export. (3) is used: the tab is opened while the extension is disabled (through
  * `chrome.management` on `chrome://extensions`, the browser's own control), which is precisely a
  * page loaded before the extension — Chrome injects no declared content script into a tab that is
- * already open when an extension is enabled. The consent the product asks for is the developer's
- * reload: the worker's own consented reload answers `no-agent-report` for a document whose agent
- * never reported, and the service's readiness gate surfaces the reload request as a
- * `session.progress` row and waits for the next document's `agent.ready`.
+ * already open when an extension is enabled.
+ *
+ * The consent is given the way a developer gives it, through the panel's own reload action. The
+ * service's readiness gate surfaces the reload request as a `session.progress` row; the worker,
+ * which sees neither a bridge nor an agent report for the tab's document, offers the reload
+ * (`agent-missing`), and the panel renders the action under `PAGE_RELOAD_ACTION_LABEL`, the name
+ * this file imports rather than retypes. Clicking it sends the panel's `page.reload` request, and
+ * the worker's consented reload — not Playwright — reloads the tab through `chrome.tabs.reload`
+ * and waits for the next document's `agent.ready`, after which the offer returns to `not-needed`
+ * and the action disappears. The reload is observed where it happens: as soon as the re-enabled
+ * extension's worker exists, the test wraps `chrome.tabs.reload` in that worker, recording each
+ * tab id and still calling the original (the worker hands the `chrome.tabs` namespace itself to
+ * its agent control, which looks the method up at call time), so zero calls before the click and
+ * exactly one, naming the inspected tab, after it are asserted beside the page-side evidence of
+ * document loads and the marker. A wrapper that cannot be installed fails the test, which never
+ * substitutes a reload of its own, and the finally block puts the original function back.
  *
  * ## Scope
  *
@@ -88,7 +106,10 @@ import type { BrowserContext, Page, Request, Worker } from '@playwright/test';
 
 import {
   AGENT_SOURCE_TAG,
+  PAGE_AGENT_FRAME_EVENT,
   PAGE_CHANNEL_VERSION,
+  PAGE_RELOAD_ACTION_LABEL,
+  PAGE_HANDSHAKE_OFFER_EVENT,
   isAgentChannelMessageOfType,
 } from '@debuggen/chrome-extension/messages';
 import type { AgentOutboundType, PageAgentReadyPayload } from '@debuggen/chrome-extension/messages';
@@ -382,16 +403,25 @@ interface FrameRecorderArgs {
   readonly sourceTag: string;
   readonly channelVersion: number;
   readonly readyType: string;
+  readonly offerEvent: string;
+  readonly agentFrameEvent: string;
 }
 
 /**
- * Runs in every document of a page before its scripts (an init script). Records the type of every
- * frame the agent posts on the page channel, keeps every `agent.ready` frame whole, and remembers
- * the document's original `fetch` and `XMLHttpRequest.prototype.open` — captured before any
- * `agent.config` can have armed the agent, since the agent is dormant at `document_start` — so a
- * later probe can tell "patched" from "restored" by identity. A `message` listener registered
- * during `document_start` receives even a frame the agent posted earlier in that same moment,
- * because `postMessage` dispatches in a later task.
+ * Runs in every document of a page before its scripts and before every content script (an init
+ * script). Records the type of every frame the agent sends on the private page channel, keeps
+ * every `agent.ready` frame whole, and remembers the document's original `fetch` and
+ * `XMLHttpRequest.prototype.open` — captured before any `agent.config` can have armed the agent,
+ * since the agent is dormant at `document_start` — so a later probe can tell "patched" from
+ * "restored" by identity.
+ *
+ * The channel is a detached node the agent hands the bridge in a `MouseEvent` offer on `window`
+ * (its `relatedTarget`), answering the bridge's one handshake request; every frame is then a
+ * `CustomEvent` on that node whose `detail` is the frame's JSON text. A `window` listener that
+ * exists before the agent hears that offer too, which is the residual the product documents rather
+ * than a hole in it: only pre-agent code — this init script — can hold such a listener. The
+ * recorder listens on the node beside the bridge and never calls `preventDefault()`, so custody of
+ * every frame stays with the bridge exactly as without the recorder.
  */
 function installAgentFrameRecorder(args: FrameRecorderArgs): void {
   if (window.top !== window) {
@@ -408,11 +438,18 @@ function installAgentFrameRecorder(args: FrameRecorderArgs): void {
     originalXhrOpen: xhrPrototype['open'],
   };
   Object.defineProperty(window, args.storeKey, { value: store, configurable: true });
-  window.addEventListener('message', (event: MessageEvent<unknown>) => {
-    if (event.source !== window) {
+
+  const recordFrame = (event: Event): void => {
+    const detail: unknown = (event as CustomEvent<unknown>).detail;
+    if (typeof detail !== 'string') {
       return;
     }
-    const data = event.data;
+    let data: unknown;
+    try {
+      data = JSON.parse(detail);
+    } catch {
+      return;
+    }
     if (typeof data !== 'object' || data === null) {
       return;
     }
@@ -432,7 +469,23 @@ function installAgentFrameRecorder(args: FrameRecorderArgs): void {
     if (frame.type === args.readyType) {
       store.ready.push(data);
     }
-  });
+  };
+
+  // One node per document: the agent answers one request per document, so the first offer is the
+  // only one; a later one (there is none in a healthy page) is ignored rather than double-counted.
+  let channel: EventTarget | undefined;
+  window.addEventListener(
+    args.offerEvent,
+    (event: Event) => {
+      const node = (event as MouseEvent).relatedTarget;
+      if (channel !== undefined || node === null || typeof node.addEventListener !== 'function') {
+        return;
+      }
+      channel = node;
+      node.addEventListener(args.agentFrameEvent, recordFrame);
+    },
+    { capture: true },
+  );
 }
 
 /** Install the recorder for every later document of `page` (reloads and navigations included). */
@@ -442,6 +495,8 @@ async function recordAgentFrames(page: Page): Promise<void> {
     sourceTag: AGENT_SOURCE_TAG,
     channelVersion: PAGE_CHANNEL_VERSION,
     readyType: AGENT_READY_FRAME,
+    offerEvent: PAGE_HANDSHAKE_OFFER_EVENT,
+    agentFrameEvent: PAGE_AGENT_FRAME_EVENT,
   });
 }
 
@@ -1326,6 +1381,168 @@ async function openExtensionSwitch(
   };
 }
 
+/** The worker global the reload recorder writes to — spec-owned, disjoint from every product global. */
+const TAB_RELOAD_STORE_KEY = '__telemetryCaptureSpecTabReloads';
+
+/** Whether {@link installTabReloadRecorder} wrapped `chrome.tabs.reload`, and why not when it did not. */
+type TabReloadRecorderInstall =
+  { readonly installed: true } | { readonly installed: false; readonly reason: string };
+
+/**
+ * Runs in the extension's MV3 worker (a `worker.evaluate` callback, so it names nothing outside
+ * itself). Wraps `chrome.tabs.reload` in place: the worker hands the `chrome.tabs` namespace
+ * itself to its agent control, which looks `reload` up on it at call time, so the wrapper sees
+ * every reload the worker asks Chrome for. Each call records the tab id it names (`null` for a call
+ * naming none, which would reload whichever tab is active) and is then performed by the original
+ * function with its own receiver and arguments. The recorder keeps both functions, so it can be
+ * verified and removed; installing it into a worker that already carries it keeps the first one.
+ */
+function installTabReloadRecorder(storeKey: string): TabReloadRecorderInstall {
+  const scope = globalThis as unknown as Record<string, unknown> & {
+    readonly chrome?: { readonly tabs?: Record<string, unknown> };
+  };
+  const tabs = scope.chrome?.tabs;
+  if (tabs === undefined) {
+    return { installed: false, reason: 'chrome.tabs is not available in this worker' };
+  }
+  const existing = scope[storeKey];
+  if (
+    typeof existing === 'object' &&
+    existing !== null &&
+    tabs['reload'] === (existing as { readonly wrapper?: unknown }).wrapper
+  ) {
+    return { installed: true };
+  }
+  const current = tabs['reload'];
+  if (typeof current !== 'function') {
+    return {
+      installed: false,
+      reason: `chrome.tabs.reload is a ${typeof current}, not a function`,
+    };
+  }
+  const original = current as (this: unknown, ...args: unknown[]) => unknown;
+  const calls: (number | null)[] = [];
+  const wrapper = function (this: unknown, ...args: unknown[]): unknown {
+    const [tabId] = args;
+    calls.push(typeof tabId === 'number' ? tabId : null);
+    return original.apply(this, args);
+  };
+  const failures: string[] = [];
+  try {
+    tabs['reload'] = wrapper;
+  } catch (error) {
+    failures.push(`assignment threw ${String(error)}`);
+  }
+  if (tabs['reload'] !== wrapper) {
+    try {
+      Object.defineProperty(tabs, 'reload', {
+        value: wrapper,
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
+    } catch (error) {
+      failures.push(`Object.defineProperty threw ${String(error)}`);
+    }
+  }
+  if (tabs['reload'] !== wrapper) {
+    return {
+      installed: false,
+      reason: `chrome.tabs.reload still holds the original function (${failures.length === 0 ? 'the assignment and Object.defineProperty were both ignored' : failures.join('; ')})`,
+    };
+  }
+  Object.defineProperty(scope, storeKey, {
+    value: { calls, wrapper, original },
+    configurable: true,
+  });
+  return { installed: true };
+}
+
+/** The reloads the extension's worker asked Chrome for, observed at `chrome.tabs.reload`. */
+interface TabReloadRecorder {
+  /** The tab id of every `chrome.tabs.reload` call since the recorder was installed, in call order. */
+  calls(): Promise<readonly (number | null)[]>;
+  /** Put the original `chrome.tabs.reload` back and drop the record; a no-op once the worker is gone. */
+  dispose(): Promise<void>;
+}
+
+/**
+ * Install the reload recorder in `worker` — the extension's live MV3 worker — and return its
+ * handle. The consented reload is the worker's to perform, so it is observed where it happens: a
+ * recorder that cannot be installed fails the test, which never falls back to reloading the page
+ * itself. A worker that stops takes its recorder with it, so reading one from a stopped worker
+ * fails too, rather than reporting "no reload" for reloads a restarted worker made unobserved.
+ */
+async function recordTabReloads(worker: Worker): Promise<TabReloadRecorder> {
+  let closed = false;
+  worker.once('close', () => {
+    closed = true;
+  });
+  const install = await worker.evaluate(installTabReloadRecorder, TAB_RELOAD_STORE_KEY);
+  if (!install.installed) {
+    throw new Error(
+      `chrome.tabs.reload could not be wrapped in the extension's worker ${worker.url()}: ${install.reason}. The consented reload cannot be observed where the worker performs it, and this test does not substitute a reload of its own.`,
+    );
+  }
+  return {
+    async calls() {
+      if (closed) {
+        throw new Error(
+          `The extension's worker ${worker.url()} stopped after its chrome.tabs.reload recorder was installed; a restarted worker carries no recorder, so its reloads cannot be counted.`,
+        );
+      }
+      const raw: unknown = await worker.evaluate((key) => {
+        const scope = globalThis as unknown as Record<string, unknown> & {
+          readonly chrome?: { readonly tabs?: Record<string, unknown> };
+        };
+        const store = scope[key];
+        if (typeof store !== 'object' || store === null) {
+          return null;
+        }
+        const { calls, wrapper } = store as {
+          readonly calls?: unknown;
+          readonly wrapper?: unknown;
+        };
+        return { calls, wrapped: scope.chrome?.tabs?.['reload'] === wrapper };
+      }, TAB_RELOAD_STORE_KEY);
+      if (!isRecord(raw) || !Array.isArray(raw.calls)) {
+        throw new Error(
+          `The chrome.tabs.reload recorder is not installed in the extension's worker ${worker.url()}: install it with recordTabReloads(worker) before anything can reload.`,
+        );
+      }
+      if (raw.wrapped !== true) {
+        throw new Error(
+          'chrome.tabs.reload was replaced after the recorder wrapped it, so a reload through the replacement would go unrecorded.',
+        );
+      }
+      return raw.calls.map((call: unknown) => (typeof call === 'number' ? call : null));
+    },
+    async dispose() {
+      if (closed) {
+        return;
+      }
+      await worker.evaluate((key) => {
+        const scope = globalThis as unknown as Record<string, unknown> & {
+          readonly chrome?: { readonly tabs?: Record<string, unknown> };
+        };
+        const store = scope[key];
+        const tabs = scope.chrome?.tabs;
+        if (typeof store !== 'object' || store === null) {
+          return;
+        }
+        const { wrapper, original } = store as {
+          readonly wrapper?: unknown;
+          readonly original?: unknown;
+        };
+        if (tabs !== undefined && tabs['reload'] === wrapper) {
+          tabs['reload'] = original;
+        }
+        Reflect.deleteProperty(scope, key);
+      }, TAB_RELOAD_STORE_KEY);
+    },
+  };
+}
+
 /** Counts of a page's real document loads: `load` events and main-frame navigation requests. */
 interface DocumentLoadCounter {
   loads(): number;
@@ -1676,6 +1893,7 @@ test.describe('telemetry capture', () => {
     let enabled = true;
     let legacyPage: Page | undefined;
     let loads: DocumentLoadCounter | undefined;
+    let reloads: TabReloadRecorder | undefined;
     try {
       // The pre-extension state, produced by the browser itself: a tab loaded while the extension
       // is disabled, then the extension enabled around it. Chrome injects no declared content
@@ -1686,8 +1904,12 @@ test.describe('telemetry capture', () => {
       const legacyUrl = new URL('/', fixtureApp.baseUrl);
       legacyUrl.searchParams.set(PROBE_QUERY_KEY, randomProbeValue());
       await legacyPage.goto(legacyUrl.toString(), { timeout: APP_READY_TIMEOUT_MS });
-      await extension.enable();
+      const worker = await extension.enable();
       enabled = true;
+      // Every reload the new worker asks Chrome for is recorded from here on — before the pairing,
+      // the panel, the binding or the offer exist — so no reload of the worker's can go unseen.
+      const tabReloads = await recordTabReloads(worker);
+      reloads = tabReloads;
       await pairing.ensurePaired();
 
       const legacy = await readAgentGlobals(legacyPage);
@@ -1695,7 +1917,8 @@ test.describe('telemetry capture', () => {
       expect(legacy.rendererCount, 'React met no agent hook in that page').toBe(0);
 
       // Observe the reload by its effects: a marker only the current document carries, and a count
-      // of real document loads. The recorder is in place for the document a reload will create.
+      // of real document loads. The agent-frame recorder is in place for the document a reload
+      // will create.
       const marker = randomProbeValue();
       await setDocumentMarker(legacyPage, marker);
       await recordAgentFrames(legacyPage);
@@ -1717,13 +1940,26 @@ test.describe('telemetry capture', () => {
         (message) => message.payload.sessionId === created.id && message.payload.tabId === tabId,
       );
 
-      // The consent step is surfaced, and nothing has reloaded the page on its own.
+      // The consent step is surfaced — the service's reload request and the panel's own reload
+      // action — and nothing has reloaded the page on its own.
       const request = await waitForReloadRequest(editorClient, created.id);
       expect(request.message.trim(), 'the reload request tells the developer what to do').not.toBe(
         '',
       );
+      const reloadAction = panel.main.getByRole('button', {
+        name: PAGE_RELOAD_ACTION_LABEL,
+        exact: true,
+      });
+      await expect(
+        reloadAction,
+        `the panel offers its "${PAGE_RELOAD_ACTION_LABEL}" action for a page without an agent`,
+      ).toBeVisible({ timeout: DEFAULT_WAIT_TIMEOUT_MS });
       expect(loads.loads(), 'no reload happened before the developer consented').toBe(0);
       expect(loads.navigationRequests()).toBe(0);
+      expect(
+        await tabReloads.calls(),
+        'the worker asked Chrome for no reload before the developer consented',
+      ).toEqual([]);
       expect(
         await readDocumentMarker(legacyPage),
         'the pre-extension document is still loaded',
@@ -1733,8 +1969,15 @@ test.describe('telemetry capture', () => {
         'ready' satisfies SessionRecord['status'],
       );
 
-      // The developer consents: exactly one reload of the same URL.
-      await legacyPage.reload({ timeout: APP_READY_TIMEOUT_MS });
+      // The developer consents through the panel's own action; the worker's consented reload, not
+      // this test, reloads the inspected tab — once, through chrome.tabs.reload, of that tab.
+      await reloadAction.click();
+      await expect
+        .poll(() => tabReloads.calls(), {
+          message: `the panel's "${PAGE_RELOAD_ACTION_LABEL}" action did not make the worker call chrome.tabs.reload exactly once, for the inspected tab ${String(tabId)}`,
+          timeout: DEFAULT_WAIT_TIMEOUT_MS,
+        })
+        .toEqual([tabId]);
       const session = await sessions.waitForReady(created.id, {
         timeoutMs: SESSION_READY_TIMEOUT_MS,
       });
@@ -1746,11 +1989,19 @@ test.describe('telemetry capture', () => {
       ).toBe(true);
       expectAgentBeforeReact(await readAgentGlobals(legacyPage));
       expect(await readDocumentMarker(legacyPage), 'the reload replaced the document').toBeNull();
+      await expect(
+        reloadAction,
+        `the "${PAGE_RELOAD_ACTION_LABEL}" offer is withdrawn once the new document's agent reported`,
+      ).toBeHidden({ timeout: DEFAULT_WAIT_TIMEOUT_MS });
       await new Promise<void>((resolve) => {
         setTimeout(resolve, RELOAD_QUIET_WINDOW_MS);
       });
       expect(loads.loads(), 'exactly one reload').toBe(1);
       expect(loads.navigationRequests(), 'exactly one document request').toBe(1);
+      expect(
+        await tabReloads.calls(),
+        'exactly one chrome.tabs.reload, of the inspected tab, and none after it',
+      ).toEqual([tabId]);
       expect(legacyPage.url(), 'the reload kept the URL').toBe(urlBeforeReload);
 
       // Recovery: a capture now yields the fresh-page trace shape.
@@ -1781,6 +2032,8 @@ test.describe('telemetry capture', () => {
       await extension.close();
       await legacyPage?.close();
       await resetExtensionState();
+      // Last, so restoring the worker's own chrome.tabs.reload can never skip the cleanup above.
+      await reloads?.dispose();
     }
   });
 });

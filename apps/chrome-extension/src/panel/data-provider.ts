@@ -16,13 +16,21 @@
  * the renderer's own `mapPanelDataResult`, which also refuses an answer for
  * another source — so no component ever narrows on a `source` that lies.
  *
+ * The same object answers the event drawer, which renders outside `PanelHost`:
+ * {@link PanelDataProvider.resolveEvent} resolves a selected event and the
+ * stored events of its parent chain, however far into the capture they lie, by
+ * paging `events` through this provider's own `query` — each of its two passes
+ * within a page budget of its own, and resumable where it stopped.
+ *
  * ## The seam, one-directional
  *
  * {@link createPanelDataProvider} is a factory, not a singleton, and it
  * acquires nothing: the request function (`panelRequest`, or
  * `getPanelConnection().request`), the port-loss registration
- * (`onPortDisconnect`) and the session getter (`getSessionId` from
- * `./state/session-store.ts`) are all injected by `../App.tsx`. This module
+ * (`onPortDisconnect`), the session getter (`getSessionId` from
+ * `./state/session-store.ts`), the capture getter and the trace cache's
+ * authorisation predicate (both reading that store's snapshot) are all
+ * injected by `../App.tsx`. This module
  * never creates, holds or reconnects a port, never opens a socket and never
  * calls `fetch` — the worker owns every HTTP call, so the protocol package's
  * `HttpClient` (whose documentation lists this file among its consumers) is
@@ -52,41 +60,92 @@
  *   the default rather than clamped, because clamping a negative `limit` to
  *   zero would turn a defect into an empty page that looks like a real answer.
  *   `filter` and `sort` travel untouched; their semantics are the service's.
- * - **Correlation is layered.** `./state/connection.ts` correlates port frames
- *   with its own request ids; this module keeps its own registry of the
- *   queries it has in flight, keyed by {@link newPortRequestId}, so that it can
- *   settle each exactly once, bound it with its own timeout, cancel it on
- *   abort and reject all of them on port loss — whatever request function was
- *   injected. `../shared/messages` declares no cancel frame, so an aborted or
- *   timed-out query is dropped locally and a late answer is discarded, never
- *   resolved into a promise that already settled.
+ * - **The panel identity is forwarded, never dropped.** A node of a rendered
+ *   panel queries through a provider `./components/PanelView.tsx` bound to
+ *   that panel with the renderer's `bindPanelIdentity`, so its call carries
+ *   `options.panelId` — the specification's own `id`. It is sent beside the
+ *   query as the protocol's `PanelDataRequest` body (`{ ...query, panelId }`),
+ *   and the service answers from the capture that panel was generated from, so
+ *   an older panel still on screen never draws a newer capture under its own
+ *   findings. A call with no `panelId` sends no `panelId` key and is a live
+ *   read (the open capture, else the most recent). A present `panelId` that is
+ *   not a string with a visible character is refused with `PANEL_INVALID`
+ *   before anything is sent: dropping it would silently turn a panel-bound
+ *   read into a live one. The `panelId` is part of the body the coalescing key
+ *   is computed over, so a panel-bound read never joins a live one or a read
+ *   bound to another panel.
+ * - **Correlation is layered, and identical requests are coalesced.**
+ *   `./state/connection.ts` correlates port frames with its own request ids;
+ *   this module keeps its own registry of the *distinct* requests it has in
+ *   flight, keyed by the session, the capture the panel's store shows and the
+ *   renderer's `stableQueryKey` of the whole normalised query (see
+ *   {@link panelDataRequestKey}). Two nodes asking for the same page at the
+ *   same time — a `Timeline` and a `FlameChart` of one trace — therefore share
+ *   one port request, one HTTP call and one store read. The capture is part of
+ *   the identity because the service answers each call from the session's
+ *   active (or latest) capture: a new capture changes what an identical query
+ *   means without changing the session, so a query issued under capture B
+ *   never joins a request opened under capture A. The capture is read from the
+ *   injected `getCaptureId` on every call; when it is unknown the key says so,
+ *   and such a request is shared only with others issued while it was unknown.
+ *   Each shared request has its own `AbortController`, its own timeout
+ *   and a set of subscribers, one per `query` call: a caller's abort rejects
+ *   only that caller and detaches its listener, and when the last caller has
+ *   left the shared request is aborted and forgotten. A timeout, port loss or
+ *   a failed request rejects every subscriber; an answer resolves each of them
+ *   through its own mapping. `../shared/messages` declares no cancel frame, so
+ *   an abandoned or timed-out request is dropped locally and a late answer is
+ *   discarded, never resolved into a promise that already settled.
+ * - **In flight, never cached.** A request leaves the registry the moment it
+ *   settles, so an identical query issued afterwards is sent afresh. The
+ *   capture behind a session grows while it runs, and a settled cache would
+ *   need an invalidation rule that nothing in the panel can state. Coalescing
+ *   only requests that overlap in time — and only within one session and one
+ *   capture — needs none: the answer a joining caller receives was still
+ *   outstanding when it asked, for the capture it asked under, so it is never
+ *   older than one round trip. (The drawer's trace cache behind
+ *   {@link PanelDataProvider.resolveEvent} is the one bounded exception. It is
+ *   scoped by session, capture and trace — observing another current capture
+ *   empties it — and it answers only while the panel's own tab is bound to the
+ *   session and connected, so a cached trace never outlives its capture, the
+ *   binding that authorised it, or the port it arrived on.)
  * - **A failure is never data.** Every path that is not a checked answer ends
  *   in a rejected promise carrying a `DebuggenError` — which is what makes
  *   `useQuery` render its error state with a retry (AAP §0.5.5). No path
  *   resolves with an empty page on failure.
  * - **Nothing private reaches an error.** Messages, hints and details name the
  *   requested source and, at most, the numeric `limit` and `offset` — never the
- *   query's filter values, the answer's contents, a session id, a token or a
- *   URL (AAP §0.5.2). A worker failure keeps the code, message and hint the
- *   worker and service chose.
+ *   query's filter values, the answer's contents, a session id, a panel id
+ *   (only whether the query was panel-bound), a token or a URL (AAP §0.5.2). A
+ *   worker failure keeps the code, message and hint the worker and service
+ *   chose.
  * - **No validation of panels.** The service validated the specification and
- *   the worker's protocol client parsed the answer; this module neither
- *   re-parses nor re-validates, and the shallow wire-to-view mapping is the
- *   renderer's.
+ *   the worker's protocol client parses both the request body against the
+ *   route's schema and the answer; this module neither re-parses nor
+ *   re-validates, and the shallow wire-to-view mapping is the renderer's.
  *
- * @example Building the provider once in `../App.tsx`:
+ * @example Building the provider once in `../App.tsx`, and binding it per
+ * rendered panel in `./components/PanelView.tsx`:
  * ```tsx
  * const dataProvider = useMemo(
- *   () => createPanelDataProvider({ request: panelRequest, onPortDisconnect, getSessionId }),
+ *   () =>
+ *     createPanelDataProvider({
+ *       request: panelRequest,
+ *       onPortDisconnect,
+ *       getSessionId,
+ *       getCaptureId: readCaptureId,
+ *       canServeCached: canServeCachedTrace,
+ *     }),
  *   [],
  * );
- * return <PanelHost spec={spec} dataProvider={dataProvider} actions={actions} theme={theme} />;
+ * const panelProvider = useMemo(() => bindPanelIdentity(dataProvider, spec.id), [dataProvider, spec.id]);
+ * return <PanelHost spec={spec} dataProvider={panelProvider} actions={actions} theme={theme} />;
  * ```
  *
  * @module apps/chrome-extension/src/panel/data-provider
  */
 
-import { mapPanelDataResult } from '@debuggen/panel-renderer';
+import { mapPanelDataResult, stableQueryKey } from '@debuggen/panel-renderer';
 import type { DataProvider, DataQueryOptions, DataQueryResponse } from '@debuggen/panel-renderer';
 import {
   DATA_QUERY_DEFAULT_LIMIT,
@@ -94,12 +153,11 @@ import {
   DATA_QUERY_MAX_LIMIT,
 } from '@debuggen/panel-schema';
 import type { DataQuery, DataQuerySource } from '@debuggen/panel-schema';
+import type { PanelDataRequest, TelemetryEvent } from '@debuggen/protocol';
 import { DebuggenError, noopLogger } from '@debuggen/shared';
-import type { Logger, SessionId } from '@debuggen/shared';
+import type { CaptureId, Logger, SessionId } from '@debuggen/shared';
 
-import { newPortRequestId } from '../shared/messages';
 import type {
-  PortRequestId,
   PortRequestKind,
   PortRequestPayloads,
   PortResponsePayloads,
@@ -133,6 +191,59 @@ export const PANEL_DATA_REQUEST_TIMEOUT_MS = PANEL_PORT_REQUEST_TIMEOUT_MS;
 /** The largest delay a platform timer accepts without firing immediately. */
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
+/**
+ * The most `events` pages **one pass** of a
+ * {@link PanelDataProvider.resolveEvent} call requests: **10** pages of
+ * `DATA_QUERY_MAX_LIMIT` (5 000) events, so one pass reads at most 50 000
+ * stored events.
+ *
+ * A lookup has at most two passes, and each has this budget of its own: the
+ * **find** pass, which pages until the selected event turns up, and the
+ * **ancestry** pass, which pages the event's trace for the ancestors the find
+ * pass did not already collect. So an event found on the find pass's last
+ * page still gets a full ancestry pass, and one lookup requests at most twice
+ * this many pages.
+ *
+ * The selection carries no filter the service can index an event by — the
+ * query schema has no event-id field — so a lookup pages the capture. The
+ * budget is what keeps one click from reading an arbitrarily large capture
+ * into the panel, and it is a bound per call, not a horizon: a find pass that
+ * stops at it is reported as `budget-exhausted` — distinctly from `not-found`
+ * ("the capture does not hold it") — with the offset it stopped at, and a
+ * later call resumes there (`resumeFrom`); an ancestry pass that stops at it
+ * is reported on the `found` answer, and a later call continues it
+ * (`resumeAncestry`). So the drawer never claims an event or an ancestor is
+ * missing when it merely stopped looking, and every stored event stays
+ * reachable. A selection that names its trace — every selection raised by a
+ * timeline, a waterfall or an evidence chip does — is scanned within that
+ * trace only, where the budget is never the limit in practice.
+ */
+export const EVENT_RESOLUTION_PAGE_BUDGET = 10;
+
+/**
+ * The most stored events **one pass** of a
+ * {@link PanelDataProvider.resolveEvent} call reads:
+ * {@link EVENT_RESOLUTION_PAGE_BUDGET} pages of `DATA_QUERY_MAX_LIMIT` events.
+ * Derived, never restated, so the bound a pass applies and the bound the
+ * drawer names can never disagree.
+ */
+export const EVENT_RESOLUTION_MAX_EVENTS = EVENT_RESOLUTION_PAGE_BUDGET * DATA_QUERY_MAX_LIMIT;
+
+/**
+ * How many traces the drawer's trace cache keeps: **16**, least recently used
+ * evicted first. Enough for a developer walking back and forth between the
+ * events of a handful of interactions, and small enough to be irrelevant to
+ * the panel's memory.
+ */
+export const EVENT_TRACE_CACHE_MAX_TRACES = 16;
+
+/**
+ * How many stored events the drawer's trace cache keeps across all of its
+ * traces: **20 000**, least recently used traces evicted first until the total
+ * fits. A single trace larger than this is never cached.
+ */
+export const EVENT_TRACE_CACHE_MAX_EVENTS = 20_000;
+
 /** The one request kind this module sends. */
 const PANEL_DATA_QUERY_KIND = 'panelData.query' satisfies PortRequestKind;
 
@@ -149,9 +260,11 @@ type PanelDataQueryAnswer = PortResponsePayloads[typeof PANEL_DATA_QUERY_KIND];
 const HINTS = {
   unbound: 'Start a session from the Debug Generator view in VS Code, then reopen this panel.',
   foreignSession: 'Reload the panel to show the session this tab is bound to.',
+  unusablePanel: 'Reload the panel; if it keeps failing, reopen Chrome DevTools.',
   disconnected: 'The panel reconnects on its own; retry in a moment.',
   timeout: 'Retry in a moment; if it keeps failing, reload the extension.',
   failed: 'Retry in a moment; if it keeps failing, reopen Chrome DevTools.',
+  unidentified: 'Select the event again from the panel or the live tail.',
 } as const;
 
 /*
@@ -170,7 +283,8 @@ const HINTS = {
  * suite can pass a plain function for the one kind.
  *
  * @param kind Always `'panelData.query'`.
- * @param payload The session to address and the normalised query.
+ * @param payload The session to address and the request body: the normalised
+ * query, plus the `panelId` of the panel it belongs to for a panel-bound read.
  * @param options The caller's abort signal and this provider's timeout.
  * @returns The worker's answer: the service's wire-form `DataResult`.
  */
@@ -201,10 +315,41 @@ export interface PanelDataProviderOptions {
    */
   readonly getSessionId: () => SessionId | undefined;
   /**
+   * The capture this panel's store shows — `capture.captureId` of the store's
+   * snapshot: the running capture, or the most recent one after it stopped.
+   *
+   * Read on every call, because a new capture changes it without changing the
+   * session, while the service answers each call from the session's active
+   * (or latest) capture. It is part of every request's identity (see
+   * {@link panelDataRequestKey}) and the scope of every trace-cache entry.
+   * Omitted, returning a blank value, or throwing (logged, never rethrown),
+   * the capture counts as **unknown**: requests are then coalesced only with
+   * others issued while it was unknown, and the trace cache answers nothing.
+   */
+  readonly getCaptureId?: (() => CaptureId | undefined) | undefined;
+  /**
+   * Whether the drawer's trace cache may answer for `sessionId` right now —
+   * in `../App.tsx`, whether the panel is connected and its inspected tab is
+   * bound to exactly that session.
+   *
+   * The cache fails closed (AAP §0.5.6: a devtools client may read panel data
+   * only for the session bound to its tab). It answers only when
+   * `getSessionId()` returns exactly `sessionId` **and** this predicate is
+   * present and returns `true`; in every other case — the predicate omitted,
+   * answering anything but `true`, or throwing (logged, never rethrown) — the
+   * cache is emptied and the lookup goes to the service, which authorises the
+   * request against the tab's binding. So a trace cached while the tab was
+   * bound is never served after the tab unbinds, leaves, or loses its
+   * credential. Read at every cache read and write, never remembered.
+   */
+  readonly canServeCached?: ((sessionId: SessionId) => boolean) | undefined;
+  /**
    * `onPortDisconnect` from `./state/connection.ts`. When given, the provider
-   * subscribes while it has queries in flight and rejects every one of them
-   * the moment the port closes (the worker suspends after about thirty seconds
-   * idle), so no node keeps a spinner for a port that is gone.
+   * subscribes while it has queries in flight **or** holds cached traces: the
+   * moment the port closes (the worker suspends after about thirty seconds
+   * idle) it rejects every query in flight, so no node keeps a spinner for a
+   * port that is gone, and empties the trace cache, whose entries were
+   * authorised over that port. With neither left, it unsubscribes.
    */
   readonly onPortDisconnect?: PanelDataDisconnectRegistration | undefined;
   /**
@@ -220,17 +365,176 @@ export interface PanelDataProviderOptions {
 }
 
 /**
+ * What {@link PanelDataProvider.resolveEvent} looks up: the store's selection,
+ * as far as it is known.
+ */
+export interface PanelEventTarget {
+  /** The selected event's id. */
+  readonly eventId: string;
+  /**
+   * The selected event's trace, when the selection or the live tail knows it.
+   * Known, the scan is narrowed to that trace; unknown (or blank), the whole
+   * capture is paged until the event is found.
+   */
+  readonly traceId?: string | undefined;
+}
+
+/**
+ * Where a lookup continues an ancestry pass that stopped at its page budget:
+ * the `ancestryResumeOffset` and the `trace` of the `found` answer it
+ * continues.
+ */
+export interface PanelAncestryResume {
+  /**
+   * The first offset of the event's trace that pass did not read — the
+   * earlier answer's `ancestryResumeOffset`.
+   */
+  readonly from: number;
+  /**
+   * The stored events of the trace that pass collected — the earlier answer's
+   * `trace`. It must hold the selected event; the continuation pages the
+   * trace from `from` on top of it, so nothing already read is read again.
+   */
+  readonly trace: readonly TelemetryEvent[];
+}
+
+/** Per-call options for {@link PanelDataProvider.resolveEvent}. */
+export interface PanelEventResolveOptions {
+  /**
+   * Cancels the lookup. Checked before every page and honoured by every page
+   * request; an abort rejects with the same `TRANSPORT_DISCONNECTED` /
+   * `reason: "aborted"` failure an aborted `query` rejects with.
+   */
+  readonly signal?: AbortSignal | undefined;
+  /**
+   * Resume a find pass that stopped at its page budget: the find pass starts
+   * at this offset — an earlier `budget-exhausted` answer's `resumeOffset` —
+   * instead of at the first stored event, with a full page budget of its own.
+   * The offset is into the same sequence the earlier pass paged: the whole
+   * capture when the target names no trace, the target's trace when it does.
+   * Normalised like a query's `offset` (a malformed value starts at the
+   * first event). The ancestry pass, when one is needed, still pages the
+   * trace from its start, because the ancestors may lie before this offset.
+   */
+  readonly resumeFrom?: number | undefined;
+  /**
+   * Continue an ancestry pass that stopped at its page budget (see
+   * {@link PanelAncestryResume}). Used only when its `trace` holds the target
+   * event of the target's trace; otherwise it is ignored and the lookup runs
+   * from the start. Takes precedence over `resumeFrom`.
+   */
+  readonly resumeAncestry?: PanelAncestryResume | undefined;
+}
+
+/**
+ * What {@link PanelDataProvider.resolveEvent} established — always a real
+ * answer about the stored capture; a failure to reach it rejects instead.
+ *
+ * - `found` — the capture holds the event. `trace` is the pool of stored
+ *   events of its trace that were collected, which is what
+ *   {@link buildEventParentChain} builds the parent chain from; `chainComplete`
+ *   says whether it holds every ancestor up to the root. When it does not,
+ *   `budgetExhausted` says why: `true` — the ancestry pass stopped at
+ *   {@link EVENT_RESOLUTION_PAGE_BUDGET}, and `ancestryResumeOffset` is the
+ *   first offset of the trace it did not read (continue with
+ *   `resumeAncestry`); `false` — every page of the trace was read, so the
+ *   missing ancestors were never stored.
+ * - `not-found` — every page that could hold the event was read, and none did.
+ * - `budget-exhausted` — the find pass stopped at its page budget without
+ *   finding it; the capture may hold it further on. `scope` names what was
+ *   paged — the whole `capture`, or the target's `trace` — and the pass read
+ *   offsets `searchedFrom` up to (not including) `resumeOffset` of it,
+ *   `eventsSearched` events in all. Resume with `resumeFrom: resumeOffset`.
+ *
+ * `pagesRead` counts the `events` pages requested by the call, across its
+ * passes; `0` is a cache hit.
+ */
+export type PanelEventResolution =
+  | {
+      readonly status: 'found';
+      readonly event: TelemetryEvent;
+      readonly trace: readonly TelemetryEvent[];
+      readonly chainComplete: boolean;
+      readonly budgetExhausted: boolean;
+      /** Present exactly when `budgetExhausted` is `true`. */
+      readonly ancestryResumeOffset?: number | undefined;
+      readonly pagesRead: number;
+    }
+  | { readonly status: 'not-found'; readonly pagesRead: number }
+  | {
+      readonly status: 'budget-exhausted';
+      readonly scope: 'capture' | 'trace';
+      readonly searchedFrom: number;
+      readonly resumeOffset: number;
+      readonly eventsSearched: number;
+      readonly pagesRead: number;
+    };
+
+/**
  * The provider {@link createPanelDataProvider} returns: the renderer's
- * {@link DataProvider}, plus the two hooks its owner and its tests need.
+ * {@link DataProvider}, the drawer's event lookup, and the two hooks its owner
+ * and its tests need.
  *
  * Assignable to `DataProvider` as it stands, so `PanelHost`'s `dataProvider`
  * prop takes it without a cast.
  */
 export interface PanelDataProvider extends DataProvider {
   /**
-   * Reject every query this provider has in flight, each with a transport
-   * failure naming its own source, and forget them; their answers are dropped
-   * if they arrive later.
+   * Resolve a selected event — and the stored events its parent chain is built
+   * from — against the session's stored capture, however far into the capture
+   * it lies.
+   *
+   * The query schema has no event-id filter, so the lookup pages `events`
+   * through this provider's own `query` (identical concurrent pages are
+   * therefore shared with every other caller), `DATA_QUERY_MAX_LIMIT` at a
+   * time, following each page's `nextOffset`:
+   *
+   * 1. **The find pass** — pages from `resumeFrom` (default: the first stored
+   *    event) until the event is collected: `filter: { traceId }` when the
+   *    trace is known, the unfiltered capture when it is not. It stops early
+   *    once the pages collected so far also hold the event's complete
+   *    ancestor chain (by `parentSpanId` within the trace).
+   * 2. **The ancestry pass** — when the find pass found the event but not its
+   *    whole chain, pages `filter: { traceId }` of the event's trace, on top of
+   *    what the find pass collected, until the chain is complete or the
+   *    trace's pages end. It continues where the find pass stopped when that
+   *    pass paged the same trace from its start, and starts at the trace's
+   *    first event otherwise.
+   *
+   * Each pass has its own {@link EVENT_RESOLUTION_PAGE_BUDGET}. A pass that
+   * spends it reports where it stopped, and a later call resumes there —
+   * `resumeFrom` for the find pass, `resumeAncestry` for the ancestry pass —
+   * so no stored event is beyond reach, however large the capture.
+   *
+   * Before any page is requested, a bounded least-recently-used cache of trace
+   * pools (keyed by session, capture and trace) is consulted, and it answers
+   * **only** when it holds the event and its complete chain *and* the cache is
+   * authorised (see {@link PanelDataProviderOptions.canServeCached}): stored
+   * events are immutable once written, so such an answer is exactly what a
+   * scan would find, whereas a pool missing the event or an ancestor may be
+   * missing something the growing capture now holds, and is re-queried.
+   *
+   * @param sessionId The session the selection belongs to. Missing, blank or
+   * foreign to the panel's store, the call rejects with `TAB_NOT_BOUND`
+   * exactly as `query` does — before the cache is consulted.
+   * @param target The selected event's id and, when known, its trace.
+   * @param options The lookup's abort signal, and where to resume a pass an
+   * earlier call stopped at its budget.
+   * @returns What the stored capture says about the event. Rejects with a
+   * `DebuggenError` — never an empty success — when a page cannot be read, the
+   * target names no event, or the call is aborted.
+   */
+  resolveEvent(
+    sessionId: SessionId | undefined,
+    target: PanelEventTarget,
+    options?: PanelEventResolveOptions,
+  ): Promise<PanelEventResolution>;
+  /**
+   * Reject every request this provider has in flight — every caller waiting on
+   * each of them — with a transport failure naming the request's own source,
+   * abort the underlying requests and forget them; their answers are dropped if
+   * they arrive later. The drawer's trace cache is emptied too: its entries
+   * were authorised over the port that is gone.
    *
    * Called by the provider itself on port loss when `onPortDisconnect` was
    * injected; exposed so that an owner wiring the port some other way can
@@ -239,10 +543,18 @@ export interface PanelDataProvider extends DataProvider {
    * @param error The loss to report. Its code, message and hint are kept and
    * each rejection's details gain the query's source; when omitted, a
    * `TRANSPORT_DISCONNECTED` "the port closed" failure is used.
-   * @returns How many queries were rejected.
+   * @returns How many **distinct requests** were rejected — the unit
+   * {@link PanelDataProvider.pendingCount} counts. Three callers coalesced into
+   * one request count once, although all three promises reject.
    */
   rejectAllPending(error?: DebuggenError): number;
-  /** How many queries are in flight: sent, and neither answered nor rejected. */
+  /**
+   * How many **distinct requests** are in flight: sent, and neither answered
+   * nor rejected nor abandoned by their last caller. Identical concurrent
+   * queries share one request (see the module documentation), so this is the
+   * number of `panelData.query` port requests outstanding, not the number of
+   * `query` calls waiting.
+   */
   pendingCount(): number;
 }
 
@@ -313,6 +625,104 @@ export function normalizePanelDataQuery<Source extends DataQuerySource>(
   };
 }
 
+/**
+ * The identity of one request as this provider coalesces it: the session it
+ * is addressed to, the capture the panel's store showed when it was issued,
+ * and the renderer's `stableQueryKey` of the query **as it is sent** — after
+ * {@link normalizePanelDataQuery}.
+ *
+ * - Computed over the whole normalised query, not over a chosen list of
+ *   fields, so any field the query schema gains participates without a change
+ *   here: two queries share a request exactly when they would send the same
+ *   payload to the same session under the same capture.
+ * - Normalised first, so `{ source: 'events' }` and
+ *   `{ source: 'events', limit: 200, offset: 0 }` are one request — they are
+ *   one page — while keys in another order and members explicitly `undefined`
+ *   fold together by `stableQueryKey`'s own rules.
+ * - Scoped by capture, because the service answers from the session's active
+ *   (or latest) capture: the same query under a new capture is another
+ *   question. An unknown capture is its own scope (`null`), distinct from
+ *   every known one — including a capture whose id is the text `null`.
+ * - The session and the capture are JSON-encoded before their separators. A
+ *   JSON string ends at its first unescaped quote and `null` is a fixed token,
+ *   so both segments are self-delimiting and no triple of a session, a capture
+ *   and a query can spell the key of another triple, whatever characters any
+ *   of them holds.
+ *
+ * The key holds the session id, the capture id and the filter values, so it
+ * is compared and never logged, shown or placed in an error.
+ *
+ * @param sessionId The session the query is addressed to.
+ * @param captureId The capture the panel's store shows, or `undefined` when it
+ * is unknown.
+ * @param sent The request body exactly as it will be sent: the normalised
+ * query, plus the `panelId` of a panel-bound read — so a read bound to one
+ * panel never shares an answer with a live read or with another panel's.
+ * @returns A string equal for exactly the requests that may share one answer.
+ */
+export function panelDataRequestKey(
+  sessionId: SessionId,
+  captureId: CaptureId | undefined,
+  sent: DataQuery,
+): string {
+  return `${JSON.stringify(sessionId)}:${JSON.stringify(captureId ?? null)}:${stableQueryKey(sent)}`;
+}
+
+/**
+ * An event's ancestors, from the trace root to its immediate parent, built
+ * only from events in `pool` — never synthesised from `parentSpanId` alone.
+ *
+ * The one definition of "the parent chain" in the panel: the drawer renders
+ * what it answers, and {@link PanelDataProvider.resolveEvent} stops paging
+ * once it answers a chain, so the two can never disagree about when the chain
+ * is complete.
+ *
+ * - A root event (no `parentSpanId`) answers an empty chain.
+ * - Ancestors are looked up by span id among the pool's events of the same
+ *   trace; when several share a span id, the first in pool order is used.
+ * - When an ancestor is missing from `pool` (a partial page, or a parent that
+ *   never arrived), or the links form a cycle, the chain cannot be stated from
+ *   the root and `undefined` is answered, so a caller omits it rather than
+ *   presenting a fragment as the whole lineage.
+ *
+ * @param event The event whose ancestry is wanted.
+ * @param pool Stored or streamed events to look ancestors up in.
+ * @returns The ancestors, root first, or `undefined` when incomplete.
+ */
+export function buildEventParentChain(
+  event: TelemetryEvent,
+  pool: readonly TelemetryEvent[],
+): readonly TelemetryEvent[] | undefined {
+  const bySpan = new Map<string, TelemetryEvent>();
+  for (const candidate of pool) {
+    if (candidate.traceId === event.traceId && !bySpan.has(candidate.spanId)) {
+      bySpan.set(candidate.spanId, candidate);
+    }
+  }
+  const chain: TelemetryEvent[] = [];
+  const visited = new Set<string>([event.spanId]);
+  let parentSpanId = event.parentSpanId;
+  while (parentSpanId !== undefined) {
+    const parent = bySpan.get(parentSpanId);
+    if (parent === undefined || visited.has(parentSpanId)) {
+      return undefined;
+    }
+    visited.add(parentSpanId);
+    chain.push(parent);
+    parentSpanId = parent.parentSpanId;
+  }
+  return chain.reverse();
+}
+
+/**
+ * Where the drawer's trace cache holds one trace of one capture of one
+ * session. Every part is JSON-quoted, so the triple is self-delimiting (see
+ * {@link panelDataRequestKey}); compared only, never logged.
+ */
+function traceCacheKey(sessionId: SessionId, captureId: CaptureId, traceId: string): string {
+  return `${JSON.stringify(sessionId)}:${JSON.stringify(captureId)}:${JSON.stringify(traceId)}`;
+}
+
 /** A usable timer delay: `candidate` when finite and positive, else `fallback`. */
 function usableTimeout(candidate: number | undefined, fallback: number): number {
   const delay =
@@ -367,6 +777,30 @@ function foreignSessionError(source: DataQuerySource): DebuggenError {
     'TAB_NOT_BOUND',
     `The "${source}" data for this view is addressed to a session this panel is not showing.`,
     { hint: HINTS.foreignSession, details: { source, session: 'mismatched' } },
+  );
+}
+
+/** The kind of an unusable panel id, for a detail — never the value itself. */
+function panelIdKind(panelId: unknown): string {
+  if (typeof panelId === 'string') {
+    return 'blank';
+  }
+  return panelId === null ? 'null' : typeof panelId;
+}
+
+/**
+ * A query naming a panel identity that cannot name a panel: not a string, or
+ * blank. `PANEL_INVALID`, like the renderer's own refusal of the same value.
+ * The value is described by its kind only — a panel id never reaches an error.
+ */
+function unusablePanelError(source: DataQuerySource, panelId: unknown): DebuggenError {
+  return new DebuggenError(
+    'PANEL_INVALID',
+    `The "${source}" data for this view was requested for a panel with no usable id.`,
+    {
+      hint: HINTS.unusablePanel,
+      details: { source, panelBound: true, panelId: panelIdKind(panelId) },
+    },
   );
 }
 
@@ -467,30 +901,61 @@ function requestFailedError(context: QueryContext, cause: unknown): DebuggenErro
   );
 }
 
+/** An event lookup whose target names no event: a defect in the caller's selection. */
+function unidentifiedEventError(): DebuggenError {
+  return new DebuggenError(
+    'PROTOCOL_INVALID_MESSAGE',
+    'The selected event cannot be looked up: the selection does not name an event.',
+    { hint: HINTS.unidentified, details: { source: 'events', eventId: 'missing' } },
+  );
+}
+
 /*
  * ===========================================================================
  * Section E — the provider
  * ===========================================================================
  */
 
-/** One query in flight, as a provider's registry holds it. */
-interface PendingEntry {
-  /** The query's source and paging, for the rejection wording. */
-  readonly context: QueryContext;
-  /** Reject the query with a typed error; a no-op once it has settled. */
-  readonly fail: (error: DebuggenError) => void;
-}
-
-/** A sent query: its answer, and the cleanup that must run however it ends. */
-interface InFlightQuery {
-  /** Settles exactly once: the worker's answer, or a typed rejection. */
-  readonly answer: Promise<PanelDataQueryAnswer>;
-  /** Clears the timer, detaches the abort listener and forgets the entry. Idempotent. */
-  readonly cleanup: () => void;
-}
-
 /** A platform timer handle, whichever runtime's `setTimeout` produced it. */
 type TimerHandle = ReturnType<typeof globalThis.setTimeout>;
+
+/**
+ * One caller waiting on a shared request: one `query` call.
+ *
+ * Settled at most once, by whichever comes first — the shared request's
+ * outcome, or the caller's own abort.
+ */
+interface Subscriber {
+  /** Hands the caller the worker's answer, for it to map with its own query. */
+  readonly resolve: (answer: PanelDataQueryAnswer) => void;
+  /** Rejects the caller with a typed error. */
+  readonly reject: (error: DebuggenError) => void;
+  /** Detaches the caller's abort listener. Idempotent. */
+  readonly detach: () => void;
+}
+
+/**
+ * One distinct request in flight, shared by every caller that asked for the
+ * same page of the same session while it was outstanding.
+ */
+interface SharedRequest {
+  /** Its {@link panelDataRequestKey}: where the registry holds it. */
+  readonly key: string;
+  /** The query's source and paging, for the rejection wording. */
+  readonly context: QueryContext;
+  /**
+   * Cancels the underlying request. Owned by the shared request, never a
+   * caller's: one caller leaving must not cancel the answer others still wait
+   * for.
+   */
+  readonly controller: AbortController;
+  /** The callers waiting on it; the request is abandoned when the last one leaves. */
+  readonly subscribers: Set<Subscriber>;
+  /** Its timeout, until it settles. */
+  timer: TimerHandle | undefined;
+  /** Whether it has settled: answered, failed or abandoned. Set exactly once. */
+  settled: boolean;
+}
 
 /**
  * Build the DevTools panel's {@link DataProvider}.
@@ -504,48 +969,79 @@ type TimerHandle = ReturnType<typeof globalThis.setTimeout>;
  * Each `query` call, in order:
  *
  * 1. refuses a call naming no session, or naming a session other than the one
- *    `getSessionId` reports, with `TAB_NOT_BOUND`;
+ *    `getSessionId` reports, with `TAB_NOT_BOUND`, and a call whose
+ *    `options.panelId` is present but not a string with a visible character
+ *    with `PANEL_INVALID`;
  * 2. normalises `limit` and `offset` (see {@link normalizePanelDataQuery});
  * 3. refuses an already-aborted call without sending anything;
- * 4. registers the query under a fresh {@link newPortRequestId}, starts its
- *    timeout and abort watch, and sends one `panelData.query` port request
- *    with the caller's signal and this provider's timeout;
- * 5. maps the worker's wire-form answer into the view form with the renderer's
- *    `mapPanelDataResult`, which rejects an answer for another source or with
- *    a malformed payload or page echo as `PROTOCOL_INVALID_MESSAGE`;
- * 6. resolves with `{ source, data }` plus, for a paged source, the `total`,
+ * 4. reads the store's capture through `getCaptureId`, computes the request's
+ *    {@link panelDataRequestKey} over the session, that capture and the
+ *    request body — the protocol's `PanelDataRequest`: the normalised query,
+ *    plus `panelId` when the call named one — and joins the identical request already in flight
+ *    under the same capture, when there is one; otherwise it opens a new
+ *    shared request — its own `AbortController`, its own timeout, registered
+ *    for port loss — and sends one `panelData.query` port request with that
+ *    controller's signal (never a caller's) and this provider's timeout;
+ * 5. waits as one subscriber of that request: its own signal's abort rejects
+ *    this call alone and detaches its listener, and abandons the request —
+ *    aborting it and dropping any late answer — once no caller is left, while
+ *    a timeout, port loss or a failed request rejects every subscriber;
+ * 6. maps the worker's wire-form answer into the view form with the renderer's
+ *    `mapPanelDataResult` and **its own** query, which rejects an answer for
+ *    another source or with a malformed payload or page echo as
+ *    `PROTOCOL_INVALID_MESSAGE`;
+ * 7. resolves with `{ source, data }` plus, for a paged source, the `total`,
  *    `limit`, `offset` and `nextOffset` the service reported — `null` included
  *    — and nothing the service did not send.
  *
- * Every failure — abort, timeout, port loss, a worker's typed refusal, a
- * mismatched answer — rejects with a `DebuggenError` and leaves no entry, timer
- * or listener behind; `query` never throws synchronously and never resolves a
- * failure as data.
+ * A joining caller shares the request's remaining time: it waits no longer
+ * than the provider's timeout, and possibly less. Every failure — abort,
+ * timeout, port loss, a worker's typed refusal, a mismatched answer — rejects
+ * with a `DebuggenError` and leaves no entry, timer or listener behind once no
+ * caller holds the request; `query` never throws synchronously and never
+ * resolves a failure as data.
  *
- * @param options The injected request function, session getter, optional port
- * loss registration, timeout and logger.
- * @returns The provider, with {@link PanelDataProvider.rejectAllPending} and
+ * {@link PanelDataProvider.resolveEvent}, the drawer's lookup, reads the
+ * capture through this same `query` — so its pages are guarded, coalesced and
+ * bounded exactly like any node's — and keeps its trace cache per provider,
+ * scoped by session, capture and trace, authorised at every read and write by
+ * `getSessionId` and `canServeCached`, and emptied on port loss.
+ *
+ * @param options The injected request function, session and capture getters,
+ * cache authorisation predicate, optional port loss registration, timeout and
+ * logger.
+ * @returns The provider, with {@link PanelDataProvider.resolveEvent},
+ * {@link PanelDataProvider.rejectAllPending} and
  * {@link PanelDataProvider.pendingCount} beside `query`.
  */
 export function createPanelDataProvider(options: PanelDataProviderOptions): PanelDataProvider {
-  const { request, getSessionId, onPortDisconnect } = options;
+  const { request, getSessionId, getCaptureId, canServeCached, onPortDisconnect } = options;
   const logger = options.logger ?? noopLogger;
   const timeoutMs = usableTimeout(options.timeoutMs, PANEL_DATA_REQUEST_TIMEOUT_MS);
 
   // Per provider rather than per module, so two providers — two panel
-  // documents' worth in one test — share no queries and no subscription.
-  const pending = new Map<PortRequestId, PendingEntry>();
+  // documents' worth in one test — share no requests, no cached trace and no
+  // subscription. Keyed by `panelDataRequestKey`; an entry is removed the
+  // moment it settles.
+  const inFlight = new Map<string, SharedRequest>();
+  const traceCache = createTraceCache(EVENT_TRACE_CACHE_MAX_TRACES, EVENT_TRACE_CACHE_MAX_EVENTS);
+  // The capture the provider last read from the store. Reading any other one
+  // empties the trace cache, so no entry outlives the capture it was read from.
+  let observedCapture: CaptureId | undefined;
   let unsubscribeDisconnect: (() => void) | undefined;
 
   function rejectAllPending(error?: DebuggenError): number {
     const loss =
       error === undefined ? undefined : DebuggenError.from(error, 'TRANSPORT_DISCONNECTED');
-    // A copy: each `fail` removes its own entry while this loop runs.
-    const entries = [...pending.values()];
-    for (const entry of entries) {
-      entry.fail(disconnectedError(entry.context, loss));
+    // A copy: each settlement removes its own entry while this loop runs.
+    const requests = [...inFlight.values()];
+    for (const shared of requests) {
+      fail(shared, disconnectedError(shared.context, loss), true);
     }
-    return entries.length;
+    // Every cached trace was authorised over the port that is gone; the next
+    // lookup asks the service again, over whatever port replaces it.
+    clearTraceCache('port-lost');
+    return requests.length;
   }
 
   const handleDisconnect: PanelPortDisconnectListener = (event) => {
@@ -558,9 +1054,18 @@ export function createPanelDataProvider(options: PanelDataProviderOptions): Pane
     }
   };
 
-  // The port-loss subscription exists only while a query is in flight, so a
-  // provider that React builds and discards (StrictMode's double invoke of
-  // `useMemo`) leaves no listener behind in the connection module.
+  // The port-loss subscription exists only while a query is in flight or the
+  // trace cache holds an entry, so a provider that React builds and discards
+  // (StrictMode's double invoke of `useMemo`) leaves no listener behind in the
+  // connection module.
+  function syncDisconnectWatch(): void {
+    if (inFlight.size > 0 || traceCache.size() > 0) {
+      watchDisconnect();
+    } else {
+      unwatchDisconnect();
+    }
+  }
+
   function watchDisconnect(): void {
     if (onPortDisconnect === undefined || unsubscribeDisconnect !== undefined) {
       return;
@@ -587,15 +1092,180 @@ export function createPanelDataProvider(options: PanelDataProviderOptions): Pane
     }
   }
 
-  function track(id: PortRequestId, entry: PendingEntry): void {
-    pending.set(id, entry);
-    watchDisconnect();
+  /**
+   * Empty the trace cache, and drop the port-loss subscription when nothing
+   * else holds it. Logged with a fixed reason word only.
+   */
+  function clearTraceCache(reason: 'port-lost' | 'capture-changed' | 'not-authorised'): void {
+    if (traceCache.size() === 0) {
+      return;
+    }
+    traceCache.clear();
+    logger.debug("Emptied the event drawer's trace cache.", { reason });
+    syncDisconnectWatch();
   }
 
-  function untrack(id: PortRequestId): void {
-    if (pending.delete(id) && pending.size === 0) {
-      unwatchDisconnect();
+  /**
+   * Claim a shared request's one settlement: stop its timer, take it out of
+   * the registry — dropping the port-loss subscription with the last entry,
+   * unless cached traces still hold it — and hand back the callers it still
+   * had, each with its abort listener detached.
+   *
+   * @returns The callers to settle, or `undefined` when the request had
+   * already settled (so a second outcome is dropped).
+   */
+  function settle(shared: SharedRequest): readonly Subscriber[] | undefined {
+    if (shared.settled) {
+      return undefined;
     }
+    shared.settled = true;
+    if (shared.timer !== undefined) {
+      globalThis.clearTimeout(shared.timer);
+      shared.timer = undefined;
+    }
+    if (inFlight.get(shared.key) === shared) {
+      inFlight.delete(shared.key);
+      syncDisconnectWatch();
+    }
+    const waiting = [...shared.subscribers];
+    shared.subscribers.clear();
+    for (const subscriber of waiting) {
+      subscriber.detach();
+    }
+    return waiting;
+  }
+
+  /**
+   * Reject every caller of a shared request with one typed error.
+   *
+   * @param abortRequest Whether the underlying request is still outstanding
+   * and must be aborted — a timeout or port loss — rather than one that has
+   * itself just failed. Its rejection after the abort finds the request
+   * settled and is dropped.
+   */
+  function fail(shared: SharedRequest, error: DebuggenError, abortRequest: boolean): void {
+    const waiting = settle(shared);
+    if (waiting === undefined) {
+      return;
+    }
+    if (abortRequest) {
+      shared.controller.abort(error);
+    }
+    for (const subscriber of waiting) {
+      subscriber.reject(error);
+    }
+  }
+
+  /**
+   * One caller leaves a shared request (its signal fired). The others keep
+   * waiting; when it was the last one, the request is abandoned: settled,
+   * forgotten and aborted, so a late answer is dropped.
+   */
+  function leave(shared: SharedRequest, subscriber: Subscriber, reason: unknown): void {
+    if (!shared.subscribers.delete(subscriber)) {
+      return;
+    }
+    subscriber.detach();
+    if (shared.subscribers.size > 0 || settle(shared) === undefined) {
+      return;
+    }
+    shared.controller.abort(abortedError(shared.context, reason));
+    logger.debug('Cancelled a panel-data request that no caller is waiting for any more.', {
+      source: shared.context.source,
+    });
+  }
+
+  /**
+   * Open and register a shared request, with its controller and its timeout.
+   * Nothing is sent yet: the first caller subscribes before {@link send}, so a
+   * request function that fails at once still has someone to reject.
+   */
+  function open(key: string, context: QueryContext): SharedRequest {
+    const shared: SharedRequest = {
+      key,
+      context,
+      controller: new AbortController(),
+      subscribers: new Set(),
+      timer: undefined,
+      settled: false,
+    };
+    inFlight.set(key, shared);
+    watchDisconnect();
+    shared.timer = globalThis.setTimeout(() => {
+      fail(shared, timeoutError(context, timeoutMs), true);
+    }, timeoutMs);
+    return shared;
+  }
+
+  /** Send a freshly opened shared request's one `panelData.query` port request. */
+  function send(shared: SharedRequest, sessionId: SessionId, query: PanelDataRequest): void {
+    let sent: Promise<PanelDataQueryAnswer>;
+    try {
+      sent = Promise.resolve(
+        request(
+          PANEL_DATA_QUERY_KIND,
+          { sessionId, query },
+          { signal: shared.controller.signal, timeoutMs },
+        ),
+      );
+    } catch (cause) {
+      // `panelRequest` never throws; an injected function that does is
+      // reported like any other failed request, never as an exception.
+      fail(shared, requestFailedError(shared.context, cause), false);
+      return;
+    }
+
+    sent.then(
+      (value) => {
+        const waiting = settle(shared);
+        if (waiting === undefined) {
+          logger.debug('Dropped a panel-data answer that arrived after its request settled.', {
+            source: shared.context.source,
+          });
+          return;
+        }
+        for (const subscriber of waiting) {
+          subscriber.resolve(value);
+        }
+      },
+      (cause: unknown) => {
+        fail(shared, requestFailedError(shared.context, cause), false);
+      },
+    );
+  }
+
+  /**
+   * Join a shared request as one caller, honouring that caller's own signal:
+   * its abort rejects this caller alone, with the aborted failure, and leaves
+   * the request to whoever else is waiting on it.
+   */
+  function subscribe(
+    shared: SharedRequest,
+    signal: AbortSignal | undefined,
+  ): Promise<PanelDataQueryAnswer> {
+    return new Promise<PanelDataQueryAnswer>((resolve, reject) => {
+      let onAbort: (() => void) | undefined;
+      const subscriber: Subscriber = {
+        resolve,
+        reject,
+        detach: () => {
+          if (onAbort !== undefined) {
+            signal?.removeEventListener('abort', onAbort);
+            onAbort = undefined;
+          }
+        },
+      };
+      shared.subscribers.add(subscriber);
+      if (signal === undefined) {
+        return;
+      }
+      onAbort = (): void => {
+        const reason: unknown = signal.reason;
+        leave(shared, subscriber, reason);
+        reject(abortedError(shared.context, reason));
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+    });
   }
 
   /**
@@ -606,151 +1276,821 @@ export function createPanelDataProvider(options: PanelDataProviderOptions): Pane
     if (!isAddressable(sessionId)) {
       throw unboundError(source);
     }
-    let shown: SessionId | undefined;
-    try {
-      shown = getSessionId();
-    } catch (cause) {
-      // A store that cannot answer proves nothing about which session is on
-      // screen; the specification's own session is routed, and the worker and
-      // service still authorise it against the tab's binding.
-      logger.warn('Reading the panel session failed; routing by the panel specification.', {
-        error: errorName(cause),
-      });
-      shown = undefined;
-    }
+    // A store that cannot answer proves nothing about which session is on
+    // screen; the specification's own session is routed, and the worker and
+    // service still authorise it against the tab's binding.
+    const shown = readShownSession(
+      'Reading the panel session failed; routing by the panel specification.',
+    );
     if (isAddressable(shown) && shown !== sessionId) {
       throw foreignSessionError(source);
     }
     return sessionId;
   }
 
-  /** Register and send one query; the returned answer settles exactly once. */
-  function dispatch(
-    sessionId: SessionId,
-    query: DataQuery,
-    context: QueryContext,
-    signal: AbortSignal | undefined,
-  ): InFlightQuery {
-    const id = newPortRequestId();
-    let settled = false;
-    let timer: TimerHandle | undefined;
-    let onAbort: (() => void) | undefined;
+  /**
+   * `getSessionId()`, or `undefined` — after logging `failureMessage` with the
+   * error's name only — when the getter throws.
+   */
+  function readShownSession(failureMessage: string): SessionId | undefined {
+    try {
+      return getSessionId();
+    } catch (cause) {
+      logger.warn(failureMessage, { error: errorName(cause) });
+      return undefined;
+    }
+  }
 
-    const cleanup = (): void => {
-      if (timer !== undefined) {
-        globalThis.clearTimeout(timer);
-        timer = undefined;
-      }
-      if (onAbort !== undefined) {
-        signal?.removeEventListener('abort', onAbort);
-        onAbort = undefined;
-      }
-      untrack(id);
-    };
+  /**
+   * The capture the panel's store shows right now, or `undefined` when it is
+   * unknown: no getter was injected, it answered a blank or non-string value,
+   * or it threw (logged with the error's name only). Reading a capture other
+   * than the one last read empties the trace cache.
+   */
+  function readCurrentCapture(): CaptureId | undefined {
+    let candidate: unknown;
+    try {
+      candidate = getCaptureId?.();
+    } catch (cause) {
+      logger.warn('Reading the panel capture failed; treating the capture as unknown.', {
+        error: errorName(cause),
+      });
+      candidate = undefined;
+    }
+    const captureId = isFilledString(candidate) ? candidate : undefined;
+    if (captureId !== observedCapture) {
+      observedCapture = captureId;
+      clearTraceCache('capture-changed');
+    }
+    return captureId;
+  }
 
-    // Claims the one settlement; every path — answer, refusal, abort,
-    // timeout, port loss — goes through it, so a later one is dropped.
-    const settle = (): boolean => {
-      if (settled) {
-        return false;
-      }
-      settled = true;
-      cleanup();
+  /**
+   * Whether the injected `canServeCached` exists and answers exactly `true`
+   * for `sessionId`. Absent, answering anything else or throwing (logged with
+   * the error's name only), the answer is `false`: the cache fails closed.
+   */
+  function cacheAuthorised(sessionId: SessionId): boolean {
+    if (canServeCached === undefined) {
+      return false;
+    }
+    try {
+      return canServeCached(sessionId) === true;
+    } catch (cause) {
+      logger.warn("Checking the trace cache's authorisation failed; asking the service instead.", {
+        error: errorName(cause),
+      });
+      return false;
+    }
+  }
+
+  /**
+   * Whether the trace cache may be read or written right now for one lookup's
+   * session and capture — the fail-closed rule of
+   * {@link PanelDataProviderOptions.canServeCached}, evaluated at every access
+   * and never remembered:
+   *
+   * 1. the lookup's capture is known and is still the store's current capture
+   *    (reading another one has already emptied the cache);
+   * 2. `getSessionId()` returns exactly the lookup's session — `undefined`
+   *    included, a store showing no session authorises nothing; and
+   * 3. `canServeCached` answers `true` for it.
+   *
+   * A failure of 2 or 3 empties the whole cache, so what was cached under an
+   * authorisation that has since lapsed is gone rather than merely skipped.
+   */
+  function traceCacheUsable(sessionId: SessionId, captureId: CaptureId | undefined): boolean {
+    if (captureId === undefined || readCurrentCapture() !== captureId) {
+      return false;
+    }
+    const shown = readShownSession(
+      "Reading the panel session failed; the event drawer's trace cache is not consulted.",
+    );
+    if (shown === sessionId && cacheAuthorised(sessionId)) {
       return true;
-    };
+    }
+    clearTraceCache('not-authorised');
+    return false;
+  }
 
-    const answer = new Promise<PanelDataQueryAnswer>((resolve, reject) => {
-      const fail = (error: DebuggenError): void => {
-        if (settle()) {
-          reject(error);
+  /**
+   * The trace cache as one lookup sees it: scoped to the lookup's session and
+   * capture, and authorised by {@link traceCacheUsable} at every read and
+   * every write, so a lookup that outlives its authorisation or its capture
+   * neither reads nor records anything more.
+   */
+  function scopedTraceCache(
+    sessionId: SessionId,
+    captureId: CaptureId | undefined,
+  ): ScopedTraceCache {
+    return {
+      lookup(eventId, traceId) {
+        if (captureId === undefined || !traceCacheUsable(sessionId, captureId)) {
+          return undefined;
         }
-      };
+        return traceCache.lookup(sessionId, captureId, eventId, traceId);
+      },
+      write(traceId, pool) {
+        if (captureId === undefined || !traceCacheUsable(sessionId, captureId)) {
+          return;
+        }
+        traceCache.write(sessionId, captureId, traceId, pool);
+        syncDisconnectWatch();
+      },
+    };
+  }
 
-      track(id, { context, fail });
+  /**
+   * The panel a call is bound to: `undefined` for a live read, else the
+   * caller's `panelId`, once it has been checked. Throws (inside the async
+   * `query`, so as a rejection) for a present value that cannot name a panel.
+   */
+  function resolvePanelId(panelId: unknown, source: DataQuerySource): string | undefined {
+    if (panelId === undefined) {
+      return undefined;
+    }
+    if (typeof panelId !== 'string' || panelId.trim() === '') {
+      throw unusablePanelError(source, panelId);
+    }
+    return panelId;
+  }
 
-      onAbort = (): void => {
-        const reason: unknown = signal?.reason;
-        fail(abortedError(context, reason));
-      };
-      signal?.addEventListener('abort', onAbort, { once: true });
+  async function query<Source extends DataQuerySource>(
+    sessionId: string,
+    dataQuery: DataQuery & { source: Source },
+    queryOptions?: DataQueryOptions,
+  ): Promise<DataQueryResponse<Source>> {
+    const source = dataQuery.source;
+    const session = resolveSession(sessionId, source);
+    const panelId = resolvePanelId(queryOptions?.panelId, source);
+    const normalised = normalizePanelDataQuery(dataQuery);
+    const context: QueryContext = { source, limit: normalised.limit, offset: normalised.offset };
+    // The route's body: the node's query, plus the panel it belongs to for a
+    // panel-bound read. A live read carries no `panelId` key at all, and the
+    // coalescing key below is computed over this body, so it scopes by panel.
+    const sent: PanelDataRequest = panelId === undefined ? normalised : { ...normalised, panelId };
 
-      timer = globalThis.setTimeout(() => {
-        fail(timeoutError(context, timeoutMs));
-      }, timeoutMs);
+    const signal = queryOptions?.signal;
+    if (signal?.aborted === true) {
+      const reason: unknown = signal.reason;
+      throw abortedError(context, reason);
+    }
 
-      let sent: Promise<PanelDataQueryAnswer>;
-      try {
-        sent = Promise.resolve(
-          request(PANEL_DATA_QUERY_KIND, { sessionId, query }, { signal, timeoutMs }),
-        );
-      } catch (cause) {
-        // `panelRequest` never throws; an injected function that does is
-        // reported like any other failed request, never as an exception.
-        fail(requestFailedError(context, cause));
-        return;
-      }
+    // Join the identical request already in flight under the same capture, or
+    // open one. The caller subscribes before anything is sent, so a request
+    // function that fails at once still has this caller to reject.
+    const key = panelDataRequestKey(session, readCurrentCapture(), sent);
+    const joined = inFlight.get(key);
+    const shared = joined ?? open(key, context);
+    const pendingAnswer = subscribe(shared, signal);
+    if (joined === undefined) {
+      send(shared, session, sent);
+    } else {
+      logger.debug('Joined an identical panel-data request already in flight.', { source });
+    }
 
-      sent.then(
-        (value) => {
-          if (settle()) {
-            resolve(value);
-            return;
-          }
-          logger.debug('Dropped a panel-data answer that arrived after its query settled.', {
-            source: context.source,
-          });
-        },
-        (cause: unknown) => {
-          fail(requestFailedError(context, cause));
-        },
-      );
-    });
+    const answer = await pendingAnswer;
+    // The renderer's wire-to-view translation, with this caller's own query:
+    // the source-named payload becomes `data`, the page echo is carried
+    // across as it arrived, and an answer for another source (or with a
+    // malformed payload or echo) is refused. It returns the typed view, so no
+    // cast is needed here.
+    const mapped = mapPanelDataResult(dataQuery, answer);
+    if (!mapped.ok) {
+      logger.warn('Refused a panel-data answer that does not match its query.', {
+        source,
+        code: mapped.error.code,
+      });
+      throw mapped.error;
+    }
+    return mapped.value;
+  }
 
-    return { answer, cleanup };
+  async function resolveEvent(
+    sessionId: SessionId | undefined,
+    target: PanelEventTarget,
+    resolveOptions?: PanelEventResolveOptions,
+  ): Promise<PanelEventResolution> {
+    // The same guard every page applies, run first so a cache hit can never
+    // answer for a session this panel is not showing.
+    const session = resolveSession(sessionId, 'events');
+    if (!isFilledString(target.eventId)) {
+      throw unidentifiedEventError();
+    }
+    const signal = resolveOptions?.signal;
+    throwIfAborted(signal, DATA_QUERY_DEFAULT_OFFSET);
+
+    // The lookup's capture scope: the one the store shows as it starts. Its
+    // cache reads and writes stop the moment the store shows another one.
+    const cache = scopedTraceCache(session, readCurrentCapture());
+    const page: EventPageQuery = (eventsQuery, pageSignal) =>
+      query(session, eventsQuery, { signal: pageSignal });
+    const resume: LookupResume = {
+      from: normalizePanelDataOffset(resolveOptions?.resumeFrom),
+      ancestry: resolveOptions?.resumeAncestry,
+    };
+    const resolution = await resolveStoredEvent({ page, cache, logger }, target, resume, signal);
+    // An abort that landed after the last page settled still rejects: an
+    // aborted call is never resolved.
+    throwIfAborted(signal, DATA_QUERY_DEFAULT_OFFSET);
+    return resolution;
   }
 
   return {
-    async query<Source extends DataQuerySource>(
-      sessionId: string,
-      query: DataQuery & { source: Source },
-      queryOptions?: DataQueryOptions,
-    ): Promise<DataQueryResponse<Source>> {
-      const source = query.source;
-      const session = resolveSession(sessionId, source);
-      const sent = normalizePanelDataQuery(query);
-      const context: QueryContext = { source, limit: sent.limit, offset: sent.offset };
-
-      const signal = queryOptions?.signal;
-      if (signal?.aborted === true) {
-        const reason: unknown = signal.reason;
-        throw abortedError(context, reason);
-      }
-
-      const inFlight = dispatch(session, sent, context, signal);
-      try {
-        const answer = await inFlight.answer;
-        // The renderer's wire-to-view translation: the source-named payload
-        // becomes `data`, the page echo is carried across as it arrived, and an
-        // answer for another source (or with a malformed payload or echo) is
-        // refused. It returns the typed view, so no cast is needed here.
-        const mapped = mapPanelDataResult(query, answer);
-        if (!mapped.ok) {
-          logger.warn('Refused a panel-data answer that does not match its query.', {
-            source,
-            code: mapped.error.code,
-          });
-          throw mapped.error;
-        }
-        return mapped.value;
-      } finally {
-        inFlight.cleanup();
-      }
-    },
-
+    query,
+    resolveEvent,
     rejectAllPending,
-
     pendingCount(): number {
-      return pending.size;
+      return inFlight.size;
     },
   };
+}
+
+/*
+ * ===========================================================================
+ * Section F — the drawer's event resolution
+ *
+ * Module-level, and handed the provider's own `query` as its only way to read
+ * the capture: every page is a guarded, coalesced, time-bounded request like
+ * any node's, and nothing here sends anything itself.
+ * ===========================================================================
+ */
+
+/** One `events` page request: the provider's own `query`, bound to the lookup's session. */
+type EventPageQuery = (
+  eventsQuery: DataQuery & { source: 'events' },
+  signal: AbortSignal | undefined,
+) => Promise<DataQueryResponse<'events'>>;
+
+/** An event held by the trace cache, with the pool its complete chain is built from. */
+interface CachedEvent {
+  readonly event: TelemetryEvent;
+  readonly pool: readonly TelemetryEvent[];
+}
+
+/** One cached trace: the session and capture it belongs to, and its collected stored events. */
+interface CachedTrace {
+  readonly sessionId: SessionId;
+  readonly captureId: CaptureId;
+  readonly pool: readonly TelemetryEvent[];
+}
+
+/**
+ * The drawer's bounded, least-recently-used cache of stored trace pools, keyed
+ * by session, capture and trace. Pure storage: whether it may be read or
+ * written at all is the provider's decision (see `scopedTraceCache`).
+ */
+interface TraceCache {
+  /**
+   * The cached event with `eventId` of `sessionId`'s capture `captureId` —
+   * within `traceId`'s pool when the trace is known, otherwise within any of
+   * that capture's pools — but only when that pool also holds the event's
+   * complete parent chain. A hit becomes the most recently used entry.
+   */
+  lookup(
+    sessionId: SessionId,
+    captureId: CaptureId,
+    eventId: string,
+    traceId: string | undefined,
+  ): CachedEvent | undefined;
+  /**
+   * Hold `pool` as the trace's collected events, replacing any earlier pool of
+   * that trace, then evict least recently used traces until both bounds hold.
+   * An empty pool, or one larger than the event bound, is not held.
+   */
+  write(
+    sessionId: SessionId,
+    captureId: CaptureId,
+    traceId: string,
+    pool: readonly TelemetryEvent[],
+  ): void;
+  /** How many traces are held. */
+  size(): number;
+  /** Forget every trace. */
+  clear(): void;
+}
+
+/**
+ * The trace cache as one lookup sees it: its session and capture are fixed,
+ * and every read and write is authorised afresh by the provider — an
+ * unauthorised read misses, and an unauthorised write records nothing.
+ */
+interface ScopedTraceCache {
+  /** See {@link TraceCache.lookup}, within the lookup's session and capture. */
+  lookup(eventId: string, traceId: string | undefined): CachedEvent | undefined;
+  /** See {@link TraceCache.write}, within the lookup's session and capture. */
+  write(traceId: string, pool: readonly TelemetryEvent[]): void;
+}
+
+/**
+ * Build a {@link TraceCache} bounded by trace count and by total events.
+ *
+ * A `Map`'s iteration order is its insertion order, and every hit or write
+ * re-inserts its entry, so the first entry is always the least recently used
+ * one and eviction walks from the front.
+ *
+ * @param maxTraces The most traces held.
+ * @param maxEvents The most events held across all traces.
+ */
+function createTraceCache(maxTraces: number, maxEvents: number): TraceCache {
+  const entries = new Map<string, CachedTrace>();
+  let held = 0;
+
+  function touch(key: string, entry: CachedTrace): void {
+    entries.delete(key);
+    entries.set(key, entry);
+  }
+
+  function completeHit(entry: CachedTrace, eventId: string): CachedEvent | undefined {
+    const event = entry.pool.find((candidate) => candidate.id === eventId);
+    if (event === undefined || buildEventParentChain(event, entry.pool) === undefined) {
+      return undefined;
+    }
+    return { event, pool: entry.pool };
+  }
+
+  return {
+    lookup(sessionId, captureId, eventId, traceId) {
+      if (traceId !== undefined) {
+        const key = traceCacheKey(sessionId, captureId, traceId);
+        const entry = entries.get(key);
+        const hit = entry === undefined ? undefined : completeHit(entry, eventId);
+        if (entry !== undefined && hit !== undefined) {
+          touch(key, entry);
+        }
+        return hit;
+      }
+      for (const [key, entry] of entries) {
+        if (entry.sessionId !== sessionId || entry.captureId !== captureId) {
+          continue;
+        }
+        const hit = completeHit(entry, eventId);
+        if (hit !== undefined) {
+          // Returning at once, so re-inserting during the walk is safe.
+          touch(key, entry);
+          return hit;
+        }
+      }
+      return undefined;
+    },
+
+    write(sessionId, captureId, traceId, pool) {
+      const key = traceCacheKey(sessionId, captureId, traceId);
+      const previous = entries.get(key);
+      if (previous !== undefined) {
+        entries.delete(key);
+        held -= previous.pool.length;
+      }
+      if (pool.length === 0 || pool.length > maxEvents) {
+        return;
+      }
+      entries.set(key, { sessionId, captureId, pool });
+      held += pool.length;
+      for (const [staleKey, stale] of entries) {
+        if (entries.size <= maxTraces && held <= maxEvents) {
+          break;
+        }
+        entries.delete(staleKey);
+        held -= stale.pool.length;
+      }
+    },
+
+    size() {
+      return entries.size;
+    },
+
+    clear() {
+      entries.clear();
+      held = 0;
+    },
+  };
+}
+
+/** What {@link resolveStoredEvent} is handed by the provider. */
+interface EventResolutionDeps {
+  readonly page: EventPageQuery;
+  readonly cache: ScopedTraceCache;
+  readonly logger: Logger;
+}
+
+/** Where one lookup resumes the passes an earlier lookup stopped at their budget. */
+interface LookupResume {
+  /** The find pass's first offset: {@link DATA_QUERY_DEFAULT_OFFSET} unless resumed. */
+  readonly from: number;
+  /** The ancestry pass to continue, when one is. */
+  readonly ancestry: PanelAncestryResume | undefined;
+}
+
+/** Pages one lookup has requested so far, across its passes: its `pagesRead`. */
+interface PageCount {
+  used: number;
+}
+
+/** What one trace-filtered pass is asked to do. */
+interface TraceScanRequest {
+  /** The trace to page, as `filter: { traceId }`. */
+  readonly traceId: string;
+  /** The target event. */
+  readonly eventId: string;
+  /** The target event, when an earlier pass already holds it. */
+  readonly known: TelemetryEvent | undefined;
+  /** Events of this trace an earlier pass already collected. */
+  readonly seed: readonly TelemetryEvent[];
+  /** The first offset of the trace to read. */
+  readonly from: number;
+  /**
+   * When the pass is done: a **find** pass stops on the page where the target
+   * event is first collected (earlier, never later, than its chain); an
+   * **ancestry** pass stops once the event's complete chain is collected.
+   * Either stops at the trace's last page or at its own page budget.
+   */
+  readonly stopWhen: 'event-found' | 'chain-complete';
+}
+
+/** What one trace-filtered pass collected, and where it stopped. */
+type TraceScan = {
+  /** The trace's stored events collected, each once, in first-seen order. */
+  readonly pool: readonly TelemetryEvent[];
+  /** The target event, when collected (or already known). */
+  readonly event: TelemetryEvent | undefined;
+  /** Whether `pool` holds the event's complete parent chain. */
+  readonly chainComplete: boolean;
+  /** How many stored events this pass's pages held. */
+  readonly eventsRead: number;
+} & (
+  | {
+      /** The pass stopped at its page budget; the trace continues at `nextOffset`. */
+      readonly budgetExhausted: true;
+      readonly nextOffset: number;
+    }
+  | {
+      /** The pass stopped because it was done, or the trace ended. */
+      readonly budgetExhausted: false;
+      /** The first offset the pass did not read; `undefined` when it read the trace's last page. */
+      readonly nextOffset: number | undefined;
+    }
+);
+
+/** Whether a value is a string with at least one non-whitespace character. */
+function isFilledString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim() !== '';
+}
+
+/**
+ * Reject a lookup whose signal fired, with the aborted failure a `query` for
+ * the page at `offset` would have rejected with.
+ */
+function throwIfAborted(signal: AbortSignal | undefined, offset: number): void {
+  if (signal?.aborted === true) {
+    const reason: unknown = signal.reason;
+    throw abortedError({ source: 'events', limit: DATA_QUERY_MAX_LIMIT, offset }, reason);
+  }
+}
+
+/**
+ * The offset of the page after `response`, or `undefined` when it was the
+ * last. A `nextOffset` that does not advance past `offset` is read as the end,
+ * so every paging loop here terminates whatever the service answers.
+ */
+function followingOffset(
+  response: DataQueryResponse<'events'>,
+  offset: number,
+): number | undefined {
+  const next = response.nextOffset;
+  return typeof next === 'number' && next > offset ? next : undefined;
+}
+
+/**
+ * One trace-filtered pass: page the trace from `request.from` until the pass
+ * is done (see {@link TraceScanRequest.stopWhen}), the trace's pages end, or
+ * the pass's own {@link EVENT_RESOLUTION_PAGE_BUDGET} is spent.
+ *
+ * @param deps The provider's page request.
+ * @param request The trace, the target, what is already held, where to start
+ * and when to stop.
+ * @param count The lookup's pages so far; incremented per page requested.
+ * @param signal The lookup's abort signal, checked before every page.
+ */
+async function scanTrace(
+  deps: EventResolutionDeps,
+  request: TraceScanRequest,
+  count: PageCount,
+  signal: AbortSignal | undefined,
+): Promise<TraceScan> {
+  const { traceId, eventId, stopWhen } = request;
+  // Keyed by event id: a capture growing while it is paged can shift an event
+  // across a page boundary, and the pool must hold it once.
+  const collected = new Map<string, TelemetryEvent>();
+  const collect = (candidate: TelemetryEvent): void => {
+    if (candidate.traceId === traceId && !collected.has(candidate.id)) {
+      collected.set(candidate.id, candidate);
+    }
+  };
+  request.seed.forEach(collect);
+  if (request.known !== undefined) {
+    collect(request.known);
+  }
+
+  let event = request.known ?? collected.get(eventId);
+  let offset = request.from;
+  let eventsRead = 0;
+  for (let pages = 0; pages < EVENT_RESOLUTION_PAGE_BUDGET; pages += 1) {
+    throwIfAborted(signal, offset);
+    count.used += 1;
+    const response = await deps.page(
+      { source: 'events', filter: { traceId }, limit: DATA_QUERY_MAX_LIMIT, offset },
+      signal,
+    );
+    eventsRead += response.data.length;
+    response.data.forEach(collect);
+    event ??= collected.get(eventId);
+    const pool = [...collected.values()];
+    const chainComplete = event !== undefined && buildEventParentChain(event, pool) !== undefined;
+    const next = followingOffset(response, offset);
+    const done = chainComplete || (stopWhen === 'event-found' && event !== undefined);
+    if (done || next === undefined) {
+      return { pool, event, chainComplete, eventsRead, budgetExhausted: false, nextOffset: next };
+    }
+    offset = next;
+  }
+  return {
+    pool: [...collected.values()],
+    event,
+    chainComplete: false,
+    eventsRead,
+    budgetExhausted: true,
+    nextOffset: offset,
+  };
+}
+
+/**
+ * Turn a finished pass that holds the event into the lookup's `found` answer,
+ * caching the pool; a pass that stopped at its budget is reported with the
+ * offset a continuation resumes at.
+ */
+function concludeTraceScan(
+  deps: EventResolutionDeps,
+  traceId: string,
+  scan: TraceScan,
+  count: PageCount,
+): PanelEventResolution {
+  if (scan.event === undefined) {
+    // Unreachable from the callers — an ancestry pass always starts from a
+    // known event, and a find pass without it is concluded by its caller —
+    // and answered truthfully rather than asserted: the pages read held no
+    // such event.
+    return { status: 'not-found', pagesRead: count.used };
+  }
+  deps.cache.write(traceId, scan.pool);
+  const found = {
+    status: 'found',
+    event: scan.event,
+    trace: scan.pool,
+    chainComplete: scan.chainComplete,
+    pagesRead: count.used,
+  } as const;
+  if (!scan.budgetExhausted) {
+    return { ...found, budgetExhausted: false };
+  }
+  deps.logger.debug('Stopped an event lookup at its page budget.', {
+    pagesRead: count.used,
+    budget: EVENT_RESOLUTION_PAGE_BUDGET,
+    pass: 'ancestry',
+  });
+  return { ...found, budgetExhausted: true, ancestryResumeOffset: scan.nextOffset };
+}
+
+/** A find pass that stopped at its budget, as the lookup's answer. */
+function exhaustedResolution(
+  deps: EventResolutionDeps,
+  scope: 'capture' | 'trace',
+  searchedFrom: number,
+  resumeOffset: number,
+  eventsSearched: number,
+  count: PageCount,
+): PanelEventResolution {
+  deps.logger.debug('Stopped an event lookup at its page budget.', {
+    pagesRead: count.used,
+    budget: EVENT_RESOLUTION_PAGE_BUDGET,
+    pass: 'find',
+    traceKnown: scope === 'trace',
+  });
+  return {
+    status: 'budget-exhausted',
+    scope,
+    searchedFrom,
+    resumeOffset,
+    eventsSearched,
+    pagesRead: count.used,
+  };
+}
+
+/** A cache hit, as the lookup's answer. */
+function cachedResolution(hit: CachedEvent, count: PageCount): PanelEventResolution {
+  return {
+    status: 'found',
+    event: hit.event,
+    trace: hit.pool,
+    chainComplete: true,
+    budgetExhausted: false,
+    pagesRead: count.used,
+  };
+}
+
+/**
+ * The ancestry pass `resume` asks to continue, when it can be: its `trace`
+ * holds the target event, of the target's trace when that is known. The
+ * offset is normalised like a query's.
+ */
+function ancestryContinuation(
+  resume: PanelAncestryResume | undefined,
+  eventId: string,
+  traceId: string | undefined,
+):
+  | {
+      readonly event: TelemetryEvent;
+      readonly seed: readonly TelemetryEvent[];
+      readonly from: number;
+    }
+  | undefined {
+  if (resume === undefined) {
+    return undefined;
+  }
+  const seed = resume.trace;
+  const event = seed.find((candidate) => candidate.id === eventId);
+  if (event === undefined || (traceId !== undefined && event.traceId !== traceId)) {
+    return undefined;
+  }
+  return { event, seed, from: normalizePanelDataOffset(resume.from) };
+}
+
+/**
+ * The trace-known lookup: a find pass over the trace from `from`, then —
+ * when the event turned up without its whole chain — an ancestry pass over
+ * the same trace with a budget of its own.
+ */
+async function resolveWithinTrace(
+  deps: EventResolutionDeps,
+  traceId: string,
+  eventId: string,
+  from: number,
+  count: PageCount,
+  signal: AbortSignal | undefined,
+): Promise<PanelEventResolution> {
+  const find = await scanTrace(
+    deps,
+    { traceId, eventId, known: undefined, seed: [], from, stopWhen: 'event-found' },
+    count,
+    signal,
+  );
+  if (find.event === undefined) {
+    return find.budgetExhausted
+      ? exhaustedResolution(deps, 'trace', from, find.nextOffset, find.eventsRead, count)
+      : { status: 'not-found', pagesRead: count.used };
+  }
+  if (find.chainComplete) {
+    return concludeTraceScan(deps, traceId, find, count);
+  }
+  // A find pass that read the trace from its start holds every event before
+  // the one it found, so the ancestry pass continues after it — and when the
+  // trace ended there, every stored ancestor has been read. A resumed find
+  // pass skipped the trace's start, where ancestors may lie, so the ancestry
+  // pass reads the trace from its first event.
+  const ancestryFrom =
+    from === DATA_QUERY_DEFAULT_OFFSET ? find.nextOffset : DATA_QUERY_DEFAULT_OFFSET;
+  if (ancestryFrom === undefined) {
+    return concludeTraceScan(deps, traceId, find, count);
+  }
+  const ancestry = await scanTrace(
+    deps,
+    {
+      traceId,
+      eventId,
+      known: find.event,
+      seed: find.pool,
+      from: ancestryFrom,
+      stopWhen: 'chain-complete',
+    },
+    count,
+    signal,
+  );
+  return concludeTraceScan(deps, traceId, ancestry, count);
+}
+
+/**
+ * The trace-unknown lookup: a find pass over the whole capture from `from`;
+ * once the event turns up, unless the page it was found on already completes
+ * its chain, an ancestry pass over its trace, from the trace's first event,
+ * with a budget of its own.
+ */
+async function resolveAcrossCapture(
+  deps: EventResolutionDeps,
+  eventId: string,
+  from: number,
+  count: PageCount,
+  signal: AbortSignal | undefined,
+): Promise<PanelEventResolution> {
+  let offset = from;
+  let eventsRead = 0;
+  for (let pages = 0; pages < EVENT_RESOLUTION_PAGE_BUDGET; pages += 1) {
+    throwIfAborted(signal, offset);
+    count.used += 1;
+    const response = await deps.page(
+      { source: 'events', limit: DATA_QUERY_MAX_LIMIT, offset },
+      signal,
+    );
+    eventsRead += response.data.length;
+    const found = response.data.find((candidate) => candidate.id === eventId);
+    if (found !== undefined) {
+      const foundTrace = found.traceId;
+      const hit = deps.cache.lookup(eventId, foundTrace);
+      if (hit !== undefined) {
+        return cachedResolution(hit, count);
+      }
+      // The page it was found on often holds its whole ancestry already — a
+      // trace's events lie close together in a capture — and only when it does
+      // not is the trace paged for the rest.
+      const seed = response.data.filter((candidate) => candidate.traceId === foundTrace);
+      if (buildEventParentChain(found, seed) !== undefined) {
+        deps.cache.write(foundTrace, seed);
+        return {
+          status: 'found',
+          event: found,
+          trace: seed,
+          chainComplete: true,
+          budgetExhausted: false,
+          pagesRead: count.used,
+        };
+      }
+      const ancestry = await scanTrace(
+        deps,
+        {
+          traceId: foundTrace,
+          eventId,
+          known: found,
+          seed,
+          from: DATA_QUERY_DEFAULT_OFFSET,
+          stopWhen: 'chain-complete',
+        },
+        count,
+        signal,
+      );
+      return concludeTraceScan(deps, foundTrace, ancestry, count);
+    }
+    const next = followingOffset(response, offset);
+    if (next === undefined) {
+      return { status: 'not-found', pagesRead: count.used };
+    }
+    offset = next;
+  }
+  return exhaustedResolution(deps, 'capture', from, offset, eventsRead, count);
+}
+
+/**
+ * The lookup behind {@link PanelDataProvider.resolveEvent}; see its
+ * documentation for the passes, the budgets, resumption and the cache rule.
+ *
+ * @param deps The provider's page request (bound to the guarded session), the
+ * trace cache scoped to that session and the lookup's capture, and the logger.
+ * @param target The selection; its `eventId` is already known to be filled.
+ * @param resume Where the find pass starts, and the ancestry pass to continue.
+ * @param signal The lookup's abort signal.
+ */
+async function resolveStoredEvent(
+  deps: EventResolutionDeps,
+  target: PanelEventTarget,
+  resume: LookupResume,
+  signal: AbortSignal | undefined,
+): Promise<PanelEventResolution> {
+  const { eventId } = target;
+  const traceId = isFilledString(target.traceId) ? target.traceId : undefined;
+  const count: PageCount = { used: 0 };
+
+  const cached = deps.cache.lookup(eventId, traceId);
+  if (cached !== undefined) {
+    return cachedResolution(cached, count);
+  }
+
+  const continuation = ancestryContinuation(resume.ancestry, eventId, traceId);
+  if (continuation !== undefined) {
+    const continuedTrace = continuation.event.traceId;
+    const scan = await scanTrace(
+      deps,
+      {
+        traceId: continuedTrace,
+        eventId,
+        known: continuation.event,
+        seed: continuation.seed,
+        from: continuation.from,
+        stopWhen: 'chain-complete',
+      },
+      count,
+      signal,
+    );
+    return concludeTraceScan(deps, continuedTrace, scan, count);
+  }
+
+  return traceId === undefined
+    ? resolveAcrossCapture(deps, eventId, resume.from, count, signal)
+    : resolveWithinTrace(deps, traceId, eventId, resume.from, count, signal);
 }

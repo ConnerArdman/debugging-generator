@@ -702,9 +702,9 @@ let failureCount = 0;
  *
  * Splitting a surrogate pair would leave a lone half at the end, which is a
  * well-formed JavaScript string but an ill-formed one to send: it survives
- * `postMessage` and then turns into a replacement character somewhere
- * downstream. Dropping the whole pair costs one character and keeps the text
- * valid all the way to the panel.
+ * the page channel's JSON and then turns into a replacement character
+ * somewhere downstream. Dropping the whole pair costs one character and keeps
+ * the text valid all the way to the panel.
  */
 function boundText(value: string, maxChars: number): BoundedText {
   if (value.length <= maxChars) {

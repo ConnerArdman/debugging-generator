@@ -25,9 +25,14 @@
  *   ├─ inbound subscription table · transport · configuration · project root
  *   └─ void startup()                                   (never awaited)
  *
- * deactivate()                                        (asynchronous)
- *   1. POST /sessions/:id/end for the active session   (bounded, awaited)
- *   2. stop the service child this extension spawned   (only after 1 settled)
+ * deactivate()                                 (asynchronous, ≤ DEACTIVATE_BUDGET_MS)
+ *   0. state.beginShutdown()                            (no create/reopen/adopt after)
+ *   1. endSessionsForShutdown: the active session's end at its owning
+ *      endpoint, the creates in flight, the sessions they created
+ *                                                       (bounded, keepAliveFor)
+ *   2. stop the service child this extension spawned   (issued with 1; acts only
+ *      after 1 settled or its bound: still in progress → left running unsignalled;
+ *      refused → SIGTERM only; concluded → SIGTERM, then SIGKILL after the grace)
  *   3. close the WebSocket client
  * ```
  *
@@ -45,13 +50,25 @@
  * ## Why deactivation is ordered
  *
  * AAP §0.5.1 lists VS Code deactivation among the three moments cleanup runs.
- * The extension host calls `deactivate()` and then disposes
- * `context.subscriptions` synchronously, before the promise settles. The end
- * request is therefore issued — and registered with
- * `ServiceProcess.keepAliveFor`, which holds off the child's termination —
- * before the first `await`, and the child is stopped only after the request
- * settled. The service also reconciles every outstanding modification record
- * on its next start; that is a safety net, not a substitute.
+ * The extension host calls `deactivate()`, disposes `context.subscriptions`
+ * synchronously before the promise settles, and terminates itself about five
+ * seconds later. So the shutdown gate is closed first, everything is issued
+ * before the first `await`, and it all fits one budget,
+ * {@link DEACTIVATE_BUDGET_MS}: the shutdown routine's end requests —
+ * registered with `ServiceProcess.keepAliveFor`, which holds off the child's
+ * termination — and the stop that waits for them, which
+ * `ServiceProcess.dispose` then leaves in charge of the child. A
+ * `POST /sessions` still in flight is waited for (bounded) and the session it
+ * created ended too. The child is acted on only after the ends settled or
+ * their bound passed, and never in a way that interrupts a restore: the
+ * service keeps serving an end request after its client went away — it waits
+ * for a cancelled install to settle, then restores the files — so an end
+ * still in progress leaves the child running, unsignalled, to finish it (a
+ * later window uses that service); a refused end gets `SIGTERM` only; and
+ * `SIGKILL` follows the grace window only when every end concluded (see
+ * `stopServiceForShutdown`). The service also reconciles every outstanding
+ * modification record on its next start; that is a safety net, not a
+ * substitute.
  *
  * ## What never happens here
  *
@@ -68,9 +85,12 @@
 import * as vscode from 'vscode';
 import { WebSocket } from 'ws';
 
+import { MESSAGE_TYPE, PROVIDER_IDS } from '@debuggen/protocol';
 import type {
   ConnectionState,
   MessageByType,
+  ProviderId,
+  ServiceOriginRule,
   SessionRecord,
   WsStateChangeDetail,
   WsUnauthorizedDetail,
@@ -80,9 +100,16 @@ import type { LogFields, LogRecord, Logger } from '@debuggen/shared';
 
 import { registerCommands } from './commands';
 import type { CommandId } from './commands';
+import { DEFAULT_SHUTDOWN_TIMEOUTS, endSessionsForShutdown } from './commands/end-session';
+import type { ShutdownReport } from './commands/end-session';
 import { createEditorCredentialStore } from './service/auth';
 import type { EditorCredentialStore } from './service/auth';
-import { createServiceClient } from './service/client';
+import {
+  DEFAULT_EDITOR_REQUEST_TIMEOUT_MS,
+  EDITOR_OPERATION_TIMEOUTS_MS,
+  createServiceClient,
+  errorClassOf,
+} from './service/client';
 import type { ServiceClient } from './service/client';
 import { readDevServerUrlSetting, resolveProjectRoot } from './service/discovery';
 import { createServiceProcess, isServiceReachable } from './service/process';
@@ -92,7 +119,12 @@ import type {
   ServiceStatus,
   WorkspaceServiceEntry,
 } from './service/process';
-import { disposeSourceRevealResources, openSourceLocation } from './source/open-location';
+import {
+  disposeSourceRevealResources,
+  openSourceLocation,
+  sourceResultFor,
+} from './source/open-location';
+import type { ForwardedSourceOpenOutcome } from './source/open-location';
 import { ExtensionState } from './state';
 import { registerDebuggenUriHandler } from './uri-handler';
 import {
@@ -131,17 +163,18 @@ const SETTING = Object.freeze({
  * The embedded artefacts inside the installed extension, relative to
  * `context.extensionUri` — `esbuild.mjs`'s `LAYOUT`. `.vscodeignore` keeps
  * `dist/service/**` and `dist/telemetry/**`, so every one of these survives
- * packaging, and `test/suite/packaged-vsix.test.ts` asserts they resolve from
- * an installed VSIX. They are always joined onto `context.extensionUri`, never
- * derived from `__dirname`, `process.cwd()` or a workspace path, because the
- * installed location is the only one guaranteed to exist.
+ * packaging, and `test/suite/packaged-vsix.test.ts` activates an installed
+ * VSIX and asserts its service runs from them. They are always joined onto
+ * `context.extensionUri`, never derived from `__dirname`, `process.cwd()` or a
+ * workspace path, because the installed location is the only one guaranteed
+ * to exist.
  */
 const EMBEDDED_LAYOUT = Object.freeze({
   serviceMain: ['dist', 'service', 'main.js'],
   servicePromptsDir: ['dist', 'service', 'prompts'],
-  serviceSchema: ['dist', 'service', 'store', 'schema.sql'],
   telemetryPreload: ['dist', 'telemetry', 'node', 'register.mjs'],
-} satisfies Record<keyof EmbeddedPaths, readonly string[]>);
+  // No `serviceSchema`: the store DDL is inlined into the service bundle, so no file exists to name.
+} satisfies Record<Exclude<keyof EmbeddedPaths, 'serviceSchema'>, readonly string[]>);
 
 /**
  * The workspace build of the service beside this extension in the monorepo
@@ -155,17 +188,42 @@ const WORKSPACE_SERVICE_LAYOUT = Object.freeze({
 });
 
 /**
- * The bound on the end-of-session request `deactivate()` sends. The extension
- * host gives the whole shutdown roughly five seconds, and the request has to
- * leave room for stopping the child afterwards.
+ * The one budget every step of `deactivate()` is carved from, in milliseconds.
+ *
+ * VS Code terminates the extension host about five seconds after it began
+ * deactivating extensions, and cancels `globalState` writes made meanwhile, so
+ * nothing `deactivate()` starts may be counted on after that. The budget stays
+ * inside that window with room for the editor's own teardown; the three
+ * constants below are derived from it, so the steps can never add up to more.
  */
-const DEACTIVATE_END_SESSION_TIMEOUT_MS = 4_000;
+export const DEACTIVATE_BUDGET_MS = 4_500;
 
-/** How long `deactivate()` lets the settled service quiesce before signalling it. */
-const DEACTIVATE_QUIESCE_TIMEOUT_MS = 500;
+/**
+ * The bound on the end-of-session request `deactivate()` sends for the active
+ * session — the shutdown routine's `activeEndMs`, three seconds, within which
+ * it also waits for the creates in flight and ends what they created. The service
+ * restores every instrumented file while it handles the request, and it keeps
+ * handling it after this bound passes and the editor goes away (it first waits
+ * for a cancelled install to settle); a service this window started is then
+ * left running, unsignalled, until that restore is done — see
+ * {@link stopServiceForShutdown}.
+ */
+export const DEACTIVATE_END_SESSION_TIMEOUT_MS = DEFAULT_SHUTDOWN_TIMEOUTS.activeEndMs;
 
-/** The grace window between `SIGTERM` and `SIGKILL` when `deactivate()` stops the child. */
-const DEACTIVATE_STOP_GRACE_MS = 1_000;
+/**
+ * How long `deactivate()`'s stop waits for the end request before it decides
+ * what to do with the child: the request's own bound plus a margin for its
+ * settlement to reach the process manager.
+ */
+export const DEACTIVATE_QUIESCE_TIMEOUT_MS = DEACTIVATE_END_SESSION_TIMEOUT_MS + 250;
+
+/**
+ * The grace window between `SIGTERM` and a `SIGKILL` when `deactivate()`
+ * stops the child — the rest of {@link DEACTIVATE_BUDGET_MS}. `SIGKILL` is sent
+ * only when the end request concluded (or there was no session to end); see
+ * {@link stopServiceForShutdown}.
+ */
+export const DEACTIVATE_STOP_GRACE_MS = DEACTIVATE_BUDGET_MS - DEACTIVATE_QUIESCE_TIMEOUT_MS;
 
 /** The bound on the informational health read after the service answered. */
 const HEALTH_READ_TIMEOUT_MS = 2_000;
@@ -192,6 +250,26 @@ const FALLBACK_PANEL_NOTICE =
 /** A run of whitespace, collapsed to one space for display. */
 const WHITESPACE_RUN = /\s+/g;
 
+/**
+ * Every {@link ServiceOriginRule} a refused `debuggen.serviceUrl` may name,
+ * as a lookup table. `satisfies Record<ServiceOriginRule, true>` keeps it in
+ * step with the protocol's type in both directions: a rule the protocol adds
+ * is a compile error here until it is listed, and a key the protocol does not
+ * define is refused as an excess property. {@link describeServiceUrl} logs a
+ * refusal's rule only when it is one of these keys, so the log carries a fixed
+ * vocabulary whatever a `details` bag happens to hold.
+ */
+const SERVICE_ORIGIN_RULES = Object.freeze({
+  empty: true,
+  unparseable: true,
+  userinfo: true,
+  scheme: true,
+  host: true,
+  'not-loopback': true,
+  path: true,
+  'query-or-fragment': true,
+} satisfies Record<ServiceOriginRule, true>);
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -208,6 +286,13 @@ interface ExtensionSettings {
 
 /** Why the host asked for a service to answer. */
 type EnsureTrigger = 'activation' | 'connection-lost' | 'settings-changed';
+
+/**
+ * How a `debuggen.provider` value is written to the output channel: the id
+ * itself when it is one of {@link PROVIDER_IDS}, `unset` when the snapshot
+ * holds nothing, otherwise `invalid` — never the configured text.
+ */
+type ProviderSettingClass = ProviderId | 'unset' | 'invalid';
 
 /**
  * Everything `activate` builds, kept in one module-scoped handle because
@@ -240,6 +325,13 @@ let runtime: ExtensionRuntime | undefined;
  * total — a `bigint`, a function or an `Error` never makes a log call throw.
  * Fields carry codes, ids and shapes by the logging contract, never payloads
  * or credentials; this function only makes them printable.
+ *
+ * It is also the backstop for that contract where an error slips into a
+ * record: an `Error` (or a `DebuggenError` built in another realm, which is
+ * not `instanceof Error` here) is printed as its closed class from
+ * `errorClassOf` and its error code only.
+ * Its message, its stack and a `name` outside the closed vocabulary never
+ * reach the channel, which redacts nothing (AAP §0.5.2).
  */
 function formatLogFields(fields: LogFields): string {
   if (Object.keys(fields).length === 0) {
@@ -255,8 +347,8 @@ function formatLogFields(fields: LogFields): string {
       if (typeof value === 'function' || typeof value === 'symbol') {
         return undefined;
       }
-      if (value instanceof Error) {
-        return { name: value.name, code: DebuggenError.from(value).code };
+      if (value instanceof Error || DebuggenError.is(value)) {
+        return { errorClass: errorClassOf(value), code: DebuggenError.from(value).code };
       }
       if (typeof value === 'object' && value !== null) {
         if (seen.has(value)) {
@@ -348,10 +440,11 @@ function readSettings(): ExtensionSettings {
 /**
  * Resolves the embedded artefacts from `context.extensionUri` as absolute
  * filesystem paths. The service child is spawned from `serviceMain` with
- * `DEBUGGEN_PROMPTS_DIR` set to `servicePromptsDir`; the schema and the
- * preload are checked by the process manager so an incomplete bundle is a
- * clear failure, and the service's dev-server launcher finds the preload
- * beside its own bundle.
+ * `DEBUGGEN_PROMPTS_DIR` set to `servicePromptsDir`; the preload is checked by
+ * the process manager so an incomplete bundle is a clear failure, and the
+ * service's dev-server launcher finds the preload beside its own bundle. No
+ * schema path is passed: `esbuild.mjs` inlines the store DDL into
+ * `serviceMain`, and the VSIX ships no `.sql` file for the manager to check.
  */
 function resolveEmbeddedPaths(extensionUri: vscode.Uri): EmbeddedPaths {
   const at = (segments: readonly string[]): string =>
@@ -359,7 +452,6 @@ function resolveEmbeddedPaths(extensionUri: vscode.Uri): EmbeddedPaths {
   return Object.freeze({
     serviceMain: at(EMBEDDED_LAYOUT.serviceMain),
     servicePromptsDir: at(EMBEDDED_LAYOUT.servicePromptsDir),
-    serviceSchema: at(EMBEDDED_LAYOUT.serviceSchema),
     telemetryPreload: at(EMBEDDED_LAYOUT.telemetryPreload),
   });
 }
@@ -386,6 +478,75 @@ function resolveWorkspaceService(
 /** Whether a session still owns instrumentation the service may have to remove. */
 function isSessionOpen(session: SessionRecord | undefined): session is SessionRecord {
   return session !== undefined && session.status !== 'ended';
+}
+
+/** Whether a value is one of the closed {@link ServiceOriginRule} names. */
+function isServiceOriginRule(value: unknown): value is ServiceOriginRule {
+  return typeof value === 'string' && Object.hasOwn(SERVICE_ORIGIN_RULES, value);
+}
+
+/**
+ * The log fields that describe the service URL the client is using: the one
+ * projection the activation record and the "Service URL changed" record share.
+ *
+ * The configured `debuggen.serviceUrl` is never among them. A refused value
+ * may carry a pasted credential in its user information, query or fragment,
+ * and the output channel redacts nothing (AAP §0.5.2, §0.5.6), so every field
+ * is read from the client's validated state instead:
+ *
+ * - accepted: `{ serviceUrl, accepted: true }`, where `serviceUrl` is
+ *   `client.baseUrl`, the canonical loopback origin the protocol client
+ *   validated, which has no user information, path, query or fragment;
+ * - refused: `{ accepted: false, code, rule }`, where `code` is the refusal's
+ *   error code and `rule` its {@link ServiceOriginRule}, present only when
+ *   `details.rule` is one of {@link SERVICE_ORIGIN_RULES}.
+ *
+ * @example
+ * describeServiceUrl(client);
+ * // accepted → { serviceUrl: 'http://127.0.0.1:43117', accepted: true }
+ * // refused  → { accepted: false, code: 'CONFIG_INVALID', rule: 'userinfo' }
+ *
+ * @param client The service client whose current base URL is described.
+ * @returns Fields safe to hand to any log level.
+ */
+function describeServiceUrl(
+  client: Pick<ServiceClient, 'baseUrl' | 'configurationError'>,
+): LogFields {
+  const refused = client.configurationError;
+  if (refused === undefined) {
+    return { serviceUrl: client.baseUrl, accepted: true };
+  }
+  const rule = refused.details?.rule;
+  return {
+    accepted: false,
+    code: refused.code,
+    rule: isServiceOriginRule(rule) ? rule : undefined,
+  };
+}
+
+/**
+ * Classifies a `debuggen.provider` snapshot value for the output channel.
+ *
+ * `package.json` advertises the setting as an enum over {@link PROVIDER_IDS},
+ * but a hand-edited `settings.json` can hold any text there, so the value is
+ * logged only once it is known to be one of those ids. {@link readSettings}
+ * trims the value and reads a non-string as empty, so a missing and a
+ * non-string setting are both `unset`. Only the log is affected:
+ * `ExtensionState.setProvider` still receives the snapshot for display.
+ *
+ * @example
+ * classifyProviderSetting('deterministic'); // 'deterministic'
+ * classifyProviderSetting('');              // 'unset'
+ * classifyProviderSetting('sk-pasted-key'); // 'invalid'
+ *
+ * @param provider The trimmed `debuggen.provider` value from {@link readSettings}.
+ * @returns The provider id, `unset` or `invalid`.
+ */
+function classifyProviderSetting(provider: string): ProviderSettingClass {
+  if (provider === '') {
+    return 'unset';
+  }
+  return PROVIDER_IDS.find((id) => id === provider) ?? 'invalid';
 }
 
 // ---------------------------------------------------------------------------
@@ -504,12 +665,31 @@ export function activate(context: vscode.ExtensionContext): void {
 
     // 6. The service client. Built before the process manager because the
     //    manager's liveness probe *is* the client's auth-exempt `GET /health`.
+    //    Every HTTP call gets a deadline: its own `timeoutMs` when it passes
+    //    one (the probe, the deactivation end, the session lookups), else the
+    //    per-operation bound for the operations whose service-side work
+    //    legitimately runs long, else the default — so a service that accepts
+    //    connections but stalls surfaces as a retryable failure instead of a
+    //    command that never settles.
+    //    The service admits the editor's session requests only while one of
+    //    its sockets announces the project there, so the socket to the
+    //    service owning the session in view survives a `debuggen.serviceUrl`
+    //    or project change, and is released once the store tracks another
+    //    session (or none) — checked on every store change.
     const client = own(
       createServiceClient({
         credential: credentials,
         projectRoot: isOk(projectRoot) ? projectRoot.value.projectRoot : undefined,
         logger: logger.child({ component: 'service-client' }),
         webSocketConstructor: WebSocket,
+        defaultTimeoutMs: DEFAULT_EDITOR_REQUEST_TIMEOUT_MS,
+        operationTimeoutsMs: EDITOR_OPERATION_TIMEOUTS_MS,
+        retainedEndpoint: () => state.activeSessionEndpoint,
+      }),
+    );
+    own(
+      state.onDidChange(() => {
+        client.pruneRetainedConnections();
       }),
     );
 
@@ -588,8 +768,10 @@ export function activate(context: vscode.ExtensionContext): void {
     }
 
     runtime = rt;
+    // The validated origin or the refusal's code and rule — never the raw
+    // setting, which a refused value may carry a credential in.
     logger.info('Debug Generator activated', {
-      serviceUrl: client.baseUrl ?? settings.serviceUrl,
+      ...describeServiceUrl(client),
       autoStartService: settings.autoStartService,
     });
 
@@ -628,10 +810,10 @@ export function activate(context: vscode.ExtensionContext): void {
  * | Frame                   | Destination                                       |
  * | ----------------------- | ------------------------------------------------- |
  * | `session.created`       | `applySessionRecord(payload.session)`             |
- * | `session.updated`       | `applySessionRecord(payload.session)`             |
+ * | `session.updated`       | `applySessionRecord(payload.session)`, the selected target included |
  * | `session.progress`      | `applyProgress(payload)`                          |
  * | `session.bound`         | logged; the record's `boundTab` arrives on `session.updated` |
- * | `target.selected`       | `applyTargetSelected(payload)`                    |
+ * | `target.selected`       | not subscribed: DevTools → service only           |
  * | `instrumentation.plan`  | `applyInstrumentationPlan(payload)`               |
  * | `instrumentation.ready` | `applyInstrumentationReady(payload)` + degradation notice |
  * | `instrumentation.failed`| `applyInstrumentationFailed(payload)` + its hint  |
@@ -640,68 +822,78 @@ export function activate(context: vscode.ExtensionContext): void {
  * | `analysis.completed`    | `applyAnalysis(payload.analysis)`                 |
  * | `panel.generated`       | `applyPanelGenerated(payload)` + fallback banner  |
  * | `cleanup.completed`     | `applyCleanupCompleted(payload)`                  |
- * | `source.open`           | `openSourceLocation(payload.location, session root)` |
+ * | `source.open`           | `openSourceLocation(payload.location, session root)`, answered with `source.result` (`ref` = the frame's `id`) |
  * | `error`                 | logged at `warn` + one notice                     |
  *
- * @returns The unsubscribe function of every row.
+ * `source.open` is the one row that answers: the service waits for the
+ * editor's `source.result` and relays it to the DevTools panel that asked, so
+ * the panel reports a click as done only once the editor has opened it.
+ *
+ * The element selected in DevTools reaches the editor only as the `target` of
+ * the `SessionRecord` inside `session.updated`, which is authoritative: the
+ * service stores a `target.selected` it accepted from the tab bound to the
+ * session and then broadcasts the stored record, from which
+ * `applySessionRecord` takes the target. `target.selected` itself travels
+ * DevTools → service only (AAP §0.4.2) and no service path sends it to an
+ * editor, so it is intentionally not subscribed here: a listener for it could
+ * never fire, and it would present a selection the service had not recorded.
+ *
+ * @returns The unsubscribe function of every subscribed row.
  */
 function subscribeInbound(rt: ExtensionRuntime): Array<() => void> {
   const { client, state, logger } = rt;
   return [
-    client.on('session.created', (message) => {
+    client.on(MESSAGE_TYPE.SESSION_CREATED, (message) => {
       state.applySessionRecord(message.payload.session);
     }),
-    client.on('session.updated', (message) => {
+    client.on(MESSAGE_TYPE.SESSION_UPDATED, (message) => {
       state.applySessionRecord(message.payload.session);
     }),
-    client.on('session.progress', (message) => {
+    client.on(MESSAGE_TYPE.SESSION_PROGRESS, (message) => {
       state.applyProgress(message.payload);
     }),
-    client.on('session.bound', (message) => {
+    client.on(MESSAGE_TYPE.SESSION_BOUND, (message) => {
       logger.debug('Tab binding changed', {
         sessionId: message.payload.sessionId,
         tabId: message.payload.tabId,
         reason: message.payload.reason,
       });
     }),
-    client.on('target.selected', (message) => {
-      state.applyTargetSelected(message.payload);
-    }),
-    client.on('instrumentation.plan', (message) => {
+    client.on(MESSAGE_TYPE.INSTRUMENTATION_PLAN, (message) => {
       state.applyInstrumentationPlan(message.payload);
     }),
-    client.on('instrumentation.ready', (message) => {
+    client.on(MESSAGE_TYPE.INSTRUMENTATION_READY, (message) => {
       state.applyInstrumentationReady(message.payload);
       announceDegradedSignals(rt, message.payload);
     }),
-    client.on('instrumentation.failed', (message) => {
+    client.on(MESSAGE_TYPE.INSTRUMENTATION_FAILED, (message) => {
       state.applyInstrumentationFailed(message.payload);
       announceInstrumentationFailure(rt, message.payload);
     }),
-    client.on('capture.started', (message) => {
+    client.on(MESSAGE_TYPE.CAPTURE_STARTED, (message) => {
       state.applyCaptureStarted(message.payload);
     }),
-    client.on('capture.stopped', (message) => {
+    client.on(MESSAGE_TYPE.CAPTURE_STOPPED, (message) => {
       state.applyCaptureStopped(message.payload);
     }),
-    client.on('analysis.completed', (message) => {
+    client.on(MESSAGE_TYPE.ANALYSIS_COMPLETED, (message) => {
       state.applyAnalysis(message.payload.analysis);
     }),
-    client.on('panel.generated', (message) => {
+    client.on(MESSAGE_TYPE.PANEL_GENERATED, (message) => {
       state.applyPanelGenerated(message.payload);
       announcePanel(rt, message.payload);
     }),
-    client.on('cleanup.completed', (message) => {
+    client.on(MESSAGE_TYPE.CLEANUP_COMPLETED, (message) => {
       state.applyCleanupCompleted(message.payload);
     }),
-    client.on('source.open', (message) => {
-      void openSourceFromService(rt, message.payload).catch((error: unknown) => {
-        logger.error('Opening a source location failed unexpectedly', {
+    client.on(MESSAGE_TYPE.SOURCE_OPEN, (message) => {
+      void answerSourceOpen(rt, message).catch((error: unknown) => {
+        logger.error('Answering a source.open failed unexpectedly', {
           code: DebuggenError.from(error).code,
         });
       });
     }),
-    client.on('error', (message) => {
+    client.on(MESSAGE_TYPE.ERROR, (message) => {
       announceServiceError(rt, message);
     }),
   ];
@@ -836,18 +1028,66 @@ function announceServiceError(rt: ExtensionRuntime, message: MessageByType<'erro
 }
 
 /**
+ * Handles one forwarded `source.open` end to end: opens the location, then
+ * answers the service with `source.result`, `ref` = this frame's `id`.
+ *
+ * Exactly one answer per frame, and every path produces it — `opened`, or
+ * `failed` for an unknown session, a refused or failed open, and an attempt
+ * that threw — except one: once `deactivate()` has begun nothing is sent, and
+ * the service's own deadline answers the panel. The answer's text is built by
+ * `sourceResultFor` from constants, never from the local error, whose message
+ * and cause may quote a path (AAP §0.5.2). A send that fails is logged by code
+ * and never shown: the developer already saw this window's own notice, and the
+ * service tells the panel when no answer arrives.
+ */
+async function answerSourceOpen(
+  rt: ExtensionRuntime,
+  message: MessageByType<'source.open'>,
+): Promise<void> {
+  let outcome: ForwardedSourceOpenOutcome | undefined;
+  try {
+    outcome = await openSourceFromService(rt, message.payload);
+  } catch (error) {
+    rt.logger.error('Opening a source location failed unexpectedly', {
+      code: DebuggenError.from(error).code,
+    });
+    outcome = { kind: 'unexpected' };
+  }
+  if (outcome === undefined || rt.disposed) {
+    return;
+  }
+
+  const answer = sourceResultFor(
+    { sessionId: message.payload.sessionId, ref: message.id },
+    outcome,
+  );
+  if (isErr(answer)) {
+    rt.logger.warn('The answer to a source.open could not be built', { code: answer.error.code });
+    return;
+  }
+  const sent = rt.client.send(MESSAGE_TYPE.SOURCE_RESULT, answer.value);
+  if (isErr(sent)) {
+    rt.logger.info('The answer to a source.open was not sent', { code: sent.error.code });
+  }
+}
+
+/**
  * `source.open` — the editor end of DevTools → service → editor. The location
  * is validated against the project root of the session *record* (never a root
  * carried by the frame) inside `openSourceLocation`, which also reports any
  * refusal to the developer itself.
+ *
+ * @returns What became of the attempt, for the answer; `undefined` when the
+ *   runtime was disposed while the session was being looked up, in which case
+ *   nothing was opened and nothing is answered.
  */
 async function openSourceFromService(
   rt: ExtensionRuntime,
   payload: MessageByType<'source.open'>['payload'],
-): Promise<void> {
+): Promise<ForwardedSourceOpenOutcome | undefined> {
   const projectRoot = await projectRootOfSession(rt, payload.sessionId);
   if (rt.disposed) {
-    return;
+    return undefined;
   }
   if (projectRoot === undefined) {
     rt.logger.warn('Source location refused: the session is unknown', {
@@ -857,7 +1097,7 @@ async function openSourceFromService(
       level: 'warning',
       message: 'Could not open the source location: its session is not known to this window.',
     });
-    return;
+    return { kind: 'unknown-session' };
   }
   const opened = await openSourceLocation(
     payload.location,
@@ -869,7 +1109,9 @@ async function openSourceFromService(
       sessionId: payload.sessionId,
       code: opened.error.code,
     });
+    return { kind: 'not-opened', code: opened.error.code };
   }
+  return { kind: 'opened' };
 }
 
 /**
@@ -1084,15 +1326,15 @@ function wireConfiguration(rt: ExtensionRuntime): vscode.Disposable {
     if (event.affectsConfiguration(SETTING.serviceUrl)) {
       rt.state.setServiceUrl(settings.serviceUrl);
       rt.client.setBaseUrl(settings.serviceUrl);
-      rt.logger.info('Service URL changed', {
-        serviceUrl: rt.client.baseUrl,
-        code: rt.client.configurationError?.code,
-      });
+      rt.logger.info('Service URL changed', describeServiceUrl(rt.client));
       ensure = true;
     }
     if (event.affectsConfiguration(SETTING.provider)) {
       rt.state.setProvider(settings.provider);
-      rt.logger.info('Model provider setting changed', { provider: settings.provider });
+      // The setting is free text in `settings.json`; only its class is logged.
+      rt.logger.info('Model provider setting changed', {
+        provider: classifyProviderSetting(settings.provider),
+      });
     }
     if (event.affectsConfiguration(SETTING.devServerUrl)) {
       const devServerUrl = readDevServerUrlSetting();
@@ -1274,11 +1516,31 @@ async function announceStartFailure(rt: ExtensionRuntime, error: DebuggenError):
 // ---------------------------------------------------------------------------
 
 /**
+ * How the end of the active session went during shutdown:
+ *
+ * | Outcome | Meaning |
+ * | --- | --- |
+ * | `no-session` | no open session to end |
+ * | `ended` | the service answered the end request: its cleanup concluded |
+ * | `in-progress` | the request timed out on this side; the service is still serving it — waiting for a cancelled install to settle, then restoring the files |
+ * | `not-ended` | the service refused or failed the request, or could not be reached: nothing is being restored for it |
+ */
+export type ShutdownEndOutcome = 'no-session' | 'ended' | 'in-progress' | 'not-ended';
+
+/**
  * Deactivates the extension and upholds the end-of-session cleanup guarantee
- * (AAP §0.5.1): the active session is ended — the service restores every
- * instrumented file — before the service child this extension spawned is
- * stopped. VS Code awaits the returned promise within its own budget, which is
- * why this is asynchronous while `activate` is not. Never throws.
+ * (AAP §0.5.1): every session this editor is responsible for is ended at the
+ * service that owns it — the service restores every instrumented file — and
+ * the service child this extension spawned is never acted on in a way that
+ * interrupts that restore: it is left running while an end is still in
+ * progress, and force-stopped only when every end concluded. VS Code awaits
+ * the returned promise within its own budget ({@link DEACTIVATE_BUDGET_MS}
+ * stays inside it), which is why this is asynchronous while `activate` is
+ * not. Never throws.
+ *
+ * The session work is {@link endSessionsForShutdown}, the one routine the
+ * suites exercise as "actual deactivation": it ends the active session, waits
+ * (bounded) for every `POST /sessions` in flight, and ends what those created.
  */
 export async function deactivate(): Promise<void> {
   const rt = runtime;
@@ -1289,27 +1551,32 @@ export async function deactivate(): Promise<void> {
   rt.disposed = true;
 
   try {
-    // 1. End the active session. Issued and registered with the process
-    //    manager synchronously, before the first `await`: the extension host
-    //    disposes `context.subscriptions` — the process manager included —
-    //    right after this function returns its promise, and the manager's
-    //    disposal waits for registered operations before it signals the child.
-    const ending = endActiveSession(rt);
-    if (ending !== undefined) {
-      await ending;
-    }
+    // 0. Close the gate: from here on no command creates, reopens or adopts a
+    //    session, and a create already in flight hands its session over.
+    rt.state.beginShutdown();
 
-    // 2. Only now stop the child this extension spawned (a service someone
-    //    else runs is never touched). Reversing steps 1 and 2 would kill the
+    // 1. End the sessions, and 2. stop the child this extension spawned (a
+    //    service someone else runs is never touched). Both are issued
+    //    synchronously, before the first `await`: the routine sends the active
+    //    session's end before its own first `await`, and its promise is
+    //    registered with the process manager in this same turn. The extension
+    //    host disposes `context.subscriptions` — the store, the client and the
+    //    process manager included — right after this function returns its
+    //    promise; the create ledger survives that disposal, HTTP still works on
+    //    a disposed client, and the manager's disposal leaves the child to a
+    //    stop already in flight instead of racing it with a termination of its
+    //    own. The stop waits for the ends before it acts on the child, and
+    //    leaves it running while an end is still in progress; signalling it
+    //    earlier would stop the
     //    service mid-cleanup and leave patched files in the developer's
-    //    working tree; the service's start-up reconciliation of modification
-    //    records would repair them next time, but that is a safety net, not a
-    //    substitute for ending the session here.
-    await rt.serviceProcess.stop({
-      awaitInFlight: ending,
-      quiesceTimeoutMs: DEACTIVATE_QUIESCE_TIMEOUT_MS,
-      graceMs: DEACTIVATE_STOP_GRACE_MS,
-    });
+    //    working tree until the service's start-up reconciliation repairs
+    //    them — a safety net, not a substitute for ending the session here.
+    const ending = rt.serviceProcess.keepAliveFor(
+      endSessionsForShutdown({ state: rt.state, client: rt.client, logger: rt.logger }).then(
+        shutdownEndOutcomeOf,
+      ),
+    );
+    await stopServiceForShutdown(rt.serviceProcess, ending, rt.logger);
   } catch (error) {
     rt.logger.error('Deactivation cleanup failed unexpectedly', {
       code: DebuggenError.from(error).code,
@@ -1330,42 +1597,102 @@ export async function deactivate(): Promise<void> {
 }
 
 /**
- * Sends `POST /sessions/:id/end` for the active session when it is still
- * open, bounded by {@link DEACTIVATE_END_SESSION_TIMEOUT_MS}, and registers it
- * with the process manager so the child outlives it.
+ * Reads the shutdown routine's report as the one outcome the stop acts on
+ * ({@link ShutdownEndOutcome}): `in-progress` when an end timed out on this
+ * side or a create was still unanswered — the service may still be restoring
+ * files, or be about to create a session the start command then ends —
+ * `not-ended` when an end was refused or failed, or an open session had no
+ * known owner, `ended` when every end concluded, and `no-session` when there
+ * was nothing to end.
  *
- * @returns The request, resolving once it settled (never rejecting), or
- *   `undefined` when no open session exists.
+ * @param report What {@link endSessionsForShutdown} did.
  */
-function endActiveSession(rt: ExtensionRuntime): Promise<void> | undefined {
-  const session = rt.state.activeSession;
-  if (!isSessionOpen(session)) {
-    return undefined;
+export function shutdownEndOutcomeOf(report: ShutdownReport): ShutdownEndOutcome {
+  if (report.unsettledCreates > 0 || report.ended.some((end) => end.timedOut === true)) {
+    return 'in-progress';
   }
-  const sessionId = session.id;
-  rt.logger.info('Ending the active session before shutdown', { sessionId });
-  const request = rt.client
-    .endSession(sessionId, { timeoutMs: DEACTIVATE_END_SESSION_TIMEOUT_MS })
-    .then(
-      (ended) => {
-        if (isOk(ended)) {
-          rt.logger.info('Session ended on shutdown', {
-            sessionId,
-            cleanup: ended.value.cleanup,
-          });
-        } else {
-          rt.logger.warn('Session could not be ended on shutdown', {
-            sessionId,
-            code: ended.error.code,
-          });
-        }
-      },
-      (error: unknown) => {
-        rt.logger.warn('Session could not be ended on shutdown', {
-          sessionId,
-          code: DebuggenError.from(error).code,
-        });
-      },
+  if (report.unowned.length > 0 || report.ended.some((end) => end.code !== undefined)) {
+    return 'not-ended';
+  }
+  return report.ended.length === 0 ? 'no-session' : 'ended';
+}
+
+/**
+ * Stops the service child for shutdown within {@link DEACTIVATE_BUDGET_MS},
+ * without ever cutting a restore short.
+ *
+ * `stop()` is called synchronously — before this function's first `await` —
+ * so a `dispose()` that follows at once finds the stop in flight and leaves
+ * the child to it. The stop waits for `ending` (bounded by
+ * {@link DEACTIVATE_QUIESCE_TIMEOUT_MS}) and then, by the outcome:
+ *
+ * - **still in progress** (`in-progress`, or not settled by the bound) — the
+ *   child is **released**: left running and never signalled, because the
+ *   service keeps serving the end request after this window stops waiting
+ *   and a signal would interrupt its restore. It restores the files on its
+ *   own schedule, and a later window finds it answering and uses it. A child
+ *   kept on an address `debuggen.serviceUrl` no longer names cannot be
+ *   serving the request and is stopped as below;
+ * - **refused or failed** (`not-ended`) — `SIGTERM`, and no `SIGKILL`: the
+ *   service runs its own shutdown, and whatever it leaves instrumented is
+ *   restored when it next starts (AAP §0.5.1);
+ * - **concluded** (`ended`, or `no-session`) — `SIGTERM`, then `SIGKILL`
+ *   after {@link DEACTIVATE_STOP_GRACE_MS} if the child is still running.
+ *
+ * @example
+ * ```ts
+ * const report = endSessionsForShutdown({ state, client, logger });
+ * const ending = rt.serviceProcess.keepAliveFor(report.then(shutdownEndOutcomeOf));
+ * await stopServiceForShutdown(rt.serviceProcess, ending, rt.logger);
+ * ```
+ *
+ * @param serviceProcess The process manager; a service it did not spawn is never touched.
+ * @param ending How the active session's end went; a rejection counts as `not-ended`.
+ * @param logger Where an unconcluded end is reported.
+ * @returns The end's outcome, or `undefined` when it had not settled by the
+ *   time the stop acted on the child. Never rejects.
+ */
+export async function stopServiceForShutdown(
+  serviceProcess: Pick<ServiceProcess, 'stop'>,
+  ending: Promise<ShutdownEndOutcome>,
+  logger: Logger,
+): Promise<ShutdownEndOutcome | undefined> {
+  let outcome: ShutdownEndOutcome | undefined;
+  const settled = ending.then(
+    (value) => {
+      outcome = value;
+    },
+    () => {
+      outcome = 'not-ended';
+    },
+  );
+  const inProgress = (): boolean => outcome === undefined || outcome === 'in-progress';
+  const concluded = (): boolean => outcome === 'ended' || outcome === 'no-session';
+  try {
+    // Issued before the first `await` of this function; see the TSDoc.
+    const stopping = serviceProcess.stop({
+      awaitInFlight: settled,
+      quiesceTimeoutMs: DEACTIVATE_QUIESCE_TIMEOUT_MS,
+      graceMs: DEACTIVATE_STOP_GRACE_MS,
+      release: inProgress,
+      escalate: concluded,
+    });
+    await stopping;
+  } catch (error) {
+    logger.error('Stopping the service on shutdown failed unexpectedly', {
+      code: DebuggenError.from(error).code,
+    });
+  }
+  if (inProgress()) {
+    logger.warn(
+      'The session end was still in progress at shutdown; a service this window started is left running, unsignalled, so it finishes restoring the instrumented files',
+      { outcome: outcome ?? 'pending' },
     );
-  return rt.serviceProcess.keepAliveFor(request);
+  } else if (!concluded()) {
+    logger.warn(
+      'The session end did not conclude before shutdown; a service this window started is sent SIGTERM but never force-stopped, and anything it leaves instrumented is restored when the service next starts',
+      { outcome },
+    );
+  }
+  return outcome;
 }

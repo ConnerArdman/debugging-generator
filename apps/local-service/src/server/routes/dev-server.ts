@@ -3,32 +3,24 @@
  * /dev-server/launch`, `POST /dev-server/stop` and `POST
  * /dev-server/credential` (AAP §0.4.2, §0.5.5, §0.5.6).
  *
- * ## Three operations, two owners of the contract
+ * ## Three operations, one owner of the contract
  *
- * `devServer.launch` and `devServer.stop` are rows of `@debuggen/protocol`'s
- * `HTTP_ROUTES`. `../http.ts` registers them at the table's own method and
- * pattern while it iterates `HTTP_OPERATIONS`, and this module answers them
- * from {@link DevServerRoutes.handlers}. Their bodies are validated with
- * protocol's `parseHttpRequest` and `parseHttpResponse` — the same helpers the
- * client SDK uses — so the service accepts exactly what a client can send and
- * answers exactly what a client can parse.
- *
- * `POST /dev-server/credential` is **not** a protocol operation: protocol's
- * seventeen-route table deliberately has no credential row. Its path, method
- * and both body schemas are defined once, in `../../dev-server/launcher.ts`,
- * which names this module as their registrar. {@link DevServerRoutes.credential}
- * is that registration handed to `../http.ts` explicitly — method, pattern,
- * the protocol operation whose authorization it runs under, and the handler —
- * rather than smuggled into the table-keyed record, where an extra key would
- * break the record's exhaustiveness check. {@link createDevServerRoutes}
- * refuses to build when a protocol route would claim the same path
- * (`findCredentialRouteCollision`), so ownership of the path stays
- * unambiguous if the table ever grows.
+ * `devServer.launch`, `devServer.stop` and `devServer.credential` are rows of
+ * `@debuggen/protocol`'s `HTTP_ROUTES`, which owns their methods, paths and
+ * bodies. `../http.ts` registers each at the table's own method and pattern
+ * while it iterates `HTTP_OPERATIONS`, behind the auth middleware for that
+ * same operation, and this module answers them from
+ * {@link DevServerRoutes.handlers}. Every body is validated with protocol's
+ * `parseHttpRequest` and every reply with `parseHttpResponse` — the same
+ * helpers the client SDK uses — so the service accepts exactly what a client
+ * can send and answers exactly what a client can parse. No route of this
+ * module is registered beside the table.
  *
  * A command-line client such as `scripts/dev-instrumented.mjs` follows the
- * same surface: it probes `GET /health` (unauthenticated), then calls
+ * same surface: it probes `GET /health` (unauthenticated), then either calls
  * `POST /dev-server/launch` with the editor credential and, on teardown,
- * `POST /dev-server/stop`.
+ * `POST /dev-server/stop`, or requests a server-agent credential for a dev
+ * server it starts itself with `POST /dev-server/credential`.
  *
  * ## Authorization comes from the resolved principal
  *
@@ -37,15 +29,12 @@
  * `c.get('principal')` and never from a body field, a header or a client's
  * description of itself. Each handler then applies, in this order:
  *
- * 1. the **role** — `OPERATION_ROLES` of its operation, the editor (`vscode`)
- *    only. The credential route runs under `devServer.launch`
- *    ({@link DEV_SERVER_CREDENTIAL_AUTHORIZED_AS}): it mints exactly the
- *    authority a launch mints — one `server-agent` credential scoped to one
- *    project — so it is authorized as that operation, by the same middleware
- *    decision and the same role table. A `devtools` or `server-agent`
- *    credential can never launch, stop or mint;
+ * 1. the **role** — `OPERATION_ROLES` of its own operation, the editor
+ *    (`vscode`) only for all three, decided by the same role table the
+ *    middleware applied. A `devtools` or `server-agent` credential can never
+ *    launch, stop or mint;
  * 2. the **body** — bounded ({@link MAX_DEV_SERVER_REQUEST_BODY_BYTES}), JSON,
- *    and valid against the operation's schema;
+ *    and valid against the operation's protocol schema;
  * 3. the **project root's shape** — {@link normalizeRequestedProjectRoot}
  *    refuses a relative, network (UNC), `..`-bearing, whitespace-padded or
  *    control-character-bearing root before it reaches the launcher, and a
@@ -55,10 +44,44 @@
  *    the launcher is handed, so what was authorized is what is acted on;
  * 4. the **scope** — `requireProjectScope`: an editor credential acts only on
  *    projects under the workspace folders its connections announced in
- *    `client.hello`. A project outside them is refused with `403`.
+ *    `client.hello`. A project outside them is refused with `403`;
+ * 5. for a launch that names a `sessionId`, the **session** — it must exist
+ *    (`404`), belong to exactly the launched project and not have ended
+ *    (`409`). Only then is the child tied to it: the launcher stops a child
+ *    spawned for a session when the last session relying on it ends, while a
+ *    launch that names no session starts the developer's own dev server, which
+ *    no session end stops;
+ * 6. the **revocation fence** — `AuthService.requireLiveCredential`: the
+ *    credential the middleware resolved the principal from must still be
+ *    live once the body has been read. A rotation (`POST /credentials/rotate`)
+ *    or an expiry that retired it while the body was in flight is refused
+ *    `401` (`unknown-credential` / `expired-credential`), so a retired editor
+ *    credential can neither launch, stop nor mint.
  *
  * The role is checked before the body is read, so a caller without the editor
  * role learns nothing about dev servers.
+ *
+ * ## Why the fence sits where it does
+ *
+ * The middleware resolves the principal once, before the handler runs, and
+ * the handler then awaits the client's body — for as long as the client
+ * chooses. The fence runs after that await and **immediately before** the
+ * launcher call, with no `await` between the two:
+ *
+ * - `devServer.credential` is fenced end to end. `launcher.issueCredential`
+ *   runs synchronously up to its issuer call, which `main.ts`'s
+ *   `credentialIssuerOf` binds to `AuthService.issueServerAgentCredential` —
+ *   itself synchronous up to its insert. `AuthService.rotateAll` is
+ *   synchronous too, so no rotation can run between a fence that passed and
+ *   the insert of the new server-agent row: either the rotation ran first and
+ *   the fence refuses, or the insert ran first and the rotation deletes it.
+ * - `devServer.launch` and `devServer.stop` are fenced at **initiation**. A
+ *   launch probes, spawns and waits for readiness across many awaits, and the
+ *   launcher mints the child's server-agent credential only on the way; a
+ *   launch started under a then-live credential may therefore complete after
+ *   a rotation. Its credential goes into the child's environment, never into
+ *   this response, and the rotation's contract is that launched dev servers
+ *   are relaunched (AAP §0.5.6).
  *
  * ## What this module does not do
  *
@@ -108,13 +131,12 @@
 import type { Context, Handler } from 'hono';
 
 import {
-  describeZodIssues,
   httpErrorResponseSchema,
   parseHttpRequest,
   parseHttpResponse,
   toErrorPayload,
 } from '@debuggen/protocol';
-import type { HttpErrorResponse, HttpMethod, HttpRequestBody } from '@debuggen/protocol';
+import type { HttpErrorResponse, HttpRequestBody, SessionRecord } from '@debuggen/protocol';
 import {
   DebuggenError,
   err,
@@ -128,16 +150,10 @@ import {
 } from '@debuggen/shared';
 import type { DebuggenErrorCode, Logger, Result } from '@debuggen/shared';
 
-import {
-  DEV_SERVER_CREDENTIAL_METHOD,
-  DEV_SERVER_CREDENTIAL_PATH,
-  devServerCredentialRequestSchema,
-  devServerCredentialResponseSchema,
-  findCredentialRouteCollision,
-  toDevServerLaunchResponse,
-} from '../../dev-server/launcher.js';
-import type { DevServerCredentialRequest, DevServerLauncher } from '../../dev-server/launcher.js';
+import { toDevServerLaunchResponse } from '../../dev-server/launcher.js';
+import type { DevServerLauncher } from '../../dev-server/launcher.js';
 import { subsystemLogger } from '../../logging.js';
+import type { SessionManager } from '../../sessions/manager.js';
 import {
   AUTH_FAILURE_REASONS,
   OPERATION_ROLES,
@@ -148,6 +164,7 @@ import {
 } from '../auth.js';
 import type {
   AuthFailureReason,
+  AuthService,
   AuthenticatedOperation,
   Principal,
   PrincipalRole,
@@ -170,6 +187,13 @@ const LAUNCH = 'devServer.launch' satisfies AuthenticatedOperation;
 const STOP = 'devServer.stop' satisfies AuthenticatedOperation;
 
 /**
+ * `POST /dev-server/credential`, pinned the same way as {@link LAUNCH}: it
+ * mints a project-scoped `server-agent` credential for a dev server the caller
+ * starts itself, so it must never run without a principal.
+ */
+const CREDENTIAL = 'devServer.credential' satisfies AuthenticatedOperation;
+
+/**
  * The protocol operations this module answers, in the route table's order.
  *
  * `../http.ts` builds an exhaustive `Record<HttpOperationId, handler>` from the
@@ -179,39 +203,17 @@ const STOP = 'devServer.stop' satisfies AuthenticatedOperation;
 export const DEV_SERVER_OPERATIONS = Object.freeze([
   LAUNCH,
   STOP,
+  CREDENTIAL,
 ] as const satisfies readonly AuthenticatedOperation[]);
 
 /** One of {@link DEV_SERVER_OPERATIONS}. */
 export type DevServerOperation = (typeof DEV_SERVER_OPERATIONS)[number];
 
 /**
- * The protocol operation the credential route is authorized as: its middleware
- * is `createAuthMiddleware(auth)(DEV_SERVER_CREDENTIAL_AUTHORIZED_AS)` and its
- * role check reads `OPERATION_ROLES` under the same key.
- *
- * `devServer.launch`, because minting a credential for a dev server the caller
- * starts itself grants exactly what a launch grants — a `server-agent`
- * credential scoped to one project root — and nothing more. Borrowing the
- * operation keeps the access decision in `../auth.ts`'s single role table
- * instead of a second, local one that could drift from it.
+ * Every label a request handled here is logged and refused under: its
+ * protocol operation id, never a path.
  */
-export const DEV_SERVER_CREDENTIAL_AUTHORIZED_AS = LAUNCH;
-
-/**
- * The method of the credential route, typed against protocol's method
- * vocabulary so a launcher-side change to a verb this service never registers
- * fails here at compile time.
- */
-const CREDENTIAL_METHOD = DEV_SERVER_CREDENTIAL_METHOD satisfies HttpMethod;
-
-/**
- * The label the credential route's log records and refusals name it by. Not a
- * protocol operation id — the credential route has none — and never a path.
- */
-const CREDENTIAL_LABEL = 'devServer.credential';
-
-/** Every label a request handled here is logged and refused under. */
-type RouteLabel = DevServerOperation | typeof CREDENTIAL_LABEL;
+type RouteLabel = DevServerOperation;
 
 /* -------------------------------------------------------------------------------------------------
  * Policy constants
@@ -280,13 +282,16 @@ const RESPONSE_DRIFT_MESSAGE =
 
 /**
  * What {@link createDevServerRoutes} is built from: the narrowest slice of the
- * dev-server launcher the three handlers call, and an optional logger.
+ * dev-server launcher the three handlers call, the access boundary's
+ * revocation fence, and an optional logger.
  *
  * Declared here, next to the routes that need it, so `../http.ts` composes its
  * dependency aggregate from this interface rather than restating its fields.
- * The session store is deliberately absent: every operation here is keyed by
- * the project root in its own body, which the principal's scope is checked
- * against directly.
+ * The field name `auth` matches the sibling route modules' slices of the same
+ * service, so the aggregate asks for one object that satisfies them all. Every
+ * operation is keyed by the project root in its own body, which the
+ * principal's scope is checked against directly; the session manager is read
+ * only to check the session a launch names.
  */
 export interface DevServerRoutesDeps {
   /**
@@ -295,6 +300,21 @@ export interface DevServerRoutesDeps {
    * inside these calls.
    */
   readonly launcher: Pick<DevServerLauncher, 'launch' | 'stop' | 'issueCredential'>;
+
+  /**
+   * The session manager, the same object the session routes receive: a launch
+   * that names a session is tied to it only when the session exists, belongs
+   * to the launched project and has not ended (`get`); and a session whose
+   * launched dev server serves at another origin than the one it recorded is
+   * brought up to date (`patch`), because its tab is bound by that origin.
+   */
+  readonly manager: Pick<SessionManager, 'get' | 'patch'>;
+
+  /**
+   * The revocation fence each handler applies between reading its body and
+   * calling the launcher (see the module documentation).
+   */
+  readonly auth: Pick<AuthService, 'requireLiveCredential'>;
 
   /**
    * The platform whose path grammar a requested project root is read in;
@@ -320,48 +340,25 @@ export interface DevServerRoutesDeps {
 export type DevServerRouteHandler = Handler<ServerEnv>;
 
 /**
- * The handlers of the two protocol operations, keyed by operation id so
+ * The handlers of the three protocol operations, keyed by operation id so
  * `../http.ts` can place them in its exhaustive handler record unchanged.
  */
 export type DevServerRouteHandlers = Readonly<Record<DevServerOperation, DevServerRouteHandler>>;
 
-/**
- * The folder-owned credential route, as `../http.ts` registers it beside the
- * table-driven operations:
- *
- * ```ts
- * const { method, pattern, authorizeAs, handler } = devServer.credential;
- * app.on(method, pattern, authFor(authorizeAs), handler);
- * ```
- *
- * Every field is taken from its single definition: the method and pattern
- * from `../../dev-server/launcher.ts`, the authorizing operation from
- * {@link DEV_SERVER_CREDENTIAL_AUTHORIZED_AS}.
- */
-export interface DevServerCredentialRoute {
-  /** `DEV_SERVER_CREDENTIAL_METHOD` — `POST`. */
-  readonly method: typeof DEV_SERVER_CREDENTIAL_METHOD;
-  /** `DEV_SERVER_CREDENTIAL_PATH`, verbatim; kept stable because clients call it. */
-  readonly pattern: typeof DEV_SERVER_CREDENTIAL_PATH;
-  /** The protocol operation whose middleware and role table authorize the route. */
-  readonly authorizeAs: typeof DEV_SERVER_CREDENTIAL_AUTHORIZED_AS;
-  /** The handler; it re-checks the role and applies the project scope itself. */
-  readonly handler: DevServerRouteHandler;
-}
-
 /** Everything {@link createDevServerRoutes} returns. */
 export interface DevServerRoutes {
-  /** `devServer.launch` and `devServer.stop`, for the table-driven registration loop. */
+  /**
+   * `devServer.launch`, `devServer.stop` and `devServer.credential`, for the
+   * table-driven registration loop.
+   */
   readonly handlers: DevServerRouteHandlers;
-  /** `POST /dev-server/credential`, for its explicit registration. */
-  readonly credential: DevServerCredentialRoute;
 }
 
 /**
  * Every status this module answers a failure with, besides the access-boundary
  * statuses `../auth.ts`'s `authErrorResponse` chooses (`401`, `403`, `429`).
  */
-export type DevServerFailureStatus = 400 | 403 | 404 | 409 | 413 | 500 | 502 | 503 | 504;
+export type DevServerFailureStatus = 400 | 403 | 404 | 408 | 409 | 413 | 500 | 502 | 503 | 504;
 
 /* -------------------------------------------------------------------------------------------------
  * The failure vocabulary: which status a failure is answered with
@@ -381,6 +378,12 @@ export type DevServerFailureStatus = 400 | 403 | 404 | 409 | 413 | 500 | 502 | 5
  * - `PATH_OUTSIDE_PROJECT` — a project root outside the principal's scope:
  *   `403` (this module's malformed-root refusal is refined to `400` by reason).
  * - `PROJECT_NOT_FOUND` — the project root is not an existing directory: `404`.
+ * - `SESSION_NOT_FOUND` — the session a launch names does not exist: `404`.
+ * - `SESSION_INVALID_STATE` — the session a launch names belongs to another
+ *   project or has already ended: `409`.
+ * - `CLEANUP_PARTIAL` — a stop ended its dev server but could not yet revoke
+ *   the server's credential: `500`, with the launcher's constant sentence and
+ *   the moment the credential lapses on its own.
  * - `SERVER_AGENT_NOT_READY` — a dev server already serves the project without
  *   the preload, so a second one was not started on its port: `409`.
  * - `DEV_SERVER_LAUNCH_FAILED` — the dev server could not be started or died
@@ -397,11 +400,14 @@ const STATUS_BY_CODE: ReadonlyMap<DebuggenErrorCode, DevServerFailureStatus> = n
   ['PROTOCOL_INVALID_MESSAGE', 400],
   ['PATH_OUTSIDE_PROJECT', 403],
   ['PROJECT_NOT_FOUND', 404],
+  ['SESSION_NOT_FOUND', 404],
+  ['SESSION_INVALID_STATE', 409],
   ['SERVER_AGENT_NOT_READY', 409],
   ['DEV_SERVER_LAUNCH_FAILED', 502],
   ['DEV_SERVER_UNAVAILABLE', 503],
   ['INSTRUMENTATION_UNAVAILABLE', 503],
   ['CONFIG_INVALID', 500],
+  ['CLEANUP_PARTIAL', 500],
 ]);
 
 /**
@@ -707,10 +713,45 @@ export function normalizeRequestedProjectRoot(
 
 /** A refused request body and the status it is answered with. */
 interface BodyRejection {
-  /** `413` for an oversized body, `400` for one that is unreadable, not JSON or off-schema. */
-  readonly status: 400 | 413;
+  /**
+   * `413` for an oversized body, `408` for one that did not arrive in time,
+   * `400` for one that is unreadable, not JSON or off-schema.
+   */
+  readonly status: 400 | 408 | 413;
   /** The refusal; its message never quotes the body. */
   readonly error: DebuggenError;
+}
+
+/**
+ * The `details.reason` values of the refusal `../http.ts`'s request-body guard
+ * errors a body stream with — what `c.req.text()` rejects with when the body
+ * crosses {@link MAX_DEV_SERVER_REQUEST_BODY_BYTES} while it is read, or does
+ * not arrive within the time ceiling. Stated here because a route module never
+ * imports `../http.ts` (which imports it); they must equal that module's
+ * `REQUEST_BODY_REFUSAL_REASONS`, and `../http-body-guard.test.ts` holds them to it.
+ */
+const GUARD_BODY_TOO_LARGE_REASON = 'body-too-large';
+
+/** See {@link GUARD_BODY_TOO_LARGE_REASON}. */
+const GUARD_BODY_READ_TIMEOUT_REASON = 'body-read-timeout';
+
+/**
+ * Which ceiling `../http.ts`'s request-body guard refused a body at, read
+ * from what a body read rejected with.
+ *
+ * @param caught The rejection of `c.req.text()`.
+ * @returns The guard's reason, or `undefined` for any other read failure.
+ */
+function guardRefusalOf(
+  caught: unknown,
+): typeof GUARD_BODY_TOO_LARGE_REASON | typeof GUARD_BODY_READ_TIMEOUT_REASON | undefined {
+  if (!DebuggenError.is(caught)) {
+    return undefined;
+  }
+  const reason = caught.details?.[REASON_DETAIL_KEY];
+  return reason === GUARD_BODY_TOO_LARGE_REASON || reason === GUARD_BODY_READ_TIMEOUT_REASON
+    ? reason
+    : undefined;
 }
 
 /** The refusal of a body larger than {@link MAX_DEV_SERVER_REQUEST_BODY_BYTES}. */
@@ -723,6 +764,21 @@ function bodyTooLarge(label: RouteLabel): BodyRejection {
       {
         hint: `Send a JSON body of at most ${String(MAX_DEV_SERVER_REQUEST_BODY_BYTES)} bytes.`,
         details: { operation: label, maxBytes: MAX_DEV_SERVER_REQUEST_BODY_BYTES },
+      },
+    ),
+  };
+}
+
+/** The refusal of a body that did not arrive within `../http.ts`'s time ceiling. */
+function bodyReadTimedOut(label: RouteLabel): BodyRejection {
+  return {
+    status: 408,
+    error: new DebuggenError(
+      'PROTOCOL_INVALID_MESSAGE',
+      `The ${label} request body did not arrive in time.`,
+      {
+        hint: 'Send the whole JSON body at once, then wait for the reply.',
+        details: { operation: label, reason: GUARD_BODY_READ_TIMEOUT_REASON },
       },
     ),
   };
@@ -747,11 +803,16 @@ function bodyNotJson(label: RouteLabel, problem: 'unreadable' | 'not-json'): Bod
  * Reads a request body as JSON, bounded by {@link MAX_DEV_SERVER_REQUEST_BODY_BYTES}.
  *
  * A declared `Content-Length` above the bound is refused before anything is
- * read; the text actually read is measured again, which covers a chunked body
- * that declared no length. The text is read through hono's cached accessor, so
- * a body a middleware already consumed is still available. An empty body reads
- * as `undefined`, which every schema here then refuses. `JSON.parse`'s own
- * error is discarded, because its message quotes the offending input.
+ * read. A body that declares no length (a chunked upload) is bounded while it
+ * is read: `../http.ts`'s request-body guard errors the stream at the same
+ * bound — and at its time ceiling — so `c.req.text()` rejects with the guard's
+ * refusal instead of buffering an unbounded body, and that rejection is
+ * answered `413` or `408` here. The text read is measured once more, which
+ * keeps the bound for a handler composed without the guard. The text is read
+ * through hono's cached accessor, so a body a middleware already consumed is
+ * still available. An empty body reads as `undefined`, which every schema here
+ * then refuses. `JSON.parse`'s own error is discarded, because its message
+ * quotes the offending input.
  *
  * @param c The request context.
  * @param label The route the body belongs to, for the refusal message.
@@ -772,7 +833,14 @@ async function readJsonBody(
   let text: string;
   try {
     text = await c.req.text();
-  } catch {
+  } catch (caught) {
+    const refusal = guardRefusalOf(caught);
+    if (refusal === GUARD_BODY_TOO_LARGE_REASON) {
+      return err(bodyTooLarge(label));
+    }
+    if (refusal === GUARD_BODY_READ_TIMEOUT_REASON) {
+      return err(bodyReadTimedOut(label));
+    }
     return err(bodyNotJson(label, 'unreadable'));
   }
   if (Buffer.byteLength(text, 'utf8') > MAX_DEV_SERVER_REQUEST_BODY_BYTES) {
@@ -813,40 +881,6 @@ async function readOperationRequest<O extends DevServerOperation>(
     return err({ status: 400, error: parsed.error });
   }
   return ok(parsed.value);
-}
-
-/**
- * Reads and validates the credential route's request body against the
- * launcher's `devServerCredentialRequestSchema` — the schema's single
- * definition — rendering a failure from the Zod issues' paths and codes only,
- * in the same words protocol's parser uses for its own operations.
- *
- * @param c The request context.
- * @returns The validated `{ projectRoot }`, or the refusal (`400`/`413`).
- */
-async function readCredentialRequest(
-  c: Context<ServerEnv>,
-): Promise<Result<DevServerCredentialRequest, BodyRejection>> {
-  const raw = await readJsonBody(c, CREDENTIAL_LABEL);
-  if (isErr(raw)) {
-    return raw;
-  }
-  const parsed = devServerCredentialRequestSchema.safeParse(raw.value);
-  if (!parsed.success) {
-    const issues = parsed.error.issues;
-    return err({
-      status: 400,
-      error: new DebuggenError(
-        'PROTOCOL_INVALID_MESSAGE',
-        `Invalid ${CREDENTIAL_LABEL} request body: ${describeZodIssues(issues)}`,
-        {
-          hint: 'Send a JSON object whose only field is "projectRoot", the absolute path of the project folder.',
-          details: { operation: CREDENTIAL_LABEL, issueCount: issues.length },
-        },
-      ),
-    });
-  }
-  return ok(parsed.data);
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -950,8 +984,8 @@ function answerFailure(
 
 /**
  * Answers a response this module built that does not satisfy its contract with
- * a fixed `INTERNAL` payload. The offending value is never logged: for the
- * credential route it holds a token.
+ * a fixed `INTERNAL` payload. The offending value is never logged: for
+ * `devServer.credential` it holds a token.
  *
  * @param c The request context.
  * @param label The route, for the log.
@@ -971,14 +1005,144 @@ function answerResponseDrift(c: Context<ServerEnv>, label: RouteLabel, log: Logg
 }
 
 /* -------------------------------------------------------------------------------------------------
- * The shared request steps: principal and role, project root and scope, delegation
+ * The shared request steps: principal and role, project root and scope, fence, delegation
  * ---------------------------------------------------------------------------------------------- */
 
 /** The dependencies every handler closes over, with their defaults applied. */
 interface ResolvedDeps {
   readonly launcher: DevServerRoutesDeps['launcher'];
+  readonly manager: DevServerRoutesDeps['manager'];
+  readonly auth: DevServerRoutesDeps['auth'];
   readonly platform: NodeJS.Platform;
   readonly log: Logger;
+}
+
+/**
+ * The session step of a launch that names one: the session must exist, belong
+ * to exactly the project being launched, and not have ended — a child tied to
+ * a session of another project would be stopped by the wrong session's end,
+ * and one tied to an ended session would have no owner left to stop it.
+ *
+ * Authorization is already settled by then: the project root was checked
+ * against the principal's announced scope, and the session is required to be
+ * that very project's, so a session outside the editor's workspace cannot be
+ * named here.
+ *
+ * @param manager The session manager's read.
+ * @param sessionId The session the body named.
+ * @param projectRoot The normalised, scope-checked project root.
+ * @returns The session's record when the launch may be tied to it, or the refusal.
+ */
+function sessionForLaunch(
+  manager: DevServerRoutesDeps['manager'],
+  sessionId: string,
+  projectRoot: string,
+): Result<SessionRecord, DebuggenError> {
+  let loaded: Result<SessionRecord | undefined, DebuggenError>;
+  try {
+    loaded = manager.get(sessionId);
+  } catch {
+    return err(
+      new DebuggenError('INTERNAL', DEV_SERVER_UNAVAILABLE_MESSAGE, {
+        details: { reason: 'session-lookup-threw' },
+      }),
+    );
+  }
+  if (isErr(loaded)) {
+    return loaded;
+  }
+  const record = loaded.value;
+  if (record === undefined) {
+    return err(
+      new DebuggenError('SESSION_NOT_FOUND', 'The session this launch names does not exist.', {
+        hint: 'Start a session first, or launch the dev server without naming a session.',
+        details: { reason: 'unknown-session' },
+      }),
+    );
+  }
+  if (normalizePosix(toPosix(record.projectRoot)) !== projectRoot) {
+    return err(
+      new DebuggenError(
+        'SESSION_INVALID_STATE',
+        'The session this launch names belongs to a different project.',
+        {
+          hint: "Launch the dev server of the session's own project, or launch this project's dev server without naming a session.",
+          details: { reason: 'session-project-mismatch' },
+        },
+      ),
+    );
+  }
+  if (record.status === 'ended') {
+    return err(
+      new DebuggenError(
+        'SESSION_INVALID_STATE',
+        'The session this launch names has already ended.',
+        {
+          hint: 'Start a new session, then launch the dev server for it.',
+          details: { reason: 'session-ended' },
+        },
+      ),
+    );
+  }
+  return ok(record);
+}
+
+/**
+ * The origin of a dev-server URL, or `undefined` when it does not parse. Two
+ * spellings of one dev server (`http://127.0.0.1:3000` and
+ * `http://127.0.0.1:3000/`) compare equal by origin, which is also what a tab
+ * is bound by.
+ */
+function originOf(url: string | undefined): string | undefined {
+  if (url === undefined || url.length === 0) {
+    return undefined;
+  }
+  try {
+    return new URL(url).origin;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Records where a session's launched dev server serves when that is another
+ * origin than the one the session recorded — a session created against an
+ * external server the editor configured, or one whose earlier child came back
+ * on another port. The session's tab is bound by origin, so a stale address
+ * would bind it to a server it does not own.
+ *
+ * Never fails the launch: the dev server runs either way. A record that could
+ * not be updated is logged by code and the answer says so.
+ *
+ * @param manager The session manager.
+ * @param session The session the launch was tied to, as it was read.
+ * @param devServerUrl Where the launched dev server serves.
+ * @param log This module's logger.
+ * @returns Whether the session's recorded address was changed.
+ */
+async function recordLaunchedUrl(
+  manager: DevServerRoutesDeps['manager'],
+  session: SessionRecord,
+  devServerUrl: string,
+  log: Logger,
+): Promise<boolean> {
+  if (originOf(session.devServerUrl) === originOf(devServerUrl)) {
+    return false;
+  }
+  let patched: Result<SessionRecord, DebuggenError>;
+  try {
+    patched = await manager.patch(session.id, { devServerUrl });
+  } catch (error) {
+    patched = err(DebuggenError.from(error, 'INTERNAL'));
+  }
+  if (isErr(patched)) {
+    log.warn('The session could not record where its launched dev server serves', {
+      operation: LAUNCH,
+      errorCode: patched.error.code,
+    });
+    return false;
+  }
+  return true;
 }
 
 /**
@@ -1046,6 +1210,49 @@ function scopedProjectRoot(
 }
 
 /**
+ * The revocation fence of every handler: the credential the principal was
+ * resolved from must still be live after the body was read
+ * (`AuthService.requireLiveCredential`). Synchronous, and every handler calls
+ * it immediately before its launcher call with no `await` in between — the
+ * ordering the module documentation's atomicity argument rests on.
+ *
+ * A retired or expired credential is answered by `authErrorResponse` at `401`
+ * through {@link answerFailure}, exactly like the middleware's own refusal. A
+ * store that cannot be read, or a fence that throws, is answered `500`: the
+ * fence fails closed and never lets the launcher run on a credential it could
+ * not confirm.
+ *
+ * @param c The request context.
+ * @param principal The principal the middleware resolved.
+ * @param label The route, for the log.
+ * @param deps The resolved dependencies.
+ * @returns `ok`, or the response that refuses the request.
+ */
+function requireLive(
+  c: Context<ServerEnv>,
+  principal: Principal,
+  label: RouteLabel,
+  deps: ResolvedDeps,
+): Result<void, Response> {
+  let live: Result<void, DebuggenError>;
+  try {
+    live = deps.auth.requireLiveCredential(principal);
+  } catch {
+    // The thrown value is not kept: nothing below promises it is free of
+    // credential material.
+    live = err(
+      new DebuggenError('INTERNAL', DEV_SERVER_UNAVAILABLE_MESSAGE, {
+        details: { reason: 'credential-check-threw' },
+      }),
+    );
+  }
+  if (isErr(live)) {
+    return err(answerFailure(c, live.error, label, deps.log));
+  }
+  return ok(undefined);
+}
+
+/**
  * Runs one launcher call, turning a rejection into an `INTERNAL` failure.
  *
  * The launcher's operations report every failure as a `Result` and never
@@ -1108,12 +1315,39 @@ function createLaunchHandler(deps: ResolvedDeps): DevServerRouteHandler {
     if (isErr(projectRoot)) {
       return projectRoot.error;
     }
-    const command = request.value.command;
+    const { command, sessionId } = request.value;
+    let owner: SessionRecord | undefined;
+    if (sessionId !== undefined) {
+      const found = sessionForLaunch(deps.manager, sessionId, projectRoot.value);
+      if (isErr(found)) {
+        return answerFailure(c, found.error, LAUNCH, log);
+      }
+      owner = found.value;
+    }
+    // The address detection probes before anything is spawned: the one the
+    // editor configured, else the one the named session recorded. The schema
+    // checked its shape only; detection's own probe dials nothing but a
+    // loopback address. A server already answering there is never duplicated
+    // on its port — the launcher reuses its own child and refuses any other
+    // with the relaunch command (AAP §0.5.5).
+    const requestedUrl = request.value.devServerUrl;
+    const recordedUrl =
+      owner?.devServerUrl === undefined || owner.devServerUrl.length === 0
+        ? undefined
+        : owner.devServerUrl;
+    const devServerUrl = requestedUrl ?? recordedUrl;
 
+    // The fence of initiation: nothing between it and the launcher call awaits.
+    const live = requireLive(c, principal.value, LAUNCH, deps);
+    if (isErr(live)) {
+      return live.error;
+    }
     const launched = await delegate(() =>
       launcher.launch({
         projectRoot: projectRoot.value,
         ...(command === undefined ? {} : { command }),
+        ...(sessionId === undefined ? {} : { sessionId }),
+        ...(devServerUrl === undefined ? {} : { devServerUrl }),
       }),
     );
     if (isErr(launched)) {
@@ -1121,18 +1355,27 @@ function createLaunchHandler(deps: ResolvedDeps): DevServerRouteHandler {
     }
     const response = toDevServerLaunchResponse(launched.value);
     if (response === undefined) {
-      // An unmanaged server has no pid this service can stop; the HTTP route
-      // never asks for one, so reaching here is a launcher/contract drift.
+      // An unmanaged server has no pid this service can stop. The launcher
+      // attributes a preload only to a child it launched itself — which it
+      // reuses before detecting anything — so reaching here is a
+      // launcher/contract drift.
       return answerResponseDrift(c, LAUNCH, log);
     }
     const checked = parseHttpResponse(LAUNCH, response);
     if (isErr(checked)) {
       return answerResponseDrift(c, LAUNCH, log);
     }
+    const addressUpdated =
+      owner === undefined
+        ? false
+        : await recordLaunchedUrl(deps.manager, owner, checked.value.devServerUrl, log);
     log.info('Answered a dev-server launch', {
       operation: LAUNCH,
       status: 200,
       pid: checked.value.pid,
+      sessionNamed: sessionId !== undefined,
+      addressRequested: requestedUrl !== undefined,
+      sessionAddressUpdated: addressUpdated,
     });
     return c.json(checked.value, 200);
   };
@@ -1141,9 +1384,11 @@ function createLaunchHandler(deps: ResolvedDeps): DevServerRouteHandler {
 /**
  * `POST /dev-server/stop`: stop the dev server the service launched for the
  * project. The launcher signals the child (`SIGTERM`, then `SIGKILL`) and
- * revokes its server-agent credential exactly once; nothing here signals or
- * revokes. A project with no launched server answers `200 { stopped: false }`
- * — stopping is idempotent, never a failure.
+ * revokes its server-agent credential; nothing here signals or revokes. A
+ * project with no launched server answers `200 { stopped: false }` — stopping
+ * is idempotent, never a failure. A stop whose credential revocation is still
+ * pending is answered `500` `CLEANUP_PARTIAL` rather than a clean `200`, and a
+ * repeated stop retries the revocation before it answers.
  */
 function createStopHandler(deps: ResolvedDeps): DevServerRouteHandler {
   const { launcher, log } = deps;
@@ -1168,6 +1413,11 @@ function createStopHandler(deps: ResolvedDeps): DevServerRouteHandler {
       return projectRoot.error;
     }
 
+    // The fence of initiation: nothing between it and the launcher call awaits.
+    const live = requireLive(c, principal.value, STOP, deps);
+    if (isErr(live)) {
+      return live.error;
+    }
     const stopped = await delegate(() => launcher.stop({ projectRoot: projectRoot.value }));
     if (isErr(stopped)) {
       return answerFailure(c, stopped.error, STOP, log);
@@ -1199,53 +1449,62 @@ function createCredentialHandler(deps: ResolvedDeps): DevServerRouteHandler {
   const { launcher, log } = deps;
   return async (c) => {
     c.header(CACHE_CONTROL_HEADER, NO_STORE);
-    const principal = authorize(c, DEV_SERVER_CREDENTIAL_AUTHORIZED_AS, CREDENTIAL_LABEL, log);
+    const principal = authorize(c, CREDENTIAL, CREDENTIAL, log);
     if (isErr(principal)) {
       return principal.error;
     }
-    const request = await readCredentialRequest(c);
+    const request = await readOperationRequest(c, CREDENTIAL);
     if (isErr(request)) {
-      return answerBodyRejection(c, request.error, CREDENTIAL_LABEL, log);
+      return answerBodyRejection(c, request.error, CREDENTIAL, log);
     }
+    // Protocol's schema checks the body's shape only; the root's form —
+    // absolute, no traversal, no padding — is checked here, before the scope,
+    // exactly as for a launch or a stop, and the launcher re-checks it.
     const projectRoot = scopedProjectRoot(
       c,
       principal.value,
       request.value.projectRoot,
-      CREDENTIAL_LABEL,
+      CREDENTIAL,
       deps,
     );
     if (isErr(projectRoot)) {
       return projectRoot.error;
     }
 
+    // The fence, end to end: `delegate` invokes `issueCredential` at once, and
+    // it runs synchronously through the issuer to the server-agent row's
+    // insert. With no await in between, a rotation either ran before this
+    // check (refused here) or runs after the insert (and deletes the row).
+    const live = requireLive(c, principal.value, CREDENTIAL, deps);
+    if (isErr(live)) {
+      return live.error;
+    }
     const issued = await delegate(() =>
       launcher.issueCredential({ projectRoot: projectRoot.value }),
     );
     if (isErr(issued)) {
-      return answerFailure(c, issued.error, CREDENTIAL_LABEL, log);
+      return answerFailure(c, issued.error, CREDENTIAL, log);
     }
-    const checked = devServerCredentialResponseSchema.safeParse(issued.value);
-    if (!checked.success) {
-      return answerResponseDrift(c, CREDENTIAL_LABEL, log);
+    const checked = parseHttpResponse(CREDENTIAL, issued.value);
+    if (isErr(checked)) {
+      return answerResponseDrift(c, CREDENTIAL, log);
     }
     log.info('Issued a server-agent credential', {
-      operation: CREDENTIAL_LABEL,
+      operation: CREDENTIAL,
       status: 200,
-      expiresAt: checked.data.expiresAt,
+      expiresAt: checked.value.expiresAt,
     });
-    return c.json(checked.data, 200);
+    return c.json(checked.value, 200);
   };
 }
 
 /**
- * Builds the dev-server routes: the `devServer.launch` and `devServer.stop`
- * handlers for protocol's table, and the folder-owned credential route.
+ * Builds the dev-server routes: the `devServer.launch`, `devServer.stop` and
+ * `devServer.credential` handlers for protocol's table.
  *
  * Registers nothing, opens nothing and holds no state beyond its dependencies.
- * `../http.ts` registers each table handler at `HTTP_ROUTES[operation].method`
- * / `.pattern` behind the auth middleware for that operation, and the
- * credential route at its own `method` / `pattern` behind the middleware for
- * its `authorizeAs` operation.
+ * `../http.ts` registers each handler at `HTTP_ROUTES[operation].method` /
+ * `.pattern` behind the auth middleware for that same operation.
  *
  * Status codes, all with protocol's `httpErrorResponseSchema` body on failure:
  *
@@ -1253,8 +1512,10 @@ function createCredentialHandler(deps: ResolvedDeps): DevServerRouteHandler {
  * | --- | --- | --- | --- |
  * | success | `200 { devServerUrl, pid }` | `200 { stopped }` | `200 { token, expiresAt }` |
  * | no credential / wrong role | `401` / `403` | `401` / `403` | `401` / `403` |
+ * | credential retired or expired while the body was read | `401` | `401` | `401` |
  * | body off-schema / malformed root | `400` | `400` | `400` |
- * | body too large | `413` | `413` | `413` |
+ * | body too large, declared or as it arrives | `413` | `413` | `413` |
+ * | body not arrived within `../http.ts`'s time ceiling | `408` | `408` | `408` |
  * | project outside the editor's workspace folders | `403` | `403` | `403` |
  * | project root is not a directory | `404` | — | — |
  * | running without the preload / no dev script / cancelled | `409` | — | — |
@@ -1263,33 +1524,21 @@ function createCredentialHandler(deps: ResolvedDeps): DevServerRouteHandler {
  * | readiness timeout | `504` | — | — |
  * | store, configuration or internal failure | `500` | `500` | `500` |
  *
- * @param deps The launcher slice, the platform and the logger.
- * @returns The frozen table handlers and credential route.
- * @throws {DebuggenError} `INTERNAL` when a protocol route claims the
- *   credential route's path — a build-time contract collision, raised while
- *   the service is being composed rather than answered per request.
+ * @param deps The launcher slice, the revocation fence, the platform and the logger.
+ * @returns The frozen table handlers, keyed by operation id.
  *
  * @example
- * const devServer = createDevServerRoutes({ launcher, logger });
+ * const devServer = createDevServerRoutes({ launcher, auth, logger });
  * for (const operation of DEV_SERVER_OPERATIONS) {
  *   const route = HTTP_ROUTES[operation];
  *   app.on(route.method, route.pattern, authFor(operation), devServer.handlers[operation]);
  * }
- * const { method, pattern, authorizeAs, handler } = devServer.credential;
- * app.on(method, pattern, authFor(authorizeAs), handler);
  */
 export function createDevServerRoutes(deps: DevServerRoutesDeps): DevServerRoutes {
-  const collision = findCredentialRouteCollision();
-  if (collision !== undefined) {
-    throw new DebuggenError(
-      'INTERNAL',
-      `The protocol operation ${collision} claims the dev-server credential route's path, which the launcher owns.`,
-      { details: { operation: collision } },
-    );
-  }
-
   const resolved: ResolvedDeps = {
     launcher: deps.launcher,
+    manager: deps.manager,
+    auth: deps.auth,
     platform: deps.platform ?? process.platform,
     log: subsystemLogger(deps.logger ?? noopLogger, LOG_SUBSYSTEM),
   };
@@ -1297,12 +1546,7 @@ export function createDevServerRoutes(deps: DevServerRoutesDeps): DevServerRoute
   const handlers: DevServerRouteHandlers = Object.freeze({
     [LAUNCH]: createLaunchHandler(resolved),
     [STOP]: createStopHandler(resolved),
+    [CREDENTIAL]: createCredentialHandler(resolved),
   });
-  const credential: DevServerCredentialRoute = Object.freeze({
-    method: CREDENTIAL_METHOD,
-    pattern: DEV_SERVER_CREDENTIAL_PATH,
-    authorizeAs: DEV_SERVER_CREDENTIAL_AUTHORIZED_AS,
-    handler: createCredentialHandler(resolved),
-  });
-  return Object.freeze({ handlers, credential });
+  return Object.freeze({ handlers });
 }

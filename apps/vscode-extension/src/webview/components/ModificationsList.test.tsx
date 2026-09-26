@@ -6,18 +6,25 @@
  * Pinned here:
  *
  *   - **One row per record, in the given order**, each named by its file and
- *     carrying its status badge's text label — colour is never alone.
+ *     carrying its status badge's text label — colour is never alone. The
+ *     badge's tone is the design system's shared `MODIFICATION_STATUS_TONE`,
+ *     the table the DevTools `SessionSummary` draws from as well.
  *   - **"View diff" is a disclosure** that routes the record's own `diff` into
  *     `DiffView` inside the grid's detail row, wires `aria-expanded` and
  *     `aria-controls`, collapses on a second activation, and moves to another
- *     row when that row's diff is opened. The grid's keyboard toggle drives the
- *     same state.
+ *     row when that row's diff is opened. On a conflict row the same control
+ *     reads "Open diff", AAP 0.5.5's recovery action. The grid's keyboard
+ *     toggle drives the same state.
  *   - **The grid stays one Tab stop**: every control in a cell or in an open
- *     detail row, the diff's scroll region included, is `tabIndex={-1}`.
+ *     detail row, the diff's labelled `<pre>` region included, is
+ *     `tabIndex={-1}`, and the grid's arrow keys walk from the row onto that
+ *     region.
  *   - **The open-file payload is untouched**, and the control exists only when
  *     a callback is supplied.
- *   - **A conflict is never reported as a revert**, and only a conflict row
- *     shows where its original is preserved.
+ *   - **A conflict is never reported as a revert**: its row states AAP 0.5.5's
+ *     message exactly — "‹file› was edited while instrumented. Debug Generator
+ *     will not overwrite it. Original saved at ‹backup path›." — with both
+ *     values from the record, and no detail row repeats the backup path.
  *   - **The grid is the design system's**: `DataTable` owns `role="grid"` and
  *     the component adds no competing table role of its own.
  *   - **The three states** and their precedence: error > pending > empty > table.
@@ -40,6 +47,8 @@ import { act, cleanup, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { MODIFICATION_STATUS_TONE } from '@debuggen/panel-renderer';
+import type { BadgeTone } from '@debuggen/panel-renderer';
 import { createEnvelope, MODIFICATION_STATUSES, parseMessage } from '@debuggen/protocol';
 import type { ModificationRecord, ModificationStatus } from '@debuggen/protocol';
 
@@ -165,9 +174,16 @@ const STATUS_PRESENTATION: Readonly<
   pending: { label: 'Pending', toneClass: 'dg-badge--neutral' },
   applied: { label: 'Applied', toneClass: 'dg-badge--info' },
   reverted: { label: 'Reverted', toneClass: 'dg-badge--success' },
-  conflict: { label: 'Conflict', toneClass: 'dg-badge--danger' },
+  conflict: { label: 'Conflict', toneClass: 'dg-badge--warning' },
   failed: { label: 'Failed', toneClass: 'dg-badge--danger' },
 };
+
+/**
+ * The shared status→tone table, adopted the way the component adopts it:
+ * typed against the protocol's union, so a status the design system's table
+ * does not cover fails to compile here too.
+ */
+const SHARED_TONE: Readonly<Record<ModificationStatus, BadgeTone>> = MODIFICATION_STATUS_TONE;
 
 /** The five console methods the privacy cases watch. */
 const CONSOLE_METHODS = ['log', 'info', 'warn', 'error', 'debug'] as const;
@@ -296,6 +312,34 @@ describe('ModificationsList table', () => {
     },
   );
 
+  it.each(MODIFICATION_STATUSES.map((status) => [status]))(
+    'draws a %s badge in the design system’s shared status tone',
+    (status) => {
+      const { container } = render(
+        <ModificationsList modifications={[numberedRecord(6, 'src/lib/solo/entry.ts', status)]} />,
+      );
+
+      // The DevTools panel's `SessionSummary` reads the same table, so the
+      // tone asserted here is the one both surfaces draw.
+      const badge = rowAt(container, 0).querySelector('.dg-badge');
+      const expected = `dg-badge--${SHARED_TONE[status]}`;
+      expect(expected).toBe(STATUS_PRESENTATION[status].toneClass);
+      expect(badge?.classList.contains(expected)).toBe(true);
+      const toneClasses = Array.from(badge?.classList ?? []).filter((name) =>
+        /^dg-badge--(?:neutral|accent|success|warning|danger|info)$/u.test(name),
+      );
+      expect(toneClasses).toEqual([expected]);
+    },
+  );
+
+  it('gives the five statuses five distinct tones, a conflict a warning rather than a danger', () => {
+    const tones = MODIFICATION_STATUSES.map((status) => SHARED_TONE[status]);
+    expect(new Set(tones).size).toBe(MODIFICATION_STATUSES.length);
+    expect(SHARED_TONE.conflict).toBe('warning');
+    expect(SHARED_TONE.failed).toBe('danger');
+    expect(Object.isFrozen(MODIFICATION_STATUS_TONE)).toBe(true);
+  });
+
   it('gives the five statuses five distinct, non-blank labels', () => {
     const { container } = render(<ModificationsList modifications={RECORDS} />);
 
@@ -322,13 +366,28 @@ describe('ModificationsList table', () => {
     expect(conflictBadge).not.toMatch(/revert/iu);
   });
 
-  it('says a conflicting file was left untouched with its original preserved, never reverted', () => {
+  it('states the conflict message in the row itself, with the record’s file and backup path', () => {
     const { container } = render(<ModificationsList modifications={RECORDS} />);
 
+    // No row is expanded: the message is the row's own text, not its detail.
+    expect(detailRows(container)).toHaveLength(0);
     const conflictRow = rowAt(container, 1);
-    const note = conflictRow.querySelector('.dgv-modifications__note')?.textContent ?? '';
-    expect(note).toContain('left it untouched');
-    expect(note).toContain('original is preserved');
+    const note = conflictRow.querySelector('.dgv-modifications__note');
+    expect(note?.textContent).toBe(
+      `${fixture(1).file} was edited while instrumented. Debug Generator will not overwrite it. ` +
+        `Original saved at ${fixture(1).backupPath}.`,
+    );
+
+    // Both values render through the byte-faithful `Code` primitive, wrapping.
+    const values = Array.from(note?.querySelectorAll('code') ?? []);
+    expect(values.map((code) => code.textContent)).toEqual([
+      fixture(1).file,
+      fixture(1).backupPath,
+    ]);
+    for (const code of values) {
+      expect(code.classList.contains('dg-code--wrap')).toBe(true);
+    }
+
     expect(conflictRow.textContent ?? '').not.toMatch(/revert/iu);
 
     // Applied and reverted rows carry no note: their labels say everything.
@@ -336,6 +395,32 @@ describe('ModificationsList table', () => {
     expect(rowAt(container, 2).querySelector('.dgv-modifications__note')).toBeNull();
     expect(rowAt(container, 3).querySelector('.dgv-modifications__note')).not.toBeNull();
     expect(rowAt(container, 4).querySelector('.dgv-modifications__note')).not.toBeNull();
+  });
+
+  it('omits only the saved-at sentence for a conflict whose backup path is blank', () => {
+    const file = 'src/lib/nobackup/entry.ts';
+    const orphan = numberedRecord(13, file, 'conflict', { backupPath: '  ' });
+    const { container } = render(<ModificationsList modifications={[orphan]} />);
+
+    const note = rowAt(container, 0).querySelector('.dgv-modifications__note');
+    expect(note?.textContent).toBe(
+      `${file} was edited while instrumented. Debug Generator will not overwrite it.`,
+    );
+    // Nothing stands in for the missing value: no constructed path, no label.
+    expect(container.textContent ?? '').not.toContain('Original saved at');
+    expect(container.textContent ?? '').not.toContain('.debuggen/backups');
+  });
+
+  it('labels a conflict row’s disclosure "Open diff" and every other row’s "View diff"', () => {
+    render(<ModificationsList modifications={RECORDS} />);
+
+    RECORDS.forEach((entry) => {
+      const label = entry.status === 'conflict' ? 'Open diff' : 'View diff';
+      const toggle = screen.getByRole('button', { name: `${label} of ${entry.file}` });
+      expect(toggle.textContent).toBe(label);
+      expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    });
+    expect(screen.getAllByRole('button', { name: /^Open diff of /u })).toHaveLength(1);
   });
 
   it('shows the plan version, the layering and a machine-readable time in the meta line', () => {
@@ -382,7 +467,84 @@ describe('ModificationsList table', () => {
     }
 
     const scroll = detailRows(container)[0]?.querySelector('.dgv-diff__scroll');
+    expect(scroll?.tagName).toBe('PRE');
     expect(scroll?.getAttribute('tabindex')).toBe('-1');
+  });
+
+  it('reaches the diff’s labelled region from the row with the grid’s own arrow keys', async () => {
+    const user = userEvent.setup();
+    const file = 'src/server/zeta/handler.ts';
+    const { container } = render(
+      <ModificationsList modifications={RECORDS} onOpenFile={vi.fn()} />,
+    );
+
+    // The grid is the one Tab stop; the region's `tabIndex={-1}` is what the
+    // table's caller contract asks for, and this is the path its keys take.
+    focusRow(rowAt(container, 0));
+
+    // ArrowRight on a collapsed row expands it.
+    await user.keyboard('{ArrowRight}');
+    expect(detailRows(container)).toHaveLength(1);
+
+    // ArrowRight on the expanded row moves into it: its first control.
+    await user.keyboard('{ArrowRight}');
+    expect(document.activeElement).toBe(
+      screen.getByRole('button', { name: `Hide diff of ${file}` }),
+    );
+
+    await user.keyboard('{ArrowRight}');
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: `Open file ${file}` }));
+
+    // The next control in document order is the diff's region in the detail row.
+    await user.keyboard('{ArrowRight}');
+    const region = screen.getByRole('region', { name: `Diff of ${file}` });
+    expect(document.activeElement).toBe(region);
+    expect(region.tagName).toBe('PRE');
+    expect(region.getAttribute('role')).toBe('region');
+    expect(region.getAttribute('tabindex')).toBe('-1');
+    expect(detailRows(container)[0]?.contains(region)).toBe(true);
+  });
+
+  it('reaches a long diff’s window control before its region, and pages it by keyboard, all tabIndex -1', async () => {
+    const user = userEvent.setup();
+    const file = 'src/lib/long/generated.ts';
+    const lines = Array.from({ length: 1200 }, (_, index) => `+const line${String(index)} = 0;`);
+    const long = numberedRecord(14, file, 'applied', { diff: `${lines.join('\n')}\n` });
+    const { container } = render(<ModificationsList modifications={[long]} onOpenFile={vi.fn()} />);
+
+    focusRow(rowAt(container, 0));
+    await user.keyboard('{ArrowRight}{ArrowRight}{ArrowRight}');
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: `Open file ${file}` }));
+
+    // The control precedes the horizontally scrolling region, so the grid's
+    // ArrowRight reaches it before the region keeps the inline-axis keys.
+    await user.keyboard('{ArrowRight}');
+    const next = screen.getByRole('button', { name: 'Show next 200 lines' });
+    expect(document.activeElement).toBe(next);
+    expect(next.getAttribute('tabindex')).toBe('-1');
+
+    await user.keyboard('{ArrowRight}');
+    const region = screen.getByRole('region', { name: `Diff of ${file}` });
+    expect(document.activeElement).toBe(region);
+    expect(container.querySelectorAll('.dgv-diff__line')).toHaveLength(1000);
+
+    // Enter on the control moves the window to the last 200 lines; the control
+    // has reached its end, so it unmounts and focus lands on the region rather
+    // than on the document body.
+    next.focus();
+    await user.keyboard('{Enter}');
+    expect(document.activeElement).toBe(region);
+    expect(container.querySelectorAll('.dgv-diff__line')).toHaveLength(200);
+    expect(screen.queryByRole('button', { name: /^Show next /u })).toBeNull();
+    expect(screen.getByRole('button', { name: /^Show previous /u })).toBeDefined();
+
+    // Every focusable element in the grid, the window controls included, is -1.
+    const grid = screen.getByRole('grid');
+    for (const element of Array.from(
+      grid.querySelectorAll<HTMLElement>('button, [tabindex]:not(.dg-data-table__row)'),
+    )) {
+      expect(element.getAttribute('tabindex')).toBe('-1');
+    }
   });
 });
 
@@ -391,9 +553,11 @@ describe('ModificationsList "View diff"', () => {
     const user = userEvent.setup();
     const { container } = render(<ModificationsList modifications={RECORDS} />);
 
+    // The conflict row: its disclosure is the message's "Open diff" action.
     const toggle = screen.getByRole('button', {
-      name: 'View diff of src/features/alpha/Widget.tsx',
+      name: 'Open diff of src/features/alpha/Widget.tsx',
     });
+    expect(toggle.textContent).toBe('Open diff');
     expect(toggle.getAttribute('aria-expanded')).toBe('false');
     expect(toggle.hasAttribute('aria-controls')).toBe(false);
     expect(detailRows(container)).toHaveLength(0);
@@ -416,7 +580,7 @@ describe('ModificationsList "View diff"', () => {
     expect(opened.getAttribute('aria-controls')).toBe(detail.id);
     expect(detail.querySelector('[aria-colspan]')?.getAttribute('aria-colspan')).toBe('3');
 
-    const region = within(detail).getByRole('group', {
+    const region = within(detail).getByRole('region', {
       name: 'Diff of src/features/alpha/Widget.tsx',
     });
     const lines = Array.from(region.querySelectorAll('.dgv-diff__line')).map(
@@ -431,7 +595,7 @@ describe('ModificationsList "View diff"', () => {
     expect(detailRows(container)).toHaveLength(0);
     expect(toggle.getAttribute('aria-expanded')).toBe('false');
     expect(toggle.hasAttribute('aria-controls')).toBe(false);
-    expect(toggle.textContent).toBe('View diff');
+    expect(toggle.textContent).toBe('Open diff');
   });
 
   it('renders the expanded record’s own diff and never another record’s', async () => {
@@ -475,7 +639,9 @@ describe('ModificationsList "View diff"', () => {
     const details = detailRows(container);
     expect(details).toHaveLength(1);
     expect(
-      within(details[0] ?? container).getByRole('group', { name: 'Diff of src/lib/mid/loader.ts' }),
+      within(details[0] ?? container).getByRole('region', {
+        name: 'Diff of src/lib/mid/loader.ts',
+      }),
     ).toBeDefined();
     expect(
       screen
@@ -484,16 +650,22 @@ describe('ModificationsList "View diff"', () => {
     ).toBe('false');
   });
 
-  it('shows the hashes, and the preserved original only for a conflict', async () => {
+  it('shows the hashes, and never repeats the backup path in a detail row', async () => {
     const user = userEvent.setup();
     const { container } = render(<ModificationsList modifications={RECORDS} />);
 
     await user.click(
-      screen.getByRole('button', { name: 'View diff of src/features/alpha/Widget.tsx' }),
+      screen.getByRole('button', { name: 'Open diff of src/features/alpha/Widget.tsx' }),
     );
     let detail = detailRows(container)[0];
-    const preserved = detail?.querySelector('.dgv-modifications__preserved');
-    expect(preserved?.textContent).toBe(`Original preserved at ${fixture(1).backupPath}`);
+    // The conflict row already states where the original is saved; its detail
+    // holds the hashes and the diff only.
+    expect(detail?.textContent ?? '').not.toContain('Original preserved at');
+    expect(detail?.textContent ?? '').not.toContain('Original saved at');
+    expect(detail?.textContent ?? '').not.toContain('.debuggen/backups');
+    expect(rowAt(container, 1).textContent ?? '').toContain(
+      `Original saved at ${fixture(1).backupPath}.`,
+    );
 
     const hashes = detail?.querySelector('.dgv-modifications__hashes');
     expect(hashes?.textContent ?? '').toContain(`Original SHA-256 ${digest('a').slice(0, 12)}`);
@@ -505,8 +677,10 @@ describe('ModificationsList "View diff"', () => {
 
     await user.click(screen.getByRole('button', { name: 'View diff of src/lib/mid/loader.ts' }));
     detail = detailRows(container)[0];
-    expect(detail?.querySelector('.dgv-modifications__preserved')).toBeNull();
+    expect(detail?.textContent ?? '').not.toContain('Original preserved at');
     expect(detail?.textContent ?? '').not.toContain('.debuggen/backups');
+    // Only a conflict row names a backup at all.
+    expect(rowAt(container, 2).textContent ?? '').not.toContain('.debuggen/backups');
   });
 
   it('opens and closes a row’s diff from the grid’s own keyboard toggle', async () => {
@@ -575,7 +749,9 @@ describe('ModificationsList open file', () => {
     render(<ModificationsList modifications={RECORDS} />);
 
     expect(screen.queryByRole('button', { name: /^Open file/u })).toBeNull();
-    expect(screen.getAllByRole('button', { name: /^View diff of /u })).toHaveLength(RECORDS.length);
+    expect(screen.getAllByRole('button', { name: /^(?:View|Open) diff of /u })).toHaveLength(
+      RECORDS.length,
+    );
   });
 });
 
@@ -693,12 +869,14 @@ describe('ModificationsList privacy', () => {
       <ModificationsList modifications={RECORDS} onOpenFile={onOpenFile} />,
     );
 
-    // The conflict row's detail carries all three sensitive values at once: the
-    // source diff, both hashes and the local backup path.
+    // The open conflict row carries all three sensitive values at once: the
+    // local backup path in its message, and the source diff and both hashes in
+    // its detail.
     await user.click(
-      screen.getByRole('button', { name: 'View diff of src/features/alpha/Widget.tsx' }),
+      screen.getByRole('button', { name: 'Open diff of src/features/alpha/Widget.tsx' }),
     );
-    expect(detailRows(container)[0]?.querySelector('.dgv-modifications__preserved')).not.toBeNull();
+    expect(rowAt(container, 1).textContent ?? '').toContain(fixture(1).backupPath);
+    expect(detailRows(container)[0]?.querySelector('.dgv-modifications__hashes')).not.toBeNull();
     expect(diffLineTexts(container, 'added')).toEqual(['+  const marker2 = true;']);
 
     await user.click(

@@ -21,9 +21,18 @@
  *    request-key secret. Its backup directory is removed afterwards. A session
  *    whose journal still holds a `conflict` record is **retained** — together
  *    with its backups — until the developer resolves the conflict (AAP 0.5.1).
+ *    A session that is still **active** is retained too, however old its last
+ *    update: one in a pipeline stage (`understanding` through `analyzing`,
+ *    including `capturing`), one with an open capture window — ingest into an
+ *    open window does not touch `updated_at` — and one the caller reports as
+ *    in use. Such a session ages out once the developer ends it or it settles.
  * 2. **Orphan backups.** A file under `backups/<sessionId>/` that no journal
  *    row references is deleted once it is older than
- *    {@link ORPHAN_BACKUP_GRACE_DAYS}. The grace window exists because the
+ *    {@link ORPHAN_BACKUP_GRACE_DAYS}. A row references a file when the file
+ *    is its composed backup — `backups/<sessionId>/<originalHash>` — or when
+ *    its recorded `backup_path` names the file; only the rows of the
+ *    directory's own session can, because the backup store never resolves a
+ *    record to another session's directory. The grace window exists because the
  *    patcher writes the backup *before* it journals the record: a crash in
  *    between leaves a legitimately unreferenced file, and a concurrent install
  *    may be about to claim a younger one.
@@ -40,14 +49,47 @@
  *
  * `src/main.ts` runs start-up modification reconciliation first and this sweep
  * second, before the service accepts a client, and the editor command
- * `debuggen.purgeSessions` runs it on demand. Because reconciliation has
- * already moved every `pending`, `applied` and `failed` record to `reverted`
- * or `conflict` by the time the start-up sweep runs, `conflict` is the
- * realistic open state here — which is why the conflict exemption is the rule
- * that protects real developer data. A session still holding some *other*
- * open record is not purged either: the journal is the only description of a
- * patched file, so the session is retained and the fact is reported as a
- * {@link RetentionIssue} for the next reconciliation to settle.
+ * `debuggen.purgeSessions` is meant to run it on demand while the service
+ * serves. Because reconciliation has already moved every `pending`, `applied`
+ * and `failed` record to `reverted` or `conflict` by the time the start-up
+ * sweep runs, `conflict` is the realistic open state here — which is why the
+ * conflict exemption is the rule that protects real developer data. A session
+ * still holding some *other* open record is not purged either: the journal is
+ * the only description of a patched file, so the session is retained and the
+ * fact is reported as a {@link RetentionIssue} for the next reconciliation to
+ * settle.
+ *
+ * ## Atomic per session
+ *
+ * Every rule that makes a session eligible is re-read, and the session deleted,
+ * inside **one** `BEGIN IMMEDIATE` transaction: the row still exists, it is
+ * still older than the cutoff, it is not active, its journal holds no open or
+ * conflicting record — and then its row goes, and the cascade takes every
+ * child row in the same statement. Nothing of a session is deleted before that
+ * decision commits, so a session refreshed at any moment of the sweep either
+ * keeps every row it had or loses the row and its evidence together, and a
+ * failure anywhere in the cascade rolls the whole session back. The price is
+ * that one session's cascade holds the write lock — and, `node:sqlite` being
+ * synchronous, the event loop — for as long as it takes (about ten
+ * microseconds per telemetry event); the sweep yields to the event loop after
+ * every deleted session and between pages, so the hold is bounded by the
+ * largest single session, never by the backlog.
+ *
+ * ## Bounded work
+ *
+ * Candidates are read in keyset pages of {@link RETENTION_CANDIDATE_PAGE_SIZE}
+ * — an index range read of `(updated_at, rowid)`, with no sort however many
+ * sessions share a timestamp — and each page is purged before the next is
+ * read, so memory does not grow with the backlog. The journal is never read
+ * whole: a backup lives in the directory of the session whose record protects
+ * it, and no other session's record can resolve to it, so a purged session's
+ * directory needs no journal read at all, and an old file in
+ * `backups/<sessionId>/` is checked against that one session's records through
+ * an indexed probe, in batches of at most {@link BACKUP_PROBE_BATCH_SIZE}. A
+ * start-up with nothing aged reads no journal row. The report's id lists and
+ * issues are capped at {@link MAX_REPORTED_ITEMS}, with
+ * {@link RetentionReport.omitted} counting the rest, while every count stays
+ * exact.
  *
  * ## Containment
  *
@@ -93,7 +135,10 @@
 import { constants as fsConstants } from 'node:fs';
 import type { Stats } from 'node:fs';
 import { lstat, open, readdir, rm, rmdir, unlink } from 'node:fs/promises';
+import { setImmediate as yieldToEventLoop } from 'node:timers/promises';
 
+import { isSessionStatus } from '@debuggen/protocol';
+import type { SessionStatus } from '@debuggen/protocol';
 import {
   DebuggenError,
   basenamePosix,
@@ -115,11 +160,15 @@ import type { Logger, Result, SessionId } from '@debuggen/shared';
 import { DEFAULT_RETENTION_DAYS } from '../config.js';
 import type { ServiceConfig } from '../config.js';
 import type { Store } from './db.js';
-import type { ListBackupPathsOptions, ModificationsRepo } from './modifications-repo.js';
+import { scanSessionBackupReferences } from './modifications-repo.js';
+import type { ModificationsRepo } from './modifications-repo.js';
 import type { PanelsRepo } from './panels-repo.js';
 import { MAX_SESSION_LIST_LIMIT } from './sessions-repo.js';
-import type { SessionListItem, SessionsRepo } from './sessions-repo.js';
-import { DEFAULT_PURGE_BATCH_SIZE } from './telemetry-repo.js';
+import type {
+  RetentionCandidate,
+  RetentionCandidateCursor,
+  SessionsRepo,
+} from './sessions-repo.js';
 import type { TelemetryRepo } from './telemetry-repo.js';
 
 /* -------------------------------------------------------------------------------------------------
@@ -152,6 +201,57 @@ export { DEFAULT_RETENTION_DAYS };
  */
 export const ORPHAN_BACKUP_GRACE_DAYS = 7;
 
+/**
+ * The statuses in which a session is **in flight** — a pipeline stage is
+ * running, or a capture is recording — and which therefore keep an aged session
+ * out of the purge whatever its `updated_at` says (AAP 0.5.5's stage sequence:
+ * `understanding` through `analyzing`).
+ *
+ * The complement is the resting statuses, which wait on the developer:
+ * `created`, `ready`, `generated`, `failed` and `ended`. A resting session's
+ * age is how long the developer has left it, which is what the window
+ * measures; an in-flight session's age is not, because the stage or capture
+ * that owns it may write to it at any moment. A status this build does not
+ * know is treated as in flight — the sweep never deletes a session whose state
+ * it cannot interpret.
+ */
+export const IN_FLIGHT_SESSION_STATUSES: readonly SessionStatus[] = Object.freeze([
+  'understanding',
+  'investigating',
+  'planning',
+  'instrumenting',
+  'capturing',
+  'analyzing',
+] satisfies SessionStatus[]);
+
+/**
+ * How many purge candidates one keyset page reads: **500**.
+ *
+ * A page is purged completely — its sessions decided and deleted, and then
+ * their backup directories removed — before the next page is read, so this
+ * bounds what the sweep holds in memory at once, and the sweep yields to the
+ * event loop between pages.
+ */
+export const RETENTION_CANDIDATE_PAGE_SIZE = 500;
+
+/**
+ * How many backup files one journal probe judges at most: **1 000**.
+ *
+ * Rule 3 collects the files of one session directory that are old enough to
+ * be orphans and checks them against that session's records in batches of
+ * this size, so its memory is bounded by the batch rather than by the journal
+ * or the backup tree.
+ */
+export const BACKUP_PROBE_BATCH_SIZE = 1_000;
+
+/**
+ * The most entries any one list of a {@link RetentionReport} carries:
+ * **1 000**. The counts stay exact; {@link RetentionReport.omitted} says how
+ * many entries each list left out, so a sweep over a large backlog cannot
+ * build an unbounded report.
+ */
+export const MAX_REPORTED_ITEMS = 1_000;
+
 /* -------------------------------------------------------------------------------------------------
  * Public types
  * ---------------------------------------------------------------------------------------------- */
@@ -173,7 +273,8 @@ export interface RetentionIssue {
   /**
    * What the problem is about: a session id for `session`, a path relative to
    * `$DEBUGGEN_HOME` for `backup` and `index-cache`, or the operation's name
-   * (`sessions.list`, `checkpoint`, `vacuum`) for `database`.
+   * (`sessions.listRetentionCandidates`, `modifications.scanSessionBackupReferences`,
+   * `sessions.list`, `checkpoint`, `vacuum`) for `database`.
    */
   readonly target: string;
 
@@ -213,10 +314,29 @@ export interface RetentionOptions {
 }
 
 /**
+ * How many entries each capped list of a {@link RetentionReport} left out
+ * because it already held {@link MAX_REPORTED_ITEMS}. All zero unless the
+ * sweep met a backlog that large.
+ */
+export interface RetentionOmissions {
+  /** Deleted sessions beyond {@link RetentionReport.sessionIdsDeleted}. */
+  readonly sessionIdsDeleted: number;
+  /** Conflict-retained sessions beyond {@link RetentionReport.sessionsRetainedForConflicts}. */
+  readonly sessionsRetainedForConflicts: number;
+  /** Active retained sessions beyond {@link RetentionReport.sessionsRetainedActive}. */
+  readonly sessionsRetainedActive: number;
+  /** Issues beyond {@link RetentionReport.errors}; every one was still logged. */
+  readonly errors: number;
+}
+
+/**
  * What one sweep removed — or, for a dry run, would have removed.
  *
  * Arrays are sorted, and the traversal order is fixed, so two sweeps over the
- * same state produce the same report apart from {@link durationMs}.
+ * same state produce the same report apart from {@link durationMs}. Every list
+ * holds at most {@link MAX_REPORTED_ITEMS} entries — the first ones the sweep
+ * met, oldest session first — and {@link omitted} counts the rest; every count
+ * is exact.
  */
 export interface RetentionReport {
   /**
@@ -229,7 +349,7 @@ export interface RetentionReport {
   /** How many sessions were deleted. */
   readonly sessionsDeleted: number;
 
-  /** Their ids, sorted. */
+  /** Their ids, sorted; see {@link omitted} for any beyond the cap. */
   readonly sessionIdsDeleted: readonly string[];
 
   /** How many telemetry events those sessions held. */
@@ -263,6 +383,14 @@ export interface RetentionReport {
   readonly sessionsRetainedForConflicts: readonly string[];
 
   /**
+   * Aged sessions kept because they are still active, sorted: in an in-flight
+   * status ({@link IN_FLIGHT_SESSION_STATUSES}), holding an open capture
+   * window, or reported in use by {@link RetentionDeps.isSessionInUse}. Their
+   * rows, telemetry and backups are untouched.
+   */
+  readonly sessionsRetainedActive: readonly string[];
+
+  /**
    * The bytes of the files removed from `$DEBUGGEN_HOME`, from their `lstat`
    * sizes. Database pages freed by the purge are not included: SQLite reuses
    * them, and only a `VACUUM` returns them to the filesystem.
@@ -272,8 +400,11 @@ export interface RetentionReport {
   /** How long the sweep took, in milliseconds of monotonic time. */
   readonly durationMs: number;
 
-  /** Every per-item problem, in the order it was met. */
+  /** Every per-item problem, in the order it was met, up to the cap. */
   readonly errors: readonly RetentionIssue[];
+
+  /** How many entries each capped list above left out. */
+  readonly omitted: RetentionOmissions;
 }
 
 /**
@@ -285,13 +416,18 @@ export interface RetentionDeps {
   /** The open, migrated store the repositories below are built over. */
   readonly store: Store;
 
-  /** Candidate sessions and the project roots active inside the window. */
+  /** Candidate sessions, their deletion, and the project roots active inside the window. */
   readonly sessions: SessionsRepo;
 
-  /** Per-session event counts, and the batched purge of very large sessions. */
+  /** Per-session event counts, read inside the deleting transaction. */
   readonly telemetry: TelemetryRepo;
 
-  /** The conflict exemption, the open-record check and the referenced backup paths. */
+  /**
+   * The conflict exemption: each candidate's `conflict` records. The open-record
+   * re-check and the backup-reference probe read the same table through the
+   * store — inside the deleting transaction, and as an indexed per-session
+   * stream respectively.
+   */
   readonly modifications: ModificationsRepo;
 
   /** Per-session panel and analysis counts. */
@@ -312,6 +448,35 @@ export interface RetentionDeps {
 
   /** The current epoch-millisecond time. Defaults to `nowEpochMs()`. */
   readonly now?: (() => number) | undefined;
+
+  /**
+   * Whether a live component holds the session right now, so it must not be
+   * purged however old its last update.
+   *
+   * Asked inside the deleting transaction, after every other check, for a
+   * session that would otherwise be deleted; `true` retains it and reports it
+   * in {@link RetentionReport.sessionsRetainedActive}. Absent at start-up,
+   * where nothing is live yet. An on-demand purge run while the service
+   * serves should pass the session manager's view: the sessions repository's
+   * `update` inserts a row that is absent, so a manager writing back a session
+   * this sweep had deleted would resurrect its row without its evidence.
+   * Synchronous, because the transaction it runs in is; a predicate that
+   * throws is taken to mean "in use".
+   */
+  readonly isSessionInUse?: ((sessionId: SessionId) => boolean) | undefined;
+
+  /**
+   * Told of each session this sweep deleted, once the transaction that deleted
+   * it has committed — never in a dry run, and never for a session it kept.
+   *
+   * An on-demand purge run while the service serves passes its trace
+   * correlator's `invalidate` here, so a purged session's cached trace trees
+   * are dropped with its rows instead of being held until the cache evicts
+   * them. Absent at start-up, where no cache exists yet. A listener that
+   * throws is logged by code and the sweep carries on: the rows are already
+   * gone, and the report still counts the session.
+   */
+  readonly onSessionDeleted?: ((sessionId: SessionId) => void) | undefined;
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -336,8 +501,11 @@ const COMPONENT = 'retention';
  */
 const REVERTED_STATUS: Parameters<ModificationsRepo['updateStatus']>[1] = 'reverted';
 
-/** The one status the conflict exemption protects. */
-const CONFLICT_STATUSES: NonNullable<ListBackupPathsOptions['statuses']> = ['conflict'];
+/** The one status the conflict exemption protects, typed the same way. */
+const CONFLICT_STATUS: Parameters<ModificationsRepo['updateStatus']>[1] = 'conflict';
+
+/** {@link IN_FLIGHT_SESSION_STATUSES} as a set, for the in-transaction check. */
+const IN_FLIGHT_STATUS_SET: ReadonlySet<string> = new Set<string>(IN_FLIGHT_SESSION_STATUSES);
 
 /**
  * The largest index-cache document read for its `projectRoot`: 64 MiB.
@@ -366,19 +534,33 @@ const MAX_MEASURE_DEPTH = 4;
 const INDEX_ENTRY_EXTENSION = '.json';
 
 /**
- * Re-reads a session's last-activity instant inside the deleting transaction,
- * so a session touched after it was listed is never purged.
+ * Re-reads a session's last-activity instant and status inside the deleting
+ * transaction, so a session touched — or moved into a pipeline stage — after
+ * it was listed is never purged.
  */
-const SESSION_UPDATED_AT_SQL = 'SELECT updated_at FROM sessions WHERE id = ?';
+const SESSION_STATE_SQL = 'SELECT updated_at, status FROM sessions WHERE id = ?';
 
 /**
- * Counts a session's journal records that still describe a patched file,
- * inside the deleting transaction. The journal repository's own checks are
- * asynchronous and therefore cannot run inside `Store.transaction`; this
- * read closes the window between them and the delete.
+ * Whether a session holds an open capture window, inside the deleting
+ * transaction. Served by the partial index over `stopped_at IS NULL`. Ingest
+ * into an open window writes telemetry without touching `updated_at`, so an
+ * open window is activity the age basis cannot see.
  */
-const SESSION_OPEN_MODIFICATIONS_SQL =
-  'SELECT COUNT(*) AS open_records FROM modifications WHERE session_id = ? AND status <> ?';
+const SESSION_OPEN_CAPTURE_SQL =
+  'SELECT EXISTS (SELECT 1 FROM captures WHERE session_id = ? AND stopped_at IS NULL) AS capture_open';
+
+/**
+ * A session's journal, counted inside the deleting transaction: every record
+ * (what the cascade removes, for the report), those that still describe a
+ * patched file, and those in conflict. The journal repository's methods are
+ * asynchronous and therefore cannot run inside `Store.transaction`; this one
+ * read is what makes the journal half of the decision atomic with the delete.
+ * Bound as `(reverted, conflict, sessionId)`.
+ */
+const SESSION_JOURNAL_SQL = `SELECT COUNT(*) AS records,
+  COALESCE(SUM(status <> ?), 0) AS open_records,
+  COALESCE(SUM(status = ?), 0) AS conflict_records
+FROM modifications WHERE session_id = ?`;
 
 /** `O_NOFOLLOW` where the platform defines it, so a metadata read never follows a link. */
 const OPEN_NO_FOLLOW_FLAGS = fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0);
@@ -407,16 +589,28 @@ interface SweepContext {
   readonly logger: Logger;
 }
 
+/** {@link RetentionOmissions}, as the phases count them up. */
+type OmissionCounters = { -readonly [K in keyof RetentionOmissions]: RetentionOmissions[K] };
+
+/** The three capped id lists of the report. */
+type ReportedIdList =
+  'sessionIdsDeleted' | 'sessionsRetainedForConflicts' | 'sessionsRetainedActive';
+
 /** What the phases accumulate; frozen into a {@link RetentionReport} at the end. */
 interface SweepState {
   readonly sessionIdsDeleted: string[];
   readonly sessionsRetainedForConflicts: string[];
+  readonly sessionsRetainedActive: string[];
   readonly errors: RetentionIssue[];
+  readonly omitted: OmissionCounters;
   /**
-   * Directories the session phase removed — or, in a dry run, would have
-   * removed — so the orphan walk never counts their files a second time.
+   * Directories the session phase would have removed in a **dry run**, so the
+   * orphan walk never counts their files a second time. Empty in a real run:
+   * a directory the session phase removed is gone from disk before the orphan
+   * walk lists the backups root, so no per-session state is kept for it.
    */
   readonly removedDirectories: Set<string>;
+  sessionsDeleted: number;
   telemetryEventsDeleted: number;
   panelsDeleted: number;
   analysesDeleted: number;
@@ -442,26 +636,66 @@ type DirectoryInspection =
   | { readonly kind: 'directory'; readonly identity: NodeIdentity }
   | { readonly kind: 'unsafe'; readonly error: DebuggenError };
 
-/**
- * The backup paths the journal still references, read once per phase so every
- * deletion decision in that phase is made against the same snapshot.
- */
-interface BackupGuards {
-  /** Every path any record references, normalised. */
-  readonly referenced: ReadonlySet<string>;
-  /** The paths `conflict` records reference — never deleted, whatever else matched. */
-  readonly conflicted: ReadonlySet<string>;
-}
-
-/** What the in-transaction re-check concluded about one candidate session. */
-type SessionEligibility = 'eligible' | 'gone' | 'refreshed' | 'open-modifications';
-
 /** The counts a candidate session contributes to the report once it is deleted. */
 interface SessionCounts {
   readonly telemetry: number;
   readonly panels: number;
   readonly analyses: number;
   readonly modifications: number;
+}
+
+/** Why an aged session was found still active. */
+type ActiveReason = 'in-flight' | 'capture-open' | 'in-use';
+
+/**
+ * What the in-transaction evaluation of one candidate decided.
+ *
+ * - `gone` — the row had already been deleted.
+ * - `refreshed` — it was updated at or after the cutoff since it was listed
+ *   (or its `updated_at` is unreadable, which is never read as "old").
+ * - `conflict` — its journal gained a `conflict` record since it was listed.
+ * - an {@link ActiveReason} — it is still active.
+ * - `open-modifications` — its journal still describes a patched file.
+ * - `deleted` — it was deleted (in a dry run: it would have been), with the
+ *   counts the cascade removed.
+ */
+type SessionVerdict =
+  | { readonly outcome: 'gone' | 'refreshed' | ActiveReason }
+  | { readonly outcome: 'conflict'; readonly conflicts: number }
+  | { readonly outcome: 'open-modifications'; readonly openRecords: number | undefined }
+  | { readonly outcome: 'deleted'; readonly counts: SessionCounts };
+
+/**
+ * A `backups/<sessionId>` directory the orphan walk is judging, and what it
+ * has found in it so far.
+ */
+interface WalkedDirectory {
+  /** Its resolved absolute path. */
+  readonly path: string;
+  /** Its name: the id of the session whose records alone can reference its files. */
+  readonly sessionId: string;
+  /** Its identity as the walk observed it. */
+  readonly identity: NodeIdentity;
+  /** Entries still in it, as far as the walk has seen. */
+  remaining: number;
+  /** Whether any of its files was removed (or, in a dry run, would be). */
+  removedAny: boolean;
+  /** Whether a probe covering it failed, so nothing more of it is removed on this pass. */
+  blocked: boolean;
+}
+
+/** One file old enough to be an orphan, awaiting the journal probe. */
+interface OrphanCandidate {
+  /** Its resolved absolute path. */
+  readonly path: string;
+  /** Its file name — for a composed backup, the digest of the original. */
+  readonly name: string;
+  /** Its identity as the walk observed it; a file replaced since is left alone. */
+  readonly identity: NodeIdentity;
+  /** Its `lstat` size, for {@link RetentionReport.bytesReclaimed}. */
+  readonly size: number;
+  /** The identity of the directory holding it. */
+  readonly parent: NodeIdentity;
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -518,7 +752,12 @@ function unsafePath(target: string, reason: string, message: string): DebuggenEr
   });
 }
 
-/** Records one per-item problem and logs it; the sweep then continues. */
+/**
+ * Records one per-item problem and logs it; the sweep then continues.
+ *
+ * Every issue is logged. The report keeps the first {@link MAX_REPORTED_ITEMS}
+ * and counts the rest in {@link RetentionReport.omitted}.
+ */
 function recordIssue(
   context: SweepContext,
   state: SweepState,
@@ -527,12 +766,25 @@ function recordIssue(
   error: DebuggenError,
 ): void {
   const { message } = error.toPayload();
-  state.errors.push({ scope, target, message });
+  if (state.errors.length < MAX_REPORTED_ITEMS) {
+    state.errors.push({ scope, target, message });
+  } else {
+    state.omitted.errors += 1;
+  }
   context.logger.warn('retention sweep skipped an item', {
     scope,
     target,
     code: error.code,
   });
+}
+
+/** Adds one id to a capped report list, or counts it as omitted. */
+function reportId(state: SweepState, list: ReportedIdList, id: string): void {
+  if (state[list].length < MAX_REPORTED_ITEMS) {
+    state[list].push(id);
+  } else {
+    state.omitted[list] += 1;
+  }
 }
 
 /** Whether the store can still be used; records one issue when it cannot. */
@@ -1071,34 +1323,10 @@ function resolveSettings(
 }
 
 /* -------------------------------------------------------------------------------------------------
- * Journal snapshots
+ * The per-session decision
  * ---------------------------------------------------------------------------------------------- */
 
-/**
- * Reads the backup paths the journal references — all of them, and the
- * `conflict` ones separately — normalised for comparison with walked paths.
- *
- * Both reads must succeed: without them no file under `backups/` can be told
- * apart from an orphan, so a failure makes the caller delete nothing there.
- */
-async function readBackupGuards(
-  modifications: ModificationsRepo,
-): Promise<Result<BackupGuards, DebuggenError>> {
-  const referenced = await modifications.listBackupPaths();
-  if (isErr(referenced)) {
-    return referenced;
-  }
-  const conflicted = await modifications.listBackupPaths({ statuses: CONFLICT_STATUSES });
-  if (isErr(conflicted)) {
-    return conflicted;
-  }
-  return ok({
-    referenced: new Set(referenced.value.map((path) => normalizePosix(path))),
-    conflicted: new Set(conflicted.value.map((path) => normalizePosix(path))),
-  });
-}
-
-/** A `sessions` column value as an integer, or `undefined`. */
+/** A column value as an integer, or `undefined`. */
 function readInteger(value: unknown): number | undefined {
   if (typeof value === 'number' && Number.isFinite(value)) {
     return value;
@@ -1110,46 +1338,200 @@ function readInteger(value: unknown): number | undefined {
 }
 
 /**
- * Re-checks one candidate against the database as it stands **now**.
- *
- * Runs inside the deleting transaction in a real sweep (and as a plain read in
- * a dry run): the row must still exist, must still be older than the cutoff —
- * a session touched after it was listed has become active again and is never
- * purged mid-flight — and must hold no journal record that still describes a
- * patched file.
+ * Whether the caller reports the session as held by a live component, through
+ * {@link RetentionDeps.isSessionInUse}. A predicate that throws is taken to
+ * mean "in use" — the only safe reading for a module that deletes — and the
+ * failure is logged by code.
  */
-function checkEligibility(store: Store, sessionId: SessionId, cutoff: number): SessionEligibility {
-  const row = store.statement(SESSION_UPDATED_AT_SQL).get(sessionId);
-  if (row === undefined) {
-    return 'gone';
+function claimedInUse(context: SweepContext, sessionId: SessionId): boolean {
+  const predicate = context.deps.isSessionInUse;
+  if (predicate === undefined) {
+    return false;
   }
-  const updatedAt = readInteger(row['updated_at']);
-  if (updatedAt === undefined || updatedAt >= cutoff) {
-    return 'refreshed';
+  try {
+    return predicate(sessionId);
+  } catch (caught) {
+    context.logger.warn('the in-use check failed; the session is kept', {
+      sessionId,
+      code: DebuggenError.from(caught, 'INTERNAL').code,
+    });
+    return true;
   }
-  const open = store.statement(SESSION_OPEN_MODIFICATIONS_SQL).get(sessionId, REVERTED_STATUS);
-  const openRecords = open === undefined ? undefined : readInteger(open['open_records']);
-  if (openRecords === undefined || openRecords > 0) {
-    return 'open-modifications';
-  }
-  return 'eligible';
 }
 
 /**
- * {@link checkEligibility} outside a transaction, as a `Result`: the precheck
- * of a real sweep and the whole check of a dry run. A read the store refuses
- * (the handle closed, a statement that no longer prepares) becomes a per-item
- * issue rather than an exception that would end the pass.
+ * Tells {@link RetentionDeps.onSessionDeleted} of a session whose deleting
+ * transaction has committed. A listener that throws is logged by code only —
+ * the session is gone either way — and never fails the sweep.
  */
-function readEligibility(
-  store: Store,
-  sessionId: SessionId,
-  cutoff: number,
-): Result<SessionEligibility, DebuggenError> {
+function announceDeleted(context: SweepContext, sessionId: SessionId): void {
+  const listener = context.deps.onSessionDeleted;
+  if (listener === undefined) {
+    return;
+  }
   try {
-    return ok(checkEligibility(store, sessionId, cutoff));
+    listener(sessionId);
   } catch (caught) {
-    return err(DebuggenError.from(caught, 'STORE_ERROR'));
+    context.logger.warn('the listener for a purged session failed', {
+      sessionId,
+      code: DebuggenError.from(caught, 'INTERNAL').code,
+    });
+  }
+}
+
+/**
+ * Evaluates one candidate against the database as it stands **now** and, when
+ * `remove` is set and every check passes, deletes it.
+ *
+ * Synchronous from its first read to the delete, so in a real sweep — where it
+ * runs as the body of one `Store.transaction` — nothing can land between the
+ * decision and the deletion, and nothing of the session is deleted before the
+ * decision is final. The checks, in order:
+ *
+ * 1. the row still exists (`gone` otherwise);
+ * 2. it is still older than the cutoff — a session touched after it was listed
+ *    has become active again (`refreshed`);
+ * 3. its journal holds no `conflict` record (`conflict`) — the exemption of
+ *    AAP 0.5.1, re-read here so a conflict the watcher marked after the
+ *    candidate's pre-check still protects it;
+ * 4. it is not active: not in an in-flight status (`in-flight`) and holding
+ *    no open capture window (`capture-open`) — ingest into an open window never
+ *    touches `updated_at`, so the age alone cannot see such a session working;
+ * 5. its journal holds no other record that still describes a patched file
+ *    (`open-modifications`);
+ * 6. the caller does not claim it (`in-use`,
+ *    {@link RetentionDeps.isSessionInUse}).
+ *
+ * Only then are the counts the report states read — telemetry, panels,
+ * analyses and journal records, inside the same transaction, so they are
+ * exactly what the cascade removes — and the row deleted, the schema's
+ * `ON DELETE CASCADE` taking every child row in the same statement. In a dry
+ * run the same reads run as plain reads and nothing is deleted.
+ *
+ * @throws Whatever the store throws, and the `DebuggenError` of a repository
+ * read or delete that answered `Err` — thrown so the surrounding transaction
+ * rolls back; {@link decideSession} turns either into a `Result`.
+ */
+function evaluateSession(
+  context: SweepContext,
+  sessionId: SessionId,
+  remove: boolean,
+): SessionVerdict {
+  const { store, sessions, telemetry, panels } = context.deps;
+
+  const row = store.statement(SESSION_STATE_SQL).get(sessionId);
+  if (row === undefined) {
+    return { outcome: 'gone' };
+  }
+  const updatedAt = readInteger(row['updated_at']);
+  if (updatedAt === undefined || updatedAt >= context.settings.cutoff) {
+    return { outcome: 'refreshed' };
+  }
+
+  const journal = store
+    .statement(SESSION_JOURNAL_SQL)
+    .get(REVERTED_STATUS, CONFLICT_STATUS, sessionId);
+  const records = readInteger(journal?.['records']);
+  const openRecords = readInteger(journal?.['open_records']);
+  const conflictRecords = readInteger(journal?.['conflict_records']);
+  if (conflictRecords !== undefined && conflictRecords > 0) {
+    return { outcome: 'conflict', conflicts: conflictRecords };
+  }
+
+  const status = row['status'];
+  if (typeof status !== 'string' || !isSessionStatus(status) || IN_FLIGHT_STATUS_SET.has(status)) {
+    return { outcome: 'in-flight' };
+  }
+  const capture = store.statement(SESSION_OPEN_CAPTURE_SQL).get(sessionId);
+  const captureOpen = readInteger(capture?.['capture_open']);
+  if (captureOpen === undefined || captureOpen !== 0) {
+    return { outcome: 'capture-open' };
+  }
+
+  if (
+    records === undefined ||
+    openRecords === undefined ||
+    conflictRecords === undefined ||
+    openRecords > 0
+  ) {
+    return { outcome: 'open-modifications', openRecords };
+  }
+
+  // Last, as its contract states: the caller is asked only about a session
+  // every rule of this module would delete.
+  if (claimedInUse(context, sessionId)) {
+    return { outcome: 'in-use' };
+  }
+
+  const events = telemetry.countBySession(sessionId);
+  if (isErr(events)) {
+    throw events.error;
+  }
+  const documents = panels.countBySession(sessionId);
+  if (isErr(documents)) {
+    throw documents.error;
+  }
+  const counts: SessionCounts = {
+    telemetry: events.value,
+    panels: documents.value.panels,
+    analyses: documents.value.analyses,
+    modifications: records,
+  };
+  if (!remove) {
+    return { outcome: 'deleted', counts };
+  }
+
+  const deleted = sessions.delete(sessionId);
+  if (isErr(deleted)) {
+    // Thrown so `Store.transaction` rolls back; caught by `decideSession`.
+    throw deleted.error;
+  }
+  return deleted.value === 0 ? { outcome: 'gone' } : { outcome: 'deleted', counts };
+}
+
+/**
+ * The issue for a candidate whose decision the store refused. A repository's
+ * own coded error is kept; an engine error is wrapped in a fixed sentence, so
+ * no engine message — which may quote a value — reaches the report.
+ */
+function decisionFailed(sessionId: SessionId, cause: unknown): DebuggenError {
+  if (DebuggenError.is(cause)) {
+    return cause;
+  }
+  return new DebuggenError(
+    'STORE_ERROR',
+    `The retention decision for session ${sessionId} failed in the session store; none of its rows were deleted.`,
+    {
+      hint: 'The next start or purge evaluates the session again.',
+      details: { subsystem: SUBSYSTEM, component: COMPONENT, sessionId, operation: 'purge' },
+      cause,
+    },
+  );
+}
+
+/**
+ * Decides one candidate: in a real sweep inside one `BEGIN IMMEDIATE`
+ * transaction that deletes it when every check passes, and in a dry run as
+ * plain reads that delete nothing.
+ *
+ * The transaction is what makes the purge atomic per session: no telemetry is
+ * deleted ahead of it in separately committed batches, so a session refreshed
+ * at any point keeps all of its evidence, and a failure anywhere in the
+ * cascade — a trigger, a constraint, a full disk — rolls the whole session
+ * back.
+ */
+function decideSession(
+  context: SweepContext,
+  sessionId: SessionId,
+): Result<SessionVerdict, DebuggenError> {
+  const { store } = context.deps;
+  try {
+    if (context.settings.dryRun) {
+      return ok(evaluateSession(context, sessionId, false));
+    }
+    return ok(store.transaction((): SessionVerdict => evaluateSession(context, sessionId, true)));
+  } catch (caught) {
+    return err(decisionFailed(sessionId, caught));
   }
 }
 
@@ -1157,356 +1539,284 @@ function readEligibility(
  * Rule 1 — aged sessions
  * ---------------------------------------------------------------------------------------------- */
 
-/**
- * Every session last updated strictly before `cutoff`, sorted by id.
- *
- * The age basis is **`sessions.updated_at`** — the session's last activity —
- * not `created_at`: a long-running session is refreshed by every progress
- * step, capture and follow-up, so it can never age out mid-flight however long
- * ago it was created. `SessionsRepo.list({ updatedBefore })` is the candidate
- * query, served by the `updated_at` index. Pages are read in full before any
- * deletion, so the purge cannot shift the offsets it pages with; an id seen
- * twice across pages (a concurrent update reordering the list) is kept once.
- */
-function listAgedSessions(
-  sessions: SessionsRepo,
-  cutoff: number,
-): Result<SessionListItem[], DebuggenError> {
-  const seen = new Map<string, SessionListItem>();
-  let offset = 0;
-
-  for (;;) {
-    const page = sessions.list({ updatedBefore: cutoff, limit: MAX_SESSION_LIST_LIMIT, offset });
-    if (isErr(page)) {
-      return page;
-    }
-    for (const item of page.value.items) {
-      if (!seen.has(item.id)) {
-        seen.set(item.id, item);
-      }
-    }
-    offset += page.value.items.length;
-    if (page.value.items.length < MAX_SESSION_LIST_LIMIT || offset >= page.value.total) {
-      break;
-    }
-  }
-
-  return ok([...seen.values()].sort((left, right) => compareText(left.id, right.id)));
+/** Records an aged session kept because its journal holds a conflict. */
+function retainForConflicts(
+  context: SweepContext,
+  state: SweepState,
+  sessionId: SessionId,
+  conflicts: number,
+): void {
+  reportId(state, 'sessionsRetainedForConflicts', sessionId);
+  context.logger.info('retaining an aged session: its journal holds an unresolved conflict', {
+    sessionId,
+    conflicts,
+  });
 }
 
-/**
- * Reads what one candidate holds, so the report states what the cascade
- * removes — a cascade reports no count of its own.
- */
-async function countSessionContents(
-  deps: RetentionDeps,
-  sessionId: SessionId,
-): Promise<Result<SessionCounts, DebuggenError>> {
-  const telemetry = deps.telemetry.countBySession(sessionId);
-  if (isErr(telemetry)) {
-    return telemetry;
-  }
-  const documents = deps.panels.countBySession(sessionId);
-  if (isErr(documents)) {
-    return documents;
-  }
-  const modifications = await deps.modifications.countBySession(sessionId);
-  if (isErr(modifications)) {
-    return modifications;
-  }
-  return ok({
-    telemetry: telemetry.value,
-    panels: documents.value.panels,
-    analyses: documents.value.analyses,
-    modifications: modifications.value,
+/** Records an aged session kept because it is still active. */
+function retainActive(
+  context: SweepContext,
+  state: SweepState,
+  candidate: RetentionCandidate,
+  reason: ActiveReason,
+): void {
+  reportId(state, 'sessionsRetainedActive', candidate.id);
+  context.logger.info('retaining an aged session: it is still active', {
+    sessionId: candidate.id,
+    status: candidate.status,
+    reason,
   });
 }
 
 /**
- * Deletes one session row — and, through `ON DELETE CASCADE`, every row scoped
- * to it — in its own transaction.
+ * Decides and — unless it must be kept — deletes one candidate.
  *
- * One transaction per session rather than one for the sweep, so a long purge
- * never holds the write lock long enough to stall an ingest batch in flight.
- * The eligibility re-check runs inside the same transaction as the delete, so
- * no update between the two can be lost. A session holding more telemetry than
- * one purge batch has its events removed first, in bounded batches that yield
- * to the event loop, and only then is the row deleted; the batched purge is
- * refused inside a transaction by design, which is why it precedes this one.
- */
-async function deleteSession(
-  context: SweepContext,
-  sessionId: SessionId,
-  counts: SessionCounts,
-): Promise<Result<SessionEligibility | 'deleted', DebuggenError>> {
-  const { store, sessions, telemetry } = context.deps;
-  const { cutoff } = context.settings;
-
-  const precheck = readEligibility(store, sessionId, cutoff);
-  if (isErr(precheck) || precheck.value !== 'eligible') {
-    return precheck;
-  }
-
-  if (counts.telemetry > DEFAULT_PURGE_BATCH_SIZE) {
-    const purged = await telemetry.deleteBySession(sessionId);
-    if (isErr(purged)) {
-      return purged;
-    }
-    context.logger.debug('purged the telemetry of a large session in batches before its row', {
-      sessionId,
-      events: purged.value,
-    });
-  }
-
-  try {
-    const outcome = store.transaction((): SessionEligibility | 'deleted' => {
-      const eligibility = checkEligibility(store, sessionId, cutoff);
-      if (eligibility !== 'eligible') {
-        return eligibility;
-      }
-      const deleted = sessions.delete(sessionId);
-      if (isErr(deleted)) {
-        // Thrown so `Store.transaction` rolls back; caught just below.
-        throw deleted.error;
-      }
-      return deleted.value === 0 ? 'gone' : 'deleted';
-    });
-    return ok(outcome);
-  } catch (caught) {
-    return err(DebuggenError.from(caught, 'STORE_ERROR'));
-  }
-}
-
-/**
- * Removes a purged session's backup directory, `backups/<sessionId>`.
+ * Before anything else the journal is asked whether it holds a `conflict`
+ * record for the session. If so, the session is **retained**: AAP 0.5.1
+ * exempts a conflict backup until the developer resolves the conflict, and the
+ * journal row is what makes that backup interpretable — it names the file, the
+ * hashes and the diff — so the row must outlive the window too. Everything
+ * else is decided, atomically with the deletion, by {@link decideSession}.
  *
- * Refused, with an issue, when the id does not name a directory directly inside
- * the backups root (an id carrying a separator or a traversal), when the
- * directory is a link or not a directory, when a link sits anywhere inside it,
- * or when it still holds a file that a *remaining* journal record references —
- * another session's, or any `conflict` record's. Such a directory is left for
- * the orphan rule, which judges its files one by one.
+ * @returns Whether the session was deleted (in a dry run: would have been).
  */
-async function removeSessionBackups(
+async function purgeCandidate(
   context: SweepContext,
   state: SweepState,
-  sessionId: SessionId,
-  ownPaths: ReadonlySet<string>,
-  guards: BackupGuards,
-  backupsRoot: NodeIdentity,
-): Promise<void> {
-  const { home, backupsDir, dryRun } = context.settings;
-  const directory = joinPosix(backupsDir, sessionId);
+  candidate: RetentionCandidate,
+): Promise<boolean> {
+  const sessionId = candidate.id;
 
-  if (
-    dirnamePosix(directory) !== backupsDir ||
-    basenamePosix(directory) !== sessionId ||
-    !isStrictlyWithin(home, directory)
-  ) {
-    recordIssue(
-      context,
-      state,
-      'backup',
-      sessionId,
-      unsafePath(
-        sessionId,
-        'unsafe-session-id',
-        `The id of session ${sessionId} does not name a directory inside the backups root; no backup directory was touched for it.`,
-      ),
-    );
-    return;
+  const conflicts = await context.deps.modifications.listConflicts(sessionId);
+  if (isErr(conflicts)) {
+    recordIssue(context, state, 'session', sessionId, conflicts.error);
+    return false;
+  }
+  if (conflicts.value.length > 0) {
+    retainForConflicts(context, state, sessionId, conflicts.value.length);
+    return false;
   }
 
-  const target = relativeToHome(home, directory);
-  const inspection = await inspectDirectory(home, directory);
-  if (inspection.kind === 'absent') {
-    return;
-  }
-  if (inspection.kind === 'unsafe') {
-    recordIssue(context, state, 'backup', target, inspection.error);
-    return;
+  const decided = decideSession(context, sessionId);
+  if (isErr(decided)) {
+    recordIssue(context, state, 'session', sessionId, decided.error);
+    return false;
   }
 
-  const stillReferenced = [...guards.referenced].filter(
-    (path) => isWithin(directory, path) && !ownPaths.has(path),
-  );
-  const conflicted = [...guards.conflicted].filter((path) => isWithin(directory, path));
-  if (stillReferenced.length > 0 || conflicted.length > 0) {
-    recordIssue(
-      context,
-      state,
-      'backup',
-      target,
-      unsafePath(
-        target,
-        'still-referenced',
-        `${target} still holds ${String(stillReferenced.length + conflicted.length)} backup(s) other journal records reference; it was kept and its files are judged by the orphan rule.`,
-      ),
-    );
-    return;
-  }
-
-  const survey = await surveyTree(directory);
-  if (survey.link !== undefined) {
-    recordIssue(context, state, 'backup', target, treeHoldsLink(home, directory, survey.link));
-    return;
-  }
-  if (!dryRun) {
-    const removed = await removeTreeWithin(home, directory, backupsRoot, inspection.identity);
-    if (isErr(removed)) {
-      recordIssue(context, state, 'backup', target, removed.error);
-      return;
-    }
-    if (!removed.value) {
-      return;
-    }
-  }
-
-  state.backupDirsDeleted += 1;
-  state.bytesReclaimed += survey.bytes;
-  state.removedDirectories.add(directory);
-}
-
-/**
- * Rule 1: deletes every aged session that holds no open journal record, and
- * its backup directory.
- *
- * Before anything is deleted for a candidate, the journal is asked whether it
- * still holds a `conflict` record for it. If so, the session is **retained**:
- * AAP 0.5.1 exempts a conflict backup until the developer resolves the
- * conflict, and the journal row is what makes that backup interpretable — it
- * names the file, the hashes and the diff — so the row must outlive the window
- * too. A session holding any other open record (which reconciliation in
- * `src/main.ts` normally settles before this sweep runs) is retained as well
- * and reported, because deleting the only record of a patched file would
- * abandon that file permanently.
- */
-async function purgeAgedSessions(context: SweepContext, state: SweepState): Promise<void> {
-  const { deps, settings, logger } = context;
-  const { modifications } = deps;
-
-  if (!storeUsable(context, state, 'sessions.list')) {
-    return;
-  }
-  const candidates = listAgedSessions(deps.sessions, settings.cutoff);
-  if (isErr(candidates)) {
-    recordIssue(context, state, 'database', 'sessions.list', candidates.error);
-    return;
-  }
-  if (candidates.value.length === 0) {
-    return;
-  }
-
-  // Read once for the whole phase: which backup paths remaining records still
-  // need, and which a conflict protects. Without them no backup directory can
-  // be removed safely, but sessions can still be purged — each one's own
-  // records are checked individually below.
-  const guards = await readBackupGuards(modifications);
-  if (isErr(guards)) {
-    recordIssue(context, state, 'database', 'modifications.listBackupPaths', guards.error);
-  }
-  const backupsRoot = await inspectDirectory(settings.home, settings.backupsDir);
-  if (backupsRoot.kind === 'unsafe') {
-    recordIssue(
-      context,
-      state,
-      'backup',
-      relativeToHome(settings.home, settings.backupsDir),
-      backupsRoot.error,
-    );
-  }
-
-  for (const candidate of candidates.value) {
-    if (!storeUsable(context, state, 'sessions.delete')) {
-      return;
-    }
-    const sessionId = candidate.id;
-
-    const conflicts = await modifications.listConflicts(sessionId);
-    if (isErr(conflicts)) {
-      recordIssue(context, state, 'session', sessionId, conflicts.error);
-      continue;
-    }
-    if (conflicts.value.length > 0) {
-      state.sessionsRetainedForConflicts.push(sessionId);
-      logger.info('retaining an aged session: its journal holds an unresolved conflict', {
-        sessionId,
-        conflicts: conflicts.value.length,
-      });
-      continue;
-    }
-
-    const open = await modifications.listOpen(sessionId);
-    if (isErr(open)) {
-      recordIssue(context, state, 'session', sessionId, open.error);
-      continue;
-    }
-    if (open.value.length > 0) {
+  const verdict = decided.value;
+  switch (verdict.outcome) {
+    case 'deleted':
+      state.sessionsDeleted += 1;
+      reportId(state, 'sessionIdsDeleted', sessionId);
+      state.telemetryEventsDeleted += verdict.counts.telemetry;
+      state.panelsDeleted += verdict.counts.panels;
+      state.analysesDeleted += verdict.counts.analyses;
+      state.modificationsDeleted += verdict.counts.modifications;
+      if (!context.settings.dryRun) {
+        announceDeleted(context, sessionId);
+      }
+      return true;
+    case 'conflict':
+      retainForConflicts(context, state, sessionId, verdict.conflicts);
+      return false;
+    case 'in-flight':
+    case 'capture-open':
+    case 'in-use':
+      retainActive(context, state, candidate, verdict.outcome);
+      return false;
+    case 'open-modifications':
       recordIssue(
         context,
         state,
         'session',
         sessionId,
-        openRecordsRetained(sessionId, open.value.length),
+        openRecordsRetained(sessionId, verdict.openRecords),
       );
-      continue;
-    }
-
-    const counts = await countSessionContents(deps, sessionId);
-    if (isErr(counts)) {
-      recordIssue(context, state, 'session', sessionId, counts.error);
-      continue;
-    }
-    const own = await modifications.listBackupPaths({ sessionId });
-    if (isErr(own)) {
-      recordIssue(context, state, 'session', sessionId, own.error);
-      continue;
-    }
-
-    let outcome: SessionEligibility | 'deleted';
-    if (settings.dryRun) {
-      const eligibility = readEligibility(deps.store, sessionId, settings.cutoff);
-      if (isErr(eligibility)) {
-        recordIssue(context, state, 'session', sessionId, eligibility.error);
-        continue;
-      }
-      outcome = eligibility.value === 'eligible' ? 'deleted' : eligibility.value;
-    } else {
-      const deleted = await deleteSession(context, sessionId, counts.value);
-      if (isErr(deleted)) {
-        recordIssue(context, state, 'session', sessionId, deleted.error);
-        continue;
-      }
-      outcome = deleted.value;
-    }
-
-    if (outcome === 'open-modifications') {
-      recordIssue(context, state, 'session', sessionId, openRecordsRetained(sessionId, undefined));
-      continue;
-    }
-    if (outcome !== 'deleted') {
+      return false;
+    case 'gone':
+    case 'refreshed':
       // Gone already, or touched since it was listed: neither is a problem.
-      logger.debug('aged session no longer eligible at deletion time', { sessionId, outcome });
-      continue;
-    }
+      context.logger.debug('aged session no longer eligible at deletion time', {
+        sessionId,
+        outcome: verdict.outcome,
+      });
+      return false;
+  }
+}
 
-    state.sessionIdsDeleted.push(sessionId);
-    state.telemetryEventsDeleted += counts.value.telemetry;
-    state.panelsDeleted += counts.value.panels;
-    state.analysesDeleted += counts.value.analyses;
-    state.modificationsDeleted += counts.value.modifications;
+/**
+ * The backups directory of a session, `backups/<sessionId>`, or `undefined`
+ * when the id does not name a directory directly inside the backups root (an
+ * id carrying a separator or a traversal).
+ */
+function sessionBackupDirectory(settings: SweepSettings, sessionId: SessionId): string | undefined {
+  const directory = joinPosix(settings.backupsDir, sessionId);
+  return dirnamePosix(directory) === settings.backupsDir &&
+    basenamePosix(directory) === sessionId &&
+    isStrictlyWithin(settings.home, directory)
+    ? directory
+    : undefined;
+}
 
-    if (!isErr(guards) && backupsRoot.kind === 'directory') {
-      await removeSessionBackups(
+/**
+ * Removes the backup directories of the sessions one page purged.
+ *
+ * A backup lives in the directory of the session whose record it protects —
+ * the path the backup store composes, `backups/<sessionId>/<originalHash>`, or
+ * a relocation into a subdirectory of that same directory — and the store
+ * never resolves one session's record to a file in another session's
+ * directory (`@debuggen/instrumentation`'s `patch/backup-store.ts`). A purged
+ * session's own records went with its row in the cascade (in a dry run: would
+ * have gone), so nothing left in the journal can need its directory, and no
+ * journal read is required to remove it. What remains is the containment
+ * discipline: a directory that is a link or not a directory, or that holds a
+ * link anywhere inside it, is reported and left in place for the orphan rule,
+ * which judges its files one by one.
+ */
+async function removePurgedBackups(
+  context: SweepContext,
+  state: SweepState,
+  purged: readonly SessionId[],
+  backupsRoot: NodeIdentity,
+): Promise<void> {
+  const { home, dryRun } = context.settings;
+
+  for (const sessionId of purged) {
+    const directory = sessionBackupDirectory(context.settings, sessionId);
+    if (directory === undefined) {
+      recordIssue(
         context,
         state,
+        'backup',
         sessionId,
-        new Set(own.value.map((path) => normalizePosix(path))),
-        guards.value,
-        backupsRoot.identity,
+        unsafePath(
+          sessionId,
+          'unsafe-session-id',
+          `The id of session ${sessionId} does not name a directory inside the backups root; no backup directory was touched for it.`,
+        ),
       );
+      continue;
     }
+
+    const target = relativeToHome(home, directory);
+    const inspection = await inspectDirectory(home, directory);
+    if (inspection.kind === 'absent') {
+      continue;
+    }
+    if (inspection.kind === 'unsafe') {
+      recordIssue(context, state, 'backup', target, inspection.error);
+      continue;
+    }
+
+    const survey = await surveyTree(directory);
+    if (survey.link !== undefined) {
+      recordIssue(context, state, 'backup', target, treeHoldsLink(home, directory, survey.link));
+      continue;
+    }
+    if (dryRun) {
+      state.removedDirectories.add(directory);
+    } else {
+      const removed = await removeTreeWithin(home, directory, backupsRoot, inspection.identity);
+      if (isErr(removed)) {
+        recordIssue(context, state, 'backup', target, removed.error);
+        continue;
+      }
+      if (!removed.value) {
+        continue;
+      }
+    }
+
+    state.backupDirsDeleted += 1;
+    state.bytesReclaimed += survey.bytes;
   }
+}
+
+/**
+ * Rule 1: deletes every aged session that is neither conflicted, active nor
+ * still patching a file, and its backup directory.
+ *
+ * Candidates come in keyset pages — `updated_at ASC, rowid ASC`, strictly
+ * before a cutoff computed once for the whole sweep, read from the
+ * `updated_at` index without a sort — and each page is completely purged
+ * before the next is read: its sessions decided and deleted one transaction at
+ * a time, then their backup directories removed. The cursor moves past every
+ * candidate of a page whatever happened to it, so a retained session is never
+ * read twice and a deleted one cannot shift a later page; a session refreshed
+ * mid-sweep simply stops matching the cutoff. The sweep yields to the event
+ * loop after every deleted session — whose cascade held it — and between
+ * pages.
+ *
+ * A session holding an open record other than a conflict (which
+ * reconciliation in `src/main.ts` normally settles before this sweep runs) is
+ * retained and reported, because deleting the only record of a patched file
+ * would abandon that file permanently.
+ */
+async function purgeAgedSessions(context: SweepContext, state: SweepState): Promise<void> {
+  const { deps, settings } = context;
+  let backupsRoot: DirectoryInspection | undefined;
+  let after: RetentionCandidateCursor | undefined;
+
+  for (;;) {
+    if (!storeUsable(context, state, 'sessions.listRetentionCandidates')) {
+      return;
+    }
+    const page = deps.sessions.listRetentionCandidates({
+      updatedBefore: settings.cutoff,
+      after,
+      limit: RETENTION_CANDIDATE_PAGE_SIZE,
+    });
+    if (isErr(page)) {
+      recordIssue(context, state, 'database', 'sessions.listRetentionCandidates', page.error);
+      return;
+    }
+    const last = page.value.at(-1);
+    if (last === undefined) {
+      return;
+    }
+
+    const purged: SessionId[] = [];
+    for (const candidate of page.value) {
+      if (!storeUsable(context, state, 'sessions.delete')) {
+        return;
+      }
+      if (await purgeCandidate(context, state, candidate)) {
+        purged.push(candidate.id);
+        if (!settings.dryRun) {
+          // The cascade just held the event loop; let queued work run.
+          await yieldToEventLoop();
+        }
+      }
+    }
+
+    if (purged.length > 0) {
+      backupsRoot ??= await inspectBackupsRoot(context, state);
+      if (backupsRoot.kind === 'directory') {
+        await removePurgedBackups(context, state, purged, backupsRoot.identity);
+      }
+    }
+
+    if (page.value.length < RETENTION_CANDIDATE_PAGE_SIZE) {
+      return;
+    }
+    after = { updatedAt: last.updatedAt, position: last.position };
+    await yieldToEventLoop();
+  }
+}
+
+/**
+ * Inspects the backups root once for Rule 1, recording an issue when it is a
+ * link or not a directory. Absent is not a problem: nothing was ever backed up.
+ */
+async function inspectBackupsRoot(
+  context: SweepContext,
+  state: SweepState,
+): Promise<DirectoryInspection> {
+  const { home, backupsDir } = context.settings;
+  const inspection = await inspectDirectory(home, backupsDir);
+  if (inspection.kind === 'unsafe') {
+    recordIssue(context, state, 'backup', relativeToHome(home, backupsDir), inspection.error);
+  }
+  return inspection;
 }
 
 /** The issue for an aged session kept because its journal still describes a patched file. */
@@ -1530,121 +1840,186 @@ function openRecordsRetained(sessionId: SessionId, count: number | undefined): D
  * ---------------------------------------------------------------------------------------------- */
 
 /**
- * Judges one file of the backup tree: kept when any record references it or a
- * conflict protects it, kept while it is younger than the grace window, and
- * otherwise removed.
- *
- * @returns Whether the file is gone — removed now or, in a dry run, would be.
+ * Removes one orphan — or, in a dry run, counts it — and reports whether it is
+ * gone.
  */
-async function sweepBackupFile(
+async function removeOrphan(
   context: SweepContext,
   state: SweepState,
-  guards: BackupGuards,
-  path: string,
-  stats: Stats,
-  parent: NodeIdentity,
+  candidate: OrphanCandidate,
 ): Promise<boolean> {
-  const { home, graceCutoff, dryRun } = context.settings;
-
-  // The conflict set is a subset of the referenced one by construction; it is
-  // asked separately so a conflict backup is protected even if the two reads
-  // ever disagreed.
-  if (guards.conflicted.has(path) || guards.referenced.has(path)) {
-    return false;
-  }
-  if (stats.mtimeMs >= graceCutoff) {
-    return false;
-  }
-
+  const { home, dryRun } = context.settings;
   if (!dryRun) {
-    const removed = await removeFileWithin(home, path, parent, identityOf(stats));
+    const removed = await removeFileWithin(
+      home,
+      candidate.path,
+      candidate.parent,
+      candidate.identity,
+    );
     if (isErr(removed)) {
-      recordIssue(context, state, 'backup', relativeToHome(home, path), removed.error);
+      recordIssue(context, state, 'backup', relativeToHome(home, candidate.path), removed.error);
       return false;
     }
   }
-
   state.orphanBackupsDeleted += 1;
-  state.bytesReclaimed += stats.size;
+  state.bytesReclaimed += candidate.size;
   return true;
 }
 
 /**
+ * Judges one batch of a session directory's old files against that session's
+ * records, and removes the ones none of them references.
+ *
+ * A record references a file of its session's directory when the file is the
+ * composed backup of the record — named by the record's `originalHash` — or
+ * when the record's normalised `backupPath` names it. Records of any status
+ * count, and a file a `conflict` record names is kept even should the two
+ * readings ever disagree. The probe is one indexed read of this session's
+ * records (`scanSessionBackupReferences`), whatever the size of the rest of
+ * the journal. When it fails, nothing of the directory is removed on this
+ * pass: without the journal no file can be told apart from an orphan.
+ */
+async function judgeCandidates(
+  context: SweepContext,
+  state: SweepState,
+  directory: WalkedDirectory,
+  candidates: readonly OrphanCandidate[],
+): Promise<void> {
+  const byName = new Set(candidates.map((candidate) => candidate.name));
+  const referenced = new Set<string>();
+  const conflicted = new Set<string>();
+
+  if (!storeUsable(context, state, 'modifications.scanSessionBackupReferences')) {
+    directory.blocked = true;
+    return;
+  }
+  const scanned = scanSessionBackupReferences(
+    context.deps.store,
+    directory.sessionId,
+    (reference) => {
+      const names = [reference.originalHash];
+      const recorded = normalizePosix(reference.backupPath);
+      if (dirnamePosix(recorded) === directory.path) {
+        names.push(basenamePosix(recorded));
+      }
+      for (const name of names) {
+        if (byName.has(name)) {
+          referenced.add(name);
+          if (reference.status === CONFLICT_STATUS) {
+            conflicted.add(name);
+          }
+        }
+      }
+      return true;
+    },
+  );
+  if (isErr(scanned)) {
+    recordIssue(
+      context,
+      state,
+      'database',
+      'modifications.scanSessionBackupReferences',
+      scanned.error,
+    );
+    directory.blocked = true;
+    return;
+  }
+
+  for (const candidate of candidates) {
+    if (conflicted.has(candidate.name) || referenced.has(candidate.name)) {
+      continue;
+    }
+    if (await removeOrphan(context, state, candidate)) {
+      directory.remaining -= 1;
+      directory.removedAny = true;
+    }
+  }
+}
+
+/**
  * Walks one `backups/<sessionId>` directory — exactly one level, the level the
- * backup store writes `<originalHash>` files at.
+ * backup store writes `<originalHash>` files at — and judges its old files in
+ * batches of at most {@link BACKUP_PROBE_BATCH_SIZE}, one indexed journal
+ * probe per batch. A file younger than the grace window is kept without being
+ * looked up at all, so a directory holding nothing old costs no journal read.
  *
  * A subdirectory is where a relocated (quarantined) backup lives, and it is
  * never descended into: those files are reached only through the record that
  * names them. A link is reported and left. When every entry was a file this
  * walk removed, the directory itself is removed; a directory that still holds
  * anything — a referenced backup, a young orphan, a subdirectory, a link — is
- * left alone.
+ * left alone, as is one a failed probe covered.
  */
-async function sweepBackupDirectory(
+async function walkBackupDirectory(
   context: SweepContext,
   state: SweepState,
-  guards: BackupGuards,
-  directory: string,
+  path: string,
   identity: NodeIdentity,
   backupsRoot: NodeIdentity,
 ): Promise<void> {
-  const { home, dryRun } = context.settings;
-  const target = relativeToHome(home, directory);
+  const { home, graceCutoff, dryRun } = context.settings;
+  const target = relativeToHome(home, path);
 
   let names: string[];
   try {
-    names = await listNames(directory);
+    names = await listNames(path);
   } catch (cause) {
     recordIssue(context, state, 'backup', target, fsFailure('read', target, cause));
     return;
   }
 
-  let remaining = names.length;
-  let removedAny = false;
+  const directory: WalkedDirectory = {
+    path,
+    sessionId: basenamePosix(path),
+    identity,
+    remaining: names.length,
+    removedAny: false,
+    blocked: false,
+  };
+  let batch: OrphanCandidate[] = [];
 
   for (const name of names) {
-    const path = joinPosix(directory, name);
-    const entry = relativeToHome(home, path);
+    const entryPath = joinPosix(path, name);
+    const entry = relativeToHome(home, entryPath);
     let stats: Stats | undefined;
     try {
-      stats = await lstatIfPresent(path);
+      stats = await lstatIfPresent(entryPath);
     } catch (cause) {
       recordIssue(context, state, 'backup', entry, fsFailure('inspect', entry, cause));
       continue;
     }
     if (stats === undefined) {
-      remaining -= 1;
+      directory.remaining -= 1;
       continue;
     }
     if (stats.isSymbolicLink()) {
-      recordIssue(
-        context,
-        state,
-        'backup',
-        entry,
-        unsafePath(
-          entry,
-          'symlink',
-          `${entry} is a symbolic link; the retention sweep does not follow it and left it in place.`,
-        ),
-      );
+      recordIssue(context, state, 'backup', entry, linkLeftInPlace(entry));
       continue;
     }
-    if (!stats.isFile()) {
+    if (!stats.isFile() || stats.mtimeMs >= graceCutoff || directory.blocked) {
       continue;
     }
-    if (await sweepBackupFile(context, state, guards, path, stats, identity)) {
-      remaining -= 1;
-      removedAny = true;
+    batch.push({
+      path: entryPath,
+      name,
+      identity: identityOf(stats),
+      size: stats.size,
+      parent: identity,
+    });
+    if (batch.length >= BACKUP_PROBE_BATCH_SIZE) {
+      await judgeCandidates(context, state, directory, batch);
+      batch = [];
     }
   }
+  if (batch.length > 0 && !directory.blocked) {
+    await judgeCandidates(context, state, directory, batch);
+  }
 
-  if (!removedAny || remaining > 0) {
+  if (directory.blocked || !directory.removedAny || directory.remaining > 0) {
     return;
   }
-
   if (!dryRun) {
-    const removed = await removeEmptyDirectoryWithin(home, directory, backupsRoot, identity);
+    const removed = await removeEmptyDirectoryWithin(home, path, backupsRoot, identity);
     if (isErr(removed)) {
       recordIssue(context, state, 'backup', target, removed.error);
       return;
@@ -1654,6 +2029,15 @@ async function sweepBackupDirectory(
     }
   }
   state.backupDirsDeleted += 1;
+}
+
+/** The refusal to follow a link met by the orphan walk. */
+function linkLeftInPlace(entry: string): DebuggenError {
+  return unsafePath(
+    entry,
+    'symlink',
+    `${entry} is a symbolic link; the retention sweep does not follow it and left it in place.`,
+  );
 }
 
 /**
@@ -1667,12 +2051,18 @@ async function sweepBackupDirectory(
  * not remove the directory) is not deleted wholesale, its files age out under
  * the same grace window as any other orphan.
  *
- * The referenced set is read **after** Rule 1, so it reflects the records the
- * purge removed. A directory Rule 1 removed — or, in a dry run, would have
- * removed — is skipped, so its files are never counted twice.
+ * Only files older than the grace window are candidates, and only candidates
+ * are looked up — one session directory at a time, through an indexed read of
+ * that session's records alone — so a backup tree holding nothing old costs no
+ * journal read, and neither the journal nor the tree is ever held in memory.
+ * A stray file directly under `backups/` belongs to no session directory, so
+ * no record can resolve to it: it is judged by the grace window alone. The
+ * probes run **after** Rule 1, so they see the records the purge removed. A
+ * directory Rule 1 would have removed in a dry run is skipped, so its files
+ * are never counted twice.
  */
 async function sweepOrphanBackups(context: SweepContext, state: SweepState): Promise<void> {
-  const { deps, settings } = context;
+  const { settings } = context;
   const rootTarget = relativeToHome(settings.home, settings.backupsDir);
 
   const root = await inspectDirectory(settings.home, settings.backupsDir);
@@ -1683,15 +2073,7 @@ async function sweepOrphanBackups(context: SweepContext, state: SweepState): Pro
     recordIssue(context, state, 'backup', rootTarget, root.error);
     return;
   }
-
-  if (!storeUsable(context, state, 'modifications.listBackupPaths')) {
-    return;
-  }
-  const guards = await readBackupGuards(deps.modifications);
-  if (isErr(guards)) {
-    // Without the referenced set no file can be told apart from an orphan, so
-    // nothing under backups/ is deleted on this pass.
-    recordIssue(context, state, 'database', 'modifications.listBackupPaths', guards.error);
+  if (!storeUsable(context, state, 'modifications.scanSessionBackupReferences')) {
     return;
   }
 
@@ -1724,34 +2106,24 @@ async function sweepOrphanBackups(context: SweepContext, state: SweepState): Pro
       continue;
     }
     if (stats.isSymbolicLink()) {
-      recordIssue(
-        context,
-        state,
-        'backup',
-        entry,
-        unsafePath(
-          entry,
-          'symlink',
-          `${entry} is a symbolic link; the retention sweep does not follow it and left it in place.`,
-        ),
-      );
+      recordIssue(context, state, 'backup', entry, linkLeftInPlace(entry));
       continue;
     }
     if (stats.isDirectory()) {
-      await sweepBackupDirectory(
-        context,
-        state,
-        guards.value,
-        path,
-        identityOf(stats),
-        root.identity,
-      );
+      await walkBackupDirectory(context, state, path, identityOf(stats), root.identity);
       continue;
     }
-    if (stats.isFile()) {
-      // Not a layout the backup store writes, but a stray file directly under
-      // backups/ is judged exactly like an orphan inside a session directory.
-      await sweepBackupFile(context, state, guards.value, path, stats, root.identity);
+    if (stats.isFile() && stats.mtimeMs < settings.graceCutoff) {
+      // Not a layout the backup store writes: a stray file directly under
+      // backups/ sits in no session's directory, so no record resolves to it,
+      // and it is judged by the grace window like any other orphan.
+      await removeOrphan(context, state, {
+        path,
+        name,
+        identity: identityOf(stats),
+        size: stats.size,
+        parent: root.identity,
+      });
     }
   }
 }
@@ -2087,7 +2459,7 @@ function reclaimDatabaseSpace(context: SweepContext, state: SweepState): void {
     return;
   }
 
-  if (state.sessionIdsDeleted.length > 0) {
+  if (state.sessionsDeleted > 0) {
     if (!storeUsable(context, state, 'checkpoint')) {
       return;
     }
@@ -2145,13 +2517,16 @@ function reclaimDatabaseSpace(context: SweepContext, state: SweepState): void {
  * The sweep
  * ---------------------------------------------------------------------------------------------- */
 
-/** Assembles the report from the accumulated state, with every array sorted. */
+/**
+ * Assembles the report from the accumulated state, with every id list sorted.
+ * The lists hold at most {@link MAX_REPORTED_ITEMS} entries each; the counters
+ * and {@link RetentionReport.omitted} carry the rest.
+ */
 function toReport(cutoff: number, state: SweepState, durationMs: number): RetentionReport {
-  const sessionIdsDeleted = [...state.sessionIdsDeleted].sort(compareText);
   return {
     cutoff,
-    sessionsDeleted: sessionIdsDeleted.length,
-    sessionIdsDeleted,
+    sessionsDeleted: state.sessionsDeleted,
+    sessionIdsDeleted: [...state.sessionIdsDeleted].sort(compareText),
     telemetryEventsDeleted: state.telemetryEventsDeleted,
     panelsDeleted: state.panelsDeleted,
     analysesDeleted: state.analysesDeleted,
@@ -2160,9 +2535,11 @@ function toReport(cutoff: number, state: SweepState, durationMs: number): Retent
     orphanBackupsDeleted: state.orphanBackupsDeleted,
     indexCachesDeleted: state.indexCachesDeleted,
     sessionsRetainedForConflicts: [...state.sessionsRetainedForConflicts].sort(compareText),
+    sessionsRetainedActive: [...state.sessionsRetainedActive].sort(compareText),
     bytesReclaimed: state.bytesReclaimed,
     durationMs,
     errors: state.errors.map((issue) => ({ ...issue })),
+    omitted: { ...state.omitted },
   };
 }
 
@@ -2180,8 +2557,18 @@ function toReport(cutoff: number, state: SweepState, durationMs: number): Retent
  * mid-flight; `cutoff = now() - retentionDays × 86 400 000`, and a session last
  * updated strictly before it is a candidate.
  *
+ * A session that is still active — in an in-flight status, holding an open
+ * capture window, or reported in use by {@link RetentionDeps.isSessionInUse}
+ * — is retained however old its last update, and so is one whose journal
+ * holds a conflict or still describes a patched file.
+ *
  * Asynchronous because of the filesystem work; the database work is
- * synchronous, one short transaction per purged session.
+ * synchronous, one `BEGIN IMMEDIATE` transaction per candidate that decides
+ * and deletes it atomically — the cascade removes its telemetry, panels,
+ * analyses and journal in the same statement, or nothing of it at all. Work is
+ * bounded: candidates come in indexed keyset pages, journal probes read one
+ * session's records through an index and are batched, and the report's lists
+ * are capped (see the module overview).
  *
  * @param deps The store, the four repositories, the resolved paths and window,
  * and optionally a logger and a clock.
@@ -2231,8 +2618,16 @@ export async function runRetention(
   const state: SweepState = {
     sessionIdsDeleted: [],
     sessionsRetainedForConflicts: [],
+    sessionsRetainedActive: [],
     errors: [],
+    omitted: {
+      sessionIdsDeleted: 0,
+      sessionsRetainedForConflicts: 0,
+      sessionsRetainedActive: 0,
+      errors: 0,
+    },
     removedDirectories: new Set<string>(),
+    sessionsDeleted: 0,
     telemetryEventsDeleted: 0,
     panelsDeleted: 0,
     analysesDeleted: 0,
@@ -2269,9 +2664,12 @@ export async function runRetention(
     backupDirsDeleted: report.backupDirsDeleted,
     orphanBackupsDeleted: report.orphanBackupsDeleted,
     indexCachesDeleted: report.indexCachesDeleted,
-    sessionsRetainedForConflicts: report.sessionsRetainedForConflicts.length,
+    sessionsRetainedForConflicts:
+      report.sessionsRetainedForConflicts.length + report.omitted.sessionsRetainedForConflicts,
+    sessionsRetainedActive:
+      report.sessionsRetainedActive.length + report.omitted.sessionsRetainedActive,
     bytesReclaimed: report.bytesReclaimed,
-    issues: report.errors.length,
+    issues: report.errors.length + report.omitted.errors,
     durationMs: report.durationMs,
   });
   return ok(report);

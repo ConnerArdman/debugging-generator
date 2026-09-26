@@ -43,7 +43,7 @@
  * privacy rule, which applies to a rejected analysis exactly as it applies to a
  * rejected frame.
  *
- * ## The twenty-five payloads, and the one property that cannot be read
+ * ## The twenty-six payloads, and the one property that cannot be read
  *
  * The third and largest part of this file — everything below the section banner
  * that names it — is one valid case and a set of refusals for every payload in
@@ -74,10 +74,14 @@
  *   **success**, never an error (AAP §0.5.5);
  * - `source.open` and `cleanup.completed` carry the shared source-location and
  *   conflict shapes, so an absolute path, a `..` traversal and a zero line are
- *   refused by the same schema every located runtime item already answers to.
+ *   refused by the same schema every located runtime item already answers to;
+ * - `source.result` is a union discriminated on `status`, so a failure's
+ *   `error` is required exactly when the status is `failed` and forbidden
+ *   otherwise, and the editor-open URI built for a `no-editor` answer survives
+ *   the two decodes its receiver applies.
  *
  * Two cross-cutting suites follow. One is driven from
- * `MESSAGE_PAYLOAD_SCHEMAS` itself, so a twenty-sixth message cannot escape the
+ * `MESSAGE_PAYLOAD_SCHEMAS` itself, so a twenty-seventh message cannot escape the
  * JSON round trip or the no-transform check by being added without a test; the
  * other plants a sentinel in a refused field of several payloads — the
  * credential on `client.hello` included — and requires that nothing the
@@ -182,20 +186,29 @@ import {
   BINDING_REASONS,
   CLIENT_HELLO_TIMEOUT_MS,
   CLIENT_KINDS,
+  EDITOR_OPEN_URI,
   HTTP_ONLY_PAYLOAD_NAMES,
   HTTP_ONLY_PAYLOAD_SCHEMAS,
   MESSAGE_PAYLOAD_SCHEMAS,
+  MESSAGE_TYPE,
   MESSAGE_TYPES,
   PROGRESS_STAGES,
   PROGRESS_STATUSES,
+  SELECTION_DOCUMENT_VERDICTS,
+  SOURCE_MESSAGE_PAYLOADS,
+  SOURCE_OPEN_EDITOR_TIMEOUT_MS,
+  SOURCE_OPEN_RESULT_TIMEOUT_MS,
+  SOURCE_RESULT_STATUSES,
   WS_CLOSE_UNAUTHORIZED,
   agentConfigPayloadSchema,
   agentReadyPayloadSchema,
   analysisCompletedPayloadSchema,
+  buildEditorOpenUri,
   captureStartedPayloadSchema,
   captureStoppedPayloadSchema,
   cleanupCompletedPayloadSchema,
   clientHelloPayloadSchema,
+  compareSelectionDocument,
   instrumentationFailedPayloadSchema,
   instrumentationPlanPayloadSchema,
   instrumentationReadyPayloadSchema,
@@ -206,8 +219,10 @@ import {
   parseInstrumentationReadyPayload,
   parsePanelGeneratedPayload,
   parseSourceOpenPayload,
+  parseSourceResultPayload,
   parseTargetSelectedPayload,
   parseTelemetryEventPayload,
+  sameSelectedTarget,
   serverAgentConfigPayloadSchema,
   sessionBindPayloadSchema,
   sessionBoundPayloadSchema,
@@ -216,6 +231,7 @@ import {
   sessionUnbindPayloadSchema,
   sessionUpdatedPayloadSchema,
   sourceOpenPayloadSchema,
+  sourceResultPayloadSchema,
   tabNavigatedPayloadSchema,
   targetRequestPayloadSchema,
   targetSelectedPayloadSchema,
@@ -223,21 +239,26 @@ import {
   telemetryTailPayloadSchema,
   unavailableSignalSchema,
 } from '../messages/index.js';
-import type { MessageType } from '../messages/index.js';
+import type { MessageType, SourceResultPayload } from '../messages/index.js';
 import * as messagesBarrel from '../messages/index.js';
 import {
   CLEANUP_STATUSES,
+  FOLLOW_UP_ATTEMPT_ID_PREFIX,
+  FOLLOW_UP_OUTCOME_KEYS,
   PROMPT_STAGE_KEYS,
   PROVIDER_IDS,
   SESSION_STATUSES,
+  followUpAttemptIdSchema,
+  followUpRecordSchema,
   isCleanupStatus,
+  isFollowUpAnswered,
   isSessionStatus,
   parseSessionRecord,
   relevantFileSchema,
   sessionRecordSchema,
   touchSessionRecord,
 } from '../session-record.js';
-import type { SessionRecord } from '../session-record.js';
+import type { FollowUpRecord, SessionRecord } from '../session-record.js';
 import { PROTOCOL_VERSION, protocolVersionSchema } from '../version.js';
 
 /** A code from the `@debuggen/shared` vocabulary, used as a valid fixture. */
@@ -1264,6 +1285,91 @@ describe('parseSessionRecord — a rejected session never leaks the developer’
   });
 });
 
+describe('followUpRecordSchema — a follow-up attempt carries an identity, not a guessable key', () => {
+  /** An attempt id of the shape the product mints; literal, so no clock or generator is read. */
+  const ATTEMPT_ID = `${FOLLOW_UP_ATTEMPT_ID_PREFIX}_4k2p9dq7m1zx0c3v`;
+
+  /** A follow-up as the service records it when asked: the ask, and no outcome yet. */
+  const asked: FollowUpRecord = {
+    question: 'Why did that step run twice?',
+    askedAt: 1_758_000_100_000,
+    attemptId: ATTEMPT_ID,
+    attempt: 1,
+  };
+
+  it('accepts an attempt id and its counter, and a stored follow-up that predates both', () => {
+    expect(followUpRecordSchema.safeParse(asked).success).toBe(true);
+    expect(followUpRecordSchema.safeParse({ ...asked, attempt: 3 }).success).toBe(true);
+    // A legacy row: written before attempts had an identity, and still readable.
+    expect(
+      followUpRecordSchema.safeParse({ question: asked.question, askedAt: asked.askedAt }).success,
+    ).toBe(true);
+    expect(
+      sessionRecordSchema.safeParse({ ...validSessionRecord(), followUps: [asked] }).success,
+    ).toBe(true);
+  });
+
+  it('refuses an attempt counter below one or off the integers, and a malformed attempt id', () => {
+    for (const attempt of [0, -1, 1.5, Number.NaN, '1']) {
+      expect(followUpRecordSchema.safeParse({ ...asked, attempt }).success, String(attempt)).toBe(
+        false,
+      );
+    }
+    for (const attemptId of ['', ' ', 'fua_\u0000', 'x'.repeat(65), 7, null]) {
+      expect(followUpRecordSchema.safeParse({ ...asked, attemptId }).success).toBe(false);
+      expect(followUpAttemptIdSchema.safeParse(attemptId).success).toBe(false);
+    }
+    expect(followUpAttemptIdSchema.safeParse(ATTEMPT_ID).success).toBe(true);
+  });
+
+  it('names the attempt id and prefix the product mints', () => {
+    expect(FOLLOW_UP_ATTEMPT_ID_PREFIX).toMatch(/^[a-z]{3}$/);
+  });
+});
+
+describe('isFollowUpAnswered — any outcome link, present, answers a follow-up', () => {
+  it('reads an ask with no outcome link as unanswered, whatever its attempt counter', () => {
+    const ask: FollowUpRecord = {
+      question: 'Why did that step run twice?',
+      askedAt: 1_758_000_100_000,
+      attemptId: `${FOLLOW_UP_ATTEMPT_ID_PREFIX}_4k2p9dq7m1zx0c3v`,
+      attempt: 2,
+    };
+
+    expect(isFollowUpAnswered(ask)).toBe(false);
+    expect(isFollowUpAnswered({ question: ask.question, askedAt: ask.askedAt })).toBe(false);
+  });
+
+  it.each([
+    ['needsNewCapture: false', { needsNewCapture: false }],
+    ['needsNewCapture: true', { needsNewCapture: true }],
+    ['planVersion', { planVersion: 2 }],
+    ['captureId', { captureId: CAPTURE_ID }],
+    ['analysisId', { analysisId: ANALYSIS_ID }],
+    ['panelId', { panelId: PANEL_ID }],
+  ] as const)('reads a follow-up carrying only %s as answered', (_link, outcome) => {
+    const followUp: FollowUpRecord = {
+      question: 'Why did that step run twice?',
+      askedAt: 1_758_000_100_000,
+      ...outcome,
+    };
+
+    expect(followUpRecordSchema.safeParse(followUp).success).toBe(true);
+    expect(isFollowUpAnswered(followUp)).toBe(true);
+  });
+
+  it('lists exactly the five outcome links, frozen', () => {
+    expect([...FOLLOW_UP_OUTCOME_KEYS]).toEqual([
+      'needsNewCapture',
+      'planVersion',
+      'captureId',
+      'analysisId',
+      'panelId',
+    ]);
+    expect(Object.isFrozen(FOLLOW_UP_OUTCOME_KEYS)).toBe(true);
+  });
+});
+
 describe('touchSessionRecord — a pure updatedAt bump, and nothing else', () => {
   it('returns a new record with the new timestamp and leaves the original alone', () => {
     const record = validSessionRecord();
@@ -1348,6 +1454,30 @@ const TOKEN = 'editor-credential-placeholder';
  * this file too.
  */
 const SENTINEL = 'SENTINEL-do-not-leak-9c31';
+
+/**
+ * The envelope id of the `source.open` a `source.result` fixture answers, in the
+ * shape `newMessageId()` mints — the value its `ref` correlates by.
+ */
+const SOURCE_OPEN_FRAME_ID = 'msg_8e2r4t6y1u3i5o7p';
+
+/**
+ * A `failed` source result with every optional field present.
+ *
+ * Typed as that one member of the union rather than as the whole payload, so
+ * the cases below can reach its `error` without narrowing first; it is also the
+ * `source.result` fixture of {@link VALID_PAYLOADS}.
+ */
+const FAILED_SOURCE_RESULT: Extract<SourceResultPayload, { status: 'failed' }> = {
+  sessionId: SESSION_ID,
+  ref: SOURCE_OPEN_FRAME_ID,
+  status: 'failed',
+  error: {
+    code: 'PATH_OUTSIDE_PROJECT',
+    message: 'The location is outside the session\u2019s project.',
+    hint: 'Open the project folder in VS Code and try the link again.',
+  },
+};
 
 /**
  * The payload type the registry binds to a message type.
@@ -1580,7 +1710,7 @@ const CAPTURE_SUMMARY: CaptureSummary = computeCaptureSummary([validPersistedEve
  * The mapped type is the point twice over. It makes the table **exhaustive** — a
  * message added to the protocol without a fixture here is a compile error, which
  * is what stops the registry-driven suites at the end of this file from silently
- * covering twenty-five of twenty-six frames. And it types every slot from the
+ * covering twenty-six of twenty-seven frames. And it types every slot from the
  * *schema*, so placing an upstream value (a `SelectedTarget`, an
  * `InstrumentationAction`, a `TelemetryEvent`, a `SourceLocation`) into it is a
  * compile-time statement that the payload field is that same type rather than a
@@ -1654,6 +1784,9 @@ const VALID_PAYLOADS: { readonly [T in MessageType]: PayloadOf<T> } = {
   'telemetry.tail': { sessionId: SESSION_ID, events: [validPersistedEvent()] },
   'panel.generated': { sessionId: SESSION_ID, panelId: PANEL_ID, panel: validPanelSpec() },
   'source.open': { sessionId: SESSION_ID, location: validSourceLocation() },
+  // The `failed` member, because it is the one that carries every optional
+  // field a `source.result` can hold — the error and its hint.
+  'source.result': FAILED_SOURCE_RESULT,
   'target.request': { sessionId: SESSION_ID },
   'target.selected': { sessionId: SESSION_ID, target: validSelectedTarget() },
   'cleanup.completed': {
@@ -1697,6 +1830,7 @@ const REGISTERED_SCHEMAS: { readonly [T in MessageType]: (typeof MESSAGE_PAYLOAD
   'telemetry.tail': telemetryTailPayloadSchema,
   'panel.generated': panelGeneratedPayloadSchema,
   'source.open': sourceOpenPayloadSchema,
+  'source.result': sourceResultPayloadSchema,
   'target.request': targetRequestPayloadSchema,
   'target.selected': targetSelectedPayloadSchema,
   'cleanup.completed': cleanupCompletedPayloadSchema,
@@ -2773,8 +2907,15 @@ describe('telemetry.event — the strict ingress schema does the refusing', () =
     // The only payload in this folder with no `sessionId`, and deliberately so:
     // the service resolves a telemetry frame to a session from the *connection*
     // — the tab binding for a browser producer, the credential's scoped project
-    // root for a server one (AAP §0.4.2, §0.5.6).
-    expect(Object.keys(telemetryEventPayloadSchema.shape)).toEqual(['events']);
+    // root for a server one (AAP §0.4.2, §0.5.6). Beside the batch it carries
+    // only delivery context: the capture the producer was armed for, which can
+    // refuse a late batch but never choose a capture, and its loss report.
+    expect(Object.keys(telemetryEventPayloadSchema.shape)).toEqual([
+      'events',
+      'armedCaptureId',
+      'droppedCount',
+    ]);
+    expect(Object.keys(telemetryEventPayloadSchema.shape)).not.toContain('captureId');
     expect(
       telemetryEventPayloadSchema.safeParse({ ...payload, sessionId: SESSION_ID }).success,
     ).toBe(false);
@@ -3233,6 +3374,406 @@ describe('source.open — the one hop that opens a developer\u2019s file', () =>
   });
 });
 
+/** One valid `source.result` per member of the union, minimal where a field is optional. */
+const SOURCE_RESULT_VARIANTS: readonly SourceResultPayload[] = [
+  { sessionId: SESSION_ID, ref: SOURCE_OPEN_FRAME_ID, status: 'opened' },
+  { sessionId: SESSION_ID, ref: SOURCE_OPEN_FRAME_ID, status: 'no-editor' },
+  {
+    sessionId: SESSION_ID,
+    ref: SOURCE_OPEN_FRAME_ID,
+    status: 'failed',
+    error: { code: 'SESSION_NOT_FOUND', message: 'The session no longer exists.' },
+  },
+  VALID_PAYLOADS['source.result'],
+];
+
+describe('source.result — the one answer that settles a source.open', () => {
+  it('names three outcomes, and the union discriminates on exactly those, in order', () => {
+    expect([...SOURCE_RESULT_STATUSES]).toEqual(['opened', 'no-editor', 'failed']);
+    expect(sourceResultPayloadSchema.options.map((option) => option.shape.status.value)).toEqual([
+      ...SOURCE_RESULT_STATUSES,
+    ]);
+  });
+
+  it('accepts every member exactly as sent, through the schema and the parse helper', () => {
+    for (const payload of SOURCE_RESULT_VARIANTS) {
+      const parsed = parseSourceResultPayload(payload);
+
+      expect(sourceResultPayloadSchema.parse(payload)).toStrictEqual(payload);
+      expect(isOk(parsed) ? parsed.value : parsed.error.message).toStrictEqual(payload);
+    }
+  });
+
+  it('refuses an unknown or missing status at the discriminator', () => {
+    for (const status of ['done', 'Opened', 'no_editor', 'open', '', 1, null, undefined]) {
+      const refused = sourceResultPayloadSchema.safeParse({
+        sessionId: SESSION_ID,
+        ref: SOURCE_OPEN_FRAME_ID,
+        status,
+      });
+
+      expect(refused.success).toBe(false);
+      if (refused.success) {
+        return;
+      }
+      expect(issuePaths(refused.error)).toEqual(['status']);
+      expect(refused.error.issues[0]?.code).toBe('invalid_union');
+    }
+    expect(
+      sourceResultPayloadSchema.safeParse({ sessionId: SESSION_ID, ref: SOURCE_OPEN_FRAME_ID })
+        .success,
+    ).toBe(false);
+  });
+
+  it('refuses a stray key, a missing ref and a missing sessionId on every member', () => {
+    for (const payload of SOURCE_RESULT_VARIANTS) {
+      const withStrayKey = sourceResultPayloadSchema.safeParse({ ...payload, tabId: 7 });
+
+      expect(withStrayKey.success).toBe(false);
+      for (const key of ['ref', 'sessionId']) {
+        const refused = sourceResultPayloadSchema.safeParse(without(payload, key));
+
+        expect(refused.success).toBe(false);
+        if (refused.success) {
+          return;
+        }
+        expect(issuePaths(refused.error)).toEqual([key]);
+      }
+    }
+  });
+
+  it('requires an error exactly when the status is failed', () => {
+    const failed = FAILED_SOURCE_RESULT;
+    const withoutError = sourceResultPayloadSchema.safeParse(without(failed, 'error'));
+
+    expect(withoutError.success).toBe(false);
+    if (!withoutError.success) {
+      expect(issuePaths(withoutError.error)).toEqual(['error']);
+    }
+
+    // An `opened` or `no-editor` result that also carried an error would be a
+    // contradiction only a guess could resolve, so each member refuses it.
+    for (const status of ['opened', 'no-editor'] as const) {
+      const contradictory = sourceResultPayloadSchema.safeParse({
+        sessionId: SESSION_ID,
+        ref: SOURCE_OPEN_FRAME_ID,
+        status,
+        error: failed.error,
+      });
+
+      expect(contradictory.success).toBe(false);
+      if (!contradictory.success) {
+        expect(contradictory.error.issues[0]?.code).toBe('unrecognized_keys');
+      }
+    }
+  });
+
+  it('refuses an error code outside the shared vocabulary, and any key the error does not name', () => {
+    const failed = FAILED_SOURCE_RESULT;
+
+    for (const [error, path] of [
+      [{ ...failed.error, code: 'NOT_A_CODE' }, 'error.code'],
+      [{ ...failed.error, code: 'model_unavailable' }, 'error.code'],
+      [without(failed.error, 'code'), 'error.code'],
+      [without(failed.error, 'message'), 'error.message'],
+      [{ ...failed.error, ref: SOURCE_OPEN_FRAME_ID }, 'error'],
+      [{ ...failed.error, details: {} }, 'error'],
+      ['The location is outside the project.', 'error'],
+    ] as const) {
+      const refused = sourceResultPayloadSchema.safeParse({ ...failed, error });
+
+      expect(refused.success).toBe(false);
+      if (refused.success) {
+        return;
+      }
+      expect(issuePaths(refused.error)).toEqual([path]);
+    }
+  });
+
+  it('bounds the ref, the session id, the message and the hint', () => {
+    const failed = FAILED_SOURCE_RESULT;
+    const accepts = (value: unknown): boolean => sourceResultPayloadSchema.safeParse(value).success;
+
+    expect(accepts({ ...failed, ref: 'r'.repeat(64) })).toBe(true);
+    expect(accepts({ ...failed, ref: 'r'.repeat(65) })).toBe(false);
+    expect(accepts({ ...failed, ref: '' })).toBe(false);
+    expect(accepts({ ...failed, ref: 7 })).toBe(false);
+    expect(accepts({ ...failed, sessionId: 's'.repeat(65) })).toBe(false);
+    expect(accepts({ ...failed, sessionId: '' })).toBe(false);
+    expect(accepts({ ...failed, error: { ...failed.error, message: 'm'.repeat(2000) } })).toBe(
+      true,
+    );
+    expect(accepts({ ...failed, error: { ...failed.error, message: 'm'.repeat(2001) } })).toBe(
+      false,
+    );
+    expect(accepts({ ...failed, error: { ...failed.error, message: '' } })).toBe(false);
+    expect(accepts({ ...failed, error: { ...failed.error, hint: 'h'.repeat(2000) } })).toBe(true);
+    expect(accepts({ ...failed, error: { ...failed.error, hint: 'h'.repeat(2001) } })).toBe(false);
+    expect(accepts({ ...failed, error: { ...failed.error, hint: '' } })).toBe(false);
+
+    const tooLong = parseSourceResultPayload({ ...failed, ref: 'r'.repeat(65) });
+
+    expect(isErr(tooLong) ? tooLong.error.message : '').toContain(
+      'ref (too_big origin=string max=64)',
+    );
+  });
+
+  it('carries DebuggenError.toPayload() unchanged, with or without a hint', () => {
+    // The service and the editor report a failure by placing what the class
+    // already produces into the result; the compile-time drift assertion in
+    // `../messages/source.ts` keeps that true, and this proves it at run time.
+    for (const error of [
+      new DebuggenError('PATH_OUTSIDE_PROJECT', 'The location is outside the project.', {
+        hint: 'Open the project folder in VS Code.',
+      }),
+      new DebuggenError('SESSION_NOT_FOUND', 'The session no longer exists.'),
+    ]) {
+      const payload = {
+        sessionId: SESSION_ID,
+        ref: SOURCE_OPEN_FRAME_ID,
+        status: 'failed',
+        error: error.toPayload(),
+      };
+      const parsed = parseSourceResultPayload(payload);
+
+      expect(isOk(parsed) ? parsed.value : parsed.error.message).toStrictEqual(payload);
+    }
+  });
+
+  it('reports a refusal by field name and never by value', () => {
+    const failed = FAILED_SOURCE_RESULT;
+
+    for (const [value, named] of [
+      [
+        { ...failed, error: { ...failed.error, message: SENTINEL, code: 'NOT_A_CODE' } },
+        'error.code (invalid_value',
+      ],
+      [{ ...failed, ref: `${SENTINEL}-${'x'.repeat(64)}` }, 'ref (too_big'],
+      [{ ...failed, status: SENTINEL }, 'status (invalid_union'],
+      [
+        { ...failed, error: { ...failed.error, hint: SENTINEL.repeat(100) } },
+        'error.hint (too_big',
+      ],
+    ] as const) {
+      const parsed = parseSourceResultPayload(value);
+
+      expect(isErr(parsed)).toBe(true);
+      if (!isErr(parsed)) {
+        return;
+      }
+      expect(parsed.error.code).toBe('PROTOCOL_INVALID_MESSAGE');
+      expect(parsed.error.message.startsWith('Invalid source.result payload: ')).toBe(true);
+      expect(parsed.error.message).toContain(named);
+      expect(parsed.error.cause).toBeUndefined();
+      for (const surface of renderedSurfaces(parsed.error)) {
+        expect(surface).not.toContain(SENTINEL);
+      }
+    }
+  });
+
+  it('gives the editor a shorter deadline than the sender, and both fit the worker\u2019s port ceiling', () => {
+    // The service answers `failed` for a silent editor before the sender stops
+    // waiting, so the developer sees the specific reason; and the sender stops
+    // before the MV3 worker's twenty-second port-request ceiling would time the
+    // panel's request out generically.
+    const workerPortRequestCeilingMs = 20_000;
+
+    expect(SOURCE_OPEN_EDITOR_TIMEOUT_MS).toBe(10_000);
+    expect(SOURCE_OPEN_RESULT_TIMEOUT_MS).toBe(15_000);
+    expect(SOURCE_OPEN_RESULT_TIMEOUT_MS).toBeGreaterThan(SOURCE_OPEN_EDITOR_TIMEOUT_MS);
+    expect(SOURCE_OPEN_RESULT_TIMEOUT_MS).toBeLessThan(workerPortRequestCeilingMs);
+  });
+
+  it('registers both source messages in the source domain map, which is frozen', () => {
+    expect(Object.keys(SOURCE_MESSAGE_PAYLOADS)).toEqual(['source.open', 'source.result']);
+    expect(SOURCE_MESSAGE_PAYLOADS['source.result']).toBe(sourceResultPayloadSchema);
+    expect(Object.isFrozen(SOURCE_MESSAGE_PAYLOADS)).toBe(true);
+  });
+});
+
+/**
+ * Reads a file back out of an editor-open URI the way its receiver does.
+ *
+ * VS Code's `Uri.parse` percent-decodes the query once, and the extension's URI
+ * handler splits the result with `URLSearchParams`, which decodes each value a
+ * second time. Mirrored here with the same two steps — `decodeURIComponent`
+ * once, then `URLSearchParams` — so the assertion is about the real receiver's
+ * arithmetic rather than about this package's own encoder.
+ *
+ * @param uri An editor-open URI.
+ * @returns The parameters the handler would see.
+ */
+function receivedParameters(uri: string): URLSearchParams {
+  const query = uri.slice(uri.indexOf('?') + 1);
+
+  return new URLSearchParams(decodeURIComponent(query));
+}
+
+describe('buildEditorOpenUri — the fallback a no-editor answer opens', () => {
+  it('names the URI parts once, for the panel and the URI handler alike', () => {
+    expect(EDITOR_OPEN_URI).toEqual({
+      scheme: 'vscode',
+      authority: 'debuggen.debug-generator',
+      path: '/open',
+      fileParameter: 'file',
+      lineParameter: 'line',
+      columnParameter: 'col',
+    });
+    expect(Object.isFrozen(EDITOR_OPEN_URI)).toBe(true);
+  });
+
+  it('builds vscode://debuggen.debug-generator/open?file=…&line=N&col=M', () => {
+    const built = buildEditorOpenUri(validSourceLocation());
+
+    expect(isOk(built) ? built.value : built.error.message).toBe(
+      'vscode://debuggen.debug-generator/open?file=src%252Flib%252Fthing.ts&line=42&col=3',
+    );
+    if (!isOk(built)) {
+      return;
+    }
+
+    const url = new URL(built.value);
+
+    expect([url.protocol, url.host, url.pathname]).toEqual([
+      'vscode:',
+      'debuggen.debug-generator',
+      '/open',
+    ]);
+  });
+
+  it('carries only the file, the line and the column', () => {
+    const built = buildEditorOpenUri({
+      ...validSourceLocation(),
+      symbol: SENTINEL,
+      endLine: 57,
+      resolvedBy: 'code-graph',
+      confidence: 0.85,
+    });
+
+    expect(isOk(built)).toBe(true);
+    if (!isOk(built)) {
+      return;
+    }
+    expect(built.value).not.toContain(SENTINEL);
+    expect([...receivedParameters(built.value)]).toEqual([
+      ['file', SOURCE_FILE],
+      ['line', '42'],
+      ['col', '3'],
+    ]);
+  });
+
+  it.each([
+    ['a plus sign', 'src/lib/a+b.ts'],
+    ['an ampersand and an equals sign', 'src/lib/a&line=1&b=c.ts'],
+    ['a space', 'src/lib/with space.ts'],
+    ['a percent sign', 'src/lib/100%.ts'],
+    ['what looks like an escape', 'src/lib/%2F%41%zz.ts'],
+    ['a hash', 'src/lib/#fragment.ts'],
+    ['all of them at once', 'src/a+b &c=d %25 #e/f g.ts'],
+    ['non-ASCII text', 'src/lib/\u00fcber-\u6587\u4ef6.ts'],
+    ['a surrogate pair', 'src/lib/emoji-\u{1f600}.ts'],
+  ])('round-trips a file name with %s through both receiving decodes', (_label, file) => {
+    const built = buildEditorOpenUri({ ...validSourceLocation(), file, line: 7, column: 12 });
+
+    expect(isOk(built) ? 'ok' : built.error.message).toBe('ok');
+    if (!isOk(built)) {
+      return;
+    }
+
+    // Nothing in the URI can be read as a separator by either decode: no
+    // fragment marker, no space and no `+` survive encoding, and the only `&`
+    // and `=` left are the two separators and three assignments of the query.
+    expect(built.value).not.toMatch(/[#+ ]/);
+    expect(built.value.split('&')).toHaveLength(3);
+
+    const received = receivedParameters(built.value);
+
+    expect(received.get('file')).toBe(file);
+    expect(received.get('line')).toBe('7');
+    expect(received.get('col')).toBe('12');
+    expect([...received.keys()]).toEqual(['file', 'line', 'col']);
+  });
+
+  it('encodes twice because a single encoding does not survive the receiver', () => {
+    // The control case: what the receiver would make of a once-encoded `+`.
+    // This is the defect the second encoding exists to prevent.
+    const once = `file=${encodeURIComponent('src/lib/a+b.ts')}`;
+
+    expect(new URLSearchParams(decodeURIComponent(once)).get('file')).toBe('src/lib/a b.ts');
+  });
+
+  it.each([
+    ['an absolute path', { file: `/home/example/${SENTINEL}/secret.ts` }, 'file'],
+    ['a traversal', { file: `../../${SENTINEL}/secret.ts` }, 'file'],
+    ['an inner traversal', { file: `src/../../${SENTINEL}.ts` }, 'file'],
+    ['a Windows drive path', { file: `C:\\${SENTINEL}\\secret.ts` }, 'file'],
+    ['a control character', { file: `src/${SENTINEL}\u0000.ts` }, 'file'],
+    [
+      'a lone high surrogate',
+      { file: `src/${SENTINEL}\ud800.ts` },
+      'file (custom label=well-formed-text)',
+    ],
+    [
+      'a lone low surrogate',
+      { file: `src/\udc00${SENTINEL}.ts` },
+      'file (custom label=well-formed-text)',
+    ],
+    ['a zero line', { symbol: SENTINEL, line: 0 }, 'line (too_small'],
+    ['a zero column', { symbol: SENTINEL, column: 0 }, 'column (too_small'],
+    ['a fractional line', { symbol: SENTINEL, line: 1.5 }, 'line'],
+    ['an inverted range', { symbol: SENTINEL, endLine: 1 }, 'endLine'],
+    ['an unknown resolution route', { symbol: SENTINEL, resolvedBy: 'guess' }, 'resolvedBy'],
+  ])('refuses %s without echoing it or throwing', (_label, shape, named) => {
+    // Cast because each case is deliberately not a valid location; a caller
+    // holding data that crossed two process boundaries can pass one, too. A
+    // throw — `encodeURIComponent`'s `URIError` on a lone surrogate, say —
+    // would fail this case before any assertion runs.
+    const location = { ...validSourceLocation(), ...shape } as unknown as SourceLocation;
+    const built = buildEditorOpenUri(location);
+
+    expect(isErr(built)).toBe(true);
+    if (!isErr(built)) {
+      return;
+    }
+
+    const { error } = built;
+
+    expect(error.code).toBe('PROTOCOL_INVALID_MESSAGE');
+    expect(error.message.startsWith('Invalid source location for the editor-open URI: ')).toBe(
+      true,
+    );
+    expect(error.message).toContain(named);
+    expect(error.cause).toBeUndefined();
+    for (const surface of renderedSurfaces(error)) {
+      expect(surface).not.toContain(SENTINEL);
+    }
+  });
+
+  it('refuses a value that is not a location at all, without throwing', () => {
+    for (const value of [
+      null,
+      undefined,
+      SENTINEL,
+      [],
+      {},
+      { ...validSourceLocation(), file: 42 },
+      { ...validSourceLocation(), line: '42' },
+      without(validSourceLocation(), 'file'),
+    ]) {
+      const built = buildEditorOpenUri(value as unknown as SourceLocation);
+
+      expect(isErr(built)).toBe(true);
+      if (!isErr(built)) {
+        return;
+      }
+      expect(built.error.code).toBe('PROTOCOL_INVALID_MESSAGE');
+      for (const surface of renderedSurfaces(built.error)) {
+        expect(surface).not.toContain(SENTINEL);
+      }
+    }
+  });
+});
+
 describe('target.request and target.selected — the element the developer pointed at', () => {
   it('target.request is a session id and nothing more', () => {
     const payload = VALID_PAYLOADS['target.request'];
@@ -3327,6 +3868,177 @@ describe('target.request and target.selected — the element the developer point
   });
 });
 
+describe('the target.selected verdict — sameSelectedTarget and compareSelectionDocument', () => {
+  /** The descriptor with its optional `text` omitted, as the producer sends it. */
+  function textlessTarget(): SelectedTarget {
+    const { selector, tagName, componentChain, url } = validSelectedTarget();
+    return { selector, tagName, componentChain, url };
+  }
+
+  it('sameSelectedTarget confirms a copy of the sent descriptor, including one read back from JSON', () => {
+    const sent = validSelectedTarget();
+
+    expect(sameSelectedTarget(sent, sent)).toBe(true);
+    expect(sameSelectedTarget(sent, validSelectedTarget())).toBe(true);
+    // What the service stores and replays on `session.updated` has been
+    // through a JSON round trip; the comparison must survive it.
+    expect(sameSelectedTarget(sent, JSON.parse(JSON.stringify(sent)) as SelectedTarget)).toBe(true);
+    // Validated by the payload schema first, as the service does before it
+    // records anything: the schema transforms nothing, so the value still
+    // compares equal.
+    const recorded = targetSelectedPayloadSchema.parse({ sessionId: SESSION_ID, target: sent });
+    expect(sameSelectedTarget(recorded.target, sent)).toBe(true);
+  });
+
+  it('sameSelectedTarget refuses a descriptor that differs in any one field', () => {
+    const sent = validSelectedTarget();
+    const variants: readonly SelectedTarget[] = [
+      { ...sent, selector: 'main > button.secondary' },
+      { ...sent, tagName: 'A' },
+      { ...sent, text: 'Continue later' },
+      { ...sent, url: 'http://localhost:3000/cart?filter=%3F' },
+      { ...sent, componentChain: ['PrimaryAction', 'ActionPanel'] },
+    ];
+
+    for (const variant of variants) {
+      expect(sameSelectedTarget(sent, variant)).toBe(false);
+      expect(sameSelectedTarget(variant, sent)).toBe(false);
+    }
+  });
+
+  it('sameSelectedTarget reads the component chain element-wise and in order', () => {
+    const sent = validSelectedTarget();
+
+    // Nearest-first is the contract, so the same names reversed are a
+    // different position in the tree.
+    expect(
+      sameSelectedTarget(sent, { ...sent, componentChain: ['ActionRow', 'PrimaryAction'] }),
+    ).toBe(false);
+    expect(sameSelectedTarget(sent, { ...sent, componentChain: ['PrimaryAction'] })).toBe(false);
+    expect(
+      sameSelectedTarget(sent, { ...sent, componentChain: ['PrimaryAction', 'ActionRow', 'Page'] }),
+    ).toBe(false);
+    expect(
+      sameSelectedTarget({ ...sent, componentChain: [] }, { ...sent, componentChain: [] }),
+    ).toBe(true);
+  });
+
+  it('sameSelectedTarget treats text absent on both sides as equal, and absent against present as not', () => {
+    expect(sameSelectedTarget(textlessTarget(), textlessTarget())).toBe(true);
+    expect(sameSelectedTarget(textlessTarget(), validSelectedTarget())).toBe(false);
+    expect(sameSelectedTarget(validSelectedTarget(), textlessTarget())).toBe(false);
+  });
+
+  it('sameSelectedTarget compares tagName ASCII case-insensitively and every other field exactly', () => {
+    const sent = validSelectedTarget();
+
+    // The producer's case depends on the document type, not on the element.
+    expect(sameSelectedTarget(sent, { ...sent, tagName: 'button' })).toBe(true);
+    expect(sameSelectedTarget(sent, { ...sent, tagName: 'Button' })).toBe(true);
+    // Only ASCII letters fold: a non-ASCII letter is compared as written.
+    expect(sameSelectedTarget({ ...sent, tagName: 'x-İtem' }, { ...sent, tagName: 'x-i̇tem' })).toBe(
+      false,
+    );
+    expect(sameSelectedTarget(sent, { ...sent, selector: 'MAIN > BUTTON.PRIMARY' })).toBe(false);
+    expect(sameSelectedTarget(sent, { ...sent, text: 'CONTINUE' })).toBe(false);
+  });
+
+  it('sameSelectedTarget answers false whenever either side is undefined, both included', () => {
+    expect(sameSelectedTarget(undefined, validSelectedTarget())).toBe(false);
+    expect(sameSelectedTarget(validSelectedTarget(), undefined)).toBe(false);
+    // A session with no target confirms nothing, and nothing pending has
+    // nothing to be confirmed.
+    expect(sameSelectedTarget(undefined, undefined)).toBe(false);
+  });
+
+  it('SELECTION_DOCUMENT_VERDICTS is the closed, frozen four-verdict vocabulary', () => {
+    expect([...SELECTION_DOCUMENT_VERDICTS]).toEqual([
+      'same-document',
+      'other-origin',
+      'other-document',
+      'unreadable',
+    ]);
+    expect(Object.isFrozen(SELECTION_DOCUMENT_VERDICTS)).toBe(true);
+  });
+
+  it('compareSelectionDocument ignores the query string and the fragment', () => {
+    // The binding URL is stored query-redacted while a descriptor's URL may
+    // not be, and a fragment never changes the document.
+    expect(compareSelectionDocument('http://localhost:3000/list?filter=shoes', PAGE_URL)).toBe(
+      'same-document',
+    );
+    expect(compareSelectionDocument(PAGE_URL, 'http://localhost:3000/list')).toBe('same-document');
+    expect(
+      compareSelectionDocument('http://localhost:3000/list#reviews', 'http://localhost:3000/list?'),
+    ).toBe('same-document');
+    expect(compareSelectionDocument(validSelectedTarget().url, PAGE_URL)).toBe('same-document');
+  });
+
+  it('compareSelectionDocument normalises what the URL parser normalises', () => {
+    expect(
+      compareSelectionDocument('http://LOCALHOST:3000/list', 'http://localhost:3000/list'),
+    ).toBe('same-document');
+    expect(compareSelectionDocument('http://localhost:80/', 'http://localhost')).toBe(
+      'same-document',
+    );
+    // User information is not part of the origin.
+    expect(
+      compareSelectionDocument(
+        ['http://', 'u', ':', 'p', '@localhost:3000/list'].join(''),
+        'http://localhost:3000/list',
+      ),
+    ).toBe('same-document');
+  });
+
+  it('compareSelectionDocument answers other-document for another path on the same origin', () => {
+    expect(
+      compareSelectionDocument('http://localhost:3000/list', 'http://localhost:3000/cart'),
+    ).toBe('other-document');
+    expect(
+      compareSelectionDocument('http://localhost:3000/list', 'http://localhost:3000/list/'),
+    ).toBe('other-document');
+    expect(compareSelectionDocument(PAGE_URL, 'http://localhost:3000/')).toBe('other-document');
+  });
+
+  it('compareSelectionDocument answers other-origin for another scheme, host or port, never matching a prefix', () => {
+    expect(
+      compareSelectionDocument('http://localhost:3000/list', 'http://localhost:30001/list'),
+    ).toBe('other-origin');
+    expect(
+      compareSelectionDocument('http://localhost:30001/list', 'http://localhost:3000/list'),
+    ).toBe('other-origin');
+    expect(
+      compareSelectionDocument('http://localhost/list', 'http://localhost.evil.test/list'),
+    ).toBe('other-origin');
+    expect(
+      compareSelectionDocument('http://localhost.evil.test/list', 'http://localhost/list'),
+    ).toBe('other-origin');
+    expect(
+      compareSelectionDocument('https://localhost:3000/list', 'http://localhost:3000/list'),
+    ).toBe('other-origin');
+    expect(
+      compareSelectionDocument('http://127.0.0.1:3000/list', 'http://localhost:3000/list'),
+    ).toBe('other-origin');
+  });
+
+  it('compareSelectionDocument gives a URL without a web origin no document to share', () => {
+    // The tab may show `about:blank`, a `chrome://` page or a file; none is a
+    // document a selection can belong to, even compared with itself.
+    for (const url of ['about:blank', 'chrome://newtab/', 'file:///tmp/list.html', 'data:,x']) {
+      expect(compareSelectionDocument('http://localhost:3000/list', url)).toBe('other-origin');
+      expect(compareSelectionDocument(url, url)).toBe('other-origin');
+    }
+  });
+
+  it('compareSelectionDocument answers unreadable, and never throws, for a value that is not a URL', () => {
+    for (const garbage of ['', 'not a url', '/list', 'localhost', 'http://', 'http://[::1']) {
+      expect(compareSelectionDocument(garbage, 'http://localhost:3000/list')).toBe('unreadable');
+      expect(compareSelectionDocument('http://localhost:3000/list', garbage)).toBe('unreadable');
+    }
+    expect(compareSelectionDocument('', '')).toBe('unreadable');
+  });
+});
+
 describe('cleanup.completed — the verdict, and what was left alone', () => {
   it('accepts each of the four cleanup statuses', () => {
     expect([...CLEANUP_STATUSES]).toEqual(['pending', 'clean', 'partial', 'conflict']);
@@ -3407,21 +4119,22 @@ describe('cleanup.completed — the verdict, and what was left alone', () => {
 //
 // Everything below is driven from `MESSAGE_PAYLOAD_SCHEMAS` and `MESSAGE_TYPES`
 // rather than from a list written here, which is the only way these cases stay
-// true of a protocol that grows: a twenty-sixth message added to the registry
+// true of a protocol that grows: a twenty-seventh message added to the registry
 // without a fixture in `VALID_PAYLOADS` is a compile error, and one added with a
 // fixture is carried into the round-trip and no-transform cases without an edit —
 // and into the frame-level `parseMessage` cases that close the file, which also
 // need it an entry in `MISMATCHED_PAYLOADS`, again enforced by the compiler.
 //
-// `../messages/index.ts` proves three properties of the registries at compile
-// time — the WebSocket registry covers exactly the twenty-five types, the
-// HTTP-only names overlap them nowhere, and the HTTP-only tuple and map name the
-// same five operations. A type-level assertion is blind to a repeated tuple
-// element and says nothing about key order, so the runtime halves are here.
+// `../messages/index.ts` proves four properties of the registries at compile
+// time — the WebSocket registry covers exactly the twenty-six types, the
+// `MESSAGE_TYPE` constants are exactly those types, the HTTP-only names overlap
+// them nowhere, and the HTTP-only tuple and map name the same five operations.
+// A type-level assertion is blind to a repeated tuple element, to two constants
+// naming one message and to key order, so the runtime halves are here.
 // ---------------------------------------------------------------------------
 
 describe('MESSAGE_TYPES and MESSAGE_PAYLOAD_SCHEMAS — one registry, no gaps', () => {
-  it('lists the twenty-five names of AAP \u00a70.4.2, in order and without duplicates', () => {
+  it('lists the twenty-five names of AAP \u00a70.4.2 and source.result, in order and without duplicates', () => {
     expect([...MESSAGE_TYPES]).toEqual([
       'client.hello',
       'agent.ready',
@@ -3444,6 +4157,7 @@ describe('MESSAGE_TYPES and MESSAGE_PAYLOAD_SCHEMAS — one registry, no gaps', 
       'telemetry.tail',
       'panel.generated',
       'source.open',
+      'source.result',
       'target.request',
       'target.selected',
       'cleanup.completed',
@@ -3453,13 +4167,13 @@ describe('MESSAGE_TYPES and MESSAGE_PAYLOAD_SCHEMAS — one registry, no gaps', 
     // leaves the derived union unchanged, so the compile-time registry check
     // cannot see it, and the mistake would surface one file onward as a Zod
     // discriminated union with two members claiming the same discriminant.
-    expect(MESSAGE_TYPES).toHaveLength(25);
-    expect(new Set(MESSAGE_TYPES).size).toBe(25);
+    expect(MESSAGE_TYPES).toHaveLength(26);
+    expect(new Set(MESSAGE_TYPES).size).toBe(26);
   });
 
   it('holds a schema for every type and for no other name', () => {
     expect(Object.keys(MESSAGE_PAYLOAD_SCHEMAS).sort()).toEqual([...MESSAGE_TYPES].sort());
-    expect(Object.keys(MESSAGE_PAYLOAD_SCHEMAS)).toHaveLength(25);
+    expect(Object.keys(MESSAGE_PAYLOAD_SCHEMAS)).toHaveLength(26);
   });
 
   it('binds each type to the schema its own module exports, by identity', () => {
@@ -3475,6 +4189,24 @@ describe('MESSAGE_TYPES and MESSAGE_PAYLOAD_SCHEMAS — one registry, no gaps', 
   it('is frozen, so no consumer can add a message at runtime', () => {
     expect(Object.isFrozen(MESSAGE_PAYLOAD_SCHEMAS)).toBe(true);
     expect(Object.isFrozen(HTTP_ONLY_PAYLOAD_SCHEMAS)).toBe(true);
+    expect(Object.isFrozen(MESSAGE_TYPE)).toBe(true);
+  });
+
+  it('names every type once under MESSAGE_TYPE, in tuple order, keyed by its upper-snake spelling', () => {
+    // The tuple is built from the constants, so equal order is the claim that
+    // no constant was left out of it or listed twice.
+    expect(Object.values(MESSAGE_TYPE)).toEqual([...MESSAGE_TYPES]);
+    // The key is derivable from the wire name — `.` and `-` become `_` — which
+    // is what lets a reader go from a frame in a log to the constant, and what
+    // rules out two keys naming one message (a second key could not also equal
+    // the one spelling its value derives).
+    for (const [key, type] of Object.entries(MESSAGE_TYPE)) {
+      expect(key, type).toBe(type.replace(/[.-]/g, '_').toUpperCase());
+    }
+    expect(Object.keys(MESSAGE_TYPE)).toHaveLength(26);
+    // None of the five HTTP operations has a WebSocket constant.
+    const constants: ReadonlySet<string> = new Set(Object.values(MESSAGE_TYPE));
+    expect(HTTP_ONLY_PAYLOAD_NAMES.filter((name) => constants.has(name))).toEqual([]);
   });
 
   it('accepts its fixture for every registered type', () => {
@@ -3533,7 +4265,7 @@ describe('MESSAGE_TYPES and MESSAGE_PAYLOAD_SCHEMAS — one registry, no gaps', 
 
       // The envelope carries `payload` as an object for every frame, so a
       // primitive, an array or an absent payload is a rejection at each of the
-      // twenty-five schemas rather than at the envelope alone.
+      // twenty-six schemas rather than at the envelope alone.
       for (const value of [undefined, null, 7, 'x', [], true]) {
         expect(schema.safeParse(value).success).toBe(false);
       }
@@ -3807,7 +4539,7 @@ describe('a rejected payload never echoes what it refused', () => {
 // `../envelope.ts`, which must select the one union member the frame's `type`
 // names and validate the payload against that member alone (AAP §0.4.2). Two
 // properties follow, and both are asserted for every member of `MESSAGE_TYPES`
-// by iterating the tuple itself: a twenty-sixth message is carried into every
+// by iterating the tuple itself: a twenty-seventh message is carried into every
 // case below automatically, and it cannot be added at all without a fixture in
 // `VALID_PAYLOADS` and an entry in `MISMATCHED_PAYLOADS`, each of which is a
 // compile error when missing:
@@ -4007,6 +4739,15 @@ const MISMATCHED_PAYLOADS: { readonly [T in MessageType]: MismatchedPayload<T> }
   'source.open': {
     partner: 'target.selected',
     payload: { sessionId: SESSION_ID, target: { ...validSelectedTarget(), text: SENTINEL } },
+  },
+  // The nearest lookalike of a failed source answer: a session and a nested
+  // `{ code, message, hint }` error, missing only the `ref` and the `status`.
+  'source.result': {
+    partner: 'instrumentation.failed',
+    payload: {
+      sessionId: SESSION_ID,
+      error: { ...VALID_PAYLOADS['instrumentation.failed'].error, message: SENTINEL },
+    },
   },
   'target.request': {
     partner: 'target.selected',
@@ -4337,7 +5078,7 @@ const SUBJECT_TYPES = MESSAGE_TYPES.filter(
 // payload's subject is what a handler acts on. A devtools principal is
 // authorized only for its bound session (AAP §0.5.6), so every member of the
 // union must refuse a frame whose two answers differ — the rule lives in one
-// place in `../envelope.ts`, and this suite proves it reached all twenty-five.
+// place in `../envelope.ts`, and this suite proves it reached all twenty-six.
 describe('parseMessage — every member refuses a routing key that contradicts its payload', () => {
   it('partitions the registry into payloads that name a session and six that name none', () => {
     const subjectless = MESSAGE_TYPES.filter(
@@ -4635,6 +5376,14 @@ const PARSE_HELPER_CASES: { readonly [N in ParseHelperName]: ParseHelperCase<N> 
       location: { ...validSourceLocation(), symbol: SENTINEL, line: 0 },
     },
     refusedFor: 'location.line (too_small',
+  },
+  parseSourceResultPayload: {
+    valid: VALID_PAYLOADS['source.result'],
+    invalid: {
+      ...FAILED_SOURCE_RESULT,
+      error: { ...FAILED_SOURCE_RESULT.error, message: SENTINEL, code: 'NOT_A_CODE' },
+    },
+    refusedFor: 'error.code (invalid_value',
   },
   parseTargetRequestPayload: {
     valid: VALID_PAYLOADS['target.request'],

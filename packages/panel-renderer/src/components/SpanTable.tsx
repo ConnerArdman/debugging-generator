@@ -169,6 +169,7 @@ import { Button } from '../primitives/Button';
 import { DataTable } from '../primitives/DataTable';
 import type {
   DataTableColumn,
+  DataTableColumnWidth,
   DataTableSort,
   DataTableSortDirection,
 } from '../primitives/DataTable';
@@ -379,47 +380,52 @@ const START_COLUMN_KEY = 'startTime' satisfies keyof TelemetryEvent;
 const DURATION_COLUMN_KEY = 'duration' satisfies keyof TelemetryEvent;
 
 /*
- * The column tracks. Each is `minmax(<floor>, <share>)`:
+ * The column width ROLES. A role names what a column holds, never how wide it
+ * is: `primitives/DataTable` resolves each one through
+ * `DATA_TABLE_COLUMN_TRACKS` to a grid track built from the `--dg-column-min-*`
+ * floor and `--dg-column-share-*` share tokens, so this table agrees with every
+ * other table on both extension surfaces about how wide a name or a duration
+ * is, and no length is chosen here (AAP 0.6.4). Each column below takes the
+ * smallest role whose floor keeps its content readable, in the vocabulary every
+ * table shares, and every role's track has two parts:
  *
- * - The SHARE is a ratio, so a column lands at the same offset in every row
- *   (the header and each row are separate grid containers) and spare width goes
- *   to the operation name, the one long and variable value here, four parts to
- *   every other column's one.
  * - The FLOOR is what the column never shrinks below. `primitives/DataTable`
  *   sums the floors into the grid's own minimum width, so a surface narrower
  *   than their sum scrolls the table horizontally with every column still
  *   readable, instead of squeezing each column to its padding and letting one
- *   cell's content paint over the next. Each floor is measured in `ch` of the
- *   table's type and covers the column's header - with the sort arrow where the
- *   column is sortable - its widest bounded value and the cell's own inline
- *   padding. `ch` rather than any literal length (AAP 0.6.4).
+ *   cell's content paint over the next.
+ * - The SHARE is a ratio, so a column lands at the same offset in every row
+ *   (the header and each row are separate grid containers), and the largest
+ *   share of spare width goes to the operation name, the one long and variable
+ *   value here.
  */
 
 /**
- * The operation name, its failure chip and its source chip. The value is free
- * text, so the floor keeps a readable excerpt of the name beside a compact
- * source chip whose file label ellipsizes; the full name wins spare width.
+ * The operation name, its failure chip and its source chip: an identifier, so
+ * the `name` role, whose floor keeps a readable excerpt of the name beside a
+ * compact source chip whose file label ellipsizes, and whose share is the
+ * widest of the table's, so the full name wins spare width.
  */
-const NAME_COLUMN_TRACK = 'minmax(28ch, 4fr)';
+const NAME_COLUMN_WIDTH: DataTableColumnWidth = 'name';
 
-/** The kind chip: fits the longest kind label, "Performance entry", whole. */
-const KIND_COLUMN_TRACK = 'minmax(18ch, 1fr)';
+/** The kind chip, a short categorical label such as "Performance entry". */
+const KIND_COLUMN_WIDTH: DataTableColumnWidth = 'label';
 
-/** The tier chip: fits the longest tier label, "Database", whole. */
-const TIER_COLUMN_TRACK = 'minmax(11ch, 1fr)';
+/** The tier chip, a short badge such as "Database". */
+const TIER_COLUMN_WIDTH: DataTableColumnWidth = 'status';
 
 /**
- * The relative start: fits an offset up to five integer digits in seconds
- * ("12,345.678 s") and the sortable header with its arrow.
+ * The relative start, a formatted offset with its unit such as "12,345.678 s",
+ * under a sortable header.
  */
-const START_COLUMN_TRACK = 'minmax(12ch, 1fr)';
+const START_COLUMN_WIDTH: DataTableColumnWidth = 'quantity';
 
 /**
- * The duration, in the duration cell's wider figures: fits every millisecond
- * value ("999.99 ms") and seconds up to four integer digits ("1,234.567 s"),
- * and the sortable header with its arrow.
+ * The duration, a formatted measurement with its unit - a millisecond value
+ * such as "999.99 ms" or seconds such as "1,234.567 s" - under a sortable
+ * header.
  */
-const DURATION_COLUMN_TRACK = 'minmax(13ch, 1fr)';
+const DURATION_COLUMN_WIDTH: DataTableColumnWidth = 'quantity';
 
 /** The key of one of this table's columns. */
 type SpanColumnKey =
@@ -810,7 +816,7 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<Telemetr
     columns.push({
       key: NAME_COLUMN_KEY,
       header: NAME_HEADER,
-      width: NAME_COLUMN_TRACK,
+      width: NAME_COLUMN_WIDTH,
       // The row's header cell, so a reader hears the operation named as they
       // move across the row rather than hearing five unattributed values.
       rowHeader: true,
@@ -851,7 +857,7 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<Telemetr
     columns.push({
       key: KIND_COLUMN_KEY,
       header: KIND_HEADER,
-      width: KIND_COLUMN_TRACK,
+      width: KIND_COLUMN_WIDTH,
       // A view order either way, by the label the chip displays.
       sortable: true,
       defaultSortDirection: 'asc',
@@ -871,7 +877,7 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<Telemetr
     columns.push({
       key: TIER_COLUMN_KEY,
       header: TIER_HEADER,
-      width: TIER_COLUMN_TRACK,
+      width: TIER_COLUMN_WIDTH,
       // A view order either way: pipeline order (browser, server, database)
       // first, then its reverse.
       sortable: true,
@@ -891,7 +897,7 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<Telemetr
       key: START_COLUMN_KEY,
       header: START_HEADER,
       headerLabel: START_HEADER_LABEL,
-      width: START_COLUMN_TRACK,
+      width: START_COLUMN_WIDTH,
       align: 'end',
       sortable: true,
       // Earliest first is the service's `start_asc`; latest first is a view order.
@@ -908,7 +914,7 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<Telemetr
     columns.push({
       key: DURATION_COLUMN_KEY,
       header: DURATION_HEADER,
-      width: DURATION_COLUMN_TRACK,
+      width: DURATION_COLUMN_WIDTH,
       align: 'end',
       sortable: true,
       // Longest first is the service's `duration_desc`; shortest first is a

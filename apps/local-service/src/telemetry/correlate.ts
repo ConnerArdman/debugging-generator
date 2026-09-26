@@ -10,28 +10,48 @@
  * with `POST /sessions/:id/panel-data { source: 'trace', filter: { traceId } }`
  * (AAP 0.8.1, slice 7). Nothing about the tree itself is decided here.
  *
- * ## Rebuild per touched trace, never patch in place
+ * ## Extend cached trees at ingest; rebuild lazily as the bounded fallback
  *
  * Every event of a trace arrives from one of two independent producers — the
  * MAIN-world browser agent and the dev-server Node preload — over two different
  * transports, in batches whose interleaving nobody controls. A page reload
  * replays an agent buffer; a server span can land before the `fetch` span that
- * caused it; a parent can arrive after its children.
+ * caused it; a parent can arrive after its children. The pipeline is persist →
+ * correlate incrementally → tail (AAP 0.7.1, Group 2), and correlation must
+ * stay proportional to what each batch brought: rereading and re-sorting the
+ * whole accumulated trace per batch costs `O(n²/b)` for `n` events arriving in
+ * batches of `b`, on the same path that feeds the live tail, and deferring that
+ * rebuild to the next read only moves the same cost to a panel that reads after
+ * every batch.
  *
- * So {@link TraceCorrelator.onEventsPersisted} does not merge a batch into a
- * cached tree. For each `(sessionId, traceId)` pair the batch mentions it loads
- * the trace's **complete** persisted event set and correlates that from
- * scratch. The reason is that rebuilding is idempotent and permutation
- * invariant — `correlateTrace`'s own guarantee — so out-of-order arrival, a
- * replayed buffer and a late parent all converge on exactly the same tree,
- * whereas an in-place patch would have to re-parent, re-sort and re-count a
- * subtree and would leave a tree that depends on arrival order. The cost is one
- * indexed read and one `O(n log n)` pass per touched trace per batch, over the
- * handful of traces one interaction produces; the alternative is a structure
- * that two clients can disagree about.
+ * So {@link TraceCorrelator.onEventsPersisted} **extends each cached tree the
+ * batch touched, in place of rebuilding it**, through `@debuggen/telemetry`'s
+ * `extendCorrelatedTrace`. That function is exact or silent: it either answers
+ * with the very tree `correlateTrace` would build from the scope's complete
+ * stored rows — identical down to the key order — or it refuses. What a capture
+ * really streams extends: spans under known parents, server spans whose
+ * `fetch` has not landed (orphans on the anchor), the late `fetch` that adopts
+ * them, and parentless spans that do not outrank the anchor. It refuses only
+ * what a full correlation alone reproduces: a batch that moves the trace's
+ * anchor (`primary-change` — possible only while the trace has no genuine root,
+ * and once per root that outranks the anchor), a span id seen twice, a cycle,
+ * the depth guard, and rows that are not the stored ones. A refused scope is
+ * dropped, and its next read reloads and correlates the complete stored set
+ * once, however many batches landed in between — the lazy rebuild, kept as the
+ * bounded fallback, after which the scope extends again. Either way no tree is
+ * ever built from a batch alone, and no write to the store leaves a cached tree
+ * behind it: an extended tree equals the full correlation by construction, and
+ * a dropped one is rebuilt from the store. Rows the store deletes — a retention
+ * purge, a session end — reach the cache through
+ * {@link TraceCorrelator.invalidate}, as before.
  *
- * A tree is therefore **never** built from a batch alone. A batch names traces;
- * the store supplies their events.
+ * The per-scope index an extension needs (span id → node, the spans the
+ * trace's orphans are missing) is built lazily, in one `O(n)` walk, the first
+ * time a batch touches the cached entry, and kept current by every extension;
+ * after that each batch costs its own size plus the orphan subtrees it moves
+ * and the paths it touches, and no store read. Scopes that are not cached are
+ * not touched at all: nothing is read or built for a tree no reader has asked
+ * for.
  *
  * ## Ordering is delegated, in full
  *
@@ -70,8 +90,8 @@
  *
  * A bounded, insertion-ordered `Map` holds the last tree built for each
  * `(sessionId, scope, traceId)` triple, so the panel's repeated reads of one
- * interaction cost nothing after the capture that produced it. Recency is by
- * last **write**, not by read (see {@link TRACE_CACHE_LIMIT}).
+ * interaction cost nothing after the first. Recency is by last **write**, not
+ * by read (see {@link TRACE_CACHE_LIMIT}).
  *
  * The scope is the `captureId` a read named, or the whole session when it named
  * none. When given, `captureId` narrows **both** the enumeration of trace ids
@@ -90,11 +110,36 @@
  * capture-scoped tree is the complete interaction as that capture recorded it.
  * Omitting `captureId` gives the session-wide join, over every capture.
  *
- * {@link TraceCorrelator.onEventsPersisted} rebuilds the session-wide tree of
- * every trace a batch touches and drops that trace's capture-scoped trees for
- * exactly the captures the batch named, which the next capture-scoped read
- * rebuilds. The trees of the captures the batch did not name stay cached: their
- * event sets did not change.
+ * {@link TraceCorrelator.onEventsPersisted} reaches the session-wide tree of
+ * every trace a batch touches — with every event of the batch for that session
+ * and trace — and that trace's capture-scoped trees for exactly the captures
+ * the batch named, each with only that capture's events of the batch. Each of
+ * those that is cached is extended, or dropped for a rebuild on its next read.
+ * The trees of the captures the batch did not name stay cached as they were:
+ * their event sets did not change.
+ *
+ * ## What bounds the cache, and what a racing read may keep
+ *
+ * An entry's weight is its tree's node count — plus the extension index's
+ * share once a batch has indexed it ({@link TRACE_INDEX_WEIGHT_DIVISOR}) — and
+ * a count bound alone does not bound that: one trace may hold up to 100 000
+ * nodes, and the same trace can be cached session-wide and once per capture. So
+ * two bounds hold together — {@link TRACE_CACHE_LIMIT} entries and
+ * {@link TRACE_CACHE_NODE_BUDGET} weight across all of them, evicted
+ * oldest-write-first until both are met — and no single entry may weigh more
+ * than {@link TRACE_CACHE_MAX_TREE_NODES}: a heavier tree answers its read
+ * exactly as any other and is not cached, and an extension that grows a tree
+ * past the cap leaves it uncached rather than evicting everything else. The
+ * weight is stored on the entry when it is written, and every removal goes
+ * through one helper, so the total the budget is checked against is exact.
+ *
+ * A read that misses registers itself before it loads, and an invalidation of
+ * its scope that lands while the load is in flight — a batch, an
+ * {@link TraceCorrelator.invalidate} or a {@link TraceCorrelator.close} — marks
+ * it stale. A stale read's tree still answers that read, since it is what the
+ * store held when the read began, but it is not cached, so no later read can be
+ * served a tree that predates rows the store now holds. Only reads in flight are
+ * registered, so that bookkeeping is bounded by concurrency, never by history.
  *
  * ## Failure, privacy and what this module is not
  *
@@ -116,26 +161,37 @@
  *
  * It computes trees and nothing else. Metrics belong to `@debuggen/telemetry`'s
  * `aggregate/*`, facts to `../analysis/`, and the assembly of a `DataResult` to
- * `../panels/data.ts` — which calls `correlateTrace` directly for its `trace`
- * source and deliberately does not depend on this cache, so the two paths
- * return the same upstream {@link TraceTree} shape and can never disagree.
+ * `../panels/data.ts`, which reads its `trace` source through
+ * {@link TraceCorrelator.getTrace}, as `../analysis/summarize.ts` does: both are
+ * served the upstream {@link TraceTree} this module built from the trace's
+ * complete stored set, or extended to exactly the tree that set produces.
  *
  * @example
  * ```ts
  * const correlator = createTraceCorrelator({ telemetry, logger });
  * const stored = telemetry.insertMany(attributed); // ingestSeq assigned here
  * if (isOk(stored)) {
- *   await correlator.onEventsPersisted(stored.value.events);
+ *   await correlator.onEventsPersisted(stored.value.events); // extends cached trees; no store read
  * }
- * const trace = await correlator.getTrace(sessionId, traceId); // every capture
+ * const trace = await correlator.getTrace(sessionId, traceId); // every capture; built once, then cached
  * const window = await correlator.getTraces(sessionId, captureId); // that capture's events only
  * ```
  */
 
 import { DebuggenError, err, isErr, noopLogger, ok } from '@debuggen/shared';
 import type { CaptureId, Logger, Result, SessionId, TraceId } from '@debuggen/shared';
-import { DEFAULT_MAX_DEPTH, correlateTrace } from '@debuggen/telemetry';
-import type { TelemetryEvent, TraceTree } from '@debuggen/telemetry';
+import {
+  DEFAULT_MAX_DEPTH,
+  correlateTrace,
+  extendCorrelatedTrace,
+  indexTraceForExtension,
+} from '@debuggen/telemetry';
+import type {
+  ExtensionRefusalReason,
+  TelemetryEvent,
+  TraceExtensionIndex,
+  TraceTree,
+} from '@debuggen/telemetry';
 
 import { LOG_BINDING_KEYS } from '../logging.js';
 import { TELEMETRY_QUERY_MAX_LIMIT } from '../store/telemetry-repo.js';
@@ -170,13 +226,13 @@ export const CORRELATOR_MAX_DEPTH: number = DEFAULT_MAX_DEPTH;
 /**
  * How many correlated traces one correlator keeps in memory: `256`.
  *
- * The bound is generous on purpose and still small: a cached entry is one
- * {@link TraceTree} whose nodes *reference* the event objects the store already
- * reconstructed, so an entry costs a few hundred small objects rather than a
- * copy of the capture, and one interaction produces one trace — a long session
- * across several captures rarely reaches three figures. 256 therefore holds
- * every trace a developer is likely to revisit while keeping the ceiling
- * bounded and predictable.
+ * The **count** bound. It caps how many entries exist — and so the length of
+ * every walk over them, such as {@link TraceCorrelator.invalidate} — while
+ * {@link TRACE_CACHE_NODE_BUDGET} caps what they weigh; neither stands in for
+ * the other, because one entry holds anything from a single node to
+ * {@link TRACE_CACHE_MAX_TREE_NODES}. One interaction produces one trace,
+ * cached once per scope it is read in, so 256 holds every trace a developer is
+ * likely to revisit across a long session of several captures.
  *
  * Eviction is oldest-**write**-first: a rebuild re-inserts its key, so the
  * victim is always the least recently *built* trace. A cache hit deliberately
@@ -188,6 +244,73 @@ export const CORRELATOR_MAX_DEPTH: number = DEFAULT_MAX_DEPTH;
  * is legal and disables caching entirely.
  */
 export const TRACE_CACHE_LIMIT = 256;
+
+/**
+ * How much cached weight one correlator keeps, summed over every entry:
+ * `50 000` node units.
+ *
+ * The **weight** bound, and the one that bounds memory. One unit is one cached
+ * node: a `TraceNode` plus the reconstructed `TelemetryEvent` it references —
+ * the store builds a fresh event object on every read, so the cache is what
+ * keeps it alive — which measures about 0.85 KiB on Node 24 for representative
+ * events (the identifiers, a name, a handful of redacted attributes and a
+ * source location) and is budgeted here at 1 KiB. An entry that a batch has
+ * indexed for extension also carries the index's share
+ * ({@link TRACE_INDEX_WEIGHT_DIVISOR}). 50 000 units therefore hold the cache
+ * near 50 MiB at worst: a ceiling a developer machine carries for the life of
+ * the service, and still room for the full {@link TRACE_CACHE_LIMIT} of traces
+ * at about 200 nodes each, beyond the tens to hundreds of events a real
+ * interaction produces.
+ *
+ * Entries are evicted oldest-write-first until both this bound and
+ * {@link TRACE_CACHE_LIMIT} hold. Override it per correlator with
+ * {@link TraceCorrelatorDeps.cacheNodeBudget}; `0` disables caching entirely.
+ */
+export const TRACE_CACHE_NODE_BUDGET = 50_000;
+
+/**
+ * The heaviest entry the cache may hold: `10 000` node units.
+ *
+ * A single trace may reach {@link MAX_TRACE_EVENTS} (100 000) nodes — about
+ * 100 MiB at the per-node estimate of {@link TRACE_CACHE_NODE_BUDGET} — and
+ * caching one would evict every other entry to make room for it. Capped at a
+ * fifth of the budget (about 10 MiB), no one trace can take more than that share,
+ * so the working set of ordinary interactions survives a pathological one. A
+ * tree above the cap is correlated and returned to its reader like any other
+ * and is not cached: each read of it rebuilds from the store, which has to page
+ * that many rows to answer it either way.
+ *
+ * The cap applies to an entry's **weight** — its nodes, plus the extension
+ * index's share once indexed — so that no entry, indexed or not, can outweigh
+ * the budget and evict itself. A cached tree too heavy to index within the cap
+ * is dropped when a batch touches it, and one an extension grows past the cap
+ * is not cached; both rebuild on their next read, as a tree above the cap
+ * always does.
+ *
+ * The cap in force is the smaller of this and the node budget. Override it per
+ * correlator with {@link TraceCorrelatorDeps.maxCachedTreeNodes}.
+ */
+export const TRACE_CACHE_MAX_TREE_NODES = 10_000;
+
+/**
+ * What the extension index costs, as a fraction of the tree it indexes: one
+ * node unit per `16` indexed nodes, rounded up.
+ *
+ * An index (`TraceExtensionIndex` in `@debuggen/telemetry`) holds one `Map`
+ * entry per node — span id → node, sharing the strings and node objects the
+ * tree already keeps alive — plus a map of the few span ids the trace's
+ * orphans are missing and three small vocabulary sets. Measured on Node 24
+ * over realistic trees of 2 000 to 100 000 nodes, the index adds 31–47 bytes
+ * per node, and at most 56 bytes just after the map's hash table has doubled —
+ * about 7.5 % of the 750–800 bytes each tree node itself measured. One
+ * sixteenth of the 1 KiB a node unit is budgeted at is 64 bytes, which covers
+ * that worst case. The placement parent is derived from each node rather than
+ * stored in a second map, which is what keeps the share this small.
+ *
+ * The weight is computed once, when an entry is written, and stored on it, so
+ * every removal subtracts exactly what the insertion added.
+ */
+export const TRACE_INDEX_WEIGHT_DIVISOR = 16;
 
 /**
  * How many rows one page of a trace load asks for: the store's ceiling.
@@ -234,6 +357,14 @@ const STORE_FAILURE_HINT =
 /** The recovery instruction an unexpected correlation failure carries. */
 const CORRELATE_FAILURE_HINT =
   'Reload the panel to request the trace again; the captured events are stored and unaffected.';
+
+/**
+ * The recovery instruction a persisted batch that could not be scanned
+ * carries: the rows are stored, and every cached tree was dropped so that each
+ * rebuilds from them on its next read.
+ */
+const BATCH_SCAN_FAILURE_HINT =
+  'Report the service log; the batch is stored and every trace rebuilds from the store on its next read.';
 
 /**
  * The recovery instruction a refused tree carries when correlation did not keep
@@ -348,33 +479,51 @@ export interface TraceCorrelatorDeps {
    * absent.
    */
   readonly cacheLimit?: number | undefined;
+
+  /**
+   * How much weight the cached entries may carry between them, in node units
+   * (see {@link TRACE_CACHE_NODE_BUDGET}). Defaults to
+   * {@link TRACE_CACHE_NODE_BUDGET}; `0` disables caching, and a value that is
+   * not a non-negative integer is treated as absent.
+   */
+  readonly cacheNodeBudget?: number | undefined;
+
+  /**
+   * The most weight one cached entry may carry — its nodes, plus the extension
+   * index's share once indexed; a heavier tree answers its read and is not
+   * cached. Defaults to {@link TRACE_CACHE_MAX_TREE_NODES}, never exceeds
+   * `cacheNodeBudget`, and a value that is not a non-negative integer is
+   * treated as absent.
+   */
+  readonly maxCachedTreeNodes?: number | undefined;
 }
 
 /**
  * What one {@link TraceCorrelator.onEventsPersisted} call did.
  *
- * The counts are the ingest path's audit trail: `tracesTouched.length` is how
- * many distinct traces the batch mentioned, `rebuilt` how many trees were
- * actually built (a touched trace with no persisted rows contributes to the
- * first and not the second), and `orphanCount` how much parentage had to be
- * repaired across them — a count only, never the affected spans.
+ * The ingest path's audit trail: which traces the batch mentioned. No cached
+ * tree of any of them predates the batch — each was extended to include it or
+ * dropped for a rebuild on its next read. What happened to each entry is
+ * counted in {@link CorrelatorStats} rather than here, so this shape stays the
+ * one the ingest path builds and reads.
  */
 export interface CorrelateUpdate {
-  /** The trace ids the batch mentioned, in first-seen order. */
+  /**
+   * The trace ids the batch mentioned, one per distinct `(session, trace)` pair,
+   * in first-seen order.
+   */
   readonly tracesTouched: readonly TraceId[];
-  /** How many trees were rebuilt and cached. */
-  readonly rebuilt: number;
-  /** How many nodes were re-attached, summed over the rebuilt trees. */
-  readonly orphanCount: number;
 }
 
 /**
  * The cache and build counters of one correlator, for diagnostics and tests.
  *
- * `hits`, `misses` and `rebuilds` are cumulative for the correlator's lifetime
- * and are not reset by {@link TraceCorrelator.invalidate} or
+ * `hits`, `misses`, `rebuilds`, `invalidations`, `extensions` and
+ * `extensionNodesBuilt` are cumulative for the correlator's lifetime and are
+ * not reset by {@link TraceCorrelator.invalidate} or
  * {@link TraceCorrelator.close}: they describe what the correlator has done,
- * while `cachedTraces` describes what it currently holds.
+ * while `cachedTraces`, `cachedNodes` and `cachedWeight` describe what it
+ * currently holds.
  */
 export interface CorrelatorStats {
   /**
@@ -382,51 +531,95 @@ export interface CorrelatorStats {
    * a trace cached session-wide and for two of its captures counts three times.
    */
   readonly cachedTraces: number;
+  /** How many tree nodes the cached trees hold between them right now. */
+  readonly cachedNodes: number;
+  /**
+   * The weight the cached entries carry right now: their nodes plus the share
+   * of every extension index they hold ({@link TRACE_INDEX_WEIGHT_DIVISOR}) —
+   * the total {@link TRACE_CACHE_NODE_BUDGET} bounds. Equal to `cachedNodes`
+   * while no entry is indexed.
+   */
+  readonly cachedWeight: number;
   /** How many reads were served from the cache. */
   readonly hits: number;
   /** How many reads had to load and build. */
   readonly misses: number;
   /**
-   * How many trees have been built, by ingest and by cache misses alike. A
-   * tree refused because it did not hold every loaded row is not counted.
+   * How many trees have been built from the store. Only a read that missed
+   * builds one; a tree refused because it did not hold every loaded row is not
+   * counted, and neither is an extension.
    */
   readonly rebuilds: number;
+  /**
+   * How many cached trees were dropped rather than kept current — by a
+   * persisted batch the tree could not absorb exactly (or that would have
+   * grown it past the per-entry cap), or by {@link TraceCorrelator.invalidate}.
+   * Eviction and {@link TraceCorrelator.close} are not counted.
+   */
+  readonly invalidations: number;
+  /**
+   * How many times a persisted batch grew a cached tree incrementally instead
+   * of dropping it. A batch of replays alone changes nothing and is not
+   * counted.
+   */
+  readonly extensions: number;
+  /**
+   * The node objects those extensions created between them — the new nodes
+   * plus the ancestors copied to hold them: the whole incremental work, which
+   * depends on the batches and the paths they touch, never on the size of the
+   * trees they grew.
+   */
+  readonly extensionNodesBuilt: number;
 }
 
 /**
  * Incremental trace correlation for one service process.
  *
  * Construct it with {@link createTraceCorrelator}. The ingest path calls
- * {@link TraceCorrelator.onEventsPersisted} as each batch lands; the panel-data
- * and analysis paths read through {@link TraceCorrelator.getTrace},
- * {@link TraceCorrelator.getTraces} and
- * {@link TraceCorrelator.listTraceIds}. No method throws and no method rejects.
+ * {@link TraceCorrelator.onEventsPersisted} as each batch lands, which extends
+ * the cached trees it touched (or drops those it cannot extend exactly); the
+ * panel-data and analysis paths read through {@link TraceCorrelator.getTrace},
+ * {@link TraceCorrelator.getTraces} and {@link TraceCorrelator.listTraceIds},
+ * and a read of a dropped or never-cached scope builds it once from the store.
+ * No method throws and no method rejects.
  */
 export interface TraceCorrelator {
   /**
-   * Rebuilds every trace a freshly persisted batch mentions.
+   * Brings every cached tree a freshly persisted batch touched up to date with
+   * it: extended incrementally where that is exact, dropped for a rebuild on
+   * its next read where it is not.
    *
    * Call it with the events **returned** by the store's `insertMany`, never
-   * with the ingress events: `ingestSeq` is assigned by the store and is the
-   * final ordering tie-break, so a batch that has not been through persistence
-   * carries no such number to order by.
+   * with the ingress events: attribution stamps the `sessionId` and `captureId`
+   * that name the cache scopes a batch changed, those rows carry the
+   * `ingestSeq` the canonical order ends on, and the rows a dropped scope
+   * rebuilds from have to be in the store before any read asks for them.
    *
-   * Each touched trace is reloaded in full and correlated from scratch, which
-   * makes the call idempotent: running it twice on the same batch, or retrying
-   * it after a store failure, converges on the same trees.
-   *
-   * What is rebuilt is each touched trace's **session-wide** tree. Its
-   * capture-scoped trees are dropped for exactly the captures the batch named
-   * for it — their event sets changed — and rebuilt by the next capture-scoped
-   * read; the trees of captures the batch did not name are left cached.
+   * The call reads nothing from the store. It scans the batch once; then, for
+   * each distinct `(sessionId, traceId)` pair, it takes the trace's
+   * session-wide scope with every event of the batch for the pair, and its
+   * scopes for exactly the captures the batch named, each with that capture's
+   * events. A scope that is cached is extended with those events — its
+   * extension index is built on first use, in one walk of the tree, and kept
+   * current afterwards — so that the tree stays exactly the correlation of the
+   * scope's stored rows — orphans, the late parents that adopt them and roots
+   * that leave the anchor in place included; a batch the tree cannot absorb
+   * exactly (one that moves the anchor, a reused span id, a cycle, the depth
+   * guard), a tree that cannot be indexed, and one that would outgrow the
+   * per-entry cap are dropped instead, and the next {@link getTrace} rebuilds
+   * that scope from the store once. A scope that is not cached is left alone:
+   * nothing is read or built for it. Any read of a reached scope still in
+   * flight is marked stale, so that it cannot cache what it loaded before the
+   * batch. The trees of captures the batch did not name stay cached as they
+   * were. A replayed row — the stored row itself, delivered again — changes
+   * nothing, so running it twice on one batch is harmless.
    *
    * @param events The batch as the store now holds it, in any order. An empty
    * batch is a successful no-op that touches neither the store nor the cache.
-   * @returns What was rebuilt, or the first failure encountered — in which case
-   * the traces already rebuilt keep their fresh trees, the failing trace and
-   * every touched trace after it lose the trees cached before the batch
-   * (session-wide and for the captures the batch named) so none is served
-   * stale, and a retry is safe.
+   * @returns The traces the batch touched. The call fails, with `INTERNAL`, only
+   * when the batch itself cannot be scanned; which traces it changed is then
+   * unknown, so every cached tree is dropped and every read in flight is marked
+   * stale before the error is returned, and nothing stale can be served.
    */
   onEventsPersisted(
     events: readonly TelemetryEvent[],
@@ -434,6 +627,12 @@ export interface TraceCorrelator {
 
   /**
    * One correlated trace, from the cache when it is there.
+   *
+   * A miss loads the scope's complete event set, correlates it and caches the
+   * tree — unless the tree exceeds the per-entry cap, or a batch touching the
+   * scope (or an invalidation of it) landed while the load was in flight; the
+   * tree answers this read in both cases and is not cached (see the module
+   * notes).
    *
    * @param sessionId The session that owns the evidence.
    * @param traceId The interaction to resolve.
@@ -489,7 +688,8 @@ export interface TraceCorrelator {
    * Drops cached trees so the next read rebuilds from the store.
    *
    * Every scope is dropped: the session-wide tree and each capture-scoped tree
-   * alike.
+   * alike. A read of any of those scopes still in flight is marked stale, so it
+   * answers its caller without caching a tree loaded before this call.
    *
    * @param sessionId The session whose entries to drop.
    * @param traceId One trace, under every scope it is cached in, or every
@@ -504,10 +704,12 @@ export interface TraceCorrelator {
   /**
    * Releases the cache.
    *
-   * The correlator owns no connection, timer or listener, so this is idempotent
-   * and leaves the instance usable: a read arriving after a shutdown has begun
-   * still answers from the store rather than failing, and repopulates the cache
-   * it needs. The counters are left alone.
+   * Every cached tree is dropped and every read in flight is marked stale, so
+   * none of them repopulates the cache it was begun against. The correlator
+   * owns no connection, timer or listener, so this is idempotent and leaves the
+   * instance usable: a read arriving after a shutdown has begun still answers
+   * from the store rather than failing, and repopulates the cache it needs. The
+   * counters are left alone.
    */
   close(): void;
 }
@@ -518,39 +720,121 @@ export interface TraceCorrelator {
 
 /**
  * One `(sessionId, traceId)` pair a persisted batch mentioned, with the
- * session-wide cache key and the captures the batch named for it.
+ * session-wide cache key and the batch's events for each scope it changed.
  */
 interface TouchedTrace {
   /** The session that owns the trace. */
   readonly sessionId: SessionId;
-  /** The trace to rebuild. */
+  /** The trace whose cached trees the batch changed. */
   readonly traceId: TraceId;
   /** The session-wide cache key for the pair, computed once. */
   readonly key: string;
   /**
-   * The distinct captures the batch named for the pair, in first-seen order:
-   * the capture-scoped trees of the trace whose event sets the batch changed.
+   * Every event of the batch for the pair, in batch order: what the
+   * session-wide scope, which joins every capture, gained.
    */
-  readonly captureIds: ReadonlySet<CaptureId>;
+  readonly events: readonly TelemetryEvent[];
+  /**
+   * The batch's events for each capture it named for the pair, captures in
+   * first-seen order: what each capture-scoped tree of the trace gained.
+   */
+  readonly captures: ReadonlyMap<CaptureId, readonly TelemetryEvent[]>;
+}
+
+/** One cache scope a batch changed, with the events it gained. */
+interface ChangedScope {
+  /** The scope's cache key. */
+  readonly key: string;
+  /** The capture it is narrowed to; `undefined` for the session-wide scope. */
+  readonly captureId: CaptureId | undefined;
+  /** The batch's events that belong to the scope. */
+  readonly events: readonly TelemetryEvent[];
 }
 
 /**
- * One cached tree, with the scope it was built for.
+ * The scope one tree is built for: a trace of a session, narrowed to one
+ * capture or joined across all of them.
  *
- * The scope travels with the tree rather than being parsed back out of the key,
- * so deciding which entries belong to a session or to a trace is a comparison
- * of the fields below and never depends on what characters an identifier
- * contains.
+ * The scope travels with a cached tree and with a read in flight rather than
+ * being parsed back out of the key, so deciding which of them belong to a
+ * session or to a trace is a comparison of these fields and never depends on
+ * what characters an identifier contains.
  */
-interface CachedTrace {
+interface TraceScope {
   /** The session that owns the evidence. */
   readonly sessionId: SessionId;
   /** The capture the tree is narrowed to; `undefined` for the session-wide tree. */
   readonly captureId: CaptureId | undefined;
   /** The trace the tree correlates. */
   readonly traceId: TraceId;
-  /** The tree itself, exactly as the correlator built it. */
+}
+
+/** One cached tree, with the scope it was built for. */
+interface CachedTrace extends TraceScope {
+  /**
+   * The tree itself: exactly what `correlateTrace` builds from the scope's
+   * stored rows, whether it was built that way or extended to it.
+   */
   readonly tree: TraceTree;
+  /**
+   * The index that lets a batch extend {@link CachedTrace.tree}, once a batch
+   * has touched the entry; `undefined` until then. It always describes this
+   * entry's tree, and belongs to this entry alone.
+   */
+  readonly extension: TraceExtensionIndex | undefined;
+  /**
+   * What the entry weighs against the node budget — the tree's nodes, plus
+   * the index's share when there is one — fixed when the entry was written, so
+   * that removing it subtracts exactly what inserting it added.
+   */
+  readonly weight: number;
+}
+
+/** What {@link CachedTrace} holds besides its scope. */
+type CachedTraceContent = Pick<CachedTrace, 'tree' | 'extension'>;
+
+/**
+ * Why a cached tree a batch reached was dropped rather than extended: the
+ * extension's own refusal, or one of the service's two reasons not to try —
+ * the tree cannot be indexed for extension, or indexing it (or growing it)
+ * would carry it past the per-entry cap.
+ */
+type DropReason = ExtensionRefusalReason | 'not-extendable' | 'over-cap' | 'extension-failed';
+
+/** What a batch did to one scope it changed. */
+type ScopeOutcome =
+  | { readonly kind: 'uncached' }
+  | { readonly kind: 'unchanged' }
+  | { readonly kind: 'extended'; readonly nodesBuilt: number }
+  | { readonly kind: 'dropped'; readonly reason: DropReason };
+
+/**
+ * What a cached entry weighs: one unit per node, plus one per
+ * {@link TRACE_INDEX_WEIGHT_DIVISOR} nodes, rounded up, when it is indexed.
+ *
+ * @param nodeCount The tree's node count.
+ * @param indexed Whether the entry holds an extension index.
+ * @returns The weight in node units.
+ */
+function entryWeight(nodeCount: number, indexed: boolean): number {
+  return indexed ? nodeCount + Math.ceil(nodeCount / TRACE_INDEX_WEIGHT_DIVISOR) : nodeCount;
+}
+
+/**
+ * One cache miss whose load is in flight: the scope it will cache under, and
+ * whether an invalidation of that scope has landed since the load began.
+ *
+ * Registered before the load starts and removed when it ends, however it ends,
+ * so the registry holds only reads in flight — bounded by concurrency, never by
+ * history. Invalidation matches a pending read by the same fields, and with the
+ * same rules, as it matches a cached tree.
+ */
+interface PendingRead extends TraceScope {
+  /**
+   * Set once an invalidation of this scope has landed: the read's tree still
+   * answers its caller, and is never cached.
+   */
+  stale: boolean;
 }
 
 /** What one batch scan found. */
@@ -601,6 +885,46 @@ function cacheKey(
   captureId: CaptureId | undefined,
 ): string {
   return JSON.stringify([sessionId, captureId ?? null, traceId]);
+}
+
+/**
+ * Every scope one touched trace's batch changed, with the events each gained:
+ * the session-wide tree with all of them, then one capture-scoped tree per
+ * capture the batch named, with that capture's.
+ *
+ * @param touched The pair, with its events per scope.
+ * @returns The scopes, session-wide first, then in first-seen capture order.
+ */
+function changedScopes(touched: TouchedTrace): ChangedScope[] {
+  const scopes: ChangedScope[] = [
+    { key: touched.key, captureId: undefined, events: touched.events },
+  ];
+
+  for (const [captureId, events] of touched.captures) {
+    scopes.push({
+      key: cacheKey(touched.sessionId, touched.traceId, captureId),
+      captureId,
+      events,
+    });
+  }
+
+  return scopes;
+}
+
+/**
+ * Whether a cached tree or a read in flight belongs to one session, or to one
+ * trace of it — under any scope, session-wide and per capture alike.
+ *
+ * The one rule {@link TraceCorrelator.invalidate} applies to both, so a cached
+ * tree and a read that is about to cache one can never be matched differently.
+ *
+ * @param scope The tree's or the read's scope.
+ * @param sessionId The session being invalidated.
+ * @param traceId One trace of it, or every trace when absent.
+ * @returns `true` when the scope is covered.
+ */
+function isWithin(scope: TraceScope, sessionId: SessionId, traceId: TraceId | undefined): boolean {
+  return scope.sessionId === sessionId && (traceId === undefined || scope.traceId === traceId);
 }
 
 /**
@@ -748,8 +1072,8 @@ function incompleteTraceError(
  * Constructing it performs no I/O, opens nothing and reads no clock: the first
  * store access happens inside the first call.
  *
- * @param deps The telemetry reads, the logger and the two bounds; see
- * {@link TraceCorrelatorDeps}.
+ * @param deps The telemetry reads, the logger, the depth guard and the three
+ * cache bounds; see {@link TraceCorrelatorDeps}.
  * @returns The correlator, whose methods neither throw nor reject.
  */
 export function createTraceCorrelator(deps: TraceCorrelatorDeps): TraceCorrelator {
@@ -757,6 +1081,14 @@ export function createTraceCorrelator(deps: TraceCorrelatorDeps): TraceCorrelato
   const log = (deps.logger ?? noopLogger).child({ [LOG_BINDING_KEYS.subsystem]: SUBSYSTEM });
   const maxDepth = resolveBound(deps.maxDepth, CORRELATOR_MAX_DEPTH);
   const cacheLimit = resolveBound(deps.cacheLimit, TRACE_CACHE_LIMIT);
+  const nodeBudget = resolveBound(deps.cacheNodeBudget, TRACE_CACHE_NODE_BUDGET);
+  // A tree above the budget could never be cached without evicting itself, so
+  // the per-entry cap is never allowed to exceed it.
+  const maxTreeNodes = Math.min(
+    resolveBound(deps.maxCachedTreeNodes, TRACE_CACHE_MAX_TREE_NODES),
+    nodeBudget,
+  );
+  const cachingEnabled = cacheLimit > 0 && nodeBudget > 0;
 
   /**
    * The cached trees, in insertion order of their last write.
@@ -766,33 +1098,121 @@ export function createTraceCorrelator(deps: TraceCorrelatorDeps): TraceCorrelato
    */
   const cache = new Map<string, CachedTrace>();
 
+  /**
+   * The reads in flight, by the cache key they will write.
+   *
+   * A set per key because two reads of one scope can be in flight at once — two
+   * panel nodes asking for the same trace — and each must be judged stale on
+   * its own. A key leaves the map with its last read, so the map is empty
+   * whenever no read is in flight.
+   */
+  const pending = new Map<string, Set<PendingRead>>();
+
+  /**
+   * The node count summed over {@link cache}, reported as
+   * {@link CorrelatorStats.cachedNodes}.
+   */
+  let cachedNodes = 0;
+  /**
+   * The stored weights summed over {@link cache}: the total
+   * {@link TRACE_CACHE_NODE_BUDGET} bounds. Exact because every insertion goes
+   * through {@link remember}, every removal through {@link drop}, and both use
+   * the weight stored on the entry.
+   */
+  let cachedWeight = 0;
   let hits = 0;
   let misses = 0;
   let rebuilds = 0;
+  let invalidations = 0;
+  let extensions = 0;
+  let extensionNodesBuilt = 0;
 
   /**
-   * Caches a freshly built tree and evicts down to {@link cacheLimit}.
+   * Removes one cached tree and its weight — the only way an entry leaves the
+   * cache, which is what keeps {@link cachedNodes} and {@link cachedWeight}
+   * exact.
    *
-   * The `delete` before the `set` is load-bearing: re-assigning an existing key
-   * in a `Map` leaves it in its original position, so without it a trace that
-   * is rebuilt on every batch would keep aging towards eviction while newer,
-   * untouched traces stayed.
+   * @param key The entry's cache key.
+   * @returns Whether an entry was removed.
    */
-  function remember(key: string, entry: CachedTrace): void {
-    if (cacheLimit === 0) {
-      return;
+  function drop(key: string): boolean {
+    const entry = cache.get(key);
+
+    if (entry === undefined) {
+      return false;
     }
 
     cache.delete(key);
-    cache.set(key, entry);
+    cachedNodes -= entry.tree.nodeCount;
+    cachedWeight -= entry.weight;
+    return true;
+  }
 
-    while (cache.size > cacheLimit) {
+  /**
+   * Caches a tree — freshly built by a read, or extended by a batch — then
+   * evicts oldest-write-first until both the count bound and the node budget
+   * hold.
+   *
+   * The key's previous entry is dropped first, and that is load-bearing twice
+   * over: re-assigning an existing key in a `Map` leaves it in its original
+   * position, so without it a trace rebuilt on every read would keep aging
+   * towards eviction while newer, untouched traces stayed; and the tree being
+   * cached is at least as fresh as whatever a concurrent read stored under the
+   * key meanwhile, so the older one must not outlive it — even when the fresh
+   * tree is itself too large to cache. An extension is a write too, so an
+   * extended tree moves to the newest position like a rebuilt one.
+   *
+   * The entry's weight is computed here, once, and stored on it. The eviction
+   * loop cannot evict the entry it just inserted: that weight is at most
+   * {@link maxTreeNodes}, which never exceeds the budget, and it is the newest
+   * entry, so the loop stops by the time it is the only one left.
+   *
+   * @param key The entry's cache key.
+   * @param scope The scope the tree was built for.
+   * @param content The tree, and its extension index when it has one.
+   * @returns Whether the entry was cached; `false` when caching is disabled or
+   * the entry would outweigh the per-entry cap.
+   */
+  function remember(key: string, scope: TraceScope, content: CachedTraceContent): boolean {
+    if (!cachingEnabled) {
+      return false;
+    }
+
+    drop(key);
+
+    const nodes = content.tree.nodeCount;
+    const weight = entryWeight(nodes, content.extension !== undefined);
+
+    if (weight > maxTreeNodes) {
+      log.debug('a correlated tree exceeds the largest cache entry; it is not cached', {
+        ...traceScopeFields(scope.sessionId, scope.traceId, scope.captureId),
+        nodeCount: nodes,
+        weight,
+        maxTreeNodes,
+      });
+      return false;
+    }
+
+    cache.set(key, {
+      sessionId: scope.sessionId,
+      captureId: scope.captureId,
+      traceId: scope.traceId,
+      tree: content.tree,
+      extension: content.extension,
+      weight,
+    });
+    cachedNodes += nodes;
+    cachedWeight += weight;
+
+    while (cache.size > cacheLimit || cachedWeight > nodeBudget) {
       const oldest = cache.keys().next();
       if (oldest.done === true) {
         break;
       }
-      cache.delete(oldest.value);
+      drop(oldest.value);
     }
+
+    return true;
   }
 
   /**
@@ -808,14 +1228,11 @@ export function createTraceCorrelator(deps: TraceCorrelatorDeps): TraceCorrelato
    * @param traceId One trace of it, or every trace when absent.
    * @returns How many entries were dropped.
    */
-  function forget(sessionId: SessionId, traceId?: TraceId): number {
+  function forget(sessionId: SessionId, traceId: TraceId | undefined): number {
     let removed = 0;
 
     for (const [key, entry] of [...cache.entries()]) {
-      const matches =
-        entry.sessionId === sessionId && (traceId === undefined || entry.traceId === traceId);
-
-      if (matches && cache.delete(key)) {
+      if (isWithin(entry, sessionId, traceId) && drop(key)) {
         removed += 1;
       }
     }
@@ -824,40 +1241,90 @@ export function createTraceCorrelator(deps: TraceCorrelatorDeps): TraceCorrelato
   }
 
   /**
-   * Drops the capture-scoped trees of one touched trace for exactly the
-   * captures the batch named for it: their event sets changed, so the next
-   * capture-scoped read has to rebuild them.
+   * Registers a read that is about to load, so that an invalidation of its
+   * scope landing before the load completes can mark it stale.
    *
-   * @param touched The pair, with the captures the batch named.
-   * @returns How many entries were dropped.
+   * @param key The cache key the read will write.
+   * @param scope The read's scope.
+   * @returns The registration, to hand back to {@link endRead}.
    */
-  function forgetTouchedCaptures(touched: TouchedTrace): number {
-    let removed = 0;
+  function beginRead(key: string, scope: TraceScope): PendingRead {
+    const read: PendingRead = { ...scope, stale: false };
+    const reads = pending.get(key);
 
-    for (const captureId of touched.captureIds) {
-      if (cache.delete(cacheKey(touched.sessionId, touched.traceId, captureId))) {
-        removed += 1;
-      }
+    if (reads === undefined) {
+      pending.set(key, new Set([read]));
+    } else {
+      reads.add(read);
     }
 
-    return removed;
+    return read;
   }
 
   /**
-   * Drops every entry one touched trace made stale: its session-wide tree and
-   * its trees for the captures the batch named.
+   * Removes a read's registration once its load has ended, however it ended.
    *
-   * What a failed rebuild leaves behind for a trace it could not refresh. The
-   * trees of captures the batch did not name are kept, because their events
-   * did not change.
-   *
-   * @param touched The pair, with the captures the batch named.
-   * @returns How many entries were dropped.
+   * @param key The cache key the read was registered under.
+   * @param read The registration {@link beginRead} returned.
    */
-  function forgetTouched(touched: TouchedTrace): number {
-    const sessionWide = cache.delete(touched.key) ? 1 : 0;
+  function endRead(key: string, read: PendingRead): void {
+    const reads = pending.get(key);
 
-    return sessionWide + forgetTouchedCaptures(touched);
+    if (reads === undefined) {
+      return;
+    }
+
+    reads.delete(read);
+    if (reads.size === 0) {
+      pending.delete(key);
+    }
+  }
+
+  /**
+   * Marks every read in flight for exactly one cache key stale.
+   *
+   * @param key The scope a batch changed.
+   * @returns How many reads were newly marked.
+   */
+  function markKeyStale(key: string): number {
+    const reads = pending.get(key);
+    let marked = 0;
+
+    if (reads === undefined) {
+      return marked;
+    }
+
+    for (const read of reads) {
+      if (!read.stale) {
+        read.stale = true;
+        marked += 1;
+      }
+    }
+
+    return marked;
+  }
+
+  /**
+   * Marks every read in flight whose scope satisfies `covers` stale.
+   *
+   * The walk is over reads in flight only, so it is bounded by concurrency.
+   *
+   * @param covers Which scopes the invalidation reaches.
+   * @returns How many reads were newly marked.
+   */
+  function markReadsStale(covers: (scope: TraceScope) => boolean): number {
+    let marked = 0;
+
+    for (const reads of pending.values()) {
+      for (const read of reads) {
+        if (!read.stale && covers(read)) {
+          read.stale = true;
+          marked += 1;
+        }
+      }
+    }
+
+    return marked;
   }
 
   /**
@@ -1016,7 +1483,7 @@ export function createTraceCorrelator(deps: TraceCorrelatorDeps): TraceCorrelato
    * `try`/`catch` covers exactly one thing: rows that are not schema-valid,
    * which only a supplied double or a database written by another build can
    * produce. That is an internal invariant failure rather than a store failure,
-   * and it is reported as one instead of crashing an ingest batch.
+   * and it is reported as one instead of rejecting the read that asked.
    *
    * A tree that does not hold every loaded row is refused the same way, as
    * `INTERNAL` with reason `trace-nodes-dropped`: it is neither returned nor
@@ -1111,19 +1578,28 @@ export function createTraceCorrelator(deps: TraceCorrelatorDeps): TraceCorrelato
 
   /**
    * Collects the distinct `(sessionId, traceId)` pairs a batch mentions, each
-   * with the distinct captures the batch named for it.
+   * with its events for the session-wide scope and for every capture the batch
+   * named for it.
    *
-   * First-seen order, so the rebuild order — and therefore
-   * {@link CorrelateUpdate.tracesTouched} — is a function of the batch rather
-   * than of a hash iteration. An event whose session or trace id is unusable is
-   * counted and skipped: nothing here re-validates a persisted event, and
-   * keying a cache entry on an empty string is the one thing that would corrupt
-   * the cache. An unusable capture id alone does not skip the event — the pair
-   * is still rebuilt session-wide — it only names no capture-scoped entry,
-   * because no read could have cached one under it.
+   * First-seen order, so {@link CorrelateUpdate.tracesTouched} is a function of
+   * the batch rather than of a hash iteration. An event whose session or trace
+   * id is unusable is counted and skipped: nothing here re-validates a persisted
+   * event, and keying a cache entry on an empty string is the one thing that
+   * would corrupt the cache. An unusable capture id alone does not skip the
+   * event — it still belongs to the pair's session-wide scope — it only names
+   * no capture-scoped entry, because no read could have cached one under it.
+   * One pass, and memory proportional to the batch.
    */
   function collectTouched(events: readonly TelemetryEvent[]): TouchedBatch {
-    const traces = new Map<string, TouchedTrace & { readonly captureIds: Set<CaptureId> }>();
+    // The mutable accumulators are kept beside the published record rather
+    // than typed through it, so the record stays read-only to its consumers.
+    interface Accumulator {
+      readonly touched: TouchedTrace;
+      readonly events: TelemetryEvent[];
+      readonly captures: Map<CaptureId, TelemetryEvent[]>;
+    }
+
+    const traces = new Map<string, Accumulator>();
     let ignored = 0;
 
     for (const event of events) {
@@ -1135,89 +1611,207 @@ export function createTraceCorrelator(deps: TraceCorrelatorDeps): TraceCorrelato
       }
 
       const key = cacheKey(sessionId, traceId, undefined);
-      let touched = traces.get(key);
+      let accumulator = traces.get(key);
 
-      if (touched === undefined) {
-        touched = { sessionId, traceId, key, captureIds: new Set<CaptureId>() };
-        traces.set(key, touched);
+      if (accumulator === undefined) {
+        const pairEvents: TelemetryEvent[] = [];
+        const captures = new Map<CaptureId, TelemetryEvent[]>();
+        accumulator = {
+          touched: { sessionId, traceId, key, events: pairEvents, captures },
+          events: pairEvents,
+          captures,
+        };
+        traces.set(key, accumulator);
       }
+
+      accumulator.events.push(event);
 
       if (isUsableId(captureId)) {
-        touched.captureIds.add(captureId);
+        const captured = accumulator.captures.get(captureId);
+        if (captured === undefined) {
+          accumulator.captures.set(captureId, [event]);
+        } else {
+          captured.push(event);
+        }
       }
     }
 
-    return { traces: [...traces.values()], ignored };
+    return { traces: [...traces.values()].map((accumulator) => accumulator.touched), ignored };
   }
 
-  async function onEventsPersisted(
-    events: readonly TelemetryEvent[],
-  ): Promise<Result<CorrelateUpdate, DebuggenError>> {
-    const batch = collectTouched(events);
-    const tracesTouched: TraceId[] = [];
-    let rebuilt = 0;
-    let orphanCount = 0;
-    let absent = 0;
+  /**
+   * Brings one cached scope a batch changed up to date with the events it
+   * gained — extended, or dropped for a rebuild — and leaves an uncached scope
+   * alone.
+   *
+   * The extension index is built here the first time a batch reaches the entry
+   * (one walk of its tree), unless the indexed entry could not be cached within
+   * the per-entry cap, in which case building it would be wasted and the entry
+   * is dropped instead. After that, `extendCorrelatedTrace` either returns the
+   * tree `correlateTrace` would build from the scope's stored rows — which
+   * replaces the entry through {@link remember}, keeping the oldest-write
+   * order, the weight accounting and the cap — or refuses, and the entry is
+   * dropped. A batch of replays alone leaves the entry as it was, except that
+   * an index built for it is kept.
+   *
+   * `extendCorrelatedTrace` does not throw for rows the store wrote. A throw
+   * here can only come from a malformed row, and it drops the entry — the
+   * rebuild from the store is always correct — rather than escaping ingest.
+   *
+   * @param scope The scope and the batch's events for it.
+   * @returns What happened to the scope.
+   */
+  function applyToCached(scope: ChangedScope): ScopeOutcome {
+    const entry = cache.get(scope.key);
+
+    if (entry === undefined) {
+      return { kind: 'uncached' };
+    }
+
+    const dropped = (reason: DropReason): ScopeOutcome => {
+      drop(scope.key);
+      return { kind: 'dropped', reason };
+    };
+
+    try {
+      let index = entry.extension;
+      const indexedNow = index === undefined;
+
+      if (index === undefined) {
+        if (entryWeight(entry.tree.nodeCount, true) > maxTreeNodes) {
+          return dropped('over-cap');
+        }
+        index = indexTraceForExtension(entry.tree, { maxDepth });
+        if (index === undefined) {
+          return dropped('not-extendable');
+        }
+      }
+
+      const result = extendCorrelatedTrace(index, scope.events, { maxDepth });
+
+      if (result.kind === 'refused') {
+        return dropped(result.reason);
+      }
+
+      if (result.added === 0) {
+        // Replays only: the stored rows are the ones the tree was built from.
+        // A freshly built index is kept, re-weighing the entry.
+        if (indexedNow && !remember(scope.key, entry, { tree: entry.tree, extension: index })) {
+          return { kind: 'dropped', reason: 'over-cap' };
+        }
+        return { kind: 'unchanged' };
+      }
+
+      if (!remember(scope.key, entry, { tree: result.tree, extension: index })) {
+        return { kind: 'dropped', reason: 'over-cap' };
+      }
+
+      return { kind: 'extended', nodesBuilt: result.nodesBuilt };
+    } catch {
+      return dropped('extension-failed');
+    }
+  }
+
+  /**
+   * Drops every cached tree and marks every read in flight stale: what
+   * {@link close} does, and what a batch that cannot be scanned forces, since
+   * which scopes it changed is then unknown.
+   *
+   * @returns How many trees were dropped and how many reads were newly marked.
+   */
+  function releaseEverything(): { readonly dropped: number; readonly staleReads: number } {
     let dropped = 0;
 
-    // Sequential by design. The production store is synchronous, so there is
-    // no latency to hide, and rebuilding several traces at once would hold
-    // several full event sets in memory during a capture that is already
-    // producing them as fast as the page can.
-    for (const [position, touched] of batch.traces.entries()) {
-      const built = await rebuild(touched.sessionId, touched.traceId, undefined);
+    for (const key of [...cache.keys()]) {
+      if (drop(key)) {
+        dropped += 1;
+      }
+    }
 
-      if (isErr(built)) {
-        // Fail fast, and safely. The traces rebuilt before this point are
-        // cached with fresh trees. This trace and every touched trace after it
-        // lose the trees cached before the batch: those predate events the
-        // store now holds, and serving one would present a stale interaction
-        // as current. A rebuild reloads the whole trace, so retrying the same
-        // batch converges on the same result.
-        const pending = batch.traces.slice(position);
-        let staleDropped = 0;
+    return { dropped, staleReads: markReadsStale(() => true) };
+  }
 
-        for (const stale of pending) {
-          staleDropped += forgetTouched(stale);
+  /*
+   * Deliberately not `async`: nothing here awaits, so the whole update — every
+   * extension, every drop and every read in flight marked stale — happens
+   * synchronously inside the call and is complete before any pending read
+   * resumes.
+   */
+  function onEventsPersisted(
+    events: readonly TelemetryEvent[],
+  ): Promise<Result<CorrelateUpdate, DebuggenError>> {
+    let batch: TouchedBatch;
+
+    try {
+      batch = collectTouched(events);
+    } catch (thrown) {
+      // Only a malformed element — one no store row can produce — makes the
+      // scan throw. The batch is persisted, but which traces it changed is
+      // unknown, so nothing cached can be trusted to match the store: every
+      // tree goes, every read in flight is marked stale, and each scope
+      // rebuilds from the store on its next read.
+      const released = releaseEverything();
+
+      invalidations += released.dropped;
+      log.warn('a persisted batch could not be scanned; every cached trace was dropped', {
+        invalidated: released.dropped,
+        staleReads: released.staleReads,
+        cachedTraces: cache.size,
+        cachedNodes,
+        cachedWeight,
+      });
+      return Promise.resolve(
+        err(
+          asReportableError(
+            thrown,
+            'INTERNAL',
+            'Scanning a persisted telemetry batch for the traces it touched failed.',
+            BATCH_SCAN_FAILURE_HINT,
+            { operation: 'marking the traces of a persisted batch stale' },
+          ),
+        ),
+      );
+    }
+
+    let extended = 0;
+    let unchanged = 0;
+    let invalidated = 0;
+    let nodesBuilt = 0;
+    let staleReads = 0;
+    const dropReasons: Partial<Record<DropReason, number>> = {};
+
+    // Exactly the scopes whose event sets the batch changed: each touched
+    // trace's session-wide tree, and its trees for the captures the batch
+    // named. Captures the batch did not name keep theirs untouched.
+    for (const touched of batch.traces) {
+      for (const scope of changedScopes(touched)) {
+        const outcome = applyToCached(scope);
+
+        switch (outcome.kind) {
+          case 'extended':
+            extended += 1;
+            nodesBuilt += outcome.nodesBuilt;
+            break;
+          case 'unchanged':
+            unchanged += 1;
+            break;
+          case 'dropped':
+            invalidated += 1;
+            dropReasons[outcome.reason] = (dropReasons[outcome.reason] ?? 0) + 1;
+            break;
+          case 'uncached':
+            break;
         }
 
-        log.debug('dropped the cached trees a failed rebuild left stale', {
-          batchSize: events.length,
-          rebuilt,
-          pending: pending.length,
-          dropped: staleDropped,
-          code: built.error.code,
-          cachedTraces: cache.size,
-        });
-        return built;
+        // A read of the scope still in flight loaded the store before this
+        // batch, so it must not cache what it loaded, whatever happened above.
+        staleReads += markKeyStale(scope.key);
       }
-
-      tracesTouched.push(touched.traceId);
-
-      if (built.value === undefined) {
-        // The batch named a trace the store holds no rows for — retention
-        // purged it, or the rows were deleted between the insert and this
-        // call. No capture of the session holds any either, so every scope of
-        // the trace is dropped rather than served when it no longer reflects
-        // the store.
-        dropped += forget(touched.sessionId, touched.traceId);
-        absent += 1;
-        continue;
-      }
-
-      // The batch changed the event set of every capture it named for this
-      // trace, so those captures' trees are stale; the next capture-scoped read
-      // rebuilds them. Captures the batch did not name keep theirs.
-      dropped += forgetTouchedCaptures(touched);
-      rebuilt += 1;
-      orphanCount += built.value.orphanCount;
-      remember(touched.key, {
-        sessionId: touched.sessionId,
-        captureId: undefined,
-        traceId: touched.traceId,
-        tree: built.value,
-      });
     }
+
+    extensions += extended;
+    extensionNodesBuilt += nodesBuilt;
+    invalidations += invalidated;
 
     if (batch.ignored > 0) {
       // Reported unconditionally, and at `warn`: every persisted event carries
@@ -1231,18 +1825,23 @@ export function createTraceCorrelator(deps: TraceCorrelatorDeps): TraceCorrelato
     }
 
     if (batch.traces.length > 0) {
-      log.debug('rebuilt the traces a persisted batch touched', {
+      // Counts and the closed refusal vocabulary only — never an event field.
+      log.debug('brought the cached traces a persisted batch touched up to date', {
         batchSize: events.length,
-        tracesTouched: tracesTouched.length,
-        rebuilt,
-        absent,
-        dropped,
-        orphanCount,
+        tracesTouched: batch.traces.length,
+        extended,
+        nodesBuilt,
+        unchanged,
+        invalidated,
+        ...(invalidated > 0 ? { dropReasons } : {}),
+        staleReads,
         cachedTraces: cache.size,
+        cachedNodes,
+        cachedWeight,
       });
     }
 
-    return ok({ tracesTouched, rebuilt, orphanCount });
+    return Promise.resolve(ok({ tracesTouched: batch.traces.map((touched) => touched.traceId) }));
   }
 
   async function getTrace(
@@ -1263,25 +1862,50 @@ export function createTraceCorrelator(deps: TraceCorrelatorDeps): TraceCorrelato
 
     misses += 1;
 
-    const built = await rebuild(sessionId, traceId, captureId);
-    if (isErr(built)) {
-      return built;
-    }
+    // Registered before the first `await`, so a batch or an invalidation of
+    // this scope that lands at any point while the load is in flight marks it;
+    // released in the `finally`, however the load ends.
+    const read = beginRead(key, { sessionId, captureId, traceId });
 
-    if (built.value === undefined) {
-      // Not an error: a trace can be purged by retention, and a trace whose
-      // events have not arrived yet is the ordinary state of a capture in
-      // flight. The absence is not cached, so the next read sees the events
-      // the moment they land.
-      log.debug(
-        'no persisted events for the requested trace',
-        traceScopeFields(sessionId, traceId, captureId),
-      );
-      return ok(undefined);
-    }
+    try {
+      const built = await rebuild(sessionId, traceId, captureId);
+      if (isErr(built)) {
+        return built;
+      }
 
-    remember(key, { sessionId, captureId, traceId, tree: built.value });
-    return ok(built.value);
+      if (built.value === undefined) {
+        // Not an error: a trace can be purged by retention, and a trace whose
+        // events have not arrived yet is the ordinary state of a capture in
+        // flight. The absence is not cached, so the next read sees the events
+        // the moment they land.
+        log.debug(
+          'no persisted events for the requested trace',
+          traceScopeFields(sessionId, traceId, captureId),
+        );
+        return ok(undefined);
+      }
+
+      if (read.stale) {
+        // The tree is what the store held when this read began, so it answers
+        // this read; the store has changed since, so it must not answer a
+        // later one. The next read of the scope rebuilds from the store.
+        log.debug(
+          'the trace changed while it was being read; the tree answered the read uncached',
+          {
+            ...traceScopeFields(sessionId, traceId, captureId),
+            nodeCount: built.value.nodeCount,
+          },
+        );
+        return ok(built.value);
+      }
+
+      // Cached without an index: most trees are read and never touched by a
+      // later batch, so the index is built only when a batch first needs it.
+      remember(key, { sessionId, captureId, traceId }, { tree: built.value, extension: undefined });
+      return ok(built.value);
+    } finally {
+      endRead(key, read);
+    }
   }
 
   async function listTraceIds(
@@ -1336,6 +1960,7 @@ export function createTraceCorrelator(deps: TraceCorrelatorDeps): TraceCorrelato
       enumerated: ids.value.length,
       returned: trees.length,
       cachedTraces: cache.size,
+      cachedNodes,
     });
 
     return ok(trees);
@@ -1343,15 +1968,21 @@ export function createTraceCorrelator(deps: TraceCorrelatorDeps): TraceCorrelato
 
   function invalidate(sessionId: SessionId, traceId?: TraceId): void {
     // Every scope goes: the session-wide tree and each capture-scoped tree of
-    // the trace — or of the whole session — alike.
+    // the trace — or of the whole session — alike, and every read in flight
+    // for those scopes, matched by the same rule.
     const removed = forget(sessionId, traceId);
+    const staleReads = markReadsStale((scope) => isWithin(scope, sessionId, traceId));
+
+    invalidations += removed;
 
     if (traceId !== undefined) {
       log.debug('invalidated a cached trace', {
         [LOG_BINDING_KEYS.sessionId]: sessionId,
         traceId,
         removed,
+        staleReads,
         cachedTraces: cache.size,
+        cachedNodes,
       });
       return;
     }
@@ -1359,18 +1990,39 @@ export function createTraceCorrelator(deps: TraceCorrelatorDeps): TraceCorrelato
     log.debug("invalidated a session's cached traces", {
       [LOG_BINDING_KEYS.sessionId]: sessionId,
       removed,
+      staleReads,
       cachedTraces: cache.size,
+      cachedNodes,
     });
   }
 
   function stats(): CorrelatorStats {
-    return { cachedTraces: cache.size, hits, misses, rebuilds };
+    return {
+      cachedTraces: cache.size,
+      cachedNodes,
+      cachedWeight,
+      hits,
+      misses,
+      rebuilds,
+      invalidations,
+      extensions,
+      extensionNodesBuilt,
+    };
   }
 
   function close(): void {
-    const released = cache.size;
-    cache.clear();
-    log.debug('released the correlated trace cache', { released, hits, misses, rebuilds });
+    const released = releaseEverything();
+
+    log.debug('released the correlated trace cache', {
+      released: released.dropped,
+      staleReads: released.staleReads,
+      hits,
+      misses,
+      rebuilds,
+      invalidations,
+      extensions,
+      extensionNodesBuilt,
+    });
   }
 
   return { onEventsPersisted, getTrace, getTraces, listTraceIds, invalidate, stats, close };

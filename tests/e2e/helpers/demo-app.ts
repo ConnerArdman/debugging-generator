@@ -9,7 +9,12 @@
  *   available. Every failure names its fix.
  * - **The database** — {@link ensureDemoDatabase} runs the root scripts
  *   `pnpm demo:migrate` and `pnpm demo:seed` by name, once per process, with a
- *   heartbeat so the ≈200 000-row seed never looks like a hang.
+ *   heartbeat so the ≈200 000-row seed never looks like a hang. The `e2e`
+ *   project is the acceptance tier, so both steps run on every run, local or
+ *   CI (AAP §0.8.3), and there is no opt-out: a set {@link SKIP_SEED_ENV} is
+ *   refused before anything runs. The handle's `ensureDatabase()` applies
+ *   {@link assertDemoDatabaseReady}, so a caller that ignores the returned
+ *   state still cannot proceed unless this process migrated and seeded.
  * - **The dev server** — {@link startDemoApp} / {@link stopDemoApp} go through
  *   the product's own launcher (`POST /dev-server/launch`, `POST
  *   /dev-server/stop`). That path attaches `NODE_OPTIONS=--import <telemetry
@@ -96,6 +101,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import { expect } from '@playwright/test';
+import type { Page } from '@playwright/test';
 
 import { sha256Hex, sha256OfFile } from '@debuggen/shared/node';
 
@@ -134,9 +140,18 @@ export const RESIDUAL_CHECK_SCRIPT = 'scripts/check-no-residual-instrumentation.
 export const DATABASE_URL_ENV = 'DATABASE_URL';
 
 /**
- * Set to `1` (or `true`) to skip `pnpm demo:seed` while iterating locally on an
- * already-seeded database. Migrations still run. {@link ensureDemoDatabase}
- * reports the skip so a spec can say why data is missing.
+ * A former opt-out from `pnpm demo:seed`, now **refused**. The `e2e`
+ * Playwright project (`pnpm test:e2e`) is the acceptance tier, and it migrates
+ * and seeds the demo database on every run, local or CI (AAP §0.8.3); a run
+ * on whatever rows an earlier seed left could pass while the current seed is
+ * broken, so there is no way to skip either step.
+ *
+ * The variable is still recognised so that a stale shell or CI job setting it
+ * fails loudly instead of being silently ignored: while it holds any non-empty
+ * value, {@link ensureDemoDatabase} rejects with a `database`
+ * {@link DemoAppError} before the prerequisites are checked or any script
+ * runs, memoises nothing, and says to unset it. The value itself is never read
+ * into a message.
  */
 export const SKIP_SEED_ENV = 'DEBUGGEN_E2E_SKIP_SEED';
 
@@ -176,6 +191,34 @@ export const DEMO_APP_SETUP_TIMEOUT_MS =
 
 /** Files hashed concurrently by {@link snapshotTrackedFiles}. */
 export const SNAPSHOT_HASH_CONCURRENCY = 16;
+
+/** How long a demo page may take to reveal what it streamed behind a Suspense boundary. */
+export const STREAMED_CONTENT_TIMEOUT_MS = 15_000;
+
+/**
+ * Wait until `page` holds no streamed Suspense segment that is still unrevealed.
+ * The demo's root `app/loading.tsx` wraps every route in a Suspense boundary,
+ * so a page that suspends while rendering on the server (the checkout awaits
+ * its `searchParams`) arrives as the fallback plus a `<div hidden id="S:n">`
+ * segment, which React's inline reveal later moves into place and removes.
+ * Until then that segment holds a second, hidden copy of the page's controls. A
+ * CSS locator counts the copy, and so does the product's selector builder,
+ * which verifies a path's uniqueness against the document and then rightly
+ * appends a leaf `:nth-child(n)`. A developer never acts in that instant, and a
+ * test that does races the reveal.
+ *
+ * @throws When a segment is still present after `timeoutMs`.
+ */
+export async function waitForStreamedContent(
+  page: Page,
+  timeoutMs: number = STREAMED_CONTENT_TIMEOUT_MS,
+): Promise<void> {
+  await page.waitForFunction(
+    () => document.querySelector('div[hidden][id^="S:"]') === null,
+    undefined,
+    { timeout: timeoutMs, polling: 100 },
+  );
+}
 
 /** The largest source file {@link sourceLineContaining} / {@link readDemoSource} will read. */
 export const MAX_SOURCE_BYTES = 4 * 1024 * 1024;
@@ -290,10 +333,15 @@ function listPaths(paths: readonly string[]): string {
   return rest > 0 ? [...shown, `    … and ${String(rest)} more`].join('\n') : shown.join('\n');
 }
 
-/** Whether an optional flag variable is switched on (`1`, `true`, `yes`; case-insensitive). */
-function flagEnabled(name: string): boolean {
-  const value = process.env[name]?.trim().toLowerCase();
-  return value === '1' || value === 'true' || value === 'yes';
+/**
+ * Whether the refused {@link SKIP_SEED_ENV} opt-out is set: any non-empty
+ * value counts, whatever it spells (`0` and `false` included), because the
+ * variable no longer has a meaning to switch off. Read at call time, never at
+ * import, and the value is compared, never returned.
+ */
+function skipSeedRequested(): boolean {
+  const value = process.env[SKIP_SEED_ENV];
+  return value !== undefined && value !== '';
 }
 
 // ---------------------------------------------------------------------------
@@ -443,23 +491,49 @@ export interface EnsureDemoDatabaseOptions {
   readonly force?: boolean | undefined;
 }
 
-/** What {@link ensureDemoDatabase} did. */
+/**
+ * A successful acceptance preparation, the only thing {@link ensureDemoDatabase}
+ * resolves with: `pnpm demo:migrate` and then `pnpm demo:seed` both ran and
+ * succeeded in this process (AAP §0.8.3). A preparation that cannot do both
+ * rejects instead, so there is no partial or skipped shape; `migrated` and
+ * `seeded` are the literal `true` and exist for callers and reports to read.
+ *
+ * Every state is frozen and registered as it is produced, which is how
+ * {@link assertDemoDatabaseReady} tells a real preparation from a hand-built
+ * or copied object of the same shape.
+ */
 export interface DemoDatabaseState {
-  /** `pnpm demo:migrate` ran and succeeded. */
-  readonly migrated: boolean;
-  /** `pnpm demo:seed` ran and succeeded. */
-  readonly seeded: boolean;
-  /** Seeding was skipped on request ({@link SKIP_SEED_ENV}); the data is whatever was there. */
-  readonly skipped: boolean;
-  /** Why seeding was skipped, when it was. */
-  readonly skipReason: string | undefined;
+  /** `pnpm demo:migrate` ran and succeeded in this preparation. */
+  readonly migrated: true;
+  /** `pnpm demo:seed` ran and succeeded in this preparation, after the migration. */
+  readonly seeded: true;
   /** Where `DATABASE_URL` came from. */
   readonly databaseUrlSource: DemoDatabaseUrlSource;
   /** Wall-clock milliseconds of the migrate step. */
   readonly migrateDurationMs: number;
-  /** Wall-clock milliseconds of the seed step (0 when skipped). */
+  /** Wall-clock milliseconds of the seed step. */
   readonly seedDurationMs: number;
 }
+
+/**
+ * The fields of a {@link DemoDatabaseState}, and the only ones: a state
+ * carrying any other field (the removed opt-out's `skipped`, `skipReason` or
+ * `acceptance`, say) was not produced by {@link prepareDemoDatabase}.
+ */
+const DEMO_DATABASE_STATE_FIELDS: ReadonlySet<string> = new Set<keyof DemoDatabaseState>([
+  'migrated',
+  'seeded',
+  'databaseUrlSource',
+  'migrateDurationMs',
+  'seedDurationMs',
+]);
+
+/**
+ * Every state {@link prepareDemoDatabase} resolved with in this process. Weak,
+ * so a discarded state is collected; its members are frozen, so a registered
+ * state still says what the preparation did.
+ */
+const preparedDatabaseStates = new WeakSet<object>();
 
 /** The one database preparation of this process; see {@link ensureDemoDatabase}. */
 let databaseReady: Promise<DemoDatabaseState> | undefined;
@@ -476,7 +550,22 @@ let databaseReady: Promise<DemoDatabaseState> | undefined;
  * module can never drift from how a developer prepares the database. The seed
  * truncates all twelve tables before loading, so repeating it is safe.
  *
- * @throws {DemoAppError} `prerequisites` or `database`, naming the fix.
+ * Both are mandatory on every run of the `e2e` project, which is the
+ * acceptance tier, locally and in CI alike (AAP §0.8.3); there is no opt-out.
+ * {@link SKIP_SEED_ENV} is checked first, each time a preparation starts: while
+ * it holds any non-empty value the preparation rejects before the
+ * prerequisites are checked or any script runs, and — being a failure — is not
+ * memoised, so the call after it is unset prepares afresh. A preparation that
+ * already succeeded in this process did migrate and seed, so a call without
+ * `force` still answers with it; a forced call, like a first one, is refused.
+ *
+ * The resolved {@link DemoDatabaseState} is always a full preparation. The
+ * {@link DemoAppHandle}'s `ensureDatabase()` still passes it through
+ * {@link assertDemoDatabaseReady} on every call, and a direct caller can too.
+ *
+ * @throws {DemoAppError} `database` when {@link SKIP_SEED_ENV} is set or a
+ *   script fails; `prerequisites` when the demo cannot be prepared. Each names
+ *   the fix.
  */
 export function ensureDemoDatabase(
   options: EnsureDemoDatabaseOptions = {},
@@ -496,6 +585,123 @@ export function ensureDemoDatabase(
   return attempt;
 }
 
+/**
+ * Refuse any database state but a real acceptance preparation, so a caller
+ * that ignores what {@link ensureDemoDatabase} returned still cannot proceed
+ * unless this process migrated **and** seeded the demo database (AAP §0.8.3).
+ *
+ * A state is ready only when all of these hold:
+ *
+ * - it is an object whose fields are exactly those of
+ *   {@link DemoDatabaseState} — so the removed opt-out's shape (`skipped`,
+ *   `skipReason`, `acceptance`) is refused whatever its values;
+ * - `migrated` and `seeded` are both `true`, `databaseUrlSource` is a known
+ *   source, and both durations are finite, non-negative numbers;
+ * - it is the very object a preparation in this process resolved with, not a
+ *   hand-built or copied look-alike: only a registered state proves the two
+ *   scripts ran.
+ *
+ * Anything else — `undefined`, a non-object, a partial or hand-built object,
+ * `seeded: false`, `skipped: true` — throws, listing every problem at once.
+ * Fields are read as own data properties, so no getter on a hand-built object
+ * runs; the message names fields, variables and scripts, never a value.
+ *
+ * @example
+ * // What the handle's ensureDatabase() does; a direct caller can do the same.
+ * const state = assertDemoDatabaseReady(await ensureDemoDatabase());
+ *
+ * @param state - Whatever the caller holds; typed `unknown` because refusing
+ *   shapes the type system would admit through a cast is the whole point.
+ * @returns `state` unchanged, so it can be chained.
+ * @throws {DemoAppError} `database`, naming the fix.
+ */
+export function assertDemoDatabaseReady(state: unknown): DemoDatabaseState {
+  const problems = databaseStateProblems(state);
+  if (problems.length === 0 && isPreparedDatabaseState(state)) {
+    return state;
+  }
+  if (!isPreparedDatabaseState(state)) {
+    problems.push(
+      'it is not a state that ensureDemoDatabase() resolved with in this process, so nothing shows that `pnpm demo:migrate` and `pnpm demo:seed` ran; a hand-built or copied state is refused even when its fields look right.',
+    );
+  }
+  throw new DemoAppError(
+    'database',
+    [
+      `The demo database is not ready for the e2e suite (${String(problems.length)} problem(s)):`,
+      ...problems.map((problem) => `  - ${problem}`),
+      `Prepare it through ensureDemoDatabase() (the demoApp fixture does), which runs \`pnpm demo:migrate\` and \`pnpm demo:seed\` on every e2e run; the e2e project is the acceptance tier and has no opt-out from either step.`,
+    ].join('\n'),
+  );
+}
+
+/** Whether `value` is a state {@link prepareDemoDatabase} registered in this process. */
+function isPreparedDatabaseState(value: unknown): value is DemoDatabaseState {
+  return typeof value === 'object' && value !== null && preparedDatabaseStates.has(value);
+}
+
+/** An own data property of `record`, read without running a getter; `undefined` when absent. */
+function ownDataField(record: object, field: string): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(record, field);
+  return descriptor !== undefined && 'value' in descriptor ? descriptor.value : undefined;
+}
+
+/** How a field's value reads in a problem: a boolean as itself, anything else by kind only. */
+function describeField(value: unknown): string {
+  if (typeof value === 'boolean') {
+    return String(value);
+  }
+  return value === undefined ? 'missing' : `a ${value === null ? 'null' : typeof value} value`;
+}
+
+/** Whether `value` is a finite, non-negative millisecond count. */
+function isDuration(value: unknown): boolean {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0;
+}
+
+/**
+ * Every structural reason `state` is not a {@link DemoDatabaseState}, in a
+ * fixed order; empty when its shape is right. Provenance is checked by the
+ * caller, {@link assertDemoDatabaseReady}.
+ */
+function databaseStateProblems(state: unknown): string[] {
+  if (typeof state !== 'object' || state === null || Array.isArray(state)) {
+    const kind = state === null ? 'null' : Array.isArray(state) ? 'an array' : typeof state;
+    return [`the state is not a preparation result object (it is ${kind}).`];
+  }
+  const problems: string[] = [];
+  const unexpected = Object.keys(state).filter((field) => !DEMO_DATABASE_STATE_FIELDS.has(field));
+  if (unexpected.length > 0) {
+    problems.push(
+      `it carries field(s) no preparation produces (${unexpected.join(', ')}); \`skipped\`, \`skipReason\` and \`acceptance\` belong to the removed ${SKIP_SEED_ENV} opt-out.`,
+    );
+  }
+  const migrated = ownDataField(state, 'migrated');
+  if (migrated !== true) {
+    problems.push(
+      `\`pnpm demo:migrate\` did not run successfully in this preparation (migrated is ${describeField(migrated)}).`,
+    );
+  }
+  const seeded = ownDataField(state, 'seeded');
+  if (seeded !== true) {
+    problems.push(
+      `\`pnpm demo:seed\` did not run successfully in this preparation (seeded is ${describeField(seeded)}), and the acceptance tier never runs on rows an earlier seed left.`,
+    );
+  }
+  const source = ownDataField(state, 'databaseUrlSource');
+  if (source !== 'environment' && source !== 'demo-dotenv-file') {
+    problems.push(
+      `databaseUrlSource is not 'environment' or 'demo-dotenv-file' (it is ${describeField(source)}).`,
+    );
+  }
+  for (const field of ['migrateDurationMs', 'seedDurationMs'] as const) {
+    if (!isDuration(ownDataField(state, field))) {
+      problems.push(`${field} is not a finite, non-negative number of milliseconds.`);
+    }
+  }
+  return problems;
+}
+
 /** The non-interactive, explicit environment of the database scripts. */
 function databaseCommandEnv(): Record<string, string> {
   const url = databaseUrlFromEnvironment();
@@ -509,34 +715,49 @@ function databaseCommandEnv(): Record<string, string> {
   };
 }
 
+/**
+ * Refuse the removed {@link SKIP_SEED_ENV} opt-out before any other work.
+ *
+ * @throws {DemoAppError} `database` while {@link SKIP_SEED_ENV} holds any
+ *   non-empty value, locally or under CI: the acceptance tier always migrates
+ *   and seeds, so it never runs on the rows an earlier seed left.
+ */
+function refuseSeedOptOut(): void {
+  if (!skipSeedRequested()) {
+    return;
+  }
+  throw new DemoAppError(
+    'database',
+    `${SKIP_SEED_ENV} is set, but the e2e Playwright project (\`pnpm test:e2e\`) is the acceptance tier, which always runs \`pnpm demo:migrate\` and \`pnpm demo:seed\` before any spec (AAP §0.8.3), locally and in CI alike. There is no opt-out from either step, so neither ran: unset ${SKIP_SEED_ENV} (in your shell or the CI job's environment) and run again.`,
+  );
+}
+
+/**
+ * One acceptance preparation: refuse the opt-out, check the prerequisites,
+ * then `pnpm demo:migrate` and `pnpm demo:seed`, in that order, each of which
+ * rejects on failure. Only when both succeed is a state produced — frozen and
+ * registered for {@link assertDemoDatabaseReady}.
+ */
 async function prepareDemoDatabase(): Promise<DemoDatabaseState> {
+  // First, so a refused opt-out runs nothing: no prerequisite check and no
+  // script; ensureDemoDatabase() forgets the rejection, so nothing is memoised.
+  refuseSeedOptOut();
   const prerequisites = await assertDemoPrerequisites();
   const env = databaseCommandEnv();
 
   const migrate = await runDatabaseScript('demo:migrate', MIGRATE_TIMEOUT_MS, env);
-
-  if (flagEnabled(SKIP_SEED_ENV)) {
-    return {
-      migrated: true,
-      seeded: false,
-      skipped: true,
-      skipReason: `${SKIP_SEED_ENV} is set, so \`pnpm demo:seed\` did not run; the database holds whatever an earlier seed left.`,
-      databaseUrlSource: prerequisites.databaseUrlSource,
-      migrateDurationMs: migrate.durationMs,
-      seedDurationMs: 0,
-    };
-  }
-
   const seed = await runDatabaseScript('demo:seed', SEED_TIMEOUT_MS, env);
-  return {
+
+  const state: DemoDatabaseState = {
     migrated: true,
     seeded: true,
-    skipped: false,
-    skipReason: undefined,
     databaseUrlSource: prerequisites.databaseUrlSource,
     migrateDurationMs: migrate.durationMs,
     seedDurationMs: seed.durationMs,
   };
+  Object.freeze(state);
+  preparedDatabaseStates.add(state);
+  return state;
 }
 
 /** What a database script's output said about why it failed, if it said anything recognisable. */
@@ -2125,7 +2346,15 @@ export interface DemoAppHandle {
   readonly launch: DemoAppLaunch | undefined;
   /** {@link assertDemoPrerequisites}. */
   assertPrerequisites(): Promise<DemoPrerequisites>;
-  /** {@link ensureDemoDatabase}. */
+  /**
+   * {@link ensureDemoDatabase} (memoised once per process, as there), with
+   * every returned state passed through {@link assertDemoDatabaseReady}: it
+   * resolves only when this process ran both `pnpm demo:migrate` and
+   * `pnpm demo:seed`, and rejects with a `database` {@link DemoAppError}
+   * otherwise — including whenever {@link SKIP_SEED_ENV} is set, locally or in
+   * CI — so a caller that ignores the resolved value, as the `demoApp` fixture
+   * does, still cannot proceed on an unmigrated or unseeded database.
+   */
   ensureDatabase(options?: EnsureDemoDatabaseOptions): Promise<DemoDatabaseState>;
   /** {@link startDemoApp} with this handle's defaults; serialised with `stop()`. */
   start(options?: StartDemoAppOptions): Promise<DemoAppLaunch>;
@@ -2194,7 +2423,8 @@ export function createDemoAppHandle(
       return launches.get(projectRoot);
     },
     assertPrerequisites: () => assertDemoPrerequisites(),
-    ensureDatabase: (databaseOptions) => ensureDemoDatabase(databaseOptions),
+    ensureDatabase: (databaseOptions) =>
+      ensureDemoDatabase(databaseOptions).then(assertDemoDatabaseReady),
     start: (startOptions = {}) =>
       serialise(() =>
         startDemoApp(service, {

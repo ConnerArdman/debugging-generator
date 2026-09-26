@@ -3,12 +3,15 @@
  *
  * Next.js renders this file for two different wrong turns, and the copy below has to cover both:
  * an address that matches no route at all, and a route that exists but was asked for something
- * that does not - a product page whose slug resolves to nothing calls `notFound()` and lands the
- * reader here. So the wording names neither the URL nor the segment that failed: it says the page
- * is not here, offers the reason a buyer actually has (a saved link that has gone stale, an item
- * that is no longer listed) and points at the catalog. Echoing the requested address back would
- * also print whatever a stranger put in a link into the page, which is not a thing to do with
- * text nobody in this store wrote.
+ * that does not - a product address no product owns. `proxy.ts` rewrites such an address here
+ * before the product page renders (and `next.config.ts` does the same for a dotted one that names
+ * no public file), so the response carries a 404 status, and in the rarer case the
+ * proxy could not settle it the product page's own `notFound()` lands the reader here instead. So
+ * the wording names neither the URL nor the segment that failed: it says the page is not here,
+ * offers the reason a buyer actually has (a saved link that has gone stale, an item that is no
+ * longer listed) and points at the catalog. Echoing the requested address back would also print
+ * whatever a stranger put in a link into the page, which is not a thing to do with text nobody in
+ * this store wrote.
  *
  * A SERVER COMPONENT THAT READS NOTHING, BECAUSE `next build` RENDERS IT
  * There is no client directive and no data access of any kind: nothing from `@/server/**`, no

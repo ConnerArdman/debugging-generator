@@ -50,6 +50,18 @@
  *   own constants so this checkpoint can never be looser than the ingest one,
  *   and reaching any of them flags the record instead of leaving a reader to
  *   guess whether a branch was absent or merely cut.
+ * - **The closed exception shape.** An exception's `message`, `stack` and
+ *   `name` carry whatever the failing code was handed, which `scrub` cannot
+ *   recognise. Low-entropy sentinels — a URL query value, an inline SQL
+ *   literal, a codeframe line, a hostile `name`, a thrown string — are
+ *   asserted absent from every record at `info`, `warn`, `error` and `fatal`,
+ *   and present only in redacted form at `debug` and `trace`. They are
+ *   deliberately *not* credential-shaped: a sentinel `scrub` would catch
+ *   proves nothing about the closed shape. The same holds for a
+ *   `DebuggenError`'s `hint` and `details`, and a `DebuggenError` cause's:
+ *   at the operating levels no hint is emitted and `details` keeps only its
+ *   closed-token entries, and at the diagnostic levels both are present with
+ *   every string redacted by context.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -61,10 +73,18 @@ import { MAX_ATTRIBUTE_NODES, MAX_TRACKED_KEYS, REDACTION_MARKER } from '@debugg
 
 import type { ServiceConfig } from './config.js';
 import {
+  CLOSED_DETAIL_KEY_PATTERN,
+  CLOSED_DETAIL_MAX_LENGTH,
+  CLOSED_DETAIL_TOKEN_PATTERN,
+  DETAILS_OMITTED_KEY,
+  DIAGNOSTIC_LOG_LEVELS,
+  DIAGNOSTIC_TEXT_MAX_LENGTH,
+  EXCEPTION_CLASSES,
   FIELDS_TRUNCATED_KEY,
   FIELDS_UNREADABLE_KEY,
   LOG_BINDING_KEYS,
   LOG_ERROR_FIELD_KEY,
+  LOG_FAILURE_NOTICE_MESSAGE,
   LOG_MARKERS,
   PROTOTYPE_LOG_KEYS,
   RESERVED_FIELD_PREFIX,
@@ -74,6 +94,9 @@ import {
   SERVICE_SENSITIVE_KEY_NAMES,
   SQL_STATEMENT_FIELD_KEYS,
   createServiceLogger,
+  describeException,
+  guardLogger,
+  redactDiagnosticText,
   scrubLogFields,
   scrubLogMessage,
   sessionLogger,
@@ -574,20 +597,33 @@ describe('structure, bounds and hostile values', () => {
 });
 
 describe('errors', () => {
-  it('serialises a plain Error with a scrubbed message and stack', () => {
+  it('serialises a plain Error in the closed shape, with neither message nor stack', () => {
     const c = capture();
     c.logger.error('failed', {
       [LOG_ERROR_FIELD_KEY]: new Error(`bad key ${fixtures.providerKey}`),
     });
     const [record] = c.records();
+    expect(record?.[LOG_ERROR_FIELD_KEY]).toEqual({ type: 'Error' });
+    const line = c.lines().join('');
+    expect(line).not.toContain(fixtures.providerKey);
+    expect(line).not.toContain('bad key');
+  });
+
+  it('adds a scrubbed message and the stack to a plain Error at DEBUG only', () => {
+    const c = capture();
+    c.logger.debug('failed', {
+      [LOG_ERROR_FIELD_KEY]: new Error(`bad key ${fixtures.providerKey}`),
+    });
+    const [record] = c.records();
     const err = record?.[LOG_ERROR_FIELD_KEY] as Record<string, unknown>;
     expect(err.type).toBe('Error');
+    expect(String(err.message)).toContain('bad key');
     expect(String(err.message)).toContain(REDACTION_MARKER);
     expect(typeof err.stack).toBe('string');
     expect(c.lines().join('')).not.toContain(fixtures.providerKey);
   });
 
-  it('serialises a DebuggenError as its payload plus scrubbed details', () => {
+  it('serialises a DebuggenError as its code, closed-token details and a closed cause, never its hint', () => {
     const error = new DebuggenError('CONFIG_INVALID', 'config rejected', {
       hint: 'set DEBUGGEN_LOG_LEVEL',
       details: { setting: 'DEBUGGEN_PORT', key: 'DEBUGGEN_PORT', token: fixtures.providerKey },
@@ -596,16 +632,58 @@ describe('errors', () => {
     const c = capture();
     c.logger.fatal('boom', { [LOG_ERROR_FIELD_KEY]: error });
     const [record] = c.records();
+    // `setting` is a closed token under an identifier key; `key` is withheld
+    // by its name (any name folding onto a sensitive term is), and `token` by
+    // its name and its value. Both are counted, neither is named.
+    expect(record?.[LOG_ERROR_FIELD_KEY]).toEqual({
+      type: 'DebuggenError',
+      code: 'CONFIG_INVALID',
+      details: { setting: 'DEBUGGEN_PORT' },
+      [DETAILS_OMITTED_KEY]: 2,
+      cause: { type: 'Error' },
+    });
+    const line = c.lines().join('');
+    expect(line).not.toContain('"hint"');
+    expect(line).not.toContain('set DEBUGGEN_LOG_LEVEL');
+    expect(line).not.toContain('config rejected');
+    expect(line).not.toContain('inner');
+    expect(line).not.toContain(fixtures.jwt);
+    expect(line).not.toContain(fixtures.providerKey);
+  });
+
+  it('adds the redacted hint and the name-masked details of a DebuggenError at DEBUG', () => {
+    const error = new DebuggenError('CONFIG_INVALID', 'config rejected', {
+      hint: 'set DEBUGGEN_LOG_LEVEL',
+      details: { setting: 'DEBUGGEN_PORT', key: 'DEBUGGEN_PORT', token: fixtures.providerKey },
+    });
+    const c = capture();
+    c.logger.debug('boom', { [LOG_ERROR_FIELD_KEY]: error });
+    const [record] = c.records();
     const err = record?.[LOG_ERROR_FIELD_KEY] as Record<string, unknown>;
-    expect(err.code).toBe('CONFIG_INVALID');
-    expect(err.message).toBe('config rejected');
     expect(err.hint).toBe('set DEBUGGEN_LOG_LEVEL');
-    const details = err.details as Record<string, unknown>;
-    expect(details.setting).toBe('DEBUGGEN_PORT');
-    // Deliberately over-masked: any name folding onto a sensitive term is masked.
-    expect(details.key).toBe(REDACTION_MARKER);
-    expect(details.token).toBe(REDACTION_MARKER);
+    // At a diagnostic level every entry travels, through the full value walk:
+    // a denied name is still masked, and nothing is counted as withheld.
+    expect(err.details).toEqual({
+      setting: 'DEBUGGEN_PORT',
+      key: REDACTION_MARKER,
+      token: REDACTION_MARKER,
+    });
+    expect(err).not.toHaveProperty(DETAILS_OMITTED_KEY);
+    expect(c.lines().join('')).not.toContain(fixtures.providerKey);
+  });
+
+  it('adds the DebuggenError message and a scrubbed cause message at DEBUG', () => {
+    const error = new DebuggenError('CONFIG_INVALID', 'config rejected', {
+      cause: new Error(`inner ${fixtures.jwt}`),
+    });
+    const c = capture();
+    c.logger.debug('boom', { [LOG_ERROR_FIELD_KEY]: error });
+    const [record] = c.records();
+    const err = record?.[LOG_ERROR_FIELD_KEY] as Record<string, unknown>;
+    expect(err.message).toBe('config rejected');
+    expect(typeof err.stack).toBe('string');
     const cause = err.cause as Record<string, unknown>;
+    expect(cause.type).toBe('Error');
     expect(String(cause.message)).toContain(REDACTION_MARKER);
     expect(c.lines().join('')).not.toContain(fixtures.jwt);
   });
@@ -839,29 +917,37 @@ describe('values that refuse to be read', () => {
     const c = capture();
     expect(() => {
       c.logger.error('failed', { [LOG_ERROR_FIELD_KEY]: error });
+      c.logger.debug('failed', { [LOG_ERROR_FIELD_KEY]: error });
     }).not.toThrow();
-    const [record] = c.records();
-    const err = record?.[LOG_ERROR_FIELD_KEY] as Record<string, unknown>;
-    expect(err.type).toBe(LOG_MARKERS.unserializable);
-    expect(err.message).toBe(LOG_MARKERS.unserializable);
+    const [atError, atDebug] = c.records();
+    const err = atError?.[LOG_ERROR_FIELD_KEY] as Record<string, unknown>;
+    // A lying `name` cannot choose the label: the closed taxonomy does.
+    expect(err.type).toBe('Error');
+    expect(err).not.toHaveProperty('message');
     expect(err.cause).toBe(LOG_MARKERS.unserializable);
-    // An empty stack is omitted rather than emitted as an empty string.
     expect(err).not.toHaveProperty('stack');
+    const diagnostic = atDebug?.[LOG_ERROR_FIELD_KEY] as Record<string, unknown>;
+    expect(diagnostic.type).toBe('Error');
+    expect(diagnostic.message).toBe(LOG_MARKERS.unserializable);
+    expect(diagnostic.cause).toBe(LOG_MARKERS.unserializable);
+    // An empty stack is omitted rather than emitted as an empty string.
+    expect(diagnostic).not.toHaveProperty('stack');
   });
 
   it('serialises a DebuggenError that carries neither hint nor details', () => {
     const c = capture();
-    c.logger.error('failed', {
-      [LOG_ERROR_FIELD_KEY]: new DebuggenError('INTERNAL', 'bare failure'),
-    });
-    const [record] = c.records();
-    const err = record?.[LOG_ERROR_FIELD_KEY] as Record<string, unknown>;
-    expect(err.type).toBe('DebuggenError');
-    expect(err.code).toBe('INTERNAL');
-    expect(err.message).toBe('bare failure');
-    expect(err).not.toHaveProperty('hint');
-    expect(err).not.toHaveProperty('details');
-    expect(typeof err.stack).toBe('string');
+    const error = new DebuggenError('INTERNAL', 'bare failure');
+    c.logger.error('failed', { [LOG_ERROR_FIELD_KEY]: error });
+    c.logger.trace('failed', { [LOG_ERROR_FIELD_KEY]: error });
+    const [atError, atTrace] = c.records();
+    expect(atError?.[LOG_ERROR_FIELD_KEY]).toEqual({ type: 'DebuggenError', code: 'INTERNAL' });
+    const diagnostic = atTrace?.[LOG_ERROR_FIELD_KEY] as Record<string, unknown>;
+    expect(diagnostic.type).toBe('DebuggenError');
+    expect(diagnostic.code).toBe('INTERNAL');
+    expect(diagnostic.message).toBe('bare failure');
+    expect(diagnostic).not.toHaveProperty('hint');
+    expect(diagnostic).not.toHaveProperty('details');
+    expect(typeof diagnostic.stack).toBe('string');
   });
 });
 
@@ -1033,11 +1119,1031 @@ describe('nothing secret-shaped reaches the sink', () => {
     }
     expect(line).not.toContain('ada@example.com');
     expect(line).not.toContain('hunter2');
+    // The error travels as its closed shape: neither its text nor its stack.
+    expect(c.records()[0]?.[LOG_ERROR_FIELD_KEY]).toEqual({ type: 'Error' });
+    expect(line).not.toContain('inner');
     // What must survive: the product's own identifiers and the diagnostics a
     // reader needs to act on the record.
     expect(line).toContain('session-42');
     expect(line).toContain('generate-panel');
     expect(line).toContain('pipeline stage failed');
     expect(line).toContain('application/json');
+  });
+});
+
+describe('describeException — the closed taxonomy', () => {
+  it('names the product error by its code and never by its text', () => {
+    const described = describeException(
+      new DebuggenError('STORE_ERROR', 'SELECT * FROM account WHERE email = ?'),
+    );
+    expect(described).toEqual({ errorClass: 'DebuggenError', errorCode: 'STORE_ERROR' });
+  });
+
+  it('maps the built-in constructors onto their own labels', () => {
+    expect(describeException(new TypeError('x'))).toEqual({ errorClass: 'TypeError' });
+    expect(describeException(new RangeError('x'))).toEqual({ errorClass: 'RangeError' });
+    expect(describeException(new SyntaxError('x'))).toEqual({ errorClass: 'SyntaxError' });
+    expect(describeException(new Error('x'))).toEqual({ errorClass: 'Error' });
+  });
+
+  it('keeps an errno or ERR_ code and labels the value a system error', () => {
+    const errno = Object.assign(new Error('listen EADDRINUSE: address already in use'), {
+      code: 'EADDRINUSE',
+    });
+    expect(describeException(errno)).toEqual({
+      errorClass: 'SystemError',
+      errorCode: 'EADDRINUSE',
+    });
+    const internal = Object.assign(new TypeError('Invalid URL'), { code: 'ERR_INVALID_URL' });
+    expect(describeException(internal)).toEqual({
+      errorClass: 'TypeError',
+      errorCode: 'ERR_INVALID_URL',
+    });
+  });
+
+  it('never copies an arbitrary name or code', () => {
+    const hostile = Object.assign(new Error('boom'), {
+      name: '/home/dev/project/src/secret.ts',
+      code: "ada@example.com' OR 1=1",
+    });
+    const described = describeException(hostile);
+    expect(described).toEqual({ errorClass: 'Error' });
+    expect(EXCEPTION_CLASSES).toContain(described.errorClass);
+    const prefixed = Object.assign(new Error('boom'), { name: 'TypeError: /home/dev/x' });
+    expect(describeException(prefixed)).toEqual({ errorClass: 'Error' });
+  });
+
+  it('labels every non-Error value NonError', () => {
+    for (const value of ['a string', 42, null, undefined, { message: 'plain' }, Symbol('s')]) {
+      expect(describeException(value)).toEqual({ errorClass: 'NonError' });
+    }
+  });
+
+  it('survives a value that refuses a prototype lookup or a property read', () => {
+    expect(describeException(hostilePrototype())).toEqual({ errorClass: 'Error' });
+    const getter = new Error('boom');
+    Object.defineProperty(getter, 'name', {
+      get(): never {
+        throw new Error('no name for you');
+      },
+    });
+    expect(describeException(getter)).toEqual({ errorClass: 'Error' });
+  });
+});
+
+/**
+ * Low-entropy private sentinels for the closed exception shape.
+ *
+ * None is credential-shaped, so `scrub` leaves every one of them intact: only
+ * the closed shape (at the operating levels) and the context-aware redactor
+ * (at the diagnostic levels) can keep them out of a record, which is exactly
+ * what these suites assert.
+ */
+const sentinels = {
+  query: 'zz-query-sentinel',
+  relativeQuery: 'zz-relative-sentinel',
+  socketQuery: 'zz-socket-sentinel',
+  sql: 'zz-sql-sentinel',
+  sqlNumber: '918273645',
+  source: 'zzSourceSentinel',
+  name: 'zz-name-sentinel',
+  thrown: 'zz-thrown-sentinel',
+} as const;
+
+/** A request URL whose query value is private. */
+const SENTINEL_URL = `https://app.test/api/items?email=${sentinels.query}`;
+
+/** A statement carrying an inline string literal and an inline number. */
+const SENTINEL_SQL = `SELECT id FROM account WHERE email = '${sentinels.sql}' AND tenant = ${sentinels.sqlNumber}`;
+
+/** A Babel / Next.js codeframe whose pointed-at line is private source. */
+const SENTINEL_CODEFRAME = [
+  '  11 | export function load() {',
+  `> 12 |   const secret = ${sentinels.source};`,
+  '     |         ^',
+  '  13 | }',
+].join('\n');
+
+/** A V8 frame, which the redactor must keep byte-identical. */
+const SENTINEL_FRAME = '    at load (/home/dev/project/src/load.ts:12:9)';
+
+/** The escape code, built at runtime so no control character sits in the source. */
+const ESC = String.fromCharCode(0x1b);
+
+/**
+ * An error carrying every sentinel: a hostile `name`, a URL query value and a
+ * codeframe in its message and stack, a SQL literal in its cause, and a thrown
+ * string — with a relative URL — as the cause's cause.
+ */
+function sentinelError(): Error {
+  const cause = new Error(`cause: ${SENTINEL_SQL}`, {
+    cause: `${sentinels.thrown} while reading /api/items?email=${sentinels.relativeQuery}`,
+  });
+  cause.name = sentinels.name;
+  cause.stack = [`${sentinels.name}: cause: ${SENTINEL_SQL}`, SENTINEL_FRAME].join('\n');
+  const error = new Error(`request to ${SENTINEL_URL} failed\n${SENTINEL_CODEFRAME}`, { cause });
+  error.name = sentinels.name;
+  error.stack = [
+    `${sentinels.name}: request to ${SENTINEL_URL} failed`,
+    SENTINEL_CODEFRAME,
+    SENTINEL_FRAME,
+  ].join('\n');
+  return error;
+}
+
+/** The levels a record is written at by default, where only the closed shape may appear. */
+const OPERATING_LEVELS = ['info', 'warn', 'error', 'fatal'] as const;
+
+describe('the closed exception shape — no free text at INFO, WARN, ERROR or FATAL', () => {
+  it('declares debug and trace as the only diagnostic levels', () => {
+    expect([...DIAGNOSTIC_LOG_LEVELS].sort()).toEqual(['debug', 'trace']);
+    expect(Object.isFrozen(DIAGNOSTIC_LOG_LEVELS)).toBe(true);
+  });
+
+  for (const level of OPERATING_LEVELS) {
+    it(`keeps every sentinel out of the ${level.toUpperCase()} record and keeps the codes`, () => {
+      const c = capture();
+      c.logger[level]('the request failed', {
+        [LOG_ERROR_FIELD_KEY]: sentinelError(),
+        nested: { [LOG_ERROR_FIELD_KEY]: `${sentinels.thrown} ${SENTINEL_SQL}` },
+        bind: Object.assign(new Error(`listen EADDRINUSE ${SENTINEL_URL}`), {
+          code: 'EADDRINUSE',
+        }),
+        store: new DebuggenError('STORE_ERROR', SENTINEL_SQL, { cause: SENTINEL_URL }),
+      });
+      c.logger[level]('a string was thrown', { [LOG_ERROR_FIELD_KEY]: sentinels.thrown });
+
+      const lines = c.lines();
+      expect(lines).toHaveLength(2);
+      for (const line of lines) {
+        for (const [name, value] of Object.entries(sentinels)) {
+          expect(line, `${level}: ${name}`).not.toContain(value);
+        }
+        expect(line).not.toContain('"message"');
+        expect(line).not.toContain('"stack"');
+      }
+
+      const [record, thrown] = c.records();
+      const err = record?.[LOG_ERROR_FIELD_KEY] as Record<string, unknown>;
+      expect(EXCEPTION_CLASSES).toContain(err.type);
+      expect(err).toEqual({ type: 'Error', cause: { type: 'Error', cause: { type: 'NonError' } } });
+      expect(record?.nested).toEqual({ [LOG_ERROR_FIELD_KEY]: { type: 'NonError' } });
+      expect(record?.bind).toEqual({ type: 'SystemError', code: 'EADDRINUSE' });
+      expect(record?.store).toEqual({
+        type: 'DebuggenError',
+        code: 'STORE_ERROR',
+        cause: { type: 'NonError' },
+      });
+      expect(thrown?.[LOG_ERROR_FIELD_KEY]).toEqual({ type: 'NonError' });
+    });
+  }
+
+  it('emits the closed shape from scrubLogFields unless diagnostics are asked for', () => {
+    const error = new Error(`request to ${SENTINEL_URL} failed`);
+    expect(scrubLogFields({ [LOG_ERROR_FIELD_KEY]: error })).toEqual({
+      [LOG_ERROR_FIELD_KEY]: { type: 'Error' },
+    });
+    expect(scrubLogFields({ [LOG_ERROR_FIELD_KEY]: error }, { diagnostics: false })).toEqual({
+      [LOG_ERROR_FIELD_KEY]: { type: 'Error' },
+    });
+    const diagnostic = scrubLogFields({ [LOG_ERROR_FIELD_KEY]: error }, { diagnostics: true });
+    const err = diagnostic[LOG_ERROR_FIELD_KEY] as Record<string, unknown>;
+    expect(err.message).toBe('request to https://app.test/api/items?email=? failed');
+  });
+
+  it('never gives a child binding the diagnostic text, even on a DEBUG record', () => {
+    const c = capture();
+    c.logger.child({ [LOG_ERROR_FIELD_KEY]: sentinelError() }).debug('bound');
+    const [line] = c.lines();
+    for (const [name, value] of Object.entries(sentinels)) {
+      expect(line, name).not.toContain(value);
+    }
+    expect(c.records()[0]?.[LOG_ERROR_FIELD_KEY]).toMatchObject({ type: 'Error' });
+  });
+
+  it('bounds a cause chain by depth and cuts a cause cycle', () => {
+    let chain = new Error('link 0');
+    for (let link = 1; link < 12; link += 1) {
+      chain = new Error(`link ${link}`, { cause: chain });
+    }
+    const scrubbed = scrubLogFields({ [LOG_ERROR_FIELD_KEY]: chain });
+    let node: unknown = scrubbed[LOG_ERROR_FIELD_KEY];
+    let links = 0;
+    while (typeof node === 'object' && node !== null) {
+      links += 1;
+      node = (node as Record<string, unknown>).cause;
+    }
+    expect(node).toBe(LOG_MARKERS.truncated);
+    expect(links).toBeLessThan(12);
+    expect(scrubbed[FIELDS_TRUNCATED_KEY]).toBe(true);
+
+    const looped = new Error('loop');
+    looped.cause = looped;
+    expect(scrubLogFields({ [LOG_ERROR_FIELD_KEY]: looped })[LOG_ERROR_FIELD_KEY]).toEqual({
+      type: 'Error',
+      cause: LOG_MARKERS.circular,
+    });
+  });
+
+  it('reports a value under err whose prototype cannot be inspected', () => {
+    expect(scrubLogFields({ [LOG_ERROR_FIELD_KEY]: hostilePrototype() })).toEqual({
+      [LOG_ERROR_FIELD_KEY]: LOG_MARKERS.unserializable,
+    });
+  });
+});
+
+describe('the diagnostic levels — redacted message and stack at DEBUG and TRACE', () => {
+  for (const level of DIAGNOSTIC_LOG_LEVELS) {
+    it(`emits the redacted message and stack at ${level.toUpperCase()}`, () => {
+      const c = capture();
+      c.logger[level]('the request failed', { [LOG_ERROR_FIELD_KEY]: sentinelError() });
+      const [record] = c.records();
+      const err = record?.[LOG_ERROR_FIELD_KEY] as Record<string, unknown>;
+      // The label is still closed: a hostile name never becomes the type.
+      expect(err.type).toBe('Error');
+
+      const message = String(err.message);
+      expect(message).toContain('request to https://app.test/api/items?email=? failed');
+      expect(message).toContain(REDACTION_MARKER);
+      expect(message).not.toContain(sentinels.query);
+      expect(message).not.toContain(sentinels.source);
+      expect(message).not.toContain('> 12 |');
+
+      const stack = String(err.stack);
+      expect(stack.split('\n')).toContain(SENTINEL_FRAME);
+      expect(stack).not.toContain(sentinels.query);
+      expect(stack).not.toContain(sentinels.source);
+
+      const cause = err.cause as Record<string, unknown>;
+      expect(cause.type).toBe('Error');
+      expect(cause.message).toBe('cause: SELECT id FROM account WHERE email = ? AND tenant = ?');
+      expect(String(cause.stack)).not.toContain(sentinels.sql);
+      expect(String(cause.stack)).not.toContain(sentinels.sqlNumber);
+
+      const thrown = cause.cause as Record<string, unknown>;
+      expect(thrown.type).toBe('NonError');
+      expect(thrown.message).toBe(`${sentinels.thrown} while reading /api/items?email=?`);
+    });
+  }
+});
+
+/**
+ * Low-entropy private sentinels for a `DebuggenError`'s own free text: its
+ * `hint`, and its `details` as string values, inside a nested object, inside
+ * an array and as a key — and the same fields of a `DebuggenError` cause.
+ *
+ * Like {@link sentinels}, none is credential-shaped, so `scrub` leaves every
+ * one intact: only the closed-token rule (at the operating levels) and the
+ * context-aware redactor (at the diagnostic levels) can keep them out.
+ */
+const contextSentinels = {
+  hintQuery: 'zz-hint-query',
+  hintSql: 'zz-hint-sql',
+  hintSource: 'zzHintSource',
+  detailQuery: 'zz-detail-query',
+  detailSql: 'zz-detail-sql',
+  detailSource: 'zzDetailSource',
+  nestedQuery: 'zz-nested-query',
+  nestedSql: 'zz-nested-sql',
+  listQuery: 'zz-list-query',
+  listSource: 'zzListSource',
+  labelQuery: 'zz-label-query',
+  causeHintQuery: 'zz-cause-hint-query',
+  causeHintSql: 'zz-cause-hint-sql',
+  causeHintSource: 'zzCauseHintSource',
+  causeDetailQuery: 'zz-cause-detail-query',
+  causeDetailSql: 'zz-cause-detail-sql',
+  causeDetailSource: 'zzCauseDetailSource',
+  causeNestedSql: 'zz-cause-nested-sql',
+  causeListQuery: 'zz-cause-list-query',
+} as const;
+
+/** An origin-relative request URL whose query value is private. */
+const queryText = (value: string): string => `/api/probe?email=${value}`;
+
+/** A statement carrying a private inline literal. */
+const sqlText = (value: string): string =>
+  `lookup failed: SELECT id FROM account WHERE email = '${value}'`;
+
+/** One Babel / Next.js codeframe source line whose source is private. */
+const codeframeText = (value: string): string => `> 12 |   const x = ${value};`;
+
+/** A recovery hint carrying all three kinds of private text, one per line. */
+const hintText = (query: string, sql: string, source: string): string =>
+  [`Reload ${queryText(query)} and retry.`, sqlText(sql), codeframeText(source)].join('\n');
+
+/** {@link queryText} after `redactDiagnosticText`: the path and key stay, the value is `?`. */
+const REDACTED_QUERY = '/api/probe?email=?';
+
+/** {@link sqlText} after `redactDiagnosticText`: the literal is parameterised. */
+const REDACTED_SQL = 'lookup failed: SELECT id FROM account WHERE email = ?';
+
+/** {@link hintText} after `redactDiagnosticText`: the codeframe line becomes the marker. */
+const REDACTED_HINT = [`Reload ${REDACTED_QUERY} and retry.`, REDACTED_SQL, REDACTION_MARKER].join(
+  '\n',
+);
+
+/**
+ * A `DebuggenError` whose hint and details carry every context sentinel next
+ * to two content-free entries (`reason: 'probe-failed'`, `count: 3`), and
+ * whose cause is another `DebuggenError` built the same way.
+ */
+function contextError(): DebuggenError {
+  const s = contextSentinels;
+  const cause = new DebuggenError('STORE_ERROR', 'the store refused the write', {
+    hint: hintText(s.causeHintQuery, s.causeHintSql, s.causeHintSource),
+    details: {
+      reason: 'store-locked',
+      attempt: 2,
+      url: queryText(s.causeDetailQuery),
+      note: sqlText(s.causeDetailSql),
+      excerpt: codeframeText(s.causeDetailSource),
+      nested: { note: sqlText(s.causeNestedSql) },
+      list: [queryText(s.causeListQuery)],
+    },
+  });
+  return new DebuggenError('AGENT_NOT_READY', 'the probe failed', {
+    hint: hintText(s.hintQuery, s.hintSql, s.hintSource),
+    details: {
+      reason: 'probe-failed',
+      count: 3,
+      url: queryText(s.detailQuery),
+      note: sqlText(s.detailSql),
+      excerpt: codeframeText(s.detailSource),
+      nested: { url: queryText(s.nestedQuery), note: sqlText(s.nestedSql) },
+      list: [queryText(s.listQuery), codeframeText(s.listSource)],
+      [queryText(s.labelQuery)]: 1,
+    },
+    cause,
+  });
+}
+
+/**
+ * The closed shape {@link contextError} takes at every operating level: the
+ * two content-free entries of each error, and the count of the rest — six
+ * withheld from the error (`url`, `note`, `excerpt`, `nested`, `list` and the
+ * URL-shaped key) and five from its cause.
+ */
+const CLOSED_CONTEXT_ERROR = Object.freeze({
+  type: 'DebuggenError',
+  code: 'AGENT_NOT_READY',
+  details: { reason: 'probe-failed', count: 3 },
+  [DETAILS_OMITTED_KEY]: 6,
+  cause: {
+    type: 'DebuggenError',
+    code: 'STORE_ERROR',
+    details: { reason: 'store-locked', attempt: 2 },
+    [DETAILS_OMITTED_KEY]: 5,
+  },
+});
+
+/** Asserts that no context sentinel appears anywhere in an emitted line. */
+function expectNoContextSentinel(line: string | undefined, label: string): void {
+  expect(line, label).toBeDefined();
+  for (const [name, value] of Object.entries(contextSentinels)) {
+    expect(line, `${label}: ${name}`).not.toContain(value);
+  }
+}
+
+describe('DebuggenError hint and details — closed at INFO, WARN, ERROR and FATAL', () => {
+  for (const level of OPERATING_LEVELS) {
+    it(`emits no hint and only closed-token details at ${level.toUpperCase()}, causes included`, () => {
+      const c = capture();
+      c.logger[level]('probe diagnostics', {
+        [LOG_ERROR_FIELD_KEY]: contextError(),
+        // The same rules wherever the error sits: under an ordinary name, and
+        // as the cause of an error that is not a DebuggenError at all.
+        failure: contextError(),
+        wrapped: new Error('wrapper', { cause: contextError() }),
+      });
+
+      const lines = c.lines();
+      expect(lines).toHaveLength(1);
+      const [line] = lines;
+      expectNoContextSentinel(line, level);
+      expect(line).not.toContain('"hint"');
+      expect(line).not.toContain('"message"');
+      expect(line).not.toContain('"stack"');
+      expect(line).not.toContain('the probe failed');
+      expect(line).not.toContain('the store refused the write');
+      expect(line).not.toContain('wrapper');
+
+      const [record] = c.records();
+      expect(record?.[LOG_ERROR_FIELD_KEY]).toEqual(CLOSED_CONTEXT_ERROR);
+      expect(record?.failure).toEqual(CLOSED_CONTEXT_ERROR);
+      expect(record?.wrapped).toEqual({ type: 'Error', cause: CLOSED_CONTEXT_ERROR });
+      expect(record).not.toHaveProperty(FIELDS_TRUNCATED_KEY);
+    });
+  }
+
+  it('keeps a closed token, a finite number and a boolean, and withholds everything else', () => {
+    const details: Record<string, unknown> = {
+      reason: 'probe-failed',
+      state: 'state-tree',
+      sessionId: 'ses_4k2p9dq7m1zx0c3v',
+      errno: 'ENOENT',
+      code: 'STORE_ERROR',
+      stage: 'generate-panel',
+      ok: true,
+      ratio: 0.5,
+      edge: 'a'.repeat(CLOSED_DETAIL_MAX_LENGTH),
+      ['k'.repeat(CLOSED_DETAIL_MAX_LENGTH)]: 'kept',
+      // An absent value is no entry: neither emitted nor counted.
+      missing: undefined,
+      // Withheld by value: not a closed token, or not a finite scalar.
+      version: '1.2.3',
+      phone: '5551234567',
+      path: 'src/load.ts',
+      sentence: 'probe failed twice',
+      camel: 'stateTree',
+      long: 'a'.repeat(CLOSED_DETAIL_MAX_LENGTH + 1),
+      huge: 'a'.repeat(200_000),
+      inf: Number.POSITIVE_INFINITY,
+      nan: Number.NaN,
+      big: 10n,
+      none: null,
+      // Withheld by value although the grammar admits it: `scrub` recognises
+      // an access key id, so a credential never travels on the grammar alone.
+      accessId: ['AKIA', 'Q'.repeat(16)].join(''),
+      // Withheld by key: the grammar, then every name rule of the value walk.
+      'bad key': 'x',
+      ['k'.repeat(CLOSED_DETAIL_MAX_LENGTH + 1)]: 'x',
+      token: 'probe-failed',
+      databaseUrl: 'db',
+      body: 'x',
+      sql: 'x',
+      [LOG_ERROR_FIELD_KEY]: 'x',
+    };
+    const c = capture();
+    c.logger.error('failed', {
+      [LOG_ERROR_FIELD_KEY]: new DebuggenError('INTERNAL', 'failed', { details }),
+    });
+    const err = c.records()[0]?.[LOG_ERROR_FIELD_KEY] as Record<string, unknown>;
+    expect(err.details).toEqual({
+      reason: 'probe-failed',
+      state: 'state-tree',
+      sessionId: 'ses_4k2p9dq7m1zx0c3v',
+      errno: 'ENOENT',
+      code: 'STORE_ERROR',
+      stage: 'generate-panel',
+      ok: true,
+      ratio: 0.5,
+      edge: 'a'.repeat(CLOSED_DETAIL_MAX_LENGTH),
+      ['k'.repeat(CLOSED_DETAIL_MAX_LENGTH)]: 'kept',
+    });
+    // Twelve withheld by value, seven by key; `missing` is not counted.
+    expect(err[DETAILS_OMITTED_KEY]).toBe(19);
+    const line = c.lines().join('');
+    expect(line).not.toContain('AKIA');
+    expect(line).not.toContain('src/load.ts');
+    expect(line).not.toContain('5551234567');
+  });
+
+  it('omits details altogether when no entry qualifies, and still counts them', () => {
+    const c = capture();
+    c.logger.warn('failed', {
+      [LOG_ERROR_FIELD_KEY]: new DebuggenError('INTERNAL', 'failed', {
+        details: {
+          url: queryText(contextSentinels.detailQuery),
+          nested: { reason: 'probe-failed' },
+        },
+      }),
+    });
+    expect(c.records()[0]?.[LOG_ERROR_FIELD_KEY]).toEqual({
+      type: 'DebuggenError',
+      code: 'INTERNAL',
+      [DETAILS_OMITTED_KEY]: 2,
+    });
+    expectNoContextSentinel(c.lines()[0], 'warn');
+  });
+
+  it('bounds the closed pass by the key cap, counts the rest and flags the record', () => {
+    const details: Record<string, number> = {};
+    for (let index = 0; index < MAX_TRACKED_KEYS + 5; index += 1) {
+      details[`e${index}`] = index;
+    }
+    const scrubbed = scrubLogFields({
+      [LOG_ERROR_FIELD_KEY]: new DebuggenError('INTERNAL', 'failed', { details }),
+    });
+    const err = scrubbed[LOG_ERROR_FIELD_KEY] as Record<string, unknown>;
+    expect(Object.keys(err.details as object)).toHaveLength(MAX_TRACKED_KEYS);
+    expect(err[DETAILS_OMITTED_KEY]).toBe(5);
+    expect(scrubbed[FIELDS_TRUNCATED_KEY]).toBe(true);
+  });
+
+  it('confines hostile details: a throwing getter costs its entry, a refusing Proxy the field', () => {
+    const getterDetails: Record<string, unknown> = { reason: 'probe-failed' };
+    Object.defineProperty(getterDetails, 'lazy', {
+      enumerable: true,
+      get: (): never => {
+        throw new Error(`getter refused ${queryText(contextSentinels.detailQuery)}`);
+      },
+    });
+    const refusing = new Proxy<Record<string, unknown>>(
+      {},
+      {
+        ownKeys(): never {
+          throw new Error('these details refuse enumeration');
+        },
+      },
+    );
+
+    const c = capture();
+    expect(() => {
+      for (const level of ['error', 'debug'] as const) {
+        c.logger[level]('failed', {
+          getter: new DebuggenError('INTERNAL', 'failed', { details: getterDetails }),
+          refusing: new DebuggenError('INTERNAL', 'failed', { details: refusing }),
+        });
+      }
+    }).not.toThrow();
+    const [atError, atDebug] = c.records();
+    expect(atError?.getter).toEqual({
+      type: 'DebuggenError',
+      code: 'INTERNAL',
+      details: { reason: 'probe-failed' },
+      [DETAILS_OMITTED_KEY]: 1,
+    });
+    expect(atError?.refusing).toEqual({
+      type: 'DebuggenError',
+      code: 'INTERNAL',
+      details: LOG_MARKERS.unserializable,
+    });
+    const getterAtDebug = atDebug?.getter as Record<string, unknown>;
+    expect(getterAtDebug.details).toEqual({
+      reason: 'probe-failed',
+      lazy: LOG_MARKERS.unserializable,
+    });
+    const refusingAtDebug = atDebug?.refusing as Record<string, unknown>;
+    expect(refusingAtDebug.details).toEqual({
+      [FIELDS_UNREADABLE_KEY]: LOG_MARKERS.unserializable,
+    });
+    for (const line of c.lines()) {
+      expectNoContextSentinel(line, 'hostile details');
+    }
+  });
+
+  it('reports details that turn unreadable after classification, at every level', () => {
+    // `DebuggenError.is` reads `details` once to classify the value; a getter
+    // that throws only on a later read reaches the serializer's own guard.
+    const error = new DebuggenError('INTERNAL', 'failed', { hint: 'h', details: {} });
+    let reads = 0;
+    Object.defineProperty(error, 'details', {
+      get: (): Record<string, unknown> => {
+        reads += 1;
+        if (reads % 2 === 0) {
+          throw new Error('these details refuse a second read');
+        }
+        return {};
+      },
+    });
+    const c = capture();
+    c.logger.error('failed', { [LOG_ERROR_FIELD_KEY]: error });
+    c.logger.debug('failed', { [LOG_ERROR_FIELD_KEY]: error });
+    const [atError, atDebug] = c.records();
+    expect(atError?.[LOG_ERROR_FIELD_KEY]).toEqual({
+      type: 'DebuggenError',
+      code: 'INTERNAL',
+      details: LOG_MARKERS.unserializable,
+    });
+    const diagnostic = atDebug?.[LOG_ERROR_FIELD_KEY] as Record<string, unknown>;
+    expect(diagnostic.hint).toBe('h');
+    expect(diagnostic.details).toBe(LOG_MARKERS.unserializable);
+  });
+
+  it('declares the grammar, its bound and the omitted counter', () => {
+    expect(CLOSED_DETAIL_MAX_LENGTH).toBe(64);
+    expect(DETAILS_OMITTED_KEY).toBe('detailsOmitted');
+    expect(Object.isFrozen(CLOSED_DETAIL_KEY_PATTERN)).toBe(true);
+    expect(Object.isFrozen(CLOSED_DETAIL_TOKEN_PATTERN)).toBe(true);
+
+    expect(CLOSED_DETAIL_KEY_PATTERN.test(`a${'b'.repeat(CLOSED_DETAIL_MAX_LENGTH - 1)}`)).toBe(
+      true,
+    );
+    expect(CLOSED_DETAIL_KEY_PATTERN.test(`a${'b'.repeat(CLOSED_DETAIL_MAX_LENGTH)}`)).toBe(false);
+    for (const key of ['reason', 'planVersion', 'active_plan2']) {
+      expect(CLOSED_DETAIL_KEY_PATTERN.test(key), key).toBe(true);
+    }
+    for (const key of ['', '_private', '2fa', 'http.method', 'bad key', 'a-b', '/api']) {
+      expect(CLOSED_DETAIL_KEY_PATTERN.test(key), key).toBe(false);
+    }
+
+    for (const token of [
+      'probe-failed',
+      'state-tree',
+      'ses_4k2p9dq7m1zx0c3v',
+      'generate-panel',
+      'v1.plan',
+      'ENOENT',
+      'STORE_ERROR',
+      'ERR_INVALID_URL',
+    ]) {
+      expect(CLOSED_DETAIL_TOKEN_PATTERN.test(token), token).toBe(true);
+    }
+    for (const token of [
+      '',
+      'Probe-failed',
+      'stateTree',
+      '1.2.3',
+      'probe--failed',
+      'probe-',
+      'STORE-ERROR',
+      'STORE__ERROR',
+      'probe failed',
+      '/api/probe',
+      'email=zz',
+      "'zz'",
+      '> 12 |',
+    ]) {
+      expect(CLOSED_DETAIL_TOKEN_PATTERN.test(token), token).toBe(false);
+    }
+  });
+});
+
+describe('DebuggenError hint and details — redacted at DEBUG and TRACE', () => {
+  for (const level of DIAGNOSTIC_LOG_LEVELS) {
+    it(`emits the redacted hint and every redacted detail at ${level.toUpperCase()}, cause included`, () => {
+      const c = capture();
+      c.logger[level]('the probe failed', { [LOG_ERROR_FIELD_KEY]: contextError() });
+
+      const [line] = c.lines();
+      expectNoContextSentinel(line, level);
+
+      const err = c.records()[0]?.[LOG_ERROR_FIELD_KEY] as Record<string, unknown>;
+      expect(err.type).toBe('DebuggenError');
+      expect(err.code).toBe('AGENT_NOT_READY');
+      expect(err.hint).toBe(REDACTED_HINT);
+      // Every entry travels — strings, the nested object, the array and the
+      // URL-shaped key — each string redacted by context, nothing counted.
+      expect(err.details).toEqual({
+        reason: 'probe-failed',
+        count: 3,
+        url: REDACTED_QUERY,
+        note: REDACTED_SQL,
+        excerpt: REDACTION_MARKER,
+        nested: { url: REDACTED_QUERY, note: REDACTED_SQL },
+        list: [REDACTED_QUERY, REDACTION_MARKER],
+        [REDACTED_QUERY]: 1,
+      });
+      expect(err).not.toHaveProperty(DETAILS_OMITTED_KEY);
+      expect(err.message).toBe('the probe failed');
+      expect(typeof err.stack).toBe('string');
+
+      expect(err.cause).toMatchObject({
+        type: 'DebuggenError',
+        code: 'STORE_ERROR',
+        hint: REDACTED_HINT,
+        details: {
+          reason: 'store-locked',
+          attempt: 2,
+          url: REDACTED_QUERY,
+          note: REDACTED_SQL,
+          excerpt: REDACTION_MARKER,
+          nested: { note: REDACTED_SQL },
+          list: [REDACTED_QUERY],
+        },
+        message: 'the store refused the write',
+      });
+      expect(err.cause).not.toHaveProperty(DETAILS_OMITTED_KEY);
+    });
+  }
+
+  it('confines the context-aware redaction to the details it was entered for', () => {
+    const inner = new DebuggenError('INTERNAL', 'inner', {
+      details: { url: queryText(contextSentinels.nestedQuery) },
+    });
+    const c = capture();
+    c.logger.debug('failed', {
+      before: '/api/probe?page=2',
+      [LOG_ERROR_FIELD_KEY]: new DebuggenError('INTERNAL', 'outer', {
+        // A DebuggenError nested in details enters and leaves the mode itself;
+        // the entry after it is still redacted, because the outer walk is.
+        details: { inner, after: queryText(contextSentinels.listQuery) },
+      }),
+      after: '/api/probe?page=2',
+    });
+    expectNoContextSentinel(c.lines()[0], 'nested details');
+    const [record] = c.records();
+    const details = (record?.[LOG_ERROR_FIELD_KEY] as Record<string, unknown>).details as Record<
+      string,
+      unknown
+    >;
+    expect((details.inner as Record<string, unknown>).details).toEqual({ url: REDACTED_QUERY });
+    expect(details.after).toBe(REDACTED_QUERY);
+    // Ordinary fields on either side keep their `scrub`-only treatment.
+    expect(record?.before).toBe('/api/probe?page=2');
+    expect(record?.after).toBe('/api/probe?page=2');
+  });
+
+  it('stays bounded and total on a huge hint, a huge value, a huge key and a cycle', () => {
+    const huge = `${queryText(contextSentinels.detailQuery)} ${'word '.repeat(40_000)}`;
+    const details: Record<string, unknown> = { huge, [huge]: 1 };
+    details.self = details;
+    const c = capture();
+    expect(() => {
+      c.logger.trace('failed', {
+        [LOG_ERROR_FIELD_KEY]: new DebuggenError('INTERNAL', 'failed', { hint: huge, details }),
+      });
+    }).not.toThrow();
+    expectNoContextSentinel(c.lines()[0], 'adversarial details');
+
+    const err = c.records()[0]?.[LOG_ERROR_FIELD_KEY] as Record<string, unknown>;
+    expect(String(err.hint).length).toBeLessThanOrEqual(DIAGNOSTIC_TEXT_MAX_LENGTH);
+    expect(String(err.hint).startsWith(`${REDACTED_QUERY} word`)).toBe(true);
+    const emitted = err.details as Record<string, unknown>;
+    expect(String(emitted.huge).length).toBeLessThanOrEqual(DIAGNOSTIC_TEXT_MAX_LENGTH);
+    for (const key of Object.keys(emitted)) {
+      expect(key.length).toBeLessThanOrEqual(DIAGNOSTIC_TEXT_MAX_LENGTH);
+    }
+    // The walk's own cycle cut, unchanged: the self-reference is walked once
+    // as a container and cut where it recurs.
+    expect((emitted.self as Record<string, unknown>).self).toBe(LOG_MARKERS.circular);
+  });
+});
+
+describe('redactDiagnosticText — context-aware diagnostic redaction', () => {
+  it('masks URL query values and keeps the path, host and a frame position', () => {
+    const redacted = redactDiagnosticText(
+      [
+        `GET ${SENTINEL_URL} failed`,
+        `redirected to /checkout?coupon=${sentinels.relativeQuery}.`,
+        `socket ws://127.0.0.1:20240/ws?ticket=${sentinels.socketQuery} closed`,
+        `    at fetchItems (https://app.test/_next/static/chunks/app.js?v=${sentinels.query}:12:5)`,
+      ].join('\n'),
+    );
+    expect(redacted).toBe(
+      [
+        'GET https://app.test/api/items?email=? failed',
+        'redirected to /checkout?coupon=?.',
+        'socket ws://127.0.0.1:20240/ws?ticket=? closed',
+        '    at fetchItems (https://app.test/_next/static/chunks/app.js?v=?:12:5)',
+      ].join('\n'),
+    );
+  });
+
+  it('parameterises SQL literals in a statement, across lines and in any case', () => {
+    expect(redactDiagnosticText(`query failed: ${SENTINEL_SQL}`)).toBe(
+      'query failed: SELECT id FROM account WHERE email = ? AND tenant = ?',
+    );
+    const multiLine = redactDiagnosticText(
+      `update account set note = 'first line\n${sentinels.sql}' where id = 7`,
+    );
+    expect(multiLine).toBe('update account set note = ? where id = ?');
+    // A frame after the statement is not read as SQL and keeps its position.
+    expect(redactDiagnosticText(`${SENTINEL_SQL}\n${SENTINEL_FRAME}`)).toBe(
+      `SELECT id FROM account WHERE email = ? AND tenant = ?\n${SENTINEL_FRAME}`,
+    );
+    // Prose without a statement keeps its quotes and numbers.
+    expect(redactDiagnosticText("the value 'kept' failed 3 times")).toBe(
+      "the value 'kept' failed 3 times",
+    );
+  });
+
+  it('matches its documented example', () => {
+    const email = ['ada', 'example.com'].join('@');
+    expect(
+      redactDiagnosticText(
+        `GET /api/items?email=${email} failed: SELECT id FROM account WHERE email = '${email}'`,
+      ),
+    ).toBe('GET /api/items?email=? failed: SELECT id FROM account WHERE email = ?');
+  });
+
+  it('removes Babel, esbuild and TypeScript codeframes, colour included', () => {
+    expect(
+      redactDiagnosticText(
+        ['Unexpected token (12:17)', SENTINEL_CODEFRAME, SENTINEL_FRAME].join('\n'),
+      ),
+    ).toBe(['Unexpected token (12:17)', REDACTION_MARKER, SENTINEL_FRAME].join('\n'));
+
+    const coloured = `${ESC}[31m${ESC}[1m>${ESC}[22m${ESC}[39m${ESC}[90m 12 |${ESC}[39m   const secret ${ESC}[33m=${ESC}[39m ${sentinels.source};`;
+    expect(redactDiagnosticText(`${ESC}[31mUnexpected token${ESC}[39m\n${coloured}`)).toBe(
+      `Unexpected token\n${REDACTION_MARKER}`,
+    );
+
+    const esbuild = [
+      '    src/load.ts:12:17:',
+      `      12 │   const secret = ${sentinels.source};`,
+      '         ╵                  ^',
+    ].join('\n');
+    expect(redactDiagnosticText(esbuild)).toBe(`    src/load.ts:12:17:\n${REDACTION_MARKER}`);
+
+    const typescript = [
+      "src/load.ts:12:17 - error TS1005: ';' expected.",
+      '',
+      `${ESC}[7m12${ESC}[0m   const secret = ${sentinels.source}`,
+      `${ESC}[7m  ${ESC}[0m ${ESC}[91m                 ~~~~~~~~~~~~~~~~${ESC}[0m`,
+    ].join('\n');
+    expect(redactDiagnosticText(typescript)).toBe(
+      `src/load.ts:12:17 - error TS1005: ';' expected.\n\n${REDACTION_MARKER}`,
+    );
+  });
+
+  it('scrubs credentials, strips control characters and bounds the result', () => {
+    const redacted = redactDiagnosticText(
+      `key ${fixtures.providerKey}${ESC}[0m${String.fromCharCode(0x07)} done`,
+    );
+    expect(redacted).not.toContain(fixtures.providerKey);
+    expect(redacted).toContain(REDACTION_MARKER);
+    expect(redacted).not.toContain(ESC);
+    expect(redacted).not.toContain(String.fromCharCode(0x07));
+    expect(redacted.endsWith(' done')).toBe(true);
+
+    const long = redactDiagnosticText('word '.repeat(5_000));
+    expect(long.length).toBeLessThanOrEqual(DIAGNOSTIC_TEXT_MAX_LENGTH);
+    expect(long.endsWith(`\n${LOG_MARKERS.truncated}`)).toBe(true);
+  });
+
+  it('stays bounded on adversarial input shaped against each pass', () => {
+    // Overlapping URL starts, a scheme run with no query, an unterminated
+    // literal after a keyword, and a codeframe-shaped flood: each is the
+    // worst case of one pass, and each must come back bounded.
+    for (const hostile of [
+      '(/'.repeat(8_000),
+      'x://'.repeat(4_000),
+      `SELECT '${'a'.repeat(15_000)}`,
+      '> 1 | x\n'.repeat(2_000),
+      `${ESC}[`.repeat(8_000),
+    ]) {
+      const redacted = redactDiagnosticText(hostile);
+      expect(redacted.length).toBeLessThanOrEqual(DIAGNOSTIC_TEXT_MAX_LENGTH);
+    }
+  });
+
+  it('is total: a value it cannot scan becomes the marker and nothing throws', () => {
+    expect(redactDiagnosticText('')).toBe('');
+    expect(redactDiagnosticText(42)).toBe('42');
+    expect(redactDiagnosticText(null)).toBe(REDACTION_MARKER);
+    expect(redactDiagnosticText({ message: sentinels.query })).toBe(REDACTION_MARKER);
+    expect(() => redactDiagnosticText(hostilePrototype())).not.toThrow();
+  });
+});
+
+/** A `Logger` whose every method throws, standing in for a failing destination. */
+function throwingLogger(): Logger {
+  const fail = (): never => {
+    throw new Error('EPIPE: the destination is closed at /home/dev/project');
+  };
+  return {
+    level: 'trace',
+    trace: fail,
+    debug: fail,
+    info: fail,
+    warn: fail,
+    error: fail,
+    fatal: fail,
+    child: fail,
+  };
+}
+
+describe('guardLogger — best-effort, never-throwing logging', () => {
+  it('never throws from a level method and announces the first drop once', () => {
+    const notices: string[] = [];
+    const log = guardLogger(throwingLogger(), {
+      fallback: (line) => void notices.push(line),
+      now: () => 1_000,
+    });
+    for (const level of ['trace', 'debug', 'info', 'warn', 'error', 'fatal'] as const) {
+      expect(() => {
+        log[level]('a record', { a: 1 });
+      }).not.toThrow();
+    }
+    expect(notices).toHaveLength(1);
+    const notice = JSON.parse(notices[0] ?? '') as Record<string, unknown>;
+    expect(notice).toMatchObject({
+      level: 50,
+      subsystem: 'logging',
+      msg: LOG_FAILURE_NOTICE_MESSAGE,
+      operation: 'trace',
+      errorClass: 'Error',
+      droppedRecords: 1,
+    });
+    // The notice is built from constants and counts only: nothing the failure said.
+    expect(notices[0]).not.toContain('/home/dev/project');
+    expect(notices[0]).not.toContain('a record');
+  });
+
+  it('rate-limits notices and carries the drops folded into the next one', () => {
+    const notices: string[] = [];
+    let now = 0;
+    const log = guardLogger(throwingLogger(), {
+      fallback: (line) => void notices.push(line),
+      now: () => now,
+      noticeIntervalMs: 100,
+    });
+    log.info('first');
+    now = 50;
+    log.info('second');
+    log.info('third');
+    expect(notices).toHaveLength(1);
+    now = 150;
+    log.info('fourth');
+    expect(notices).toHaveLength(2);
+    expect(JSON.parse(notices[1] ?? '')).toMatchObject({
+      droppedRecords: 4,
+      droppedSinceLastNotice: 3,
+    });
+  });
+
+  it('counts a notice its own sink refuses and still never throws', () => {
+    let now = 0;
+    const accepted: string[] = [];
+    let refuse = true;
+    const log = guardLogger(throwingLogger(), {
+      fallback: (line) => {
+        if (refuse) {
+          throw new Error('stderr is gone too');
+        }
+        accepted.push(line);
+      },
+      now: () => now,
+      noticeIntervalMs: 10,
+    });
+    expect(() => {
+      log.error('dropped');
+    }).not.toThrow();
+    refuse = false;
+    now = 20;
+    log.error('dropped again');
+    expect(JSON.parse(accepted[0] ?? '')).toMatchObject({ failedNotices: 1, droppedRecords: 2 });
+  });
+
+  it('replaces a refused child with one merging the bindings into each call', () => {
+    const received: { message: string; fields: LogFields | undefined }[] = [];
+    const notices: string[] = [];
+    const parent: Logger = {
+      ...throwingLogger(),
+      info: (message, fields) => {
+        received.push({ message, fields });
+      },
+    };
+    const log = guardLogger(parent, { fallback: (line) => void notices.push(line) });
+    const child = log.child({ subsystem: 'store', a: 'binding' });
+    child.info('from the child', { a: 'call' });
+    expect(received).toEqual([
+      { message: 'from the child', fields: { subsystem: 'store', a: 'call' } },
+    ]);
+    expect(JSON.parse(notices[0] ?? '')).toMatchObject({ operation: 'child' });
+    expect(() => {
+      child.child({ captureId: 'c1' }).warn('nested');
+    }).not.toThrow();
+  });
+
+  it('is the identity for noopLogger and for a logger it already guarded', () => {
+    expect(guardLogger(noopLogger)).toBe(noopLogger);
+    const once = guardLogger(throwingLogger(), { fallback: () => undefined });
+    expect(guardLogger(once)).toBe(once);
+  });
+
+  it('keeps the level and forwards arguments unchanged when nothing fails', () => {
+    const received: unknown[][] = [];
+    const inner: Logger = {
+      level: 'debug',
+      trace: (...args: unknown[]) => void received.push(['trace', ...args]),
+      debug: (...args: unknown[]) => void received.push(['debug', ...args]),
+      info: (...args: unknown[]) => void received.push(['info', ...args]),
+      warn: (...args: unknown[]) => void received.push(['warn', ...args]),
+      error: (...args: unknown[]) => void received.push(['error', ...args]),
+      fatal: (...args: unknown[]) => void received.push(['fatal', ...args]),
+      child: () => inner,
+    };
+    const log = guardLogger(inner);
+    expect(log.level).toBe('debug');
+    log.info('plain');
+    log.warn('with fields', { a: 1 });
+    expect(received).toEqual([
+      ['info', 'plain'],
+      ['warn', 'with fields', { a: 1 }],
+    ]);
+  });
+});
+
+describe('createServiceLogger never throws from a failing destination', () => {
+  it('drops the record, announces it through the policy and keeps serving', () => {
+    const notices: string[] = [];
+    let healthy = false;
+    const lines: string[] = [];
+    const logger = createServiceLogger(BASE_CONFIG, {
+      destination: {
+        write: (line: string) => {
+          if (!healthy) {
+            throw new Error('EPIPE');
+          }
+          lines.push(line);
+        },
+      },
+      failurePolicy: { fallback: (line) => void notices.push(line) },
+    });
+    const store = subsystemLogger(logger, 'store');
+    expect(() => {
+      store.error('the store failed', { code: 'STORE_ERROR' });
+    }).not.toThrow();
+    expect(notices).toHaveLength(1);
+    healthy = true;
+    store.info('the store recovered');
+    expect(lines).toHaveLength(1);
+    expect(JSON.parse(lines[0] ?? '')).toMatchObject({
+      msg: 'the store recovered',
+      subsystem: 'store',
+    });
   });
 });

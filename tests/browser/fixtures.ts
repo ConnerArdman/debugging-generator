@@ -1,8 +1,11 @@
 /**
  * Shared Playwright fixtures for the `browser` project (AAP §0.8.3 "Browser").
  *
- * Every spec under `tests/browser/**` imports `test` and `expect` from this
- * module and nothing else owns the suite's lifecycle: one persistent Chromium
+ * Every spec under `tests/browser/**` that drives the browser imports `test`
+ * and `expect` from this module (`fixture-lifecycle.spec.ts`, which exercises
+ * the pure lifecycle helpers exported here, imports `@playwright/test`
+ * directly so that the automatic `_hygiene` fixture launches no Chromium),
+ * and nothing else owns the suite's lifecycle: one persistent Chromium
  * context with the built MV3 extension loaded, its service worker, a typed
  * client of the already-running local service, the generic fixture app
  * (`tests/fixtures/sample-next-app`), the one-time pairing of the extension, a
@@ -30,9 +33,19 @@
  *   `turbopack.root` to its own directory, so borrowing another workspace's
  *   `next` binary in place fails ("Could not find the Next.js package") and
  *   Next then runs `pnpm install` against the repository lockfile. The app is
- *   therefore served from a *copy* outside the repository
- *   (`<os tmpdir>/debuggen-browser-suite/<repo hash>/sample-next-app`) with its
- *   own `node_modules`, and the tracked fixture tree is only ever read.
+ *   therefore served from a *private per-worker copy* outside the repository:
+ *   `<realpath(mkdtemp(<os tmpdir>/debuggen-browser-fixture-))>/sample-next-app`,
+ *   a fresh `0700` boundary owned by this account and verified with
+ *   `assertSecureDir`, into which {@link copyFixtureTree} copies the tracked
+ *   tree without ever following or overwriting anything and without a
+ *   check/use window: every directory and file is created through a held,
+ *   verified directory descriptor (`pinPrivateFileWithinRoot`), never by
+ *   path, so a directory swapped for a link mid-copy cannot redirect a write
+ *   (no-follow reads, exclusive no-follow creates, symlinked or special
+ *   entries refused, realpath containment checked) before its dependencies
+ *   are installed. The tracked fixture tree is only ever read, and nothing is
+ *   shared between runs or workers: teardown removes the whole boundary once
+ *   the server stopped, and verifies it is gone.
  * - **Who starts the fixture app.** The service learns a dev server's address
  *   only from its own launcher (`apps/local-service/src/server/routes/sessions.ts`,
  *   `resolveDevServerUrl`: the launcher's registry, else an earlier session of
@@ -40,10 +53,40 @@
  *   carries no URL, so a server this file started on its own would never be
  *   probed and no session could be created for it. The fixture app is
  *   therefore launched *through the service* with an explicit command pinning
- *   the configured port — which also means the launcher attaches the telemetry
- *   preload, exactly as it does for any project. Only when the running service
- *   does not serve the launch route at all (`404`) is the app spawned directly,
- *   without the preload, and sessions are then expected to be refused.
+ *   the served origin's port and hostname — which also means the launcher
+ *   attaches the telemetry preload, exactly as it does for any project.
+ * - **Where the fixture app is served.** A server this worker did not start
+ *   can never serve its sessions: the service attributes a dev server only
+ *   from its launcher's registry for the project root or from an earlier
+ *   session of the same root, and this worker's root is a fresh private copy;
+ *   adopting another run's leftover root instead would take over — and stop —
+ *   a server this worker does not own. So nothing is reused. The configured
+ *   origin (`fixtureAppUrl`) is identified with two bounded `GET`s (`/` and
+ *   `/api/ping`) as `none`, `fixture` or `foreign` ({@link identifyFixtureOrigin});
+ *   when it is occupied — by the fixture app or anything else — the occupant
+ *   is never launched against, stopped or sent anything more, and this worker
+ *   serves its copy on an *alternate loopback origin* of its own (a port the
+ *   OS reports free, identified as `none` before use, three attempts), noted
+ *   once on stderr and in `fixtureApp.displaced`; `fixtureApp.baseUrl` is
+ *   always the origin actually served ({@link planFixtureServing},
+ *   {@link serveFixtureApp}). When the running service does not serve the
+ *   launcher routes at all (`404` to a no-op `devServer.stop`), the copy is
+ *   spawned directly without the preload, and `sessions.create()` refuses at
+ *   once with the reason, since the service could not attribute that server.
+ * - **Diagnostics never quote a server.** Every sentence built from a
+ *   response names only its status, its media type and whether the ping
+ *   honoured the fixture contract ({@link describeMediaType}); bodies are read,
+ *   bounded, for that check alone, and no header value is printed.
+ * - **Teardown is an oracle.** No fixture swallows a teardown failure. Test-
+ *   scoped fixtures (`sessions`, `appPage`, `openPanelPage`, `_hygiene`) hand
+ *   their problems to {@link settleTestTeardown}: a test that passed fails
+ *   with them, a test that already failed carries them as `fixture-teardown`
+ *   annotations. The `sessions` helper requires every session it created to
+ *   end with cleanup `clean`, and stops any capture left open. Worker-scoped
+ *   fixtures (`fixtureApp`, `_extension`) throw one aggregated error: the
+ *   server this worker started must stop answering its origin, the Chromium
+ *   context must report closing and its profile directory must be gone, and
+ *   the private copy must be removed.
  * - **`fixtureApp.projectRoot`** is the served copy — the root the service
  *   records on every session — and `fixtureApp.sourceRoot` the tracked
  *   directory; project-relative paths are identical in both, which is what
@@ -55,11 +98,13 @@
  *   `panels.themeName`) and plays the DevTools page's part by opening the
  *   `PORT_DEVTOOLS` port and sending its `devtools.hello` frame; the panel
  *   offers no real affordance (no `?tabId=` parameter) that could replace it.
- * - **Pairing** drives the panel's own `PairDialog` (rung 1 of the plan). The
- *   service worker only ever dials `DEFAULT_SERVICE_BASE_URL`, so pairing is
- *   refused with an explanation when the suite's service listens elsewhere.
+ * - **Pairing** drives the panel's own `PairDialog` (rung 1 of the plan),
+ *   typing only the pairing code: the dialog's service address field is left
+ *   at `DEFAULT_SERVICE_BASE_URL`, so pairing is refused with an explanation
+ *   when the suite's service listens elsewhere.
  * - **Panel accessible names.** `PANEL_NAMES` types the capture button,
- *   session summary, event drawer and live tail names, and the renderer's
+ *   session summary, event drawer, live tail and pairing-code field names,
+ *   and the renderer's
  *   `.dg-panel` block class is typed too, because their owning modules keep
  *   them private and a React component module cannot be evaluated in Node
  *   without React and its CSS. The connection pill's wording is imported from
@@ -83,9 +128,19 @@
  */
 import { spawn } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import {
+  closeSync,
+  constants as fsConstants,
+  existsSync,
+  fchmodSync,
+  fstatSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  writeFileSync,
+} from 'node:fs';
+import { lstat, mkdtemp, readdir, readFile, realpath, rm } from 'node:fs/promises';
+import { createServer } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -96,6 +151,7 @@ import type {
   LaunchOptions,
   Locator,
   Page,
+  TestInfo,
   Worker,
   WorkerInfo,
 } from '@playwright/test';
@@ -105,8 +161,10 @@ import {
   isCompatibleProtocolVersion,
   isMessageOfType,
   ReconnectingWsClient,
+  SESSION_LIST_MAX_LIMIT,
 } from '@debuggen/protocol';
 import type {
+  CleanupStatus,
   ConnectionState,
   DataQuery,
   DataQuerySource,
@@ -117,11 +175,22 @@ import type {
   HttpResponseBody,
   MessageType,
   ProtocolMessage,
+  SessionListItem,
   SessionRecord,
   SessionStatus,
+  SourceResultPayload,
   WsUnauthorizedDetail,
 } from '@debuggen/protocol';
 import type { DebuggenError, Result } from '@debuggen/shared';
+import {
+  assertSecureDir,
+  isSameFileIdentity,
+  pinPrivateFileWithinRoot,
+  readFileNoFollow,
+  SECURE_DIR_MODE,
+  SECURE_FILE_MODE,
+} from '@debuggen/shared/node';
+import type { FileIdentity, PinnedFile } from '@debuggen/shared/node';
 import {
   DEFAULT_SERVICE_BASE_URL,
   EXTENSION_CHANNEL,
@@ -204,6 +273,39 @@ const MAX_CHILD_OUTPUT_CHARS = 64 * 1024;
 /** Longest a dependency install into the fixture copy may take (a cold store downloads four packages). */
 const INSTALL_TIMEOUT_MS = 180_000;
 
+/** Longest single diagnostic (a teardown problem, a foreign server's description) kept in an error or annotation. */
+const MAX_DIAGNOSTIC_CHARS = 2_000;
+
+/** How many teardown problems one aggregated error or annotation set lists before it summarises the rest. */
+const MAX_REPORTED_PROBLEMS = 20;
+
+/** Bound on one teardown `session.end`, which awaits the whole instrumentation cleanup. */
+const SESSION_END_TIMEOUT_MS = 60_000;
+
+/** Window in which teardown retries a `SESSION_INVALID_STATE` answer to `session.end` while another operation of the session settles. */
+const SESSION_END_SETTLE_MS = 30_000;
+
+/** Bound on one identification request to the fixture origin: a running fixture app's first request may compile the route. */
+const IDENTIFY_TIMEOUT_MS = 30_000;
+
+/** Bound on the response body an identification request reads — for the contract check only, never quoted. */
+const MAX_PROBE_BODY_BYTES = 64 * 1024;
+
+/** How many free ports are tried for a worker-owned alternate origin before serving fails (each one is identified first). */
+const ALTERNATE_PORT_ATTEMPTS = 3;
+
+/** The lowest port an alternate origin may use: never a privileged one. */
+const MIN_ALTERNATE_PORT = 1024;
+
+/** Bound on the no-op `devServer.stop` that tells whether the service has the launcher routes. */
+const ROUTE_PROBE_TIMEOUT_MS = 10_000;
+
+/** How long a stopped fixture server has to stop answering its origin (the launcher's grace is 5 s before `SIGKILL`). */
+const SERVER_STOP_TIMEOUT_MS = 15_000;
+
+/** Bound on each probe while waiting for the origin to go quiet. */
+const QUIET_PROBE_TIMEOUT_MS = 2_000;
+
 // ---------------------------------------------------------------------------
 // Paths and file-name contracts
 // ---------------------------------------------------------------------------
@@ -233,8 +335,11 @@ const EDITOR_CREDENTIAL_FILE = 'auth.json';
 /** Build output and dependencies of the fixture app — exactly the entries its own `.gitignore` covers. */
 const FIXTURE_GENERATED_ENTRIES = new Set(['node_modules', '.next', 'next-env.d.ts']);
 
-/** Files the copy owns beyond the tracked tree: the rewritten manifest's lockfile and this file's install stamp. */
-const COPY_OWNED_ENTRIES = new Set(['pnpm-lock.yaml', '.debuggen-install-stamp']);
+/** Prefix of the private, per-worker `mkdtemp` directory the fixture copy lives in. */
+const FIXTURE_BOUNDARY_PREFIX = 'debuggen-browser-fixture-';
+
+/** The copy's own directory name inside that boundary: the fixture's basename, which Next and the service see. */
+const FIXTURE_COPY_DIR_NAME = 'sample-next-app';
 
 /** The fixture app's contract route: `GET /api/ping` answers `{ reply: string }` after a short delay. */
 const FIXTURE_PING_PATH = '/api/ping';
@@ -247,8 +352,10 @@ const RENDERED_PANEL_BODY_CHILDREN = '.dg-panel__body > *';
  * Accessible names the panel renders from module-private constants (not
  * exported, and their `.tsx` modules cannot be evaluated in Node; see header):
  * `START_CAPTURE_LABEL` / `STOP_CAPTURE_LABEL` in `CaptureControls.tsx`,
- * `SUMMARY_TITLE` in `SessionSummary.tsx`, and `DRAWER_LABEL` /
- * `LIVE_TAIL_REGION_LABEL` in `App.tsx`.
+ * `SUMMARY_TITLE` in `SessionSummary.tsx`, `DRAWER_LABEL` /
+ * `LIVE_TAIL_REGION_LABEL` in `App.tsx`, and `PAIRING_FIELD_LABEL` in
+ * `PairDialog.tsx` — the dialog also holds a "Service address" field, so the
+ * code field is addressed by its name rather than as the dialog's only textbox.
  */
 const PANEL_NAMES = Object.freeze({
   startCapture: 'Start capture',
@@ -256,6 +363,7 @@ const PANEL_NAMES = Object.freeze({
   sessionSummary: 'Session',
   eventDetails: 'Selected event',
   liveTail: 'Live event tail',
+  pairingCode: 'Pairing code',
 });
 
 /** Why the stubbed `chrome.devtools.inspectedWindow.eval` refuses, surfaced by the panel's element-selection path. */
@@ -318,9 +426,32 @@ export interface EditorClient {
   clear(): void;
   /** Resolves on the next recorded frame, or after `withinMs` with `undefined`. */
   next(withinMs: number): Promise<RecordedMessage | undefined>;
+  /**
+   * Answer a `source.open` the service forwarded to this connection the way
+   * VS Code does: a `source.result` whose `ref` is the forwarded frame's id and
+   * whose session is the forward's. The service relays the answer to the
+   * DevTools sender under the sender's own `ref`; a forward nobody answers is
+   * settled `failed` once the service's editor deadline passes, so a spec that
+   * expects a click to succeed answers it. Throws when the frame could not be
+   * written.
+   */
+  answerSourceOpen(forwarded: RecordedMessage<'source.open'>, answer?: SourceOpenAnswer): void;
   /** Close the socket; the service releases this connection's workspace announcement. */
   close(): void;
 }
+
+/** `Omit` applied to each member of a union, so the discriminant survives. */
+type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
+
+/**
+ * What an editor reports about a forwarded `source.open` — `opened`, or
+ * `failed` with its error. `no-editor` is the service's own answer, which an
+ * editor may not send.
+ */
+export type SourceOpenAnswer = DistributiveOmit<
+  Exclude<SourceResultPayload, { readonly status: 'no-editor' }>,
+  'sessionId' | 'ref'
+>;
 
 /** A failed service call, carrying protocol's error body. */
 export class ServiceCallError extends Error {
@@ -370,7 +501,8 @@ export interface ServiceHandle {
   pairStart(): Promise<HttpResponseBody<'pair.start'>>;
   createSession(input: SessionCreateInput): Promise<SessionRecord>;
   getSession(id: string): Promise<SessionRecord>;
-  listSessions(): Promise<readonly SessionRecord[]>;
+  /** Every page of `GET /sessions` (`nextOffset` walked until `null`): list rows, most recently updated first. */
+  listSessions(): Promise<readonly SessionListItem[]>;
   startCapture(id: string): Promise<HttpResponseBody<'capture.start'>>;
   stopCapture(id: string): Promise<HttpResponseBody<'capture.stop'>>;
   endSession(id: string): Promise<HttpResponseBody<'session.end'>>;
@@ -384,25 +516,58 @@ export interface ServiceHandle {
   connectEditor(projectRoot: string, options?: WaitOptions): Promise<EditorClient>;
 }
 
-/** How the fixture app came to be served. */
+/**
+ * How this worker's fixture app came to be served — always by this worker:
+ *
+ * - `service-launcher` — the service's launcher started this worker's private
+ *   copy (preload attached); this worker stops it through `devServer.stop`.
+ * - `fixture-process` — the service has no launcher route, so this file spawned
+ *   `next dev` for the copy (no preload) and terminates it. The service cannot
+ *   attribute such a server to the copy, so no session can be created for it
+ *   (`sessions.create()` says so at once).
+ *
+ * A server this worker did not start is never adopted: an occupied configured
+ * origin is left alone and the copy is served on an alternate origin instead
+ * (see {@link planFixtureServing} for why reuse cannot work).
+ */
 export type FixtureAppServer = 'service-launcher' | 'fixture-process';
 
-/** The generic fixture app, served from a copy outside the repository. */
+/** What occupied the configured origin when this worker served its copy elsewhere. */
+export interface FixtureAppDisplacement {
+  /** Whether the occupant honoured the fixture contract (`GET /api/ping` → `{ reply: string }`). */
+  readonly occupant: 'fixture' | 'foreign';
+  /** The occupant's identification: status, media type and contract verdict per request — never a body or header value. */
+  readonly description: string;
+}
+
+/** The generic fixture app, served from a private per-worker copy outside the repository. */
 export interface FixtureAppHandle {
-  /** The configured origin the app answers on (`fixtureAppUrl`). */
+  /**
+   * The origin the app actually answers on: the configured one when it was
+   * free, else this worker's alternate loopback origin. Specs navigate here.
+   */
   readonly baseUrl: string;
-  /** The served root — the copy the service records on every session. */
+  /** The configured origin (`fixtureAppUrl`), whether or not it is the one served. */
+  readonly configuredUrl: string;
+  /** `undefined` when the configured origin was free; otherwise what occupied it (never touched). */
+  readonly displaced: FixtureAppDisplacement | undefined;
+  /** The private copy (`<mkdtemp boundary>/sample-next-app`) — the root the service records on every session. */
   readonly projectRoot: string;
-  /** The tracked fixture directory the copy mirrors (`tests/fixtures/sample-next-app`). */
+  /** The tracked fixture directory the copy was taken from (`tests/fixtures/sample-next-app`). */
   readonly sourceRoot: string;
-  /** Whether this worker caused the server to start (and therefore stops it). */
-  readonly startedByFixture: boolean;
-  /** Who started the process currently serving `baseUrl`. */
+  /**
+   * Always `true`: this worker started the server serving {@link baseUrl},
+   * directly or through the launcher, and stops it at teardown. A server it
+   * did not start is never adopted (it is {@link displaced} instead).
+   */
+  readonly startedByFixture: true;
+  /** Who started the process serving {@link baseUrl}. */
   readonly servedBy: FixtureAppServer;
   /**
-   * Make sure the service still serves the app for `projectRoot`. The
-   * launcher reuses its ready child, so this is cheap; it restarts the child
-   * if ending a session stopped it.
+   * Make sure the app still serves `projectRoot` on {@link baseUrl}, per
+   * {@link servedBy}: the launcher is asked again (it reuses its ready child
+   * and restarts it if ending a session stopped it); a spawned child must
+   * still be alive and answering.
    */
   ensureServing(): Promise<void>;
   /** Output of a server this file spawned itself (the launcher logs its child to the service log). */
@@ -490,7 +655,13 @@ export interface CaptureOutcome {
   readonly summary: HttpResponseBody<'capture.stop'>['summary'];
 }
 
-/** Session helpers that track every session they create and end it in teardown. */
+/**
+ * Session helpers that track every session they create and end it in
+ * teardown. Teardown is an oracle, not a courtesy: every session must end with
+ * cleanup `clean`, and anything else — a capture that could not be stopped, an
+ * end that was refused, a `partial` or `conflict` cleanup — fails a passing
+ * test (see {@link settleTestTeardown}).
+ */
 export interface SessionHelper {
   create(
     question: string,
@@ -502,11 +673,17 @@ export interface SessionHelper {
     options?: WaitOptions,
   ): Promise<SessionRecord>;
   waitForReady(id: string, options?: WaitOptions): Promise<SessionRecord>;
+  /**
+   * `capture.start` → `action` → settle → `capture.stop`. When `action` throws,
+   * the capture is still stopped and the action's error is rethrown; a stop
+   * that fails then is recorded as a teardown problem, never ignored.
+   */
   capture(
     id: string,
     action: () => Promise<void>,
     options?: CaptureOptions,
   ): Promise<CaptureOutcome>;
+  /** `session.end`; a returned cleanup status other than `clean` is recorded as a teardown problem. */
   end(id: string): Promise<HttpResponseBody<'session.end'>>;
   /** Every session id this helper created in the current test, oldest first. */
   created(): readonly string[];
@@ -536,6 +713,92 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** `text` cut to `max` characters, with a marker naming how much was dropped. */
+function boundDiagnostic(text: string, max = MAX_DIAGNOSTIC_CHARS): string {
+  return text.length <= max
+    ? text
+    : `${text.slice(0, max)}… [${String(text.length - max)} more characters]`;
+}
+
+/** A bounded bullet list of problems: each one truncated, at most {@link MAX_REPORTED_PROBLEMS} listed. */
+function formatProblems(problems: readonly string[]): string {
+  const listed = problems
+    .slice(0, MAX_REPORTED_PROBLEMS)
+    .map((problem) => `- ${boundDiagnostic(problem)}`);
+  const rest = problems.length - listed.length;
+  return [...listed, ...(rest > 0 ? [`- (+${String(rest)} more)`] : [])].join('\n');
+}
+
+/**
+ * `error` with the problems a cleanup found while handling it appended, the
+ * original kept as `cause` — so a failed cleanup after a failed step is
+ * reported alongside that failure instead of replacing it or being dropped.
+ */
+function errorWithProblems(error: unknown, context: string, problems: readonly string[]): Error {
+  if (problems.length === 0) {
+    return error instanceof Error ? error : new Error(describeError(error));
+  }
+  return new Error(`${describeError(error)}\n${context}:\n${formatProblems(problems)}`, {
+    cause: error,
+  });
+}
+
+/** Throw one aggregated error when a teardown found problems (the worker-scoped fixtures' contract). */
+function throwIfProblems(subject: string, problems: readonly string[]): void {
+  if (problems.length > 0) {
+    throw new Error(
+      `${subject} teardown found ${String(problems.length)} problem(s):\n${formatProblems(problems)}`,
+    );
+  }
+}
+
+/** The part of Playwright's `TestInfo` a test-scoped teardown reads and writes. */
+export type TeardownTestInfo = Pick<TestInfo, 'status' | 'expectedStatus' | 'annotations'>;
+
+/**
+ * Report the problems a test-scoped fixture's teardown found, without ever
+ * swallowing them.
+ *
+ * - The test ended as expected (`status === expectedStatus`, a pass in
+ *   practice): one aggregated error is thrown, which Playwright records as a
+ *   failure of that test — a leaked capture, an unclean cleanup or a page that
+ *   would not close fails the run instead of passing it.
+ * - The test already failed: each problem becomes a `fixture-teardown`
+ *   annotation, so the original error stays the reported one and the leak is
+ *   still visible next to it.
+ *
+ * Every message is bounded ({@link boundDiagnostic}, {@link MAX_REPORTED_PROBLEMS}).
+ *
+ * @param testInfo The running test's info (`status` is set once the body finished).
+ * @param subject The fixture whose teardown found the problems, for example `sessions`.
+ * @param problems One sentence per problem; nothing happens when empty.
+ * @throws When there are problems and the test ended as expected.
+ */
+export function settleTestTeardown(
+  testInfo: TeardownTestInfo,
+  subject: string,
+  problems: readonly string[],
+): void {
+  if (problems.length === 0) {
+    return;
+  }
+  if (testInfo.status === testInfo.expectedStatus) {
+    throwIfProblems(subject, problems);
+  }
+  for (const problem of problems.slice(0, MAX_REPORTED_PROBLEMS)) {
+    testInfo.annotations.push({
+      type: 'fixture-teardown',
+      description: `${subject}: ${boundDiagnostic(problem)}`,
+    });
+  }
+  if (problems.length > MAX_REPORTED_PROBLEMS) {
+    testInfo.annotations.push({
+      type: 'fixture-teardown',
+      description: `${subject}: (+${String(problems.length - MAX_REPORTED_PROBLEMS)} more problem(s))`,
+    });
+  }
 }
 
 /** The HTTP status a protocol client error recorded in its details, if any. */
@@ -875,6 +1138,18 @@ async function connectEditorClient(
       }
       return frames[index()];
     },
+    answerSourceOpen(forwarded, answer = { status: 'opened' }) {
+      const sent = client.send('source.result', {
+        ...answer,
+        sessionId: forwarded.payload.sessionId,
+        ref: forwarded.id,
+      });
+      if (!sent.ok) {
+        throw new Error(
+          `The editor connection could not answer source.open ${forwarded.id}: ${sent.error.code} (connection ${live.state}).`,
+        );
+      }
+    },
     close() {
       client.close();
     },
@@ -954,6 +1229,88 @@ function isResultFor<S extends DataQuerySource>(
   return result.source === source;
 }
 
+/** The window one `GET /sessions` page request of {@link collectSessionList} carries. */
+interface SessionListWindow {
+  /** {@link SESSION_LIST_MAX_LIMIT}, the largest page the listing serves. */
+  readonly limit: number;
+  /** `0`, then each page's `nextOffset`. */
+  readonly offset: number;
+}
+
+/**
+ * Every row of `GET /sessions`: requests pages from offset `0` at
+ * {@link SESSION_LIST_MAX_LIMIT}, follows `nextOffset` until it is `null`, and
+ * answers the pages' rows concatenated, most recently updated first.
+ *
+ * The service may leave out a stored row it counts but cannot read or may not
+ * show, and still move past it, so the rows number at most `total`. The protocol
+ * client already refuses a page that breaks the paging rule; these checks fail
+ * loudly, naming the offsets, where a broken or moving list would otherwise loop
+ * or pass part of itself off as the whole: each page echoes its requested
+ * offset, `total` holds across pages, no session id repeats (the order shifted
+ * under the walk, so another row may have been skipped), `nextOffset` advances,
+ * and the walk ends within `max(1, total)` pages — every page before the last
+ * starts at a distinct offset below `total`.
+ *
+ * @param fetchPage Fetches one page; a refusal is thrown as a {@link ServiceCallError}.
+ * @returns Every row the service answered, in its order.
+ * @throws {Error} When the list breaks any rule above.
+ */
+async function collectSessionList(
+  fetchPage: (window: SessionListWindow) => Promise<HttpResponseBody<'session.list'>>,
+): Promise<readonly SessionListItem[]> {
+  const rows: SessionListItem[] = [];
+  const seen = new Set<string>();
+  let offset = 0;
+  let total: number | undefined;
+  let pages = 0;
+  for (;;) {
+    const page = await fetchPage({ limit: SESSION_LIST_MAX_LIMIT, offset });
+    pages += 1;
+    if (page.offset !== offset) {
+      throw new Error(
+        `session.list echoed offset ${String(page.offset)} for a request at offset ${String(offset)}.`,
+      );
+    }
+    if (total === undefined) {
+      total = page.total;
+    } else if (page.total !== total) {
+      throw new Error(
+        `session.list total changed from ${String(total)} to ${String(page.total)} on page ${String(pages)} (offset ${String(offset)}) — sessions were created or removed while paging; read the list again once it has settled.`,
+      );
+    }
+    for (const row of page.sessions) {
+      if (seen.has(row.id)) {
+        throw new Error(
+          `session.list answered session ${row.id} again on page ${String(pages)} (offset ${String(offset)}) — the list's order shifted while paging, so another row may have been skipped; read the list again once it has settled.`,
+        );
+      }
+      seen.add(row.id);
+      rows.push(row);
+    }
+    if (page.nextOffset === null) {
+      break;
+    }
+    if (page.nextOffset <= offset) {
+      throw new Error(
+        `session.list nextOffset ${String(page.nextOffset)} does not advance past offset ${String(offset)}.`,
+      );
+    }
+    if (pages >= Math.max(1, total)) {
+      throw new Error(
+        `session.list was still paging after ${String(pages)} page(s) of ${String(total)} session(s) (nextOffset ${String(page.nextOffset)}); every page before the last starts at a distinct offset below total, so the service's paging is broken.`,
+      );
+    }
+    offset = page.nextOffset;
+  }
+  if (rows.length > total) {
+    throw new Error(
+      `session.list answered ${String(rows.length)} row(s) over ${String(pages)} page(s) but counts ${String(total)}; it may leave a row out, never add one.`,
+    );
+  }
+  return rows;
+}
+
 /**
  * Connect to the service the config's `webServer` started: probe
  * `GET /health` (and its protocol version), then read the editor credential.
@@ -1023,8 +1380,10 @@ async function createServiceHandle(baseUrl: string, home: string): Promise<Servi
     async getSession(id) {
       return unwrap('session.get', await call('session.get', { params: { id } }));
     },
-    async listSessions() {
-      return unwrap('session.list', await call('session.list')).sessions;
+    listSessions() {
+      return collectSessionList(async (query) =>
+        unwrap('session.list', await call('session.list', { query })),
+      );
     },
     async startCapture(id) {
       return unwrap('capture.start', await call('capture.start', { params: { id }, body: {} }));
@@ -1126,54 +1485,432 @@ function pnpmInvocation(): { readonly file: string; readonly prefix: readonly st
   return { file: 'pnpm', prefix: [] };
 }
 
-/** Mirror the tracked fixture tree into `target`, writing only what differs. */
-async function mirrorTree(source: string, target: string): Promise<void> {
-  await mkdir(target, { recursive: true });
-  const sourceEntries = await readdir(source, { withFileTypes: true });
-  const kept = new Set<string>();
-  for (const entry of sourceEntries) {
+/** The `code` of a Node.js system error (`ENOENT`, `EEXIST`, …), if `error` carries one. */
+function errnoCode(error: unknown): string | undefined {
+  return isRecord(error) && typeof error.code === 'string' ? error.code : undefined;
+}
+
+/** Whether absolute `child` is `parent` itself or lies below it, compared lexically. */
+function isWithin(parent: string, child: string): boolean {
+  const relative = path.relative(parent, child);
+  return (
+    relative === '' ||
+    (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
+  );
+}
+
+/** Whether absolute `child` lies strictly below `parent`. */
+function isStrictlyWithin(parent: string, child: string): boolean {
+  return child !== parent && isWithin(parent, child);
+}
+
+/**
+ * Allocate the private boundary one worker's fixture copy lives in: a fresh
+ * `mkdtemp` directory under the OS temp directory — unpredictably named and
+ * created `0700` by this account — resolved with `realpath`, so every later
+ * containment check compares canonical paths, and verified with
+ * `assertSecureDir` (a real directory, not a link, owned by this uid, no group
+ * or other access). Nothing is ever shared between runs or workers.
+ *
+ * @returns The boundary's canonical absolute path.
+ * @throws When the directory cannot be created or fails the check (it is removed first).
+ */
+export async function allocateFixtureBoundary(): Promise<string> {
+  const boundary = await realpath(await mkdtemp(path.join(os.tmpdir(), FIXTURE_BOUNDARY_PREFIX)));
+  try {
+    assertSecureDir(boundary);
+  } catch (error) {
+    const problems: string[] = [];
+    try {
+      await removeFixtureBoundary(boundary);
+    } catch (removeError) {
+      problems.push(describeError(removeError));
+    }
+    throw errorWithProblems(
+      error,
+      `Removing the refused boundary ${boundary} also failed`,
+      problems,
+    );
+  }
+  return boundary;
+}
+
+/**
+ * Delete a boundary {@link allocateFixtureBoundary} created, with everything
+ * in it, and prove it is gone. `rm` removes a link found inside rather than
+ * following it; the name check refuses any path this module did not allocate.
+ *
+ * @param boundary The boundary to delete.
+ * @throws When the path is not a fixture boundary, or still exists (or cannot
+ * be inspected) after the removal.
+ */
+export async function removeFixtureBoundary(boundary: string): Promise<void> {
+  const boundaryAbs = path.resolve(boundary);
+  if (!path.basename(boundaryAbs).startsWith(FIXTURE_BOUNDARY_PREFIX)) {
+    throw new Error(
+      `removeFixtureBoundary refuses ${boundaryAbs}: only a boundary allocateFixtureBoundary() created (named ${FIXTURE_BOUNDARY_PREFIX}*) is removed.`,
+    );
+  }
+  await rm(boundaryAbs, { recursive: true, force: true });
+  try {
+    await lstat(boundaryAbs);
+  } catch (error) {
+    if (errnoCode(error) === 'ENOENT') {
+      return;
+    }
+    throw new Error(
+      `The private fixture copy ${boundaryAbs} could not be confirmed removed: ${describeError(error)}`,
+      { cause: error },
+    );
+  }
+  throw new Error(`The private fixture copy ${boundaryAbs} still exists after it was removed.`);
+}
+
+/**
+ * The seams of {@link copyFixtureTree}, for a test that attacks the copy in the
+ * exact window a path-based copy would lose: production passes none.
+ */
+export interface CopyFixtureTreeHooks {
+  /**
+   * Runs after the directory that will hold an entry was pinned (its
+   * descriptor is held and its identity verified) and before the entry is
+   * created in it.
+   *
+   * @param relativePath The entry, POSIX and relative to the target root (`.` for the root itself).
+   * @param kind What is about to be created there.
+   */
+  readonly afterPin?: ((relativePath: string, kind: 'directory' | 'file') => void) | undefined;
+}
+
+/** This account's uid, or `undefined` on a platform without one. */
+function currentUid(): number | undefined {
+  return typeof process.getuid === 'function' ? process.getuid() : undefined;
+}
+
+/**
+ * A refusal that explains `error` and keeps its errno `code` (`EEXIST` for a
+ * planted entry, for example), with the original as `cause`.
+ */
+function copyRefusal(message: string, error: unknown): Error {
+  const refusal = new Error(`${message}: ${describeError(error)}`, { cause: error });
+  const code = errnoCode(error);
+  return code === undefined ? refusal : Object.assign(refusal, { code });
+}
+
+/**
+ * Pin the chain of directories that holds `relativePath` below `root`
+ * (`pinPrivateFileWithinRoot`: `root` opened `O_DIRECTORY | O_NOFOLLOW`, every
+ * component below it relative to its parent's descriptor, each descriptor held
+ * to the private policy — a directory owned by this account with no group or
+ * other access).
+ *
+ * @param label The entry's logical path, for the refusal.
+ * @throws When the chain cannot be pinned, and when the platform cannot
+ * address a descriptor as a path: a degraded pin would detect a swapped
+ * directory only after the write, so the copy is refused instead.
+ */
+function pinForCopy(root: string, relativePath: string, label: string): PinnedFile {
+  let pinned: PinnedFile;
+  try {
+    pinned = pinPrivateFileWithinRoot(root, relativePath);
+  } catch (error) {
+    throw copyRefusal(
+      `The fixture copy refuses ${label}: the directories that would hold it could not be pinned (a symbolic link, a foreign or group/other-accessible directory, or a missing one)`,
+      error,
+    );
+  }
+  if (!pinned.enforced) {
+    pinned.release();
+    throw new Error(
+      `The fixture copy refuses ${label}: this platform cannot address an open directory descriptor as a path (no /proc/self/fd), so the copy cannot be pinned against a directory swapped between its check and its write. The browser suite runs on Linux.`,
+    );
+  }
+  return pinned;
+}
+
+/**
+ * Create the directory `pinned` names, fresh, inside the pinned parent: any
+ * existing entry — a planted link or directory included — is a refusal, never
+ * reused or followed. The new directory is then opened `O_NOFOLLOW`, checked
+ * to be a directory owned by this account, set to exactly `0700` through its
+ * descriptor (whatever the umask), and its identity returned.
+ */
+function createPinnedDirectory(pinned: PinnedFile, label: string): FileIdentity {
+  try {
+    mkdirSync(pinned.path, { mode: SECURE_DIR_MODE });
+  } catch (error) {
+    throw copyRefusal(
+      `The fixture copy refuses ${label}: the directory could not be created fresh (an existing entry is never reused, followed or overwritten)`,
+      error,
+    );
+  }
+  let fd: number;
+  try {
+    fd = openSync(
+      pinned.path,
+      fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
+    );
+  } catch (error) {
+    throw copyRefusal(
+      `The fixture copy refuses ${label}: the directory it just created was replaced before it could be opened`,
+      error,
+    );
+  }
+  try {
+    const stats = fstatSync(fd, { bigint: true });
+    const uid = currentUid();
+    if (!stats.isDirectory() || (uid !== undefined && stats.uid !== BigInt(uid))) {
+      throw new Error(
+        `The fixture copy refuses ${label}: the entry it just created is not a directory owned by this account.`,
+      );
+    }
+    fchmodSync(fd, SECURE_DIR_MODE);
+    return { dev: stats.dev, ino: stats.ino };
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
+ * Create the file `pinned` names inside the pinned parent with
+ * `O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW` at `0600` (set exactly through the
+ * descriptor), write every byte, `fsync` and close. An existing entry — a
+ * planted link included — is `EEXIST`, and its target is left untouched.
+ */
+function createPinnedFile(pinned: PinnedFile, bytes: string | Uint8Array, label: string): void {
+  let fd: number;
+  try {
+    fd = openSync(
+      pinned.path,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+      SECURE_FILE_MODE,
+    );
+  } catch (error) {
+    throw copyRefusal(
+      `The fixture copy refuses ${label}: the file could not be created exclusively (an existing entry, a planted link included, is never followed or overwritten)`,
+      error,
+    );
+  }
+  try {
+    fchmodSync(fd, SECURE_FILE_MODE);
+    writeFileSync(fd, bytes);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
+ * After a create through `pinned`: the directory's path must still name the
+ * pinned inode. The entry itself landed in the pinned directory whatever
+ * happened to the path — never outside — but a swapped directory means the
+ * copy is no longer the tree its paths describe, so it is refused.
+ */
+function requirePinnedDirectoryIntact(pinned: PinnedFile, label: string): void {
+  if (!pinned.verifyDirectory()) {
+    throw new Error(
+      `The fixture copy refuses ${label}: the directory holding it was moved or replaced while the entry was created. The entry landed in the pinned directory, not outside it, but the copy can no longer be trusted.`,
+    );
+  }
+}
+
+/** What every level of one {@link copyFixtureTree} walk shares. */
+interface FixtureCopyWalk {
+  /** The logical target root, for diagnostics. */
+  readonly targetRoot: string;
+  /**
+   * The target root addressed through the held descriptor of its parent
+   * (`/proc/self/fd/<n>/<name>`): every entry is pinned from here, so no
+   * change to the paths above the target root reaches the walk.
+   */
+  readonly anchor: string;
+  readonly hooks: CopyFixtureTreeHooks | undefined;
+}
+
+/**
+ * Create one entry of the copy: pin its parent chain from the walk's anchor,
+ * require the pinned parent to be the very directory this copy created for it
+ * (`parentIdentity`), let the hook run, create the entry through the
+ * descriptor and require the parent's path to still name it afterwards.
+ */
+function createCopyEntry<T>(
+  walk: FixtureCopyWalk,
+  parentIdentity: FileIdentity,
+  relativePath: string,
+  kind: 'directory' | 'file',
+  create: (pinned: PinnedFile, label: string) => T,
+): T {
+  const label = path.join(walk.targetRoot, ...relativePath.split('/'));
+  const pinned = pinForCopy(walk.anchor, relativePath, label);
+  try {
+    if (!isSameFileIdentity(pinned.directoryIdentity, parentIdentity)) {
+      throw new Error(
+        `copyFixtureTree refuses ${label}: the directory that would hold it is no longer the one this copy created for it (it was replaced after it was created).`,
+      );
+    }
+    walk.hooks?.afterPin?.(relativePath, kind);
+    const created = create(pinned, label);
+    requirePinnedDirectoryIntact(pinned, label);
+    return created;
+  } finally {
+    pinned.release();
+  }
+}
+
+/** Copy one directory level; see {@link copyFixtureTree} for the rules. */
+async function copyFixtureDirectory(
+  walk: FixtureCopyWalk,
+  sourceDir: string,
+  relativeDir: string,
+  identity: FileIdentity,
+): Promise<void> {
+  for (const entry of await readdir(sourceDir, { withFileTypes: true })) {
     if (FIXTURE_GENERATED_ENTRIES.has(entry.name) || entry.name.endsWith('.tsbuildinfo')) {
       continue;
     }
-    kept.add(entry.name);
-    const from = path.join(source, entry.name);
-    const to = path.join(target, entry.name);
+    const source = path.join(sourceDir, entry.name);
+    const relativePath = relativeDir === '' ? entry.name : `${relativeDir}/${entry.name}`;
+    if (entry.isSymbolicLink()) {
+      throw new Error(
+        `copyFixtureTree refuses the symbolic link ${source}: a fixture copy never follows or reproduces a link.`,
+      );
+    }
     if (entry.isDirectory()) {
-      await mirrorTree(from, to);
-    } else if (
-      entry.isFile() &&
-      !(source === FIXTURE_SOURCE_ROOT && entry.name === 'package.json')
-    ) {
-      await writeIfChanged(to, await readFile(from));
+      const created = createCopyEntry(walk, identity, relativePath, 'directory', (pinned, label) =>
+        createPinnedDirectory(pinned, label),
+      );
+      await copyFixtureDirectory(walk, source, relativePath, created);
+      continue;
     }
-  }
-  for (const entry of await readdir(target, { withFileTypes: true })) {
-    const owned =
-      FIXTURE_GENERATED_ENTRIES.has(entry.name) ||
-      (target === fixtureCopyRoot() && COPY_OWNED_ENTRIES.has(entry.name));
-    if (!kept.has(entry.name) && !owned) {
-      await rm(path.join(target, entry.name), { recursive: true, force: true });
+    if (!entry.isFile()) {
+      throw new Error(
+        `copyFixtureTree refuses ${source}: it is neither a regular file nor a directory.`,
+      );
     }
+    if (relativeDir === '' && entry.name === 'package.json') {
+      // Written separately from the rewritten manifest (`copyManifest`).
+      continue;
+    }
+    const bytes = readFileNoFollow(source);
+    createCopyEntry(walk, identity, relativePath, 'file', (pinned, label) => {
+      createPinnedFile(pinned, bytes, label);
+    });
   }
 }
 
-async function writeIfChanged(file: string, content: Buffer): Promise<boolean> {
+/**
+ * Copy the tracked fixture tree `sourceRoot` to `targetRoot`, a fresh path
+ * inside the private `boundary` ({@link allocateFixtureBoundary}), without ever
+ * following or overwriting anything — and without a check/use window a
+ * process of this account could exploit by swapping a directory (CWE-22,
+ * CWE-367):
+ *
+ * - the chain from the boundary to the target root's parent is pinned once
+ *   (`pinPrivateFileWithinRoot`: no-follow, descriptor-relative, every
+ *   descriptor held to the private policy) and held for the whole copy; the
+ *   target root is created in it and must not exist yet;
+ * - every entry below is created through descriptors, never through a path:
+ *   its parent chain is pinned from that held descriptor, the pinned parent
+ *   must be the very directory inode this copy created, and the entry is then
+ *   made in it — a directory with `mkdir` at `0700`, a file with
+ *   `O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW` at `0600`, written in full and
+ *   `fsync`ed. An existing entry (a planted link or file) is a refusal
+ *   (`EEXIST`) and its target is left byte-for-byte untouched;
+ * - after each create the parent's path must still name the pinned inode: a
+ *   directory swapped for a link mid-copy received the entry in the pinned
+ *   inode (never outside), and the copy is refused;
+ * - the pin must be enforced (`/proc/self/fd`); where it cannot be, the copy
+ *   is refused rather than run with a detect-only pin;
+ * - source entries are read with `lstat` semantics (`readdir` with file types),
+ *   and a symbolic link or any entry that is neither a regular file nor a
+ *   directory is refused, so a link's target can never be imported; each file
+ *   is read `O_NOFOLLOW` (`readFileNoFollow`);
+ * - the fixture's generated entries (`node_modules`, `.next`, `next-env.d.ts`,
+ *   `*.tsbuildinfo`) are skipped, and so is the root `package.json`, which the
+ *   caller writes from `copyManifest()` through the same pinned create
+ *   ({@link writeFixtureCopyFile});
+ * - finally the canonical `targetRoot` must still lie inside the canonical
+ *   boundary.
+ *
+ * @param sourceRoot The tracked tree to copy; must be a real directory.
+ * @param targetRoot Where the copy goes; must lie strictly inside `boundary`,
+ * below a parent that already exists there, and must not exist itself.
+ * @param boundary The private directory that owns the copy.
+ * @param hooks Test seams ({@link CopyFixtureTreeHooks}); production passes none.
+ * @throws On the first refused entry or unsafe path. What was already copied
+ * stays inside the boundary; nothing outside it is written.
+ */
+export async function copyFixtureTree(
+  sourceRoot: string,
+  targetRoot: string,
+  boundary: string,
+  hooks?: CopyFixtureTreeHooks,
+): Promise<void> {
+  const sourceAbs = path.resolve(sourceRoot);
+  const targetAbs = path.resolve(targetRoot);
+  const boundaryAbs = path.resolve(boundary);
+  if (!isStrictlyWithin(boundaryAbs, targetAbs)) {
+    throw new Error(
+      `copyFixtureTree: the target ${targetAbs} does not lie inside its boundary ${boundaryAbs}.`,
+    );
+  }
+  assertSecureDir(boundaryAbs);
+  const sourceStats = await lstat(sourceAbs);
+  if (!sourceStats.isDirectory()) {
+    throw new Error(
+      `copyFixtureTree: the source ${sourceAbs} is not a real directory (a symbolic link or a file is refused).`,
+    );
+  }
+  const rootPin = pinForCopy(boundaryAbs, path.relative(boundaryAbs, targetAbs), targetAbs);
   try {
-    const current = await readFile(file);
-    if (current.equals(content)) {
-      return false;
-    }
-  } catch {
-    // Absent: written below.
+    hooks?.afterPin?.('.', 'directory');
+    const rootIdentity = createPinnedDirectory(rootPin, targetAbs);
+    requirePinnedDirectoryIntact(rootPin, targetAbs);
+    await copyFixtureDirectory(
+      { targetRoot: targetAbs, anchor: rootPin.path, hooks },
+      sourceAbs,
+      '',
+      rootIdentity,
+    );
+  } finally {
+    rootPin.release();
   }
-  await writeFile(file, content);
-  return true;
+  const [realBoundary, realTarget] = await Promise.all([
+    realpath(boundaryAbs),
+    realpath(targetAbs),
+  ]);
+  if (!isStrictlyWithin(realBoundary, realTarget)) {
+    throw new Error(
+      `copyFixtureTree: the copy resolved to ${realTarget}, outside its boundary ${realBoundary}.`,
+    );
+  }
 }
 
-/** Where this clone's fixture copy lives: stable per repository clone, so a reused service's launch is reused too. */
-function fixtureCopyRoot(): string {
-  const repoKey = createHash('sha256').update(REPO_ROOT).digest('hex').slice(0, 12);
-  return path.join(os.tmpdir(), 'debuggen-browser-suite', repoKey, 'sample-next-app');
+/**
+ * Write one file of a fixture copy that {@link copyFixtureTree} leaves to its
+ * caller (the rewritten manifest), through the same pinned create: the chain
+ * from `boundary` down is pinned and held, the file is made
+ * `O_CREAT | O_EXCL | O_NOFOLLOW` at `0600` through the held descriptor, and
+ * the directory's path must still name the pinned inode afterwards.
+ *
+ * @param boundary The copy's private boundary.
+ * @param relativePath The file, POSIX and relative to `boundary` (for example `sample-next-app/package.json`).
+ * @param bytes The content, written in full and `fsync`ed.
+ * @throws On an existing entry (`EEXIST`), an unpinnable chain, a degraded pin or a swapped directory.
+ */
+function writeFixtureCopyFile(
+  boundary: string,
+  relativePath: string,
+  bytes: string | Uint8Array,
+): void {
+  const label = path.join(boundary, ...relativePath.split('/'));
+  const pinned = pinForCopy(boundary, relativePath, label);
+  try {
+    createPinnedFile(pinned, bytes, label);
+    requirePinnedDirectoryIntact(pinned, label);
+  } finally {
+    pinned.release();
+  }
 }
 
 /**
@@ -1203,42 +1940,66 @@ async function copyManifest(): Promise<string> {
   return `${JSON.stringify({ ...manifest, devDependencies: { ...ownDev, ...pinned } }, null, 2)}\n`;
 }
 
+/** One worker's private copy of the fixture app. */
+export interface FixtureAppCopy {
+  /** The copy's root, `<boundary>/sample-next-app` — the project root the service records. */
+  readonly root: string;
+  /** The private `mkdtemp` directory that owns the copy; the only thing `remove()` deletes. */
+  readonly boundary: string;
+  /** Delete the boundary with everything in it and verify it is gone; throws when it is not. */
+  remove(): Promise<void>;
+}
+
 /**
- * Prepare the fixture app's copy: mirror the tracked tree and install its
- * dependencies there (never into the repository). Idempotent; the install runs
- * only when the manifest changed or `next` is missing.
+ * Prepare this worker's private copy of the fixture app: allocate a fresh
+ * boundary, copy the tracked tree into `<boundary>/sample-next-app`
+ * ({@link copyFixtureTree}), write the rewritten manifest with the same pinned,
+ * exclusive, no-follow create ({@link writeFixtureCopyFile}), and install its
+ * dependencies there — always, since the copy is new (never into the
+ * repository). Nothing survives the worker: the caller removes the copy after
+ * its server stopped, and a failure here removes it before the error is
+ * rethrown.
  *
- * @returns The copy's absolute root.
+ * @returns The copy and its removal.
  */
-export async function prepareFixtureAppCopy(): Promise<string> {
-  const root = fixtureCopyRoot();
-  await mirrorTree(FIXTURE_SOURCE_ROOT, root);
-  const manifest = await copyManifest();
-  await writeIfChanged(path.join(root, 'package.json'), Buffer.from(manifest, 'utf8'));
-  const stampFile = path.join(root, '.debuggen-install-stamp');
-  const stamp = createHash('sha256').update(manifest).digest('hex');
-  const previous = await readFile(stampFile, 'utf8').then(
-    (text) => text.trim(),
-    () => '',
-  );
-  if (previous === stamp && existsSync(path.join(root, 'node_modules', 'next', 'package.json'))) {
-    return root;
-  }
-  const pnpm = pnpmInvocation();
-  const installed = await runToCompletion(
-    pnpm.file,
-    [...pnpm.prefix, 'install', '--ignore-workspace', '--prefer-offline', '--no-frozen-lockfile'],
-    root,
-    childEnvironment({ CI: 'true' }),
-    INSTALL_TIMEOUT_MS,
-  );
-  if (installed.code !== 0) {
-    throw new Error(
-      `Installing the fixture app's dependencies into ${root} failed (exit ${String(installed.code)}); pnpm must be available (corepack enable). Output:\n${installed.output}`,
+export async function prepareFixtureAppCopy(): Promise<FixtureAppCopy> {
+  const boundary = await allocateFixtureBoundary();
+  const root = path.join(boundary, FIXTURE_COPY_DIR_NAME);
+  try {
+    await copyFixtureTree(FIXTURE_SOURCE_ROOT, root, boundary);
+    writeFixtureCopyFile(boundary, `${FIXTURE_COPY_DIR_NAME}/package.json`, await copyManifest());
+    const pnpm = pnpmInvocation();
+    const installed = await runToCompletion(
+      pnpm.file,
+      [...pnpm.prefix, 'install', '--ignore-workspace', '--prefer-offline', '--no-frozen-lockfile'],
+      root,
+      childEnvironment({ CI: 'true' }),
+      INSTALL_TIMEOUT_MS,
+    );
+    if (installed.code !== 0) {
+      throw new Error(
+        `Installing the fixture app's dependencies into ${root} failed (exit ${String(installed.code)}); pnpm must be available (corepack enable). Output:\n${installed.output}`,
+      );
+    }
+    if (!existsSync(path.join(root, 'node_modules', 'next', 'package.json'))) {
+      throw new Error(
+        `Installing the fixture app's dependencies into ${root} exited 0 but left no node_modules/next. Output:\n${installed.output}`,
+      );
+    }
+  } catch (error) {
+    const problems: string[] = [];
+    try {
+      await removeFixtureBoundary(boundary);
+    } catch (removeError) {
+      problems.push(describeError(removeError));
+    }
+    throw errorWithProblems(
+      error,
+      'Removing the private fixture copy after that failure also failed',
+      problems,
     );
   }
-  await writeFile(stampFile, `${stamp}\n`);
-  return root;
+  return { root, boundary, remove: () => removeFixtureBoundary(boundary) };
 }
 
 /** A dev server this file spawned itself (the fallback when the service cannot launch one). */
@@ -1309,8 +2070,16 @@ async function terminateSpawned(server: SpawnedServer): Promise<void> {
  * Wait until the fixture app answers `/`, then pre-warm `/` and the contract
  * route once — so the first spec's click does not measure a first compile —
  * and confirm the server really is the fixture app.
+ *
+ * Its errors are body-free like every diagnostic here: the last status of `/`,
+ * and for the ping its status, media type and contract verdict
+ * ({@link describeProbe}) — never the reply itself, whatever it carries.
+ *
+ * @param baseUrl The origin this worker serves its copy on.
+ * @param diagnostics This worker's own account of its server (a spawned child's output, or where the launcher logs it).
+ * @throws When `/` does not answer 200 in time, or the ping does not honour `{ reply: string }`.
  */
-async function waitForFixtureApp(baseUrl: string, diagnostics: () => string): Promise<void> {
+export async function waitForFixtureApp(baseUrl: string, diagnostics: () => string): Promise<void> {
   const root = new URL('/', baseUrl).toString();
   let lastStatus: number | undefined;
   await pollFor(
@@ -1322,134 +2091,667 @@ async function waitForFixtureApp(baseUrl: string, diagnostics: () => string): Pr
     () =>
       `The fixture app at ${root} did not answer 200 within ${String(APP_READY_TIMEOUT_MS)} ms (last status ${String(lastStatus)}). ${diagnostics()}`,
   );
-  const ping = new URL(FIXTURE_PING_PATH, baseUrl).toString();
-  let reply: unknown;
-  try {
-    const response = await fetch(ping, { signal: AbortSignal.timeout(APP_READY_TIMEOUT_MS) });
-    reply = response.ok ? await response.json() : undefined;
-  } catch (error) {
-    reply = describeError(error);
-  }
-  if (!isRecord(reply) || typeof reply.reply !== 'string') {
+  const ping = await probeOrigin(
+    new URL(FIXTURE_PING_PATH, baseUrl).toString(),
+    APP_READY_TIMEOUT_MS,
+  );
+  if (!(ping.kind === 'answered' && ping.status === 200 && isFixturePingReply(ping.body))) {
     throw new Error(
-      `The server at ${baseUrl} is not the sample-next-app fixture: GET ${FIXTURE_PING_PATH} did not answer { reply: string } (got ${JSON.stringify(reply)}). Free the port or point FIXTURE_APP_URL at another one. ${diagnostics()}`,
+      `The server at ${baseUrl} is not the sample-next-app fixture: GET ${FIXTURE_PING_PATH} ${describeProbe(ping)}, which does not honour the fixture contract { reply: string }. Something other than this worker's copy answers that origin: free the port or set FIXTURE_APP_URL to another one. ${diagnostics()}`,
     );
   }
 }
 
-/** The worker-scoped state behind {@link FixtureAppHandle}. */
-interface FixtureAppState {
+/** What one bounded `GET` of an origin observed. */
+type OriginProbe =
+  /** A connection-level failure (refused, reset, unresolvable): nothing serves the origin. */
+  | { readonly kind: 'unreachable'; readonly reason: string }
+  /** Something accepted the request but did not answer within the bound. */
+  | { readonly kind: 'stalled'; readonly reason: string }
+  /**
+   * An HTTP answer. `body` holds at most {@link MAX_PROBE_BODY_BYTES} and is
+   * read for the fixture-contract check only: no diagnostic ever quotes it,
+   * nor any header value ({@link describeProbe}).
+   */
+  | {
+      readonly kind: 'answered';
+      readonly status: number;
+      readonly contentType: string | null;
+      readonly body: string;
+    };
+
+/** Whether a fetch failure is its `AbortSignal.timeout` firing rather than a connection failure. */
+function isTimeoutError(error: unknown): boolean {
+  return error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError');
+}
+
+/** At most `maxBytes` of a response body as UTF-8; the rest is cancelled unread. */
+async function readBoundedText(response: Response, maxBytes: number): Promise<string> {
+  const reader = response.body?.getReader();
+  if (reader === undefined) {
+    return '';
+  }
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      const kept = value.subarray(0, maxBytes - total);
+      chunks.push(kept);
+      total += kept.byteLength;
+      if (total >= maxBytes) {
+        await reader.cancel();
+        break;
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+/**
+ * One bounded `GET url` — no redirect followed — classified (see
+ * {@link OriginProbe}); never throws. A connection failure is reported by its
+ * error code alone (`ECONNREFUSED`), never by a message that could echo what
+ * the peer sent; an unreadable body reads as empty, which fails the contract.
+ */
+async function probeOrigin(url: string, timeoutMs: number): Promise<OriginProbe> {
+  let response: Response;
+  try {
+    response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs), redirect: 'manual' });
+  } catch (error) {
+    if (isTimeoutError(error)) {
+      return {
+        kind: 'stalled',
+        reason: `accepted the connection but did not answer within ${String(timeoutMs)} ms`,
+      };
+    }
+    const cause: unknown = error instanceof Error ? error.cause : undefined;
+    return {
+      kind: 'unreachable',
+      reason:
+        errnoCode(cause) ??
+        errnoCode(error) ??
+        (error instanceof Error ? error.name : 'an unknown failure'),
+    };
+  }
+  let body: string;
+  try {
+    body = await readBoundedText(response, MAX_PROBE_BODY_BYTES);
+  } catch {
+    body = '';
+  }
+  return {
+    kind: 'answered',
+    status: response.status,
+    contentType: response.headers.get('content-type'),
+    body,
+  };
+}
+
+/** A media type (`type/subtype`) in the character set RFC 6838 allows — the only shape a diagnostic prints. */
+const PRINTABLE_MEDIA_TYPE = /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/;
+
+/** Longest media type a diagnostic prints. */
+const MAX_PRINTED_MEDIA_TYPE_CHARS = 100;
+
+/**
+ * A `Content-Type` header reduced to what a diagnostic may print: the media
+ * type before any `;`, lowercased, and only when it has the RFC 6838 shape and
+ * at most {@link MAX_PRINTED_MEDIA_TYPE_CHARS} characters — otherwise
+ * `an unrecognised content type`. Parameters (a `charset`, or whatever else a
+ * server put there) are never printed.
+ *
+ * @example
+ * ```ts
+ * describeMediaType('Text/HTML; charset=utf-8'); // 'text/html'
+ * describeMediaType('text/html; x=<secret>'); // 'text/html'
+ * describeMediaType('not a media type'); // 'an unrecognised content type'
+ * ```
+ */
+export function describeMediaType(header: string | null): string {
+  if (header === null || header.trim() === '') {
+    return 'no content type';
+  }
+  const media = (header.split(';', 1)[0] ?? '').trim().toLowerCase();
+  return media.length <= MAX_PRINTED_MEDIA_TYPE_CHARS && PRINTABLE_MEDIA_TYPE.test(media)
+    ? media
+    : 'an unrecognised content type';
+}
+
+/**
+ * One probe in a sentence for a diagnostic: the status and the media type
+ * ({@link describeMediaType}), or how the connection failed — never a body, a
+ * header value or a `Content-Type` parameter, so nothing a server returns
+ * (a token in an error page, a header) can reach a Playwright or CI log.
+ */
+function describeProbe(probe: OriginProbe): string {
+  switch (probe.kind) {
+    case 'unreachable':
+      return `failed at the connection level (${probe.reason})`;
+    case 'stalled':
+      return probe.reason;
+    case 'answered':
+      return `answered ${String(probe.status)} (${describeMediaType(probe.contentType)})`;
+  }
+}
+
+/** Whether a `GET /api/ping` body is the fixture contract's `{ reply: string }`. */
+function isFixturePingReply(body: string): boolean {
+  try {
+    const parsed: unknown = JSON.parse(body);
+    return isRecord(parsed) && typeof parsed.reply === 'string';
+  } catch {
+    return false;
+  }
+}
+
+/** Who answers an origin before this worker does anything about it. */
+export type FixtureOriginIdentity =
+  /** Nothing listens there. */
+  | { readonly kind: 'none' }
+  /** A server that honours the fixture contract (`GET /api/ping` → `{ reply: string }`), described without its bodies. */
+  | { readonly kind: 'fixture'; readonly description: string }
+  /** Something else, described without its bodies. */
+  | { readonly kind: 'foreign'; readonly description: string };
+
+/**
+ * Identify what serves `origin` with at most two bounded `GET`s — `/`, then
+ * the contract route `GET /api/ping` — and nothing else: no other path, no
+ * other method, no redirect followed. Nothing answering `/` at the connection
+ * level is `none`; otherwise the fixture contract decides between `fixture`
+ * and `foreign`.
+ *
+ * The description names each request's status and media type and whether the
+ * ping honoured the contract, and nothing else: bodies are read, bounded, for
+ * the contract check only, and no header value or `Content-Type` parameter is
+ * printed, so a secret an occupant returns never reaches a log.
+ *
+ * @param origin An `http(s)` origin, for example `http://127.0.0.1:3100`.
+ * @returns What answers it; never throws for a failed request.
+ */
+export async function identifyFixtureOrigin(origin: string): Promise<FixtureOriginIdentity> {
+  const root = await probeOrigin(new URL('/', origin).toString(), IDENTIFY_TIMEOUT_MS);
+  if (root.kind === 'unreachable') {
+    return { kind: 'none' };
+  }
+  const ping = await probeOrigin(
+    new URL(FIXTURE_PING_PATH, origin).toString(),
+    IDENTIFY_TIMEOUT_MS,
+  );
+  const honoured = ping.kind === 'answered' && ping.status === 200 && isFixturePingReply(ping.body);
+  const description = `GET / ${describeProbe(root)}; GET ${FIXTURE_PING_PATH} ${describeProbe(ping)}, which ${honoured ? 'honours' : 'does not honour'} the fixture contract { reply: string }`;
+  return honoured ? { kind: 'fixture', description } : { kind: 'foreign', description };
+}
+
+/** Whether the running service serves the dev-server launcher routes; `unknown` until probed. */
+export type LauncherRoutes = 'present' | 'missing' | 'unknown';
+
+/**
+ * Which origin this worker serves its private copy on: the configured one when
+ * nothing answers it, else an alternate loopback origin of its own. The
+ * occupant — the fixture app or anything else — is never launched against,
+ * stopped or sent anything beyond its two identification `GET`s.
+ */
+export type FixtureServingTarget =
+  | { readonly origin: 'configured' }
+  | { readonly origin: 'alternate'; readonly occupant: 'fixture' | 'foreign' };
+
+/** Where and how this worker serves the fixture app — the decision {@link planFixtureServing} makes before anything is launched. */
+export type FixtureServingPlan =
+  /** Probe the service's launcher routes first (a no-op `devServer.stop`), then plan again. */
+  | { readonly target: FixtureServingTarget; readonly action: 'probe-launcher-routes' }
+  /** Have the service's launcher start the private copy on the target origin. */
+  | {
+      readonly target: FixtureServingTarget;
+      readonly action: 'launch';
+      readonly servedBy: 'service-launcher';
+    }
+  /** The service cannot launch: spawn `next dev` for the copy on the target origin directly. */
+  | {
+      readonly target: FixtureServingTarget;
+      readonly action: 'spawn';
+      readonly servedBy: 'fixture-process';
+    };
+
+/**
+ * Decide, purely, where and how this worker serves its private copy — before
+ * any launch, spawn or stop.
+ *
+ * | configured origin     | launcher routes | target                   | action                                    |
+ * |-----------------------|-----------------|--------------------------|-------------------------------------------|
+ * | `none`                | `unknown`       | configured               | probe the routes                          |
+ * | `none`                | `present`       | configured               | launch through the service (`service-launcher`) |
+ * | `none`                | `missing`       | configured               | spawn directly (`fixture-process`)        |
+ * | `fixture` / `foreign` | `unknown`       | alternate, occupant named | probe the routes                         |
+ * | `fixture` / `foreign` | `present`       | alternate, occupant named | launch through the service              |
+ * | `fixture` / `foreign` | `missing`       | alternate, occupant named | spawn directly                          |
+ *
+ * An occupied origin is never reused, even when it is the fixture app, because
+ * reuse cannot work and cannot be safe. The service attributes a session's dev
+ * server only from its launcher's registry for that project root, or from an
+ * earlier session of the same root (`resolveDevServerUrl` in
+ * `apps/local-service/src/server/routes/sessions.ts`); this worker's root is a
+ * fresh private copy, so a server it did not launch for that copy can never be
+ * attributed to it, and every session would be refused. Adopting the root of
+ * another run's leftover server instead would take over — and at teardown
+ * stop — a server this worker does not own.
+ *
+ * @param configured What answers the configured origin ({@link FixtureOriginIdentity}).
+ * @param launcherRoutes Whether the service serves `devServer.launch`/`devServer.stop`.
+ * @returns The plan.
+ */
+export function planFixtureServing(
+  configured: FixtureOriginIdentity,
+  launcherRoutes: LauncherRoutes,
+): FixtureServingPlan {
+  const target: FixtureServingTarget =
+    configured.kind === 'none'
+      ? { origin: 'configured' }
+      : { origin: 'alternate', occupant: configured.kind };
+  switch (launcherRoutes) {
+    case 'unknown':
+      return { target, action: 'probe-launcher-routes' };
+    case 'present':
+      return { target, action: 'launch', servedBy: 'service-launcher' };
+    case 'missing':
+      return { target, action: 'spawn', servedBy: 'fixture-process' };
+  }
+}
+
+/** Whether a failed dev-server call means the route itself is absent (an older service), not a refusal by a present route. */
+function isRouteMissing(error: DebuggenError): boolean {
+  return statusOf(error) === 404 && error.code !== 'PROJECT_NOT_FOUND';
+}
+
+/**
+ * Whether the service serves the launcher routes, without side effects: a
+ * `devServer.stop` for `projectRoot` — the private copy just created, which the
+ * service has never seen — answers `{ stopped: false }` when the route exists
+ * and `404` when it does not. The route acts only inside a workspace an editor
+ * connection announced, and that announcement is recorded asynchronously, so a
+ * `PATH_OUTSIDE_PROJECT` refusal is retried within {@link ANNOUNCEMENT_SETTLE_MS}.
+ *
+ * @throws On any other failure, or when the probe unexpectedly stopped a server.
+ */
+async function probeLauncherRoutes(
+  service: ServiceHandle,
+  projectRoot: string,
+): Promise<'present' | 'missing'> {
+  const retryUntil = Date.now() + ANNOUNCEMENT_SETTLE_MS;
+  for (;;) {
+    const result = await service.call('devServer.stop', {
+      body: { projectRoot },
+      timeoutMs: ROUTE_PROBE_TIMEOUT_MS,
+    });
+    if (result.ok) {
+      if (result.value.stopped) {
+        throw new Error(
+          `Probing the service's launcher with devServer.stop for ${projectRoot}, a root created moments ago, stopped a dev server: the service was not expected to know that root. Check that no other process shares this worker's temp directory.`,
+        );
+      }
+      return 'present';
+    }
+    if (isRouteMissing(result.error)) {
+      return 'missing';
+    }
+    if (result.error.code !== 'PATH_OUTSIDE_PROJECT' || Date.now() >= retryUntil) {
+      throw new Error(
+        `Probing the service's dev-server launcher (a no-op devServer.stop for the fresh copy ${projectRoot}) failed: ${new ServiceCallError('devServer.stop', result.error).message}`,
+      );
+    }
+    await delay(POLL_INTERVAL_MS);
+  }
+}
+
+/**
+ * Wait until nothing answers `origin` at the connection level.
+ *
+ * @returns `undefined` once quiet, else the last probe's body-free description when `timeoutMs` ran out.
+ */
+async function originStillAnswering(
+  origin: string,
+  timeoutMs: number,
+): Promise<string | undefined> {
+  const root = new URL('/', origin).toString();
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const probe = await probeOrigin(root, QUIET_PROBE_TIMEOUT_MS);
+    if (probe.kind === 'unreachable') {
+      return undefined;
+    }
+    if (Date.now() >= deadline) {
+      return describeProbe(probe);
+    }
+    await delay(POLL_INTERVAL_MS);
+  }
+}
+
+/** A URL's hostname as `node:net` expects it: an IPv6 literal without its brackets. */
+function listenHost(url: URL): string {
+  const { hostname } = url;
+  return hostname.startsWith('[') && hostname.endsWith(']') ? hostname.slice(1, -1) : hostname;
+}
+
+/**
+ * Ask the OS for a port nobody holds on `host`: listen on port `0`, read the
+ * port it assigned, close the listener. The port is free when this resolves,
+ * not reserved — the caller identifies the origin again before using it.
+ */
+function findFreePort(host: string): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const server = createServer();
+    server.once('error', reject);
+    server.listen({ port: 0, host, exclusive: true }, () => {
+      const address = server.address();
+      server.close((closeError) => {
+        if (closeError !== undefined) {
+          reject(closeError);
+          return;
+        }
+        if (address === null || typeof address === 'string') {
+          reject(new Error(`Listening on ${host} port 0 reported no TCP port.`));
+          return;
+        }
+        resolve(address.port);
+      });
+    });
+  });
+}
+
+/**
+ * Allocate this worker's own origin beside an occupied configured one: the
+ * same scheme and hostname, on a port the OS reports free
+ * ({@link findFreePort}), which must not be privileged and must then identify
+ * as `none` — nothing answers it. A port something else took in between is
+ * retried, up to {@link ALTERNATE_PORT_ATTEMPTS} times. The occupant is not
+ * contacted.
+ *
+ * @param configured The configured fixture URL, whose origin is occupied.
+ * @returns The alternate origin, as a URL.
+ * @throws When the OS offers a privileged port, or every candidate was answered by something.
+ */
+async function allocateAlternateOrigin(configured: URL): Promise<URL> {
+  const host = listenHost(configured);
+  const taken: string[] = [];
+  for (let attempt = 1; attempt <= ALTERNATE_PORT_ATTEMPTS; attempt += 1) {
+    const port = await findFreePort(host);
+    if (port < MIN_ALTERNATE_PORT) {
+      throw new Error(
+        `The OS offered the privileged port ${String(port)} on ${host} for the fixture app's alternate origin; the browser fixtures never serve below port ${String(MIN_ALTERNATE_PORT)}. Check the host's local port range, or free the configured origin ${configured.origin}.`,
+      );
+    }
+    const candidate = new URL(configured.origin);
+    candidate.port = String(port);
+    const identity = await identifyFixtureOrigin(candidate.origin);
+    if (identity.kind === 'none') {
+      return new URL(candidate.origin);
+    }
+    taken.push(
+      `${candidate.origin} was answered by the time it was identified (${identity.description})`,
+    );
+  }
+  throw new Error(
+    `No alternate origin for the fixture app could be allocated on ${host} in ${String(ALTERNATE_PORT_ATTEMPTS)} attempts, because the configured origin ${configured.origin} is occupied: ${taken.join('; ')}. Free ${configured.origin} or set FIXTURE_APP_URL to a free port.`,
+  );
+}
+
+/**
+ * The one stderr line a displaced worker writes: the configured origin, what
+ * occupies it (body-free, {@link identifyFixtureOrigin}) and the origin served
+ * instead.
+ */
+function displacementNotice(
+  configuredOrigin: string,
+  servedOrigin: string,
+  displaced: FixtureAppDisplacement,
+): string {
+  const who =
+    displaced.occupant === 'fixture'
+      ? 'a sample-next-app fixture this worker did not start'
+      : 'a server that is not the sample-next-app fixture';
+  return `[tests/browser/fixtures] ${configuredOrigin} (FIXTURE_APP_URL) is occupied by ${who} (${displaced.description}); it is left untouched, and this worker serves its own copy on ${servedOrigin} instead.\n`;
+}
+
+/** The launcher command for the copy: `next dev` pinned to `url`'s port and hostname (the preload and credential arrive through the child's environment). */
+function launchCommand(url: URL): string {
+  return `NEXT_TELEMETRY_DISABLED=1 "${process.execPath}" node_modules/next/dist/bin/next dev --port ${String(portOf(url))} --hostname ${url.hostname}`;
+}
+
+/** The worker-scoped state behind {@link FixtureAppHandle}, as {@link serveFixtureApp} returns it. */
+export interface FixtureAppState {
   readonly handle: FixtureAppHandle;
+  /**
+   * Stop the server this worker started — only that one: an occupant of the
+   * configured origin is never stopped or probed — and verify the served
+   * origin went quiet, close the anchor connection, then remove the private
+   * copy; every step attempted even when an earlier one failed.
+   *
+   * @returns One sentence per problem; empty when everything was released.
+   */
   dispose(): Promise<string[]>;
 }
 
 /**
- * Serve the fixture app. The service is asked to launch the copy with an
- * explicit command pinning the configured port (it reuses its own ready child
- * for the same root); only a service without the launch route (`404`) makes
- * this file spawn the app itself.
+ * Serve the fixture app for this worker, on an origin it owns. Whatever
+ * answers the configured origin is never launched against, stopped or sent
+ * anything beyond the two identification `GET`s ({@link planFixtureServing}):
+ *
+ * 1. identify what answers the configured origin (`none`, `fixture` or `foreign`);
+ * 2. prepare the private copy and open the anchor editor connection that
+ *    announces it (the launch route and every session route act only inside
+ *    an announced workspace; the anchor lives as long as the worker);
+ * 3. probe the launcher routes with a no-op `devServer.stop`, then plan;
+ * 4. choose the origin: the configured one when nothing answers it, else an
+ *    alternate loopback origin ({@link allocateAlternateOrigin}), announced by
+ *    one body-free stderr notice;
+ * 5. launch through the service with an explicit command pinning that origin's
+ *    port and hostname — the launcher's `devServerUrl` must be that origin —
+ *    or, when the service has no launcher routes, spawn `next dev` there;
+ * 6. wait for the app to answer and honour its contract.
+ *
+ * A failure at any step releases what was set up before the error is rethrown.
+ *
+ * @param service The running service.
+ * @param configuredUrl The configured fixture URL (`fixtureAppUrl`); empty for the fixture's default.
+ * @returns The handle and its release.
  */
-async function serveFixtureApp(
+export async function serveFixtureApp(
   service: ServiceHandle,
   configuredUrl: string,
 ): Promise<FixtureAppState> {
-  const baseUrl = nonEmptyOption(configuredUrl) ?? DEFAULT_FIXTURE_APP_URL;
-  const url = new URL(baseUrl);
-  const origin = url.origin;
-  const projectRoot = await prepareFixtureAppCopy();
-  const preexisting = (await probeStatus(new URL('/', origin).toString())) !== undefined;
+  const configured = new URL(nonEmptyOption(configuredUrl) ?? DEFAULT_FIXTURE_APP_URL);
+  const configuredOrigin = configured.origin;
 
-  // The launch route (and every session route) acts only under a workspace an
-  // open editor connection announced; this one lives as long as the worker.
-  const anchor = await service.connectEditor(projectRoot);
-  const command = `NEXT_TELEMETRY_DISABLED=1 "${process.execPath}" node_modules/next/dist/bin/next dev --port ${String(portOf(url))} --hostname ${url.hostname}`;
+  const occupant = await identifyFixtureOrigin(configuredOrigin);
+  const displaced: FixtureAppDisplacement | undefined =
+    occupant.kind === 'none'
+      ? undefined
+      : { occupant: occupant.kind, description: occupant.description };
 
-  const launch = async (): Promise<'served' | 'route-missing'> => {
+  const copy = await prepareFixtureAppCopy();
+  const projectRoot = copy.root;
+
+  /** What this worker owns right now; `release()` undoes exactly this. */
+  const owned: {
+    anchor: EditorClient | undefined;
+    /** The origin this worker launched or spawned on — never the occupied configured one. */
+    served: URL | undefined;
+    launchRequested: boolean;
+    spawned: SpawnedServer | undefined;
+  } = { anchor: undefined, served: undefined, launchRequested: false, spawned: undefined };
+
+  const launch = async (url: URL): Promise<'served' | 'route-missing'> => {
+    owned.launchRequested = true;
     const result = await service.call('devServer.launch', {
-      body: { projectRoot, command },
+      body: { projectRoot, command: launchCommand(url) },
       timeoutMs: APP_READY_TIMEOUT_MS,
     });
     if (!result.ok) {
-      if (statusOf(result.error) === 404) {
+      if (isRouteMissing(result.error)) {
+        owned.launchRequested = false;
         return 'route-missing';
       }
-      const occupied = preexisting
-        ? ` Something already answered on ${origin} before the launch — the service can only use a dev server it started, so free that port or set FIXTURE_APP_URL to another one.`
-        : '';
       throw new Error(
-        `${new ServiceCallError('devServer.launch', result.error).message}.${occupied} The dev server's own output is in the service log.`,
+        `${new ServiceCallError('devServer.launch', result.error).message}. The dev server's own output is in the service log.`,
       );
     }
-    if (originOf(result.value.devServerUrl) !== origin) {
+    if (originOf(result.value.devServerUrl) !== url.origin) {
       throw new Error(
-        `The service launched the fixture app at ${result.value.devServerUrl}, not at the configured ${origin}; the tab would never bind to the session. Check FIXTURE_APP_URL and that nothing else holds its port.`,
+        `The service launched the fixture app at ${result.value.devServerUrl}, not at the chosen ${url.origin}; the tab would never bind to the session. Check that nothing else took that port.`,
       );
     }
     return 'served';
   };
 
-  let spawned: SpawnedServer | undefined;
-  let servedBy: FixtureAppServer = 'service-launcher';
-  try {
-    if ((await launch()) === 'route-missing') {
-      servedBy = 'fixture-process';
-      if (!preexisting) {
-        spawned = spawnFixtureAppServer(projectRoot, url);
-      }
-    }
-    const diagnostics = (): string =>
-      spawned !== undefined
-        ? `Dev server output:\n${spawned.output()}`
-        : 'The dev server was launched by the service; its output is in the service log.';
-    await waitForFixtureApp(origin, diagnostics);
-  } catch (error) {
-    if (spawned !== undefined) {
-      await terminateSpawned(spawned);
-    }
-    anchor.close();
-    throw error;
-  }
+  const spawnedDiagnostics = (): string =>
+    owned.spawned === undefined ? '' : `Dev server output:\n${owned.spawned.output()}`;
+  const launcherDiagnostics = (): string =>
+    'The dev server was launched by the service; its output is in the service log.';
 
-  const startedByFixture = !preexisting;
-  const handle: FixtureAppHandle = {
-    baseUrl: origin,
-    projectRoot,
-    sourceRoot: FIXTURE_SOURCE_ROOT,
-    startedByFixture,
-    servedBy,
-    async ensureServing() {
-      if (servedBy === 'service-launcher') {
-        await launch();
-      } else if (
-        spawned !== undefined &&
-        (spawned.child.exitCode !== null || spawned.child.signalCode !== null)
-      ) {
-        throw new Error(`The fixture app's dev server exited. Output:\n${spawned.output()}`);
+  const release = async (): Promise<string[]> => {
+    const problems: string[] = [];
+    const served = owned.served;
+    if (owned.launchRequested) {
+      owned.launchRequested = false;
+      const stopped = await service.call('devServer.stop', {
+        body: { projectRoot },
+        timeoutMs: SERVER_STOP_TIMEOUT_MS,
+      });
+      if (!stopped.ok) {
+        problems.push(
+          `stopping the service-launched fixture app failed: ${new ServiceCallError('devServer.stop', stopped.error).message}`,
+        );
       }
-      await waitForFixtureApp(origin, () =>
-        spawned === undefined ? 'See the service log.' : spawned.output(),
-      );
-    },
-    output: () => spawned?.output() ?? '',
-  };
-
-  return {
-    handle,
-    async dispose() {
-      const problems: string[] = [];
-      if (servedBy === 'service-launcher' && startedByFixture) {
-        const stopped = await service.call('devServer.stop', { body: { projectRoot } });
-        if (!stopped.ok) {
-          problems.push(new ServiceCallError('devServer.stop', stopped.error).message);
+      if (served !== undefined) {
+        const answering = await originStillAnswering(served.origin, SERVER_STOP_TIMEOUT_MS);
+        if (answering !== undefined) {
+          problems.push(
+            `${served.origin} still answers ${String(SERVER_STOP_TIMEOUT_MS)} ms after devServer.stop (GET / ${answering}): the launcher's dev server leaked`,
+          );
         }
       }
-      if (spawned !== undefined) {
+    }
+    const spawned = owned.spawned;
+    if (spawned !== undefined) {
+      owned.spawned = undefined;
+      try {
         await terminateSpawned(spawned);
+      } catch (error) {
+        problems.push(`terminating the spawned fixture app failed: ${describeError(error)}`);
       }
-      anchor.close();
-      return problems;
-    },
+      if (spawned.child.exitCode === null && spawned.child.signalCode === null) {
+        problems.push(
+          `the spawned fixture app (pid ${String(spawned.child.pid)}) is still running after SIGTERM and SIGKILL of its process group`,
+        );
+      }
+      if (served !== undefined) {
+        const answering = await originStillAnswering(served.origin, SERVER_STOP_TIMEOUT_MS);
+        if (answering !== undefined) {
+          problems.push(
+            `${served.origin} still answers ${String(SERVER_STOP_TIMEOUT_MS)} ms after the spawned fixture app was terminated (GET / ${answering})`,
+          );
+        }
+      }
+    }
+    const anchor = owned.anchor;
+    if (anchor !== undefined) {
+      owned.anchor = undefined;
+      try {
+        anchor.close();
+      } catch (error) {
+        problems.push(`closing the anchor editor connection failed: ${describeError(error)}`);
+      }
+    }
+    // Last, so the copy is removed only after its server was stopped.
+    try {
+      await copy.remove();
+    } catch (error) {
+      problems.push(describeError(error));
+    }
+    return problems;
   };
+
+  let servedBy: FixtureAppServer;
+  let served: URL;
+  try {
+    owned.anchor = await service.connectEditor(projectRoot);
+    const plan = planFixtureServing(occupant, await probeLauncherRoutes(service, projectRoot));
+    if (plan.action === 'probe-launcher-routes') {
+      throw new Error(
+        'planFixtureServing asked for a launcher probe after one ran; the plan cannot be settled.',
+      );
+    }
+    served =
+      plan.target.origin === 'configured'
+        ? new URL(configuredOrigin)
+        : await allocateAlternateOrigin(configured);
+    owned.served = served;
+    if (displaced !== undefined) {
+      process.stderr.write(displacementNotice(configuredOrigin, served.origin, displaced));
+    }
+    if (plan.action === 'launch' && (await launch(served)) === 'served') {
+      servedBy = plan.servedBy;
+      await waitForFixtureApp(served.origin, launcherDiagnostics);
+    } else {
+      // No launcher routes — or they vanished between the probe and the launch.
+      servedBy = 'fixture-process';
+      owned.spawned = spawnFixtureAppServer(projectRoot, served);
+      await waitForFixtureApp(served.origin, spawnedDiagnostics);
+    }
+  } catch (error) {
+    throw errorWithProblems(
+      error,
+      'Releasing what this worker had set up for the fixture app also failed',
+      await release(),
+    );
+  }
+
+  const servedUrl = served;
+  const ensureServing = async (): Promise<void> => {
+    switch (servedBy) {
+      case 'service-launcher':
+        // The launcher reuses its ready child, and restarts it if ending a
+        // session stopped it — always on this worker's own origin.
+        if ((await launch(servedUrl)) === 'route-missing') {
+          throw new Error(
+            `The service at ${service.baseUrl} no longer serves POST /dev-server/launch, which served this worker's fixture app; restart the suite against one service build.`,
+          );
+        }
+        await waitForFixtureApp(servedUrl.origin, launcherDiagnostics);
+        return;
+      case 'fixture-process': {
+        const spawned = owned.spawned;
+        if (
+          spawned === undefined ||
+          spawned.child.exitCode !== null ||
+          spawned.child.signalCode !== null
+        ) {
+          throw new Error(`The fixture app's dev server exited. ${spawnedDiagnostics()}`);
+        }
+        await waitForFixtureApp(servedUrl.origin, spawnedDiagnostics);
+        return;
+      }
+    }
+  };
+
+  const handle: FixtureAppHandle = {
+    baseUrl: servedUrl.origin,
+    configuredUrl: configuredOrigin,
+    displaced,
+    projectRoot,
+    sourceRoot: FIXTURE_SOURCE_ROOT,
+    startedByFixture: true,
+    servedBy,
+    ensureServing,
+    output: () => owned.spawned?.output() ?? '',
+  };
+
+  return { handle, dispose: release };
 }
 
 // ---------------------------------------------------------------------------
@@ -1483,16 +2785,40 @@ function isExtensionUrl(url: string): boolean {
   }
 }
 
+/** Remove a Chromium profile directory and prove it is gone; returns one sentence per problem. */
+async function removeProfile(userDataDir: string): Promise<string[]> {
+  const problems: string[] = [];
+  try {
+    await rm(userDataDir, { recursive: true, force: true });
+  } catch (error) {
+    problems.push(`removing the Chromium profile ${userDataDir} failed: ${describeError(error)}`);
+  }
+  try {
+    await lstat(userDataDir);
+    problems.push(`the Chromium profile ${userDataDir} still exists after its removal`);
+  } catch (error) {
+    if (errnoCode(error) !== 'ENOENT') {
+      problems.push(
+        `the Chromium profile ${userDataDir} could not be confirmed removed: ${describeError(error)}`,
+      );
+    }
+  }
+  return problems;
+}
+
 /**
  * Launch the persistent context with the unpacked extension — extensions load
  * only in a persistent context — and obtain its MV3 worker on whichever path
- * wins the race: already registered, or awaited.
+ * wins the race: already registered, or awaited. `dispose()` attempts the
+ * context close and the profile removal independently, verifies both (the
+ * context reported `close`, the profile directory is gone) and returns the
+ * problems; every error path of this function appends them to its own error.
  */
 async function launchExtension(
   configuredPath: string,
   options: BrowserOptions,
   workerInfo: WorkerInfo,
-): Promise<ExtensionHarness & { dispose(): Promise<void> }> {
+): Promise<ExtensionHarness & { dispose(): Promise<string[]> }> {
   const extensionPath = path.resolve(nonEmptyOption(configuredPath) ?? DEFAULT_EXTENSION_PATH);
   if (!existsSync(path.join(extensionPath, 'manifest.json'))) {
     throw new Error(
@@ -1516,13 +2842,32 @@ async function launchExtension(
       ...(viewport === undefined ? {} : { viewport }),
     });
   } catch (error) {
-    await rm(userDataDir, { recursive: true, force: true });
-    throw error;
+    throw errorWithProblems(
+      error,
+      'Removing the unused Chromium profile also failed',
+      await removeProfile(userDataDir),
+    );
   }
 
-  const disposeContext = async (): Promise<void> => {
-    await context.close().catch(() => undefined);
-    await rm(userDataDir, { recursive: true, force: true });
+  // Mutated from the event, so held in an object flow analysis does not narrow.
+  const lifecycle = { closed: false };
+  context.once('close', () => {
+    lifecycle.closed = true;
+  });
+  const disposeContext = async (): Promise<string[]> => {
+    const problems: string[] = [];
+    try {
+      await context.close();
+    } catch (error) {
+      problems.push(`closing the persistent Chromium context failed: ${describeError(error)}`);
+    }
+    if (!lifecycle.closed) {
+      problems.push(
+        'the persistent Chromium context never reported closing, so its browser process may still be running',
+      );
+    }
+    problems.push(...(await removeProfile(userDataDir)));
+    return problems;
   };
 
   let serviceWorker = context.serviceWorkers().find((candidate) => isExtensionUrl(candidate.url()));
@@ -1540,10 +2885,13 @@ async function launchExtension(
         .map((page) => page.url())
         .filter(isExtensionUrl)
         .map((url) => new URL(url).host);
-      await disposeContext();
-      throw new Error(
-        `The extension's MV3 service worker did not register within ${String(WORKER_READY_TIMEOUT_MS)} ms (extension path ${extensionPath}; extension id ${pageIds[0] ?? 'unresolved'}). Build the extension first with \`pnpm build\`; a manifest that loads but whose worker fails to evaluate shows up as this timeout. ${describeError(error)}`,
-        { cause: error },
+      throw errorWithProblems(
+        new Error(
+          `The extension's MV3 service worker did not register within ${String(WORKER_READY_TIMEOUT_MS)} ms (extension path ${extensionPath}; extension id ${pageIds[0] ?? 'unresolved'}). Build the extension first with \`pnpm build\`; a manifest that loads but whose worker fails to evaluate shows up as this timeout. ${describeError(error)}`,
+          { cause: error },
+        ),
+        'Disposing the Chromium context also failed',
+        await disposeContext(),
       );
     }
   }
@@ -1558,9 +2906,10 @@ async function launchExtension(
     extensionId = fromPage === undefined ? '' : new URL(fromPage).host;
   }
   if (extensionId === '') {
-    await disposeContext();
-    throw new Error(
-      `The extension id could not be read from the worker URL ${serviceWorker.url()}.`,
+    throw errorWithProblems(
+      new Error(`The extension id could not be read from the worker URL ${serviceWorker.url()}.`),
+      'Disposing the Chromium context also failed',
+      await disposeContext(),
     );
   }
 
@@ -1738,8 +3087,11 @@ interface DevtoolsEmulationArgs {
   readonly panelPath: string;
   /** `chrome.devtools.inspectedWindow.tabId`. */
   readonly inspectedTabId: number;
-  /** `chrome.devtools.panels.themeName`: `'default'` (light) or `'dark'`. */
-  readonly themeName: 'default' | 'dark';
+  /**
+   * `chrome.devtools.panels.themeName`. The panel maps `'dark'` (and DevTools'
+   * `'default'`) to its dark token set and `'light'` to its light one.
+   */
+  readonly themeName: 'dark' | 'light';
   /** The refusal `inspectedWindow.eval` reports. */
   readonly evalRefusal: string;
   /** The DevTools page's port name and `devtools.hello` frame, when the tab is announced. */
@@ -1754,7 +3106,9 @@ interface DevtoolsEmulationArgs {
  * `chrome.devtools` members `apps/chrome-extension/src/panel/**` reads —
  * `inspectedWindow.tabId` (`state/connection.ts` `readInspectedTabId`),
  * callback-form `inspectedWindow.eval` (`App.tsx`, element selection; refused
- * here) and `panels.themeName` (`theme.ts`) — so a panel change that needs
+ * here) and `panels.themeName` (`theme.ts`, which feature-detects the optional
+ * `panels.setThemeChangeHandler` left out here and re-reads `themeName` when
+ * the panel is shown instead) — so a panel change that needs
  * another DevTools API fails visibly instead of rendering empty. It then plays
  * the DevTools page (`src/devtools/devtools.ts`): opens the `PORT_DEVTOOLS`
  * port and sends `devtools.hello`, which is what makes the worker bind the
@@ -1846,22 +3200,41 @@ interface PanelLaunch {
   readonly initScripts: readonly string[];
 }
 
-/** Open the panel document as an extension page and wrap it in a {@link PanelHandle}. */
-async function openPanel(harness: ExtensionHarness, launch: PanelLaunch): Promise<PanelHandle> {
-  const page = await harness.context.newPage();
-  const errors: string[] = [];
-  page.on('console', (message) => {
-    if (message.type() === 'error') {
-      errors.push(`console.error: ${message.text()}`);
-    }
-  });
-  page.on('pageerror', (error) => {
-    errors.push(`uncaught ${error.name}: ${error.message}`);
-  });
+/**
+ * Close `page` and confirm it closed.
+ *
+ * @param label What the page is, for the diagnostic (for example `the panel page`).
+ * @returns The problem, or `undefined` when the page is closed.
+ */
+async function closePage(page: Page, label: string): Promise<string | undefined> {
+  try {
+    await page.close();
+  } catch (error) {
+    return `closing ${label} (${page.url()}) failed: ${describeError(error)}`;
+  }
+  return page.isClosed() ? undefined : `${label} (${page.url()}) is still open after page.close()`;
+}
 
+/** Close every page, attempting each one; returns one sentence per page that did not close. */
+async function closePages(pages: readonly Page[], label: string): Promise<string[]> {
+  const problems: string[] = [];
+  for (const page of pages) {
+    const problem = await closePage(page, label);
+    if (problem !== undefined) {
+      problems.push(problem);
+    }
+  }
+  return problems;
+}
+
+/** Install the requested init scripts in a fresh page and navigate it to the panel document. */
+async function preparePanelPage(
+  page: Page,
+  harness: ExtensionHarness,
+  launch: PanelLaunch,
+): Promise<void> {
   if (launch.installDevtoolsStub) {
     if (launch.inspectedTabId === undefined) {
-      await page.close();
       throw new Error('openPanelPage: the chrome.devtools stub needs an inspected tab id.');
     }
     const inspectedUrl = launch.inspectedUrl;
@@ -1869,7 +3242,7 @@ async function openPanel(harness: ExtensionHarness, launch: PanelLaunch): Promis
     const args: DevtoolsEmulationArgs = {
       panelPath: PANEL_DOCUMENT_PATH,
       inspectedTabId: launch.inspectedTabId,
-      themeName: launch.themeName === 'light' ? 'default' : 'dark',
+      themeName: launch.themeName,
       evalRefusal: DEVTOOLS_EVAL_REFUSAL,
       announce: launch.announceDevtools
         ? {
@@ -1893,8 +3266,35 @@ async function openPanel(harness: ExtensionHarness, launch: PanelLaunch): Promis
   for (const content of launch.initScripts) {
     await page.addInitScript({ content });
   }
-  const panelUrl = `chrome-extension://${harness.extensionId}${PANEL_DOCUMENT_PATH}`;
-  await page.goto(panelUrl);
+  await page.goto(`chrome-extension://${harness.extensionId}${PANEL_DOCUMENT_PATH}`);
+}
+
+/**
+ * Open the panel document as an extension page and wrap it in a
+ * {@link PanelHandle}. A page whose setup failed is closed before the error
+ * is rethrown, a failed close appended to it.
+ */
+async function openPanel(harness: ExtensionHarness, launch: PanelLaunch): Promise<PanelHandle> {
+  const page = await harness.context.newPage();
+  const errors: string[] = [];
+  page.on('console', (message) => {
+    if (message.type() === 'error') {
+      errors.push(`console.error: ${message.text()}`);
+    }
+  });
+  page.on('pageerror', (error) => {
+    errors.push(`uncaught ${error.name}: ${error.message}`);
+  });
+
+  try {
+    await preparePanelPage(page, harness, launch);
+  } catch (error) {
+    throw errorWithProblems(
+      error,
+      'Closing the panel page after that failure also failed',
+      await closePages([page], 'the panel page'),
+    );
+  }
 
   const header = page.getByRole('banner');
   const labelPattern = new RegExp(
@@ -2045,7 +3445,7 @@ function createPairing(harness: ExtensionHarness, service: ServiceHandle): Pairi
       announceDevtools: false,
       initScripts: [],
     });
-    try {
+    const pairThroughPanel = async (): Promise<void> => {
       // Let the pill settle: a stored credential either connects, or is
       // refused by the service (a rotated token, a fresh DEBUGGEN_HOME) and
       // cleared by the worker, which shows as "not paired".
@@ -2071,7 +3471,7 @@ function createPairing(harness: ExtensionHarness, service: ServiceHandle): Pairi
       if (!(await panel.pairDialog.isVisible())) {
         await panel.header.locator('button[aria-haspopup="dialog"]').click();
       }
-      const codeInput = panel.pairDialog.getByRole('textbox');
+      const codeInput = panel.pairDialog.getByRole('textbox', { name: PANEL_NAMES.pairingCode });
       await codeInput.fill(code);
       await codeInput.press('Enter');
 
@@ -2098,8 +3498,27 @@ function createPairing(harness: ExtensionHarness, service: ServiceHandle): Pairi
           `The panel reports "${PANEL_CONNECTION_LABELS.connected}" but no devtools credential is stored under ${DEVTOOLS_TOKEN_STORAGE_KEY}.`,
         );
       }
-    } finally {
-      await panel.page.close().catch(() => undefined);
+    };
+
+    // Every outcome closes the panel page; a close that fails is never dropped.
+    let failure: { readonly error: unknown } | undefined;
+    try {
+      await pairThroughPanel();
+    } catch (error) {
+      failure = { error };
+    }
+    const closeProblems = await closePages([panel.page], 'the pairing panel page');
+    if (failure !== undefined) {
+      throw errorWithProblems(
+        failure.error,
+        'Closing the pairing panel page also failed',
+        closeProblems,
+      );
+    }
+    if (closeProblems.length > 0) {
+      throw new Error(
+        `Pairing succeeded, but its panel page could not be closed:\n${formatProblems(closeProblems)}`,
+      );
     }
   };
 
@@ -2139,6 +3558,22 @@ function createPairing(harness: ExtensionHarness, service: ServiceHandle): Pairi
 
 const TERMINAL_STATUSES: readonly SessionStatus[] = ['ended', 'failed'];
 
+/** The protocol code of a `409` answered while another operation of the session is still settling. */
+const SESSION_INVALID_STATE_CODE = 'SESSION_INVALID_STATE';
+
+/** The protocol code of a session the service does not know. */
+const SESSION_NOT_FOUND_CODE = 'SESSION_NOT_FOUND';
+
+/**
+ * Build the test-scoped session helper. Its `dispose()` mirrors
+ * `SessionTracker.endAll` in `tests/e2e/helpers/session.ts`: newest session
+ * first, each one read, its open capture stopped, ended (a
+ * `SESSION_INVALID_STATE` answer retried within {@link SESSION_END_SETTLE_MS})
+ * and its cleanup required to be `clean`; an already-ended session's stored
+ * cleanup is checked the same way. It never throws — it returns one sentence
+ * per problem, including those recorded while the test ran — and the
+ * `sessions` fixture hands them to {@link settleTestTeardown}.
+ */
 function createSessionHelper(
   service: ServiceHandle,
   editor: EditorClient,
@@ -2146,6 +3581,92 @@ function createSessionHelper(
 ): SessionHelper & { dispose(): Promise<string[]> } {
   const createdIds: string[] = [];
   const ended = new Set<string>();
+  /** Problems found while the test ran (a failed stop after a failed action, a non-clean end); reported by `dispose()`. */
+  const recorded: string[] = [];
+
+  const conflictCount = (count: number): string => `${String(count)} conflict(s)`;
+
+  /** The conflict count the service stored for `id`, or why it could not be read. */
+  const conflictsOf = async (id: string): Promise<string> => {
+    try {
+      return conflictCount((await service.getSession(id)).cleanup.conflicts.length);
+    } catch (error) {
+      return `conflict count unreadable: ${describeError(error)}`;
+    }
+  };
+
+  const uncleanEnd = (id: string, status: CleanupStatus, conflicts: string, when: string): string =>
+    `session ${id} ${when} with cleanup "${status}" (${conflicts}) — instrumentation may remain in ${fixtureApp.projectRoot}`;
+
+  /** `session.end` for teardown: bounded, retrying `SESSION_INVALID_STATE` while another operation settles. */
+  const endSettled = async (id: string): Promise<CleanupStatus> => {
+    const settleUntil = Date.now() + SESSION_END_SETTLE_MS;
+    for (;;) {
+      const result = await service.call('session.end', {
+        params: { id },
+        body: {},
+        timeoutMs: SESSION_END_TIMEOUT_MS,
+      });
+      if (result.ok) {
+        return result.value.cleanup;
+      }
+      if (result.error.code !== SESSION_INVALID_STATE_CODE) {
+        throw new ServiceCallError('session.end', result.error);
+      }
+      if (Date.now() >= settleUntil) {
+        throw new Error(
+          `the service still answered ${SESSION_INVALID_STATE_CODE} (another operation of the session settling) after ${String(SESSION_END_SETTLE_MS)} ms: ${new ServiceCallError('session.end', result.error).message}`,
+        );
+      }
+      await delay(POLL_INTERVAL_MS);
+    }
+  };
+
+  /** Bring one session this helper created to `ended` with a clean cleanup; returns what went wrong. */
+  const settleSession = async (id: string): Promise<string[]> => {
+    const problems: string[] = [];
+    let record: SessionRecord | undefined;
+    try {
+      record = await service.getSession(id);
+    } catch (error) {
+      if (error instanceof ServiceCallError && error.code === SESSION_NOT_FOUND_CODE) {
+        return [`session ${id} is unknown to the service, so its cleanup cannot be confirmed`];
+      }
+      // Still attempt the end below: an unreadable session may yet be endable.
+      problems.push(`session ${id}: reading it before teardown failed: ${describeError(error)}`);
+    }
+    if (record?.status === 'ended') {
+      if (record.cleanup.status !== 'clean') {
+        problems.push(
+          uncleanEnd(
+            id,
+            record.cleanup.status,
+            conflictCount(record.cleanup.conflicts.length),
+            'had already ended',
+          ),
+        );
+      }
+      return problems;
+    }
+    if (record?.status === 'capturing') {
+      try {
+        await service.stopCapture(id);
+      } catch (error) {
+        problems.push(
+          `session ${id}: stopping its open capture in teardown failed: ${describeError(error)}`,
+        );
+      }
+    }
+    try {
+      const cleanup = await endSettled(id);
+      if (cleanup !== 'clean') {
+        problems.push(uncleanEnd(id, cleanup, await conflictsOf(id), 'ended in teardown'));
+      }
+    } catch (error) {
+      problems.push(`session ${id} could not be ended in teardown: ${describeError(error)}`);
+    }
+    return problems;
+  };
 
   /** The newest status the editor connection reported for `id`, if any. */
   const pushedStatus = (id: string): SessionRecord | undefined => {
@@ -2201,6 +3722,14 @@ function createSessionHelper(
 
   return {
     async create(question, options) {
+      if (fixtureApp.servedBy === 'fixture-process') {
+        // The service learns a dev server only from its launcher (or an earlier
+        // session of the same root), so it cannot attribute this worker's
+        // spawned server and would answer DEV_SERVER_UNAVAILABLE.
+        throw new Error(
+          `sessions.create() cannot create a session: the service at ${service.baseUrl} does not serve POST /dev-server/launch, so this worker spawned the fixture app on ${fixtureApp.baseUrl} itself, and the service cannot attribute that dev server to ${fixtureApp.projectRoot}. Rebuild and restart the service (\`pnpm build\`) so it serves POST /dev-server/launch.`,
+        );
+      }
       await fixtureApp.ensureServing();
       const record = await service.createSession({
         projectRoot: fixtureApp.projectRoot,
@@ -2219,7 +3748,15 @@ function createSessionHelper(
         await action();
         await delay(options?.settleMs ?? CAPTURE_SETTLE_MS);
       } catch (error) {
-        await service.stopCapture(id).catch(() => undefined);
+        // The action's error is the one the test reports; a stop that fails
+        // now is a leaked capture, recorded for teardown rather than dropped.
+        try {
+          await service.stopCapture(id);
+        } catch (stopError) {
+          recorded.push(
+            `session ${id}: capture ${captureId} could not be stopped after the interaction failed: ${describeError(stopError)}`,
+          );
+        }
         throw error;
       }
       const stopped = await service.stopCapture(id);
@@ -2228,27 +3765,21 @@ function createSessionHelper(
     async end(id) {
       const result = await service.endSession(id);
       ended.add(id);
+      if (result.cleanup !== 'clean') {
+        recorded.push(uncleanEnd(id, result.cleanup, await conflictsOf(id), 'ended'));
+      }
       return result;
     },
     created: () => [...createdIds],
     async dispose() {
-      const problems: string[] = [];
-      for (const id of createdIds) {
+      const problems = recorded.splice(0, recorded.length);
+      for (const id of [...createdIds].reverse()) {
         if (ended.has(id)) {
           continue;
         }
-        try {
-          const record = await service.getSession(id);
-          if (record.status === 'capturing') {
-            await service.stopCapture(id).catch(() => undefined);
-          }
-          if (record.status !== 'ended') {
-            await service.endSession(id);
-          }
-          ended.add(id);
-        } catch (error) {
-          problems.push(`session ${id}: ${describeError(error)}`);
-        }
+        problems.push(...(await settleSession(id)));
+        // Settled either way: a second dispose() must not end it again.
+        ended.add(id);
       }
       return problems;
     },
@@ -2295,16 +3826,6 @@ export interface TestFixtures {
   _hygiene: undefined;
 }
 
-/** Record a teardown problem on the test instead of throwing over its own result. */
-function reportTeardown(
-  testInfo: { annotations: { type: string; description?: string }[] },
-  problems: readonly string[],
-): void {
-  for (const description of problems) {
-    testInfo.annotations.push({ type: 'fixture-teardown', description });
-  }
-}
-
 export const test = base.extend<TestFixtures, WorkerFixtures>({
   // Options the Playwright config's `use` block supplies (`DebuggenTestOptions`).
   extensionPath: ['', { option: true, scope: 'worker' }],
@@ -2322,7 +3843,8 @@ export const test = base.extend<TestFixtures, WorkerFixtures>({
       try {
         await use(harness);
       } finally {
-        await harness.dispose();
+        // A Chromium that would not close or a profile left behind fails the run.
+        throwIfProblems('_extension', await harness.dispose());
       }
     },
     { scope: 'worker', timeout: 60_000 },
@@ -2369,13 +3891,23 @@ export const test = base.extend<TestFixtures, WorkerFixtures>({
       try {
         await use(state.handle);
       } finally {
-        const problems = await state.dispose();
-        for (const problem of problems) {
-          process.stderr.write(`[tests/browser/fixtures] fixture app teardown: ${problem}\n`);
-        }
+        // A leaked server, port or copy fails the run as a worker teardown error.
+        throwIfProblems('fixtureApp', await state.dispose());
       }
     },
-    { scope: 'worker', timeout: INSTALL_TIMEOUT_MS + APP_READY_TIMEOUT_MS * 2 },
+    {
+      scope: 'worker',
+      // Identification of the configured origin (`/` and the ping), that of
+      // every alternate-port candidate when it is occupied, the install, the
+      // launch, the first answer and the launcher probe, each at its own bound.
+      timeout:
+        IDENTIFY_TIMEOUT_MS * 2 +
+        ALTERNATE_PORT_ATTEMPTS * IDENTIFY_TIMEOUT_MS * 2 +
+        INSTALL_TIMEOUT_MS +
+        APP_READY_TIMEOUT_MS * 2 +
+        ANNOUNCEMENT_SETTLE_MS +
+        ROUTE_PROBE_TIMEOUT_MS,
+    },
   ],
 
   pairing: [
@@ -2385,19 +3917,24 @@ export const test = base.extend<TestFixtures, WorkerFixtures>({
     { scope: 'worker' },
   ],
 
-  appPage: async ({ extensionContext, fixtureApp }, use) => {
+  appPage: async ({ extensionContext, fixtureApp }, use, testInfo) => {
     const page = await extensionContext.newPage();
     try {
       await page.goto(new URL('/', fixtureApp.baseUrl).toString(), {
         timeout: APP_READY_TIMEOUT_MS,
       });
-      await use(page);
-    } finally {
-      await page.close().catch(() => undefined);
+    } catch (error) {
+      throw errorWithProblems(
+        error,
+        'Closing the fixture app tab also failed',
+        await closePages([page], 'the fixture app tab'),
+      );
     }
+    await use(page);
+    settleTestTeardown(testInfo, 'appPage', await closePages([page], 'the fixture app tab'));
   },
 
-  openPanelPage: async ({ _extension, appPage }, use) => {
+  openPanelPage: async ({ _extension, appPage }, use, testInfo) => {
     const opened: PanelHandle[] = [];
     await use(async (options) => {
       const inspect = options?.inspect ?? appPage;
@@ -2416,9 +3953,14 @@ export const test = base.extend<TestFixtures, WorkerFixtures>({
       opened.push(handle);
       return handle;
     });
-    for (const handle of opened) {
-      await handle.page.close().catch(() => undefined);
-    }
+    settleTestTeardown(
+      testInfo,
+      'openPanelPage',
+      await closePages(
+        opened.map((handle) => handle.page),
+        'a panel page',
+      ),
+    );
   },
 
   editorClient: async ({ service, fixtureApp }, use) => {
@@ -2434,7 +3976,7 @@ export const test = base.extend<TestFixtures, WorkerFixtures>({
   sessions: async ({ service, editorClient, fixtureApp }, use, testInfo) => {
     const helper = createSessionHelper(service, editorClient, fixtureApp);
     await use(helper);
-    reportTeardown(testInfo, await helper.dispose());
+    settleTestTeardown(testInfo, 'sessions', await helper.dispose());
   },
 
   resetExtensionState: async ({ _extension }, use) => {
@@ -2444,11 +3986,13 @@ export const test = base.extend<TestFixtures, WorkerFixtures>({
   _hygiene: [
     async ({ _extension }, use, testInfo) => {
       await use(undefined);
+      const problems: string[] = [];
       try {
         await clearBindings(_extension);
       } catch (error) {
-        reportTeardown(testInfo, [`binding reset: ${describeError(error)}`]);
+        problems.push(`binding reset: ${describeError(error)}`);
       }
+      settleTestTeardown(testInfo, '_hygiene', problems);
     },
     { auto: true },
   ],

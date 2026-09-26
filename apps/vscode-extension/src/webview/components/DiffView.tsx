@@ -1,7 +1,7 @@
 /**
  * The unified diff of one instrumentation modification, as the "Debug
  * Generator" view shows it under `ModificationsList`'s "View diff" control
- * (AAP 0.7.3).
+ * ("Open diff" on a conflict row) (AAP 0.7.3, 0.5.5).
  *
  * This is the on-screen half of a product guarantee: every file the tool edits
  * is recorded, and the record - including the unified diff the patcher journaled
@@ -10,8 +10,10 @@
  * the developer reads here is exactly the `diff` string the service recorded:
  *
  *   - nothing is trimmed, re-indented, collapsed, highlighted, numbered or
- *     truncated - each line's bytes reach the `Code` primitive untouched, and
- *     `Code` is byte-faithful by contract;
+ *     silently truncated - each line's bytes reach the `Code` primitive
+ *     untouched, and `Code` is byte-faithful by contract; a long diff is
+ *     shown through a stated, movable window (see "Long diffs" below), never
+ *     cut;
  *   - a line wider than the view scrolls horizontally, it never wraps and never
  *     ends in an ellipsis, because a clipped diff line is a misrepresented one;
  *   - the only transformation is presentational: a `+`, `-` or single-space
@@ -34,6 +36,30 @@
  * truncation notice - goes through {@link classifyDiffLine}. The two agree on
  * every line of a well-formed diff that does not carry that ambiguity.
  *
+ * ## Long diffs - a bounded window over every line
+ *
+ * A recorded diff may be up to 2 MiB, which can be tens of thousands of short
+ * lines, and this view lives in a retained editor webview. Two bounds keep it
+ * responsive without hiding anything:
+ *
+ *   - the diff is parsed into rows once per `diff` string (`useMemo`), and each
+ *     row renders through a memoized component, so a re-render re-parses
+ *     nothing and re-renders no row that is already on screen;
+ *   - at most {@link DIFF_LINE_BATCH} rows are ever mounted. A longer diff is
+ *     shown as a window of that many consecutive lines, and the header strip
+ *     states exactly which ones - "Showing lines 1,001–2,000 of 2,503." -
+ *     beside "Show previous ‹n› lines" and "Show next ‹n› lines" controls that
+ *     move the window one batch at a time. Every line of the diff is reachable
+ *     in place, and however far the reader pages, the mounted row count - and
+ *     so the cost of any render - never exceeds one batch. Classification is
+ *     computed over the whole diff before the window is cut, so a window that
+ *     starts inside a hunk still colours its lines correctly. A different
+ *     `diff` starts again at its first window.
+ *
+ * When the window reaches either end, the control that led there disappears
+ * and focus moves to the lines themselves, so a keyboard user is never left on
+ * the document body.
+ *
  * ## States (AAP 0.5.5 - never a blank area)
  *
  * Fixed precedence, highest first: `error` > `pending` > empty > the diff.
@@ -48,13 +74,21 @@
  * Class names only, all declared in `../styles.css` in the `dgv-diff` block,
  * every value there a `--dg-*` token (AAP 0.6.4); no inline style. The marker
  * column is what keeps colour from being the only carrier of meaning: `+` and
- * `-` stay visible beside the success/danger text. The scroll container is a
- * named, focusable group so a keyboard user can scroll a wide line into view -
- * a Tab stop by default, or `tabIndex={-1}` through `scrollTabIndex` when the
- * owner's composite widget reaches it by other keys; the focus ring is the
- * design system's own `:focus-visible` rule. The line list is prose-like
- * content, not a grid, so it carries no table roles, and no heading is emitted
- * - the surrounding outline belongs to `ModificationsList`.
+ * `-` stay visible beside the success/danger text.
+ *
+ * The lines sit in a `<pre>`, the element for preformatted text whose
+ * whitespace is significant, exposed as a named `region` ("Diff of ‹file›")
+ * and focusable so a keyboard user can scroll a wide line into view. Each row
+ * is a `span` - phrasing content, as a `<pre>` requires - and a line break
+ * text node separates consecutive rows, so the region's text is the diff's
+ * lines exactly. The `<pre>` and the window controls are Tab stops by
+ * default, or all `tabIndex={-1}` through `innerTabIndex` when the owner's
+ * composite widget reaches them by its own keys; the focus ring is the design
+ * system's own `:focus-visible` rule. The window controls precede the `<pre>`
+ * in document order, so an owner that walks its controls with the arrow keys
+ * reaches them before the horizontally scrolling region keeps those keys. The
+ * line list carries no table roles, and no heading is emitted - the
+ * surrounding outline belongs to `ModificationsList`.
  *
  * ## Privacy
  *
@@ -65,7 +99,16 @@
  * @module apps/vscode-extension/src/webview/components/DiffView
  */
 
-import { Code, EmptyState, ErrorState, LoadingState, Text } from '@debuggen/panel-renderer';
+import {
+  Button,
+  Code,
+  EmptyState,
+  ErrorState,
+  LoadingState,
+  Stack,
+  Text,
+} from '@debuggen/panel-renderer';
+import { Fragment, memo, useEffect, useId, useMemo, useRef, useState } from 'react';
 import type { ReactElement } from 'react';
 
 /**
@@ -110,13 +153,17 @@ export interface DiffViewProps {
   error?: string | undefined;
 
   /**
-   * The `tabIndex` of the focusable scroll region. Defaults to `0`, a Tab stop
-   * of its own. An owner that renders the diff inside a composite widget which
+   * The `tabIndex` of every focusable element this component renders: the
+   * diff's scroll region and, for a diff longer than {@link DIFF_LINE_BATCH}
+   * lines, the controls that move its window. Defaults to `0`, a Tab
+   * stop each. An owner that renders the diff inside a composite widget which
    * manages focus itself passes `-1`: `ModificationsList` does, because its
-   * `DataTable` is a single Tab stop whose arrow keys reach every control in
-   * an open detail row, and the region stays focusable that way.
+   * `DataTable` requires every control in a detail row to be `tabIndex={-1}` -
+   * the grid is a single Tab stop whose arrow keys reach each of them from the
+   * row, so both stay keyboard-reachable under the table's own navigation
+   * model.
    */
-  scrollTabIndex?: 0 | -1 | undefined;
+  innerTabIndex?: 0 | -1 | undefined;
 
   /** Extra class names for the root element, applied in every state. */
   className?: string | undefined;
@@ -214,6 +261,80 @@ const LOADING_LABEL = 'Loading diff';
 
 /** The scroll region's accessible name when no file label is supplied. */
 const REGION_NAME = 'Diff';
+
+/** The text node between two rows of the `<pre>` (see {@link DiffLines}). */
+const LINE_BREAK = '\n';
+
+/**
+ * The header strip above the lines (`.dgv-diff__file` in `../styles.css`): the
+ * file label and, for a long diff, the window notice and its controls. The
+ * strip is inset to the lines' own padding and ruled off from them.
+ */
+const HEADER_CLASS = 'dgv-diff__file';
+
+/**
+ * The most diff lines ever mounted at once: the size of the window a long diff
+ * is shown through, and the step the window moves by (see the module header).
+ *
+ * A recorded diff may be up to 2 MiB, which can be tens of thousands of short
+ * lines; mounting every one - three elements per line - would stall the
+ * retained editor webview, and so would letting revealed lines accumulate. An
+ * instrumentation patch is normally a handful of hunks, so a typical diff
+ * still renders whole in one window, while the worst case stays bounded to
+ * this many mounted rows however far the reader pages.
+ */
+export const DIFF_LINE_BATCH = 1000;
+
+/** Formats line counts in the reader's own locale - the webview's, which is the editor's. */
+const COUNT_FORMAT = new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 });
+
+/**
+ * A count of lines as words, singular for exactly one.
+ *
+ * @param count A non-negative whole number of lines.
+ * @returns The formatted count with `line` or `lines`.
+ */
+function formatLines(count: number): string {
+  return `${COUNT_FORMAT.format(count)} ${count === 1 ? 'line' : 'lines'}`;
+}
+
+/**
+ * The notice that states which lines of a long diff are on screen, e.g.
+ * "Showing lines 1,001–2,000 of 2,503." - nothing is ever out of view without
+ * saying so. Line numbers are 1-based positions in the recorded diff.
+ *
+ * @param first The 1-based position of the window's first line.
+ * @param last The 1-based position of the window's last line.
+ * @param total How many lines the diff has.
+ * @returns The sentence.
+ */
+function windowNotice(first: number, last: number, total: number): string {
+  return `Showing lines ${COUNT_FORMAT.format(first)}–${COUNT_FORMAT.format(last)} of ${COUNT_FORMAT.format(total)}.`;
+}
+
+/** The backward control's text, e.g. "Show previous 1,000 lines". */
+function showPreviousLabel(count: number): string {
+  return `Show previous ${formatLines(count)}`;
+}
+
+/** The forward control's text, e.g. "Show next 1,000 lines". */
+function showNextLabel(count: number): string {
+  return `Show next ${formatLines(count)}`;
+}
+
+/**
+ * Where the reader's window starts, and for which diff. Keyed by the diff
+ * itself, so a position chosen in one diff never applies to the next: when the
+ * `diff` prop changes, the stored position no longer matches and the view is
+ * back at the first window, with no effect or second render needed to reset
+ * it.
+ */
+interface WindowState {
+  /** The diff the position was chosen in. */
+  readonly diff: string;
+  /** The 0-based index of the window's first row, a multiple of the batch. */
+  readonly start: number;
+}
 
 /** Row class per kind, total over the union so a new kind is a compile error. */
 const LINE_CLASS: Readonly<Record<DiffLineKind, string>> = {
@@ -317,38 +438,181 @@ function toRows(diff: string): DiffRow[] {
   return rows;
 }
 
-/** The scroll region holding one row per diff line. */
+/**
+ * One diff line: the marker column and the text column inside a `span`, so the
+ * row is phrasing content of the `<pre>` around it. Its text content is the
+ * recorded line exactly - `marker + text`, with no terminator; the line break
+ * between rows is a separate text node owned by {@link DiffLines}.
+ *
+ * Memoized on its row object. The rows of one diff are parsed once and keep
+ * their identity, so any re-render of the owner re-renders none of the rows
+ * already on screen; moving a long diff's window mounts only its new rows.
+ */
+const DiffLine = memo(function DiffLine(props: { readonly row: DiffRow }): ReactElement {
+  const { row } = props;
+
+  return (
+    <span className={LINE_CLASS[row.kind]}>
+      {row.marker === '' ? (
+        <span className="dgv-diff__marker" aria-hidden="true" />
+      ) : (
+        <Code size="sm" className="dgv-diff__marker">
+          {row.marker}
+        </Code>
+      )}
+      <Code size="sm" className="dgv-diff__text">
+        {row.text}
+      </Code>
+    </span>
+  );
+});
+
+/**
+ * The labelled, focusable `<pre>` region holding the diff's rows, below the
+ * header strip: the file label and - for a diff longer than
+ * {@link DIFF_LINE_BATCH} lines - the notice that says which lines are shown,
+ * with the controls that move the window. The notice lives in that strip so it
+ * is inset to the lines' padding by the strip's own rule in `../styles.css`.
+ *
+ * A `<pre>` because the content is preformatted text whose whitespace is
+ * meaningful, and a named `region` so assistive technology announces it as the
+ * diff of its file and a keyboard user can focus it to scroll a wide line into
+ * view. A `'\n'` text node sits between consecutive rows, so the element's
+ * text content is the rendered lines joined by line breaks - an unstyled
+ * render, a copy or a reader's text view still shows one line per row. The
+ * stylesheet lays the rows out as a single-column grid, and whitespace-only
+ * text between grid items is not rendered, so the separators add no height.
+ *
+ * The diff is parsed once per `diff` string, and at most
+ * {@link DIFF_LINE_BATCH} of its rows are mounted, as one window:
+ *
+ * - The first window mounts on open. "Show next ‹n› lines" and "Show previous
+ *   ‹n› lines" move the window one batch forward or back, replacing its rows,
+ *   so the mounted count never grows past one batch however far the reader
+ *   pages. The notice names the window's first and last line and the total.
+ * - The notice and its controls come BEFORE the `<pre>` in document order. The
+ *   region scrolls horizontally, and a composite owner such as `DataTable`
+ *   leaves a horizontally scrolling element its ArrowLeft/ArrowRight/Home/End,
+ *   so a control placed after it could not be reached by those keys. The
+ *   region is described by the notice, so assistive technology announces
+ *   which lines it holds, and the notice is a polite live region, so a move
+ *   of the window is announced while focus stays on the control.
+ * - A control that has led to the end it points at unmounts. Focus is then
+ *   moved to the `<pre>` - the lines the reader just brought into view - so a
+ *   keyboard user is not dropped onto the document body.
+ * - A different `diff` starts again at its first window (see
+ *   {@link WindowState}).
+ */
 function DiffLines(props: {
   readonly diff: string;
+  readonly label: string | undefined;
   readonly name: string;
   readonly tabIndex: 0 | -1;
 }): ReactElement {
-  const rows = toRows(props.diff);
+  const { diff, label, name, tabIndex } = props;
+
+  // Hooks before any branch, as they must be. Parsing is a pass over up to
+  // 2 MiB of text, so it runs once per diff, not once per render.
+  const rows = useMemo(() => toRows(diff), [diff]);
+  const [view, setView] = useState<WindowState>(() => ({ diff, start: 0 }));
+  const regionRef = useRef<HTMLPreElement>(null);
+  const noticeId = useId();
+
+  // Set by a window control whose activation reaches the end it points at, so
+  // that control unmounts; read once by the effect below after that render has
+  // committed.
+  const focusRegionAfterMoveRef = useRef(false);
+
+  const total = rows.length;
+  // The stored position applies only to the diff it was chosen in, and only
+  // while it still names a row of it.
+  const requested = view.diff === diff ? view.start : 0;
+  const start = requested < total ? requested : 0;
+  const end = Math.min(total, start + DIFF_LINE_BATCH);
+  const before = start;
+  const after = total - end;
+  const windowed = before > 0 || after > 0;
+
+  useEffect(() => {
+    if (focusRegionAfterMoveRef.current) {
+      focusRegionAfterMoveRef.current = false;
+      // The region sits directly under the controls, so its top is already on
+      // screen; not scrolling keeps the reader where they were.
+      regionRef.current?.focus({ preventScroll: true });
+    }
+  }, [start]);
+
+  const moveTo = (nextStart: number): void => {
+    const nextEnd = Math.min(total, nextStart + DIFF_LINE_BATCH);
+    // The control just used disappears when the window reaches its end.
+    focusRegionAfterMoveRef.current = nextStart === 0 || nextEnd === total;
+    setView({ diff, start: nextStart });
+  };
+
+  const handleShowPrevious = (): void => {
+    moveTo(Math.max(0, start - DIFF_LINE_BATCH));
+  };
+
+  const handleShowNext = (): void => {
+    moveTo(end);
+  };
+
+  const shown = windowed ? rows.slice(start, end) : rows;
+
+  const notice = windowed ? (
+    <Stack direction="horizontal" gap={2} wrap align="center">
+      <Text size="xs" tone="secondary" id={noticeId} aria-live="polite">
+        {windowNotice(start + 1, end, total)}
+      </Text>
+      {before === 0 ? null : (
+        <Button variant="ghost" size="sm" tabIndex={tabIndex} onClick={handleShowPrevious}>
+          {showPreviousLabel(Math.min(DIFF_LINE_BATCH, before))}
+        </Button>
+      )}
+      {after === 0 ? null : (
+        <Button variant="ghost" size="sm" tabIndex={tabIndex} onClick={handleShowNext}>
+          {showNextLabel(Math.min(DIFF_LINE_BATCH, after))}
+        </Button>
+      )}
+    </Stack>
+  ) : null;
 
   return (
-    <div
-      className="dgv-diff__scroll"
-      role="group"
-      aria-label={props.name}
-      tabIndex={props.tabIndex}
-    >
-      {rows.map((row, index) => (
-        // Lines repeat and never reorder within one diff, so the position is
-        // the stable identity; a different diff remounts the whole list.
-        <div key={index} className={LINE_CLASS[row.kind]}>
-          {row.marker === '' ? (
-            <span className="dgv-diff__marker" aria-hidden="true" />
+    <>
+      {label === undefined && notice === null ? null : (
+        // The header strip above the lines: the file label, and for a long diff
+        // the notice with its window controls beneath it, inset to the lines'
+        // own padding and ruled off from them by the strip's subtle border.
+        <Text as="div" size="sm" tone="secondary" className={HEADER_CLASS}>
+          {notice === null ? (
+            <Code size="sm">{label}</Code>
           ) : (
-            <Code size="sm" className="dgv-diff__marker">
-              {row.marker}
-            </Code>
+            <Stack gap={1} align="start">
+              {label === undefined ? null : <Code size="sm">{label}</Code>}
+              {notice}
+            </Stack>
           )}
-          <Code size="sm" className="dgv-diff__text">
-            {row.text}
-          </Code>
-        </div>
-      ))}
-    </div>
+        </Text>
+      )}
+      <pre
+        ref={regionRef}
+        className="dgv-diff__scroll"
+        role="region"
+        aria-label={name}
+        aria-describedby={windowed ? noticeId : undefined}
+        tabIndex={tabIndex}
+      >
+        {shown.map((row, offset) => (
+          // Lines repeat and never reorder within one diff, so the position in
+          // the diff is the stable identity: a re-render keeps every mounted
+          // row, and moving the window replaces rows rather than relabelling.
+          <Fragment key={start + offset}>
+            {offset === 0 ? null : LINE_BREAK}
+            <DiffLine row={row} />
+          </Fragment>
+        ))}
+      </pre>
+    </>
   );
 }
 
@@ -356,17 +620,19 @@ function DiffLines(props: {
  * Renders the unified diff of one modification, or the state that stands in
  * for it.
  *
- * Stateless and side-effect free: props in, markup out. The owner decides which
- * record is expanded and supplies its diff; nothing here fetches, subscribes or
- * remembers.
+ * Presentational: the owner decides which record is expanded and supplies its
+ * diff; nothing here fetches, subscribes or logs. The only local state is
+ * presentation of the diff state - which window of a long diff the reader is
+ * looking through - and the only effect moves focus onto the lines once a
+ * window control has led to the end it points at (see {@link DiffLines}).
  *
  * @param props See {@link DiffViewProps}.
  * @returns One root element carrying `dgv-diff` and `props.className`, holding
- *   the error, loading or empty state, or the optional file label and the
- *   diff's lines.
+ *   the error, loading or empty state, or the optional file label, the
+ *   long-diff notice when there is one, and the diff's lines.
  */
 export function DiffView(props: DiffViewProps): ReactElement {
-  const { diff, fileLabel, pending = false, error, scrollTabIndex = 0, className } = props;
+  const { diff, fileLabel, pending = false, error, innerTabIndex = 0, className } = props;
   const label = hasText(fileLabel) ? fileLabel : undefined;
   const failed = hasText(error);
 
@@ -389,29 +655,33 @@ export function DiffView(props: DiffViewProps): ReactElement {
     );
   }
 
-  let body: ReactElement;
-  if (pending) {
-    body = <LoadingState variant="rows" label={LOADING_LABEL} />;
-  } else if (diff.trim() === '') {
-    body = <EmptyState message={EMPTY_MESSAGE} />;
-  } else {
-    body = (
-      <DiffLines
-        diff={diff}
-        name={label === undefined ? REGION_NAME : `Diff of ${label}`}
-        tabIndex={scrollTabIndex}
-      />
+  if (!pending && diff.trim() !== '') {
+    // The data state: `DiffLines` draws the header strip itself, because for a
+    // long diff that strip also carries the window notice it owns.
+    return (
+      <div className={rootClass}>
+        <DiffLines
+          diff={diff}
+          label={label}
+          name={label === undefined ? REGION_NAME : `Diff of ${label}`}
+          tabIndex={innerTabIndex}
+        />
+      </div>
     );
   }
 
   return (
     <div className={rootClass}>
       {label === undefined ? null : (
-        <Text as="div" size="sm" tone="secondary" className="dgv-diff__file">
+        <Text as="div" size="sm" tone="secondary" className={HEADER_CLASS}>
           <Code size="sm">{label}</Code>
         </Text>
       )}
-      {body}
+      {pending ? (
+        <LoadingState variant="rows" label={LOADING_LABEL} />
+      ) : (
+        <EmptyState message={EMPTY_MESSAGE} />
+      )}
     </div>
   );
 }

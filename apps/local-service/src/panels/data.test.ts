@@ -21,9 +21,22 @@
  * 4. **Push-down.** Every filter field reaches the store read itself, which the
  *    fake store records, so a resolver that loaded a capture whole and filtered
  *    it afterwards fails.
- * 5. **Scope.** One capture is read — the named one, else the open one, else
- *    the latest — never a capture of another session and never two at once.
- * 6. **Failure, privacy and purity.** A store failure is a typed `Err`, a
+ * 5. **Scope.** One capture is read — the rendered panel's, else the named one,
+ *    else the open one, else the latest — never a capture of another session
+ *    and never two at once; a panel whose capture was purged reads nothing.
+ * 6. **Completeness.** An aggregate is computed from every event of its slice,
+ *    past the 50 000 events the resolver once stopped at, each slice being one
+ *    scan rather than a page walk; a slice above the ceiling, or a scan that
+ *    contradicts its own count, is refused rather than answered from part of
+ *    it; a summary is served only when it accounts for every stored event.
+ * 7. **The trace source.** The default trace is read directly, the filter keeps
+ *    matches and their ancestors, and every answer is held to the node budget.
+ * 8. **The aggregate cache.** One traversal of a capture serves every
+ *    aggregate source of one filter; the result is kept while the capture's
+ *    generation stands — a hit reads the generation and nothing else — and
+ *    recomputed as soon as it moves, keyed by filter and capture, bounded by
+ *    entries and by the events read, and never holds a failure.
+ * 9. **Failure, privacy and purity.** A store failure is a typed `Err`, a
  *    throwing port is `STORE_ERROR`, no captured value reaches an error or a log
  *    record, no request key is minted, the seeded events are never mutated or
  *    re-redacted, and two identical reads are deep-equal whatever the clock says.
@@ -31,8 +44,9 @@
  * ## Fixture conventions
  *
  * Every port is an in-file fake implementing only the methods the module
- * declares — the telemetry read, the two trace reads, the capture lookups and
- * the summary load — so nothing here opens a database, a socket or a timer. The
+ * declares — the five telemetry reads, the trace read, the capture and panel
+ * lookups and the summary load — so nothing here opens a database, a socket or
+ * a timer. The
  * store fake orders rows by the store's documented panel orderings (duration
  * descending or start ascending, then the event id), written independently of
  * `SOURCE_SORT_KEYS`; one assertion ties the stated flat chains to the store's
@@ -48,7 +62,7 @@
  * tracked file holds no token literal (AAP §0.3.4).
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   DATA_QUERY_DEFAULT_LIMIT,
@@ -80,6 +94,7 @@ import type {
   CaptureId,
   LogRecord,
   Logger,
+  PanelId,
   ProducerId,
   SessionId,
   SpanId,
@@ -116,13 +131,22 @@ import {
   TELEMETRY_QUERY_DEFAULT_OFFSET,
   TELEMETRY_QUERY_MAX_LIMIT,
 } from '../store/telemetry-repo.js';
-import type { TelemetryQuery } from '../store/telemetry-repo.js';
+import type { PanelCaptureLookup } from '../store/sessions-repo.js';
+import type {
+  CaptureEventStamp,
+  CaptureGeneration,
+  TelemetryQuery,
+  TelemetryScan,
+  TelemetryScanFilter,
+} from '../store/telemetry-repo.js';
 import {
+  AGGREGATE_CACHE_MAX_ENTRIES,
+  AGGREGATE_CACHE_MAX_INPUT_EVENTS,
   DEFAULT_SORT_BY_SOURCE,
   MAX_AGGREGATE_INPUT_EVENTS,
-  MAX_AGGREGATE_INPUT_PAGES,
   SOURCE_SORT_KEYS,
   SPAN_SOURCE_KINDS,
+  TRACE_NODE_BUDGET,
   applyPage,
   buildDataPage,
   createPanelDataResolver,
@@ -132,6 +156,7 @@ import {
 } from './data.js';
 import type {
   CaptureSummaryPort,
+  PanelDataContext,
   PanelDataResolver,
   PanelDataResolverDeps,
   PanelTelemetryPort,
@@ -140,6 +165,67 @@ import type {
   SortChain,
   SortedDataSource,
 } from './data.js';
+
+/** What one aggregate computation was handed: the aggregate, and its input event ids in order. */
+interface AggregateInput {
+  readonly aggregate: string;
+  readonly ids: readonly string[];
+}
+
+/**
+ * The recorder behind {@link recordAggregateInputs}: off unless a case turns
+ * it on, so every other case runs the aggregates exactly as shipped.
+ */
+const aggregateInputs = vi.hoisted(() => ({
+  recording: false,
+  calls: [] as AggregateInput[],
+}));
+
+/**
+ * `@debuggen/telemetry` with the seven aggregate computations the resolver
+ * calls wrapped to record their input — and otherwise real: each wrapper
+ * calls the package's own function with the same arguments and returns its
+ * result. What the equality proof of the shared traversal observes.
+ */
+vi.mock('@debuggen/telemetry', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@debuggen/telemetry')>();
+  const recorded =
+    <Args extends readonly [readonly { readonly id: string }[], ...unknown[]], Value>(
+      aggregate: string,
+      compute: (...args: Args) => Value,
+    ) =>
+    (...args: Args): Value => {
+      if (aggregateInputs.recording) {
+        aggregateInputs.calls.push({ aggregate, ids: args[0].map((event) => event.id) });
+      }
+      return compute(...args);
+    };
+  return {
+    ...actual,
+    aggregateRenders: recorded('renders', actual.aggregateRenders),
+    buildComponentTreeSnapshot: recorded('componentTree', actual.buildComponentTreeSnapshot),
+    aggregateRequests: recorded('requests', actual.aggregateRequests),
+    aggregateQueries: recorded('queries', actual.aggregateQueries),
+    aggregateStateTransitions: recorded('stateTransitions', actual.aggregateStateTransitions),
+    buildDependencyGraph: recorded('graph', actual.buildDependencyGraph),
+    computeMetrics: recorded('metrics', actual.computeMetrics),
+  };
+});
+
+/**
+ * Runs `work` with the aggregate recorder on, and returns every aggregate
+ * computation it made, in order. Cases using it run one at a time.
+ */
+async function recordAggregateInputs(work: () => Promise<void>): Promise<AggregateInput[]> {
+  aggregateInputs.calls.splice(0);
+  aggregateInputs.recording = true;
+  try {
+    await work();
+  } finally {
+    aggregateInputs.recording = false;
+  }
+  return aggregateInputs.calls.splice(0);
+}
 
 /**
  * A stored capture as the capture lookups return it, read off the resolver's
@@ -439,8 +525,8 @@ function storeOrder(
   return byStartThenId;
 }
 
-/** Whether `event` matches every narrowing field a store read carries. */
-function matchesQuery(event: TelemetryEvent, query: TelemetryQuery): boolean {
+/** Whether `event` matches every narrowing field a store read — a page or a scan — carries. */
+function matchesQuery(event: TelemetryEvent, query: TelemetryScanFilter): boolean {
   return (
     event.sessionId === query.sessionId &&
     (query.captureId === undefined || event.captureId === query.captureId) &&
@@ -454,24 +540,106 @@ function matchesQuery(event: TelemetryEvent, query: TelemetryQuery): boolean {
   );
 }
 
-/** The store's read port over a fixed event list, recording every read it serves. */
+/** One recorded capture-scoped lookup: `firstTraceId`, `captureStamp` or `captureGeneration`. */
+interface ScopeCall {
+  readonly sessionId: SessionId;
+  readonly captureId: CaptureId | undefined;
+}
+
+/** One recorded `scanEvents` call: the filter exactly as the resolver sent it, and its row budget. */
+type ScanCall = TelemetryScanFilter & { readonly maxRows: number };
+
+/** The store's read port over an event list, recording every read it serves. */
 interface FakeTelemetryRepo extends PanelTelemetryPort {
-  /** Every `query` call, in order, exactly as the resolver sent it. */
+  /** Every `query` call, in order, exactly as the resolver sent it: the page reads. */
   readonly calls: readonly TelemetryQuery[];
+  /** Every `scanEvents` call, in order: the whole-slice reads. */
+  readonly scans: readonly ScanCall[];
+  /** Every `firstTraceId` call, in order. */
+  readonly firstTraceCalls: readonly ScopeCall[];
+  /** Every `captureStamp` call, in order. */
+  readonly stampCalls: readonly ScopeCall[];
+  /** Every `captureGeneration` call, in order. */
+  readonly generationCalls: readonly ScopeCall[];
+}
+
+/** The stamp the real store computes: the capture's row count and highest `ingestSeq`. */
+function stampOf(members: readonly TelemetryEvent[]): CaptureEventStamp {
+  return {
+    count: members.length,
+    maxIngestSeq: members.reduce((highest, event) => Math.max(highest, event.ingestSeq), 0),
+  };
 }
 
 /**
- * A store over a fixed event list.
+ * A generation that moves whenever the capture's rows change, as the real
+ * store's does: an arrival raises the highest `ingestSeq`, a removal lowers
+ * the count. Compared for equality only, like the real one.
+ */
+function generationOf(members: readonly TelemetryEvent[]): CaptureGeneration {
+  const stamp = stampOf(members);
+  return { dataVersion: 0, purges: stamp.count, writes: stamp.maxIngestSeq };
+}
+
+/**
+ * The scan contract of `TelemetryRepo.scanEvents` over an already-filtered,
+ * capture-ordered selection: every row when it fits `maxRows`, and otherwise
+ * no row and the count that exceeded the budget. The selection is handed back
+ * as it is, so a case may pass a frozen array and see any write to it throw.
+ */
+function scanOf(selection: TelemetryEvent[], maxRows: number): TelemetryScan {
+  return selection.length > maxRows
+    ? { rows: [], total: selection.length, complete: false }
+    : { rows: selection, total: selection.length, complete: true };
+}
+
+/**
+ * A store over an event list, read afresh on every call so a case may append
+ * to it between two reads, as ingest would.
  *
  * It honours every narrowing field, both panel orderings, the store's own
  * default and ceiling for `limit`, and `offset`; its page omits `nextOffset`
  * on the last page, as the real store's does. It refuses a row read ordered by
- * `count_desc`, which the resolver must never send for a flat source.
+ * `count_desc`, which the resolver must never send for a flat source. Its scan
+ * is the whole selection in `start_time ASC, id ASC` order within the row
+ * budget and nothing but the count past it. Its earliest trace is the trace of
+ * the capture's earliest event, a tie at that instant going to the event that
+ * arrived first (the lower `ingestSeq`); its stamp is the capture's count and
+ * highest `ingestSeq`; its generation moves with either — each as the real
+ * store defines them.
  */
 function createFakeTelemetryRepo(events: readonly TelemetryEvent[]): FakeTelemetryRepo {
   const calls: TelemetryQuery[] = [];
+  const scans: ScanCall[] = [];
+  const firstTraceCalls: ScopeCall[] = [];
+  const stampCalls: ScopeCall[] = [];
+  const generationCalls: ScopeCall[] = [];
   return {
     calls,
+    scans,
+    firstTraceCalls,
+    stampCalls,
+    generationCalls,
+    firstTraceId(sessionId, captureId) {
+      firstTraceCalls.push({ sessionId, captureId });
+      const [earliest] = eventsInScope(events, sessionId, captureId).sort(
+        (left, right) => left.startTime - right.startTime || left.ingestSeq - right.ingestSeq,
+      );
+      return ok(earliest?.traceId);
+    },
+    captureStamp(sessionId, captureId) {
+      stampCalls.push({ sessionId, captureId });
+      return ok(stampOf(eventsInScope(events, sessionId, captureId)));
+    },
+    captureGeneration(sessionId, captureId) {
+      generationCalls.push({ sessionId, captureId });
+      return ok(generationOf(eventsInScope(events, sessionId, captureId)));
+    },
+    scanEvents(filter, maxRows) {
+      scans.push(Object.freeze({ ...filter, maxRows }));
+      const selection = events.filter((event) => matchesQuery(event, filter)).sort(byStartThenId);
+      return ok(scanOf(selection, maxRows));
+    },
     query(query) {
       calls.push(Object.freeze({ ...query }));
       if (query.sort === 'count_desc') {
@@ -496,19 +664,18 @@ function createFakeTelemetryRepo(events: readonly TelemetryEvent[]): FakeTelemet
   };
 }
 
+/** Every read the fake store served — its pages, then its scans — as their narrowings. */
+function storeReads(store: FakeTelemetryRepo): readonly TelemetryScanFilter[] {
+  return [...store.calls, ...store.scans];
+}
+
 /** One recorded trace read. */
-type CorrelatorCall =
-  | {
-      readonly method: 'listTraceIds';
-      readonly sessionId: SessionId;
-      readonly captureId: CaptureId | undefined;
-    }
-  | {
-      readonly method: 'getTrace';
-      readonly sessionId: SessionId;
-      readonly traceId: TraceId;
-      readonly captureId: CaptureId | undefined;
-    };
+interface CorrelatorCall {
+  readonly method: 'getTrace';
+  readonly sessionId: SessionId;
+  readonly traceId: TraceId;
+  readonly captureId: CaptureId | undefined;
+}
 
 /** How a fake port misbehaves, when a case asks it to. */
 type PortFailure = 'refuse' | 'throw';
@@ -555,9 +722,9 @@ function syntheticTrace(traceId: TraceId, members: readonly TelemetryEvent[]): T
 }
 
 /**
- * Trace reads over a fixed event list: trace ids in first-event order, and a
- * synthetic tree per trace, both scoped by session and capture like the real
- * correlator. `failure` makes both reads refuse, or throw the sentinel.
+ * Trace reads over an event list: a synthetic tree per trace, scoped by session
+ * and capture like the real correlator. `failure` makes the read refuse, or
+ * throw the sentinel.
  */
 function createFakeTraceCorrelator(
   events: readonly TelemetryEvent[],
@@ -568,17 +735,6 @@ function createFakeTraceCorrelator(
     new DebuggenError('STORE_ERROR', 'The fake correlator refused the read.');
   return {
     calls,
-    listTraceIds(sessionId, captureId) {
-      calls.push({ method: 'listTraceIds', sessionId, captureId });
-      if (failure === 'throw') {
-        throw new Error(SENTINEL);
-      }
-      if (failure === 'refuse') {
-        return Promise.resolve(err(refusal()));
-      }
-      const ordered = eventsInScope(events, sessionId, captureId).sort(byStartThenId);
-      return Promise.resolve(ok([...new Set(ordered.map((event) => event.traceId))]));
-    },
     getTrace(sessionId, traceId, captureId) {
       calls.push({ method: 'getTrace', sessionId, traceId, captureId });
       if (failure === 'throw') {
@@ -618,18 +774,106 @@ function storedCapture(
   return { sessionId, capture };
 }
 
-/** Capture lookups over a fixed list, oldest first. */
-function sessionsPort(captures: readonly StoredCapture[]): SessionCapturePort {
+/** A stored panel row as the panel lookup reads it: its session and the capture it links. */
+interface StoredPanelLink {
+  readonly panelId: PanelId;
+  readonly sessionId: SessionId;
+  /** The linked capture; absent once the capture has been purged. */
+  readonly captureId?: CaptureId;
+}
+
+/** The panel every panel-bound case renders. */
+const PANEL_A1: PanelId = opaqueId(ID_PREFIXES.panel, 1);
+
+/** A panel of {@link SESSION_A} whose capture has been purged. */
+const PANEL_PURGED: PanelId = opaqueId(ID_PREFIXES.panel, 2);
+
+/** A panel of {@link SESSION_B}. */
+const PANEL_B1: PanelId = opaqueId(ID_PREFIXES.panel, 3);
+
+/** The panel rows the panel-bound cases know. */
+const PANEL_LINKS: readonly StoredPanelLink[] = Object.freeze([
+  { panelId: PANEL_A1, sessionId: SESSION_A, captureId: CAPTURE_A1 },
+  { panelId: PANEL_PURGED, sessionId: SESSION_A },
+  { panelId: PANEL_B1, sessionId: SESSION_B, captureId: CAPTURE_B1 },
+]);
+
+/** How many times each capture lookup was asked. */
+interface LookupCounts {
+  getCapture: number;
+  getActiveCapture: number;
+  getLatestCapture: number;
+  getPanelCapture: number;
+}
+
+/**
+ * Capture and panel lookups over fixed lists, captures oldest first. The latest
+ * capture is the one started last, a later entry winning a tie — the real
+ * repository's `started_at DESC, rowid DESC` — and a panel is found only in its
+ * own session, as the real join is scoped. `counts` records every lookup.
+ */
+function sessionsPort(
+  captures: readonly StoredCapture[],
+  panels: readonly StoredPanelLink[] = PANEL_LINKS,
+  counts?: LookupCounts,
+): SessionCapturePort {
   return {
-    getCapture: (captureId) => ok(captures.find((stored) => stored.capture.id === captureId)),
-    getActiveCapture: (sessionId) =>
-      ok(
+    getCapture: (captureId) => {
+      if (counts !== undefined) {
+        counts.getCapture += 1;
+      }
+      return ok(captures.find((stored) => stored.capture.id === captureId));
+    },
+    getActiveCapture: (sessionId) => {
+      if (counts !== undefined) {
+        counts.getActiveCapture += 1;
+      }
+      return ok(
         captures.find(
           (stored) => stored.sessionId === sessionId && stored.capture.stoppedAt === undefined,
         ),
-      ),
-    listCaptures: (sessionId) => ok(captures.filter((stored) => stored.sessionId === sessionId)),
+      );
+    },
+    getLatestCapture: (sessionId) => {
+      if (counts !== undefined) {
+        counts.getLatestCapture += 1;
+      }
+      let latest: StoredCapture | undefined;
+      for (const stored of captures) {
+        if (
+          stored.sessionId === sessionId &&
+          (latest === undefined || stored.capture.startedAt >= latest.capture.startedAt)
+        ) {
+          latest = stored;
+        }
+      }
+      return ok(latest);
+    },
+    getPanelCapture: (sessionId, panelId) => {
+      if (counts !== undefined) {
+        counts.getPanelCapture += 1;
+      }
+      const panel = panels.find(
+        (candidate) => candidate.panelId === panelId && candidate.sessionId === sessionId,
+      );
+      const lookup: PanelCaptureLookup =
+        panel === undefined
+          ? { panel: 'unknown' }
+          : {
+              panel: 'found',
+              capture:
+                panel.captureId === undefined
+                  ? undefined
+                  : captures.find((stored) => stored.capture.id === panel.captureId),
+            };
+      return ok(lookup);
+    },
   };
+}
+
+/** Lookup counts, all zero. */
+function lookupCounts(): LookupCounts {
+  return { getCapture: 0, getActiveCapture: 0, getLatestCapture: 0, getPanelCapture: 0 };
 }
 
 /** The captures every harness knows unless a case supplies its own. */
@@ -652,6 +896,10 @@ interface Harness {
 /** What a harness may replace. */
 interface HarnessOptions {
   readonly captures?: readonly StoredCapture[];
+  /** The panel rows the panel lookup knows; {@link PANEL_LINKS} unless given. */
+  readonly panels?: readonly StoredPanelLink[];
+  /** Where the default lookups count their calls. */
+  readonly lookups?: LookupCounts;
   readonly withoutSessions?: boolean;
   readonly sessions?: SessionCapturePort;
   readonly summaries?: CaptureSummaryPort;
@@ -675,7 +923,7 @@ function harness(events: readonly TelemetryEvent[], options: HarnessOptions = {}
     options.sessions ??
     (options.withoutSessions === true
       ? undefined
-      : sessionsPort(options.captures ?? defaultCaptures()));
+      : sessionsPort(options.captures ?? defaultCaptures(), options.panels, options.lookups));
   const deps: PanelDataResolverDeps = {
     telemetry: options.telemetry ?? store,
     correlator,
@@ -694,7 +942,7 @@ const CONTEXT_A1 = Object.freeze({ sessionId: SESSION_A, captureId: CAPTURE_A1 }
 async function resolved(
   resolver: PanelDataResolver,
   query: DataQuery,
-  context: { readonly sessionId: SessionId; readonly captureId?: CaptureId } = CONTEXT_A1,
+  context: PanelDataContext = CONTEXT_A1,
 ): Promise<DataResult> {
   const result = await resolver.resolve(context, query);
   if (!result.ok) {
@@ -708,7 +956,7 @@ async function resolved(
 async function refused(
   resolver: PanelDataResolver,
   query: DataQuery,
-  context: { readonly sessionId: SessionId; readonly captureId?: CaptureId } = CONTEXT_A1,
+  context: PanelDataContext = CONTEXT_A1,
 ): Promise<DebuggenError> {
   const result = await resolver.resolve(context, query);
   if (result.ok) {
@@ -881,6 +1129,26 @@ const QUERIES_BY_SOURCE: readonly DataQuery[] = DATA_QUERY_SOURCES.map((source) 
 const AGGREGATE_SOURCES: readonly DataQuerySource[] = DATA_QUERY_SOURCES.filter(
   (source) => source !== 'trace' && source !== 'spans' && source !== 'events',
 );
+
+/**
+ * The aggregate sources whose slice is every kind of the capture — a query's
+ * caller, a transition's trigger, a graph's participants and a metric's
+ * inputs can be any record — and which therefore take the shared traversal on
+ * a miss. The shared-traversal suite asserts the list.
+ */
+const SHARED_TRAVERSAL_SOURCES: readonly DataQuerySource[] = [
+  'queries',
+  'stateTransitions',
+  'graph',
+  'metrics',
+];
+
+/** `filter` as a query field: absent when there is none, as exact optional types require. */
+function optionalFilter(filter: DataQueryFilter | undefined): {
+  readonly filter?: DataQueryFilter;
+} {
+  return filter === undefined ? {} : { filter };
+}
 
 /* -------------------------------------------------------------------------------------------------
  * Capture fixtures
@@ -1364,6 +1632,7 @@ describe('the paging contract', () => {
         const error = await refused(resolver, { source, ...paging });
         expect(error.code).toBe('PANEL_INVALID');
         expect(store.calls).toHaveLength(0);
+        expect(store.scans).toHaveLength(0);
         expect(correlator.calls).toHaveLength(0);
       }
     },
@@ -1653,8 +1922,15 @@ describe('renders', () => {
     const { resolver, store } = harness(renderFixture());
     const result = await resolved(resolver, { source: 'renders' });
 
-    expect(store.calls.every((call) => call.limit === TELEMETRY_QUERY_MAX_LIMIT)).toBe(true);
-    expect(store.calls.every((call) => call.captureId === CAPTURE_A1)).toBe(true);
+    // One whole-slice scan of the render kinds, held to the ceiling; no page walk.
+    expect(store.calls).toHaveLength(0);
+    expect(store.scans).toHaveLength(1);
+    expect(store.scans[0]).toMatchObject({
+      sessionId: SESSION_A,
+      captureId: CAPTURE_A1,
+      kinds: RENDER_KINDS,
+      maxRows: MAX_AGGREGATE_INPUT_EVENTS,
+    });
     expect(result.source).toBe('renders');
     if (result.source === 'renders') {
       expect(result.total).toBe(8);
@@ -1672,7 +1948,8 @@ describe('renders', () => {
       source: 'renders',
       filter: { component: 'Charlie' },
     });
-    expect(store.calls.every((call) => call.component === 'Charlie')).toBe(true);
+    expect(store.scans.length).toBeGreaterThan(0);
+    expect(store.scans.every((scan) => scan.component === 'Charlie')).toBe(true);
     expect(result.source).toBe('renders');
     if (result.source === 'renders') {
       expect(result.renders.map((row) => row.component)).toStrictEqual(['Charlie']);
@@ -1737,14 +2014,30 @@ describe('stateTransitions', () => {
         true,
       );
     }
-    const subjectReads = store.calls.filter((call) => call.component !== undefined);
-    expect(subjectReads.length).toBeGreaterThan(0);
-    expect(
-      subjectReads.every((call) => call.kinds?.every((kind) => STATE_KINDS.includes(kind))),
-    ).toBe(true);
-    expect(
-      store.calls.some((call) => call.component === undefined && call.kinds === undefined),
-    ).toBe(true);
+    // One shared traversal: the filter's own selection — every kind, narrowed
+    // by the component — then the capture's whole slice, with what the ceiling
+    // leaves, as the context the triggers resolve against. The transitions are
+    // that selection's state records; every other aggregate source of the
+    // filter is computed from the same two reads.
+    const alpha = events.filter((event) => event.attributes['component'] === 'Alpha');
+    expect(store.calls).toHaveLength(0);
+    expect(store.scans).toHaveLength(2);
+    const [selection, whole] = store.scans;
+    expect(selection).toMatchObject({
+      sessionId: SESSION_A,
+      captureId: CAPTURE_A1,
+      component: 'Alpha',
+      maxRows: MAX_AGGREGATE_INPUT_EVENTS,
+    });
+    expect(selection?.kinds).toBeUndefined();
+    expect(whole).toMatchObject({
+      sessionId: SESSION_A,
+      captureId: CAPTURE_A1,
+      maxRows: MAX_AGGREGATE_INPUT_EVENTS - alpha.length,
+    });
+    expect(whole?.component).toBeUndefined();
+    expect(whole?.kinds).toBeUndefined();
+    expect(alpha.every((event) => STATE_KINDS.includes(event.kind))).toBe(true);
   });
 
   it('answers an inapplicable sort chronologically and walks every transition once', async () => {
@@ -1799,14 +2092,14 @@ describe('componentTree and graph', () => {
       expect(everyone.has('Lima')).toBe(true);
     }
 
-    const before = store.calls.length;
+    const before = store.scans.length;
     const narrowed = await resolved(resolver, {
       source: 'componentTree',
       filter: { component: 'Kilo' },
     });
-    const narrowedReads = store.calls.slice(before);
+    const narrowedReads = store.scans.slice(before);
     expect(narrowedReads.length).toBeGreaterThan(0);
-    expect(narrowedReads.every((call) => call.component === 'Kilo')).toBe(true);
+    expect(narrowedReads.every((scan) => scan.component === 'Kilo')).toBe(true);
     expect(narrowed.source).toBe('componentTree');
     if (narrowed.source === 'componentTree') {
       const names = componentsIn(narrowed.componentTree?.roots ?? []);
@@ -1840,58 +2133,868 @@ describe('aggregate filters reach the store', () => {
       const { resolver, store } = harness(everythingFixture());
       await resolved(resolver, { source, filter });
 
-      expect(store.calls.length).toBeGreaterThan(0);
-      for (const call of store.calls) {
-        expect(call).toMatchObject({
+      // Aggregates read whole slices by scan, never by page.
+      expect(store.calls).toHaveLength(0);
+      expect(store.scans.length).toBeGreaterThan(0);
+      for (const scan of store.scans) {
+        expect(scan).toMatchObject({
           sessionId: SESSION_A,
           captureId: CAPTURE_A1,
           traceId: TRACE_MAIN,
         });
-        expect(call.requestKey).toBeUndefined();
+        expect(scan.requestKey).toBeUndefined();
       }
-      expect(store.calls.some((call) => call.tier === 'browser' && call.minDuration === 0.5)).toBe(
+      expect(store.scans.some((scan) => scan.tier === 'browser' && scan.minDuration === 0.5)).toBe(
         true,
       );
     },
   );
 });
 
-describe('bounded aggregate reads', () => {
-  it('stops after the page bound, each page at the store ceiling, and says so', async () => {
-    const rows = [makeEvent({ kind: 'function' })];
-    let reads = 0;
-    const endless: PanelTelemetryPort = {
-      query(filter) {
-        reads += 1;
-        expect(filter.limit).toBe(TELEMETRY_QUERY_MAX_LIMIT);
-        const offset = filter.offset ?? 0;
-        return ok({ rows, total: MAX_AGGREGATE_INPUT_EVENTS * 2, nextOffset: offset + 1 });
-      },
-    };
-    const { resolver, records } = harness([], { telemetry: endless });
-    const result = await resolved(resolver, { source: 'graph' });
-    expect(result.source).toBe('graph');
-    expect(reads).toBe(MAX_AGGREGATE_INPUT_PAGES);
-    expect(records.some((record) => record.level === 'warn')).toBe(true);
+/**
+ * A telemetry port whose scans `scan` scripts, with no page read, no trace,
+ * and a stamp and a generation that never move — for the cases that drive the
+ * scan contract directly.
+ */
+function scriptedTelemetry(scan: PanelTelemetryPort['scanEvents']): PanelTelemetryPort {
+  return {
+    query: () => err(new DebuggenError('STORE_ERROR', 'The scripted store serves scans only.')),
+    scanEvents: scan,
+    firstTraceId: () => ok(undefined),
+    captureStamp: () => ok({ count: 1, maxIngestSeq: 1 }),
+    captureGeneration: () => ok({ dataVersion: 0, purges: 0, writes: 1 }),
+  };
+}
+
+/**
+ * A scan answer that honours the contract for a selection of `total` rows
+ * none of which the case needs: complete (and empty) within the budget, and
+ * incomplete past it.
+ */
+function countedScan(total: number, maxRows: number): TelemetryScan {
+  return { rows: [], total, complete: total <= maxRows };
+}
+
+describe('complete aggregate reads', () => {
+  it('aggregates every event of a capture past the 50 000 events it once stopped at, in one scan', async () => {
+    const earlier = 50_000;
+    const later = 1_234;
+    const events: TelemetryEvent[] = [];
+    for (let index = 0; index < earlier; index += 1) {
+      events.push(renderEvent(`Pane${index % 4}`, index % 97, 1));
+    }
+    // Later in capture order than every one of the first 50 000, so a read
+    // that stopped there would have left every one of them out.
+    for (let index = 0; index < later; index += 1) {
+      events.push(renderEvent('Tail', 200 + (index % 50), 1));
+    }
+    const { resolver, store } = harness(events);
+
+    const renders = await resolved(resolver, { source: 'renders', limit: DATA_QUERY_MAX_LIMIT });
+    expect(renders.source).toBe('renders');
+    if (renders.source === 'renders') {
+      expect(renders.total).toBe(5);
+      expect(renders.nextOffset).toBeNull();
+      const tail = renders.renders.find((row) => row.component === 'Tail');
+      expect(tail?.renderCount).toBe(later);
+      expect(renders.renders.reduce((sum, row) => sum + row.renderCount, 0)).toBe(earlier + later);
+    }
+    // More than ten store pages' worth, read as one scan — one count and one
+    // ordered statement — rather than a COUNT and an OFFSET page each.
+    expect(Math.ceil((earlier + later) / TELEMETRY_QUERY_MAX_LIMIT)).toBeGreaterThan(10);
+    expect(store.calls).toHaveLength(0);
+    expect(store.scans).toHaveLength(1);
+    expect(store.scans[0]).toMatchObject({
+      kinds: RENDER_KINDS,
+      maxRows: MAX_AGGREGATE_INPUT_EVENTS,
+    });
+
+    // No summary is stored, so the unfiltered values are computed — from all of it.
+    const metrics = await resolved(resolver, { source: 'metrics' });
+    expect(metrics.source).toBe('metrics');
+    if (metrics.source === 'metrics') {
+      expect(metrics.metrics).toStrictEqual(
+        computeCaptureSummary(events, { captureId: CAPTURE_A1 }).metrics,
+      );
+    }
+    expect(store.calls).toHaveLength(0);
   });
 
-  it('stops at a pager that does not advance', async () => {
-    let reads = 0;
-    const stuck: PanelTelemetryPort = {
-      query(filter) {
+  it.each(AGGREGATE_SOURCES)(
+    'refuses %s over more events than the ceiling from the count alone, reading no row',
+    async (source) => {
+      let reads = 0;
+      const oversized = scriptedTelemetry((_filter, maxRows) => {
         reads += 1;
-        return ok({ rows: [], total: 10, nextOffset: filter.offset ?? 0 });
+        expect(maxRows).toBe(MAX_AGGREGATE_INPUT_EVENTS);
+        return ok(countedScan(MAX_AGGREGATE_INPUT_EVENTS + 1, maxRows));
+      });
+      const { resolver, records } = harness([], { telemetry: oversized });
+      const error = await refused(resolver, { source });
+      expect(error.code).toBe('PANEL_INVALID');
+      expect(error.details).toMatchObject({
+        source,
+        total: MAX_AGGREGATE_INPUT_EVENTS + 1,
+        bound: MAX_AGGREGATE_INPUT_EVENTS,
+        reason: 'aggregate-input-too-large',
+      });
+      expect(error.hint).toBeDefined();
+      // A subset source counts its own slice once; an every-kind source counts
+      // the shared traversal, then its own slice — and no row is read either way.
+      expect(reads).toBe(SHARED_TRAVERSAL_SOURCES.includes(source) ? 2 : 1);
+      expect(records.some((record) => record.level === 'warn')).toBe(true);
+    },
+  );
+
+  it('holds both halves of a subject-narrowed slice to one ceiling', async () => {
+    const halves = (subjects: number): PanelTelemetryPort =>
+      scriptedTelemetry((filter, maxRows) =>
+        ok(
+          countedScan(
+            filter.component === undefined ? MAX_AGGREGATE_INPUT_EVENTS - 10 : subjects,
+            maxRows,
+          ),
+        ),
+      );
+    const query: DataQuery = { source: 'stateTransitions', filter: { component: 'Alpha' } };
+
+    const over = await refused(harness([], { telemetry: halves(11) }).resolver, query);
+    expect(over.code).toBe('PANEL_INVALID');
+    expect(over.details).toMatchObject({
+      total: MAX_AGGREGATE_INPUT_EVENTS + 1,
+      reason: 'aggregate-input-too-large',
+    });
+
+    const atCeiling = await resolved(harness([], { telemetry: halves(10) }).resolver, query);
+    expect(atCeiling).toMatchObject({ source: 'stateTransitions', total: 0 });
+  });
+
+  it('refuses a scan the store declares incomplete as too large, never answering from its rows', async () => {
+    const row = renderEvent('Alpha', 1);
+    let reads = 0;
+    // Against the contract, the incomplete scan still hands back a row.
+    const partial = scriptedTelemetry(() => {
+      reads += 1;
+      return ok({ rows: [row], total: MAX_AGGREGATE_INPUT_EVENTS + 1, complete: false });
+    });
+    const error = await refused(harness([], { telemetry: partial }).resolver, {
+      source: 'renders',
+    });
+    expect(error.code).toBe('PANEL_INVALID');
+    expect(error.details).toMatchObject({
+      total: MAX_AGGREGATE_INPUT_EVENTS + 1,
+      reason: 'aggregate-input-too-large',
+    });
+    expect(reads).toBe(1);
+  });
+
+  /** Scans that contradict their own count or row budget. */
+  const CONTRADICTORY_SCANS: readonly (readonly [string, (maxRows: number) => TelemetryScan])[] = [
+    [
+      'claims completeness over more rows than its budget',
+      (maxRows) => ({ rows: [], total: maxRows + 1, complete: true }),
+    ],
+    [
+      'claims completeness over more rows than it counted',
+      () => ({
+        rows: [renderEvent('Alpha', 1), renderEvent('Alpha', 2)],
+        total: 1,
+        complete: true,
+      }),
+    ],
+    [
+      'declares itself incomplete within its budget',
+      () => ({ rows: [], total: 3, complete: false }),
+    ],
+  ];
+
+  it.each(CONTRADICTORY_SCANS)(
+    'refuses a scan that %s as scan-inconsistent, for a subset and an all-kinds source',
+    async (_label, answer) => {
+      for (const source of ['renders', 'graph'] as const) {
+        let reads = 0;
+        const contradictory = scriptedTelemetry((_filter, maxRows) => {
+          reads += 1;
+          return ok(answer(maxRows));
+        });
+        const { resolver, records } = harness([], { telemetry: contradictory });
+        const error = await refused(resolver, { source });
+        expect(error.code).toBe('STORE_ERROR');
+        expect(error.details).toMatchObject({ reason: 'scan-inconsistent' });
+        expect(reads).toBe(1);
+        expect(records.some((record) => record.level === 'warn')).toBe(true);
+      }
+    },
+  );
+});
+
+/**
+ * Context rows in the large-slice cases: past the most arguments one spread
+ * call can pass on Node 24 (it throws `RangeError` from about 150 000), and
+ * within the aggregate ceiling.
+ */
+const LARGE_CONTEXT_EVENTS = 200_000;
+
+describe('large subject-narrowed slices', () => {
+  /**
+   * One interaction, two of `Alpha`'s state transitions attributed to it, and
+   * {@link LARGE_CONTEXT_EVENTS} timed functions after both — so merging the
+   * subjects back into capture order ends with a remainder of every function.
+   * Built once, every event and the whole list frozen, and scanned by a store
+   * that filters that list and nothing else.
+   */
+  function largeCapture(): {
+    readonly port: PanelTelemetryPort;
+    readonly interaction: TelemetryEvent;
+    readonly transitions: readonly TelemetryEvent[];
+  } {
+    const interaction = makeEvent({ kind: 'interaction', name: 'click', startTime: at(0) });
+    const transitions = [
+      stateEvent('Alpha', 1, interaction.id),
+      stateEvent('Alpha', 2, interaction.id),
+    ];
+    const base = makeEvent({ kind: 'function', duration: 1 });
+    const functions = Array.from({ length: LARGE_CONTEXT_EVENTS }, (_, index) =>
+      Object.freeze({
+        ...base,
+        // Past every id `eventIdFor` mints, so no id repeats.
+        id: opaqueId(ID_PREFIXES.event, EVENT_ID_MODULUS + index),
+        spanId: hexId(EVENT_ID_MODULUS + index, SPAN_ID_WIDTH),
+        startTime: at(10 + index / 1_000),
+        seq: base.seq + index,
+        ingestSeq: base.ingestSeq + index,
+      }),
+    );
+    const whole: TelemetryEvent[] = [interaction, ...transitions, ...functions];
+    for (const event of [interaction, ...transitions]) {
+      deepFreeze(event);
+    }
+    Object.freeze(whole);
+    const port: PanelTelemetryPort = {
+      query: () =>
+        err(new DebuggenError('STORE_ERROR', 'The large-slice store serves scans only.')),
+      scanEvents: (filter, maxRows) => {
+        const selection = whole.filter((event) => matchesQuery(event, filter));
+        Object.freeze(selection);
+        return ok(scanOf(selection, maxRows));
+      },
+      firstTraceId: () => ok(interaction.traceId),
+      captureStamp: () => ok(stampOf(whole)),
+      captureGeneration: () => ok(generationOf(whole)),
+    };
+    return { port, interaction, transitions };
+  }
+
+  it.each(['stateTransitions', 'queries'] as const)(
+    'answers a component-narrowed %s over more context rows than a spread can pass',
+    async (source) => {
+      const { port, interaction, transitions } = largeCapture();
+      const { resolver, records } = harness([], { telemetry: port });
+      const result = await resolver.resolve(CONTEXT_A1, {
+        source,
+        filter: { component: 'Alpha' },
+      });
+      if (!result.ok) {
+        throw new Error(`expected a result, got ${result.error.code}: ${result.error.message}`);
+      }
+      expect(records.some((record) => record.level === 'error')).toBe(false);
+      if (result.value.source === 'stateTransitions') {
+        expect(result.value.total).toBe(transitions.length);
+        expect(result.value.stateTransitions.map((row) => row.id)).toStrictEqual(
+          transitions.map((event) => event.id),
+        );
+        expect(
+          result.value.stateTransitions.every((row) => row.triggerEventId === interaction.id),
+        ).toBe(true);
+      } else {
+        // No statement names the component: an empty page, not a failure.
+        expect(result.value).toMatchObject({ source: 'queries', total: 0, nextOffset: null });
+      }
+    },
+  );
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * The shared traversal
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * A capture for the equality proof: every aggregate's records in two traces,
+ * `Alpha` records of several kinds and tiers, and records of another capture
+ * and another session that no read of capture A1 may return.
+ */
+function equalityFixture(): TelemetryEvent[] {
+  const otherInteraction = makeEvent({
+    kind: 'interaction',
+    name: 'click',
+    traceId: TRACE_OTHER,
+    startTime: at(95),
+  });
+  return [
+    ...tieFixture(),
+    ...everythingFixture(),
+    otherInteraction,
+    makeEvent({
+      kind: 'render',
+      name: 'Alpha',
+      traceId: TRACE_OTHER,
+      startTime: at(96),
+      duration: 4,
+      attributes: { component: 'Alpha', phase: 'mount', trigger: 'props' },
+    }),
+    makeEvent({
+      kind: 'state',
+      name: 'state',
+      traceId: TRACE_OTHER,
+      startTime: at(97),
+      duration: 0,
+      attributes: {
+        component: 'Alpha',
+        hookIndex: 1,
+        previousValue: { type: 'number', preview: '3', truncated: false },
+        nextValue: { type: 'number', preview: '4', truncated: false },
+        triggerEventId: otherInteraction.id,
+      },
+    }),
+    makeEvent({
+      kind: 'fetch',
+      name: 'GET',
+      traceId: TRACE_OTHER,
+      startTime: at(98),
+      duration: 6,
+      attributes: {
+        'http.method': 'GET',
+        url: '/api/alpha',
+        'http.status_code': 200,
+        request_key: 'key-alpha',
+        component: 'Alpha',
+      },
+      redacted: [URL_REDACTION_PATH],
+    }),
+    queryEvent('SELECT alpha FROM rows WHERE id = $1', 99, 8),
+  ];
+}
+
+/**
+ * One generated panel's aggregate nodes, every-kind sources first: the first
+ * takes the traversal and every later one is answered from its bundle.
+ */
+const COLD_PANEL_ORDER: readonly DataQuerySource[] = [
+  'queries',
+  'stateTransitions',
+  'graph',
+  'metrics',
+  'renders',
+  'componentTree',
+  'requests',
+];
+
+/** A panel filter, and how many scans one traversal under it takes. */
+const COLD_PANEL_CASES: readonly (readonly [string, DataQueryFilter, number])[] = [
+  ['a trace filter', { traceId: TRACE_MAIN }, 1],
+  ['a filter that narrows by tier', { tier: 'browser' }, 2],
+];
+
+/** The filters the shared traversal is proven equal to each source's own read under. */
+const EQUALITY_FILTERS: readonly (readonly [string, DataQueryFilter | undefined])[] = [
+  ['no filter', undefined],
+  ['a trace filter', { traceId: TRACE_MAIN }],
+  [
+    'a component, kinds, tier and minDuration filter',
+    { component: 'Alpha', kinds: ['render', 'state', 'fetch'], tier: 'browser', minDuration: 0 },
+  ],
+];
+
+/**
+ * The fake store with its first scan answered "larger than the budget" from
+ * the count alone. The first scan of a cold every-kind read is the shared
+ * traversal's, so the resolver falls back to the source's own read, which the
+ * store then serves in full — the per-source path, driven through the
+ * resolver's own code.
+ */
+function withoutSharedTraversal(store: FakeTelemetryRepo): PanelTelemetryPort {
+  let refused = false;
+  return {
+    ...store,
+    scanEvents: (filter, maxRows) => {
+      if (!refused) {
+        refused = true;
+        return ok({ rows: [], total: maxRows + 1, complete: false });
+      }
+      return store.scanEvents(filter, maxRows);
+    },
+  };
+}
+
+describe('the shared traversal', () => {
+  it('is taken on a miss by exactly the sources that read every kind; the others read their own slice', async () => {
+    for (const source of AGGREGATE_SOURCES) {
+      const { resolver, store } = harness(everythingFixture());
+      const inputs = await recordAggregateInputs(async () => {
+        await resolved(resolver, { source });
+      });
+      if (SHARED_TRAVERSAL_SOURCES.includes(source)) {
+        // One read of the capture, and every aggregate source computed from it.
+        expect(store.scans).toHaveLength(1);
+        expect(store.scans[0]?.kinds).toBeUndefined();
+        expect(inputs.map((input) => input.aggregate).sort()).toStrictEqual(
+          [...AGGREGATE_SOURCES].sort(),
+        );
+      } else {
+        // A subset source never widens its read to every kind.
+        expect(store.scans).toHaveLength(1);
+        expect(store.scans[0]?.kinds).toBeDefined();
+        expect(inputs.map((input) => input.aggregate)).toStrictEqual([source]);
+      }
+    }
+  });
+
+  it.each(EQUALITY_FILTERS)(
+    'hands every aggregate, under %s, exactly the rows of its own read, in the same order',
+    async (_label, filter) => {
+      const events = equalityFixture();
+      const shared = await recordAggregateInputs(async () => {
+        await resolved(harness(events).resolver, { source: 'graph', ...optionalFilter(filter) });
+      });
+      expect(shared.map((input) => input.aggregate).sort()).toStrictEqual(
+        [...AGGREGATE_SOURCES].sort(),
+      );
+      expect(shared.some((input) => input.ids.length > 0)).toBe(true);
+
+      for (const source of AGGREGATE_SOURCES) {
+        const store = createFakeTelemetryRepo(events);
+        const telemetry = SHARED_TRAVERSAL_SOURCES.includes(source)
+          ? withoutSharedTraversal(store)
+          : store;
+        const own = await recordAggregateInputs(async () => {
+          await resolved(harness(events, { telemetry }).resolver, {
+            source,
+            ...optionalFilter(filter),
+          });
+        });
+        expect(own.map((input) => input.aggregate)).toStrictEqual([source]);
+        expect(shared.find((input) => input.aggregate === source)?.ids).toStrictEqual(own[0]?.ids);
+      }
+    },
+  );
+
+  it('proves the equality over inputs the filters actually narrow', async () => {
+    const events = equalityFixture();
+    // One at a time: the recorder is shared.
+    const recorded: AggregateInput[][] = [];
+    for (const [, filter] of EQUALITY_FILTERS) {
+      recorded.push(
+        await recordAggregateInputs(async () => {
+          await resolved(harness(events).resolver, { source: 'graph', ...optionalFilter(filter) });
+        }),
+      );
+    }
+    const [whole, trace, narrowed] = recorded;
+    const idsOf = (inputs: readonly AggregateInput[] | undefined, source: string): number =>
+      inputs?.find((input) => input.aggregate === source)?.ids.length ?? 0;
+    for (const source of AGGREGATE_SOURCES) {
+      expect(idsOf(trace, source)).toBeLessThanOrEqual(idsOf(whole, source));
+    }
+    // The trace filter drops the other trace; the narrowing filter keeps only
+    // `Alpha`'s subjects of the chosen kinds while the context stays whole.
+    expect(idsOf(trace, 'graph')).toBeLessThan(idsOf(whole, 'graph'));
+    expect(idsOf(narrowed, 'graph')).toBeLessThan(idsOf(trace, 'graph'));
+    expect(idsOf(narrowed, 'stateTransitions')).toBeGreaterThan(idsOf(narrowed, 'graph'));
+    expect(idsOf(narrowed, 'renders')).toBeGreaterThan(0);
+  });
+
+  it.each(COLD_PANEL_CASES)(
+    'answers a cold panel of every aggregate source under %s from one traversal, and its repeats from memory',
+    async (_label, filter, statements) => {
+      const { resolver, store } = harness(equalityFixture());
+      const panel: DataQuery[] = COLD_PANEL_ORDER.map((source) => ({ source, filter }));
+
+      for (const query of panel) {
+        await resolved(resolver, query);
+      }
+      expect(store.calls).toHaveLength(0);
+      expect(store.scans).toHaveLength(statements);
+      if (statements === 2) {
+        // The filter's own selection first, then the trace's whole slice with
+        // what the ceiling leaves.
+        const [selection, whole] = store.scans;
+        expect(selection).toMatchObject({ tier: 'browser', maxRows: MAX_AGGREGATE_INPUT_EVENTS });
+        expect(whole?.tier).toBeUndefined();
+        expect(whole?.maxRows).toBeLessThan(MAX_AGGREGATE_INPUT_EVENTS);
+      }
+
+      for (const query of panel) {
+        await resolved(resolver, query);
+      }
+      expect(store.scans).toHaveLength(statements);
+      expect(store.stampCalls).toHaveLength(0);
+      expect(store.generationCalls).toHaveLength(2 * panel.length);
+    },
+  );
+
+  it('falls back to each source’s own slice when the traversal is too large, refusing only a slice that is', async () => {
+    const alphaRender = renderEvent('Alpha', 1);
+    const port = scriptedTelemetry((filter, maxRows) => {
+      if (filter.component === undefined) {
+        // The trace's whole slice is past the ceiling; a context half is not.
+        return ok(
+          countedScan(filter.kinds === undefined ? MAX_AGGREGATE_INPUT_EVENTS + 1 : 1_000, maxRows),
+        );
+      }
+      if (filter.kinds === undefined) {
+        // So is the filter's own selection of every kind.
+        return ok(countedScan(MAX_AGGREGATE_INPUT_EVENTS + 1, maxRows));
+      }
+      if (filter.kinds.every((kind) => RENDER_KINDS.includes(kind))) {
+        return ok({ rows: [alphaRender], total: 1, complete: true });
+      }
+      return ok(countedScan(10, maxRows));
+    });
+    const { resolver, records } = harness([], { telemetry: port });
+    const filter: DataQueryFilter = { component: 'Alpha' };
+
+    // Subject-narrowed: its context half and its subjects fit together.
+    expect(await resolved(resolver, { source: 'queries', filter })).toMatchObject({ total: 0 });
+    expect(await resolved(resolver, { source: 'stateTransitions', filter })).toMatchObject({
+      total: 0,
+    });
+    // A subset source reads its own, small slice.
+    const renders = await resolved(resolver, { source: 'renders', filter });
+    expect(
+      renders.source === 'renders' ? renders.renders.map((row) => row.component) : [],
+    ).toStrictEqual(['Alpha']);
+    // Its own slice is the filter's whole selection, which does not fit.
+    const graph = await refused(resolver, { source: 'graph', filter });
+    expect(graph.code).toBe('PANEL_INVALID');
+    expect(graph.details).toMatchObject({
+      source: 'graph',
+      total: MAX_AGGREGATE_INPUT_EVENTS + 1,
+      reason: 'aggregate-input-too-large',
+    });
+    expect(records.some((record) => record.level === 'error')).toBe(false);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * The aggregate cache
+ * ---------------------------------------------------------------------------------------------- */
+
+describe('the aggregate cache', () => {
+  it('computes an aggregate once while the capture is unchanged, across pages, sorts and repeats', async () => {
+    const { resolver, store } = harness(renderFixture());
+    const first = await resolved(resolver, { source: 'renders', limit: 3 });
+    const reads = store.scans.length;
+    expect(reads).toBe(1);
+
+    await resolved(resolver, { source: 'renders', limit: 3, offset: 3 });
+    await resolved(resolver, { source: 'renders', sort: 'duration_desc' });
+    const again = await resolved(resolver, { source: 'renders', limit: 3 });
+
+    expect(again).toStrictEqual(first);
+    expect(store.scans).toHaveLength(reads);
+    // Every read is validated against the generation, hit or miss — and a hit
+    // reads nothing else: no stamp, no count, no row.
+    expect(store.generationCalls).toHaveLength(4);
+    expect(store.stampCalls).toHaveLength(0);
+  });
+
+  it('answers a hit with one generation read and nothing else, for every aggregate source and the unfiltered metrics', async () => {
+    const events = everythingFixture();
+    const prefix = computeCaptureSummary(events.slice(0, 2), {
+      captureId: CAPTURE_A1,
+      sessionId: SESSION_A,
+    });
+    const covering = computeCaptureSummary(events, {
+      captureId: CAPTURE_A1,
+      sessionId: SESSION_A,
+    });
+    for (const summary of [undefined, covering, prefix]) {
+      let loads = 0;
+      const summaries: CaptureSummaryPort = {
+        loadCaptureSummary: () => {
+          loads += 1;
+          return Promise.resolve(
+            summary === undefined
+              ? err(new DebuggenError('STORE_ERROR', 'No summary is held.'))
+              : ok(summary),
+          );
+        },
+      };
+      const { resolver, store } = harness(events, { summaries });
+      const panel: DataQuery[] = [
+        ...AGGREGATE_SOURCES.map((source) => ({ source })),
+        {
+          source: 'metrics',
+          filter: { tier: 'browser' },
+        },
+      ];
+      for (const query of panel) {
+        await resolved(resolver, query);
+      }
+      const warm = {
+        scans: store.scans.length,
+        stamps: store.stampCalls.length,
+        generations: store.generationCalls.length,
+        loads,
+      };
+      expect(warm.loads).toBe(1);
+
+      for (let round = 0; round < 3; round += 1) {
+        for (const query of panel) {
+          await resolved(resolver, query);
+        }
+      }
+      expect(store.scans).toHaveLength(warm.scans);
+      expect(store.calls).toHaveLength(0);
+      expect(store.stampCalls).toHaveLength(warm.stamps);
+      expect(loads).toBe(warm.loads);
+      expect(store.generationCalls).toHaveLength(warm.generations + 3 * panel.length);
+    }
+  });
+
+  it('recomputes as soon as the capture’s rows change, so a reloaded panel sees what arrived since', async () => {
+    const events = renderFixture();
+    const { resolver, store } = harness(events);
+    const query: DataQuery = { source: 'renders', filter: { component: 'Hotel' } };
+    const countOf = (result: DataResult): number | undefined =>
+      result.source === 'renders' ? result.renders[0]?.renderCount : undefined;
+
+    expect(countOf(await resolved(resolver, query))).toBe(1);
+    const afterFirst = store.scans.length;
+
+    const late = renderEvent('Hotel', 30);
+    events.push(late);
+    expect(countOf(await resolved(resolver, query))).toBe(2);
+    expect(store.scans.length).toBeGreaterThan(afterFirst);
+
+    const afterArrival = store.scans.length;
+    events.splice(events.indexOf(late), 1);
+    expect(countOf(await resolved(resolver, query))).toBe(1);
+    expect(store.scans.length).toBeGreaterThan(afterArrival);
+  });
+
+  it('recomputes when the generation moves though this connection changed no row', async () => {
+    const store = createFakeTelemetryRepo(everythingFixture());
+    let dataVersion = 0;
+    // Another connection's commit moves `dataVersion` alone.
+    const port: PanelTelemetryPort = {
+      ...store,
+      captureGeneration: (sessionId, captureId) => {
+        const generation = store.captureGeneration(sessionId, captureId);
+        return generation.ok ? ok({ ...generation.value, dataVersion }) : generation;
       },
     };
-    const { resolver } = harness([], { telemetry: stuck });
+    const { resolver } = harness([], { telemetry: port });
+    const first = await resolved(resolver, { source: 'queries' });
     await resolved(resolver, { source: 'renders' });
-    expect(reads).toBe(1);
+    expect(store.scans).toHaveLength(1);
+
+    dataVersion += 1;
+    expect(await resolved(resolver, { source: 'queries' })).toStrictEqual(first);
+    expect(store.scans).toHaveLength(2);
+    await resolved(resolver, { source: 'renders' });
+    expect(store.scans).toHaveLength(2);
+  });
+
+  it('keys an entry by filter and capture — one entry serving every source — and reads a kind list as a set', async () => {
+    const { resolver, store } = harness(renderFixture());
+    const readsAfter = async (query: DataQuery, context?: PanelDataContext): Promise<number> => {
+      await resolved(resolver, query, context);
+      return store.scans.length;
+    };
+
+    const plain = await readsAfter({ source: 'renders' });
+    const filtered = await readsAfter({ source: 'renders', filter: { component: 'Charlie' } });
+    expect(filtered).toBeGreaterThan(plain);
+    // The entry has no component tree yet, and a subset source reads only its own slice.
+    const otherSource = await readsAfter({ source: 'componentTree' });
+    expect(otherSource).toBeGreaterThan(filtered);
+    const otherCapture = await readsAfter(
+      { source: 'renders' },
+      { sessionId: SESSION_A, captureId: CAPTURE_A2 },
+    );
+    expect(otherCapture).toBeGreaterThan(otherSource);
+    expect(store.scans.at(-1)?.captureId).toBe(CAPTURE_A2);
+
+    // One traversal fills the unfiltered entry for every source not yet read.
+    const traversed = await readsAfter({ source: 'graph' });
+    expect(traversed).toBe(otherCapture + 1);
+    expect(await readsAfter({ source: 'requests' })).toBe(traversed);
+    expect(await readsAfter({ source: 'stateTransitions' })).toBe(traversed);
+
+    const listed = await readsAfter({ source: 'renders', filter: { kinds: ['render', 'commit'] } });
+    expect(listed).toBeGreaterThan(traversed);
+    expect(await readsAfter({ source: 'renders', filter: { kinds: ['commit', 'render'] } })).toBe(
+      listed,
+    );
+  });
+
+  it('never caches a failure', async () => {
+    const inner = createFakeTelemetryRepo(renderFixture());
+    let failing = true;
+    const flaky: PanelTelemetryPort = {
+      query: (query) => inner.query(query),
+      scanEvents: (filter, maxRows) =>
+        failing
+          ? err(new DebuggenError('STORE_ERROR', 'The store is unavailable.'))
+          : inner.scanEvents(filter, maxRows),
+      firstTraceId: (sessionId, captureId) => inner.firstTraceId(sessionId, captureId),
+      captureStamp: (sessionId, captureId) => inner.captureStamp(sessionId, captureId),
+      captureGeneration: (sessionId, captureId) => inner.captureGeneration(sessionId, captureId),
+    };
+    const { resolver } = harness([], { telemetry: flaky });
+    expect((await refused(resolver, { source: 'renders' })).code).toBe('STORE_ERROR');
+    expect((await refused(resolver, { source: 'graph' })).code).toBe('STORE_ERROR');
+    failing = false;
+    expect(await resolved(resolver, { source: 'renders' })).toMatchObject({ total: 8 });
+    expect(await resolved(resolver, { source: 'graph' })).toMatchObject({ source: 'graph' });
+  });
+
+  it('evicts the least recently used entry past AGGREGATE_CACHE_MAX_ENTRIES', async () => {
+    const { resolver, store } = harness(renderFixture());
+    const byIndex = (index: number): DataQuery => ({
+      source: 'renders',
+      filter: { minDuration: index / 1_000 },
+    });
+    for (let index = 0; index <= AGGREGATE_CACHE_MAX_ENTRIES; index += 1) {
+      await resolved(resolver, byIndex(index));
+    }
+    const filled = store.scans.length;
+
+    await resolved(resolver, byIndex(AGGREGATE_CACHE_MAX_ENTRIES));
+    expect(store.scans).toHaveLength(filled);
+    await resolved(resolver, byIndex(0));
+    expect(store.scans).toHaveLength(filled + 1);
+  });
+
+  it('bounds the cache by the events its entries read, keeping the newest write when a merge would pass it', async () => {
+    const render = renderEvent('Alpha', 1);
+    const request = requestEvent('key-one', '/api/one', 2);
+    const heavyRows = Array.from({ length: AGGREGATE_CACHE_MAX_INPUT_EVENTS }, () => render);
+    const port = scriptedTelemetry((filter, maxRows) => {
+      let rows: TelemetryEvent[] = [];
+      if (filter.kinds?.includes('render') === true) {
+        rows = filter.minDuration === 1 ? [render] : heavyRows;
+      } else if (filter.kinds?.includes('fetch') === true) {
+        rows = [request];
+      }
+      return ok({ rows, total: rows.length, complete: rows.length <= maxRows });
+    });
+    let scans = 0;
+    const counted: PanelTelemetryPort = {
+      ...port,
+      scanEvents: (filter, maxRows) => {
+        scans += 1;
+        return port.scanEvents(filter, maxRows);
+      },
+    };
+    const { resolver } = harness([], { telemetry: counted });
+    const heavy: DataQuery = { source: 'renders', filter: { minDuration: 0 } };
+    const light: DataQuery = { source: 'renders', filter: { minDuration: 1 } };
+
+    // An entry at the bound is kept...
+    await resolved(resolver, heavy);
+    await resolved(resolver, heavy);
+    expect(scans).toBe(1);
+    // ...and evicted, least recently used first, once another entry would pass it.
+    await resolved(resolver, light);
+    await resolved(resolver, light);
+    expect(scans).toBe(2);
+    await resolved(resolver, heavy);
+    expect(scans).toBe(3);
+
+    // A second source of the heavy entry's filter — its context half and its
+    // subjects, two scans — would take the merged entry past the bound: the
+    // newest write is kept alone, and the heavy slot is read again.
+    await resolved(resolver, { source: 'requests', filter: { minDuration: 0 } });
+    expect(scans).toBe(5);
+    await resolved(resolver, { source: 'requests', filter: { minDuration: 0 } });
+    expect(scans).toBe(5);
+    await resolved(resolver, heavy);
+    expect(scans).toBe(6);
+  });
+
+  it('stops weighing a write once the traversal replaced every slot it supplied', async () => {
+    const render = renderEvent('Alpha', 1);
+    const work = makeEvent({ kind: 'function', startTime: at(2) });
+    const renders = Array.from({ length: 60_000 }, () => render);
+    const whole = [...renders, ...Array.from({ length: 40_000 }, () => work)];
+    const other = Array.from({ length: 120_000 }, () => render);
+    let scans = 0;
+    const port = scriptedTelemetry((filter, maxRows) => {
+      scans += 1;
+      let rows: TelemetryEvent[] = whole;
+      if (filter.minDuration !== undefined) {
+        rows = other;
+      } else if (filter.kinds !== undefined) {
+        rows = renders;
+      }
+      return ok({ rows, total: rows.length, complete: rows.length <= maxRows });
+    });
+    const { resolver } = harness([], { telemetry: port });
+    const elsewhere: DataQuery = { source: 'renders', filter: { minDuration: 0 } };
+
+    await resolved(resolver, elsewhere); // 120 000 events, in its own entry
+    await resolved(resolver, { source: 'renders' }); // 60 000 more, in the unfiltered entry
+    // The traversal (100 000) replaces the render slot, so the unfiltered entry
+    // weighs 100 000 rather than 160 000, and both entries stay within the bound.
+    await resolved(resolver, { source: 'queries' });
+    expect(scans).toBe(3);
+    await resolved(resolver, elsewhere);
+    await resolved(resolver, { source: 'renders' });
+    await resolved(resolver, { source: 'graph' });
+    expect(scans).toBe(3);
+  });
+
+  it('keeps one 100 000-event capture as one bundle across all seven sources', async () => {
+    const base = everythingFixture();
+    const events = [...base, ...manyEvents(100_000 - base.length)];
+    expect(events).toHaveLength(100_000);
+    const { resolver, store } = harness(events);
+    // The subset sources first, each reading its own slice, then one traversal
+    // that serves the rest and retires the subset reads' weight.
+    const order: readonly DataQuerySource[] = [
+      'renders',
+      'componentTree',
+      'requests',
+      'queries',
+      'stateTransitions',
+      'graph',
+      'metrics',
+    ];
+    for (const source of order) {
+      await resolved(resolver, { source });
+    }
+    expect(store.scans).toHaveLength(4);
+
+    for (let round = 0; round < 2; round += 1) {
+      for (const source of order) {
+        await resolved(resolver, { source });
+      }
+    }
+    expect(store.scans).toHaveLength(4);
   });
 });
 
 /* -------------------------------------------------------------------------------------------------
  * trace
  * ---------------------------------------------------------------------------------------------- */
+
+/** The event ids of a tree in canonical pre-order: parents first, siblings as ordered. */
+function preOrderIds(tree: TraceTree | null | undefined): string[] {
+  const ids: string[] = [];
+  const stack: TraceNode[] = [...(tree?.roots ?? [])].reverse();
+  for (let node = stack.pop(); node !== undefined; node = stack.pop()) {
+    ids.push(node.event.id);
+    for (let index = node.children.length - 1; index >= 0; index -= 1) {
+      const child = node.children[index];
+      if (child !== undefined) {
+        stack.push(child);
+      }
+    }
+  }
+  return ids;
+}
 
 describe('trace', () => {
   const TRACE_EARLY: TraceId = traceIdFor(10);
@@ -1934,55 +3037,203 @@ describe('trace', () => {
     if (result.source === 'trace') {
       expect(result.trace?.traceId).toBe(TRACE_EARLY);
       expect(result.trace?.nodeCount).toBe(2);
+      expect(result.trace?.truncated).toBe(false);
     }
     expect(correlator.calls).toStrictEqual([
       { method: 'getTrace', sessionId: SESSION_A, traceId: TRACE_EARLY, captureId: CAPTURE_A1 },
     ]);
     expect(store.calls).toHaveLength(0);
+    expect(store.scans).toHaveLength(0);
+    expect(store.firstTraceCalls).toHaveLength(0);
   });
 
-  it('defaults to the capture’s first trace, or to its stored primary trace', async () => {
+  /** A capture whose stored summary names `primaryTraceId` as its primary trace. */
+  function withPrimaryTrace(events: readonly TelemetryEvent[], primaryTraceId: TraceId): Harness {
+    const summary = computeCaptureSummary(
+      events.filter((event) => event.captureId === CAPTURE_A1),
+      { captureId: CAPTURE_A1, sessionId: SESSION_A },
+    );
+    return harness(events, {
+      captures: [
+        storedCapture(SESSION_A, CAPTURE_A1, {
+          stopped: true,
+          summary: { ...summary, primaryTraceId },
+        }),
+      ],
+    });
+  }
+
+  it('defaults to the stored primary trace, read directly, without looking for another', async () => {
+    const { resolver, correlator, store } = withPrimaryTrace(traceFixture(), TRACE_LATE);
+    const result = await resolved(resolver, { source: 'trace' });
+    expect(result.source).toBe('trace');
+    if (result.source === 'trace') {
+      expect(result.trace?.traceId).toBe(TRACE_LATE);
+    }
+    expect(correlator.calls).toStrictEqual([
+      { method: 'getTrace', sessionId: SESSION_A, traceId: TRACE_LATE, captureId: CAPTURE_A1 },
+    ]);
+    expect(store.firstTraceCalls).toHaveLength(0);
+    expect(store.calls).toHaveLength(0);
+    expect(store.scans).toHaveLength(0);
+  });
+
+  it('defaults to the capture’s earliest trace, one indexed read, when no primary trace is held', async () => {
     const plain = harness(traceFixture());
     const first = await resolved(plain.resolver, { source: 'trace' });
     expect(first.source).toBe('trace');
     if (first.source === 'trace') {
       expect(first.trace?.traceId).toBe(TRACE_EARLY);
     }
+    expect(plain.store.firstTraceCalls).toStrictEqual([
+      { sessionId: SESSION_A, captureId: CAPTURE_A1 },
+    ]);
     expect(plain.correlator.calls).toStrictEqual([
-      { method: 'listTraceIds', sessionId: SESSION_A, captureId: CAPTURE_A1 },
       { method: 'getTrace', sessionId: SESSION_A, traceId: TRACE_EARLY, captureId: CAPTURE_A1 },
     ]);
 
-    const events = traceFixture();
-    const summary = computeCaptureSummary(
-      events.filter((event) => event.captureId === CAPTURE_A1),
-      { captureId: CAPTURE_A1, sessionId: SESSION_A },
+    // A primary trace the capture no longer holds falls back to the earliest one.
+    const stale = withPrimaryTrace(traceFixture(), TRACE_UNKNOWN);
+    const fallback = await resolved(stale.resolver, { source: 'trace' });
+    expect(fallback.source).toBe('trace');
+    if (fallback.source === 'trace') {
+      expect(fallback.trace?.traceId).toBe(TRACE_EARLY);
+    }
+    expect(stale.correlator.calls.map((call) => call.traceId)).toStrictEqual([
+      TRACE_UNKNOWN,
+      TRACE_EARLY,
+    ]);
+    expect(stale.store.firstTraceCalls).toHaveLength(1);
+  });
+
+  it('breaks a tie at the earliest instant toward the event that arrived first, not the smaller trace id', async () => {
+    // Stored first, so it carries the lower arrival number — and the larger trace id.
+    const arrivedFirst = makeEvent({ kind: 'interaction', traceId: TRACE_LATE, startTime: at(0) });
+    const arrivedSecond = makeEvent({
+      kind: 'interaction',
+      traceId: TRACE_EARLY,
+      startTime: at(0),
+    });
+    expect(arrivedFirst.ingestSeq).toBeLessThan(arrivedSecond.ingestSeq);
+    expect(byCodeUnit(TRACE_EARLY, TRACE_LATE)).toBeLessThan(0);
+
+    const { resolver, store, correlator } = harness([arrivedSecond, arrivedFirst]);
+    const result = await resolved(resolver, { source: 'trace' });
+    expect(result.source).toBe('trace');
+    if (result.source === 'trace') {
+      expect(result.trace?.traceId).toBe(TRACE_LATE);
+    }
+    // The store's own rule, taken as it answers: one lookup, one trace read.
+    expect(store.firstTraceCalls).toStrictEqual([{ sessionId: SESSION_A, captureId: CAPTURE_A1 }]);
+    expect(correlator.calls.map((call) => call.traceId)).toStrictEqual([TRACE_LATE]);
+  });
+
+  /** An interaction with a request and a handler under it, and a statement under the request. */
+  function branchingTrace(): {
+    readonly events: TelemetryEvent[];
+    readonly root: TelemetryEvent;
+    readonly request: TelemetryEvent;
+    readonly handler: TelemetryEvent;
+    readonly statement: TelemetryEvent;
+  } {
+    const root = makeEvent({ kind: 'interaction', traceId: TRACE_OTHER, startTime: at(200) });
+    const request = makeEvent({
+      kind: 'fetch',
+      traceId: TRACE_OTHER,
+      parentSpanId: root.spanId,
+      startTime: at(201),
+      duration: 40,
+    });
+    const handler = makeEvent({
+      kind: 'function',
+      traceId: TRACE_OTHER,
+      parentSpanId: root.spanId,
+      startTime: at(202),
+      duration: 2,
+    });
+    const statement = makeEvent({
+      kind: 'db.query',
+      traceId: TRACE_OTHER,
+      parentSpanId: request.spanId,
+      startTime: at(210),
+      duration: 30,
+    });
+    return { events: [root, request, handler, statement], root, request, handler, statement };
+  }
+
+  it('narrows a trace to the nodes the filter matches and every ancestor of one', async () => {
+    const { events, root, request, handler, statement } = branchingTrace();
+    const { resolver, store } = harness(events);
+    const shaped = async (filter: DataQueryFilter): Promise<TraceTree | null> => {
+      const result = await resolved(resolver, { source: 'trace', filter });
+      return result.source === 'trace' ? result.trace : null;
+    };
+
+    const whole = await shaped({ traceId: TRACE_OTHER });
+    expect(preOrderIds(whole)).toStrictEqual([root.id, request.id, statement.id, handler.id]);
+
+    const statements = await shaped({ traceId: TRACE_OTHER, kinds: ['db.query'] });
+    expect(preOrderIds(statements)).toStrictEqual([root.id, request.id, statement.id]);
+    expect(statements?.nodeCount).toBe(3);
+    expect(statements?.maxDepth).toBe(2);
+    expect(statements?.truncated).toBe(false);
+    expect(statements?.kinds).toStrictEqual(
+      TELEMETRY_KINDS.filter((kind) => ['interaction', 'fetch', 'db.query'].includes(kind)),
     );
-    const withPrimary = await resolved(
-      harness(events, {
-        captures: [
-          storedCapture(SESSION_A, CAPTURE_A1, {
-            stopped: true,
-            summary: { ...summary, primaryTraceId: TRACE_LATE },
-          }),
-        ],
-      }).resolver,
-      { source: 'trace' },
-    );
-    expect(withPrimary.source).toBe('trace');
-    if (withPrimary.source === 'trace') {
-      expect(withPrimary.trace?.traceId).toBe(TRACE_LATE);
+    // The matching is the store's own read — one scan — scoped to the trace and the capture.
+    expect(store.calls).toHaveLength(0);
+    expect(store.scans.at(-1)).toMatchObject({
+      sessionId: SESSION_A,
+      captureId: CAPTURE_A1,
+      traceId: TRACE_OTHER,
+      kinds: ['db.query'],
+    });
+
+    const slow = await shaped({ traceId: TRACE_OTHER, minDuration: 35 });
+    expect(preOrderIds(slow)).toStrictEqual([root.id, request.id]);
+
+    const rootOnly = await shaped({ traceId: TRACE_OTHER, kinds: ['interaction'] });
+    expect(preOrderIds(rootOnly)).toStrictEqual([root.id]);
+    expect(rootOnly?.roots[0]?.children).toStrictEqual([]);
+  });
+
+  it('answers a filter no node of the trace matches with null', async () => {
+    const { events } = branchingTrace();
+    const { resolver } = harness(events);
+    for (const filter of [
+      { traceId: TRACE_OTHER, component: 'Nobody' },
+      { traceId: TRACE_OTHER, kinds: [] },
+      { traceId: TRACE_OTHER, tier: 'server' },
+    ] satisfies DataQueryFilter[]) {
+      expect(await resolved(resolver, { source: 'trace', filter })).toStrictEqual({
+        source: 'trace',
+        trace: null,
+      });
     }
   });
 
-  it('narrows a trace by its id only, answering the other filter fields with the same tree', async () => {
-    const { resolver } = harness(traceFixture());
-    const plain = await resolved(resolver, { source: 'trace', filter: { traceId: TRACE_LATE } });
-    const narrowed = await resolved(resolver, {
-      source: 'trace',
-      filter: { traceId: TRACE_LATE, kinds: ['fetch'], minDuration: 1_000, component: 'Alpha' },
-    });
-    expect(narrowed).toStrictEqual(plain);
+  it('holds every trace to TRACE_NODE_BUDGET nodes in canonical pre-order, flagged truncated', async () => {
+    const root = makeEvent({ kind: 'interaction', traceId: TRACE_OTHER, startTime: at(300) });
+    const children = Array.from({ length: TRACE_NODE_BUDGET + 9 }, (_, index) =>
+      makeEvent({
+        kind: 'function',
+        traceId: TRACE_OTHER,
+        parentSpanId: root.spanId,
+        startTime: at(301 + index / 1_000),
+      }),
+    );
+    const { resolver } = harness([root, ...children]);
+    const result = await resolved(resolver, { source: 'trace', filter: { traceId: TRACE_OTHER } });
+    expect(result.source).toBe('trace');
+    if (result.source === 'trace') {
+      expect(result.trace?.nodeCount).toBe(TRACE_NODE_BUDGET);
+      expect(result.trace?.truncated).toBe(true);
+      expect(result.trace?.primaryRootSpanId).toBe(root.spanId);
+      expect(preOrderIds(result.trace)).toStrictEqual([
+        root.id,
+        ...children.slice(0, TRACE_NODE_BUDGET - 1).map((child) => child.id),
+      ]);
+    }
   });
 
   it('answers an unknown trace id, and a capture without traces, with null rather than an error', async () => {
@@ -2001,7 +3252,10 @@ describe('trace', () => {
       source: 'trace',
       trace: null,
     });
-    expect(empty.correlator.calls.map((call) => call.method)).toStrictEqual(['listTraceIds']);
+    expect(empty.correlator.calls).toHaveLength(0);
+    expect(empty.store.firstTraceCalls).toStrictEqual([
+      { sessionId: SESSION_A, captureId: CAPTURE_A1 },
+    ]);
   });
 });
 
@@ -2067,19 +3321,46 @@ describe('metrics', () => {
     }
   });
 
-  it('uses the capture’s stored summary when no summary port is supplied', async () => {
+  it('uses the capture’s stored summary when no summary port is supplied and it covers every event', async () => {
     const events = metricFixture();
-    const stored = computeCaptureSummary([], { captureId: CAPTURE_A1, sessionId: SESSION_A });
+    const stored = reversedSummary(events);
     const { resolver, store } = harness(events, {
       captures: [storedCapture(SESSION_A, CAPTURE_A1, { stopped: true, summary: stored })],
     });
     const result = await resolved(resolver, { source: 'metrics' });
     expect(store.calls).toHaveLength(0);
+    expect(store.scans).toHaveLength(0);
     expect(result.source).toBe('metrics');
     if (result.source === 'metrics') {
-      expect(result.metrics).toStrictEqual(stored.metrics);
+      expect(result.metrics).toStrictEqual([...stored.metrics].reverse());
       expect(result.metrics.map((metric) => metric.id)).toStrictEqual([...METRIC_IDS]);
     }
+  });
+
+  it('never serves a summary computed from fewer events than the capture now holds', async () => {
+    const events = metricFixture();
+    const expected = computeCaptureSummary(events, { captureId: CAPTURE_A1 }).metrics;
+    // A summary of a prefix: the summarizer's bounded read, or one taken
+    // before the last events arrived.
+    const prefix = computeCaptureSummary(events.slice(0, 2), {
+      captureId: CAPTURE_A1,
+      sessionId: SESSION_A,
+    });
+    expect(prefix.metrics).not.toStrictEqual(expected);
+
+    const stored = harness(events, {
+      captures: [storedCapture(SESSION_A, CAPTURE_A1, { stopped: true, summary: prefix })],
+    });
+    const fromStored = await resolved(stored.resolver, { source: 'metrics' });
+    expect(fromStored).toMatchObject({ source: 'metrics', metrics: expected });
+    expect(stored.store.scans.length).toBeGreaterThan(0);
+
+    const loaded = harness(events, {
+      summaries: { loadCaptureSummary: () => Promise.resolve(ok(prefix)) },
+    });
+    const fromLoaded = await resolved(loaded.resolver, { source: 'metrics' });
+    expect(fromLoaded).toMatchObject({ source: 'metrics', metrics: expected });
+    expect(loaded.store.scans.length).toBeGreaterThan(0);
   });
 
   it('computes the values from the capture when no summary exists, or when the load fails', async () => {
@@ -2117,7 +3398,7 @@ describe('metrics', () => {
     const { resolver, store } = harness(events, { summaries });
     const result = await resolved(resolver, { source: 'metrics', filter: { tier: 'db' } });
     expect(loads).toBe(0);
-    expect(store.calls.every((call) => call.tier === 'db')).toBe(true);
+    expect(store.scans.some((scan) => scan.tier === 'db')).toBe(true);
     expect(result.source).toBe('metrics');
     if (result.source === 'metrics') {
       const requestCount = result.metrics.find((metric) => metric.id === 'request_count');
@@ -2181,9 +3462,129 @@ describe('capture scoping', () => {
     await resolved(open.resolver, { source: 'events' }, { sessionId: SESSION_A });
     expect(open.store.calls[0]?.captureId).toBe(CAPTURE_A1);
 
-    const latest = harness(events);
+    const lookups = lookupCounts();
+    const latest = harness(events, { lookups });
     await resolved(latest.resolver, { source: 'events' }, { sessionId: SESSION_A });
     expect(latest.store.calls[0]?.captureId).toBe(CAPTURE_A2);
+    // One indexed lookup of each kind — the port offers no listing to walk.
+    expect(lookups).toStrictEqual({
+      getCapture: 0,
+      getActiveCapture: 1,
+      getLatestCapture: 1,
+      getPanelCapture: 0,
+    });
+  });
+
+  it('breaks a tie between two captures started together toward the one stored last', async () => {
+    const { resolver, store } = harness(everythingFixture(), {
+      captures: [
+        storedCapture(SESSION_A, CAPTURE_A1, { stopped: true }),
+        storedCapture(SESSION_A, CAPTURE_A2, { stopped: true }),
+      ],
+    });
+    await resolved(resolver, { source: 'events' }, { sessionId: SESSION_A });
+    expect(store.calls[0]?.captureId).toBe(CAPTURE_A2);
+  });
+
+  it('reads the rendered panel’s own capture while a newer capture is open', async () => {
+    const events = [...everythingFixture(), ...renderFixture()];
+    const lookups = lookupCounts();
+    const { resolver, store, correlator } = harness(events, {
+      lookups,
+      captures: [
+        storedCapture(SESSION_A, CAPTURE_A1, { stopped: true }),
+        storedCapture(SESSION_A, CAPTURE_A2, { startedAt: CAPTURE_EPOCH + 5_000 }),
+      ],
+    });
+    const panelContext: PanelDataContext = { sessionId: SESSION_A, panelId: PANEL_A1 };
+
+    for (const query of QUERIES_BY_SOURCE) {
+      await resolved(resolver, query, panelContext);
+    }
+    expect(store.calls.length).toBeGreaterThan(0);
+    expect(store.scans.length).toBeGreaterThan(0);
+    expect(storeReads(store).every((read) => read.captureId === CAPTURE_A1)).toBe(true);
+    expect(correlator.calls.every((call) => call.captureId === CAPTURE_A1)).toBe(true);
+    expect(store.stampCalls.every((call) => call.captureId === CAPTURE_A1)).toBe(true);
+    expect(lookups.getActiveCapture).toBe(0);
+    expect(lookups.getLatestCapture).toBe(0);
+    expect(lookups.getPanelCapture).toBe(QUERIES_BY_SOURCE.length);
+
+    const bound = await resolved(resolver, { source: 'renders' }, panelContext);
+    const live = await resolved(resolver, { source: 'renders' }, { sessionId: SESSION_A });
+    expect(store.scans.at(-1)?.captureId).toBe(CAPTURE_A2);
+    expect(bound).not.toStrictEqual(live);
+
+    // Naming the panel's own capture as well is consistent, and reads the same.
+    expect(
+      await resolved(resolver, { source: 'renders' }, { ...panelContext, captureId: CAPTURE_A1 }),
+    ).toStrictEqual(bound);
+  });
+
+  it('refuses a panel the session does not hold, before reading any evidence', async () => {
+    const { resolver, store, correlator } = harness(everythingFixture());
+    const unknownPanel: PanelId = opaqueId(ID_PREFIXES.panel, 99);
+    for (const panelId of [PANEL_B1, unknownPanel]) {
+      const error = await refused(
+        resolver,
+        { source: 'renders' },
+        { sessionId: SESSION_A, panelId },
+      );
+      expect(error.code).toBe('SESSION_INVALID_STATE');
+      expect(error.details).toMatchObject({ reason: 'panel-not-in-session' });
+      expect(errorTexts(error)).not.toContain(panelId);
+    }
+    expect(store.calls).toHaveLength(0);
+    expect(store.scans).toHaveLength(0);
+    expect(store.stampCalls).toHaveLength(0);
+    expect(store.generationCalls).toHaveLength(0);
+    expect(correlator.calls).toHaveLength(0);
+  });
+
+  it('answers every source with its empty value once the panel’s capture has been purged', async () => {
+    const { resolver, store, correlator } = harness(everythingFixture());
+    for (const query of QUERIES_BY_SOURCE) {
+      const result = await resolved(resolver, query, {
+        sessionId: SESSION_A,
+        panelId: PANEL_PURGED,
+      });
+      expect(result.source).toBe(query.source);
+      if ('total' in result) {
+        expect(result.total).toBe(0);
+        expect(result.nextOffset).toBeNull();
+      }
+    }
+    // Never the open or latest capture instead.
+    expect(store.calls).toHaveLength(0);
+    expect(store.scans).toHaveLength(0);
+    expect(store.stampCalls).toHaveLength(0);
+    expect(store.generationCalls).toHaveLength(0);
+    expect(store.firstTraceCalls).toHaveLength(0);
+    expect(correlator.calls).toHaveLength(0);
+  });
+
+  it('refuses a named capture that is not the panel’s own, and a panel with no lookup to find it', async () => {
+    const { resolver, store } = harness(everythingFixture());
+    for (const context of [
+      { sessionId: SESSION_A, panelId: PANEL_A1, captureId: CAPTURE_A2 },
+      { sessionId: SESSION_A, panelId: PANEL_PURGED, captureId: CAPTURE_A1 },
+    ]) {
+      const error = await refused(resolver, { source: 'events' }, context);
+      expect(error.code).toBe('SESSION_INVALID_STATE');
+      expect(error.details).toMatchObject({ reason: 'panel-capture-mismatch' });
+    }
+    expect(store.calls).toHaveLength(0);
+    expect(store.scans).toHaveLength(0);
+
+    const blind = harness(everythingFixture(), { withoutSessions: true });
+    const error = await refused(
+      blind.resolver,
+      { source: 'events' },
+      { sessionId: SESSION_A, panelId: PANEL_A1 },
+    );
+    expect(error.code).toBe('SESSION_INVALID_STATE');
+    expect(error.details).toMatchObject({ reason: 'no-capture-lookup' });
+    expect(blind.store.calls).toHaveLength(0);
   });
 
   it('never mixes two captures: with or without a named capture, every row is of the one read', async () => {
@@ -2209,7 +3610,7 @@ describe('capture scoping', () => {
       for (const query of QUERIES_BY_SOURCE) {
         await resolved(resolver, query, context);
       }
-      expect(store.calls.every((call) => call.captureId === captureId)).toBe(true);
+      expect(storeReads(store).every((read) => read.captureId === captureId)).toBe(true);
       expect(correlator.calls.every((call) => call.captureId === captureId)).toBe(true);
     }
   });
@@ -2225,6 +3626,7 @@ describe('capture scoping', () => {
       }
     }
     expect(store.calls).toHaveLength(0);
+    expect(store.scans).toHaveLength(0);
     expect(correlator.calls).toHaveLength(0);
   });
 
@@ -2247,9 +3649,10 @@ describe('capture scoping', () => {
       await resolved(resolver, query);
     }
     expect(store.calls.length).toBeGreaterThan(0);
-    for (const call of store.calls) {
-      expect(call.sessionId).toBe(SESSION_A);
-      expect(call.captureId).toBe(CAPTURE_A1);
+    expect(store.scans.length).toBeGreaterThan(0);
+    for (const read of storeReads(store)) {
+      expect(read.sessionId).toBe(SESSION_A);
+      expect(read.captureId).toBe(CAPTURE_A1);
     }
   });
 });
@@ -2351,19 +3754,37 @@ describe('every source', () => {
  * Failure
  * ---------------------------------------------------------------------------------------------- */
 
+/** The store's own typed refusal. */
+function storeRefusal(): DebuggenError {
+  return new DebuggenError('STORE_ERROR', 'The store refused the read.', {
+    details: { reason: 'unavailable' },
+  });
+}
+
 /** A telemetry port that refuses every read with the store's own typed error. */
 const REFUSING_TELEMETRY: PanelTelemetryPort = {
-  query: () =>
-    err(
-      new DebuggenError('STORE_ERROR', 'The store refused the read.', {
-        details: { reason: 'unavailable' },
-      }),
-    ),
+  query: () => err(storeRefusal()),
+  scanEvents: () => err(storeRefusal()),
+  firstTraceId: () => err(storeRefusal()),
+  captureStamp: () => err(storeRefusal()),
+  captureGeneration: () => err(storeRefusal()),
 };
 
 /** A telemetry port that throws the sentinel from every read. */
 const THROWING_TELEMETRY: PanelTelemetryPort = {
   query: () => {
+    throw new Error(SENTINEL);
+  },
+  scanEvents: () => {
+    throw new Error(SENTINEL);
+  },
+  firstTraceId: () => {
+    throw new Error(SENTINEL);
+  },
+  captureStamp: () => {
+    throw new Error(SENTINEL);
+  },
+  captureGeneration: () => {
     throw new Error(SENTINEL);
   },
 };
@@ -2398,7 +3819,7 @@ describe('failure', () => {
     },
   );
 
-  it('converts a throwing capture lookup into STORE_ERROR, with or without a named capture', async () => {
+  it('converts a throwing capture lookup into STORE_ERROR, with a named capture, a panel or neither', async () => {
     const throwing: SessionCapturePort = {
       getCapture: () => {
         throw new Error(SENTINEL);
@@ -2406,33 +3827,58 @@ describe('failure', () => {
       getActiveCapture: () => {
         throw new Error(SENTINEL);
       },
-      listCaptures: () => {
+      getLatestCapture: () => {
+        throw new Error(SENTINEL);
+      },
+      getPanelCapture: () => {
         throw new Error(SENTINEL);
       },
     };
     const { resolver, store, records } = harness(everythingFixture(), { sessions: throwing });
-    for (const context of [CONTEXT_A1, { sessionId: SESSION_A }]) {
+    for (const context of [
+      CONTEXT_A1,
+      { sessionId: SESSION_A },
+      { sessionId: SESSION_A, panelId: PANEL_A1 },
+    ]) {
       const error = await refused(resolver, { source: 'events' }, context);
       expect(error.code).toBe('STORE_ERROR');
       expectNoLeak(errorTexts(error));
     }
-    expect(store.calls).toHaveLength(0);
+    expect(storeReads(store)).toHaveLength(0);
     expectNoLeak(textOf(records));
-  });
 
-  it('fails an aggregate read that breaks on a later page instead of answering from half a slice', async () => {
-    const rows = [renderEvent('Alpha', 1)];
-    let reads = 0;
-    const breaking: PanelTelemetryPort = {
-      query: () => {
-        reads += 1;
-        return reads === 1
-          ? ok({ rows, total: rows.length + 1, nextOffset: rows.length })
-          : err(new DebuggenError('STORE_ERROR', 'The store failed mid-read.'));
+    // No capture is open, so the latest-capture lookup is reached — and throws.
+    const latestThrows: SessionCapturePort = {
+      ...sessionsPort([]),
+      getLatestCapture: () => {
+        throw new Error(SENTINEL);
       },
     };
+    const fallback = harness(everythingFixture(), { sessions: latestThrows });
+    const error = await refused(fallback.resolver, { source: 'events' }, { sessionId: SESSION_A });
+    expect(error.code).toBe('STORE_ERROR');
+    expect(error.details).toMatchObject({ reason: 'port-threw' });
+    expectNoLeak(errorTexts(error));
+    expect(storeReads(fallback.store)).toHaveLength(0);
+  });
+
+  it('fails a subject-narrowed read whose second scan fails instead of answering from the first', async () => {
+    const interaction = makeEvent({ kind: 'interaction', name: 'click', startTime: at(0) });
+    const transition = stateEvent('Alpha', 1, interaction.id);
+    let reads = 0;
+    const breaking = scriptedTelemetry((filter) => {
+      reads += 1;
+      if (reads > 1) {
+        return err(new DebuggenError('STORE_ERROR', 'The store failed mid-read.'));
+      }
+      const rows = filter.component === undefined ? [interaction] : [transition];
+      return ok({ rows, total: rows.length, complete: true });
+    });
     const { resolver } = harness([], { telemetry: breaking });
-    const error = await refused(resolver, { source: 'renders' });
+    const error = await refused(resolver, {
+      source: 'stateTransitions',
+      filter: { component: 'Alpha' },
+    });
     expect(error.code).toBe('STORE_ERROR');
     expect(reads).toBe(2);
   });
@@ -2512,7 +3958,8 @@ describe('privacy', () => {
       await resolved(resolver, query);
     }
     expect(store.calls.length).toBeGreaterThan(0);
-    expect(store.calls.every((call) => call.requestKey === undefined)).toBe(true);
+    expect(store.scans.length).toBeGreaterThan(0);
+    expect(storeReads(store).every((read) => read.requestKey === undefined)).toBe(true);
 
     const requests = await resolved(resolver, { source: 'requests' });
     expect(requests.source).toBe('requests');

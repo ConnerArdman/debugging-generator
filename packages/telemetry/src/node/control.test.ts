@@ -3191,6 +3191,209 @@ describe('the control socket handshake', () => {
 
 /*
  * ---------------------------------------------------------------------------
+ * The service's authoritative config, replayed on every (re)connect
+ *
+ * The protocol carries no producer acknowledgement (AAP §0.4.2), so the
+ * service keeps this process in step by replaying: on every `server-agent`
+ * connection it sends the authoritative `server-agent.config` — the open
+ * capture's armed config again, or a capture-less one when no capture is open,
+ * which is what a service that restarted mid-capture sends. The preload keeps
+ * its capture across an ordinary outage (see "keeps the capture running across
+ * an ordinary disconnect and reconnects with backoff"), so the replay is what
+ * decides that capture's fate: a restatement changes nothing, and an absent
+ * `captureId` tears it down to inert.
+ * ---------------------------------------------------------------------------
+ */
+
+describe('the config the service replays on the reconnected socket', () => {
+  /**
+   * One `server-agent.config` frame as the service writes it.
+   *
+   * @param payload The frame's payload.
+   * @returns The serialised frame.
+   */
+  function serverConfigFrame(payload: Record<string, unknown>): string {
+    return JSON.stringify({
+      id: `${ID_PREFIXES.message}_${'e'.repeat(16)}`,
+      type: CONTROL_MESSAGE_TYPES.config,
+      ts: Date.now(),
+      payload,
+    });
+  }
+
+  /** The armed payload the service sends for the open capture. */
+  const ARMED_PAYLOAD = Object.freeze({
+    sessionId: SESSION_ID,
+    captureId: CAPTURE_A,
+    signals: ALL_SIGNALS,
+  });
+
+  /**
+   * Arm a capture over the first socket, lose that socket to an ordinary
+   * outage, and open the one the backoff reconnects.
+   *
+   * Fake timers drive only the backoff and the handshake deadline; they are
+   * released once the second socket is open, so what a test does next runs on
+   * real ones.
+   *
+   * @param harness The harness to drive.
+   * @returns The reconnected socket, open and announced.
+   */
+  async function armThenReconnect(harness: Harness): Promise<FakeControlSocket> {
+    vi.useFakeTimers();
+    harness.control.connect();
+    const first = socketOf(harness, 0);
+    first.emitOpen();
+    first.emitMessage(serverConfigFrame(ARMED_PAYLOAD));
+    await settle();
+    expect(harness.control.captureId).toBe(CAPTURE_A);
+
+    first.emitClose(SOCKET_CLOSE_ABNORMAL, 'the service went away');
+
+    // The capture outlives the outage: the gate is left exactly as it was.
+    const during = harness.control.stats();
+    expect(during).toMatchObject({
+      connected: false,
+      reconnectPending: true,
+      captureId: CAPTURE_A,
+      sessionId: SESSION_ID,
+      providerRegistered: true,
+      instrumentationsEnabled: true,
+    });
+
+    vi.advanceTimersByTime(during.reconnectDelayMs);
+    const second = socketOf(harness, 1);
+    second.emitOpen();
+    vi.useRealTimers();
+
+    expect(harness.control.stats()).toMatchObject({
+      connected: true,
+      connectAttempts: 2,
+      helloSent: 2,
+      reconnectPending: false,
+    });
+    expect(second.frames().map((frame) => frame.type)).toEqual([CONTROL_MESSAGE_TYPES.hello]);
+    return second;
+  }
+
+  it('applies the identical armed config re-sent after a reconnect as unchanged: nothing rebuilt, flushed or disabled', async () => {
+    const driver = new RecordingInstrumentation();
+    const orm = new RecordingInstrumentation();
+    const harness = createHarness({ instrumentations: [driver, orm] });
+    const second = await armThenReconnect(harness);
+    const before = harness.control.stats();
+    expect(before).toMatchObject({
+      captureId: CAPTURE_A,
+      captureGeneration: 1,
+      configsApplied: 1,
+      enableCount: 1,
+      disableCount: 0,
+    });
+    const flushesBefore = harness.flush.forceFlushCount;
+    const reopensBefore = harness.flush.reopenCount;
+    const applied = vi.spyOn(harness.control, 'applyConfig');
+
+    second.emitMessage(serverConfigFrame({ ...ARMED_PAYLOAD }));
+    await settle();
+
+    expect(applied).toHaveBeenCalledTimes(1);
+    expect(applied.mock.settledResults).toEqual([{ type: 'fulfilled', value: 'unchanged' }]);
+    applied.mockRestore();
+
+    // Only the frame counter moved: the same capture, the same generation, the
+    // same admission policy, and no enable, disable or config counted.
+    expect(harness.control.stats()).toEqual({
+      ...before,
+      framesReceived: before.framesReceived + 1,
+    });
+    expect(harness.providerBuilds()).toBe(1);
+    expect(harness.flush.forceFlushCount).toBe(flushesBefore);
+    expect(harness.flush.reopenCount).toBe(reopensBefore);
+    for (const instrumentation of [driver, orm]) {
+      expect(instrumentation.disableCount).toBe(0);
+      expect(instrumentation.patched).toBe(true);
+    }
+
+    // And the capture is still recording.
+    const span = trace.getTracer(TRACER_NAME, TRACER_VERSION).startSpan(SPAN_NAME);
+    expect(span.isRecording()).toBe(true);
+    span.end();
+    expect(harness.spans.onStartCount).toBe(1);
+  });
+
+  it('tears the surviving capture down to inert when the reconnected socket carries a capture-less config', async () => {
+    const driver = new RecordingInstrumentation();
+    const orm = new RecordingInstrumentation();
+    const harness = createHarness({ instrumentations: [driver, orm] });
+    const second = await armThenReconnect(harness);
+
+    // Taken while the capture survives, and kept: the tracer a framework that
+    // cached one at module load holds, beyond `trace.disable()`'s reach.
+    const cachedTracer = trace.getTracer(TRACER_NAME, TRACER_VERSION);
+    cachedTracer.startSpan(SPAN_NAME).end();
+    const startsWhileArmed = harness.spans.onStartCount;
+    expect(startsWhileArmed).toBe(1);
+    const flushesBefore = harness.flush.forceFlushCount;
+    const applied = vi.spyOn(harness.control, 'applyConfig');
+
+    // The service restarted with no capture open, so the config it replays on
+    // the new connection names none.
+    second.emitMessage(serverConfigFrame({ signals: NO_SIGNALS }));
+
+    // Shut on arrival, ahead of the queued teardown.
+    expect(harness.control.captureId).toBeNull();
+    const gatedSpan = cachedTracer.startSpan(SPAN_NAME);
+    expect(gatedSpan.isRecording()).toBe(false);
+    gatedSpan.end();
+
+    await settle();
+
+    expect(applied).toHaveBeenCalledTimes(1);
+    expect(applied.mock.settledResults).toEqual([{ type: 'fulfilled', value: 'disabled' }]);
+    applied.mockRestore();
+
+    expect(harness.control.stats()).toMatchObject({
+      sessionId: null,
+      captureId: null,
+      captureGeneration: 1,
+      enabledKinds: [],
+      enabledDbSources: [],
+      functions: [],
+      instrumentationsEnabled: false,
+      providerRegistered: false,
+      cleanupStatus: 'clean',
+      pendingCleanup: [],
+      configsApplied: 2,
+      enableCount: 1,
+      disableCount: 1,
+      failures: 0,
+      // The channel stays up for the next capture's config.
+      connected: true,
+    });
+    for (const kind of TELEMETRY_KINDS) {
+      expect(harness.control.isKindEnabled(kind), kind).toBe(false);
+    }
+    for (const instrumentation of [driver, orm]) {
+      expect(instrumentation.disableCount).toBe(1);
+      expect(instrumentation.patched).toBe(false);
+    }
+    // The teardown flushed what the surviving capture had recorded, once.
+    expect(harness.flush.forceFlushCount).toBe(flushesBefore + 1);
+
+    const freshSpan = trace.getTracer(TRACER_NAME, TRACER_VERSION).startSpan(SPAN_NAME);
+    const cachedSpan = cachedTracer.startSpan(SPAN_NAME);
+    freshSpan.end();
+    cachedSpan.end();
+
+    expect(freshSpan.isRecording()).toBe(false);
+    expect(cachedSpan.isRecording()).toBe(false);
+    // Not one span was constructed after the capture-less config arrived.
+    expect(harness.spans.onStartCount).toBe(startsWhileArmed);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
  * The ingest transport: where the credential may go, and how hard it retries
  * ---------------------------------------------------------------------------
  */

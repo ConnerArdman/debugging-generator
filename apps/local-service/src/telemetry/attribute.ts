@@ -35,6 +35,48 @@
  *   dependency and logs nothing. {@link IngestAttributor.attributeBatch} is the
  *   same decision over a whole batch plus one summary log line of counts.
  *
+ * ## Capture identity, not timestamps — why a late batch is refused, not relabelled
+ *
+ * The capture a batch is stamped with is the one open **when the batch
+ * arrives**. A batch recorded during capture A can arrive after A closed and B
+ * opened — a frame the service worker queued while the socket was away and
+ * replayed on reconnect, say — and stamping it with B would put A's evidence
+ * into B's analysis (AAP §0.4.2: telemetry belongs to the bound session's
+ * *active* capture, which is the capture the producer was armed for).
+ *
+ * The page agent is armed per capture by `agent.config { captureId }`, and its
+ * relayed frame names that capture as `armedCaptureId`
+ * (`@debuggen/protocol`'s `telemetryEventPayloadSchema`). So
+ * {@link IngestAttributor.resolveBatch} compares **identities**: a browser
+ * batch naming a capture other than the bound session's open one is refused
+ * whole as `stale-capture` — never relabelled, never split. The comparison is
+ * refusal-only and cannot attribute anything (AAP §0.5.6): the session and the
+ * capture still come from the tab's binding and the store's open capture row,
+ * naming the open capture adds no authority over omitting the field, and
+ * naming another one can only discard the page's own batch. A batch without
+ * the field is attributed exactly as before. When no capture is open at all
+ * the batch is `no-active-capture` whatever it names: that reason already
+ * refuses it whole, and it keeps the routine flush after a stop at `debug`.
+ *
+ * Event `startTime`s are deliberately **not** compared with capture windows.
+ * AAP §0.2.3 applies no clock alignment between producers and the service
+ * (`clockOffsetMs` is informational): a window's bounds are read from the
+ * service's clock while an event's `startTime` is the producer's, and a span
+ * that starts just before Start and ends inside the window straddles its
+ * boundary. A time test would therefore both drop real evidence and admit a
+ * late batch whose clock happened to agree; identity has neither failure.
+ *
+ * **The residual server-tier case.** The dev-server preload's
+ * `POST /telemetry/ingest` body is `{ projectRoot, events }` and names no
+ * capture, so a server batch is attributed to the project's current capture
+ * owner. The preload guards its own side: its span processor stamps each span
+ * with the capture it started in and drops one whose capture has since been
+ * replaced, and its control channel flushes the outgoing capture before it
+ * arms the next. A batch whose POST is retried in place across a re-arm can
+ * still land in the next capture; closing that needs a capture identity on the
+ * ingest body, which the protocol's HTTP route schema and the Node exporter
+ * would have to carry first.
+ *
  * ## The drop contract (relied on by `./ingest.ts` and `../server/routes/telemetry.ts`)
  *
  * **A batch whose context cannot be resolved is a drop, not a server error.**
@@ -76,7 +118,8 @@
  *   authenticated DevTools connection the frame arrived on (whose binding is
  *   recorded against that connection's principal) — never a tab or session a
  *   page nominated. `documentId`, `producerId` and `url` are accepted as
- *   diagnostic context and are not authorization facts.
+ *   diagnostic context and are not authorization facts; `armedCaptureId` is
+ *   refusal-only context (see "Capture identity" below).
  * - The **server** context carries both the `projectRoot` the ingest body
  *   claims and the `scopedProjectRoot` the presented `server-agent` credential
  *   is bound to. They must agree exactly after POSIX normalisation — a scoped
@@ -153,7 +196,7 @@ import type {
 import { TELEMETRY_TIERS, isTelemetryTier } from '@debuggen/telemetry';
 import type { TelemetryEvent, TelemetryEventIngress, TelemetryTier } from '@debuggen/telemetry';
 
-import { LOG_BINDING_KEYS, sessionLogger, subsystemLogger } from '../logging.js';
+import { LOG_BINDING_KEYS, guardLogger, sessionLogger, subsystemLogger } from '../logging.js';
 
 /* -------------------------------------------------------------------------------------------------
  * Vocabularies
@@ -194,6 +237,10 @@ export type IngestOrigin = (typeof INGEST_ORIGINS)[number];
  *   owner's open capture window could not be confirmed.
  * - `tier-not-permitted` — per event: the event's tier is not one its producer
  *   may report (or could not be read at all).
+ * - `stale-capture` — the browser batch names the capture its producer was
+ *   armed for, and that is not the bound session's open capture: evidence
+ *   recorded for an earlier window that arrived after it closed (see "Capture
+ *   identity, not timestamps" above).
  */
 export const DROP_REASONS = Object.freeze([
   'no-binding',
@@ -202,6 +249,7 @@ export const DROP_REASONS = Object.freeze([
   'project-scope-mismatch',
   'capture-owner-mismatch',
   'tier-not-permitted',
+  'stale-capture',
 ] as const);
 
 /** One member of {@link DROP_REASONS}. */
@@ -229,9 +277,10 @@ export function isDropReason(value: unknown): value is DropReason {
  *   for the tab.
  * - `session-missing` → `SESSION_NOT_FOUND`: the bound session is gone,
  *   including one purged by retention.
- * - `no-active-capture` and `capture-owner-mismatch` →
+ * - `no-active-capture`, `capture-owner-mismatch` and `stale-capture` →
  *   `SESSION_INVALID_STATE`: storing telemetry is a real operation that is not
- *   legal while no confirmed capture window is open.
+ *   legal while no confirmed capture window is open — or, for a stale batch,
+ *   into a window other than the one it was recorded for.
  * - `project-scope-mismatch` → `UNAUTHORIZED`: the vocabulary's code for an
  *   out-of-scope credential (AAP §0.5.6).
  * - `tier-not-permitted` → `UNAUTHORIZED`: the producer's role does not cover
@@ -246,6 +295,7 @@ export const DROP_REASON_ERROR_CODES: Readonly<Record<DropReason, DebuggenErrorC
     'project-scope-mismatch': 'UNAUTHORIZED',
     'capture-owner-mismatch': 'SESSION_INVALID_STATE',
     'tier-not-permitted': 'UNAUTHORIZED',
+    'stale-capture': 'SESSION_INVALID_STATE',
   });
 
 /**
@@ -338,6 +388,17 @@ export interface BrowserIngestContext {
   readonly producerId?: ProducerId | undefined;
   /** The tab's current URL. Diagnostic only, and never logged. */
   readonly url?: string | undefined;
+  /**
+   * The capture the page agent was armed for when it recorded the batch — the
+   * `captureId` of the `agent.config` it last applied, relayed by the service
+   * worker from the bridge frame (`telemetryEventPayloadSchema.armedCaptureId`).
+   *
+   * **Refusal-only** (AAP §0.5.6): it never chooses a session or a capture.
+   * When present and different from the bound session's open capture, the
+   * batch is refused whole as `stale-capture`; when absent, the batch is
+   * attributed as it always was. Never logged or echoed: it is page-supplied.
+   */
+  readonly armedCaptureId?: CaptureId | undefined;
 }
 
 /**
@@ -621,7 +682,8 @@ type DropFault =
   | 'capture-closed'
   | 'capture-changed'
   | 'ambiguous-owner'
-  | 'owner-lookup-unavailable';
+  | 'owner-lookup-unavailable'
+  | 'invalid-armed-capture';
 
 /** The two faults a dependency read can end in. */
 type ReadFault = Extract<DropFault, 'store-read-failed' | 'dependency-threw'>;
@@ -696,6 +758,11 @@ const REFUSAL_TEXT: Readonly<Record<DropReason, RefusalText>> = Object.freeze({
   'tier-not-permitted': {
     message: 'The telemetry reports a tier its producer may not report, so it was not stored.',
     hint: 'Run the browser agent and the dev-server preload from the same Debug Generator build as the service.',
+  },
+  'stale-capture': {
+    message:
+      'The page telemetry was recorded for a different capture than the one now running, so it was not stored.',
+    hint: 'No action is needed: late events from a previous capture are discarded so they cannot mix into this one. Reproduce the issue again if this capture looks incomplete.',
   },
 });
 
@@ -797,6 +864,7 @@ function zeroCounts(): Record<DropReason, number> {
     'project-scope-mismatch': 0,
     'capture-owner-mismatch': 0,
     'tier-not-permitted': 0,
+    'stale-capture': 0,
   };
 }
 
@@ -855,6 +923,9 @@ function decideEvent(event: TelemetryEventIngress, attribution: IngestAttributio
 
   // Identity is stamped last so a smuggled sessionId/captureId is overwritten;
   // every other field — startTime and duration included — is carried as is.
+  // `captureId` is the window resolveBatch confirmed for the whole batch: a
+  // browser batch whose producer was armed for another capture was refused
+  // there as `stale-capture`, so it never reaches this stamp.
   const stamped: AttributedEvent = { ...snapshot, sessionId, captureId };
 
   // The store assigns ingestSeq. A value that bypassed the strict ingress
@@ -884,12 +955,15 @@ export function createIngestAttributor(deps: IngestAttributorDeps): IngestAttrib
   const sessions = deps.sessions;
   const manager = deps.sessionManager;
   const clock = deps.now ?? nowEpochMs;
-  const log = subsystemLogger(deps.logger ?? noopLogger, ATTRIBUTION_SUBSYSTEM);
+  // Guarded before the child is derived: a logger that throws must never turn
+  // an attribution decision into a crash, so neither `child()` nor any level
+  // method of `log` or its children can throw — a failed write is dropped and
+  // counted by the shared best-effort policy of `../logging.ts`.
+  const log = subsystemLogger(guardLogger(deps.logger ?? noopLogger), ATTRIBUTION_SUBSYSTEM);
 
   /**
-   * Emits one record, bound to the session and capture when known. A logger
-   * that throws must never turn an attribution decision into a crash, so a
-   * failure to log is swallowed here — and only here.
+   * Emits one record, bound to the session and capture when known, through the
+   * guarded logger; it never throws, so the decision stands whatever the sink does.
    */
   function emit(
     level: 'debug' | 'warn' | 'error',
@@ -898,12 +972,8 @@ export function createIngestAttributor(deps: IngestAttributorDeps): IngestAttrib
     sessionId?: SessionId,
     captureId?: CaptureId,
   ): void {
-    try {
-      const target = sessionId === undefined ? log : sessionLogger(log, sessionId, captureId);
-      target[level](message, fields);
-    } catch {
-      // Logging is advisory; the decision stands without it.
-    }
+    const target = sessionId === undefined ? log : sessionLogger(log, sessionId, captureId);
+    target[level](message, fields);
   }
 
   /** The clock's reading, or `undefined` when it throws or is not finite. */
@@ -923,8 +993,9 @@ export function createIngestAttributor(deps: IngestAttributorDeps): IngestAttrib
    * Routine refusals — a tab that is not bound, a session that has gone, no
    * capture running — are logged at `debug`, because producers legitimately
    * flush buffers around capture boundaries. Refusals that indicate a scope
-   * violation, an inconsistent owner or a failing dependency are logged at
-   * `warn`.
+   * violation, an inconsistent owner, a failing dependency or a batch recorded
+   * for another capture (`stale-capture` — evidence that would otherwise have
+   * been misfiled, and that this capture is missing) are logged at `warn`.
    */
   function refuse(spec: RefusalSpec): Result<never, DebuggenError> {
     const text =
@@ -957,7 +1028,8 @@ export function createIngestAttributor(deps: IngestAttributorDeps): IngestAttrib
     const notable =
       spec.fault !== undefined ||
       spec.reason === 'project-scope-mismatch' ||
-      spec.reason === 'capture-owner-mismatch';
+      spec.reason === 'capture-owner-mismatch' ||
+      spec.reason === 'stale-capture';
 
     emit(
       notable ? 'warn' : 'debug',
@@ -1093,6 +1165,25 @@ export function createIngestAttributor(deps: IngestAttributorDeps): IngestAttrib
         fault: 'invalid-capture',
         tabId,
         sessionId,
+      });
+    }
+
+    // Refusal-only capture identity (module notes, "Capture identity, not
+    // timestamps"): a batch the agent recorded for another capture is refused
+    // whole rather than relabelled into this one. Checked only once an open
+    // capture is confirmed, so "nothing is open" stays `no-active-capture`
+    // whatever the batch names. The page-supplied value is compared, never
+    // echoed: the refusal names the open capture it protected.
+    const armedCaptureId: unknown = context.armedCaptureId;
+
+    if (armedCaptureId !== undefined && armedCaptureId !== captureId) {
+      return refuse({
+        reason: 'stale-capture',
+        origin,
+        ...(isIdentifier(armedCaptureId) ? {} : { fault: 'invalid-armed-capture' as const }),
+        tabId,
+        sessionId,
+        captureId,
       });
     }
 

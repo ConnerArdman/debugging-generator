@@ -37,9 +37,9 @@ You should see: the install finish without resolving anything new (the lockfile 
 
 **Choose a model provider.** The copied `.env` already sets `DEBUGGEN_PROVIDER=deterministic`: a rules-based provider that needs no key, makes no network call and sends nothing off the machine. It is what every automated test uses, so this whole walkthrough is reproducible without a model account. It is not a shortcut: the deterministic provider only fills in the stage outputs from the structured inputs the pipeline hands it (code-graph candidates, capture aggregates), and every panel still comes out of the real pipeline — code analysis, a validated instrumentation plan, real telemetry, a validated analysis and a validated panel specification.
 
-To reason with the hosted model instead, edit `.env`:
+To reason with the hosted model instead, set these three lines in `.env` — they are file entries, not shell commands — replacing `<your key>` with your own Anthropic API key and `<model id>` with the id of the model you want to use:
 
-```bash
+```dotenv
 DEBUGGEN_PROVIDER=anthropic
 ANTHROPIC_API_KEY=<your key>
 DEBUGGEN_MODEL=<model id>
@@ -215,7 +215,7 @@ The symptom: placing an order takes well over a second, the Network panel shows 
 
 7. **Jump to source.** In the `QueryTable` (or on the slowest `db.query` bar of the `Timeline`), click the source chip of the slowest statement.
 
-   You should see: VS Code come to the front with `src/server/services/inventory.service.ts` open, the cursor on the `pool.query` call site and the line highlighted for a moment. The hop runs panel → service worker → service (which refuses any path outside the project root) → VS Code. For when the editor's connection to the service is down, the extension also handles `vscode://debuggen.debug-generator/open?file=…&line=…&col=…` links; a link opened that way is validated again inside VS Code (no path outside an open workspace folder, symlinks resolved) and always asks **Open ‹file›:‹line›?** before opening anything.
+   You should see: VS Code come to the front with `src/server/services/inventory.service.ts` open, the cursor on the `pool.query` call site and the line highlighted for a moment. The hop runs panel → service worker → service (which refuses any path outside the project root) → VS Code, and VS Code reports back whether it opened the location. If VS Code is not connected to the service, clicking the chip makes the panel hand the location to VS Code through a `vscode://debuggen.debug-generator/open?file=…&line=…&col=…` link instead: Chrome asks to open VS Code, and the link is validated again inside VS Code (no path outside an open workspace folder, symlinks resolved), which always asks **Open ‹file›:‹line›?** before opening anything. A location the service refuses is never handed over that way, and a failure is reported in the panel.
 
 8. **Ask a follow-up.** In the Session view's **Follow-up** section, type **Why did this query run twice?** and press **Ask follow-up**. Progress shows **Evaluating follow-up question**, and one of two things happens:
 
@@ -307,7 +307,7 @@ Runtime hooks are disabled at the end of a session, not merely idled: the page a
 
 ## 9. The seeded defects
 
-These three defects were planted deliberately in `apps/demo-app` so the walkthroughs have something real to find. **This document is the only place in the repository where they are recorded.** The product has no knowledge of them: it discovers them through code analysis, instrumentation, telemetry and analysis, never from a hardcoded hint. `scripts/check-no-hardcoding.mjs` enforces that — it derives its forbidden-token list from the demo's own code index and fails the build if any of these identifiers or routes appears in product source, prompts or templates — and `tests/e2e/generalization.spec.ts` runs the same workflow against `tests/fixtures/sample-next-app`, which shares no symbol names with the demo.
+These three defects were planted deliberately in `apps/demo-app` so the walkthroughs have something real to find. **This is the only document that records where they are and how they work.** The end-to-end acceptance suite under `tests/e2e/` asserts against them at run time; no product source, prompt, template or repository tooling records where they are or how they work. The product has no knowledge of them: it discovers them through code analysis, instrumentation, telemetry and analysis, never from a hardcoded hint. `scripts/check-no-hardcoding.mjs` enforces that — it derives its forbidden-token list from the demo's own code index and fails the build if any of these identifiers or routes appears in product source, prompts, templates or repository tooling, or if repository tooling names one of the demo's files by path or pins one with a glob — and `tests/e2e/generalization.spec.ts` runs the same workflow against `tests/fixtures/sample-next-app`, which shares no symbol names with the demo.
 
 Paths below are relative to `apps/demo-app/`.
 
@@ -371,9 +371,10 @@ General troubleshooting (ports, Node and pnpm versions, Docker) is in the [READM
 
 ## 11. Running the same flow automatically
 
-The Playwright suites run this script unattended with `DEBUGGEN_PROVIDER=deterministic`, the same pipeline and no model account:
+The Playwright suites run this script unattended with `DEBUGGEN_PROVIDER=deterministic`, the same pipeline and no model account. `pnpm install` does not download a browser, so install Playwright's Chromium and the operating-system libraries it needs once per machine first — the same step CI runs (`--with-deps` uses the system package manager and may ask for `sudo` on Linux; drop it when those libraries are already present):
 
 ```bash
+pnpm exec playwright install --with-deps chromium   # once per machine
 pnpm test:browser
 pnpm test:e2e
 ```

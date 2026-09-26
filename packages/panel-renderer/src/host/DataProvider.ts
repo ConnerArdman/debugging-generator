@@ -57,6 +57,20 @@
  * the current one side by side, and a panel can never fetch another session's
  * evidence because a closure outlived the panel it was created for.
  *
+ * ## Which capture a query reads
+ *
+ * A session holds several captures and panel versions, and a node's query names
+ * neither. The panel being drawn is what knows which one it describes, so its
+ * identity travels as {@link DataQueryOptions.panelId}: the surface that renders
+ * a specification wraps its provider with {@link bindPanelIdentity} for that
+ * specification's own `id`, every call through the wrapper carries it, and a
+ * provider forwards it beside the query as the panel-data request's `panelId`.
+ * The service then answers from the capture that panel was generated from. A
+ * call with no `panelId` is a live read — the session's open capture, else its
+ * most recent one — which is what a view with no rendered panel behind it
+ * wants. A present `panelId` is never dropped: a panel-bound read that became a
+ * live one would draw another capture's evidence under the panel's findings.
+ *
  * ## Paging counters, as the wire carries them
  *
  * The service's response marks the last page with `nextOffset: null` and always
@@ -91,8 +105,9 @@
  * uses, and from one that already speaks the view form
  * ({@link createDataProvider}, {@link DataQueryResolver}), which is what an
  * in-process stub or a recorded fixture uses — with the context both hand a
- * resolver ({@link DataQueryResolverContext}), the two checks those factories
- * and `./useQuery` apply ({@link mapPanelDataResult},
+ * resolver ({@link DataQueryResolverContext}), the wrapper that binds a
+ * provider to a rendered panel's identity ({@link bindPanelIdentity}), the two
+ * checks those factories and `./useQuery` apply ({@link mapPanelDataResult},
  * {@link checkDataQueryResponse}), the two React contexts `PanelHost` provides
  * ({@link DataProviderContext}, {@link PanelSessionContext}) and the hooks that
  * read them ({@link useDataProvider}, {@link usePanelSessionId}). The paging
@@ -415,7 +430,8 @@ export type PanelDataResult = {
  *
  * Deliberately minimal, and deliberately not a place for transport knobs: no
  * URL, no timeout, no headers, no retry count. Anything of that kind belongs to
- * the implementation behind the interface.
+ * the implementation behind the interface. What it does carry is contract: the
+ * call's cancellation and the identity of the panel the query belongs to.
  */
 export interface DataQueryOptions {
   /**
@@ -428,6 +444,25 @@ export interface DataQueryOptions {
    * own `reason`) rather than by resolving with empty data.
    */
   readonly signal?: AbortSignal | undefined;
+  /**
+   * The id of the panel specification the querying node belongs to — the
+   * rendered `PanelSpec`'s own `id`.
+   *
+   * A session holds several captures and panel versions, and a node's query
+   * names neither, so this is what says which evidence the node describes. A
+   * provider forwards it, unchanged, beside the query (the panel-data request's
+   * `panelId`), and the service answers from the capture that panel was
+   * generated from — so a panel still on screen after a newer capture started
+   * keeps drawing the evidence its own findings cite. Absent, the call is a
+   * **live** read: the session's open capture, else its most recent one.
+   *
+   * Present means a string with a visible character. A provider must never drop
+   * a present value — that would silently turn a panel-bound read into a live
+   * one — and the factories below refuse an unusable one with `PANEL_INVALID`
+   * before their resolver runs. {@link bindPanelIdentity} is how a surface sets
+   * it once for every node of a rendered panel.
+   */
+  readonly panelId?: string | undefined;
 }
 
 /**
@@ -453,7 +488,10 @@ export interface DataQueryOptions {
  * 0. **Route by the session it was given.** Address the request to exactly the
  *    `sessionId` argument, never to a session remembered from construction or
  *    from an earlier call. The argument is the panel's own claim about which
- *    capture it describes, and the service authorises and resolves against it.
+ *    session it describes, and the service authorises and resolves against it.
+ *    Forward `options.panelId` beside the query, unchanged, whenever it is
+ *    present: it is the panel's claim about which *capture* it describes, and
+ *    dropping it would answer the node from live evidence instead.
  * 1. **Echo the source.** Resolve with a response whose `source` equals the
  *    request's `source`. Components switch on it.
  * 2. **Never dress a failure as data.** A failed call must reject. Resolving
@@ -521,7 +559,8 @@ export interface DataProvider {
    * @param sessionId - The session the query is addressed to: the `sessionId`
    * of the panel specification being rendered, passed exactly as it carries it.
    * @param query - The declarative request carried by the node being rendered.
-   * @param options - Per-call options; `signal` cancels the request.
+   * @param options - Per-call options; `signal` cancels the request and
+   * `panelId` names the panel whose capture answers it.
    * @returns The response for that source, with its paging counters.
    */
   query<Source extends DataQuerySource>(
@@ -541,6 +580,11 @@ export interface DataProvider {
  * always present on the second. `sessionId` is required: the factory rejects a
  * call that names no session before the resolver ever runs, so a resolver can
  * address its request without re-checking it.
+ *
+ * `panelId` is inherited from {@link DataQueryOptions} and follows the same
+ * rule: present only when the caller named a panel — the key is omitted, not
+ * set to `undefined`, for a live read — and already checked to be usable, so a
+ * resolver forwards it as it stands.
  */
 export interface DataQueryResolverContext extends DataQueryOptions {
   /**
@@ -1115,6 +1159,10 @@ const UNNAMED_SOURCE_REMEDY =
 const UNADDRESSED_QUERY_REMEDY =
   'Pass the sessionId of the panel being rendered; PanelHost provides it through PanelSessionContext.';
 
+/** The integration remedy of a query naming a panel identity that cannot name a panel. */
+const UNUSABLE_PANEL_ID_REMEDY =
+  "Pass the id of the panel specification being rendered (the spec's own id) as panelId, or omit panelId for a live read; bindPanelIdentity binds it for every node of a panel.";
+
 /**
  * The error a response that fails a structural check is refused with.
  *
@@ -1273,6 +1321,85 @@ function unaddressedQueryError(source: DataQuerySource): DebuggenError {
 }
 
 /**
+ * Whether a value can name a panel: a string with a visible character — the
+ * same test {@link isAddressableSessionId} applies to a session.
+ *
+ * @param panelId - The candidate panel id.
+ * @returns `true` when the id can be forwarded as the request's `panelId`.
+ */
+function isUsablePanelId(panelId: unknown): panelId is string {
+  return typeof panelId === 'string' && panelId.trim() !== '';
+}
+
+/**
+ * The error a query naming an unusable panel identity is refused with, before
+ * anything is sent.
+ *
+ * `PANEL_INVALID`: the panel the node belongs to has no identity a request can
+ * carry, so no capture can be chosen for it — and falling back to a live read
+ * would draw other evidence under that panel's findings. Like
+ * {@link unaddressedQueryError}, a retry would ask with the same identity, so
+ * the reader hint points at a reload and the integration remedy is in the
+ * details. The value itself is never echoed, only its kind.
+ *
+ * @param source - The source of the query that was refused.
+ * @param panelId - The unusable value, described by kind only.
+ * @returns A fresh error.
+ */
+function unusablePanelIdError(source: DataQuerySource, panelId: unknown): DebuggenError {
+  return new DebuggenError(
+    'PANEL_INVALID',
+    `The "${source}" data for this view was requested for a panel with no usable id.`,
+    {
+      hint: UNADDRESSED_QUERY_HINT,
+      details: {
+        source,
+        panelId: typeof panelId === 'string' ? 'a blank string' : describeKind(panelId),
+        remedy: UNUSABLE_PANEL_ID_REMEDY,
+      },
+    },
+  );
+}
+
+/**
+ * The context both factories hand their resolver: the checked session, the
+ * caller's signal and — only when the caller named one — the checked panel id.
+ *
+ * Throws the refusal rather than returning it; both callers are `async`
+ * methods, so the throw is the rejection obligation 8 on {@link DataProvider}
+ * asks for. `panelId` is spread in conditionally so a live read carries no
+ * `panelId` key at all, which is what a resolver that serialises its context
+ * must see.
+ *
+ * @param sessionId - The session the call names.
+ * @param source - The query's source, for the refusal wording.
+ * @param options - The caller's per-call options.
+ * @returns The resolver context.
+ * @throws {DebuggenError} `PROTOCOL_INVALID_MESSAGE` for an unusable session,
+ * `PANEL_INVALID` for a present but unusable panel id.
+ */
+function resolverContext(
+  sessionId: string,
+  source: DataQuerySource,
+  options: DataQueryOptions | undefined,
+): DataQueryResolverContext {
+  if (!isAddressableSessionId(sessionId)) {
+    throw unaddressedQueryError(source);
+  }
+
+  const panelId = options?.panelId;
+  if (panelId !== undefined && !isUsablePanelId(panelId)) {
+    throw unusablePanelIdError(source, panelId);
+  }
+
+  return {
+    sessionId,
+    signal: options?.signal,
+    ...(panelId === undefined ? {} : { panelId }),
+  };
+}
+
+/**
  * Build a {@link DataProvider} from a source-agnostic {@link DataQueryResolver}.
  *
  * Three things are gained by going through here rather than implementing the
@@ -1295,7 +1422,10 @@ function unaddressedQueryError(source: DataQuerySource): DebuggenError {
  * checked with {@link isAddressableSessionId} and passed to the resolver on
  * {@link DataQueryResolverContext}, unchanged. A call naming no usable session
  * is rejected with a code and a hint before the resolver runs, so no transport
- * ever sends a request addressed to nobody.
+ * ever sends a request addressed to nobody. The panel identity travels the same
+ * way: a present `options.panelId` is checked and forwarded on the context as it
+ * stands, an unusable one is rejected with `PANEL_INVALID` before the resolver
+ * runs, and a live read's context carries no `panelId` key.
  *
  * The returned provider is a new object, so create it once per host surface (or
  * per test) and keep the reference: it is part of the query effect's
@@ -1315,11 +1445,7 @@ export function createDataProvider(resolve: DataQueryResolver): DataProvider {
       query: DataQuery & { source: Source },
       options?: DataQueryOptions,
     ): Promise<DataQueryResponse<Source>> {
-      if (!isAddressableSessionId(sessionId)) {
-        throw unaddressedQueryError(query.source);
-      }
-
-      const response = await resolve(query, { sessionId, signal: options?.signal });
+      const response = await resolve(query, resolverContext(sessionId, query.source, options));
 
       const problem = checkDataQueryResponse(query, response);
       if (problem !== undefined) {
@@ -1501,10 +1627,11 @@ export type PanelDataResolver = (
  * host surface whose transport returns the service's body uses.
  *
  * Everything {@link createDataProvider} guarantees holds here too: a call that
- * names no usable session is refused before the resolver runs, the session is
- * handed to the resolver unchanged beside the abort signal, and a resolver
- * that throws synchronously still produces a rejected promise because it is
- * invoked inside an `async` method. The difference is the answer: each result
+ * names no usable session, or a present but unusable panel id, is refused
+ * before the resolver runs, the session and any panel id are handed to the
+ * resolver unchanged beside the abort signal, and a resolver that throws
+ * synchronously still produces a rejected promise because it is invoked inside
+ * an `async` method. The difference is the answer: each result
  * is translated into the view form by {@link mapPanelDataResult}, and a result
  * that fails that mapping — a misrouted source, a payload under the wrong key,
  * a missing or malformed paging counter — rejects with its
@@ -1517,8 +1644,12 @@ export type PanelDataResolver = (
  *
  * @example The DevTools panel over its port to the service worker.
  * ```ts
- * const provider = createPanelDataProvider(async (query, { sessionId, signal }) => {
- *   const body = await port.request({ sessionId, query }, signal);
+ * const provider = createPanelDataProvider(async (query, { sessionId, signal, panelId }) => {
+ *   // The request body is the node's query plus, for a panel-bound read, its panel id.
+ *   const body = await port.request(
+ *     { sessionId, query: panelId === undefined ? query : { ...query, panelId } },
+ *     signal,
+ *   );
  *   const parsed = parseDataResult(body); // from @debuggen/protocol, in the host
  *   if (!parsed.ok) {
  *     throw parsed.error;
@@ -1537,11 +1668,7 @@ export function createPanelDataProvider(resolve: PanelDataResolver): DataProvide
       query: DataQuery & { source: Source },
       options?: DataQueryOptions,
     ): Promise<DataQueryResponse<Source>> {
-      if (!isAddressableSessionId(sessionId)) {
-        throw unaddressedQueryError(query.source);
-      }
-
-      const result = await resolve(query, { sessionId, signal: options?.signal });
+      const result = await resolve(query, resolverContext(sessionId, query.source, options));
       const mapped = mapPanelDataResult(query, result);
 
       if (!mapped.ok) {
@@ -1549,6 +1676,65 @@ export function createPanelDataProvider(resolve: PanelDataResolver): DataProvide
       }
 
       return mapped.value;
+    },
+  };
+}
+
+/**
+ * Bind a {@link DataProvider} to the panel specification being rendered, so
+ * every query made through it names that panel's identity.
+ *
+ * The returned provider delegates each call to `provider` with the same session,
+ * the same query and the same options — `signal` included — and with
+ * `options.panelId` set: the call's own `panelId` when it names one, otherwise
+ * the bound `panelId`. That is what makes every node of a rendered panel read
+ * the capture that panel was generated from rather than live evidence, without
+ * any node, `./useQuery` or `PanelHost` having to know the panel's id: the
+ * surface that renders the specification wraps its long-lived provider once
+ * per panel and hands the wrapper to `PanelHost`.
+ *
+ * The input provider is not touched, so the same long-lived provider keeps
+ * serving live reads elsewhere on the surface. The wrapper is a new object:
+ * memoize it on the provider and the panel id (obligation 7 on
+ * {@link DataProvider}), which also means a newly rendered panel version gets a
+ * new wrapper and its views resolve again against their own capture.
+ *
+ * Binding never throws, so a render cannot crash on it. A bound or per-call
+ * `panelId` that cannot name a panel — not a string, or blank — is refused at
+ * query time instead, with a `PANEL_INVALID` rejection, before `provider` is
+ * called: silently dropping it would turn a panel-bound read into a live one.
+ *
+ * @example Binding in the surface that renders a specification.
+ * ```tsx
+ * const panelProvider = useMemo(
+ *   () => (spec === undefined ? dataProvider : bindPanelIdentity(dataProvider, spec.id)),
+ *   [dataProvider, spec?.id],
+ * );
+ * return <PanelHost spec={spec} dataProvider={panelProvider} actions={actions} />;
+ * ```
+ *
+ * @param provider - The provider to delegate to. Not modified.
+ * @param panelId - The id of the panel specification the provider's queries
+ * belong to: the rendered `PanelSpec`'s own `id`.
+ * @returns A provider that forwards every query to `provider` with `panelId` set.
+ */
+export function bindPanelIdentity(provider: DataProvider, panelId: string): DataProvider {
+  return {
+    async query<Source extends DataQuerySource>(
+      sessionId: string,
+      query: DataQuery & { source: Source },
+      options?: DataQueryOptions,
+    ): Promise<DataQueryResponse<Source>> {
+      // An explicit `undefined` check rather than `??`, so a per-call `null`
+      // from an untyped caller is refused below instead of quietly replaced.
+      const requested: unknown = options?.panelId;
+      const effective = requested === undefined ? panelId : requested;
+
+      if (!isUsablePanelId(effective)) {
+        throw unusablePanelIdError(query.source, effective);
+      }
+
+      return provider.query(sessionId, query, { ...options, panelId: effective });
     },
   };
 }

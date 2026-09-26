@@ -854,7 +854,9 @@ export const DEFAULT_MAX_REPAIRS = 2;
  * - `'normalize'` — output passed the schema and the caller's deterministic
  *   normaliser then threw. **A product bug, never the model's fault**: the
  *   normaliser's input was valid by construction, so re-prompting cannot help.
- *   It is logged with the offending input and rejected without a retry.
+ *   It is logged once, with closed fields only (provenance, counts, the thrown
+ *   error's code and failure class) — never the parsed input or the thrown
+ *   message — and rejected without a retry.
  */
 export type StructuredRejectionReason = 'provider' | 'schema' | 'normalize' | 'empty';
 
@@ -891,8 +893,9 @@ export type StructuredRejectionReason = 'provider' | 'schema' | 'normalize' | 'e
  *   the authoring schema had already accepted, so its failure says something is
  *   wrong in the normaliser or in the schema — not in the model's answer.
  *   Re-prompting would hide a defect behind an identical second failure, so the
- *   call is rejected immediately, with the input logged for whoever has to fix
- *   it.
+ *   call is rejected immediately. The failure is logged with closed fields only
+ *   — never the parsed input, which is model-authored prose — and the thrown
+ *   value travels on as the rejection's `cause` for whoever has to fix it.
  *
  * Either way the caller gets a typed rejection and falls back to a
  * deterministic artifact assembled from the captured evidence, which the user

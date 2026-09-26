@@ -927,6 +927,64 @@ export const captureRecordSchema = z.strictObject({
 export type CaptureRecord = z.infer<typeof captureRecordSchema>;
 
 /**
+ * The three-letter kind prefix of a follow-up attempt id, for
+ * `@debuggen/shared`'s `newId`: `newId(FOLLOW_UP_ATTEMPT_ID_PREFIX)` →
+ * `fua_4k2p9dq7m1zx0c3v`.
+ *
+ * Declared here rather than in `@debuggen/shared`'s `ID_PREFIXES` because an
+ * attempt id is minted by the two parties of `session.question` — the editor's
+ * session view for every new ask, and the service when a request carries none
+ * — and this package is the contract both of them read; the id body still comes
+ * from the shared CSPRNG-backed generator. The prefix only makes the id
+ * recognisable in a log or a store row: {@link followUpAttemptIdSchema} checks
+ * shape alone, for the reason {@link MAX_ID_LENGTH} gives.
+ */
+export const FOLLOW_UP_ATTEMPT_ID_PREFIX = 'fua';
+
+/**
+ * The identity of one follow-up **attempt**: an opaque, bounded, single-line id
+ * that names one question the developer asked, across every time it is sent.
+ *
+ * ## Why a follow-up needs an identity of its own
+ *
+ * A follow-up is recorded when it is asked, before anything answers it, and a
+ * follow-up that then fails is retried. Neither the question text nor the time
+ * it was asked can tell a retry from a new question: comparing text is exactly
+ * the question-matching AAP §0.5.4 forbids, and two asks in the same
+ * millisecond share an `askedAt`. So the client mints one id per question it
+ * asks and **resends the same id on a Retry**; a new question — reworded or
+ * not — always gets a new one. The service keys the idempotency of
+ * `session.question` on it: an id it has not recorded is a new follow-up; an
+ * id naming the latest, still unanswered follow-up is a retry of that attempt,
+ * recorded in place rather than appended; an id naming an answered or an
+ * earlier follow-up is refused as the duplicate it is.
+ *
+ * Shape only, like every identifier in this package: the kind prefix
+ * ({@link FOLLOW_UP_ATTEMPT_ID_PREFIX}) is how the product mints it, not a rule
+ * a transport enforces.
+ */
+export const followUpAttemptIdSchema = z
+  .string()
+  .min(1, { error: 'expected a non-empty follow-up attempt id' })
+  .max(MAX_ID_LENGTH, {
+    error: `expected a follow-up attempt id of at most ${String(MAX_ID_LENGTH)} characters`,
+  })
+  .refine(isSingleLineText, {
+    error: 'expected a follow-up attempt id with no control characters',
+  });
+
+/** A validated follow-up attempt id; see {@link followUpAttemptIdSchema}. */
+export type FollowUpAttemptId = z.infer<typeof followUpAttemptIdSchema>;
+
+/**
+ * How many times one follow-up attempt has been asked: an integer of at least
+ * **1**. `1` when the attempt is first recorded; each retry of it recorded in
+ * place adds one, which is what lets a caller tell "this ask was recorded" from
+ * "an earlier ask of the same attempt was" without comparing timestamps.
+ */
+const attemptCounterSchema = z.int().min(1, { error: 'expected an attempt counter of at least 1' });
+
+/**
  * A follow-up question and what came of it — the `followups` table row
  * (AAP §0.4.2).
  *
@@ -956,13 +1014,36 @@ export type CaptureRecord = z.infer<typeof captureRecordSchema>;
  * Every outcome link is optional because a follow-up is recorded when it is
  * asked, before any of them exists — and a follow-up that failed keeps the
  * links it reached and no more.
+ *
+ * `attemptId` and `attempt` identify the ask itself (see
+ * {@link followUpAttemptIdSchema}): a Retry of a failed follow-up replaces the
+ * entry in place — same position, same `attemptId`, `attempt` one higher, the
+ * retry's own `askedAt` — so the ladder and the `followups` table hold one
+ * entry per question asked, never one per send.
  */
 export const followUpRecordSchema = z.strictObject({
   /** The developer's follow-up question, plain text (see {@link questionSchema}). */
   question: questionSchema,
 
-  /** When it was asked, in Unix epoch milliseconds. */
+  /** When it was asked, in Unix epoch milliseconds; a retry records its own time. */
   askedAt: epochMsSchema,
+
+  /**
+   * The identity of the attempt this entry records (see
+   * {@link followUpAttemptIdSchema}). Unique within one session's ladder.
+   *
+   * Optional only so a follow-up stored before attempts carried an identity
+   * still parses when its session is reopened. The service writes it on every
+   * follow-up it records now, together with {@link attempt}: a producer sets
+   * both or neither.
+   */
+  attemptId: followUpAttemptIdSchema.optional(),
+
+  /**
+   * How many times this attempt has been asked: `1` when first recorded, one
+   * more for each retry recorded in place. Present exactly when `attemptId` is.
+   */
+  attempt: attemptCounterSchema.optional(),
 
   /**
    * What the follow-up stage decided: whether answering required a new capture.
@@ -999,6 +1080,66 @@ export const followUpRecordSchema = z.strictObject({
  * and the VS Code `FollowUp` component.
  */
 export type FollowUpRecord = z.infer<typeof followUpRecordSchema>;
+
+/**
+ * The outcome links of a {@link FollowUpRecord}: the members the follow-up
+ * stage stamps once it has answered, as opposed to the four that describe the
+ * ask (`question`, `askedAt`, `attemptId`, `attempt`).
+ *
+ * Frozen and `as const`; {@link FollowUpOutcomeKeysExhaustive} proves at
+ * compile time that the tuple names every outcome member of the record, so a
+ * link added to {@link followUpRecordSchema} without being listed here fails
+ * `tsc -b` in this module rather than being ignored by
+ * {@link isFollowUpAnswered}.
+ */
+export const FOLLOW_UP_OUTCOME_KEYS = Object.freeze([
+  'needsNewCapture',
+  'planVersion',
+  'captureId',
+  'analysisId',
+  'panelId',
+] as const satisfies readonly (keyof FollowUpRecord)[]);
+
+/** One of {@link FOLLOW_UP_OUTCOME_KEYS}. */
+export type FollowUpOutcomeKey = (typeof FOLLOW_UP_OUTCOME_KEYS)[number];
+
+/**
+ * Whether a recorded follow-up has been answered: it carries at least one
+ * outcome link ({@link FOLLOW_UP_OUTCOME_KEYS}).
+ *
+ * Presence is checked, never truth: `needsNewCapture: false` is a decision,
+ * and a decided follow-up is answered. An unanswered follow-up is one the
+ * stage recorded and then did not finish — the only kind a Retry may resend
+ * under its own `attemptId`. Reads no question text (AAP §0.5.4).
+ *
+ * @param followUp A follow-up from a session's ladder.
+ * @returns `true` once any outcome link is present.
+ *
+ * @example
+ * ```ts
+ * isFollowUpAnswered({ question, askedAt, attemptId, attempt: 1 });        // → false
+ * isFollowUpAnswered({ question, askedAt, needsNewCapture: false });       // → true
+ * ```
+ */
+export function isFollowUpAnswered(followUp: FollowUpRecord): boolean {
+  return FOLLOW_UP_OUTCOME_KEYS.some((key) => followUp[key] !== undefined);
+}
+
+/**
+ * Compile-time proof that {@link FOLLOW_UP_OUTCOME_KEYS} and the ask members
+ * together are exactly the keys of {@link FollowUpRecord}.
+ *
+ * Exported for the reason {@link SessionRecordEmbeddedShapesPreserved} is; it
+ * has no runtime representation.
+ *
+ * @internal
+ */
+export type FollowUpOutcomeKeysExhaustive = AssertTrue<
+  MutuallyAssignable<
+    Exclude<keyof FollowUpRecord, 'question' | 'askedAt' | 'attemptId' | 'attempt'>,
+    FollowUpOutcomeKey
+  >
+>;
 
 /**
  * The session's cleanup state: whether the developer's working tree has been

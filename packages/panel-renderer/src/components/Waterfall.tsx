@@ -31,7 +31,7 @@
  * sentence in its description naming the parent that could not be resolved
  * (AAP 0.4.2: orphans are evidence, never dropped and never disguised). The
  * verdict is the flag the service persisted on the flat record, honoured only
- * while the parent the record names is absent from what is loaded, because a
+ * while the parent the record names is absent from what is held, because a
  * parent that resolves proves the flag stale. A call lifted to the top level
  * through an undrawn re-attached call carries that call's verdict, stated as
  * inherited. The grouped `requests` result carries no correlation verdict, so
@@ -79,6 +79,28 @@
  * whose own kind filter shares no kind with the ones drawn here issues no query
  * at all, because no page could ever hold a row.
  *
+ * ## Bounded however far it is paged
+ *
+ * Three costs grow with a capture, and each has its own bound:
+ *
+ *   - **Folding, not rebuilding.** Each settled page is folded into indexes
+ *     that persist across "Load more" (see "The held flat records" below):
+ *     only the page's own records, and the held rows whose ancestry a new or
+ *     departing span can change, are resolved. A call drawn at the top level
+ *     because its parent was not loaded still moves under that parent when a
+ *     later page supplies it.
+ *   - **Holding, within a budget.** At most {@link RETAINED_ITEM_BUDGET} source
+ *     items are held; past it the oldest pages are released, and the footer
+ *     says which positions of the result are held and how many were loaded
+ *     before them. Released calls were captured, and are never presented as
+ *     missing.
+ *   - **Mounting, within a window.** The rows a reader can reach are flattened
+ *     into one list, and the tree mounts at most {@link WATERFALL_ROW_BUDGET}
+ *     of them at once; Previous and Next rows move the window, the footer
+ *     states which rows are shown of how many, and the keyboard pages the
+ *     window when it steps past either edge. Expansion is kept by record id, so
+ *     it survives every window move.
+ *
  * ## Calls still in flight
  *
  * A request that had started and not settled when the capture ended arrives as
@@ -114,20 +136,28 @@
  *     disclosure are reported through the ambient actions, which may be absent —
  *     every call site chains optionally and an affordance that would lead nowhere
  *     is not rendered as a control.
- *   - **Bars are never measured; only the axis's tick density is.** The time
- *     scale's range is a percentage interval, so every bar, every tick
- *     position and every row is relational and correct before layout, with no
- *     measurement behind it. The one decision that cannot be relational is how
- *     MANY tick labels fit: six labels that read well across a wide panel run
- *     together across a phone-width strip. So `WaterfallAxis` alone measures
- *     its own `<svg>` — its inline size in a layout effect and again through a
- *     `ResizeObserver`, its font size from the computed style — and thins the
- *     tick target until the estimated label boxes no longer overlap (see
- *     {@link fitAxisTicks}). Where nothing can be measured — the colocated
- *     suite under happy-dom, where every measurement answers zero, and
- *     `host/registry.test.ts`, which renders this component against a recorded
- *     `spans` response — the axis keeps its full, unmeasured tick set, so the
- *     view still works from data alone.
+ *   - **No geometry is measured.** The time scale's range is a percentage
+ *     interval, so every bar, every tick position and every row is relational
+ *     and correct before layout. How MANY tick labels the axis carries is
+ *     decided from the data alone as well: {@link fitAxisTicks} draws the
+ *     densest tick set whose labels — sized by `../utils/format`'s
+ *     `estimateTextWidth`, in ems — stay clear of each other on a fixed
+ *     logical design strip {@link AXIS_DESIGN_WIDTH_EM} ems wide. The
+ *     stylesheet guarantees that no real strip is narrower: the row grid
+ *     floors the time track at a token-derived minimum at or above the
+ *     strip, the axis row shares that grid, and a panel narrower than a
+ *     row's resulting minimum scrolls the axis and the rows horizontally
+ *     together in `.dg-waterfall__viewport` (the footer stays outside it)
+ *     rather than squeezing the track. Tick positions grow with the strip
+ *     while label extents do not, so a set that is legible at that width is
+ *     legible on every strip drawn. This file reads no element's size,
+ *     observes no resize and consults no computed style, so the chart draws
+ *     the same from the same data in a browser, in a panel of any width and
+ *     in the layout-free DOM the colocated suite and `host/registry.test.ts`
+ *     render it in. (The one placement this view delegates — where the shared
+ *     `Tooltip` primitive opens its bubble, below — is the primitive's, and
+ *     places a popover, never a bar, a tick or a row. An open bubble is fixed
+ *     to the browser viewport, so the scroll viewport never clips it.)
  *   - **Zero hardcoded CSS values.** Colour comes from `../utils/color` as token
  *     references, geometry from `../utils/scale` as unitless numbers, and the
  *     inline style of a bar is the `--dgc-*` custom properties the stylesheet's
@@ -151,11 +181,13 @@
  * ## Accessibility
  *
  * The row list is the keyboard-reachable representation of the chart and is a
- * `role="tree"` of `role="treeitem"` rows: each row carries `aria-level` and —
- * when it has children — `aria-expanded`, and owns its child group through
- * `aria-owns` (the group is a DOM sibling because the row itself is the
- * three-column grid the stylesheet defines, and a fourth grid child would land
- * in the label column). Each row names itself with `aria-label`, so what is
+ * `role="tree"` of `role="treeitem"` rows: each row carries `aria-level`,
+ * `aria-posinset` and `aria-setsize` — stated outright, because the mounted
+ * window may hold only some of a row's siblings — and, when it has children,
+ * `aria-expanded`; it owns its mounted child group through `aria-owns` (the
+ * group is a DOM sibling because the row itself is the three-column grid the
+ * stylesheet defines, and a fourth grid child would land in the label column).
+ * Each row names itself with `aria-label`, so what is
  * announced is the label, what the call was, how far into the window it
  * started and how long it took, rather than the truncated label and the
  * tooltip's copy of it. The bar layer is `aria-hidden`, which the guidance
@@ -167,12 +199,15 @@
  * flight a "Pending" badge and the words "at least" before its duration.
  *
  * The tree is ONE composite widget, so it is ONE stop in the page's Tab order —
- * a roving tab index: exactly one visible row carries `tabIndex={0}` and every
+ * a roving tab index: exactly one mounted row carries `tabIndex={0}` and every
  * other row `-1`. The stop starts on the first top-level row, follows focus to
- * whichever row last received it, and falls back to the nearest visible
- * ancestor when a collapse hides the row that held it (see
- * {@link resolveTabStop}). Tab from any row therefore leaves the tree, and Tab
- * back into it lands on the row that was left. The keyboard model, in full:
+ * whichever row last received it, falls back to the nearest visible ancestor
+ * when a collapse hides the row that held it, and to the window's first row
+ * when the window moved away from it (see {@link resolveTabStop}). Tab from any
+ * row therefore leaves the tree, and Tab back into it lands on the row that was
+ * left. The keyboard model, in full — every move is over the whole list of
+ * visible rows, and one that lands outside the mounted window moves the window
+ * to it:
  *
  *   - **ArrowDown / ArrowUp** — the next and previous visible row.
  *   - **ArrowRight** — open a closed row, then step into its first child.
@@ -209,6 +244,7 @@ import type { DataQuery, WaterfallNode } from '@debuggen/panel-schema';
 import {
   DATA_QUERY_DEFAULT_LIMIT,
   DATA_QUERY_DEFAULT_OFFSET,
+  DATA_QUERY_MAX_LIMIT,
   catalogEntryFor,
 } from '@debuggen/panel-schema';
 import type { SourceLocation } from '@debuggen/shared';
@@ -226,7 +262,7 @@ import type {
 } from '@debuggen/telemetry';
 import clsx from 'clsx';
 import { ChartNoAxesGantt, ChevronDown, ChevronRight, Hourglass } from 'lucide-react';
-import { useCallback, useId, useMemo, useRef, useState, useLayoutEffect } from 'react';
+import { Fragment, useCallback, useId, useMemo, useRef, useState, useLayoutEffect } from 'react';
 import type {
   CSSProperties,
   FocusEvent,
@@ -234,7 +270,6 @@ import type {
   MouseEvent,
   ReactElement,
   ReactNode,
-  RefObject,
 } from 'react';
 
 import { Stack } from '../layout/Stack';
@@ -254,11 +289,11 @@ import { Kbd } from '../primitives/Kbd';
 import { LoadingState } from '../primitives/LoadingState';
 import { Text } from '../primitives/Text';
 import { Tooltip } from '../primitives/Tooltip';
-import { DESIGN_TOKENS } from '../tokens/tokens';
 import { kindColorVar } from '../utils/color';
 import {
   NOT_AVAILABLE_LABEL,
   countedNoun,
+  estimateTextWidth,
   formatBytes,
   formatCount,
   formatCountOf,
@@ -276,9 +311,14 @@ import {
   DEFAULT_ROW_HEIGHT,
   createTimeScale,
   generateAxisTicks,
+  nextWindowStart,
   placeOffsetSpan,
+  previousWindowStart,
+  windowContains,
+  windowRows,
+  windowStartFor,
 } from '../utils/scale';
-import type { AxisTick, TimeScale } from '../utils/scale';
+import type { AxisTick, RowWindow, TimeScale } from '../utils/scale';
 import { SourceLink } from './SourceLink';
 
 /* ---------------------------------------------------------------------------
@@ -361,17 +401,16 @@ const ORPHANED_PARENT_SPAN_ID_KEY = 'orphanedParentSpanId';
  * numbers `../utils/scale` returns are consumed as percentages of the track, the
  * track takes its width from the row's grid template, and every bar and tick
  * position is right on the first paint and after every resize with no observer
- * involved. (The axis observes its own width for one decision only — how many
- * tick labels fit — never for a position; see {@link fitAxisTicks}.)
+ * involved. How many tick labels are drawn is decided without a width too
+ * (see {@link fitAxisTicks}).
  */
 const PERCENT_RANGE = 100;
 
 /**
  * How many axis ticks to aim for; `generateAxisTicks` rounds to a nice step.
  *
- * The densest the axis gets, and the whole of it while the strip cannot be
- * measured. A measured strip starts here and asks for fewer until its labels
- * fit (see {@link fitAxisTicks}).
+ * The densest the axis asks for. {@link fitAxisTicks} starts here and asks for
+ * fewer until the labels clear each other on the design strip.
  */
 const AXIS_TICK_TARGET = 6;
 
@@ -383,51 +422,43 @@ const AXIS_TICK_TARGET = 6;
 const AXIS_TICK_MIN_SPACING = PERCENT_RANGE / AXIS_TICK_TARGET;
 
 /**
- * The estimated advance of one tick-label character, in ems: 0.6.
+ * The font size at which `estimateTextWidth` answers in ems: one.
  *
- * A tick label is a compact duration — digits, a decimal point, a space and a
- * unit (`0 ms`, `470 µs`, `1.2 s`) — and 0.6 em is the advance of every glyph
- * in a monospaced face and an upper bound on the average advance of those
- * characters in the UI sans-serif stack, where only the `m` of `ms` is wider
- * and the digits, the point and the space are narrower. Over-estimating is the
- * safe direction: it can drop a tick that would just have fitted, never draw
- * two labels into each other. An estimate rather than a text measurement
- * because the candidate tick sets differ in their labels, and measuring each
- * would mean rendering labels that are then thrown away.
+ * The axis fit is carried out entirely in ems of the label's own font — label
+ * extents, the gap between labels and the design strip alike — so it assumes
+ * no pixel size for the `xs` type role the strip is set in, and stays exact
+ * in every theme and at every user font scale.
  */
-const AXIS_LABEL_GLYPH_EM = 0.6;
+const EM_FONT_SIZE = 1;
 
 /** The clear space kept between two neighbouring tick labels, in ems: one. */
 const AXIS_LABEL_GAP_EM = 1;
 
 /**
- * The first pixel length in a CSS `font` shorthand — its font size, since the
- * weight before it is unitless and the line height after it follows a slash.
- */
-const FONT_SHORTHAND_SIZE = /(\d+(?:\.\d+)?)px/u;
-
-/**
- * The font size of the `xs` type role the axis strip is set in, in pixels, read
- * from the token table rather than restated: `DESIGN_TOKENS.dark.textXs` is the
- * value `--dg-text-xs` is generated from, and the role is the same in every
- * theme (AAP 0.6.3). The fallback for a host whose computed style reports no
- * usable size; `undefined` only if the token stopped being a pixel shorthand,
- * in which case the axis is treated as unmeasurable rather than guessed at.
- */
-const XS_FONT_PX: number | undefined = fontPxOfShorthand(DESIGN_TOKENS.dark.textXs);
-
-/**
- * The font size a CSS `font` shorthand declares, in pixels.
+ * The width of the logical strip the tick labels are fitted to, in ems of the
+ * label font: 14.
  *
- * @param shorthand A shorthand such as `400 11px/16px var(--dg-font-ui)`.
- * @returns The size, or `undefined` when the shorthand carries no positive
- * pixel size.
+ * No track the axis is drawn on is narrower, and that is guaranteed rather
+ * than estimated: the stylesheet's row grid gives the time track a minimum
+ * derived from the space tokens (`.dg-waterfall__row` in
+ * `../styles/components.css`, seven units of `--dg-space-7`: 168 pixels,
+ * above the 154 pixels fourteen ems of the `xs` role come to at its size in
+ * the token table), and the axis row is laid out on that same grid. The
+ * colocated suite reads that minimum from the stylesheet and holds it at or
+ * above this width in every theme.
+ *
+ * Nothing here reads the real width: the labels are placed against this strip
+ * once, from the scale alone, and every real strip is at least this wide, so
+ * it only moves the ticks further apart while the labels keep their extent —
+ * a set whose labels clear each other at this width clears each other on
+ * every strip actually drawn, and the same data always draws the same axis. A
+ * panel narrower than a row's resulting minimum does not squeeze the strip:
+ * the axis and the rows scroll horizontally together in
+ * `.dg-waterfall__viewport`, which holds the axis row and the top-level rows
+ * at one inline size, so the strip lines up with their tracks while it
+ * scrolls exactly as it does when nothing scrolls.
  */
-function fontPxOfShorthand(shorthand: string): number | undefined {
-  const match = FONT_SHORTHAND_SIZE.exec(shorthand);
-  const size = match?.[1] === undefined ? Number.NaN : Number.parseFloat(match[1]);
-  return Number.isFinite(size) && size > 0 ? size : undefined;
-}
+const AXIS_DESIGN_WIDTH_EM = 14;
 
 /** The axis strip's height, in the same unitless SVG geometry as the row rhythm. */
 const AXIS_HEIGHT = DEFAULT_ROW_HEIGHT;
@@ -450,6 +481,42 @@ const MAX_ROW_DEPTH = 24;
 
 /** How many parent hops to follow when looking for an included ancestor. */
 const MAX_ANCESTOR_HOPS = 64;
+
+/**
+ * The most rows the tree mounts at once: 200.
+ *
+ * A waterfall row is not a bar. It is the stylesheet's three-column grid
+ * holding a disclosure button, badges, a label with its tooltip, a source
+ * chip, a track and a duration cell — some thirty to forty elements with their
+ * handlers. `../utils/scale`'s absolute budget (`MAX_DRAWN_ROWS`, 2 000) is
+ * sized for SVG bars and invites a view with heavier rows to pass a smaller
+ * budget of its own; a tenth of it keeps the mounted tree to a few thousand
+ * elements however many calls are held and however many rows are expanded,
+ * and still holds a default-sized page of top-level calls in one window.
+ *
+ * Rows past the window are not dropped. The flattened list of every visible
+ * row is kept, the window moves over it — the Previous and Next row controls,
+ * or the keyboard stepping past either edge — and the footer states which rows
+ * are shown of how many (see {@link windowRows}).
+ */
+const WATERFALL_ROW_BUDGET = 200;
+
+/**
+ * The most source items — flat records, or request groups — the view holds at
+ * once: 10 000, twice the largest page a query may ask for
+ * (`DATA_QUERY_MAX_LIMIT`).
+ *
+ * "Load more" appends pages, and without a ceiling a long capture paged to its
+ * end would hold every record it ever loaded. Past this budget the OLDEST held
+ * pages are released — never the page that just arrived — so the view always
+ * holds the newest page and, even at the largest page size, the page before
+ * it, which is where the parent of a call on the newest page usually is. What
+ * was released is stated, never presented as not captured: the footer says
+ * which positions of the result are held and how many were loaded before them
+ * (see {@link describeRetention}), and a persisted re-attachment flag whose
+ * parent is not held is no longer described as a parent that never arrived.
+ */
+const RETAINED_ITEM_BUDGET = 2 * DATA_QUERY_MAX_LIMIT;
 
 /** How much of a redacted URL or statement a row shows before it is elided. */
 const LABEL_PREVIEW_LENGTH = 120;
@@ -597,7 +664,7 @@ function resolveIncludedKinds(
  * records only THAT the parent was unresolvable — never which of the
  * correlator's cases applied — so no reason is carried or claimed here.
  */
-interface WaterfallOrphan {
+interface PersistedOrphan {
   /** The parent id that could not be resolved, when one was recorded. */
   readonly missingParentSpanId: string | undefined;
   /**
@@ -609,8 +676,25 @@ interface WaterfallOrphan {
 }
 
 /**
- * One drawn row: a call, its measured place in the window, and the calls that
- * ran inside it.
+ * A {@link PersistedOrphan} as a drawn row states it.
+ *
+ * The flag is honoured only while the parent it names is absent from the
+ * records held. Before anything is released that absence is proof the parent
+ * never arrived; once pages have been released to stay within
+ * {@link RETAINED_ITEM_BUDGET}, the parent may have been among them, so the row
+ * says only what is still known — that the parent is not held — rather than
+ * claiming it never arrived.
+ */
+interface WaterfallOrphan extends PersistedOrphan {
+  /** Set when records were released, so the parent's absence proves nothing more. */
+  readonly unverified: boolean;
+}
+
+/**
+ * One drawn row: a call, its measured place in the window, and how many calls
+ * ran inside it. Built only for the rows the tree mounts (see
+ * {@link WATERFALL_ROW_BUDGET}); the held records themselves live in the
+ * indexes below.
  *
  * Every member is required and nullable rather than optional, which under
  * `exactOptionalPropertyTypes` keeps the builders free of conditional spreads
@@ -675,42 +759,43 @@ interface WaterfallRow {
   readonly lineageCandidates: readonly string[];
   /** Set when the call was re-attached to the top level; see {@link WaterfallOrphan}. */
   readonly orphan: WaterfallOrphan | undefined;
-  /** Set when this row's own children were cut by the depth bound. */
+  /** Set when this row's own children were cut by the depth bound or by the payload. */
   readonly childrenTruncated: boolean;
-  /** The calls that ran inside this one. */
-  readonly children: readonly WaterfallRow[];
+  /**
+   * How many rows are nested directly under this one and can be disclosed:
+   * the calls that ran inside it, or a group's occurrences. `0` for a leaf and
+   * for a row whose children the depth bound cut.
+   */
+  readonly childCount: number;
 }
 
-/** The whole drawable model of one page of one source. */
-interface WaterfallModel {
-  /** The top-level rows, in start-time order. */
-  readonly rows: readonly WaterfallRow[];
+/**
+ * What the held records amount to as a chart: the window every offset is
+ * measured from, how many rows the whole held tree holds, and whether any of
+ * it was cut. Computed once per fold, not per render, and never from the rows
+ * that happen to be mounted.
+ */
+interface HeldSummary {
   /** The window's start, in epoch milliseconds; every offset is relative to it. */
   readonly viewStart: number;
   /** The window's end, in epoch milliseconds. */
   readonly viewEnd: number;
   /** The window's extent, in milliseconds. */
   readonly windowMs: number;
-  /** How many rows the model holds in total, children included. */
+  /** How many rows the held tree holds, collapsed subtrees included. */
   readonly rowCount: number;
-  /** How many top-level rows the model holds. */
-  readonly topLevelCount: number;
   /** Set when a subtree was cut, either by the depth bound or by the payload. */
   readonly truncated: boolean;
 }
 
-const EMPTY_ROWS: readonly WaterfallRow[] = [];
 const EMPTY_STRINGS: readonly string[] = [];
-const EMPTY_EVENTS: readonly TelemetryEvent[] = [];
-const EMPTY_GROUPS: readonly RequestGroup[] = [];
+const EMPTY_IDS: readonly string[] = [];
 
-const EMPTY_MODEL: WaterfallModel = {
-  rows: EMPTY_ROWS,
+const EMPTY_SUMMARY: HeldSummary = {
   viewStart: 0,
   viewEnd: 0,
   windowMs: 0,
   rowCount: 0,
-  topLevelCount: 0,
   truncated: false,
 };
 
@@ -835,71 +920,152 @@ function compareEvents(left: TelemetryEvent, right: TelemetryEvent): number {
   return compareByStartThenId(left.startTime, left.id, right.startTime, right.id);
 }
 
-function compareRows(left: WaterfallRow, right: WaterfallRow): number {
-  return compareByStartThenId(left.startTime, left.eventId, right.startTime, right.eventId);
+/**
+ * Merges ids into a list already in drawing order: drops the ids leaving it,
+ * sorts the ids joining it and interleaves the two, so a fold costs the list's
+ * length plus the joiners' sort — never a re-sort of everything held.
+ *
+ * @param base The list as it was, in drawing order.
+ * @param leaving Ids to drop, when any.
+ * @param joining Ids to add, in any order, when any.
+ * @param compare The drawing order.
+ * @returns The new list, in drawing order.
+ */
+function mergeOrdered(
+  base: readonly string[],
+  leaving: ReadonlySet<string> | undefined,
+  joining: readonly string[] | undefined,
+  compare: (left: string, right: string) => number,
+): readonly string[] {
+  const kept = leaving === undefined ? base : base.filter((id) => !leaving.has(id));
+  if (joining === undefined || joining.length === 0) {
+    return kept;
+  }
+  const incoming = [...joining].sort(compare);
+  const merged: string[] = [];
+  let keptAt = 0;
+  let incomingAt = 0;
+  while (keptAt < kept.length || incomingAt < incoming.length) {
+    const left = kept[keptAt];
+    const right = incoming[incomingAt];
+    if (right === undefined || (left !== undefined && compare(left, right) <= 0)) {
+      if (left !== undefined) {
+        merged.push(left);
+      }
+      keptAt += 1;
+    } else {
+      merged.push(right);
+      incomingAt += 1;
+    }
+  }
+  return merged;
 }
 
 /* ---------------------------------------------------------------------------
- * Building the model from a flat page of records (`spans`)
+ * The held flat records (`spans`), folded one page at a time
+ *
+ * A flat page is nested by ancestry: a drawn record sits under its nearest
+ * DRAWN ancestor, found by walking `parentSpanId` links through every held
+ * record — drawn or not — which is what keeps a statement under the server
+ * request that issued it when the function span between them is a kind this
+ * view does not draw. Links are resolved within a record's own trace: a
+ * `parentSpanId` names a span of the same trace, so every lookup is keyed by
+ * trace and span together.
+ *
+ * The records are not rebuilt into a tree per page. They are FOLDED into
+ * indexes that persist across "Load more": each held record by id, the records
+ * holding each span key, where every drawn record was placed, the drawn
+ * children of each drawn record, and the top-level rows. A fold resolves only
+ * what can have changed — the page's own records, and the held records whose
+ * ancestry walk looked up a span key whose holder the fold changed. That
+ * second set is what keeps re-parenting exact: a call drawn at the top level
+ * because its parent was not loaded moves under that parent the moment a
+ * later page supplies it (or supplies the undrawn span between them), and a
+ * call whose parent is released moves back to the top level. Every walk
+ * records the keys it looked up, so the index knows precisely which rows a new
+ * or departing key can move; nothing else is revisited, no row object is
+ * built, and no attribute is read again. A fold does copy the index's
+ * reference tables — it is a pure function of the previous index, which React
+ * may render twice — and that copy is bounded by {@link RETAINED_ITEM_BUDGET}.
+ *
+ * A record another page already supplied is held once, by its id: a page
+ * sequence over a capture that is still growing can repeat a record, and a
+ * record drawn twice would be two rows claiming one call. The newest page that
+ * supplied it is remembered, so releasing an older page never releases a
+ * record a held page still carries.
  * ------------------------------------------------------------------------- */
 
-/** Mutable counters threaded through a build, so a cut is always reported. */
-interface BuildState {
-  rowCount: number;
-  truncated: boolean;
+/** A held record, and the newest held page that supplied it. */
+interface HeldRecord {
+  readonly event: TelemetryEvent;
+  /** The {@link HeldPage.seq} of the newest page that carried this record. */
+  readonly seq: number;
 }
 
-/** Where a record's parent chain led, within the records loaded so far. */
-interface Ancestry {
-  /** The nearest ancestor this view draws; `undefined` for a top-level row. */
-  readonly drawn: TelemetryEvent | undefined;
+/** Where one drawn record sits, and what its placement was read from. */
+interface SpanPlacement {
+  /** The drawn ancestor it is nested under; `undefined` for a top-level row. */
+  readonly parentId: string | undefined;
+  /** The persisted re-attachment verdict that still holds; top-level rows only. */
+  readonly orphan: PersistedOrphan | undefined;
   /**
-   * For a top-level row, the last record of the page the chain passed through
-   * before it ended — undrawn by construction — or `undefined` when the chain
-   * ended at the record itself. The one ancestor whose persisted orphan flag
-   * can still be current (see {@link persistedOrphan}), because every record
-   * below it on the chain has a parent the page holds.
+   * Every span key the placement looked up: the record's own, each ancestor
+   * the walk visited or failed to find, and the parents the orphan verdict
+   * checked. The placement is a function of the first holders of exactly these
+   * keys, so a change to any of them is what re-places the record.
    */
-  readonly liftedThrough: TelemetryEvent | undefined;
+  readonly keys: readonly string[];
 }
+
+/** The held flat records and the tree they form. Never mutated once built. */
+interface SpanIndex {
+  /** Every held record, by record id. */
+  readonly records: ReadonlyMap<string, HeldRecord>;
+  /** The held records carrying each span key, in load order; the first one resolves it. */
+  readonly holders: ReadonlyMap<string, readonly TelemetryEvent[]>;
+  /** The same, restricted to the kinds this view draws. */
+  readonly drawnHolders: ReadonlyMap<string, readonly TelemetryEvent[]>;
+  /** Where each held drawn record is placed, by record id. */
+  readonly placements: ReadonlyMap<string, SpanPlacement>;
+  /** The drawn records whose placement looked up each span key. */
+  readonly dependents: ReadonlyMap<string, ReadonlySet<string>>;
+  /** The drawn records nested directly under each drawn record, in drawing order. */
+  readonly children: ReadonlyMap<string, readonly string[]>;
+  /** The top-level drawn records, in drawing order. */
+  readonly roots: readonly string[];
+  /** The earliest drawn start, or `+Infinity` while nothing is drawn. */
+  readonly viewStart: number;
+  /** The latest drawn end, or `-Infinity` while nothing is drawn. */
+  readonly viewEnd: number;
+}
+
+const EMPTY_SPAN_INDEX: SpanIndex = {
+  records: new Map(),
+  holders: new Map(),
+  drawnHolders: new Map(),
+  placements: new Map(),
+  dependents: new Map(),
+  children: new Map(),
+  roots: EMPTY_IDS,
+  viewStart: Number.POSITIVE_INFINITY,
+  viewEnd: Number.NEGATIVE_INFINITY,
+};
 
 /**
- * The nearest ancestor of `event` that this view is actually drawing, and the
- * undrawn record a top-level row was lifted through.
- *
- * Walks the `parentSpanId` chain through *every* record in the page, not only
- * the drawn ones, which is what keeps a database statement nested under the
- * server request that issued it when the function span between them is a kind
- * this view does not draw. Bounded by {@link MAX_ANCESTOR_HOPS} and guarded
- * against a cycle in the links, both of which leave the row at the top level —
- * which is honest about an unresolved ancestry rather than inventing one.
+ * The lookup key of a span within its trace. The trace id is length-prefixed,
+ * so the concatenation is uniquely decodable whatever the ids contain.
  */
-function resolveAncestry(
-  event: TelemetryEvent,
-  bySpanId: ReadonlyMap<string, TelemetryEvent>,
-  drawnBySpanId: ReadonlyMap<string, TelemetryEvent>,
-): Ancestry {
-  const seen = new Set<string>([event.spanId]);
-  let parentSpanId = event.parentSpanId;
-  let liftedThrough: TelemetryEvent | undefined;
-  for (let hop = 0; parentSpanId !== undefined && hop < MAX_ANCESTOR_HOPS; hop += 1) {
-    if (seen.has(parentSpanId)) {
-      break;
-    }
-    seen.add(parentSpanId);
-    const drawn = drawnBySpanId.get(parentSpanId);
-    if (drawn !== undefined && drawn.id !== event.id) {
-      return { drawn, liftedThrough: undefined };
-    }
-    const linked = bySpanId.get(parentSpanId);
-    if (linked === undefined) {
-      break;
-    }
-    liftedThrough = linked;
-    parentSpanId = linked.parentSpanId;
-  }
-  return { drawn: undefined, liftedThrough };
+function spanKey(traceId: string, spanId: string): string {
+  return `${String(traceId.length)}:${traceId}${spanId}`;
 }
+
+/** A record's own span key. */
+function spanKeyOf(event: TelemetryEvent): string {
+  return spanKey(event.traceId, event.spanId);
+}
+
+/** Reads the first holder of a span key, recording that the key was looked up. */
+type HolderLookup = (key: string) => TelemetryEvent | undefined;
 
 /**
  * The orphan provenance a flat record carries in its own attribute bag, or
@@ -908,26 +1074,29 @@ function resolveAncestry(
  * The flag is what ONE earlier correlation pass concluded, and a capture is
  * correlated repeatedly as it streams in: a record whose parent arrived late
  * was orphaned then and is placed correctly now. So the flag is honoured only
- * while the parent the record names is NOT among the records loaded — a parent
+ * while the parent the record names is NOT among the records held — a parent
  * that resolves here proves it stale, and re-flagging a correctly nested call
  * would invent evidence. A record naming itself resolves to nothing but itself,
  * which does not count as resolving.
  *
  * @param record The record whose bag is read.
- * @param bySpanId Every record loaded so far, by span id.
+ * @param holderAt Resolves a span key among the held records.
  * @param viaAncestor Whether `record` is an undrawn call the row was lifted
  * through rather than the row's own record.
  */
 function persistedOrphan(
   record: TelemetryEvent,
-  bySpanId: ReadonlyMap<string, TelemetryEvent>,
+  holderAt: HolderLookup,
   viaAncestor: boolean,
-): WaterfallOrphan | undefined {
+): PersistedOrphan | undefined {
   const attributes: AttributeBag = record.attributes;
   if (!booleanAttribute(attributes, ORPHANED_KEY)) {
     return undefined;
   }
-  const parent = record.parentSpanId === undefined ? undefined : bySpanId.get(record.parentSpanId);
+  const parent =
+    record.parentSpanId === undefined
+      ? undefined
+      : holderAt(spanKey(record.traceId, record.parentSpanId));
   if (parent !== undefined && parent.id !== record.id) {
     return undefined;
   }
@@ -938,8 +1107,386 @@ function persistedOrphan(
 }
 
 /**
- * Whether a flat record is an in-flight snapshot: a browser request whose
- * {@link IN_FLIGHT_KEY} marker is the boolean `true`.
+ * Places one drawn record: under its nearest drawn ancestor, or at the top
+ * level with the re-attachment verdict that still holds for it.
+ *
+ * Walks the `parentSpanId` chain through every held record, not only the drawn
+ * ones. Bounded by {@link MAX_ANCESTOR_HOPS} and guarded against a cycle in the
+ * links, both of which leave the row at the top level — which is honest about
+ * an unresolved ancestry rather than inventing one.
+ *
+ * A top-level row's verdict is its own record's flag, or else the flag of the
+ * last undrawn record the chain passed through before it ended: the row sits
+ * at the top level only because that enclosing call was re-attached, and must
+ * not launder its verdict. Every other record below it on the chain has a
+ * parent the held records resolve, which is what proves any flag on it stale.
+ *
+ * @param event The drawn record to place.
+ * @param holders The held records by span key.
+ * @param drawnHolders The held drawn records by span key.
+ * @returns The placement, with every key it looked up.
+ */
+function placeRecord(
+  event: TelemetryEvent,
+  holders: ReadonlyMap<string, readonly TelemetryEvent[]>,
+  drawnHolders: ReadonlyMap<string, readonly TelemetryEvent[]>,
+): SpanPlacement {
+  const looked = new Set<string>();
+  const holderAt: HolderLookup = (key) => {
+    looked.add(key);
+    return holders.get(key)?.[0];
+  };
+  const drawnAt: HolderLookup = (key) => {
+    looked.add(key);
+    return drawnHolders.get(key)?.[0];
+  };
+
+  const ownKey = spanKeyOf(event);
+  looked.add(ownKey);
+  const seen = new Set<string>([ownKey]);
+  let parentSpanId = event.parentSpanId;
+  let liftedThrough: TelemetryEvent | undefined;
+  for (let hop = 0; parentSpanId !== undefined && hop < MAX_ANCESTOR_HOPS; hop += 1) {
+    const key = spanKey(event.traceId, parentSpanId);
+    if (seen.has(key)) {
+      break;
+    }
+    seen.add(key);
+    const drawn = drawnAt(key);
+    if (drawn !== undefined && drawn.id !== event.id) {
+      return { parentId: drawn.id, orphan: undefined, keys: Array.from(looked) };
+    }
+    const linked = holderAt(key);
+    if (linked === undefined) {
+      break;
+    }
+    liftedThrough = linked;
+    parentSpanId = linked.parentSpanId;
+  }
+  const orphan =
+    persistedOrphan(event, holderAt, false) ??
+    (liftedThrough === undefined ? undefined : persistedOrphan(liftedThrough, holderAt, true));
+  return { parentId: undefined, orphan, keys: Array.from(looked) };
+}
+
+/**
+ * Appends a record to a span key's holders.
+ *
+ * @returns Whether the key had no holder before, so its first holder changed.
+ */
+function addHolder(
+  holders: Map<string, readonly TelemetryEvent[]>,
+  key: string,
+  event: TelemetryEvent,
+): boolean {
+  const current = holders.get(key);
+  holders.set(key, current === undefined ? [event] : [...current, event]);
+  return current === undefined;
+}
+
+/**
+ * Removes a record from a span key's holders.
+ *
+ * @returns Whether it was the first holder, so the key now resolves otherwise.
+ */
+function dropHolder(
+  holders: Map<string, readonly TelemetryEvent[]>,
+  key: string,
+  event: TelemetryEvent,
+): boolean {
+  const current = holders.get(key);
+  const at = current === undefined ? -1 : current.indexOf(event);
+  if (current === undefined || at < 0) {
+    return false;
+  }
+  const rest = current.filter((_, position) => position !== at);
+  if (rest.length === 0) {
+    holders.delete(key);
+  } else {
+    holders.set(key, rest);
+  }
+  return at === 0;
+}
+
+/** The extent a drawn record contributes to the window, in epoch milliseconds. */
+function extentOf(event: TelemetryEvent): { readonly start: number; readonly end: number } {
+  const start = asFiniteNumber(event.startTime, 0);
+  return { start, end: start + drawableDuration(event.duration) };
+}
+
+/** What a fold produced: the new index, and how many drawn records it released. */
+interface IndexFold<I> {
+  readonly index: I;
+  /** Drawn items the fold released and no held page still carries. */
+  readonly releasedDrawnCount: number;
+}
+
+/**
+ * Folds one settled page into the held flat records, releasing the records of
+ * the pages the retention budget let go.
+ *
+ * Pure: the previous index is read, never written, and a new one is returned.
+ * Releases are applied before additions, so a record the arriving page carries
+ * again stays held; then every drawn record that can have moved is placed
+ * again, and only the child lists it left or joined are rebuilt.
+ *
+ * @param index The index before the page.
+ * @param kinds The kinds this view draws.
+ * @param added The records of the page that arrived.
+ * @param addedSeq That page's sequence number.
+ * @param released The records of the pages being released.
+ * @param releasedThroughSeq The sequence number of the newest page being
+ * released; a record some newer held page supplied again is kept.
+ * @returns The new index.
+ */
+function foldSpanPage(
+  index: SpanIndex,
+  kinds: ReadonlySet<TelemetryKind>,
+  added: readonly TelemetryEvent[],
+  addedSeq: number,
+  released: readonly TelemetryEvent[],
+  releasedThroughSeq: number,
+): IndexFold<SpanIndex> {
+  const records = new Map(index.records);
+  const holders = new Map(index.holders);
+  const drawnHolders = new Map(index.drawnHolders);
+  const placements = new Map(index.placements);
+  const dependents = new Map(index.dependents);
+  const children = new Map(index.children);
+  // Dependent sets are copied on first write, so the previous index keeps its own.
+  const ownedDependents = new Map<string, Set<string>>();
+  const writableDependents = (key: string): Set<string> => {
+    const owned = ownedDependents.get(key);
+    if (owned !== undefined) {
+      return owned;
+    }
+    const copy = new Set<string>(dependents.get(key));
+    ownedDependents.set(key, copy);
+    dependents.set(key, copy);
+    return copy;
+  };
+  const register = (keys: readonly string[], id: string): void => {
+    for (const key of keys) {
+      writableDependents(key).add(id);
+    }
+  };
+  const unregister = (keys: readonly string[], id: string): void => {
+    for (const key of keys) {
+      if (!dependents.has(key)) {
+        continue;
+      }
+      const set = writableDependents(key);
+      set.delete(id);
+      if (set.size === 0) {
+        dependents.delete(key);
+        ownedDependents.delete(key);
+      }
+    }
+  };
+
+  // Keys whose first holder changed, in either table: every record placed by
+  // looking one of them up is placed again below.
+  const changedKeys = new Set<string>();
+  const releasedDrawn: TelemetryEvent[] = [];
+  const toPlace = new Set<string>();
+
+  for (const item of released) {
+    const held = records.get(item.id);
+    if (held === undefined || held.seq > releasedThroughSeq) {
+      continue;
+    }
+    records.delete(item.id);
+    const key = spanKeyOf(held.event);
+    if (dropHolder(holders, key, held.event)) {
+      changedKeys.add(key);
+    }
+    if (kinds.has(held.event.kind)) {
+      if (dropHolder(drawnHolders, key, held.event)) {
+        changedKeys.add(key);
+      }
+      releasedDrawn.push(held.event);
+    }
+  }
+
+  const arrived: TelemetryEvent[] = [];
+  for (const event of added) {
+    const held = records.get(event.id);
+    if (held !== undefined) {
+      records.set(event.id, { event: held.event, seq: addedSeq });
+      continue;
+    }
+    records.set(event.id, { event, seq: addedSeq });
+    const key = spanKeyOf(event);
+    if (addHolder(holders, key, event)) {
+      changedKeys.add(key);
+    }
+    if (kinds.has(event.kind)) {
+      if (addHolder(drawnHolders, key, event)) {
+        changedKeys.add(key);
+      }
+      arrived.push(event);
+      toPlace.add(event.id);
+    }
+  }
+
+  for (const key of changedKeys) {
+    for (const id of dependents.get(key) ?? []) {
+      if (records.has(id)) {
+        toPlace.add(id);
+      }
+    }
+  }
+
+  // Which child lists each move leaves and joins; `undefined` is the top level.
+  const leaving = new Map<string | undefined, Set<string>>();
+  const joining = new Map<string | undefined, string[]>();
+  const leave = (parentId: string | undefined, id: string): void => {
+    const ids = leaving.get(parentId) ?? new Set<string>();
+    ids.add(id);
+    leaving.set(parentId, ids);
+  };
+  const join = (parentId: string | undefined, id: string): void => {
+    const ids = joining.get(parentId) ?? [];
+    ids.push(id);
+    joining.set(parentId, ids);
+  };
+
+  for (const event of releasedDrawn) {
+    const old = placements.get(event.id);
+    if (old === undefined) {
+      continue;
+    }
+    placements.delete(event.id);
+    unregister(old.keys, event.id);
+    leave(old.parentId, event.id);
+  }
+
+  for (const id of toPlace) {
+    const held = records.get(id);
+    if (held === undefined) {
+      continue;
+    }
+    const next = placeRecord(held.event, holders, drawnHolders);
+    const old = placements.get(id);
+    if (old !== undefined) {
+      unregister(old.keys, id);
+    }
+    register(next.keys, id);
+    placements.set(id, next);
+    if (old === undefined) {
+      join(next.parentId, id);
+    } else if (old.parentId !== next.parentId) {
+      leave(old.parentId, id);
+      join(next.parentId, id);
+    }
+  }
+
+  const compareIds = (left: string, right: string): number => {
+    const leftEvent = records.get(left)?.event;
+    const rightEvent = records.get(right)?.event;
+    return leftEvent === undefined || rightEvent === undefined
+      ? compareByStartThenId(0, left, 0, right)
+      : compareEvents(leftEvent, rightEvent);
+  };
+  let roots = index.roots;
+  for (const parentId of new Set([...leaving.keys(), ...joining.keys()])) {
+    const merged = mergeOrdered(
+      parentId === undefined ? roots : (children.get(parentId) ?? EMPTY_IDS),
+      leaving.get(parentId),
+      joining.get(parentId),
+      compareIds,
+    );
+    if (parentId === undefined) {
+      roots = merged;
+    } else if (merged.length === 0 || !placements.has(parentId)) {
+      children.delete(parentId);
+    } else {
+      children.set(parentId, merged);
+    }
+  }
+
+  // The window grows with what arrived; it is measured again from the held
+  // drawn records only when a release took away a record on its edge.
+  let viewStart = index.viewStart;
+  let viewEnd = index.viewEnd;
+  const releasedEdge = releasedDrawn.some((event) => {
+    const { start, end } = extentOf(event);
+    return start <= viewStart || end >= viewEnd;
+  });
+  const extending = releasedEdge ? Array.from(placements.keys()) : arrived.map(({ id }) => id);
+  if (releasedEdge) {
+    viewStart = Number.POSITIVE_INFINITY;
+    viewEnd = Number.NEGATIVE_INFINITY;
+  }
+  for (const id of extending) {
+    const event = records.get(id)?.event;
+    if (event === undefined) {
+      continue;
+    }
+    const { start, end } = extentOf(event);
+    viewStart = Math.min(viewStart, start);
+    viewEnd = Math.max(viewEnd, end);
+  }
+
+  return {
+    index: {
+      records,
+      holders,
+      drawnHolders,
+      placements,
+      dependents,
+      children,
+      roots,
+      viewStart,
+      viewEnd,
+    },
+    releasedDrawnCount: releasedDrawn.filter(({ id }) => !records.has(id)).length,
+  };
+}
+
+/**
+ * The summary of the held flat records: their window, and how many rows the
+ * held tree holds within the depth bound — the figure the footer counts as
+ * calls. A row whose children the bound would cut is counted, its children
+ * are not, and the cut is reported.
+ */
+function summariseSpans(index: SpanIndex): HeldSummary {
+  if (index.placements.size === 0 || !Number.isFinite(index.viewStart)) {
+    return EMPTY_SUMMARY;
+  }
+  let rowCount = 0;
+  let truncated = false;
+  const pending: { readonly id: string; readonly depth: number }[] = index.roots.map((id) => ({
+    id,
+    depth: 0,
+  }));
+  for (let next = pending.pop(); next !== undefined; next = pending.pop()) {
+    rowCount += 1;
+    const nested = index.children.get(next.id);
+    if (nested === undefined || nested.length === 0) {
+      continue;
+    }
+    if (next.depth + 1 >= MAX_ROW_DEPTH) {
+      truncated = true;
+      continue;
+    }
+    for (const id of nested) {
+      pending.push({ id, depth: next.depth + 1 });
+    }
+  }
+  const viewEnd = Math.max(index.viewEnd, index.viewStart);
+  return {
+    viewStart: index.viewStart,
+    viewEnd,
+    windowMs: clampNonNegative(roundMs(viewEnd - index.viewStart)),
+    rowCount,
+    truncated,
+  };
+}
+
+/**
+ * Whether an in-flight snapshot: a browser request whose {@link IN_FLIGHT_KEY}
+ * marker is the boolean `true`.
  *
  * Strictly the boolean, exactly as the request aggregate reads it: the string
  * `"true"`, a `1` and `false` all read as settled, and a missing status code
@@ -954,7 +1501,7 @@ function isInFlightRecord(event: TelemetryEvent): boolean {
 }
 
 /**
- * One row from one record, with its children already materialised.
+ * One row from one record.
  *
  * An in-flight snapshot ({@link isInFlightRecord}) is drawn as the request it
  * is — started, and not yet answered: its status code and transfer size are
@@ -966,7 +1513,7 @@ function isInFlightRecord(event: TelemetryEvent): boolean {
 function rowFromEvent(
   event: TelemetryEvent,
   viewStart: number,
-  children: readonly WaterfallRow[],
+  childCount: number,
   childrenTruncated: boolean,
   orphan: WaterfallOrphan | undefined,
 ): WaterfallRow {
@@ -1001,130 +1548,12 @@ function rowFromEvent(
     lineageCandidates: stringListAttribute(attributes, LINEAGE_CANDIDATES_KEY),
     orphan,
     childrenTruncated,
-    children,
-  };
-}
-
-/** Materialise one record and, depth permitting, everything nested under it. */
-function materialiseEvent(
-  event: TelemetryEvent,
-  depth: number,
-  childrenByParentId: ReadonlyMap<string, readonly TelemetryEvent[]>,
-  orphans: ReadonlyMap<string, WaterfallOrphan>,
-  viewStart: number,
-  state: BuildState,
-  visited: Set<string>,
-): WaterfallRow {
-  visited.add(event.id);
-  state.rowCount += 1;
-  const orphan = orphans.get(event.id);
-  const candidates = childrenByParentId.get(event.id) ?? EMPTY_EVENTS;
-  const pending = candidates.filter((child) => !visited.has(child.id));
-  if (pending.length === 0) {
-    return rowFromEvent(event, viewStart, EMPTY_ROWS, false, orphan);
-  }
-  if (depth + 1 >= MAX_ROW_DEPTH) {
-    state.truncated = true;
-    return rowFromEvent(event, viewStart, EMPTY_ROWS, true, orphan);
-  }
-  const children = pending.map((child) =>
-    materialiseEvent(child, depth + 1, childrenByParentId, orphans, viewStart, state, visited),
-  );
-  return rowFromEvent(event, viewStart, children, false, orphan);
-}
-
-/**
- * Build the model from a flat page of records.
- *
- * The window starts at the earliest *drawn* record, which is the only origin a
- * flat page can offer and the one that makes the leftmost bar sit at zero.
- */
-function buildFromEvents(
-  events: readonly TelemetryEvent[],
-  kinds: ReadonlySet<TelemetryKind>,
-): WaterfallModel {
-  const drawn = events.filter((event) => kinds.has(event.kind));
-  if (drawn.length === 0) {
-    return EMPTY_MODEL;
-  }
-
-  let viewStart = Number.POSITIVE_INFINITY;
-  let viewEnd = Number.NEGATIVE_INFINITY;
-  for (const event of drawn) {
-    const start = asFiniteNumber(event.startTime, 0);
-    const end = start + drawableDuration(event.duration);
-    viewStart = Math.min(viewStart, start);
-    viewEnd = Math.max(viewEnd, end);
-  }
-  if (!Number.isFinite(viewStart)) {
-    return EMPTY_MODEL;
-  }
-
-  const bySpanId = new Map<string, TelemetryEvent>();
-  for (const event of events) {
-    if (!bySpanId.has(event.spanId)) {
-      bySpanId.set(event.spanId, event);
-    }
-  }
-  const drawnBySpanId = new Map<string, TelemetryEvent>();
-  for (const event of drawn) {
-    if (!drawnBySpanId.has(event.spanId)) {
-      drawnBySpanId.set(event.spanId, event);
-    }
-  }
-
-  const childrenByParentId = new Map<string, TelemetryEvent[]>();
-  // Orphan provenance, by record id. Only a top-level row can carry it: a row
-  // nested under a drawn ancestor has a parent chain the page resolves, which
-  // is exactly what proves any flag on it stale.
-  const orphans = new Map<string, WaterfallOrphan>();
-  const roots: TelemetryEvent[] = [];
-  for (const event of drawn) {
-    const { drawn: ancestor, liftedThrough } = resolveAncestry(event, bySpanId, drawnBySpanId);
-    if (ancestor === undefined) {
-      roots.push(event);
-      // The record's own flag wins; otherwise a flag on the undrawn call it was
-      // lifted through is inherited: the row sits at the top level only because
-      // that enclosing call was re-attached, and must not launder its verdict.
-      const orphan =
-        persistedOrphan(event, bySpanId, false) ??
-        (liftedThrough === undefined ? undefined : persistedOrphan(liftedThrough, bySpanId, true));
-      if (orphan !== undefined) {
-        orphans.set(event.id, orphan);
-      }
-      continue;
-    }
-    const siblings = childrenByParentId.get(ancestor.id);
-    if (siblings === undefined) {
-      childrenByParentId.set(ancestor.id, [event]);
-    } else {
-      siblings.push(event);
-    }
-  }
-  roots.sort(compareEvents);
-  for (const siblings of childrenByParentId.values()) {
-    siblings.sort(compareEvents);
-  }
-
-  const state: BuildState = { rowCount: 0, truncated: false };
-  const visited = new Set<string>();
-  const rows = roots.map((root) =>
-    materialiseEvent(root, 0, childrenByParentId, orphans, viewStart, state, visited),
-  );
-
-  return {
-    rows,
-    viewStart,
-    viewEnd: Math.max(viewEnd, viewStart),
-    windowMs: clampNonNegative(roundMs(Math.max(viewEnd, viewStart) - viewStart)),
-    rowCount: state.rowCount,
-    topLevelCount: rows.length,
-    truncated: state.truncated,
+    childCount,
   };
 }
 
 /* ---------------------------------------------------------------------------
- * Building the model from grouped network calls (`requests`)
+ * The held grouped network calls (`requests`), folded one page at a time
  *
  * The grouped result keeps each occurrence's own start and duration, so the same
  * bars can be drawn for calls the service grouped for duplicate detection. What
@@ -1132,7 +1561,192 @@ function buildFromEvents(
  * happened in the service, on the pre-redaction request key, and a second
  * attempt over the redacted URLs on this side would answer differently and be
  * wrong (AAP 0.5.2).
+ *
+ * Groups do not nest under one another, so a fold only files the page's
+ * drawable groups into drawing order and drops the released ones. A group
+ * another held page already supplied is held once, by its id, as a record is.
  * ------------------------------------------------------------------------- */
+
+/** One held group: the occurrences this view draws, in start order, and its place. */
+interface HeldGroup {
+  readonly group: RequestGroup;
+  /** The occurrences of an included kind, in start order; never empty. */
+  readonly occurrences: readonly RequestOccurrence[];
+  /** The id its row reports: the first occurrence's event id. */
+  readonly rowId: string;
+  /** The first occurrence's start, which orders the group among its peers. */
+  readonly start: number;
+  /** The last occurrence's end. */
+  readonly end: number;
+  /** The {@link HeldPage.seq} of the newest page that carried this group. */
+  readonly seq: number;
+}
+
+/** The held groups, in drawing order. Never mutated once built. */
+interface RequestIndex {
+  /** Every held group, by group id. */
+  readonly groups: ReadonlyMap<string, HeldGroup>;
+  /** The held group ids, in drawing order. */
+  readonly order: readonly string[];
+  /** Each held group's id, by the id its row reports. */
+  readonly byRowId: ReadonlyMap<string, string>;
+  /** The earliest drawn start, or `+Infinity` while nothing is drawn. */
+  readonly viewStart: number;
+  /** The latest drawn end, or `-Infinity` while nothing is drawn. */
+  readonly viewEnd: number;
+}
+
+const EMPTY_REQUEST_INDEX: RequestIndex = {
+  groups: new Map(),
+  order: EMPTY_IDS,
+  byRowId: new Map(),
+  viewStart: Number.POSITIVE_INFINITY,
+  viewEnd: Number.NEGATIVE_INFINITY,
+};
+
+/**
+ * A group as this view holds it, or `undefined` when it has no occurrence of a
+ * kind this view draws.
+ */
+function holdGroup(
+  group: RequestGroup,
+  kinds: ReadonlySet<TelemetryKind>,
+  seq: number,
+): HeldGroup | undefined {
+  const occurrences = group.occurrences
+    .filter((occurrence) => kinds.has(occurrence.kind))
+    .sort((left, right) =>
+      compareByStartThenId(left.startTime, left.eventId, right.startTime, right.eventId),
+    );
+  const [first] = occurrences;
+  if (first === undefined) {
+    return undefined;
+  }
+  let start = Number.POSITIVE_INFINITY;
+  let end = Number.NEGATIVE_INFINITY;
+  for (const occurrence of occurrences) {
+    const begins = asFiniteNumber(occurrence.startTime, 0);
+    start = Math.min(start, begins);
+    end = Math.max(end, begins + drawableDuration(occurrence.durationMs));
+  }
+  return { group, occurrences, rowId: first.eventId, start, end, seq };
+}
+
+/**
+ * Folds one settled page into the held groups, releasing the groups of the
+ * pages the retention budget let go. Pure, like {@link foldSpanPage}.
+ *
+ * @param index The index before the page.
+ * @param kinds The kinds this view draws.
+ * @param added The groups of the page that arrived.
+ * @param addedSeq That page's sequence number.
+ * @param released The groups of the pages being released.
+ * @param releasedThroughSeq The sequence number of the newest page being released.
+ * @returns The new index.
+ */
+function foldRequestPage(
+  index: RequestIndex,
+  kinds: ReadonlySet<TelemetryKind>,
+  added: readonly RequestGroup[],
+  addedSeq: number,
+  released: readonly RequestGroup[],
+  releasedThroughSeq: number,
+): IndexFold<RequestIndex> {
+  const groups = new Map(index.groups);
+  const byRowId = new Map(index.byRowId);
+  const leaving = new Set<string>();
+  let releasedEdge = false;
+  for (const group of released) {
+    const held = groups.get(group.id);
+    if (held === undefined || held.seq > releasedThroughSeq) {
+      continue;
+    }
+    groups.delete(group.id);
+    if (byRowId.get(held.rowId) === group.id) {
+      byRowId.delete(held.rowId);
+    }
+    leaving.add(group.id);
+    releasedEdge ||= held.start <= index.viewStart || held.end >= index.viewEnd;
+  }
+
+  const joining: string[] = [];
+  for (const group of added) {
+    const held = groups.get(group.id);
+    if (held !== undefined) {
+      groups.set(group.id, { ...held, seq: addedSeq });
+      continue;
+    }
+    const fresh = holdGroup(group, kinds, addedSeq);
+    if (fresh === undefined) {
+      continue;
+    }
+    groups.set(group.id, fresh);
+    if (!byRowId.has(fresh.rowId)) {
+      byRowId.set(fresh.rowId, group.id);
+    }
+    joining.push(group.id);
+  }
+
+  const compareIds = (left: string, right: string): number => {
+    const leftGroup = groups.get(left);
+    const rightGroup = groups.get(right);
+    return leftGroup === undefined || rightGroup === undefined
+      ? compareByStartThenId(0, left, 0, right)
+      : compareByStartThenId(leftGroup.start, leftGroup.rowId, rightGroup.start, rightGroup.rowId);
+  };
+  const order =
+    leaving.size === 0 && joining.length === 0
+      ? index.order
+      : mergeOrdered(index.order, leaving, joining, compareIds);
+
+  let viewStart = releasedEdge ? Number.POSITIVE_INFINITY : index.viewStart;
+  let viewEnd = releasedEdge ? Number.NEGATIVE_INFINITY : index.viewEnd;
+  for (const id of releasedEdge ? order : joining) {
+    const held = groups.get(id);
+    if (held !== undefined) {
+      viewStart = Math.min(viewStart, held.start);
+      viewEnd = Math.max(viewEnd, held.end);
+    }
+  }
+
+  return {
+    index: { groups, order, byRowId, viewStart, viewEnd },
+    releasedDrawnCount: Array.from(leaving).filter((id) => !groups.has(id)).length,
+  };
+}
+
+/**
+ * The summary of the held groups: a group of one occurrence is one row, and a
+ * larger group is its own row plus one per occurrence. A group whose
+ * occurrence list the service truncated is the payload's cut, and reported.
+ */
+function summariseRequests(index: RequestIndex): HeldSummary {
+  if (index.order.length === 0 || !Number.isFinite(index.viewStart)) {
+    return EMPTY_SUMMARY;
+  }
+  let rowCount = 0;
+  let truncated = false;
+  for (const id of index.order) {
+    const held = index.groups.get(id);
+    if (held === undefined) {
+      continue;
+    }
+    if (held.occurrences.length === 1) {
+      rowCount += 1;
+      continue;
+    }
+    rowCount += held.occurrences.length + 1;
+    truncated ||= held.group.occurrencesTruncated;
+  }
+  const viewEnd = Math.max(index.viewEnd, index.viewStart);
+  return {
+    viewStart: index.viewStart,
+    viewEnd,
+    windowMs: clampNonNegative(roundMs(viewEnd - index.viewStart)),
+    rowCount,
+    truncated,
+  };
+}
 
 /**
  * One row from one occurrence, labelled from the group it belongs to.
@@ -1179,7 +1793,7 @@ function rowFromOccurrence(
     // The grouped network result carries no correlation verdict.
     orphan: undefined,
     childrenTruncated: false,
-    children: EMPTY_ROWS,
+    childCount: 0,
   };
 }
 
@@ -1222,7 +1836,7 @@ function rowFromGroup(
   group: RequestGroup,
   occurrences: readonly RequestOccurrence[],
   viewStart: number,
-  children: readonly WaterfallRow[],
+  childCount: number,
 ): WaterfallRow {
   let first = Number.POSITIVE_INFINITY;
   let last = Number.NEGATIVE_INFINITY;
@@ -1276,65 +1890,7 @@ function rowFromGroup(
     lineageCandidates: EMPTY_STRINGS,
     orphan: undefined,
     childrenTruncated: group.occurrencesTruncated,
-    children,
-  };
-}
-
-function buildFromRequests(
-  groups: readonly RequestGroup[],
-  kinds: ReadonlySet<TelemetryKind>,
-): WaterfallModel {
-  const drawable: {
-    readonly group: RequestGroup;
-    readonly occurrences: readonly RequestOccurrence[];
-  }[] = [];
-  let viewStart = Number.POSITIVE_INFINITY;
-  let viewEnd = Number.NEGATIVE_INFINITY;
-  for (const group of groups) {
-    const occurrences = group.occurrences.filter((occurrence) => kinds.has(occurrence.kind));
-    if (occurrences.length === 0) {
-      continue;
-    }
-    drawable.push({ group, occurrences });
-    for (const occurrence of occurrences) {
-      const start = asFiniteNumber(occurrence.startTime, 0);
-      viewStart = Math.min(viewStart, start);
-      viewEnd = Math.max(viewEnd, start + drawableDuration(occurrence.durationMs));
-    }
-  }
-  if (drawable.length === 0 || !Number.isFinite(viewStart)) {
-    return EMPTY_MODEL;
-  }
-
-  const state: BuildState = { rowCount: 0, truncated: false };
-  const rows: WaterfallRow[] = [];
-  for (const { group, occurrences } of drawable) {
-    const ordered = [...occurrences].sort((left, right) =>
-      compareByStartThenId(left.startTime, left.eventId, right.startTime, right.eventId),
-    );
-    const [single] = ordered;
-    if (ordered.length === 1 && single !== undefined) {
-      state.rowCount += 1;
-      rows.push(rowFromOccurrence(group, single, viewStart));
-      continue;
-    }
-    const children = ordered.map((occurrence) => rowFromOccurrence(group, occurrence, viewStart));
-    state.rowCount += children.length + 1;
-    if (group.occurrencesTruncated) {
-      state.truncated = true;
-    }
-    rows.push(rowFromGroup(group, ordered, viewStart, children));
-  }
-  rows.sort(compareRows);
-
-  return {
-    rows,
-    viewStart,
-    viewEnd: Math.max(viewEnd, viewStart),
-    windowMs: clampNonNegative(roundMs(Math.max(viewEnd, viewStart) - viewStart)),
-    rowCount: state.rowCount,
-    topLevelCount: rows.length,
-    truncated: state.truncated,
+    childCount,
   };
 }
 
@@ -1467,14 +2023,132 @@ function queryIdentity(query: DataQuery, sessionId: string | undefined): string 
  * errors under this repository's React rules — while a derivation is correct on
  * the very first render after the change, with no intermediate frame showing
  * another query's, another slice's or another session's rows.
+ *
+ * A page is folded into the held indexes once, in the render it arrives in
+ * ({@link holdPage}), and "Load more" carries that folded result forward as it
+ * is: nothing already held is resolved again when the next page is asked for.
+ * The fold also applies {@link RETAINED_ITEM_BUDGET}, releasing the oldest held
+ * pages, and keeps the counts the footer needs to say so truthfully.
  * ------------------------------------------------------------------------- */
+
+/** One settled page the view holds. */
+interface HeldPage<T> {
+  /** Its place in the page sequence: 0 for the first page, and so on. */
+  readonly seq: number;
+  /** The offset it was requested at. */
+  readonly offset: number;
+  /** What it carried, exactly as the provider resolved it. */
+  readonly items: readonly T[];
+}
+
+/** The pages a view holds, the index folded from them, and what was released. */
+interface Holding<T, I> {
+  /** The held pages, oldest first; never more items than the budget, bar the newest page. */
+  readonly pages: readonly HeldPage<T>[];
+  /** The index every held page has been folded into. */
+  readonly index: I;
+  /** The sequence number the next page will take. */
+  readonly nextSeq: number;
+  /** Source items every resolved page carried, released pages included. */
+  readonly loadedItemCount: number;
+  /** Source items the held pages carry. */
+  readonly heldItemCount: number;
+  /** Source items the released pages carried. */
+  readonly releasedItemCount: number;
+  /** Drawn items released, which the view no longer draws. */
+  readonly releasedDrawnCount: number;
+}
+
+/**
+ * Folds one page into an index. `released` holds the items of the pages the
+ * budget let go, and `releasedThroughSeq` the newest of their sequence numbers.
+ */
+type PageFold<T, I> = (
+  index: I,
+  added: readonly T[],
+  addedSeq: number,
+  released: readonly T[],
+  releasedThroughSeq: number,
+) => IndexFold<I>;
+
+/**
+ * Adds a settled page to what is held, releasing the oldest held pages while
+ * the total exceeds {@link RETAINED_ITEM_BUDGET}.
+ *
+ * The arriving page is never released, so a single page larger than the
+ * budget — which the schema's `limit` ceiling prevents from a conforming
+ * service — is held whole rather than drawn in part.
+ *
+ * @param holding What was held before the page, or `undefined` for the first.
+ * @param empty The index a page sequence starts from.
+ * @param offset The offset the page was requested at.
+ * @param items What the page carried.
+ * @param fold Folds a page into the index.
+ * @returns What is held now.
+ */
+function holdPage<T, I>(
+  holding: Holding<T, I> | undefined,
+  empty: I,
+  offset: number,
+  items: readonly T[],
+  fold: PageFold<T, I>,
+): Holding<T, I> {
+  const previous = holding?.pages ?? [];
+  const seq = holding?.nextSeq ?? 0;
+  let heldItemCount = (holding?.heldItemCount ?? 0) + items.length;
+  let kept = 0;
+  for (
+    let oldest = previous[kept];
+    oldest !== undefined && heldItemCount > RETAINED_ITEM_BUDGET;
+    oldest = previous[kept]
+  ) {
+    heldItemCount -= oldest.items.length;
+    kept += 1;
+  }
+  const releasedPages = previous.slice(0, kept);
+  const released = releasedPages.flatMap((page) => page.items);
+  const releasedThroughSeq = releasedPages[releasedPages.length - 1]?.seq ?? -1;
+  const folded = fold(holding?.index ?? empty, items, seq, released, releasedThroughSeq);
+  return {
+    pages: [...previous.slice(kept), { seq, offset, items }],
+    index: folded.index,
+    nextSeq: seq + 1,
+    loadedItemCount: (holding?.loadedItemCount ?? 0) + items.length,
+    heldItemCount,
+    releasedItemCount: (holding?.releasedItemCount ?? 0) + released.length,
+    releasedDrawnCount: (holding?.releasedDrawnCount ?? 0) + folded.releasedDrawnCount,
+  };
+}
+
+/** The flat records a `spans` node holds. */
+type SpanHolding = Holding<TelemetryEvent, SpanIndex>;
+
+/** The groups a `requests` node holds. */
+type RequestHolding = Holding<RequestGroup, RequestIndex>;
 
 type LoadedPages =
   | { readonly kind: 'none' }
-  | { readonly kind: 'spans'; readonly items: readonly TelemetryEvent[] }
-  | { readonly kind: 'requests'; readonly items: readonly RequestGroup[] };
+  | { readonly kind: 'spans'; readonly holding: SpanHolding }
+  | { readonly kind: 'requests'; readonly holding: RequestHolding };
 
 const NO_PAGES: LoadedPages = { kind: 'none' };
+
+/** The holding a loaded state carries, whichever source it holds. */
+function holdingOf(loaded: LoadedPages): SpanHolding | RequestHolding | undefined {
+  return loaded.kind === 'none' ? undefined : loaded.holding;
+}
+
+/** What the held records amount to as a chart; see {@link HeldSummary}. */
+function summariseLoaded(loaded: LoadedPages): HeldSummary {
+  switch (loaded.kind) {
+    case 'spans':
+      return summariseSpans(loaded.holding.index);
+    case 'requests':
+      return summariseRequests(loaded.holding.index);
+    default:
+      return EMPTY_SUMMARY;
+  }
+}
 
 interface PagingState {
   /** The {@link queryIdentity} the accumulated pages belong to. */
@@ -1485,7 +2159,7 @@ interface PagingState {
    * Never part of {@link identity}.
    */
   readonly offset: number;
-  /** Every page resolved before the current one. */
+  /** Every page resolved before the current one, already folded. */
   readonly loaded: LoadedPages;
 }
 
@@ -1611,11 +2285,19 @@ function rowLabel(row: WaterfallRow): string {
  * no reason of the correlator's, and is the missing-parent case by what the
  * service writes it for: the parent it names never arrived — named by id when
  * the service recorded the id, and without one otherwise.
+ *
+ * Once records have been released ({@link WaterfallOrphan.unverified}), the
+ * parent's absence no longer proves that, so the sentence states only what is
+ * known: the parent is not among the records held, and may have been released.
  */
 function orphanCause(orphan: WaterfallOrphan, subject: string): string {
-  return orphan.missingParentSpanId === undefined
-    ? `the parent ${subject} names never arrived`
-    : `the parent ${orphan.missingParentSpanId} of ${subject} never arrived`;
+  const parent =
+    orphan.missingParentSpanId === undefined
+      ? `the parent ${subject} names`
+      : `the parent ${orphan.missingParentSpanId} of ${subject}`;
+  return orphan.unverified
+    ? `${parent} is not among the records held here, and may have been released`
+    : `${parent} never arrived`;
 }
 
 /**
@@ -1677,7 +2359,7 @@ function disclosureName(row: WaterfallRow, expanded: boolean): string {
   const label = oneLinePreview(rowLabel(row), DISCLOSURE_LABEL_PREVIEW_LENGTH);
   const named = row.method === undefined ? label : `${row.method} ${label}`;
   const call = `${named} (${formatKindLabel(row.kind)})`;
-  const count = row.children.length;
+  const count = row.childCount;
   return row.occurrenceCount === undefined
     ? `${verb} the ${formatCountOf(count, NESTED_CALL_NOUN)} inside ${call}`
     : `${verb} the ${formatCountOf(count, CALL_NOUN)} grouped under ${call}`;
@@ -1787,82 +2469,29 @@ function isNestedControlEvent(target: EventTarget | null): boolean {
 }
 
 /* ---------------------------------------------------------------------------
- * Moving between rows
+ * The visible rows, and the window of them the tree mounts
  *
- * The arrow keys of the tree pattern, resolved through the DOM rather than
- * through a ref per row: the rows are already in the document in the order they
- * are read, a collapsed subtree is not in the document at all, and the row that
- * handled the key is the event's own target — so the next row to focus is a
- * query away and nothing has to be held between renders.
- * ------------------------------------------------------------------------- */
-
-/** The rows of the tree this row belongs to, in the order they are read. */
-function visibleRowsOf(row: HTMLElement): readonly HTMLElement[] {
-  const tree = row.closest('[role="tree"]');
-  if (tree === null) {
-    return [];
-  }
-  return Array.from(tree.querySelectorAll<HTMLElement>('[role="treeitem"]'));
-}
-
-/** Moves focus one row down (`1`) or up (`-1`), stopping at either end. */
-function focusStep(row: HTMLElement, step: 1 | -1): void {
-  const rows = visibleRowsOf(row);
-  const index = rows.indexOf(row);
-  if (index < 0) {
-    return;
-  }
-  rows[index + step]?.focus();
-}
-
-/** Moves focus to the first (`0`) or last (`-1`) row of the tree. */
-function focusEdge(row: HTMLElement, edge: 0 | -1): void {
-  const rows = visibleRowsOf(row);
-  const target = edge === 0 ? rows[0] : rows[rows.length - 1];
-  target?.focus();
-}
-
-/**
- * Moves focus to the first row nested under this one, if the group is open.
+ * Every row a reader can reach — each top-level row, and the rows under every
+ * expanded one — is flattened into one list in reading order. The list is
+ * plain data (a path key, a depth, a parent position and a reference to the
+ * held record), so it costs a few fields per row however many rows are held;
+ * the tree then mounts only a window of it ({@link WATERFALL_ROW_BUDGET}) and
+ * builds a {@link WaterfallRow} for exactly those rows. Expansion is keyed by
+ * record id, so it survives the window moving, a new page arriving, and a row
+ * moving under a parent a later page supplied.
  *
- * The group is the row's next sibling rather than its child — a fourth child of
- * the row would land in the label column — so the lookup is sideways.
- */
-function focusFirstChild(row: HTMLElement): void {
-  const group = row.nextElementSibling;
-  if (group === null || group.getAttribute('role') !== 'group') {
-    return;
-  }
-  group.querySelector<HTMLElement>('[role="treeitem"]')?.focus();
-}
-
-/**
- * Moves focus to the row this one is nested under.
- *
- * A nested row's parent element is the group, and the row that owns the group is
- * the element before it.
- */
-function focusParent(row: HTMLElement): void {
-  const group = row.parentElement;
-  if (group === null || group.getAttribute('role') !== 'group') {
-    return;
-  }
-  const owner = group.previousElementSibling;
-  if (owner instanceof HTMLElement && owner.getAttribute('role') === 'treeitem') {
-    owner.focus();
-  }
-}
-
-/* ---------------------------------------------------------------------------
- * The single tab stop
+ * The keyboard works over the list rather than over the document: the next
+ * row, the parent and the first child are list positions, and a move to a row
+ * outside the window moves the window to it first, so ArrowDown past the last
+ * mounted row pages on rather than stopping.
  *
  * The tree is one composite widget and so one stop in the page's Tab order:
- * exactly one visible row carries `tabIndex={0}`, every other row `-1`, and the
- * arrow keys — not Tab — move between rows. The helpers above move focus through
- * the DOM; the row that receives it reports itself from its `onFocus`, which is
- * what moves the stop. The stop is STATE rather than a DOM query because it has
- * to be right on renders where nothing inside the tree holds focus — the first
- * paint, a collapse, a newly appended page.
+ * exactly one mounted row carries `tabIndex={0}`, every other row `-1`, and the
+ * arrow keys — not Tab — move between rows. The row that receives focus reports
+ * itself from its `onFocus`, which is what moves the stop. The stop is STATE
+ * rather than a DOM query because it has to be right on renders where nothing
+ * inside the tree holds focus — the first paint, a collapse, a newly appended
+ * page, a window the Next control moved.
  *
  * Rows are identified by their PATH — the chain of record ids from the top level
  * down — and not by `eventId` alone, because `eventId` is not unique among drawn
@@ -1871,98 +2500,457 @@ function focusParent(row: HTMLElement): void {
  * expanding such a group would put two rows in the Tab order.
  * ------------------------------------------------------------------------- */
 
+/** What one visible row draws from: a flat record, a group, or one of its occurrences. */
+type RowSource =
+  | {
+      readonly kind: 'event';
+      readonly event: TelemetryEvent;
+      readonly orphan: PersistedOrphan | undefined;
+    }
+  | { readonly kind: 'group'; readonly held: HeldGroup }
+  | {
+      readonly kind: 'occurrence';
+      readonly held: HeldGroup;
+      readonly occurrence: RequestOccurrence;
+    };
+
+/** One row of the flattened visible list. */
+interface VisibleRow {
+  /** The row's path key; see {@link rowKeyFor}. */
+  readonly key: string;
+  /** The record id the row reports, and what `expandedIds` is keyed by. */
+  readonly eventId: string;
+  /** Zero-based nesting depth, reported to assistive technology as the level. */
+  readonly depth: number;
+  /** The list position of the row this one is nested under; `-1` at the top level. */
+  readonly parentIndex: number;
+  /** One-based position among its siblings, for `aria-posinset`. */
+  readonly position: number;
+  /** How many siblings it has, itself included, for `aria-setsize`. */
+  readonly setSize: number;
+  /** How many rows it can disclose; `0` for a leaf and for a row the depth bound cut. */
+  readonly childCount: number;
+  /** Set when the depth bound, or the payload, cut its children. */
+  readonly childrenTruncated: boolean;
+  /** Whether its children follow it in the list. */
+  readonly expanded: boolean;
+  /** The held data the row is built from. */
+  readonly source: RowSource;
+}
+
+/** The flattened visible list, and each row's position in it by path key. */
+interface VisibleRows {
+  readonly rows: readonly VisibleRow[];
+  readonly indexByKey: ReadonlyMap<string, number>;
+}
+
 /**
  * The path key of a row: its parent's key followed by its own record id.
  *
- * Each id is length-prefixed, which makes the concatenation uniquely decodable,
- * so two different chains can never produce the same key whatever characters
- * the ids contain.
+ * Each id is length-prefixed, which makes the concatenation uniquely decodable
+ * ({@link decodeRowKey}), so two different chains can never produce the same
+ * key whatever characters the ids contain.
  */
 function rowKeyFor(parentKey: string | undefined, eventId: string): string {
   return `${parentKey ?? ''}${String(eventId.length)}:${eventId}`;
 }
 
-/** What the tab-stop resolution needs to know about one drawn row. */
-interface RowIndexEntry {
-  /** The record id, which is what `expandedIds` is keyed by. */
-  readonly eventId: string;
-  /** The path key of the row this one is nested under; `undefined` at the top level. */
-  readonly parentKey: string | undefined;
-  /** Whether the row can be expanded at all. */
-  readonly hasChildren: boolean;
+/**
+ * The record ids a path key is made of, top level first.
+ *
+ * @param key A key {@link rowKeyFor} produced.
+ * @returns The ids, or `undefined` for a key it could not have produced.
+ */
+function decodeRowKey(key: string): readonly string[] | undefined {
+  const ids: string[] = [];
+  let at = 0;
+  while (at < key.length) {
+    const colon = key.indexOf(':', at);
+    const length = colon < 0 ? Number.NaN : Number(key.slice(at, colon));
+    if (!Number.isSafeInteger(length) || length < 0 || colon + 1 + length > key.length) {
+      return undefined;
+    }
+    ids.push(key.slice(colon + 1, colon + 1 + length));
+    at = colon + 1 + length;
+  }
+  return ids.length === 0 ? undefined : ids;
 }
 
-/** Every row of a model by path key, and the key of the row the stop starts on. */
-interface RowIndex {
-  readonly entries: ReadonlyMap<string, RowIndexEntry>;
-  /** The first top-level row, or `undefined` for an empty model. */
-  readonly firstKey: string | undefined;
+/** One level of the flattening walk: a sibling list and how far into it the walk is. */
+interface FlattenFrame {
+  readonly ids: readonly string[];
+  next: number;
+  readonly depth: number;
+  readonly parentIndex: number;
+  readonly parentKey: string | undefined;
 }
 
 /**
- * Index every row of a model — collapsed subtrees included — by path key.
- *
- * Walked with an explicit stack; the model's depth is already bounded by
- * {@link MAX_ROW_DEPTH}, and the order of insertion does not matter to a map.
+ * Flattens the held flat records: each top-level row in drawing order, and —
+ * while a row is expanded — its subtree directly after it. A row at the depth
+ * bound discloses nothing and reports the cut.
  */
-function indexRows(rows: readonly WaterfallRow[]): RowIndex {
-  const entries = new Map<string, RowIndexEntry>();
-  const pending: { readonly row: WaterfallRow; readonly parentKey: string | undefined }[] =
-    rows.map((row) => ({ row, parentKey: undefined }));
-  for (let next = pending.pop(); next !== undefined; next = pending.pop()) {
-    const { row, parentKey } = next;
-    const key = rowKeyFor(parentKey, row.eventId);
-    entries.set(key, { eventId: row.eventId, parentKey, hasChildren: row.children.length > 0 });
-    for (const child of row.children) {
-      pending.push({ row: child, parentKey: key });
+function flattenSpans(index: SpanIndex, expandedIds: ReadonlySet<string>): VisibleRows {
+  const rows: VisibleRow[] = [];
+  const indexByKey = new Map<string, number>();
+  const frames: FlattenFrame[] = [
+    { ids: index.roots, next: 0, depth: 0, parentIndex: -1, parentKey: undefined },
+  ];
+  for (
+    let frame = frames[frames.length - 1];
+    frame !== undefined;
+    frame = frames[frames.length - 1]
+  ) {
+    const id = frame.ids[frame.next];
+    if (id === undefined) {
+      frames.pop();
+      continue;
+    }
+    frame.next += 1;
+    const held = index.records.get(id);
+    const placement = index.placements.get(id);
+    if (held === undefined || placement === undefined) {
+      continue;
+    }
+    const nested = index.children.get(id) ?? EMPTY_IDS;
+    const cut = nested.length > 0 && frame.depth + 1 >= MAX_ROW_DEPTH;
+    const childCount = cut ? 0 : nested.length;
+    const expanded = childCount > 0 && expandedIds.has(id);
+    const key = rowKeyFor(frame.parentKey, id);
+    const at = rows.length;
+    rows.push({
+      key,
+      eventId: id,
+      depth: frame.depth,
+      parentIndex: frame.parentIndex,
+      position: frame.next,
+      setSize: frame.ids.length,
+      childCount,
+      childrenTruncated: cut,
+      expanded,
+      source: { kind: 'event', event: held.event, orphan: placement.orphan },
+    });
+    indexByKey.set(key, at);
+    if (expanded) {
+      frames.push({
+        ids: nested,
+        next: 0,
+        depth: frame.depth + 1,
+        parentIndex: at,
+        parentKey: key,
+      });
     }
   }
-  const [first] = rows;
-  return {
-    entries,
-    firstKey: first === undefined ? undefined : rowKeyFor(undefined, first.eventId),
-  };
+  return { rows, indexByKey };
 }
 
 /**
- * The row that holds the tree's single tab stop.
+ * Flattens the held groups: a group of one occurrence is that occurrence's
+ * row, and a larger group is a row of its own, followed — while it is expanded
+ * — by one row per occurrence.
+ */
+function flattenRequests(index: RequestIndex, expandedIds: ReadonlySet<string>): VisibleRows {
+  const rows: VisibleRow[] = [];
+  const indexByKey = new Map<string, number>();
+  const setSize = index.order.length;
+  let position = 0;
+  const push = (row: VisibleRow): number => {
+    const at = rows.length;
+    rows.push(row);
+    indexByKey.set(row.key, at);
+    return at;
+  };
+  for (const groupId of index.order) {
+    const held = index.groups.get(groupId);
+    if (held === undefined) {
+      continue;
+    }
+    position += 1;
+    const [single] = held.occurrences;
+    if (held.occurrences.length === 1 && single !== undefined) {
+      push({
+        key: rowKeyFor(undefined, single.eventId),
+        eventId: single.eventId,
+        depth: 0,
+        parentIndex: -1,
+        position,
+        setSize,
+        childCount: 0,
+        childrenTruncated: false,
+        expanded: false,
+        source: { kind: 'occurrence', held, occurrence: single },
+      });
+      continue;
+    }
+    const key = rowKeyFor(undefined, held.rowId);
+    const expanded = expandedIds.has(held.rowId);
+    const at = push({
+      key,
+      eventId: held.rowId,
+      depth: 0,
+      parentIndex: -1,
+      position,
+      setSize,
+      childCount: held.occurrences.length,
+      childrenTruncated: held.group.occurrencesTruncated,
+      expanded,
+      source: { kind: 'group', held },
+    });
+    if (!expanded) {
+      continue;
+    }
+    held.occurrences.forEach((occurrence, occurrenceAt) => {
+      push({
+        key: rowKeyFor(key, occurrence.eventId),
+        eventId: occurrence.eventId,
+        depth: 1,
+        parentIndex: at,
+        position: occurrenceAt + 1,
+        setSize: held.occurrences.length,
+        childCount: 0,
+        childrenTruncated: false,
+        expanded: false,
+        source: { kind: 'occurrence', held, occurrence },
+      });
+    });
+  }
+  return { rows, indexByKey };
+}
+
+const NO_VISIBLE_ROWS: VisibleRows = { rows: [], indexByKey: new Map() };
+
+/** The flattened visible list of whatever is held. */
+function flattenLoaded(loaded: LoadedPages, expandedIds: ReadonlySet<string>): VisibleRows {
+  switch (loaded.kind) {
+    case 'spans':
+      return flattenSpans(loaded.holding.index, expandedIds);
+    case 'requests':
+      return flattenRequests(loaded.holding.index, expandedIds);
+    default:
+      return NO_VISIBLE_ROWS;
+  }
+}
+
+/**
+ * Whether a chain of record ids is a row of the held tree, collapsed or not —
+ * what tells a row a collapse hid from a row the data no longer holds.
+ */
+function rowPathExists(loaded: LoadedPages, ids: readonly string[]): boolean {
+  if (loaded.kind === 'spans') {
+    if (ids.length === 0 || ids.length > MAX_ROW_DEPTH) {
+      return false;
+    }
+    let parentId: string | undefined;
+    for (const id of ids) {
+      const placement = loaded.holding.index.placements.get(id);
+      if (placement === undefined || placement.parentId !== parentId) {
+        return false;
+      }
+      parentId = id;
+    }
+    return true;
+  }
+  if (loaded.kind === 'requests') {
+    const [rowId, occurrenceId, ...rest] = ids;
+    const groupId = rowId === undefined ? undefined : loaded.holding.index.byRowId.get(rowId);
+    const held = groupId === undefined ? undefined : loaded.holding.index.groups.get(groupId);
+    if (held === undefined || rest.length > 0) {
+      return false;
+    }
+    return (
+      occurrenceId === undefined ||
+      (held.occurrences.length > 1 &&
+        held.occurrences.some((occurrence) => occurrence.eventId === occurrenceId))
+    );
+  }
+  return false;
+}
+
+/**
+ * The row object for one visible row: built only for the rows the tree mounts,
+ * with offsets measured from the window's start.
  *
- * The requested row — the one that last received focus — when it is on screen;
- * otherwise the nearest ancestor of it that is (a collapse hid it); otherwise,
- * when the requested row is not in the model at all (nothing was focused yet,
- * or the query changed), the first top-level row. An ancestor chain is walked
- * from the top down, and the first ancestor that is not open is the nearest
- * visible one, because everything beneath a closed row is out of the document.
+ * @param entry The visible row.
+ * @param viewStart The window's start, in epoch milliseconds.
+ * @param unverified Whether records were released, so a re-attachment flag's
+ * missing parent may have been among them (see {@link WaterfallOrphan}).
+ */
+function buildRow(entry: VisibleRow, viewStart: number, unverified: boolean): WaterfallRow {
+  const { source } = entry;
+  switch (source.kind) {
+    case 'event':
+      return rowFromEvent(
+        source.event,
+        viewStart,
+        entry.childCount,
+        entry.childrenTruncated,
+        source.orphan === undefined ? undefined : { ...source.orphan, unverified },
+      );
+    case 'group':
+      return rowFromGroup(source.held.group, source.held.occurrences, viewStart, entry.childCount);
+    default:
+      return rowFromOccurrence(source.held.group, source.occurrence, viewStart);
+  }
+}
+
+/**
+ * The list position of the row that holds the tree's single tab stop — always
+ * a row the window mounts.
+ *
+ * The requested row — the one that last received focus — when it is mounted;
+ * otherwise the nearest ancestor of it that is visible (a collapse hid it),
+ * when that ancestor is mounted; otherwise the window's first row, which is
+ * the first top-level row while the window is at the start. An ancestor chain
+ * is walked from the top down, and the first ancestor that is not open is the
+ * nearest visible one, because everything beneath a closed row is out of the
+ * list.
+ *
+ * @returns The position, or `undefined` when no row is mounted.
  */
 function resolveTabStop(
-  index: RowIndex,
+  loaded: LoadedPages,
+  visible: VisibleRows,
+  mounted: RowWindow,
   requestedKey: string | undefined,
-  expandedIds: ReadonlySet<string>,
-): string | undefined {
-  if (requestedKey === undefined || !index.entries.has(requestedKey)) {
-    return index.firstKey;
+): number | undefined {
+  if (mounted.count === 0) {
+    return undefined;
   }
-  // The chain from the requested row up to its top-level ancestor. The bound is
-  // the model's own depth bound, which no well-formed chain reaches.
-  const chain: string[] = [];
-  for (
-    let key: string | undefined = requestedKey;
-    key !== undefined && chain.length <= MAX_ROW_DEPTH;
-    key = index.entries.get(key)?.parentKey
-  ) {
-    chain.push(key);
+  const fallback = mounted.start;
+  const mountedOr = (at: number): number => (windowContains(mounted, at) ? at : fallback);
+  if (requestedKey === undefined) {
+    return fallback;
   }
-  for (let position = chain.length - 1; position > 0; position -= 1) {
-    const ancestorKey = chain[position];
-    const ancestor = ancestorKey === undefined ? undefined : index.entries.get(ancestorKey);
-    if (ancestor === undefined) {
-      return index.firstKey;
+  const direct = visible.indexByKey.get(requestedKey);
+  if (direct !== undefined) {
+    return mountedOr(direct);
+  }
+  const ids = decodeRowKey(requestedKey);
+  if (ids === undefined || !rowPathExists(loaded, ids)) {
+    return fallback;
+  }
+  let key: string | undefined;
+  for (const id of ids) {
+    key = rowKeyFor(key, id);
+    const at = visible.indexByKey.get(key);
+    const row = at === undefined ? undefined : visible.rows[at];
+    if (at === undefined || row === undefined) {
+      return fallback;
     }
-    if (!ancestor.hasChildren || !expandedIds.has(ancestor.eventId)) {
-      return ancestorKey;
+    if (!row.expanded) {
+      return mountedOr(at);
     }
   }
-  return requestedKey;
+  return fallback;
+}
+
+/** One mounted row: its place in the list, and the row object built for it. */
+interface WindowItem {
+  readonly entry: VisibleRow;
+  readonly row: WaterfallRow;
+  /** Its position in the flattened visible list. */
+  readonly index: number;
+}
+
+/** A mounted row, and the mounted rows nested under it. */
+interface WindowRowBlock {
+  readonly kind: 'row';
+  readonly item: WindowItem;
+  readonly children: WindowBlock[];
+}
+
+/**
+ * The mounted rows nested under an ancestor the window does not mount — the
+ * rows at the top of a window that starts inside an expanded subtree. Drawn as
+ * the same indented group a mounted ancestor's children are, so the nesting
+ * reads the same on either side of a window edge.
+ */
+interface WindowContinuation {
+  readonly kind: 'continuation';
+  /** The depth of the rows it holds. */
+  readonly depth: number;
+  readonly children: WindowBlock[];
+}
+
+type WindowBlock = WindowRowBlock | WindowContinuation;
+
+/**
+ * Nests the mounted slice of the visible list back into groups, so each row's
+ * children sit in the indented child group of the stylesheet, and rows whose
+ * ancestors lie before the window sit in continuation groups at their depth.
+ *
+ * @param items The mounted rows, in list order.
+ * @returns The top-level blocks.
+ */
+function nestWindow(items: readonly WindowItem[]): readonly WindowBlock[] {
+  const top: WindowBlock[] = [];
+  // `levels[d]` is the block list the next row at depth `d` joins.
+  const levels: WindowBlock[][] = [top];
+  for (const item of items) {
+    const depth = item.entry.depth;
+    if (levels.length > depth + 1) {
+      levels.length = depth + 1;
+    }
+    for (
+      let open = levels[levels.length - 1];
+      open !== undefined && levels.length < depth + 1;
+      open = levels[levels.length - 1]
+    ) {
+      const continuation: WindowContinuation = {
+        kind: 'continuation',
+        depth: levels.length,
+        children: [],
+      };
+      open.push(continuation);
+      levels.push(continuation.children);
+    }
+    const block: WindowRowBlock = { kind: 'row', item, children: [] };
+    levels[depth]?.push(block);
+    levels.push(block.children);
+  }
+  return top;
+}
+
+/** A keyboard move between rows, resolved over the visible list. */
+type RowMove = 'next' | 'previous' | 'first' | 'last' | 'parent' | 'firstChild';
+
+/**
+ * Where a move from the row at `from` lands.
+ *
+ * @returns The target's list position, or `undefined` when the move leads
+ * nowhere: past either end, above a top-level row, or into a closed row.
+ */
+function moveTarget(visible: VisibleRows, from: number, move: RowMove): number | undefined {
+  const origin = visible.rows[from];
+  if (origin === undefined) {
+    return undefined;
+  }
+  const target = ((): number => {
+    switch (move) {
+      case 'next':
+        return from + 1;
+      case 'previous':
+        return from - 1;
+      case 'first':
+        return 0;
+      case 'last':
+        return visible.rows.length - 1;
+      case 'parent':
+        return origin.parentIndex;
+      default:
+        // The first child directly follows an open row in reading order.
+        return origin.expanded && origin.childCount > 0 ? from + 1 : -1;
+    }
+  })();
+  return target >= 0 && target < visible.rows.length ? target : undefined;
+}
+
+/** The attribute a mounted row carries its list position in, for focusing it. */
+const ROW_POSITION_ATTRIBUTE = 'data-dg-row';
+
+/** Focuses the mounted row at a list position, if it is mounted. */
+function focusTreeRow(tree: HTMLElement | null, index: number): void {
+  tree?.querySelector<HTMLElement>(`[${ROW_POSITION_ATTRIBUTE}="${String(index)}"]`)?.focus();
 }
 
 /**
@@ -1987,151 +2975,57 @@ interface PlacedTick {
   readonly anchor: TickAnchor;
 }
 
-/** What the axis strip measured of itself: its inline size and its font size. */
-interface AxisMeasure {
-  /** The strip's inline size, in CSS pixels, rounded to a whole pixel; above zero. */
-  readonly widthPx: number;
-  /** The font size its tick labels are set in, in CSS pixels; above zero. */
-  readonly fontPx: number;
-}
-
 /**
- * Whether two measurements are the same, so a resize that changed nothing the
- * tick fit reads — a height change, a sub-pixel jitter — does not re-render.
- */
-function sameAxisMeasure(left: AxisMeasure | undefined, right: AxisMeasure | undefined): boolean {
-  if (left === undefined || right === undefined) {
-    return left === right;
-  }
-  return left.widthPx === right.widthPx && left.fontPx === right.fontPx;
-}
-
-/**
- * Reads the axis `<svg>`'s inline size and font size.
+ * The estimated inline extent of a tick label, in ems of the label font.
  *
- * The font size comes from the element's computed style — the `xs` type role
- * of the strip it inherits from — and falls back to the same role's token
- * value ({@link XS_FONT_PX}) when the host reports none.
- *
- * @param element The mounted axis graphic.
- * @returns The measurement, or `undefined` while the strip has no width (not
- * laid out, hidden, or a DOM that measures nothing) or no usable font size —
- * the states in which the unmeasured tick set is drawn.
+ * `../utils/format`'s deterministic advance estimate, which errs towards
+ * "wider": a tick label is a compact duration — digits, a decimal point, a
+ * space and a unit (`0 ms`, `470 µs`, `1.2 s`) — and the estimate's narrow
+ * advance is an upper bound on those characters in the UI face. Erring wide
+ * can drop a tick that would just have fitted, never draw two labels into
+ * each other.
  */
-function readAxisMeasure(element: SVGSVGElement): AxisMeasure | undefined {
-  const width = element.getBoundingClientRect().width;
-  if (!Number.isFinite(width) || width <= 0) {
-    return undefined;
-  }
-  const computed = Number.parseFloat(
-    element.ownerDocument.defaultView?.getComputedStyle(element).fontSize ?? '',
-  );
-  const fontPx = Number.isFinite(computed) && computed > 0 ? computed : XS_FONT_PX;
-  if (fontPx === undefined) {
-    return undefined;
-  }
-  const widthPx = Math.round(width);
-  return widthPx > 0 ? { widthPx, fontPx } : undefined;
+function labelExtentEm(label: string): number {
+  return estimateTextWidth(label, EM_FONT_SIZE);
 }
 
 /**
- * The axis graphic's measurement, kept current across resizes.
- *
- * Measured once in a layout effect, before the first paint, so a narrow strip
- * never flashes the dense tick set; then again whenever a `ResizeObserver`
- * reports a change, re-reading the element rather than trusting the entry's
- * box so the two paths cannot disagree. A host without `ResizeObserver` keeps
- * the first reading. The observer is disconnected on unmount.
- *
- * @param ref The axis graphic.
- * @returns The current measurement, or `undefined` while there is none.
- */
-function useAxisMeasure(ref: RefObject<SVGSVGElement | null>): AxisMeasure | undefined {
-  const [measure, setMeasure] = useState<AxisMeasure | undefined>(undefined);
-
-  useLayoutEffect(() => {
-    const element = ref.current;
-    if (element === null) {
-      return undefined;
-    }
-    const update = (): void => {
-      const next = readAxisMeasure(element);
-      setMeasure((current) => (sameAxisMeasure(current, next) ? current : next));
-    };
-    update();
-    if (typeof ResizeObserver === 'undefined') {
-      return undefined;
-    }
-    const observer = new ResizeObserver(update);
-    observer.observe(element);
-    return () => {
-      observer.disconnect();
-    };
-  }, [ref]);
-
-  return measure;
-}
-
-/**
- * The anchoring an unmeasured axis uses: the first label starts at its tick,
- * the last ends at it, and every other is centred — the rule that keeps both
- * end labels inside the strip whatever its width, at the price of setting
- * them beside their ticks rather than under them.
- */
-function anchorWithoutMeasure(ticks: readonly AxisTick[]): readonly PlacedTick[] {
-  const lastIndex = ticks.length - 1;
-  return ticks.map((tick, index) => ({
-    tick,
-    anchor: index === 0 ? 'start' : index === lastIndex ? 'end' : 'middle',
-  }));
-}
-
-/**
- * The estimated inline extent of a tick label, in pixels: its code points at
- * {@link AXIS_LABEL_GLYPH_EM} ems each.
- */
-function estimateLabelWidth(label: string, fontPx: number): number {
-  return Array.from(label).length * AXIS_LABEL_GLYPH_EM * fontPx;
-}
-
-/**
- * Places a tick set on a measured strip, or reports that it does not fit.
+ * Places a tick set on the design strip, or reports that it does not fit.
  *
  * Each label is centred under its tick, and anchored to its tick's start or
  * end only when a centred label would cross the strip's own edge — so a label
  * inside the strip sits under the tick it names. The set fits when every
- * estimated label box lies inside `[0, width]` and each is at least
- * {@link AXIS_LABEL_GAP_EM} ems clear of the one before it; ticks arrive in
- * ascending order, so neighbours are the only pairs that can collide.
+ * estimated label box lies inside `[0, AXIS_DESIGN_WIDTH_EM]` and each is at
+ * least {@link AXIS_LABEL_GAP_EM} ems clear of the one before it; ticks arrive
+ * in ascending order, so neighbours are the only pairs that can collide.
+ *
+ * An anchor chosen here stays right on every wider strip: a centred label
+ * that clears an edge at this width clears it by more on a wider one, and a
+ * label anchored to its tick never leaves the strip its tick is inside.
  *
  * @param ticks The candidate ticks, ascending.
- * @param measure The strip's width and font size.
  * @returns The placed ticks, or `undefined` when two labels would touch or one
  * cannot fit inside the strip at all.
  */
-function placeOnMeasuredStrip(
-  ticks: readonly AxisTick[],
-  measure: AxisMeasure,
-): readonly PlacedTick[] | undefined {
-  const { widthPx, fontPx } = measure;
-  const gap = AXIS_LABEL_GAP_EM * fontPx;
+function placeOnDesignStrip(ticks: readonly AxisTick[]): readonly PlacedTick[] | undefined {
+  const width = AXIS_DESIGN_WIDTH_EM;
   const placed: PlacedTick[] = [];
   let previousEnd = Number.NEGATIVE_INFINITY;
 
   for (const tick of ticks) {
-    const extent = estimateLabelWidth(tick.label, fontPx);
-    const x = (tick.offset / PERCENT_RANGE) * widthPx;
+    const extent = labelExtentEm(tick.label);
+    const x = (tick.offset / PERCENT_RANGE) * width;
     let anchor: TickAnchor = 'middle';
     let start = x - extent / 2;
     if (start < 0) {
       anchor = 'start';
       start = x;
-    } else if (start + extent > widthPx) {
+    } else if (start + extent > width) {
       anchor = 'end';
       start = x - extent;
     }
     const end = start + extent;
-    if (start < 0 || end > widthPx || start - previousEnd < gap) {
+    if (start < 0 || end > width || start - previousEnd < AXIS_LABEL_GAP_EM) {
       return undefined;
     }
     placed.push({ tick, anchor });
@@ -2142,31 +3036,27 @@ function placeOnMeasuredStrip(
 }
 
 /**
- * The ticks the axis draws, and how each label is anchored.
+ * The ticks the axis draws, and how each label is anchored: a pure function of
+ * the scale and the window's start.
  *
- * Unmeasured — no width yet, or a DOM that measures nothing — the axis draws
- * the full {@link AXIS_TICK_TARGET} set with {@link anchorWithoutMeasure}'s
- * anchoring, exactly as the percentage geometry alone would. Measured, it asks
- * `generateAxisTicks` for that target and then for one fewer at a time — each
- * request rounding to the scale's next "nice" step — and draws the first set
- * whose labels fit the strip (see {@link placeOnMeasuredStrip}). If not even a
- * single-tick request fits, the window's first tick is drawn alone: an axis
- * with no label at all would carry no scale.
+ * Asks `generateAxisTicks` for {@link AXIS_TICK_TARGET} ticks and then for one
+ * fewer at a time — each request rounding to the scale's next "nice" step —
+ * and draws the first set whose labels fit the design strip (see
+ * {@link placeOnDesignStrip}). That also keeps two ticks from sharing one
+ * label: a step finer than the compact label's precision prints the same text
+ * twice, and two such labels cannot both fit. If not even a single-tick
+ * request fits, the window's first tick is drawn alone: an axis with no label
+ * at all would carry no scale.
  *
- * The tick COUNT is the only thing measured. Every position is still the
- * scale's percentage, so the ticks stay in register with the bars beneath
- * them at every width.
+ * Every position is the scale's percentage, so the ticks stay in register with
+ * the bars beneath them at every width, and nothing here depends on the
+ * rendered strip: the same window always draws the same ticks.
  *
  * @param scale The shared time scale, over the percentage range.
  * @param origin The instant offsets are measured from: the first drawn call.
- * @param measure The strip's measurement, or `undefined` when there is none.
  * @returns The ticks to draw, ascending, with their anchors.
  */
-function fitAxisTicks(
-  scale: TimeScale,
-  origin: number,
-  measure: AxisMeasure | undefined,
-): readonly PlacedTick[] {
+function fitAxisTicks(scale: TimeScale, origin: number): readonly PlacedTick[] {
   const ticksFor = (targetCount: number): readonly AxisTick[] =>
     generateAxisTicks(scale, {
       origin,
@@ -2174,12 +3064,8 @@ function fitAxisTicks(
       minSpacing: AXIS_TICK_MIN_SPACING,
     }).ticks;
 
-  if (measure === undefined) {
-    return anchorWithoutMeasure(ticksFor(AXIS_TICK_TARGET));
-  }
-
   for (let target = AXIS_TICK_TARGET; target >= 1; target -= 1) {
-    const placed = placeOnMeasuredStrip(ticksFor(target), measure);
+    const placed = placeOnDesignStrip(ticksFor(target));
     if (placed !== undefined) {
       return placed;
     }
@@ -2204,11 +3090,13 @@ interface WaterfallAxisProps {
  *
  * Drawn as an SVG because a tick sits at a fraction of the track and text is the
  * only thing there is to place; the percentages come from the same scale the
- * bars use, so no position here is measured either. What IS measured is how
- * many labels the strip has room for: the graphic reads its own width and font
- * size ({@link useAxisMeasure}) and draws the densest tick set whose labels do
- * not run into each other ({@link fitAxisTicks}), falling back to the full set
- * where it cannot measure. The graphic is a single
+ * bars use, so no position here is measured either. How many labels it carries
+ * is not measured either: the tick set is the densest whose labels clear each
+ * other on the fixed design strip ({@link fitAxisTicks}) — which no drawn
+ * strip is narrower than, because the row grid this strip shares floors its
+ * track there — computed from the scale alone and memoised on it, so the
+ * graphic holds no reference to its own element and reads nothing back from
+ * the DOM. The graphic is a single
  * `role="img"` with a label that states the window it spans — its tick text is
  * a scale, not content to be read one label at a time — and its colours are
  * `currentColor`, inherited from the muted type role around it, so the axis
@@ -2234,9 +3122,7 @@ interface WaterfallAxisProps {
  */
 function WaterfallAxis(props: WaterfallAxisProps): ReactElement {
   const { scale, origin, windowMs } = props;
-  const graphicRef = useRef<SVGSVGElement>(null);
-  const measure = useAxisMeasure(graphicRef);
-  const ticks = useMemo(() => fitAxisTicks(scale, origin, measure), [scale, origin, measure]);
+  const ticks = useMemo(() => fitAxisTicks(scale, origin), [scale, origin]);
   return (
     <div className="dg-waterfall__row dg-waterfall__axis">
       <Text as="span" size="xs" tone="muted">
@@ -2244,7 +3130,6 @@ function WaterfallAxis(props: WaterfallAxisProps): ReactElement {
       </Text>
       <Text as="div" size="xs" tone="muted" className="dg-waterfall__axis-strip">
         <svg
-          ref={graphicRef}
           width="100%"
           height={AXIS_HEIGHT}
           role="img"
@@ -2289,20 +3174,17 @@ function WaterfallAxis(props: WaterfallAxisProps): ReactElement {
 }
 
 /* ---------------------------------------------------------------------------
- * One row, and the rows nested under it
+ * One row, and the mounted rows nested under it
  * ------------------------------------------------------------------------- */
 
-interface WaterfallRowItemProps {
-  readonly row: WaterfallRow;
-  /** Zero-based nesting depth, reported to assistive technology as the level. */
-  readonly depth: number;
+/** What every mounted row shares: the scale, the selection and the handlers. */
+interface RowContext {
   /** The shared time scale; every bar is placed in it. */
   readonly scale: TimeScale;
   /** The window's start, which every offset is measured from. */
   readonly viewStart: number;
-  /** Prefix for the child group's id, unique per mounted component. */
+  /** Prefix for child group ids, unique per mounted component. */
   readonly groupIdPrefix: string;
-  readonly expandedIds: ReadonlySet<string>;
   /**
    * The panel's shared selection. A row is marked when it stands for the
    * selected event — by id, or by the trace and span it draws
@@ -2310,14 +3192,14 @@ interface WaterfallRowItemProps {
    * the span differently still lands here.
    */
   readonly selection: PanelSelection | undefined;
-  /** The path key of the row this one is nested under; `undefined` at the top level. */
-  readonly parentKey: string | undefined;
-  /** The path key of the row holding the tree's single tab stop. */
-  readonly tabStopKey: string | undefined;
+  /** The list position of the row holding the tree's single tab stop. */
+  readonly tabStopIndex: number | undefined;
   /** Reports that focus entered a row, which moves the tab stop to it. */
   readonly onRowFocus: (rowKey: string) => void;
   readonly onToggle: (row: WaterfallRow) => void;
   readonly onSelect: (row: WaterfallRow) => void;
+  /** Moves focus from the row at a list position, paging the window when needed. */
+  readonly onNavigate: (from: number, move: RowMove) => void;
   /**
    * The host's open-source action, or `undefined` when there is no host. Passed
    * down rather than read per row so the Shift+Enter command and its
@@ -2326,40 +3208,50 @@ interface WaterfallRowItemProps {
   readonly onOpenSource: ((location: SourceLocation) => void) | undefined;
 }
 
+interface WaterfallRowItemProps {
+  readonly item: WindowItem;
+  /**
+   * The id of the child group mounted after this row, or `undefined` when none
+   * is: the row is closed, or its children lie past the window's end.
+   */
+  readonly groupId: string | undefined;
+  readonly context: RowContext;
+}
+
 /**
- * A row and, when it is expanded, the group of rows nested beneath it.
+ * One row of the tree.
  *
  * The row element is the three-column grid the stylesheet defines — label,
- * track, duration — so it holds exactly three children and the child group is a
- * DOM sibling, owned by the row through `aria-owns`. A fourth child would land
- * in the label column and squeeze the nesting into a two-fifths-wide box.
+ * track, duration — so it holds exactly three children and its child group is a
+ * DOM sibling ({@link WaterfallBlocks}), owned by the row through `aria-owns`
+ * while it is mounted. A fourth child would land in the label column and
+ * squeeze the nesting into a two-fifths-wide box. Its level, and its place
+ * among its siblings, are stated outright (`aria-level`, `aria-posinset`,
+ * `aria-setsize`), because the window may mount only some of its siblings.
  *
  * The row element is the treeitem and the row's only focus target: it holds the
- * tree's roving tab stop when `tabStopKey` names it, and its nested controls are
- * out of the Tab order (see the module header's keyboard model).
+ * tree's roving tab stop when `tabStopIndex` names it, and its nested controls
+ * are out of the Tab order (see the module header's keyboard model).
  */
 function WaterfallRowItem(props: WaterfallRowItemProps): ReactElement {
+  const { item, groupId, context } = props;
+  const { entry, row, index } = item;
   const {
-    row,
-    depth,
     scale,
     viewStart,
-    groupIdPrefix,
-    expandedIds,
     selection,
-    parentKey,
-    tabStopKey,
+    tabStopIndex,
     onRowFocus,
     onToggle,
     onSelect,
+    onNavigate,
     onOpenSource,
-  } = props;
+  } = context;
 
-  const hasChildren = row.children.length > 0;
-  const expanded = hasChildren && expandedIds.has(row.eventId);
+  const hasChildren = row.childCount > 0;
+  const expanded = hasChildren && entry.expanded;
   const selected = matchesPanelSelection(selection, row);
-  const groupId = `${groupIdPrefix}-${row.eventId}`;
-  const rowKey = rowKeyFor(parentKey, row.eventId);
+  const rowKey = entry.key;
   const label = rowLabel(row);
   const description = rowDescription(row);
 
@@ -2424,7 +3316,6 @@ function WaterfallRowItem(props: WaterfallRowItemProps): ReactElement {
     if ((event.key === 'Enter' || event.key === ' ') && isNestedControlEvent(event.target)) {
       return;
     }
-    const element = event.currentTarget;
     switch (event.key) {
       case 'Escape':
         // Dismisses the revealed description until the row loses focus, and is
@@ -2464,13 +3355,15 @@ function WaterfallRowItem(props: WaterfallRowItemProps): ReactElement {
         event.preventDefault();
         onSelect(row);
         return;
+      // Every move below is a position in the visible list, and one outside
+      // the mounted window moves the window to it before focusing it.
       case 'ArrowDown':
         event.preventDefault();
-        focusStep(element, 1);
+        onNavigate(index, 'next');
         return;
       case 'ArrowUp':
         event.preventDefault();
-        focusStep(element, -1);
+        onNavigate(index, 'previous');
         return;
       case 'ArrowRight':
         // Open a closed row, then step into it: the two presses the tree
@@ -2480,7 +3373,7 @@ function WaterfallRowItem(props: WaterfallRowItemProps): ReactElement {
           onToggle(row);
           return;
         }
-        focusFirstChild(element);
+        onNavigate(index, 'firstChild');
         return;
       case 'ArrowLeft':
         event.preventDefault();
@@ -2488,15 +3381,15 @@ function WaterfallRowItem(props: WaterfallRowItemProps): ReactElement {
           onToggle(row);
           return;
         }
-        focusParent(element);
+        onNavigate(index, 'parent');
         return;
       case 'Home':
         event.preventDefault();
-        focusEdge(element, 0);
+        onNavigate(index, 'first');
         return;
       case 'End':
         event.preventDefault();
-        focusEdge(element, -1);
+        onNavigate(index, 'last');
         return;
       default:
         return;
@@ -2555,70 +3448,74 @@ function WaterfallRowItem(props: WaterfallRowItemProps): ReactElement {
     );
 
   return (
-    <>
-      <div
-        className={clsx(
-          'dg-waterfall__row',
-          expanded && 'dg-is-expanded',
-          selected && 'dg-is-selected',
-          row.status === 'error' && 'dg-is-error',
-          row.lineageAmbiguous && 'dg-is-ambiguous',
-          row.orphan !== undefined && 'dg-is-orphan',
+    <div
+      className={clsx(
+        'dg-waterfall__row',
+        expanded && 'dg-is-expanded',
+        selected && 'dg-is-selected',
+        row.status === 'error' && 'dg-is-error',
+        row.lineageAmbiguous && 'dg-is-ambiguous',
+        row.orphan !== undefined && 'dg-is-orphan',
+      )}
+      role="treeitem"
+      aria-level={entry.depth + 1}
+      aria-posinset={entry.position}
+      aria-setsize={entry.setSize}
+      aria-expanded={hasChildren ? expanded : undefined}
+      aria-selected={selected}
+      aria-owns={expanded ? groupId : undefined}
+      // The row's position in the visible list, which is how the keyboard
+      // finds it again after a move (see `focusTreeRow`).
+      data-dg-row={index}
+      // The same sentence the tooltip carries, and for the same reason: the
+      // row's visible text is a truncated label beside a handful of chips,
+      // and the figure a reader most needs — how far into the window the call
+      // started — is in neither. Naming the row explicitly also settles what
+      // it is called: the tooltip's bubble is a descendant of the row, so a
+      // name computed from the row's contents would read the label once as
+      // itself and once again inside the description.
+      aria-label={description}
+      aria-keyshortcuts={canOpenSource ? OPEN_SOURCE_SHORTCUT : undefined}
+      // The roving tab index: one row of the whole tree is in the Tab order.
+      tabIndex={index === tabStopIndex ? 0 : -1}
+      onClick={handleClick}
+      onKeyDown={handleKeyDown}
+      onPointerDown={handlePointerDown}
+      onFocus={handleFocus}
+      onBlur={handleBlur}
+    >
+      <Stack direction="horizontal" gap={1} align="center" className="dg-waterfall__name">
+        {hasChildren ? (
+          <Button
+            variant="ghost"
+            size="sm"
+            iconOnly
+            icon={
+              expanded ? (
+                <ChevronDown aria-hidden="true" className="dg-icon" />
+              ) : (
+                <ChevronRight aria-hidden="true" className="dg-icon" />
+              )
+            }
+            aria-label={disclosureName(row, expanded)}
+            aria-expanded={expanded}
+            // Referenced only while the group exists: a control may not point
+            // at an id that is not in the document.
+            {...(expanded && groupId !== undefined ? { 'aria-controls': groupId } : {})}
+            // Out of the Tab order: the treeitem is the row's only stop, and
+            // ArrowRight/ArrowLeft on it are the keyboard route to the same
+            // disclosure. Still a real button for the pointer.
+            tabIndex={-1}
+            onClick={handleToggle}
+          />
+        ) : null}
+        {row.method === undefined ? null : (
+          <Badge variant="outline" tone="neutral">
+            {row.method}
+          </Badge>
         )}
-        role="treeitem"
-        aria-level={depth + 1}
-        aria-expanded={hasChildren ? expanded : undefined}
-        aria-selected={selected}
-        aria-owns={expanded ? groupId : undefined}
-        // The same sentence the tooltip carries, and for the same reason: the
-        // row's visible text is a truncated label beside a handful of chips,
-        // and the figure a reader most needs — how far into the window the call
-        // started — is in neither. Naming the row explicitly also settles what
-        // it is called: the tooltip's bubble is a descendant of the row, so a
-        // name computed from the row's contents would read the label once as
-        // itself and once again inside the description.
-        aria-label={description}
-        aria-keyshortcuts={canOpenSource ? OPEN_SOURCE_SHORTCUT : undefined}
-        // The roving tab index: one row of the whole tree is in the Tab order.
-        tabIndex={rowKey === tabStopKey ? 0 : -1}
-        onClick={handleClick}
-        onKeyDown={handleKeyDown}
-        onPointerDown={handlePointerDown}
-        onFocus={handleFocus}
-        onBlur={handleBlur}
-      >
-        <Stack direction="horizontal" gap={1} align="center" className="dg-waterfall__name">
-          {hasChildren ? (
-            <Button
-              variant="ghost"
-              size="sm"
-              iconOnly
-              icon={
-                expanded ? (
-                  <ChevronDown aria-hidden="true" className="dg-icon" />
-                ) : (
-                  <ChevronRight aria-hidden="true" className="dg-icon" />
-                )
-              }
-              aria-label={disclosureName(row, expanded)}
-              aria-expanded={expanded}
-              // Referenced only while the group exists: a control may not point
-              // at an id that is not in the document.
-              {...(expanded ? { 'aria-controls': groupId } : {})}
-              // Out of the Tab order: the treeitem is the row's only stop, and
-              // ArrowRight/ArrowLeft on it are the keyboard route to the same
-              // disclosure. Still a real button for the pointer.
-              tabIndex={-1}
-              onClick={handleToggle}
-            />
-          ) : null}
-          {row.method === undefined ? null : (
-            <Badge variant="outline" tone="neutral">
-              {row.method}
-            </Badge>
-          )}
-          <span className="dg-waterfall__label-slot" style={LABEL_SLOT_STYLE}>
-            {/* One `Tooltip` in two forms, so the label has exactly one
+        <span className="dg-waterfall__label-slot" style={LABEL_SLOT_STYLE}>
+          {/* One `Tooltip` in two forms, so the label has exactly one
                 `role="tooltip"` at all times and is never remounted by the
                 switch. For a pointer it is the primitive's own: hover opens
                 it above the label. For the keyboard — the treeitem itself
@@ -2630,137 +3527,167 @@ function WaterfallRowItem(props: WaterfallRowItemProps): ReactElement {
                 (`describesTrigger`), because the treeitem's `aria-label`
                 already carries the sentence and a reader must not hear it
                 twice. */}
-            <Tooltip
-              className="dg-waterfall__tooltip"
-              open={descriptionRevealed ? true : undefined}
-              describesTrigger={!descriptionRevealed}
-              placement={descriptionRevealed ? 'bottom' : 'top'}
-              content={
-                descriptionRevealed ? (
-                  <>
-                    {description}
-                    {canOpenSource ? (
-                      <>
-                        {' · '}
-                        <Kbd keys={OPEN_SOURCE_KEYS} /> opens the source
-                      </>
-                    ) : null}
-                  </>
-                ) : (
-                  description
-                )
-              }
-            >
-              {labelElement}
-            </Tooltip>
-          </span>
-          {row.occurrenceCount === undefined ? null : (
-            <Badge tone="info" variant="outline">
-              {formatCountOf(row.occurrenceCount, CALL_NOUN)}
-            </Badge>
-          )}
-          {row.statusCode === undefined ? null : (
-            <Badge tone={statusCodeTone(row.statusCode)} className="dg-waterfall__status">
-              {String(row.statusCode)}
-            </Badge>
-          )}
-          {showsErrorBadge(row) ? (
-            <Badge tone="danger" className="dg-waterfall__status">
-              {formatStatusLabel('error')}
-            </Badge>
-          ) : null}
-          {row.pending ? (
-            // The state in a word, never in the icon or the tone alone — the
-            // request table's own Pending chip, whose icon `Badge` hides from
-            // assistive technology. Not a tooltip trigger: the row is the tree's
-            // only stop, and the lower bound and the missing response are in the
-            // row's description.
-            <Badge
-              tone="info"
-              variant="outline"
-              icon={<Hourglass className="dg-icon" />}
-              className="dg-waterfall__status"
-            >
-              {pendingBadgeLabel(row)}
-            </Badge>
-          ) : null}
-          {row.rowCount === undefined ? null : (
-            <Badge tone="neutral" variant="outline">
-              {formatCountOf(row.rowCount, ROW_NOUN)}
-            </Badge>
-          )}
-          {row.orphan === undefined ? null : (
-            // The word Timeline uses for the same verdict; the unresolved parent
-            // is named in the row's description.
-            <Badge tone="warning" variant="outline">
-              Re-attached
-            </Badge>
-          )}
-          {row.lineageAmbiguous ? (
-            <Badge tone="warning" variant="outline">
-              Inferred parent
-            </Badge>
-          ) : null}
-          {row.childrenTruncated ? (
-            <Badge tone="warning" variant="outline">
-              Nested calls not drawn
-            </Badge>
-          ) : null}
-          {/* Out of the Tab order for the same reason as the disclosure button;
-              Shift+Enter on the row is its keyboard route. */}
-          {source === undefined ? null : <SourceLink location={source} compact tabIndex={-1} />}
-        </Stack>
-        <div className="dg-waterfall__track">
-          {/* Decorative: the duration cell beside it prints the same measurement
-              as text, so the bar adds no information for a reader. */}
-          <div
-            className="dg-waterfall__bar dg-waterfall__bar--active"
-            style={barStyle}
-            aria-hidden="true"
-          />
-        </div>
-        {row.pending ? (
-          // A lower bound, said in words beside the figure: the call had been
-          // outstanding this long when the capture ended, and was still going.
-          // The pair is the row's third grid cell, so it takes the duration
-          // column's class and placement.
-          <Stack direction="horizontal" gap={1} align="center" className="dg-waterfall__duration">
-            <Text as="span" size="xs" tone="muted">
-              {LOWER_BOUND_LABEL}
-            </Text>
-            <DurationCell ms={row.durationMs} severity="auto" size="sm" />
-          </Stack>
-        ) : (
-          <DurationCell
-            ms={row.durationMs}
-            severity="auto"
-            size="sm"
-            className="dg-waterfall__duration"
-          />
+          <Tooltip
+            className="dg-waterfall__tooltip"
+            open={descriptionRevealed ? true : undefined}
+            describesTrigger={!descriptionRevealed}
+            placement={descriptionRevealed ? 'bottom' : 'top'}
+            content={
+              descriptionRevealed ? (
+                <>
+                  {description}
+                  {canOpenSource ? (
+                    <>
+                      {' · '}
+                      <Kbd keys={OPEN_SOURCE_KEYS} /> opens the source
+                    </>
+                  ) : null}
+                </>
+              ) : (
+                description
+              )
+            }
+          >
+            {labelElement}
+          </Tooltip>
+        </span>
+        {row.occurrenceCount === undefined ? null : (
+          <Badge tone="info" variant="outline">
+            {formatCountOf(row.occurrenceCount, CALL_NOUN)}
+          </Badge>
         )}
+        {row.statusCode === undefined ? null : (
+          <Badge tone={statusCodeTone(row.statusCode)} className="dg-waterfall__status">
+            {String(row.statusCode)}
+          </Badge>
+        )}
+        {showsErrorBadge(row) ? (
+          <Badge tone="danger" className="dg-waterfall__status">
+            {formatStatusLabel('error')}
+          </Badge>
+        ) : null}
+        {row.pending ? (
+          // The state in a word, never in the icon or the tone alone — the
+          // request table's own Pending chip, whose icon `Badge` hides from
+          // assistive technology. Not a tooltip trigger: the row is the tree's
+          // only stop, and the lower bound and the missing response are in the
+          // row's description.
+          <Badge
+            tone="info"
+            variant="outline"
+            icon={<Hourglass className="dg-icon" />}
+            className="dg-waterfall__status"
+          >
+            {pendingBadgeLabel(row)}
+          </Badge>
+        ) : null}
+        {row.rowCount === undefined ? null : (
+          <Badge tone="neutral" variant="outline">
+            {formatCountOf(row.rowCount, ROW_NOUN)}
+          </Badge>
+        )}
+        {row.orphan === undefined ? null : (
+          // The word Timeline uses for the same verdict; the unresolved parent
+          // is named in the row's description.
+          <Badge tone="warning" variant="outline">
+            Re-attached
+          </Badge>
+        )}
+        {row.lineageAmbiguous ? (
+          <Badge tone="warning" variant="outline">
+            Inferred parent
+          </Badge>
+        ) : null}
+        {row.childrenTruncated ? (
+          <Badge tone="warning" variant="outline">
+            Nested calls not drawn
+          </Badge>
+        ) : null}
+        {/* Out of the Tab order for the same reason as the disclosure button;
+              Shift+Enter on the row is its keyboard route. */}
+        {source === undefined ? null : <SourceLink location={source} compact tabIndex={-1} />}
+      </Stack>
+      <div className="dg-waterfall__track">
+        {/* Decorative: the duration cell beside it prints the same measurement
+              as text, so the bar adds no information for a reader. */}
+        <div
+          className="dg-waterfall__bar dg-waterfall__bar--active"
+          style={barStyle}
+          aria-hidden="true"
+        />
       </div>
-      {expanded ? (
-        <div id={groupId} role="group" className="dg-waterfall__children dg-waterfall__child-rows">
-          {row.children.map((child) => (
-            <WaterfallRowItem
-              key={child.eventId}
-              row={child}
-              depth={depth + 1}
-              scale={scale}
-              viewStart={viewStart}
-              groupIdPrefix={groupIdPrefix}
-              expandedIds={expandedIds}
-              selection={selection}
-              parentKey={rowKey}
-              tabStopKey={tabStopKey}
-              onRowFocus={onRowFocus}
-              onToggle={onToggle}
-              onSelect={onSelect}
-              onOpenSource={onOpenSource}
-            />
-          ))}
-        </div>
-      ) : null}
+      {row.pending ? (
+        // A lower bound, said in words beside the figure: the call had been
+        // outstanding this long when the capture ended, and was still going.
+        // The pair is the row's third grid cell, so it takes the duration
+        // column's class and placement.
+        <Stack direction="horizontal" gap={1} align="center" className="dg-waterfall__duration">
+          <Text as="span" size="xs" tone="muted">
+            {LOWER_BOUND_LABEL}
+          </Text>
+          <DurationCell ms={row.durationMs} severity="auto" size="sm" />
+        </Stack>
+      ) : (
+        <DurationCell
+          ms={row.durationMs}
+          severity="auto"
+          size="sm"
+          className="dg-waterfall__duration"
+        />
+      )}
+    </div>
+  );
+}
+
+interface WaterfallBlocksProps {
+  readonly blocks: readonly WindowBlock[];
+  readonly context: RowContext;
+}
+
+/**
+ * The mounted rows, nested: each row followed by the group of its mounted
+ * children, and each continuation as the same indented group without a row
+ * above it.
+ *
+ * A row's group is a `role="group"` its row owns; a continuation holds rows
+ * whose owning row is before the window, so it is a plain container — its rows
+ * still state their own level, position and set size, and belong to the tree.
+ */
+function WaterfallBlocks(props: WaterfallBlocksProps): ReactElement {
+  const { blocks, context } = props;
+  return (
+    <>
+      {blocks.map((block) => {
+        if (block.kind === 'continuation') {
+          return (
+            <div
+              key={`continuation-${String(block.depth)}`}
+              className="dg-waterfall__children dg-waterfall__child-rows"
+            >
+              <WaterfallBlocks blocks={block.children} context={context} />
+            </div>
+          );
+        }
+        const { item, children } = block;
+        const groupId =
+          item.entry.expanded && children.length > 0
+            ? `${context.groupIdPrefix}-${item.row.eventId}`
+            : undefined;
+        return (
+          <Fragment key={item.entry.key}>
+            <WaterfallRowItem item={item} groupId={groupId} context={context} />
+            {groupId === undefined ? null : (
+              <div
+                id={groupId}
+                role="group"
+                className="dg-waterfall__children dg-waterfall__child-rows"
+              >
+                <WaterfallBlocks blocks={children} context={context} />
+              </div>
+            )}
+          </Fragment>
+        );
+      })}
     </>
   );
 }
@@ -2821,6 +3748,127 @@ function describeUndrawnPages(loaded: number, total: number | undefined): string
       : `${formatCount(loaded)} of ${formatCountOf(total, CAPTURED_RECORD_NOUN)}`;
   const verdict = pluralize(loaded, UNDRAWN_VERDICT);
   return `Loaded ${counted} so far, and ${verdict}. More records remain to be searched.`;
+}
+
+/* ---------------------------------------------------------------------------
+ * Released pages, stated
+ *
+ * Pages released to stay within {@link RETAINED_ITEM_BUDGET} were loaded: the
+ * calls on them were captured, and this view drew them. So they are stated as
+ * released — with the positions of the result still held, and how many were
+ * loaded before those — and never as absent from the capture. The copy is
+ * chosen by pure functions of the held pages, so every branch is a plain
+ * value a test can name.
+ * ------------------------------------------------------------------------- */
+
+/** What the footer and the no-rows state say about released pages. */
+interface RetentionFacts {
+  /** The noun the source's items are counted in. */
+  readonly noun: CountedNoun;
+  /** The zero-based position of the first held item. */
+  readonly heldFrom: number;
+  /** One past the position of the last held item. */
+  readonly heldTo: number;
+  /** How many items the held pages carry. */
+  readonly heldCount: number;
+  /** How many items the released pages carried. */
+  readonly releasedCount: number;
+  /** How many drawn items were released and are no longer drawn. */
+  readonly releasedDrawnCount: number;
+  /** The total the service reported, when it reported one. */
+  readonly total: number | undefined;
+  /** Whether rows nest across pages, so a release can lift the rows under it. */
+  readonly nestsAcrossPages: boolean;
+}
+
+/** The verb of "… was released" / "… were released". */
+const RELEASED_VERB: CountedNoun = countedNoun('was', 'were');
+
+/** The verb of "… includes" / "… include". */
+const INCLUDE_VERB: CountedNoun = countedNoun('includes', 'include');
+
+/** The pronoun for the held items: "it" for one, "them" for several. */
+const HELD_PRONOUN: CountedNoun = countedNoun('it', 'them');
+
+/**
+ * The facts about released pages, or `undefined` while nothing was released.
+ *
+ * @param holding What the view holds.
+ * @param noun The noun the source's items are counted in.
+ * @param total The total the service reported, when it reported one.
+ * @param nestsAcrossPages Whether rows nest across pages (the flat path).
+ */
+function retentionFacts(
+  holding: SpanHolding | RequestHolding | undefined,
+  noun: CountedNoun,
+  total: number | undefined,
+  nestsAcrossPages: boolean,
+): RetentionFacts | undefined {
+  if (holding === undefined || holding.releasedItemCount === 0) {
+    return undefined;
+  }
+  let heldFrom = Number.POSITIVE_INFINITY;
+  let heldTo = Number.NEGATIVE_INFINITY;
+  for (const page of holding.pages) {
+    heldFrom = Math.min(heldFrom, page.offset);
+    heldTo = Math.max(heldTo, page.offset + page.items.length);
+  }
+  if (!Number.isFinite(heldFrom) || !Number.isFinite(heldTo)) {
+    return undefined;
+  }
+  return {
+    noun,
+    heldFrom,
+    heldTo: Math.max(heldTo, heldFrom),
+    heldCount: holding.heldItemCount,
+    releasedCount: holding.releasedItemCount,
+    releasedDrawnCount: holding.releasedDrawnCount,
+    total: total !== undefined && Number.isSafeInteger(total) && total >= 0 ? total : undefined,
+    nestsAcrossPages,
+  };
+}
+
+/** Which positions of the result are held: "positions 5,001–15,000 of 20,000". */
+function describeHeldRange(facts: RetentionFacts): string {
+  const first = facts.heldFrom + 1;
+  const last = facts.heldTo;
+  const range =
+    last > first
+      ? `positions ${formatCount(first)}–${formatCount(last)}`
+      : `position ${formatCount(first)}`;
+  return facts.total === undefined ? range : `${range} of ${formatCount(facts.total)}`;
+}
+
+/**
+ * The footer's statement about released pages: what is held, how much was
+ * loaded before it and released, and why.
+ *
+ * @example
+ * // "Holding 10,000 spans (positions 5,001–15,000 of 20,000); the 5,000 spans
+ * //  loaded before them were released to keep this view within 10,000 spans.
+ * //  A call whose parent was released is drawn at the top level."
+ */
+function describeRetention(facts: RetentionFacts): string {
+  const lifted = facts.nestsAcrossPages
+    ? ' A call whose parent was released is drawn at the top level.'
+    : '';
+  return `Holding ${formatCountOf(facts.heldCount, facts.noun)} (${describeHeldRange(facts)}); the ${formatCountOf(facts.releasedCount, facts.noun)} loaded before ${pluralize(facts.heldCount, HELD_PRONOUN)} ${pluralize(facts.releasedCount, RELEASED_VERB)} released to keep this view within ${formatCountOf(RETAINED_ITEM_BUDGET, facts.noun)}.${lifted}`;
+}
+
+/** The title of the state for held pages with no call after calls were released. */
+const RELEASED_WITHOUT_ROWS_TITLE = 'No calls held';
+
+/**
+ * The message for held pages that draw nothing after pages holding calls were
+ * released: the calls were loaded and released, not missing.
+ */
+function describeReleasedWithoutRows(facts: RetentionFacts): string {
+  return `The ${formatCountOf(facts.heldCount, facts.noun)} held (${describeHeldRange(facts)}) ${pluralize(facts.heldCount, INCLUDE_VERB)} no network or database call. The ${formatCountOf(facts.releasedCount, facts.noun)} loaded before ${pluralize(facts.heldCount, HELD_PRONOUN)} included calls, and ${pluralize(facts.releasedCount, RELEASED_VERB)} released to keep this view within ${formatCountOf(RETAINED_ITEM_BUDGET, facts.noun)}.`;
+}
+
+/** The statement of which rows the window mounts: "Rows 201–400 of 1,234". */
+function describeRowWindow(mounted: RowWindow): string {
+  return `Rows ${formatCount(mounted.start + 1)}–${formatCount(mounted.end)} of ${formatCount(mounted.total)}`;
 }
 
 /* ---------------------------------------------------------------------------
@@ -3019,13 +4067,16 @@ type AnyQueryResult = UseQueryResult<unknown>;
 /**
  * The request and dependency waterfall of one interaction.
  *
- * Resolves the node's query through the ambient `DataProvider`, normalises the
- * payload into rows nested by ancestry and positioned by their offset from the
- * first call, and renders its states in this precedence: an unsupported source
- * (no query issued), a kind filter that selects nothing drawable (no query
- * issued), loading and error while nothing has been loaded yet, pages searched
- * with nothing drawable while more remain (with "Load more"), the empty result,
- * and the chart. A page that arrived while rows are already on screen degrades
+ * Resolves the node's query through the ambient `DataProvider`, folds each
+ * page into rows nested by ancestry and positioned by their offset from the
+ * first call — holding at most {@link RETAINED_ITEM_BUDGET} source items and
+ * mounting at most {@link WATERFALL_ROW_BUDGET} rows — and renders its states
+ * in this precedence: an unsupported source (no query issued), a kind filter
+ * that selects nothing drawable (no query issued), loading and error while
+ * nothing has been loaded yet, held pages with nothing drawable after pages
+ * holding calls were released, pages searched with nothing drawable while more
+ * remain (with "Load more"), the empty result, and the chart. A page that
+ * arrived while rows are already on screen degrades
  * to a footer notice rather than replacing the view, so paging never blanks a
  * chart the developer is reading — and a failure is still reported as a
  * failure, with a retry, never as a successful empty result (AAP 0.5.5).
@@ -3052,9 +4103,20 @@ export function Waterfall(props: WaterfallProps): ReactElement {
   // this chart agrees with every other view of the same trace.
   const { selection, markSelected } = useViewSelection();
   // The row that last received focus, by path key. What actually holds the tab
-  // stop is derived from it on every render (`resolveTabStop`), so a collapse or
-  // a new page can never leave the tree without one.
+  // stop is derived from it on every render (`resolveTabStop`), so a collapse,
+  // a new page or a moved window can never leave the tree without one.
   const [activeRowKey, setActiveRowKey] = useState<string | undefined>(undefined);
+  // Where the mounted window of rows starts, for one page-sequence identity:
+  // a different query or session starts over at the first row, derived below
+  // rather than reset in an effect, exactly as the pages are.
+  const [rowWindowState, setRowWindowState] = useState<{
+    readonly identity: string;
+    readonly start: number;
+  }>(() => ({ identity, start: 0 }));
+  // The tree element, which the keyboard focuses rows inside, and the row a
+  // keyboard move is waiting to focus once the window it moved has mounted it.
+  const treeRef = useRef<HTMLDivElement>(null);
+  const pendingFocusKeyRef = useRef<string | undefined>(undefined);
 
   // Accumulated pages belong to one page-sequence identity. When the node's
   // query — its authored offset included — or the panel's session changes, the
@@ -3087,38 +4149,61 @@ export function Waterfall(props: WaterfallProps): ReactElement {
   const spanPage = spanResult.data;
   const requestsPage = requestsResult.data;
 
-  const model = useMemo<WaterfallModel>(() => {
+  // What is held: the carried pages, with the page this render resolved folded
+  // in (see `holdPage`). Only the new page and the rows it can move are
+  // resolved; "Load more" carries this result forward as it is.
+  const loaded = useMemo<LoadedPages>(() => {
     if (spanQuery !== undefined) {
-      const previous = carried.kind === 'spans' ? carried.items : EMPTY_EVENTS;
-      const page = spanPage ?? EMPTY_EVENTS;
-      return buildFromEvents(previous.length === 0 ? page : [...previous, ...page], includedKinds);
+      const holding = carried.kind === 'spans' ? carried.holding : undefined;
+      if (spanPage === undefined) {
+        return holding === undefined ? NO_PAGES : { kind: 'spans', holding };
+      }
+      return {
+        kind: 'spans',
+        holding: holdPage(
+          holding,
+          EMPTY_SPAN_INDEX,
+          offset,
+          spanPage,
+          (index, added, addedSeq, released, releasedThroughSeq) =>
+            foldSpanPage(index, includedKinds, added, addedSeq, released, releasedThroughSeq),
+        ),
+      };
     }
     if (requestsQuery !== undefined) {
-      const previous = carried.kind === 'requests' ? carried.items : EMPTY_GROUPS;
-      const page = requestsPage ?? EMPTY_GROUPS;
-      return buildFromRequests(
-        previous.length === 0 ? page : [...previous, ...page],
-        includedKinds,
-      );
+      const holding = carried.kind === 'requests' ? carried.holding : undefined;
+      if (requestsPage === undefined) {
+        return holding === undefined ? NO_PAGES : { kind: 'requests', holding };
+      }
+      return {
+        kind: 'requests',
+        holding: holdPage(
+          holding,
+          EMPTY_REQUEST_INDEX,
+          offset,
+          requestsPage,
+          (index, added, addedSeq, released, releasedThroughSeq) =>
+            foldRequestPage(index, includedKinds, added, addedSeq, released, releasedThroughSeq),
+        ),
+      };
     }
-    return EMPTY_MODEL;
-  }, [spanQuery, spanPage, requestsQuery, requestsPage, carried, includedKinds]);
+    return NO_PAGES;
+  }, [spanQuery, spanPage, requestsQuery, requestsPage, carried, offset, includedKinds]);
 
-  // How many source items have been resolved so far, which is what "loaded of
-  // total" compares against — the drawn row count is a different figure,
-  // because records of other kinds are filtered out and groups expand into
-  // occurrences.
-  const loadedItemCount = useMemo(() => {
-    if (spanQuery !== undefined) {
-      const previous = carried.kind === 'spans' ? carried.items.length : 0;
-      return previous + (spanPage?.length ?? 0);
-    }
-    if (requestsQuery !== undefined) {
-      const previous = carried.kind === 'requests' ? carried.items.length : 0;
-      return previous + (requestsPage?.length ?? 0);
-    }
-    return 0;
-  }, [spanQuery, requestsQuery, carried, spanPage, requestsPage]);
+  const holding = holdingOf(loaded);
+  const summary = useMemo(() => summariseLoaded(loaded), [loaded]);
+  // How many source items have been resolved so far, released pages included,
+  // which is what "loaded of total" compares against — the drawn row count is
+  // a different figure, because records of other kinds are filtered out and
+  // groups expand into occurrences.
+  const loadedItemCount = holding?.loadedItemCount ?? 0;
+  const unverifiedOrphans = (holding?.releasedItemCount ?? 0) > 0;
+
+  // Every row a reader can reach, in reading order, and the window of it the
+  // tree mounts.
+  const visible = useMemo(() => flattenLoaded(loaded, expandedIds), [loaded, expandedIds]);
+  const requestedStart = rowWindowState.identity === identity ? rowWindowState.start : 0;
+  const mounted = windowRows(visible.rows.length, requestedStart, WATERFALL_ROW_BUDGET);
 
   const result: AnyQueryResult | undefined =
     spanQuery !== undefined ? spanResult : requestsQuery !== undefined ? requestsResult : undefined;
@@ -3132,16 +4217,43 @@ export function Waterfall(props: WaterfallProps): ReactElement {
       ? reportedNextOffset
       : undefined;
 
-  // The axis ticks are chosen by the axis itself, against the scale and the
-  // width it measures of its own strip (see `WaterfallAxis`).
+  // One scale for the bars and the axis, over the held window. The axis
+  // chooses its ticks from this scale alone (see `WaterfallAxis`).
   const scale = useMemo(
-    () => createTimeScale([model.viewStart, model.viewEnd], [0, PERCENT_RANGE]),
-    [model.viewStart, model.viewEnd],
+    () => createTimeScale([summary.viewStart, summary.viewEnd], [0, PERCENT_RANGE]),
+    [summary.viewStart, summary.viewEnd],
   );
 
-  const rowIndex = useMemo(() => indexRows(model.rows), [model.rows]);
-  const tabStopKey = resolveTabStop(rowIndex, activeRowKey, expandedIds);
+  // A row object for each mounted row, and the mounted rows nested back into
+  // their groups.
+  const blocks = useMemo(() => {
+    const items: WindowItem[] = [];
+    for (let index = mounted.start; index < mounted.end; index += 1) {
+      const entry = visible.rows[index];
+      if (entry !== undefined) {
+        items.push({ entry, row: buildRow(entry, summary.viewStart, unverifiedOrphans), index });
+      }
+    }
+    return nestWindow(items);
+  }, [visible, mounted.start, mounted.end, summary.viewStart, unverifiedOrphans]);
+
+  const tabStopIndex = resolveTabStop(loaded, visible, mounted, activeRowKey);
   const openSource = actions?.onOpenSource;
+
+  // A row a keyboard move paged to is focused once the moved window has
+  // mounted it; the move is spent either way, so it can never steal focus
+  // from a later render.
+  useLayoutEffect(() => {
+    const key = pendingFocusKeyRef.current;
+    if (key === undefined) {
+      return;
+    }
+    pendingFocusKeyRef.current = undefined;
+    const index = visible.indexByKey.get(key);
+    if (index !== undefined && windowContains(mounted, index)) {
+      focusTreeRow(treeRef.current, index);
+    }
+  });
 
   const handleSelect = useCallback(
     (row: WaterfallRow): void => {
@@ -3167,30 +4279,68 @@ export function Waterfall(props: WaterfallProps): ReactElement {
     [actions, expandedIds, nodeId],
   );
 
+  const handleNavigate = useCallback(
+    (from: number, move: RowMove): void => {
+      const target = moveTarget(visible, from, move);
+      const entry = target === undefined ? undefined : visible.rows[target];
+      if (target === undefined || entry === undefined) {
+        return;
+      }
+      if (windowContains(mounted, target)) {
+        focusTreeRow(treeRef.current, target);
+        return;
+      }
+      // Past the window's edge: move the window to the aligned window holding
+      // the target — the one Previous/Next would reach — and focus it there.
+      pendingFocusKeyRef.current = entry.key;
+      setActiveRowKey(entry.key);
+      setRowWindowState({ identity, start: windowStartFor(target, WATERFALL_ROW_BUDGET) });
+    },
+    [identity, mounted, visible],
+  );
+
+  const handleShowPreviousRows = useCallback((): void => {
+    setRowWindowState({ identity, start: previousWindowStart(mounted) });
+  }, [identity, mounted]);
+
+  const handleShowNextRows = useCallback((): void => {
+    setRowWindowState({ identity, start: nextWindowStart(mounted) });
+  }, [identity, mounted]);
+
   const handleLoadMore = useCallback((): void => {
     if (nextOffset === undefined) {
       return;
     }
-    if (spanQuery !== undefined) {
-      const previous = carried.kind === 'spans' ? carried.items : EMPTY_EVENTS;
-      const page = spanPage ?? EMPTY_EVENTS;
-      setPaging({
-        identity,
-        offset: nextOffset,
-        loaded: { kind: 'spans', items: [...previous, ...page] },
-      });
-      return;
-    }
-    if (requestsQuery !== undefined) {
-      const previous = carried.kind === 'requests' ? carried.items : EMPTY_GROUPS;
-      const page = requestsPage ?? EMPTY_GROUPS;
-      setPaging({
-        identity,
-        offset: nextOffset,
-        loaded: { kind: 'requests', items: [...previous, ...page] },
-      });
-    }
-  }, [carried, identity, nextOffset, requestsPage, requestsQuery, spanPage, spanQuery]);
+    // The page on screen is already folded into `loaded`; carry that forward
+    // rather than folding it again.
+    setPaging({ identity, offset: nextOffset, loaded });
+  }, [identity, loaded, nextOffset]);
+
+  const rowContext = useMemo<RowContext>(
+    () => ({
+      scale,
+      viewStart: summary.viewStart,
+      groupIdPrefix: domIdSeed,
+      selection,
+      tabStopIndex,
+      onRowFocus: setActiveRowKey,
+      onToggle: handleToggle,
+      onSelect: handleSelect,
+      onNavigate: handleNavigate,
+      onOpenSource: openSource,
+    }),
+    [
+      scale,
+      summary.viewStart,
+      domIdSeed,
+      selection,
+      tabStopIndex,
+      handleToggle,
+      handleSelect,
+      handleNavigate,
+      openSource,
+    ],
+  );
 
   // The query the active hook was handed — the node's query at the offset this
   // render requested — which is exactly what a failure reports as the failing
@@ -3198,12 +4348,14 @@ export function Waterfall(props: WaterfallProps): ReactElement {
   // neither hook was handed one, which is the unsupported source, and that
   // branch reports the authored query itself.
   const activeQuery: DataQuery = spanQuery ?? requestsQuery ?? baseQuery;
-  const hasRows = model.rowCount > 0;
+  const hasRows = summary.rowCount > 0;
   // Whether earlier pages of this sequence were resolved and are held in
   // state. The full-view loading and error states describe a sequence that
   // has produced nothing yet; once a page is carried, a page in flight or a
   // page that failed is the NEXT page, and is reported as such.
   const hasCarried = carried.kind !== 'none';
+  const itemNoun = pagedNounFor(baseQuery.source) ?? CAPTURED_RECORD_NOUN;
+  const retention = retentionFacts(holding, itemNoun, result?.total, loaded.kind === 'spans');
 
   let body: ReactNode;
   if (result === undefined) {
@@ -3244,6 +4396,40 @@ export function Waterfall(props: WaterfallProps): ReactElement {
       <div className="dg-waterfall__error">
         <ErrorState {...queryFailureProps(result, activeQuery)} />
       </div>
+    );
+  } else if (!hasRows && retention !== undefined && retention.releasedDrawnCount > 0) {
+    // The pages held now draw nothing, but pages released before them did:
+    // those calls were captured and loaded, so neither "nothing was captured"
+    // nor "none of them is a call" may be said. The statement names what is
+    // held and what was released, and the way on stays in reach.
+    const loadingMore = result.status === 'loading';
+    const failedMore = result.status === 'error';
+    body = (
+      <>
+        <div className="dg-waterfall__empty">
+          <EmptyState
+            title={RELEASED_WITHOUT_ROWS_TITLE}
+            message={describeReleasedWithoutRows(retention)}
+            action={
+              nextOffset === undefined && !loadingMore ? undefined : (
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  disabled={loadingMore}
+                  onClick={handleLoadMore}
+                >
+                  {loadingMore ? 'Loading…' : 'Load more'}
+                </Button>
+              )
+            }
+          />
+        </div>
+        {failedMore ? (
+          <div className="dg-waterfall__error">
+            <ErrorState {...queryFailureProps(result, activeQuery)} />
+          </div>
+        ) : null}
+      </>
     );
   } else if (
     !hasRows &&
@@ -3316,40 +4502,37 @@ export function Waterfall(props: WaterfallProps): ReactElement {
     // source items resolved against the service's total. Each names its own
     // noun — "4 calls · loaded 9 of 9 spans" — so the second is never read as
     // a count of calls.
-    const drawnText = formatCountOf(model.rowCount, CALL_NOUN);
+    const drawnText = formatCountOf(summary.rowCount, CALL_NOUN);
     const countText =
       total === undefined
         ? drawnText
         : `${drawnText} · loaded ${formatCount(loadedItemCount)} of ${formatCountOf(
             total,
-            pagedNounFor(baseQuery.source) ?? CAPTURED_RECORD_NOUN,
+            itemNoun,
           )}`;
+    // More visible rows than one window mounts: say which are mounted, and
+    // offer the windows either side of it.
+    const windowed = mounted.total > mounted.budget;
     body = (
       <>
-        <WaterfallAxis scale={scale} origin={model.viewStart} windowMs={model.windowMs} />
-        <div
-          className="dg-waterfall__rows"
-          role="tree"
-          aria-label="Captured calls, nested under the call that was waiting on them"
-        >
-          {model.rows.map((row) => (
-            <WaterfallRowItem
-              key={row.eventId}
-              row={row}
-              depth={0}
-              scale={scale}
-              viewStart={model.viewStart}
-              groupIdPrefix={domIdSeed}
-              expandedIds={expandedIds}
-              selection={selection}
-              parentKey={undefined}
-              tabStopKey={tabStopKey}
-              onRowFocus={setActiveRowKey}
-              onToggle={handleToggle}
-              onSelect={handleSelect}
-              onOpenSource={openSource}
-            />
-          ))}
+        {/* The axis and the tree scroll together in one viewport: the
+            stylesheet floors every time track at the design strip, so a panel
+            narrower than a row's minimum scrolls here horizontally, and both
+            children share one inline size, so the strip lines up with the
+            tracks while scrolled as it does unscrolled. The viewport carries
+            no role and no tab stop — the tree stays the one composite widget —
+            and the footer below stays outside it, so the counts and the paging
+            controls never scroll away. */}
+        <div className="dg-waterfall__viewport">
+          <WaterfallAxis scale={scale} origin={summary.viewStart} windowMs={summary.windowMs} />
+          <div
+            ref={treeRef}
+            className="dg-waterfall__rows"
+            role="tree"
+            aria-label="Captured calls, nested under the call that was waiting on them"
+          >
+            <WaterfallBlocks blocks={blocks} context={rowContext} />
+          </div>
         </div>
         <Stack
           direction="horizontal"
@@ -3360,8 +4543,36 @@ export function Waterfall(props: WaterfallProps): ReactElement {
           className="dg-waterfall__footer"
         >
           <Text size="xs" tone="muted">
-            {model.truncated ? `${countText} · some nested calls were not drawn` : countText}
+            {summary.truncated ? `${countText} · some nested calls were not drawn` : countText}
           </Text>
+          {windowed ? (
+            <Stack direction="horizontal" gap={2} align="center" wrap>
+              <Text size="xs" tone="muted">
+                {describeRowWindow(mounted)}
+              </Text>
+              <Button
+                variant="secondary"
+                size="sm"
+                disabled={mounted.before === 0}
+                onClick={handleShowPreviousRows}
+              >
+                Previous rows
+              </Button>
+              <Button
+                variant="secondary"
+                size="sm"
+                disabled={mounted.after === 0}
+                onClick={handleShowNextRows}
+              >
+                Next rows
+              </Button>
+            </Stack>
+          ) : null}
+          {retention === undefined ? null : (
+            <Text size="xs" tone="muted">
+              {describeRetention(retention)}
+            </Text>
+          )}
           {/* Kept on screen while the next page is in flight, disabled and
               saying so: `useQuery` reports no `nextOffset` while a page loads,
               and rows on screen with a page loading can only mean that page is

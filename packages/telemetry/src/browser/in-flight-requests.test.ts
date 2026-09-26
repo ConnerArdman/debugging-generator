@@ -264,10 +264,9 @@ beforeEach(() => {
   configuredCapture = undefined;
   failNextEmit = false;
   resetTransport();
-  vi.spyOn(window, 'postMessage').mockImplementation((): void => {
-    // Frames are not under test here; keeping them off the window keeps the
-    // agent's own inbound listener out of every case.
-  });
+  // Frames are not under test here, and no bridge is connected: the agent
+  // dispatches nothing on its private channel before a handshake, so nothing a
+  // case does leaves the page and nothing reaches the agent's inbound listener.
 
   originalFetch = globalThis.fetch;
   originalXhrMethods.clear();

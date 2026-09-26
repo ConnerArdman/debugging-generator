@@ -16,11 +16,18 @@
  *   → WebSocket `source.open { sessionId, location }`
  *   → apps/local-service/src/source/open.ts (validates, contains inside projectRoot)
  *   → WebSocket `source.open` to the session's editor clients   ← asserted here
+ *   ← WebSocket `source.result` `opened` from the editor (ref = the forwarded id)
+ *   ← the service's `source.result` to the worker (ref = the worker's frame id)
+ *   ← the worker's port answer `{ forwarded: true }` to the panel ← asserted here
  * ```
  *
  * Every assertion is on the forwarded payload's fields — `file`, `line`,
  * `column`, `resolvedBy`, `confidence`, `symbol` — never merely on a message
- * having been sent.
+ * having been sent. The recording editor then answers the forward the way
+ * VS Code does, and the click counts as done only when the panel's own
+ * `source.open` request resolves to `forwarded: true`: the worker answers so
+ * only on the service's correlated `opened` result, so the whole request and
+ * result chain is exercised in both directions.
  *
  * ## Test 1 — a real round trip, from a real generated panel
  *
@@ -94,7 +101,11 @@ import path from 'node:path';
 
 import type { Locator, TestInfo } from '@playwright/test';
 
-import { createEnvelope, parsePanelGeneratedPayload } from '@debuggen/protocol';
+import {
+  createEnvelope,
+  parsePanelGeneratedPayload,
+  SOURCE_OPEN_RESULT_TIMEOUT_MS,
+} from '@debuggen/protocol';
 import type { MessageByType, PanelGeneratedPayload, SessionRecord } from '@debuggen/protocol';
 import {
   SOURCE_RESOLVED_BY,
@@ -157,6 +168,13 @@ const PANEL_SETTLE_TIMEOUT_MS = 30_000;
 
 /** The fixture route answers after a fixed 300 ms; this absorbs a first compile of the route. */
 const PING_REPLY_TIMEOUT_MS = 30_000;
+
+/**
+ * How long a click may take to resolve in the panel: past the worker's own
+ * `source.open` deadline, so an answer the worker never correlated is still
+ * observed — as the typed failure it becomes — rather than missed.
+ */
+const SOURCE_OPEN_ANSWER_TIMEOUT_MS = SOURCE_OPEN_RESULT_TIMEOUT_MS + 5_000;
 
 /** Click → panel port → worker → socket → service → editor socket, on a loaded host. */
 const SOURCE_OPEN_TIMEOUT_MS = DEFAULT_WAIT_TIMEOUT_MS;
@@ -558,8 +576,9 @@ async function readPanelHealth(panel: PanelHandle): Promise<PanelHealthBaseline>
 /**
  * The editor hop is asynchronous and must not be reported as a failure in the
  * panel: no uncaught exception at any point, no new console error, and no new
- * error state (the actions surface a failed open as one) once the worker's
- * answer to the port request has had time to arrive.
+ * error state (the actions surface a failed open as one). Called after
+ * {@link expectEditorConfirmedOpen}, so the worker's answer has already
+ * arrived; the grace only lets the panel render what it did with it.
  */
 async function expectPanelStillHealthy(
   panel: PanelHandle,
@@ -633,7 +652,10 @@ function installPanelPortTap(args: {
     return;
   }
   const records: TapRecord[] = [];
-  Object.defineProperty(window, key, { value: { records }, configurable: true });
+  // The worker's answers to the panel's `source.open` requests, on any port,
+  // oldest first: what the click finally resolved to.
+  const sourceOpenAnswers: { ok: boolean; forwarded: unknown; code: unknown }[] = [];
+  Object.defineProperty(window, key, { value: { records, sourceOpenAnswers }, configurable: true });
 
   const tapped = (...args: unknown[]): unknown => {
     const real = connect.apply(runtime, args);
@@ -651,6 +673,15 @@ function installPanelPortTap(args: {
       }
       const frame = message as Record<string, unknown>;
       record.seen = [...record.seen, `${String(frame.direction)}:${String(frame.kind)}`].slice(-20);
+      if (frame.direction === 'response' && frame.kind === 'source.open') {
+        const answer = frame.payload as Record<string, unknown> | undefined;
+        const failure = frame.error as Record<string, unknown> | undefined;
+        sourceOpenAnswers.push({
+          ok: frame.ok === true,
+          forwarded: answer?.forwarded,
+          code: failure?.code,
+        });
+      }
       // Every frame on the port opens with the same header; the first one
       // (the hydration answer every new port receives) is enough.
       record.header ??= { channel: frame.channel, version: frame.version };
@@ -725,6 +756,54 @@ function readTapState(key: string): TapState {
     return { readiness: 'no-open-port', seen: [] };
   }
   return { readiness: newest.header === undefined ? 'no-frame-yet' : 'ready', seen: newest.seen };
+}
+
+/** How the worker answered one of the panel's `source.open` requests, as the tap recorded it. */
+interface SourceOpenAnswer {
+  readonly ok: boolean;
+  readonly forwarded: unknown;
+  readonly code: unknown;
+}
+
+/** Runs in the panel page: the worker's `source.open` answers the tap recorded, oldest first. */
+function readSourceOpenAnswers(key: string): SourceOpenAnswer[] {
+  const tap = (window as unknown as Record<string, unknown>)[key] as
+    { sourceOpenAnswers?: SourceOpenAnswer[] } | undefined;
+  return [...(tap?.sourceOpenAnswers ?? [])];
+}
+
+/** How many `source.open` answers the panel has received so far. */
+async function countSourceOpenAnswers(panel: PanelHandle): Promise<number> {
+  return (await panel.page.evaluate(readSourceOpenAnswers, PANEL_PORT_TAP_GLOBAL)).length;
+}
+
+/**
+ * Asserts the click resolved the way a click the editor opened must: the
+ * worker answered the panel's `source.open` with `forwarded: true`, which it
+ * does only on the service's correlated `source.result` `opened` — never on the
+ * frame merely leaving the socket, and not for `no-editor`, a refusal, an
+ * editor failure or a deadline. The wait covers the worker's own deadline, so
+ * whatever the click resolved to is observed and named.
+ */
+async function expectEditorConfirmedOpen(panel: PanelHandle, answersBefore: number): Promise<void> {
+  let answers: SourceOpenAnswer[] = [];
+  await expect
+    .poll(
+      async () => {
+        answers = await panel.page.evaluate(readSourceOpenAnswers, PANEL_PORT_TAP_GLOBAL);
+        return answers.length > answersBefore;
+      },
+      {
+        message: 'the worker answered the panel source.open request',
+        timeout: SOURCE_OPEN_ANSWER_TIMEOUT_MS,
+        intervals: [POLL_INTERVAL_MS],
+      },
+    )
+    .toBe(true);
+  expect(
+    answers.slice(answersBefore),
+    'one answer: the editor confirmed it opened the location',
+  ).toEqual([{ ok: true, forwarded: true, code: undefined }]);
 }
 
 /**
@@ -894,6 +973,7 @@ test.describe('source navigation: a SourceLink click reaches the editor as sourc
     const { session, panel } = await startBoundSession(
       { pairing, sessions, openPanelPage, editorClient },
       ROUND_TRIP_QUESTION,
+      { initScripts: [PANEL_PORT_TAP_SCRIPT] },
     );
 
     // Reproduce: one click on the widget, inside one capture window.
@@ -933,6 +1013,7 @@ test.describe('source navigation: a SourceLink click reaches the editor as sourc
     testInfo.annotations.push({ type: 'source-navigation-rung', description: located.description });
 
     const baseline = await readPanelHealth(panel);
+    const answersBefore = await countSourceOpenAnswers(panel);
     editorClient.clear();
     const clickedAt = Date.now();
     await located.chip.click();
@@ -940,6 +1021,10 @@ test.describe('source navigation: a SourceLink click reaches the editor as sourc
 
     await expectProjectRelativeLocation(forwarded.payload.location, session);
     expectCallSiteLocation(forwarded.payload.location, expectation);
+    // Answer as VS Code does once it has opened the location; the click is
+    // done only when that answer has come back to the panel.
+    editorClient.answerSourceOpen(forwarded);
+    await expectEditorConfirmedOpen(panel, answersBefore);
     await expectSingleForward(editorClient, forwarded);
     await expectPanelStillHealthy(panel, baseline);
   });
@@ -971,6 +1056,7 @@ test.describe('source navigation: a SourceLink click reaches the editor as sourc
     await expect(chip, `one interactive chip opens ${formatSourceLocation(known)}`).toHaveCount(1);
 
     const baseline = await readPanelHealth(panel);
+    const answersBefore = await countSourceOpenAnswers(panel);
     editorClient.clear();
     const clickedAt = Date.now();
     await chip.click();
@@ -981,6 +1067,8 @@ test.describe('source navigation: a SourceLink click reaches the editor as sourc
       forwarded.payload.location,
       'the forwarded location is the clicked one: file, line, column, symbol, resolvedBy and confidence',
     ).toStrictEqual(known);
+    editorClient.answerSourceOpen(forwarded);
+    await expectEditorConfirmedOpen(panel, answersBefore);
     await expectSingleForward(editorClient, forwarded);
     await expectPanelStillHealthy(panel, baseline);
   });

@@ -68,11 +68,12 @@
  * falls back to a literal: when it is absent no inline value is emitted at
  * all and the stylesheet's own `var(--dg-*)` fallback applies.
  *
- * ## Domain vocabularies are mapped by the caller, not here
+ * ## Domain vocabularies are mapped by the caller, with one shared exception
  *
  * A confidence level, a tier, a modification status and a session status are
- * all *domain* vocabularies owned by `@debuggen/panel-schema` and
- * `@debuggen/telemetry`. Each consumer maps its own vocabulary onto `tone`
+ * all *domain* vocabularies owned by the packages that define them
+ * (`@debuggen/panel-schema`, `@debuggen/telemetry`, `@debuggen/instrumentation`
+ * and `@debuggen/protocol`). Each consumer maps its own vocabulary onto `tone`
  * before it renders — `../layout/SummaryHeader` turns a hypothesis confidence
  * level into a tone and a per-level glyph beside each likely cause, so the
  * levels differ by shape as well as by colour, and the visualization components
@@ -80,6 +81,20 @@
  * that this atom stays free of every one of those types. A `tone` union
  * enumerating domain states, or a `kind` prop, would invert that and is
  * deliberately not offered.
+ *
+ * One table is the exception, and it is exported rather than applied:
+ * {@link MODIFICATION_STATUS_TONE}, the tone of each of the five journal
+ * statuses of a recorded file modification. The same journal status is drawn
+ * by two surfaces in two apps — the editor webview's `ModificationsList` and
+ * the DevTools panel's `SessionSummary` — and this package is the only module
+ * both depend on, so a mapping kept anywhere else would be two mappings free to
+ * drift apart and draw one status in two colours. The table still keeps the
+ * atom free of the domain type: its keys are the five status literals and
+ * nothing here imports the vocabulary that defines them. Each consumer assigns
+ * it to a `Readonly<Record<ModificationStatus, BadgeTone>>` of its own, so a
+ * status added upstream is a compile error at every surface until this table
+ * covers it. `Badge` itself never reads the table; the words beside the colour
+ * stay the consumer's.
  *
  * ## Markup and accessibility
  *
@@ -162,11 +177,49 @@ import type { CSSProperties, HTMLAttributes, ReactElement, ReactNode, Ref } from
  * for a colour, so the same state is drawn the same way in both themes and in
  * the high-contrast theme.
  *
- * It is also deliberately *not* a domain vocabulary. A tier, a modification
- * status, a session status and a confidence level are each mapped onto one of
- * these six by the component that owns that vocabulary.
+ * It is also deliberately *not* a domain vocabulary. A tier, a session status
+ * and a confidence level are each mapped onto one of these six by the
+ * component that owns that vocabulary; a modification status is mapped once,
+ * for both surfaces, by {@link MODIFICATION_STATUS_TONE}.
  */
 export type BadgeTone = 'neutral' | 'accent' | 'success' | 'warning' | 'danger' | 'info';
+
+/**
+ * The badge tone of each journal status of a recorded file modification — the
+ * one domain mapping this module publishes (see the module header for why).
+ *
+ * Five statuses, five distinct tones, so no two statuses share a colour and
+ * the text label beside each colour still carries the meaning on its own:
+ *
+ * - `pending` → `neutral`: recorded before the write; nothing to act on yet.
+ * - `applied` → `info`: the instrumentation is in place, as intended.
+ * - `reverted` → `success`: restored and verified — the tone a `clean`
+ *   cleanup carries on both surfaces.
+ * - `conflict` → `warning`: the tool refused to overwrite the developer's
+ *   edit. That needs attention but is not a failure — the tone a `conflict`
+ *   cleanup carries on both surfaces.
+ * - `failed` → `danger`: the change could not be completed.
+ *
+ * Keyed by the five status literals rather than by the `ModificationStatus`
+ * type, which this package does not depend on. Frozen, so no consumer can
+ * re-colour a status for every other surface at run time.
+ *
+ * @example Adopting the table in a consumer, typed against the domain union so
+ * a status added upstream is a compile error here until the table covers it.
+ * ```tsx
+ * const STATUS_TONE: Readonly<Record<ModificationStatus, BadgeTone>> =
+ *   MODIFICATION_STATUS_TONE;
+ *
+ * <Badge tone={STATUS_TONE[record.status]}>{statusLabel(record.status)}</Badge>
+ * ```
+ */
+export const MODIFICATION_STATUS_TONE = Object.freeze({
+  pending: 'neutral',
+  applied: 'info',
+  reverted: 'success',
+  conflict: 'warning',
+  failed: 'danger',
+} as const satisfies Readonly<Record<string, BadgeTone>>);
 
 /**
  * How strongly a chip is filled, in descending prominence.
@@ -374,9 +427,10 @@ export interface BadgeProps extends HTMLAttributes<HTMLSpanElement> {
  * See the file-level documentation for the two colouring routes, the
  * class-name and custom-property contract, and the tokens a chip resolves to.
  *
- * @example A modification whose file was edited while instrumented.
+ * @example A modification whose file was edited while instrumented: a refusal
+ * to overwrite, drawn in the shared status tone with its word beside it.
  * ```tsx
- * <Badge tone="danger" variant="solid">conflict</Badge>
+ * <Badge tone={MODIFICATION_STATUS_TONE.conflict}>Conflict</Badge>
  * ```
  *
  * @example A hypothesis confidence level, mapped to a tone and a glyph by the

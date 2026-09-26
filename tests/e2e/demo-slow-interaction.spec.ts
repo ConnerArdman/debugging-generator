@@ -8,9 +8,10 @@
  * `helpers/session.ts`'s `runDebugSession`, with the deterministic provider.
  * While the session is still live it gathers every piece of evidence that only
  * exists while it is live (the panel page's DOM, the click-to-source round
- * trip, the modification journal and the instrumented bytes on disk) into
- * module state. The focused tests after it assert that evidence, one claim
- * each, so a reviewer reads one failure per broken contract:
+ * trip into a real VS Code window, the modification journal and the
+ * instrumented bytes on disk) into module state. The focused tests after it
+ * assert that evidence, one claim each, so a reviewer reads one failure per
+ * broken contract:
  *
  * 1. the pipeline understood the question and armed the checkout path;
  * 2. one trace correlates the click, the checkout request, the route and the
@@ -21,7 +22,9 @@
  * 6. the generated panel is valid, not a fallback, and rendered the timeline,
  *    a flame or waterfall view and the query table;
  * 7. observed facts and likely causes stay apart, each backed by evidence;
- * 8. clicking the SQL row opens the demo's own `pool.query` call site;
+ * 8. clicking the SQL row's source chip opens the demo's own `pool.query` call
+ *    site: the service forwards the `source.open`, and a real VS Code window
+ *    with the extension activated puts its cursor on that line and column;
  * 9. the patch was journalled with both hashes and a backup outside the
  *    repository.
  *
@@ -41,6 +44,23 @@
  *   pristine line is the contract; the line in the file as served during the
  *   session is recorded as an annotation when a patch moved it.
  *
+ * The editor end of the click is real. The `editorHost` fixture is a VS Code
+ * window (`helpers/editor-host.ts`) opened on the demo with the built extension
+ * activated and pointed at the suite's service. It is started once the pipeline
+ * has generated the panel — never while the session's first stage builds the
+ * code index, which holds the service's event loop and would fail the one
+ * service probe the extension makes as it activates — and warmed up just
+ * before the chip is clicked: the recording editor connection sends
+ * `source.open` for line 1, column 1 of the inventory service file, and the
+ * window's own cursor must arrive there. That proves the window serves the live session without
+ * relying on any acknowledgement from the service. After the click the window's
+ * cursor, not a recorded frame, must sit in that file on the pristine call-site
+ * line and at the chip's column. The window opens the file as it is on disk,
+ * instrumented, and VS Code clamps a column past the end of a line to that
+ * end, so the expected column is clamped the same way. A window that could not
+ * start or connect is recorded as evidence rather than thrown, so only the
+ * editor test fails for it.
+ *
  * The control is pointed at before the question is asked, as a developer who
  * selects an element in the Elements panel and then asks about it does
  * (`runDebugSession`'s `selectBeforeQuestion`): the service starts problem
@@ -58,6 +78,7 @@
  * attribute value, a header, a full URL or statement text (AAP §0.5.2).
  */
 
+import { realpath } from 'node:fs/promises';
 import path from 'node:path';
 
 import type { Locator, Page } from '@playwright/test';
@@ -109,9 +130,10 @@ import type {
   TraceTree,
 } from '@debuggen/telemetry';
 
-import { withEditorAnnouncement } from './helpers/demo-app';
+import { messageOf, waitForStreamedContent, withEditorAnnouncement } from './helpers/demo-app';
 import {
   E2E_TIMEOUTS,
+  EDITOR_HOST_TIMEOUTS,
   createSessionTracker,
   describeEvent,
   eventsOfKind,
@@ -128,6 +150,7 @@ import {
   expectSourceLocationShape,
   expectValidPanelSpec,
   flattenTrace,
+  isEditorWarmUpLocation,
   repoRoot,
   runDebugSession,
   test,
@@ -136,6 +159,8 @@ import type {
   DebugSessionOutcome,
   DemoAppHandle,
   EditorClientHandle,
+  EditorHostHandle,
+  EditorSelectionRecord,
   PanelHandle,
   ServiceHandle,
   SessionStageRecord,
@@ -329,9 +354,19 @@ const CAPTURE_WINDOW_TOLERANCE_MS = 1_000;
  * Budget for the workflow test: the session workflow and panel budget
  * (`E2E_TIMEOUTS.longTestTimeoutMs`) plus one page budget for preparing the
  * checkout page before the session and one for collecting evidence and
- * clicking through to source after it.
+ * clicking through to source after it, plus the editor window's: its start
+ * overlaps the pipeline but may outlast a quick one, and its warm-up and the
+ * cursor wait run after it.
  */
-const WORKFLOW_TIMEOUT_MS = E2E_TIMEOUTS.longTestTimeoutMs + 2 * E2E_TIMEOUTS.pageReady;
+const WORKFLOW_TIMEOUT_MS =
+  E2E_TIMEOUTS.longTestTimeoutMs +
+  2 * E2E_TIMEOUTS.pageReady +
+  EDITOR_HOST_TIMEOUTS.startup +
+  EDITOR_HOST_TIMEOUTS.warmUp +
+  EDITOR_HOST_TIMEOUTS.selection;
+
+/** How many of the window's cursor positions after the click the evidence lists. */
+const MAX_OBSERVED_SELECTIONS = 20;
 
 // ---------------------------------------------------------------------------
 // The panel page's DOM contract (`packages/panel-renderer`)
@@ -430,6 +465,32 @@ interface SourceOpenEvidence {
   readonly location: SourceLocation;
 }
 
+/** How far the real editor window got before the chip was clicked. */
+interface EditorReadiness {
+  /** Why the window cannot be relied on (it did not start, or never reached the warm-up position). */
+  readonly problem: string | undefined;
+  /** How many warm-up `source.open` frames the window needed; 0 when the warm-up did not succeed. */
+  readonly attempts: number;
+}
+
+/** What the real VS Code window did with the chip's `source.open` (`helpers/editor-host.ts`). */
+interface EditorHopEvidence {
+  /** Why the window's cursor was not observed at the clicked location; `undefined` when it was. */
+  readonly problem: string | undefined;
+  /** The cursor the window recorded at the location, else its last one in that file after the click. */
+  readonly selection: EditorSelectionRecord | undefined;
+  /** The demo's inventory service file by real path: the document the cursor must be in. */
+  readonly expectedRealpath: string;
+  /** The column the cursor must be at: the location's, clamped by VS Code to its line's end. */
+  readonly expectedColumn: number;
+  /** The window's cursor positions after the click, `file:line:column`, oldest first (bounded). */
+  readonly observed: readonly string[];
+  /** Warm-up frames the window needed before the click. */
+  readonly warmUpAttempts: number;
+  /** The panel's error states once the editor answered the click; `undefined` when it shows none. */
+  readonly panelProblem: string | undefined;
+}
+
 /** Every protocol payload the editor connection recorded for the session. */
 interface PublishedMessages {
   readonly plans: readonly InstrumentationPlan[];
@@ -458,6 +519,7 @@ interface RunEvidence {
   readonly published: PublishedMessages;
   readonly rendered: RenderedPanelEvidence;
   readonly sourceOpen: SourceOpenEvidence;
+  readonly editorHop: EditorHopEvidence;
   readonly sqlCallSite: SqlCallSite;
   readonly instrumentedHashes: ReadonlyMap<string, string>;
   readonly debuggenHome: string;
@@ -849,6 +911,7 @@ async function ensureCheckoutCart(page: Page, baseUrl: string): Promise<CartSnap
 /** Opens the checkout page and waits until "Place order" can be pressed. */
 async function openCheckoutPage(page: Page, baseUrl: string): Promise<void> {
   await page.goto(new URL(CHECKOUT_PAGE_PATH, baseUrl).href);
+  await waitForStreamedContent(page);
   const control = page.locator(PLACE_ORDER_SELECTOR);
   await expect(control, `"${PLACE_ORDER_SELECTOR}" must match exactly one control.`).toHaveCount(1);
   await expect(control).toHaveAccessibleName(PLACE_ORDER_NAME);
@@ -1030,6 +1093,8 @@ async function collectRenderedPanel(panel: PanelHandle): Promise<RenderedPanelEv
 interface OpenSqlSourceOptions {
   readonly panel: PanelHandle;
   readonly editorClient: EditorClientHandle;
+  /** The real editor window, whose cursor position is marked just before the click. */
+  readonly editorHost: EditorHostHandle;
   readonly sessionId: string;
   /** The line the chip must name: the call site's line in the demo source. */
   readonly line: number;
@@ -1037,12 +1102,25 @@ interface OpenSqlSourceOptions {
   readonly reservationEventIds: readonly string[];
 }
 
+/** What {@link openSqlSource} clicked through to. */
+interface SqlSourceClick {
+  /** The `source.open` the recording editor connection received for the click. */
+  readonly sourceOpen: SourceOpenEvidence;
+  /** The editor window's record index just before the click, which scopes its cursor wait. */
+  readonly editorMark: number;
+}
+
 /**
  * Clicks the SQL call site's source chip the way a developer would and returns
- * the `source.open` the editor connection received, so the whole outbound path
- * runs: `SourceLink` → `PanelActions.openSource` → the panel's actions → the
- * runtime port → the service worker → WS `source.open` → the service → the
- * editor client. Nothing is sent by hand.
+ * the `source.open` the recording editor connection received, so the whole
+ * outbound path runs: `SourceLink` → `PanelActions.openSource` → the panel's
+ * actions → the runtime port → the service worker → WS `source.open` → the
+ * service → the session's editor connections — the recorder, whose frame this
+ * returns, and the real VS Code window of `editorHost`, whose extension opens
+ * the location with `showTextDocument` (read afterwards by
+ * {@link observeEditorHop} from the window's record index marked just before
+ * the click). Nothing is sent by hand; the warm-up frame the recorder sent
+ * itself earlier is never taken for the click's.
  *
  * The ladder, first hit wins:
  *
@@ -1058,8 +1136,8 @@ interface OpenSqlSourceOptions {
  *
  * and otherwise a failure naming every place searched and the chips present.
  */
-async function openSqlSource(options: OpenSqlSourceOptions): Promise<SourceOpenEvidence> {
-  const { panel, editorClient, sessionId, line } = options;
+async function openSqlSource(options: OpenSqlSourceOptions): Promise<SqlSourceClick> {
+  const { panel, editorClient, editorHost, sessionId, line } = options;
   const { locators } = panel;
   const queryTable = locators.panelView.locator(`.${NODE_BLOCK_CLASSES.queryTable}`).first();
   const searched: string[] = [];
@@ -1068,7 +1146,7 @@ async function openSqlSource(options: OpenSqlSourceOptions): Promise<SourceOpenE
     rung: string,
     scope: Locator,
     waitMs: number,
-  ): Promise<SourceOpenEvidence | undefined> => {
+  ): Promise<SqlSourceClick | undefined> => {
     const chip = locators.sourceLinkByFile(INVENTORY_FILE, { line, within: scope });
     if (waitMs > 0) {
       await appears(chip, waitMs);
@@ -1079,13 +1157,25 @@ async function openSqlSource(options: OpenSqlSourceOptions): Promise<SourceOpenE
       return undefined;
     }
     const sinceIndex = editorClient.snapshotIndex();
+    const editorMark = editorHost.snapshotIndex();
     await chip.first().click();
+    // The service forwards a `source.open` to the session's editor
+    // connections, which can include its sender, so the recorder's own warm-up
+    // frame (line 1, column 1) may still be in flight; a call site never sits
+    // there.
     const message = await editorClient.waitFor(
       'source.open',
-      (payload) => payload.sessionId === sessionId,
+      (payload) => payload.sessionId === sessionId && !isEditorWarmUpLocation(payload.location),
       { sinceIndex, timeoutMs: DEFAULT_WAIT_TIMEOUT_MS },
     );
-    return { rung, sessionId: message.payload.sessionId, location: message.payload.location };
+    return {
+      sourceOpen: {
+        rung,
+        sessionId: message.payload.sessionId,
+        location: message.payload.location,
+      },
+      editorMark,
+    };
   };
 
   // The reservation statement's data row. While it is collapsed no detail row
@@ -1183,6 +1273,131 @@ async function openSqlSource(options: OpenSqlSourceOptions): Promise<SourceOpenE
   );
 }
 
+/** What {@link warmUpEditor} needs. */
+interface WarmUpEditorOptions {
+  readonly editorHost: EditorHostHandle;
+  /** The recording editor connection, which sends the warm-up `source.open` frames. */
+  readonly editorClient: EditorClientHandle;
+  /** The live session the window must serve. */
+  readonly sessionId: string;
+  /** The window's launch, started as the workflow began: a failure's message, or `undefined`. */
+  readonly starting: Promise<string | undefined>;
+}
+
+/**
+ * Proves the real editor window is connected to the service for the live
+ * session before the chip is clicked. The recording editor connection sends
+ * `source.open` for line 1, column 1 of the inventory service file (resent
+ * until the window's cursor arrives there, `EditorHostHandle.warmUp`), so the
+ * proof rests on the window's own cursor rather than on any acknowledgement
+ * from the service. A window that did not start or never arrived is returned
+ * as the readiness problem the editor test reports, not thrown: the click and
+ * the recorder's payload are still worth collecting.
+ */
+async function warmUpEditor(options: WarmUpEditorOptions): Promise<EditorReadiness> {
+  const { editorHost, editorClient, sessionId } = options;
+  const startProblem = await options.starting;
+  if (startProblem !== undefined) {
+    return { problem: `The VS Code window did not start: ${startProblem}`, attempts: 0 };
+  }
+  try {
+    const warmed = await editorHost.warmUp({
+      sender: editorClient,
+      sessionId,
+      file: INVENTORY_FILE,
+    });
+    return { problem: undefined, attempts: warmed.attempts };
+  } catch (error) {
+    return {
+      problem: `The VS Code window never served session ${sessionId}: ${messageOf(error)}`,
+      attempts: 0,
+    };
+  }
+}
+
+/** What {@link observeEditorHop} reads the window's answer to the click with. */
+interface ObserveEditorHopOptions {
+  readonly editorHost: EditorHostHandle;
+  readonly panel: PanelHandle;
+  /** The demo checkout the window opened as its workspace folder. */
+  readonly projectRoot: string;
+  /** The location the click's `source.open` carried. */
+  readonly location: SourceLocation;
+  /** The window's record index just before the click ({@link SqlSourceClick.editorMark}). */
+  readonly editorMark: number;
+  /** Whether the window was proven connected before the click. */
+  readonly readiness: EditorReadiness;
+}
+
+/**
+ * The column VS Code puts the cursor at for `column` on a line `lineLength`
+ * characters long: `TextDocument.validatePosition` clamps a column past the
+ * line's end to that end. The window opens the file as it is on disk, which
+ * is instrumented during the session, so the pristine call site's column may
+ * fall past the end of the line now at that number. `lineLength` is -1 when
+ * the probe could not read the line, and the column is then taken as it is.
+ */
+function clampedColumn(column: number, lineLength: number): number {
+  return lineLength >= 0 ? Math.min(column, lineLength + 1) : column;
+}
+
+/**
+ * Reads what the real VS Code window did with the click's `source.open`: waits
+ * for its cursor to land in the inventory service file at the location's line
+ * and (clamped) column, then checks the panel shows no error state once the
+ * editor has answered. Every failure is returned as evidence, never thrown, so
+ * only the editor test fails for it.
+ */
+async function observeEditorHop(options: ObserveEditorHopOptions): Promise<EditorHopEvidence> {
+  const { editorHost, panel, location, editorMark, readiness } = options;
+  const expectedRealpath = await realpath(path.join(options.projectRoot, INVENTORY_FILE));
+
+  let problem = readiness.problem;
+  let landed: EditorSelectionRecord | undefined;
+  if (problem === undefined) {
+    try {
+      landed = await editorHost.waitForSelection({
+        file: INVENTORY_FILE,
+        sinceIndex: editorMark,
+        description: `at ${String(location.line)}:${String(location.column)} (the chip's location)`,
+        matches: (candidate) =>
+          candidate.line === location.line &&
+          candidate.column === clampedColumn(location.column, candidate.lineLength),
+      });
+    } catch (error) {
+      problem = `The VS Code window's cursor never reached the clicked location: ${messageOf(error)}`;
+    }
+  }
+
+  let after: readonly EditorSelectionRecord[] = [];
+  try {
+    after = await editorHost.selections(editorMark);
+  } catch (error) {
+    problem ??= `The VS Code window's cursor positions could not be read: ${messageOf(error)}`;
+  }
+  const selection =
+    landed ?? after.filter((candidate) => candidate.realpath === expectedRealpath).at(-1);
+
+  let panelProblem: string | undefined;
+  try {
+    await expectNoPanelErrorState(panel.page);
+  } catch (error) {
+    panelProblem = messageOf(error);
+  }
+
+  return {
+    problem,
+    selection,
+    expectedRealpath,
+    expectedColumn: clampedColumn(location.column, selection?.lineLength ?? -1),
+    observed: after
+      .slice(-MAX_OBSERVED_SELECTIONS)
+      .map((candidate) => editorHost.describeSelection(candidate)),
+    warmUpAttempts: readiness.attempts,
+    panelProblem,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // The spec
 // ---------------------------------------------------------------------------
@@ -1219,6 +1434,7 @@ test.describe('slow checkout interaction', () => {
     appPage,
     panel,
     editorClient,
+    editorHost,
     sessions,
   }) => {
     test.setTimeout(WORKFLOW_TIMEOUT_MS);
@@ -1344,18 +1560,66 @@ test.describe('slow checkout interaction', () => {
         .some((message) => message.payload.sessionId === sessionId),
     };
 
+    // The real VS Code window boots only once the pipeline has settled. The
+    // extension probes the service once as it activates and connects only when
+    // that probe answers, and the session's first stage builds the project's
+    // code index synchronously, holding the service's event loop for seconds;
+    // a window activating inside that interval would stay disconnected for the
+    // rest of the test. It boots while the panel's DOM is collected, and its
+    // launch never rejects here: a failure to start becomes the editor test's
+    // evidence.
+    const editorStarting = editorHost.start().then(
+      () => undefined,
+      (error: unknown) => messageOf(error),
+    );
     const rendered = await collectRenderedPanel(panel);
-    const sourceOpen = await openSqlSource({
+    const readiness = await warmUpEditor({
+      editorHost,
+      editorClient,
+      sessionId,
+      starting: editorStarting,
+    });
+    const { sourceOpen, editorMark } = await openSqlSource({
       panel,
       editorClient,
+      editorHost,
       sessionId,
       line: sqlCallSite.line,
       reservationEventIds: traceEvents.filter(isReservationQuery).map((event) => event.id),
     });
-    test.info().annotations.push({
-      type: 'source-link',
-      description: `${sourceOpen.rung} → ${sourceOpen.location.file}:${String(sourceOpen.location.line)} (${sourceOpen.location.resolvedBy})`,
+    const editorHop = await observeEditorHop({
+      editorHost,
+      panel,
+      projectRoot: demoApp.projectRoot,
+      location: sourceOpen.location,
+      editorMark,
+      readiness,
     });
+    test.info().annotations.push(
+      {
+        type: 'source-link',
+        description: `${sourceOpen.rung} → ${sourceOpen.location.file}:${String(sourceOpen.location.line)} (${sourceOpen.location.resolvedBy})`,
+      },
+      {
+        type: 'editor-hop',
+        description:
+          editorHop.problem === undefined && editorHop.selection !== undefined
+            ? `VS Code cursor at ${editorHost.describeSelection(editorHop.selection)} after ${String(editorHop.warmUpAttempts)} warm-up source.open frame(s)`
+            : `VS Code cursor not observed at the location: ${(editorHop.problem ?? 'no cursor position was recorded').split('\n')[0] ?? ''}`,
+      },
+    );
+    // The editor test fails on this evidence while this test passes, so the
+    // editor fixture's own failure-only diagnostics would never be taken: the
+    // window's text-free diagnostics are attached here, while it still runs.
+    if (editorHop.problem !== undefined) {
+      const diagnostics = await editorHost
+        .collectDiagnostics()
+        .catch((error: unknown) => [`The diagnostics could not be collected: ${messageOf(error)}`]);
+      await test.info().attach('editor-host-diagnostics', {
+        body: diagnostics.join('\n'),
+        contentType: 'text/plain',
+      });
+    }
 
     // The developer's file, as the dev server serves it during the session: a
     // patch in it moves the call's line, which is worth recording beside the
@@ -1394,6 +1658,7 @@ test.describe('slow checkout interaction', () => {
       published,
       rendered,
       sourceOpen,
+      editorHop,
       sqlCallSite,
       instrumentedHashes,
       debuggenHome: service.debuggenHome,
@@ -2000,9 +2265,9 @@ test.describe('slow checkout interaction', () => {
   test('opens the demo SQL call site in the editor from the query table', () => {
     const events = fromWorkflow(captureEvents, 'the captured events');
     const evidence = fromWorkflow(run, 'the workflow evidence');
-    const { sourceOpen, sqlCallSite } = evidence;
+    const { sourceOpen, editorHop, sqlCallSite } = evidence;
 
-    // The editor received the click, for this session, at the SQL call site.
+    // The service forwarded the click, for this session, at the SQL call site.
     expect(sourceOpen.sessionId).toBe(evidence.sessionId);
     const location = expectSourceLocationShape(sourceOpen.location, {
       expectedFile: INVENTORY_FILE,
@@ -2012,11 +2277,12 @@ test.describe('slow checkout interaction', () => {
     });
     expect(path.isAbsolute(location.file)).toBe(false);
     expect(location.file.split('/')).not.toContain('..');
-    expect(location.column).toBeGreaterThanOrEqual(1);
+    // The column is the call's own: where `pool.query` starts on its line in
+    // the developer's source, read from that source before the session began.
     expect(
       location.column,
-      'The column lies past the end of the call site line.',
-    ).toBeLessThanOrEqual(sqlCallSite.lineLength + 1);
+      `The source.open does not point at the start of ${SQL_CALL} on its line.`,
+    ).toBe(sqlCallSite.column);
 
     // The click carried the resolver's answer for the captured statement.
     const { traceEvents } = resolveCheckoutChain(events);
@@ -2029,6 +2295,36 @@ test.describe('slow checkout interaction', () => {
         'The chip opened a location no reservation statement resolved to.',
       ).toContainEqual(location);
     }
+
+    // The real VS Code window opened it: after the click its cursor sits in
+    // the demo's inventory service file on the pristine call-site line, at the
+    // call's own column — derived from the source, not from the click — which
+    // VS Code clamps only to the end of the line as it stands on disk.
+    const observed = `The window recorded after the click: ${editorHop.observed.join(', ') || '(no cursor position)'}; it needed ${String(editorHop.warmUpAttempts)} warm-up source.open frame(s).`;
+    expect(editorHop.problem, `The VS Code window did not open the location. ${observed}`).toBe(
+      undefined,
+    );
+    const selection = present(
+      editorHop.selection,
+      `The VS Code window recorded no cursor position in ${INVENTORY_FILE}. ${observed}`,
+    );
+    expect(selection.realpath, `The cursor is in another document. ${observed}`).toBe(
+      editorHop.expectedRealpath,
+    );
+    expect(selection.line, `The cursor is not on the ${SQL_CALL} line. ${observed}`).toBe(
+      sqlCallSite.line,
+    );
+    expect(
+      selection.column,
+      `The cursor is not at the start of ${SQL_CALL} on its line. ${observed}`,
+    ).toBe(clampedColumn(sqlCallSite.column, selection.lineLength));
+    expect(editorHop.expectedColumn, 'The click and the call site disagree on the column.').toBe(
+      clampedColumn(sqlCallSite.column, selection.lineLength),
+    );
+    expect(
+      editorHop.panelProblem,
+      'The panel shows an error state after the editor opened the location.',
+    ).toBeUndefined();
   });
 
   test('journalled a reversible patch with a backup outside the repository', () => {

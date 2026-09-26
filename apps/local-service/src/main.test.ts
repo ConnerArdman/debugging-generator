@@ -37,19 +37,24 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { WebSocket } from 'ws';
 
 import { createBackupStore, createModificationRecord } from '@debuggen/instrumentation';
+import type { ModificationRecord } from '@debuggen/instrumentation';
 import {
   AUTHORIZATION_HEADER,
   HttpClient,
   PROTOCOL_VERSION,
+  SESSION_STATUSES,
+  WS_CLOSE_UNAUTHORIZED,
   WS_PATH,
   createEnvelope,
   encodeMessage,
   formatBearer,
   healthResponseSchema,
   type AgentReadyPayload,
+  type SessionStatus,
 } from '@debuggen/protocol';
 import {
   DebuggenError,
+  createConsoleLogger,
   err,
   isErr,
   isOk,
@@ -61,11 +66,12 @@ import {
   ok,
   unwrap,
 } from '@debuggen/shared';
-import type { Result } from '@debuggen/shared';
+import type { LogRecord, Result } from '@debuggen/shared';
 import { MIN_EPOCH_MS } from '@debuggen/telemetry';
 import type { SessionRecord } from '@debuggen/protocol';
 import { sha256Hex } from '@debuggen/shared/node';
 
+import { spawn } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import {
   chmodSync,
@@ -80,22 +86,39 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { performance } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
 
-import { AUTH_FILE_NAME, SESSIONS_DATABASE_FILE_NAME } from './config.js';
+import { AUTH_FILE_NAME, SESSIONS_DATABASE_FILE_NAME, loadServiceConfig } from './config.js';
+import { createDevServerLauncher } from './dev-server/launcher.js';
+import type { DevServerLauncher, DevServerTerminationReport } from './dev-server/launcher.js';
+import { fingerprintDocumentId } from './instrumentation/document-fingerprint.js';
+import type { ArmingSnapshot } from './instrumentation/service.js';
+import { createServiceLogger } from './logging.js';
 import {
+  DEV_SERVER_STOP_GRACE_MS,
+  EXIT_BACKSTOP_MS,
+  LAUNCHER_KILL_CONFIRM_MS,
+  LAUNCHER_REVOCATION_SLACK_MS,
   SERVICE_VERSION,
+  SHUTDOWN_BUDGET,
   createAgentReadyLedger,
   createIngestSourceLocator,
+  endLiveSessions,
   isProcessEntry,
   regatingBindingRoutes,
   regatingReadinessPort,
+  releaseParts,
   startService,
   type ServiceHandle,
+  type ServiceLoggers,
+  type ServiceParts,
+  type ShutdownBudget,
   type StartServiceOptions,
 } from './main.js';
 import type { PipelineCodeHandles } from './pipeline/context-builder.js';
 import type { RegateRequest } from './pipeline/orchestrator.js';
+import { createAuthService } from './server/auth.js';
 import { WS_CLOSE_GOING_AWAY } from './server/clients.js';
 import type {
   BindingConnection,
@@ -103,9 +126,13 @@ import type {
   SessionBindOutcome,
 } from './server/routes/binding.js';
 import type { WsConnectionFacts } from './server/ws.js';
+import type { SessionEndResult } from './sessions/manager.js';
 import type { AttributedEvent, IngestAttribution } from './telemetry/attribute.js';
+import { openStore } from './store/db.js';
 import { createModificationsRepo } from './store/modifications-repo.js';
 import { STORE_SCHEMA_VERSION } from './store/migrations.js';
+import { MAX_SESSION_LIST_LIMIT } from './store/sessions-repo.js';
+import type { SessionListItem } from './store/sessions-repo.js';
 
 /** The permission bits of a mode, masked out of the file-type bits. */
 const PERMISSION_BITS = 0o777;
@@ -118,6 +145,9 @@ const OWNER_ONLY_DIR = 0o700;
 
 /** How long a polling assertion waits before failing. */
 const POLL_TIMEOUT_MS = 5_000;
+
+/** The constant `msg` of the record a refused start writes (`STARTUP_REFUSED_MESSAGE`). */
+const STARTUP_REFUSED_MSG = 'the Debug Generator service could not start';
 
 /** Temporary roots and open handles this suite cleans up after itself. */
 const roots: string[] = [];
@@ -245,6 +275,132 @@ function helloAsEditor(socket: WebSocket, token: string, projectRoot: string): v
       }),
     ),
   );
+}
+
+/** Sends a dev-server preload's `client.hello`, scoped to `projectRoot`. */
+function helloAsServerAgent(socket: WebSocket, token: string, projectRoot: string): void {
+  socket.send(
+    encodeMessage(
+      createEnvelope('client.hello', {
+        client: 'server-agent',
+        projectRoot,
+        version: PROTOCOL_VERSION,
+        token,
+      }),
+    ),
+  );
+}
+
+/** One frame a test socket received: its type and payload. */
+interface ReceivedFrame {
+  readonly type: string;
+  readonly payload: unknown;
+}
+
+/** Records every frame `socket` receives, in arrival order. */
+function framesOf(socket: WebSocket): ReceivedFrame[] {
+  const frames: ReceivedFrame[] = [];
+  socket.on('message', (data: Buffer) => {
+    const parsed: unknown = JSON.parse(data.toString('utf8'));
+    if (typeof parsed === 'object' && parsed !== null && 'type' in parsed) {
+      frames.push({
+        type: String(parsed.type),
+        payload: 'payload' in parsed ? parsed.payload : undefined,
+      });
+    }
+  });
+  return frames;
+}
+
+/** A log destination that keeps every JSON record it is handed. */
+function capturingDestination(): { readonly records: string[]; write(record: string): void } {
+  const records: string[] = [];
+  return {
+    records,
+    write(record: string): void {
+      records.push(record);
+    },
+  };
+}
+
+/** What {@link instrumentFileOf} left behind. */
+interface PatchedFile {
+  readonly session: SessionRecord;
+  readonly record: ModificationRecord;
+  readonly file: string;
+  readonly originalBytes: string;
+  readonly instrumentedBytes: string;
+}
+
+/**
+ * Leaves `projectRoot` the way an install does: a new session, the original
+ * bytes in its backup store, an `applied` journal record carrying both hashes,
+ * and the instrumented bytes on disk.
+ */
+async function instrumentFileOf(
+  handle: ServiceHandle,
+  stateRoot: string,
+  projectRoot: string,
+): Promise<PatchedFile> {
+  mkdirSync(join(projectRoot, 'src'), { recursive: true });
+  const file = 'src/checkout.ts';
+  const originalBytes = 'export function total(): number {\n  return 1;\n}\n';
+  const instrumentedBytes =
+    'export function total(): number {\n  return (globalThis as never, 1);\n}\n';
+  const session = unwrap(
+    await handle.manager.create({
+      projectRoot,
+      question: 'Why is it slow?',
+      devServerUrl: 'http://127.0.0.1:3000',
+    }),
+  );
+  const originalHash = sha256Hex(originalBytes);
+  const backups = createBackupStore({ debuggenHome: stateRoot, sessionId: session.id });
+  unwrap(await backups.put(originalHash, Buffer.from(originalBytes, 'utf8')));
+  const record = unwrap(
+    createModificationRecord({
+      sessionId: session.id,
+      planVersion: 1,
+      file,
+      originalHash,
+      backupPath: unwrap(backups.locate(originalHash)),
+      instrumentedHash: sha256Hex(instrumentedBytes),
+      // The exact unified diff of the two texts, as the patcher records it: a
+      // conflict's three-way view is reconstructed from it.
+      diff: [
+        `--- a/${file}`,
+        `+++ b/${file}`,
+        '@@ -1,3 +1,3 @@',
+        ' export function total(): number {',
+        '-  return 1;',
+        '+  return (globalThis as never, 1);',
+        ' }',
+        '',
+      ].join('\n'),
+      status: 'applied',
+    }),
+  );
+  unwrap(await createModificationsRepo({ store: handle.store }).append(record));
+  writeFileSync(join(projectRoot, file), instrumentedBytes);
+  return { session, record, file, originalBytes, instrumentedBytes };
+}
+
+/** Connects an editor announcing `projectRoot` and waits until the service has registered it. */
+async function connectEditor(
+  handle: ServiceHandle,
+  stateRoot: string,
+  projectRoot: string,
+): Promise<{ readonly frames: ReceivedFrame[]; readonly closed: Promise<number> }> {
+  const socket = await connect(handle);
+  const frames = framesOf(socket);
+  const closed = closeCodeOf(socket);
+  helloAsEditor(socket, editorToken(stateRoot), projectRoot);
+  const registered = await eventually(async () => {
+    const body = await health(handle.url);
+    return (body as { pairingAvailable?: unknown }).pairingAvailable === true;
+  });
+  expect(registered).toBe(true);
+  return { frames, closed };
 }
 
 afterEach(async () => {
@@ -417,49 +573,82 @@ describe('startService — the state tree, the store and the editor credential',
     expect(() => lstatSync(join(stateRoot, `${SESSIONS_DATABASE_FILE_NAME}-wal`))).toThrow();
     expect(isOk(await start(stateRoot))).toBe(true);
   });
+
+  it("names a refusal by step and code, never copying a collaborator's hint or details into ordinary fields", async () => {
+    const { container, stateRoot } = makeStateRoot();
+    // Low-entropy sentinels a collaborator's error quotes: the prompt loader
+    // names the directory it could not read in its hint and details, and this
+    // directory's name carries a URL query value and an inline SQL literal.
+    const urlSentinel = 'urlq7c1f';
+    const sqlSentinel = 'sqllit9d4e';
+    const promptsDir = join(
+      container,
+      `prompts?access_token=${urlSentinel} WHERE card = '${sqlSentinel}'`,
+    );
+    mkdirSync(promptsDir, { recursive: true });
+    const records: string[] = [];
+    const destination = {
+      write(record: string): void {
+        records.push(record);
+      },
+    };
+
+    const refused = await start(stateRoot, {
+      overrides: { promptsDir, logLevel: 'info' },
+      loggerOptions: { destination },
+    });
+
+    expect(isErr(refused)).toBe(true);
+    if (isErr(refused)) {
+      // The collaborator's own error does carry the sentinels, so the
+      // assertions below are about the record, not about an empty error.
+      const collaboratorText = JSON.stringify([refused.error.hint, refused.error.details]);
+      expect(collaboratorText).toContain(urlSentinel);
+      expect(collaboratorText).toContain(sqlSentinel);
+    }
+    const parsed = records
+      .join('')
+      .split('\n')
+      .filter((line) => line.trim().length > 0)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    const refusal = parsed.find((record) => record['msg'] === STARTUP_REFUSED_MSG);
+    expect(refusal).toMatchObject({
+      // pino's numeric `error` level.
+      level: 50,
+      step: 'prompts',
+      code: 'CONFIG_INVALID',
+      err: { type: 'DebuggenError', code: 'CONFIG_INVALID' },
+    });
+    expect(refusal).not.toHaveProperty('hint');
+    expect(refusal).not.toHaveProperty('details');
+    // Everything outside the error key — the ordinary fields the logger only
+    // credential-scrubs — is free of the collaborator's text.
+    const ordinaryText = JSON.stringify(
+      Object.entries(refusal ?? {}).filter(([key]) => key !== 'err'),
+    );
+    expect(ordinaryText).not.toContain(urlSentinel);
+    expect(ordinaryText).not.toContain(sqlSentinel);
+  });
 });
 
 describe('startService — crash recovery before serving', () => {
   it('restores a file an earlier process left instrumented, before the handle exists', async () => {
     const { container, stateRoot } = makeStateRoot();
     const projectRoot = join(container, 'project');
-    mkdirSync(join(projectRoot, 'src'), { recursive: true });
-    const file = 'src/checkout.ts';
-    const originalBytes = 'export function total(): number {\n  return 1;\n}\n';
-    const instrumentedBytes =
-      'export function total(): number {\n  return (globalThis as never, 1);\n}\n';
 
-    // A first process: a session instruments one file and is then killed — its
-    // journal says `applied`, the file holds the patched bytes, and no cleanup
-    // ever ran.
+    // A first process: a session instruments one file and the process then
+    // crashes — `retain` is exactly what a crash leaves: its journal says
+    // `applied`, the file holds the patched bytes, and no cleanup ever ran.
     const first = await started(stateRoot);
-    const session = unwrap(
-      await first.manager.create({
-        projectRoot,
-        question: 'Why is it slow?',
-        devServerUrl: 'http://127.0.0.1:3000',
-      }),
+    const { record, file, originalBytes, instrumentedBytes } = await instrumentFileOf(
+      first,
+      stateRoot,
+      projectRoot,
     );
-    const originalHash = sha256Hex(originalBytes);
-    const backups = createBackupStore({ debuggenHome: stateRoot, sessionId: session.id });
-    unwrap(await backups.put(originalHash, Buffer.from(originalBytes, 'utf8')));
-    const record = unwrap(
-      createModificationRecord({
-        sessionId: session.id,
-        planVersion: 1,
-        file,
-        originalHash,
-        backupPath: unwrap(backups.locate(originalHash)),
-        instrumentedHash: sha256Hex(instrumentedBytes),
-        diff: `--- a/${file}\n+++ b/${file}\n@@ -2 +2 @@\n`,
-        status: 'applied',
-      }),
-    );
-    unwrap(await createModificationsRepo({ store: first.store }).append(record));
-    writeFileSync(join(projectRoot, file), instrumentedBytes);
     for (const handle of handles.splice(0)) {
-      await handle.close();
+      await handle.close({ liveSessions: 'retain' });
     }
+    expect(readFileSync(join(projectRoot, file), 'utf8')).toBe(instrumentedBytes);
 
     const second = await started(stateRoot);
 
@@ -468,6 +657,252 @@ describe('startService — crash recovery before serving', () => {
     expect(second.startup.reconciliation.conflicts).toBe(0);
     const journaled = unwrap(await createModificationsRepo({ store: second.store }).get(record.id));
     expect(journaled?.status).toBe('reverted');
+  });
+});
+
+/** A three-line source file whose one function returns `expression`. */
+function totalReturning(expression: string): string {
+  return `export function total(): number {\n  return ${expression};\n}\n`;
+}
+
+/**
+ * Journals and applies, for `sessionId`, a patch of `file` from
+ * `totalReturning(fromExpression)` to `totalReturning(toExpression)`, the way an
+ * install does: the pre-patch bytes in the session's backup store, an `applied`
+ * record carrying both hashes and the exact unified diff, then the new bytes.
+ */
+async function layerPatchOf(
+  handle: ServiceHandle,
+  stateRoot: string,
+  target: { readonly sessionId: string; readonly projectRoot: string; readonly file: string },
+  fromExpression: string,
+  toExpression: string,
+): Promise<ModificationRecord> {
+  const fromBytes = totalReturning(fromExpression);
+  const toBytes = totalReturning(toExpression);
+  const originalHash = sha256Hex(fromBytes);
+  const backups = createBackupStore({ debuggenHome: stateRoot, sessionId: target.sessionId });
+  unwrap(await backups.put(originalHash, Buffer.from(fromBytes, 'utf8')));
+  const record = unwrap(
+    createModificationRecord({
+      sessionId: target.sessionId,
+      planVersion: 1,
+      file: target.file,
+      originalHash,
+      backupPath: unwrap(backups.locate(originalHash)),
+      instrumentedHash: sha256Hex(toBytes),
+      diff: [
+        `--- a/${target.file}`,
+        `+++ b/${target.file}`,
+        '@@ -1,3 +1,3 @@',
+        ' export function total(): number {',
+        `-  return ${fromExpression};`,
+        `+  return ${toExpression};`,
+        ' }',
+        '',
+      ].join('\n'),
+      status: 'applied',
+    }),
+  );
+  unwrap(await createModificationsRepo({ store: handle.store }).append(record));
+  writeFileSync(join(target.projectRoot, target.file), toBytes);
+  return record;
+}
+
+describe('ServiceHandle.close — a graceful stop ends the live sessions (AAP 0.5.1)', () => {
+  it('unwinds two sessions’ patches of one file last-applied first, even when the lower one was updated last', async () => {
+    const { container, stateRoot } = makeStateRoot();
+    const projectRoot = join(container, 'project');
+    mkdirSync(join(projectRoot, 'src'), { recursive: true });
+    const file = 'src/checkout.ts';
+    const originalBytes = totalReturning('1');
+    writeFileSync(join(projectRoot, file), originalBytes);
+    const handle = await started(stateRoot);
+    const editor = await connectEditor(handle, stateRoot, projectRoot);
+
+    // `upper` is created first, `lower` second, so the session index — most
+    // recently updated first — lists `lower` first. But `lower` patched the
+    // file first and `upper` patched `lower`'s bytes: `upper` must be undone first.
+    const create = async (): Promise<SessionRecord> =>
+      unwrap(
+        await handle.manager.create({
+          projectRoot,
+          question: 'Why is it slow?',
+          devServerUrl: 'http://127.0.0.1:3000',
+        }),
+      );
+    const upper = await create();
+    const lower = await create();
+    const lowerRecord = await layerPatchOf(
+      handle,
+      stateRoot,
+      { sessionId: lower.id, projectRoot, file },
+      '1',
+      '(globalThis as never, 1)',
+    );
+    const upperRecord = await layerPatchOf(
+      handle,
+      stateRoot,
+      { sessionId: upper.id, projectRoot, file },
+      '(globalThis as never, 1)',
+      '(globalThis as never, (globalThis as never, 1))',
+    );
+
+    await handle.close();
+
+    // The original is back, with no conflict from the ordering itself.
+    expect(readFileSync(join(projectRoot, file), 'utf8')).toBe(originalBytes);
+    expect(await editor.closed).toBe(WS_CLOSE_GOING_AWAY);
+    const reports = editor.frames.filter((frame) => frame.type === 'cleanup.completed');
+    expect(reports.map((frame) => frame.payload)).toStrictEqual([
+      { sessionId: upper.id, status: 'clean', conflicts: [] },
+      { sessionId: lower.id, status: 'clean', conflicts: [] },
+    ]);
+
+    const second = await started(stateRoot);
+    expect(second.startup.reconciliation.restored).toBe(0);
+    expect(second.startup.reconciliation.conflicts).toBe(0);
+    const journal = createModificationsRepo({ store: second.store });
+    for (const [session, record] of [
+      [upper, upperRecord],
+      [lower, lowerRecord],
+    ] as const) {
+      const stored = unwrap(second.manager.get(session.id));
+      expect(stored?.status).toBe('ended');
+      expect(stored?.cleanup.status).toBe('clean');
+      expect(unwrap(await journal.get(record.id))?.status).toBe('reverted');
+    }
+  });
+
+  it('restores the patched file, disarms the preload and tells the editor before the sockets close', async () => {
+    const { container, stateRoot } = makeStateRoot();
+    const projectRoot = join(container, 'project');
+    mkdirSync(projectRoot, { recursive: true });
+    const log = capturingDestination();
+    const handle = unwrap(
+      await start(stateRoot, {
+        overrides: { logLevel: 'debug' },
+        loggerOptions: { destination: log },
+      }),
+    );
+
+    const editor = await connectEditor(handle, stateRoot, projectRoot);
+    const agentSocket = await connect(handle);
+    const agentFrames = framesOf(agentSocket);
+    const agentClosed = closeCodeOf(agentSocket);
+    const agentToken = unwrap(handle.auth.issueServerAgentCredential({ projectRoot })).token;
+    helloAsServerAgent(agentSocket, agentToken, projectRoot);
+    const agentRegistered = await eventually(() =>
+      Promise.resolve(
+        log.records.some(
+          (line) => line.includes('Client connected') && line.includes('"role":"server-agent"'),
+        ),
+      ),
+    );
+    expect(agentRegistered).toBe(true);
+    const patched = await instrumentFileOf(handle, stateRoot, projectRoot);
+
+    await handle.close();
+
+    // The developer's file is back, byte for byte, before the process is gone.
+    expect(readFileSync(join(projectRoot, patched.file), 'utf8')).toBe(patched.originalBytes);
+
+    // The editor heard the one cleanup report before its socket was closed as going away.
+    expect(await editor.closed).toBe(WS_CLOSE_GOING_AWAY);
+    const reports = editor.frames.filter((frame) => frame.type === 'cleanup.completed');
+    expect(reports.map((frame) => frame.payload)).toStrictEqual([
+      { sessionId: patched.session.id, status: 'clean', conflicts: [] },
+    ]);
+
+    // The preload was sent its capture-less configuration — every signal off — first.
+    expect(await agentClosed).toBe(WS_CLOSE_GOING_AWAY);
+    const configs = agentFrames.filter((frame) => frame.type === 'server-agent.config');
+    expect(configs.length).toBeGreaterThanOrEqual(1);
+    const disarm = configs.at(-1)?.payload as { captureId?: unknown; signals?: unknown };
+    expect(disarm.captureId).toBeUndefined();
+    expect(disarm.signals).toMatchObject({
+      http: false,
+      routeHandlers: false,
+      fetch: false,
+      prisma: false,
+      pg: false,
+      functions: [],
+    });
+
+    // The next start has nothing left to restore: the stop did it.
+    const second = await started(stateRoot);
+    expect(second.startup.reconciliation.restored).toBe(0);
+    expect(second.startup.reconciliation.conflicts).toBe(0);
+    const stored = unwrap(second.manager.get(patched.session.id));
+    expect(stored?.status).toBe('ended');
+    expect(stored?.cleanup.status).toBe('clean');
+    const journaled = unwrap(
+      await createModificationsRepo({ store: second.store }).get(patched.record.id),
+    );
+    expect(journaled?.status).toBe('reverted');
+  });
+
+  it('leaves a file the developer edited untouched, keeps its original and reports the conflict', async () => {
+    const { container, stateRoot } = makeStateRoot();
+    const projectRoot = join(container, 'project');
+    mkdirSync(projectRoot, { recursive: true });
+    const log = capturingDestination();
+    const handle = unwrap(
+      await start(stateRoot, {
+        overrides: { logLevel: 'info' },
+        loggerOptions: { destination: log },
+      }),
+    );
+    const editor = await connectEditor(handle, stateRoot, projectRoot);
+    const patched = await instrumentFileOf(handle, stateRoot, projectRoot);
+    const editedBytes = `${patched.instrumentedBytes}// the developer kept working\n`;
+    writeFileSync(join(projectRoot, patched.file), editedBytes);
+
+    await handle.close();
+
+    expect(readFileSync(join(projectRoot, patched.file), 'utf8')).toBe(editedBytes);
+    expect(readFileSync(patched.record.backupPath, 'utf8')).toBe(patched.originalBytes);
+    await editor.closed;
+    const report = editor.frames.find((frame) => frame.type === 'cleanup.completed')?.payload as {
+      status?: unknown;
+      conflicts?: readonly { file?: unknown; recordId?: unknown }[];
+    };
+    expect(report.status).toBe('conflict');
+    expect(report.conflicts?.map((conflict) => [conflict.recordId, conflict.file])).toStrictEqual([
+      [patched.record.id, patched.file],
+    ]);
+    expect(log.records.join('')).toContain(
+      'files edited while instrumented were not overwritten; their originals are kept in the backup directory',
+    );
+
+    const second = await started(stateRoot);
+    const stored = unwrap(second.manager.get(patched.session.id));
+    expect(stored?.status).toBe('ended');
+    expect(stored?.cleanup.status).toBe('conflict');
+    const journaled = unwrap(
+      await createModificationsRepo({ store: second.store }).get(patched.record.id),
+    );
+    expect(journaled?.status).toBe('conflict');
+    expect(readFileSync(join(projectRoot, patched.file), 'utf8')).toBe(editedBytes);
+  });
+
+  it('leaves a session that holds no instrumentation open, so it can continue after the restart', async () => {
+    const { container, stateRoot } = makeStateRoot();
+    const handle = await started(stateRoot);
+    const session = unwrap(
+      await handle.manager.create({
+        projectRoot: join(container, 'project'),
+        question: 'Why is it slow?',
+        devServerUrl: 'http://127.0.0.1:3000',
+      }),
+    );
+
+    await handle.close();
+
+    const second = await started(stateRoot);
+    const stored = unwrap(second.manager.get(session.id));
+    expect(stored?.status).toBe('created');
+    expect(stored?.cleanup.status).toBe('pending');
   });
 });
 
@@ -586,6 +1021,111 @@ describe('startService — one server, two protocols', () => {
   });
 });
 
+describe('startService — shutdown reports launched dev servers still running', () => {
+  /** A dev server the launcher's report says outlived its termination. */
+  const SURVIVOR = Object.freeze({
+    projectRoot: '/work/atlas-console',
+    pid: 424_242,
+    signalFailures: 2,
+  });
+
+  /**
+   * The real launcher, except that `dispose` — after really disposing it —
+   * resolves `report`: the shutdown path is exercised without a process that
+   * refuses to die.
+   */
+  function launcherReporting(
+    report: DevServerTerminationReport,
+  ): NonNullable<StartServiceOptions['createLauncher']> {
+    return (deps): DevServerLauncher => {
+      const real = createDevServerLauncher(deps);
+      return Object.freeze({
+        launch: (request) => real.launch(request),
+        stop: (input) => real.stop(input),
+        issueCredential: (input) => real.issueCredential(input),
+        stopForSession: (sessionId) => real.stopForSession(sessionId),
+        whenReleased: (sessionId) => real.whenReleased(sessionId),
+        acquireForSession: (projectRoot) => real.acquireForSession(projectRoot),
+        preloadServesAt: (projectRoot, devServerUrl) =>
+          real.preloadServesAt(projectRoot, devServerUrl),
+        addressOfCredential: (tokenHash) => real.addressOfCredential(tokenHash),
+        stopAll: () => real.stopAll(),
+        list: () => real.list(),
+        dispose: async () => {
+          await real.dispose();
+          return report;
+        },
+      } satisfies DevServerLauncher);
+    };
+  }
+
+  /** Starts, closes and returns every record the service wrote, parsed. */
+  async function recordsOfShutdown(
+    createLauncher: NonNullable<StartServiceOptions['createLauncher']>,
+  ): Promise<Record<string, unknown>[]> {
+    const { stateRoot } = makeStateRoot();
+    const lines: string[] = [];
+    const destination = {
+      write(record: string): void {
+        lines.push(record);
+      },
+    };
+    const result = await start(stateRoot, {
+      overrides: { logLevel: 'info' },
+      loggerOptions: { destination },
+      createLauncher,
+    });
+    const handle = unwrap(result);
+    await handle.close();
+    return lines
+      .join('')
+      .split('\n')
+      .filter((line) => line.trim().length > 0)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+  }
+
+  it("names a survivor at error under step 'dev-servers', and does not call the stop clean", async () => {
+    const records = await recordsOfShutdown(launcherReporting({ survivors: [SURVIVOR] }));
+
+    const survivors = records.find(
+      (record) => record['msg'] === 'launched dev servers are still running after shutdown',
+    );
+    expect(survivors).toMatchObject({
+      // pino's numeric `error` level.
+      level: 50,
+      step: 'dev-servers',
+      survivors: 1,
+      pids: [SURVIVOR.pid],
+      projectRoots: [SURVIVOR.projectRoot],
+    });
+    const stopped = records.find(
+      (record) => record['msg'] === 'the Debug Generator service has stopped',
+    );
+    // pino's numeric `warn` level: the final record names what is still running.
+    expect(stopped).toMatchObject({
+      level: 40,
+      devServers: 'running',
+      devServerPids: [SURVIVOR.pid],
+    });
+  });
+
+  it('writes a clean final record when the launcher reports no survivor', async () => {
+    const records = await recordsOfShutdown(launcherReporting({ survivors: [] }));
+
+    expect(
+      records.find(
+        (record) => record['msg'] === 'launched dev servers are still running after shutdown',
+      ),
+    ).toBeUndefined();
+    const stopped = records.find(
+      (record) => record['msg'] === 'the Debug Generator service has stopped',
+    );
+    // pino's numeric `info` level, with no dev-server fields.
+    expect(stopped).toMatchObject({ level: 30 });
+    expect(stopped).not.toHaveProperty('devServers');
+  });
+});
+
 describe('SERVICE_VERSION', () => {
   it('is the version apps/local-service/package.json declares', () => {
     expect(SERVICE_VERSION).toBe(manifestVersion());
@@ -678,6 +1218,46 @@ describe('createAgentReadyLedger', () => {
       expect(refused.error.code).toBe('TRANSPORT_DISCONNECTED');
     }
     expect(ledger.latestAgentReady(5)).toBeUndefined();
+  });
+
+  it('logs a forged document id only as its fingerprint, and still matches on the raw id', async () => {
+    const forged = '/account/PRIVATE-SENTINEL?token=forged';
+    const records: LogRecord[] = [];
+    const ledger = createAgentReadyLedger({
+      logger: createConsoleLogger({
+        level: 'trace',
+        sink: (record) => {
+          records.push(record);
+        },
+      }),
+      now: () => 1_000,
+    });
+
+    const waiting = ledger.waitForAgentReady(9, { timeoutMs: 1_000, afterDocumentId: 'doc-old' });
+    const recorded = ledger.agentReady(report(9, forged), connection);
+
+    expect(isOk(recorded) ? recorded.value.documentId : undefined).toBe(forged);
+    expect((await waiting)?.documentId).toBe(forged);
+    expect(ledger.latestAgentReady(9)?.documentId).toBe(forged);
+
+    const noted = records.filter(
+      (record) => record.message === 'recorded a page-agent readiness report',
+    );
+    expect(noted).toHaveLength(1);
+    expect(noted[0]?.level).toBe('debug');
+    expect(noted[0]?.fields).toMatchObject({
+      tabId: 9,
+      document: fingerprintDocumentId(forged),
+      documentIdCanonical: false,
+      clientId: connection.id,
+    });
+    for (const record of records) {
+      expect(Object.keys(record.fields)).not.toContain('documentId');
+    }
+    const serialized = JSON.stringify(records);
+    expect(serialized).not.toContain('PRIVATE-SENTINEL');
+    expect(serialized).not.toContain('token=');
+    ledger.close();
   });
 });
 
@@ -938,7 +1518,7 @@ describe('createIngestSourceLocator', () => {
           );
         },
       },
-      modifications: { listBySession: () => ok([]) },
+      modifications: { listBySession: () => ok([]), listPatchEvidence: () => ok([]) },
       events: { getBySpanId: () => ok(undefined) },
       logger: noopLogger,
     });
@@ -991,6 +1571,785 @@ describe('createIngestSourceLocator', () => {
     const located = await locator.locate([render], attribution);
 
     expect(isErr(located) && located.error.code).toBe('STORE_ERROR');
+  });
+});
+
+/** A promise that never settles: a collaborator that hangs. */
+function never<T>(): Promise<T> {
+  return new Promise<T>(() => undefined);
+}
+
+/** Resolves after `ms` milliseconds. */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** One row of the session index, as `SessionsRepo.list` returns it. */
+function listItem(id: string, status: SessionStatus, updatedAt = 1_000): SessionListItem {
+  return {
+    id,
+    projectRoot: '/workspace/ledger-tool',
+    projectName: 'ledger-tool',
+    status,
+    question: 'Why is it slow?',
+    createdAt: 1_000,
+    updatedAt,
+  };
+}
+
+/** A `SessionManager.end` answer carrying `cleanup`. */
+function endedWith(cleanup: SessionEndResult['cleanup']): Result<SessionEndResult, DebuggenError> {
+  return ok({ session: {} as unknown as SessionRecord, cleanup });
+}
+
+/** Loggers that discard everything. */
+const QUIET_LOGGERS: ServiceLoggers = {
+  root: noopLogger,
+  service: noopLogger,
+  server: noopLogger,
+};
+
+describe('releaseParts — one deadline for the whole stop', () => {
+  // A scaled-down budget with the production shape: the reserves are held back
+  // for the launcher and the final steps, the pipeline is capped.
+  const budget: ShutdownBudget = {
+    totalMs: 1_200,
+    pipelineMs: 200,
+    launcherReserveMs: 400,
+    finalReserveMs: 200,
+  };
+  /** How much later than its slice a step may be observed on a loaded host. */
+  const SLACK_MS = 150;
+
+  it('bounds the stop, and still stops the dev servers and closes the store, when earlier steps hang', async () => {
+    const t0 = performance.now();
+    const steps: { readonly step: string; readonly at: number }[] = [];
+    const mark = (step: string): void => {
+      steps.push({ step, at: performance.now() - t0 });
+    };
+    const parts: ServiceParts = {
+      http: { close: () => mark('http') },
+      ledger: { close: () => mark('ledger') },
+      orchestrator: {
+        dispose: () => {
+          mark('pipeline');
+          return never();
+        },
+      },
+      liveSessions: {
+        manager: {
+          end: (sessionId) => {
+            mark(`end:${sessionId}`);
+            return never();
+          },
+        },
+        sessions: {
+          list: () =>
+            ok({
+              items: [listItem('ses_a', 'capturing'), listItem('ses_b', 'capturing')],
+              total: 2,
+            }),
+        },
+        modifications: { listAllOpen: () => Promise.resolve(ok([])) },
+      },
+      cleanup: { dispose: () => mark('cleanup') },
+      launcher: {
+        list: () => [],
+        dispose: async () => {
+          mark('launcher');
+          await sleep(50);
+          mark('launcher-done');
+          return { survivors: [] };
+        },
+      },
+      liveTail: {
+        flush: () => {
+          mark('flush');
+          return Promise.resolve(ok(0));
+        },
+        close: () => mark('tail-close'),
+      },
+      ws: {
+        close: () => {
+          mark('ws');
+          return Promise.resolve();
+        },
+      },
+      instrumentation: { dispose: () => never() },
+      store: { close: () => mark('store') },
+    };
+
+    await releaseParts(parts, QUIET_LOGGERS, { budget });
+    const elapsed = performance.now() - t0;
+
+    expect(elapsed).toBeLessThan(budget.totalMs + SLACK_MS);
+    expect(steps.map((entry) => entry.step)).toStrictEqual([
+      'http',
+      'ledger',
+      'pipeline',
+      'end:ses_a',
+      'end:ses_b',
+      'cleanup',
+      'launcher',
+      'launcher-done',
+      'flush',
+      'ws',
+      'tail-close',
+      'store',
+    ]);
+    // The hung pipeline had only its cap; each hung session end only its share
+    // of what the reserves left — so the second session was still attempted —
+    // and the launcher started no later than its reserve began.
+    const at = (step: string): number => steps.find((entry) => entry.step === step)?.at ?? -1;
+    const sessionsSlice =
+      budget.totalMs - budget.pipelineMs - budget.launcherReserveMs - budget.finalReserveMs;
+    expect(at('end:ses_a')).toBeLessThan(budget.pipelineMs + SLACK_MS);
+    expect(at('end:ses_b')).toBeLessThan(budget.pipelineMs + sessionsSlice / 2 + SLACK_MS);
+    expect(at('launcher')).toBeLessThan(
+      budget.totalMs - budget.launcherReserveMs - budget.finalReserveMs + SLACK_MS,
+    );
+  });
+
+  it('abandons a launcher that never finishes, revokes its projects’ credentials, then closes the store', async () => {
+    const t0 = performance.now();
+    const steps: string[] = [];
+    const parts: ServiceParts = {
+      launcher: {
+        list: () =>
+          [
+            { projectRoot: '/workspace/ledger-tool' },
+            { projectRoot: '/workspace/ledger-tool' },
+          ] as unknown as ReturnType<NonNullable<ServiceParts['launcher']>['list']>,
+        dispose: () => never(),
+      },
+      auth: {
+        revokeServerAgentCredentials: (projectRoot) => {
+          steps.push(`revoke:${projectRoot}`);
+          return ok(1);
+        },
+        close: () => steps.push('auth-close'),
+      },
+      ws: { close: () => never() },
+      store: { close: () => steps.push('store') },
+    };
+
+    await releaseParts(parts, QUIET_LOGGERS, { budget });
+
+    expect(performance.now() - t0).toBeLessThan(budget.totalMs + SLACK_MS);
+    expect(steps).toStrictEqual(['revoke:/workspace/ledger-tool', 'auth-close', 'store']);
+  });
+
+  it('revokes nothing itself when the launcher stopped every child, which revokes their credentials', async () => {
+    const revoked: string[] = [];
+    const parts: ServiceParts = {
+      launcher: {
+        list: () =>
+          [{ projectRoot: '/workspace/ledger-tool' }] as unknown as ReturnType<
+            NonNullable<ServiceParts['launcher']>['list']
+          >,
+        dispose: () => Promise.resolve({ survivors: [] }),
+      },
+      auth: {
+        revokeServerAgentCredentials: (projectRoot) => {
+          revoked.push(projectRoot);
+          return ok(0);
+        },
+        close: () => undefined,
+      },
+    };
+
+    await releaseParts(parts, QUIET_LOGGERS, { budget });
+
+    expect(revoked).toStrictEqual([]);
+  });
+
+  it('leaves no credential of an unresponsive launched child valid for the next start', async () => {
+    const { container, stateRoot } = makeStateRoot();
+    const projectRoot = join(container, 'project');
+    mkdirSync(projectRoot, { recursive: true });
+    // A first start lays out the state tree and the store the stop will close.
+    await (await started(stateRoot)).close();
+
+    const config = unwrap(loadServiceConfig({}, { debuggenHome: stateRoot }));
+    const store = unwrap(openStore({ config, logger: noopLogger }));
+    const auth = unwrap(createAuthService({ store, config, logger: noopLogger }));
+    // What a managed launch mints: scoped to the project, with no expiry.
+    const { token } = unwrap(auth.issueServerAgentCredential({ projectRoot }));
+    const hello = { client: 'server-agent', projectRoot, version: PROTOCOL_VERSION, token };
+    expect(isOk(auth.authorizeHello({ payload: hello, origin: undefined }))).toBe(true);
+
+    await releaseParts(
+      {
+        auth,
+        store,
+        launcher: {
+          // The child never reports its exit, so the launcher never revokes.
+          list: () =>
+            [{ projectRoot }] as unknown as ReturnType<
+              NonNullable<ServiceParts['launcher']>['list']
+            >,
+          dispose: never,
+        },
+      },
+      QUIET_LOGGERS,
+      { budget },
+    );
+
+    const next = await started(stateRoot);
+    const socket = await connect(next);
+    const closed = closeCodeOf(socket);
+    helloAsServerAgent(socket, token, projectRoot);
+    expect(await closed).toBe(WS_CLOSE_UNAUTHORIZED);
+  });
+
+  it('never reads or ends a session when the live sessions are retained', async () => {
+    const touched: string[] = [];
+    const parts: ServiceParts = {
+      liveSessions: {
+        manager: {
+          end: (sessionId) => {
+            touched.push(`end:${sessionId}`);
+            return Promise.resolve(endedWith({ status: 'clean', conflicts: [], completedAt: 1 }));
+          },
+        },
+        sessions: {
+          list: () => {
+            touched.push('list');
+            return ok({ items: [listItem('ses_a', 'capturing')], total: 1 });
+          },
+        },
+        modifications: {
+          listAllOpen: () => {
+            touched.push('journal');
+            return Promise.resolve(ok([]));
+          },
+        },
+      },
+      cleanup: { dispose: () => touched.push('cleanup') },
+      store: { close: () => touched.push('store') },
+    };
+
+    await releaseParts(parts, QUIET_LOGGERS, { budget, liveSessions: 'retain' });
+
+    expect(touched).toStrictEqual(['cleanup', 'store']);
+  });
+});
+
+describe('endLiveSessions', () => {
+  /** A journal record of `sessionId` that is still open. */
+  function openRecordOf(sessionId: string): ModificationRecord {
+    return { sessionId } as unknown as ModificationRecord;
+  }
+
+  it('ends exactly the sessions that hold instrumentation, most recently updated first', async () => {
+    const listed: unknown[] = [];
+    const ended: string[] = [];
+    const report = await endLiveSessions(
+      {
+        manager: {
+          end: (sessionId) => {
+            ended.push(sessionId);
+            return Promise.resolve(endedWith({ status: 'clean', conflicts: [], completedAt: 1 }));
+          },
+        },
+        sessions: {
+          list: (options) => {
+            listed.push(options?.statuses);
+            return ok({
+              items: [
+                listItem('ses_capturing', 'capturing', 5),
+                listItem('ses_idle', 'generated', 4),
+                listItem('ses_patched', 'generated', 3),
+                listItem('ses_armed', 'ready', 2),
+                listItem('ses_ready', 'ready', 1),
+                listItem('ses_installing', 'instrumenting', 0),
+              ],
+              total: 6,
+            });
+          },
+        },
+        modifications: { listAllOpen: () => Promise.resolve(ok([openRecordOf('ses_patched')])) },
+        instrumentation: {
+          arming: (sessionId) =>
+            sessionId === 'ses_armed' || sessionId === 'ses_ready'
+              ? ({
+                  sessionId,
+                  ...(sessionId === 'ses_armed' ? { armedCaptureId: 'cap_armed' } : {}),
+                } as unknown as ArmingSnapshot)
+              : undefined,
+        },
+      },
+      { timeoutMs: 1_000, logger: noopLogger },
+    );
+
+    const expected = ['ses_capturing', 'ses_patched', 'ses_armed', 'ses_installing'];
+    expect(ended).toStrictEqual(expected);
+    expect(report.live).toStrictEqual(expected);
+    expect(report.ended.map((session) => session.sessionId)).toStrictEqual(expected);
+    expect(report.unfinished).toStrictEqual([]);
+    expect(report.timedOut).toBe(false);
+    // Every status is asked for except the terminal one.
+    expect(listed).toStrictEqual([SESSION_STATUSES.filter((status) => status !== 'ended')]);
+  });
+
+  it('pages through the whole session index', async () => {
+    const pages: number[] = [];
+    const idle = Array.from({ length: MAX_SESSION_LIST_LIMIT }, (_, index) =>
+      listItem(`ses_idle_${String(index)}`, 'generated'),
+    );
+    const report = await endLiveSessions(
+      {
+        manager: {
+          end: () => Promise.resolve(endedWith({ status: 'clean', conflicts: [], completedAt: 1 })),
+        },
+        sessions: {
+          list: (options) => {
+            const offset = options?.offset ?? 0;
+            pages.push(offset);
+            return ok(
+              offset === 0
+                ? { items: idle, total: MAX_SESSION_LIST_LIMIT + 1 }
+                : { items: [listItem('ses_last', 'capturing')], total: MAX_SESSION_LIST_LIMIT + 1 },
+            );
+          },
+        },
+        modifications: { listAllOpen: () => Promise.resolve(ok([])) },
+      },
+      { timeoutMs: 1_000, logger: noopLogger },
+    );
+
+    expect(pages).toStrictEqual([0, MAX_SESSION_LIST_LIMIT]);
+    expect(report.live).toStrictEqual(['ses_last']);
+  });
+
+  it('reports conflicts, and leaves a session whose end failed for the next start', async () => {
+    const records = capturingDestination();
+    const logger = createServiceLogger(
+      unwrap(loadServiceConfig({}, { debuggenHome: makeStateRoot().stateRoot, logLevel: 'info' })),
+      { destination: records },
+    );
+    const report = await endLiveSessions(
+      {
+        manager: {
+          end: (sessionId) => {
+            if (sessionId === 'ses_refused') {
+              return Promise.resolve(
+                err(new DebuggenError('SESSION_INVALID_STATE', 'An install is in progress.')),
+              );
+            }
+            if (sessionId === 'ses_threw') {
+              return Promise.reject(new Error('the store is closed'));
+            }
+            return Promise.resolve(
+              endedWith({
+                status: 'conflict',
+                conflicts: [
+                  {
+                    recordId: 'mod_edited',
+                    sessionId,
+                    file: 'src/cart.ts',
+                  } as unknown as SessionEndResult['cleanup']['conflicts'][number],
+                ],
+                completedAt: 1,
+              }),
+            );
+          },
+        },
+        sessions: {
+          list: () =>
+            ok({
+              items: [
+                listItem('ses_conflict', 'capturing'),
+                listItem('ses_refused', 'capturing'),
+                listItem('ses_threw', 'capturing'),
+              ],
+              total: 3,
+            }),
+        },
+        modifications: { listAllOpen: () => Promise.resolve(ok([])) },
+      },
+      { timeoutMs: 1_000, logger },
+    );
+
+    expect(report.ended).toStrictEqual([
+      { sessionId: 'ses_conflict', cleanup: 'conflict', conflictFiles: ['src/cart.ts'] },
+    ]);
+    expect(report.unfinished).toStrictEqual(['ses_refused', 'ses_threw']);
+    expect(report.timedOut).toBe(false);
+    const logged = records.records.join('');
+    expect(logged).toContain('files edited while instrumented were not overwritten');
+    expect(logged).toContain('src/cart.ts');
+    expect(logged).toContain('a live session could not be ended');
+  });
+
+  it('gives a stalled end only its share of the slice, still ends the sessions after it and disarms it', async () => {
+    const t0 = performance.now();
+    const disarmed: { readonly sessionId: string; readonly projectRoot?: string | undefined }[] =
+      [];
+    const report = await endLiveSessions(
+      {
+        manager: {
+          end: (sessionId) =>
+            sessionId === 'ses_stuck'
+              ? never()
+              : sleep(20).then(() => endedWith({ status: 'clean', conflicts: [], completedAt: 1 })),
+        },
+        sessions: {
+          list: () =>
+            ok({
+              items: [
+                listItem('ses_quick', 'capturing'),
+                listItem('ses_stuck', 'capturing'),
+                listItem('ses_after', 'capturing'),
+              ],
+              total: 3,
+            }),
+        },
+        modifications: { listAllOpen: () => Promise.resolve(ok([])) },
+        instrumentation: {
+          arming: () => undefined,
+          disarmCapture: (request) => {
+            disarmed.push({ sessionId: request.sessionId, projectRoot: request.projectRoot });
+            return ok({
+              sessionId: request.sessionId,
+              agentDisarmed: true,
+              serverAgent: 'delivered',
+            });
+          },
+        },
+      },
+      { timeoutMs: 300, logger: noopLogger },
+    );
+
+    expect(performance.now() - t0).toBeLessThan(300 + 150);
+    expect(report.ended.map((session) => session.sessionId)).toStrictEqual([
+      'ses_quick',
+      'ses_after',
+    ]);
+    expect(report.unfinished).toStrictEqual(['ses_stuck']);
+    expect(report.timedOut).toBe(true);
+    // The stalled session's producers are disarmed anyway, for its own project.
+    expect(disarmed).toStrictEqual([
+      { sessionId: 'ses_stuck', projectRoot: '/workspace/ledger-tool' },
+    ]);
+  });
+
+  it('disarms a session whose end was refused, so its producers do not outlive the stop', async () => {
+    const disarmed: string[] = [];
+    const report = await endLiveSessions(
+      {
+        manager: {
+          end: () =>
+            Promise.resolve(
+              err(new DebuggenError('SESSION_INVALID_STATE', 'An install is in progress.')),
+            ),
+        },
+        sessions: {
+          list: () => ok({ items: [listItem('ses_installing', 'instrumenting')], total: 1 }),
+        },
+        modifications: { listAllOpen: () => Promise.resolve(ok([])) },
+        instrumentation: {
+          arming: () => undefined,
+          disarmCapture: (request) => {
+            disarmed.push(request.sessionId);
+            return ok({
+              sessionId: request.sessionId,
+              agentDisarmed: false,
+              serverAgent: 'delivered',
+            });
+          },
+        },
+      },
+      { timeoutMs: 1_000, logger: noopLogger },
+    );
+
+    expect(report.unfinished).toStrictEqual(['ses_installing']);
+    expect(report.timedOut).toBe(false);
+    expect(disarmed).toStrictEqual(['ses_installing']);
+  });
+
+  it('still ends the capturing sessions when the journal cannot be read', async () => {
+    const report = await endLiveSessions(
+      {
+        manager: {
+          end: () => Promise.resolve(endedWith({ status: 'clean', conflicts: [], completedAt: 1 })),
+        },
+        sessions: {
+          list: () =>
+            ok({
+              items: [listItem('ses_capturing', 'capturing'), listItem('ses_idle', 'generated')],
+              total: 2,
+            }),
+        },
+        modifications: {
+          listAllOpen: () =>
+            Promise.resolve(err(new DebuggenError('STORE_ERROR', 'The journal is locked.'))),
+        },
+      },
+      { timeoutMs: 1_000, logger: noopLogger },
+    );
+
+    expect(report.live).toStrictEqual(['ses_capturing']);
+  });
+
+  /** An open record of `sessionId` on `file`, taking the file from `from` to `to`. */
+  function patchRecord(
+    sessionId: string,
+    file: string,
+    from: string,
+    to: string,
+    appliedAt: number,
+  ): ModificationRecord {
+    return {
+      sessionId,
+      file,
+      originalHash: sha256Hex(from),
+      instrumentedHash: sha256Hex(to),
+      appliedAt,
+    } as unknown as ModificationRecord;
+  }
+
+  /** Ends `items` over `records` and answers the order the sessions were ended in. */
+  async function endOrder(
+    items: readonly SessionListItem[],
+    records: readonly ModificationRecord[],
+    logger = noopLogger,
+  ): Promise<string[]> {
+    const ended: string[] = [];
+    await endLiveSessions(
+      {
+        manager: {
+          end: (sessionId) => {
+            ended.push(sessionId);
+            return Promise.resolve(endedWith({ status: 'clean', conflicts: [], completedAt: 1 }));
+          },
+        },
+        sessions: { list: () => ok({ items, total: items.length }) },
+        modifications: { listAllOpen: () => Promise.resolve(ok([...records])) },
+      },
+      { timeoutMs: 1_000, logger },
+    );
+    return ended;
+  }
+
+  it('unwinds a patch applied on top of another session’s first, whatever the update order', async () => {
+    // A patched the file, B patched A's bytes, then A was updated more recently
+    // (it started a capture, say): the index lists A first, but B must go first.
+    const order = await endOrder(
+      [listItem('ses_a', 'capturing', 9), listItem('ses_b', 'ready', 1)],
+      [
+        patchRecord('ses_a', 'src/cart.ts', 'original', 'patched-by-a', 100),
+        patchRecord('ses_b', 'src/cart.ts', 'patched-by-a', 'patched-by-a-and-b', 100),
+      ],
+    );
+
+    expect(order).toStrictEqual(['ses_b', 'ses_a']);
+  });
+
+  it('falls back to the application times when the hashes do not chain', async () => {
+    const order = await endOrder(
+      [listItem('ses_a', 'capturing', 9), listItem('ses_b', 'ready', 1)],
+      [
+        patchRecord('ses_a', 'src/cart.ts', 'original', 'patched-by-a', 100),
+        patchRecord('ses_b', 'src/cart.ts', 'edited-in-between', 'patched-by-b', 200),
+      ],
+    );
+
+    expect(order).toStrictEqual(['ses_b', 'ses_a']);
+  });
+
+  it('keeps the index order for sessions that share no file, including one path in two projects', async () => {
+    const otherProject = { ...listItem('ses_other', 'ready', 1), projectRoot: '/workspace/other' };
+    const order = await endOrder(
+      [listItem('ses_a', 'capturing', 9), listItem('ses_c', 'capturing', 5), otherProject],
+      [
+        patchRecord('ses_a', 'src/cart.ts', 'original', 'patched-by-a', 100),
+        patchRecord('ses_c', 'src/orders.ts', 'original', 'patched-by-c', 300),
+        patchRecord('ses_other', 'src/cart.ts', 'patched-by-a', 'patched-elsewhere', 400),
+      ],
+    );
+
+    expect(order).toStrictEqual(['ses_a', 'ses_c', 'ses_other']);
+  });
+
+  it('leaves a session under an unfinished one for the next start instead of recording a false conflict', async () => {
+    const attempted: string[] = [];
+    const disarmed: string[] = [];
+    const report = await endLiveSessions(
+      {
+        manager: {
+          end: (sessionId) => {
+            attempted.push(sessionId);
+            return sessionId === 'ses_upper'
+              ? never()
+              : Promise.resolve(endedWith({ status: 'clean', conflicts: [], completedAt: 1 }));
+          },
+        },
+        sessions: {
+          list: () =>
+            ok({
+              items: [
+                listItem('ses_lower', 'capturing', 9),
+                listItem('ses_upper', 'ready', 5),
+                listItem('ses_elsewhere', 'ready', 1),
+              ],
+              total: 3,
+            }),
+        },
+        modifications: {
+          listAllOpen: () =>
+            Promise.resolve(
+              ok([
+                patchRecord('ses_lower', 'src/cart.ts', 'original', 'patched-by-lower', 100),
+                patchRecord('ses_upper', 'src/cart.ts', 'patched-by-lower', 'both', 200),
+                patchRecord('ses_elsewhere', 'src/orders.ts', 'original', 'patched', 300),
+              ]),
+            ),
+        },
+        instrumentation: {
+          arming: () => undefined,
+          disarmCapture: (request) => {
+            disarmed.push(request.sessionId);
+            return ok({
+              sessionId: request.sessionId,
+              agentDisarmed: true,
+              serverAgent: 'delivered',
+            });
+          },
+        },
+      },
+      { timeoutMs: 300, logger: noopLogger },
+    );
+
+    // The upper session is attempted first and stalls; the lower one is not
+    // attempted at all; the independent one is still ended.
+    expect(report.live).toStrictEqual(['ses_upper', 'ses_lower', 'ses_elsewhere']);
+    expect(attempted).toStrictEqual(['ses_upper', 'ses_elsewhere']);
+    expect(report.ended.map((session) => session.sessionId)).toStrictEqual(['ses_elsewhere']);
+    expect(report.unfinished).toStrictEqual(['ses_upper', 'ses_lower']);
+    expect(disarmed).toStrictEqual(['ses_upper', 'ses_lower']);
+  });
+
+  it('ends every session of an interleaved cycle once, and says so', async () => {
+    const records = capturingDestination();
+    const logger = createServiceLogger(
+      unwrap(loadServiceConfig({}, { debuggenHome: makeStateRoot().stateRoot, logLevel: 'warn' })),
+      { destination: records },
+    );
+    const order = await endOrder(
+      [listItem('ses_a', 'capturing', 9), listItem('ses_b', 'ready', 1)],
+      [
+        patchRecord('ses_a', 'src/cart.ts', 'original', 'a-on-cart', 100),
+        patchRecord('ses_b', 'src/cart.ts', 'a-on-cart', 'b-on-cart', 200),
+        patchRecord('ses_b', 'src/orders.ts', 'original', 'b-on-orders', 300),
+        patchRecord('ses_a', 'src/orders.ts', 'b-on-orders', 'a-on-orders', 400),
+      ],
+      logger,
+    );
+
+    expect([...order].sort()).toStrictEqual(['ses_a', 'ses_b']);
+    expect(records.records.join('')).toContain('patched the same files in an interleaved order');
+  });
+});
+
+describe('releaseParts — the stop keeps its own process alive', () => {
+  /** The repository root, the directory `tsx` resolves from. */
+  const repoRoot = fileURLToPath(new URL('../../../', import.meta.url));
+  const mainUrl = new URL('./main.ts', import.meta.url).href;
+
+  it('finishes every step in a child process whose last handle was the listener it closed', async () => {
+    // A step that waits on a promise nothing references, after the listener —
+    // the process's only handle — has closed: without a referenced watchdog,
+    // Node would exit mid-sequence and the store would never be closed.
+    const { container } = makeStateRoot();
+    mkdirSync(container, { recursive: true });
+    const script = join(container, 'release-in-child.mts');
+    writeFileSync(
+      script,
+      [
+        "import { createServer } from 'node:http';",
+        `const { releaseParts } = await import(${JSON.stringify(mainUrl)});`,
+        "const quiet = { level: 'silent', trace() {}, debug() {}, info() {}, warn() {}, error() {}, fatal() {}, child() { return quiet; } };",
+        'const server = createServer();',
+        "await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));",
+        'await releaseParts(',
+        "  { server, instrumentation: { dispose: () => new Promise(() => {}) }, store: { close: () => process.stdout.write('store-closed\\n') } },",
+        '  { root: quiet, service: quiet, server: quiet },',
+        '  { budget: { totalMs: 600, pipelineMs: 50, launcherReserveMs: 100, finalReserveMs: 100 } },',
+        ');',
+        "process.stdout.write('released\\n');",
+        '',
+      ].join('\n'),
+    );
+
+    const child = spawn(process.execPath, ['--import', 'tsx', script], {
+      cwd: repoRoot,
+      env: { ...process.env, NODE_OPTIONS: '' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk: Buffer) => {
+      stdout += chunk.toString('utf8');
+    });
+    child.stderr.on('data', (chunk: Buffer) => {
+      stderr += chunk.toString('utf8');
+    });
+    const code = await new Promise<number | null>((resolve) => {
+      child.once('exit', resolve);
+    });
+
+    expect({ code, stdout, stderr }).toMatchObject({ code: 0, stdout: 'store-closed\nreleased\n' });
+  }, 60_000);
+});
+
+describe('SHUTDOWN_BUDGET — the stop fits every process that stops the service', () => {
+  /** The service's whole lifetime after `SIGTERM`: the deadline plus the exit backstop. */
+  const lifetimeMs = SHUTDOWN_BUDGET.totalMs + EXIT_BACKSTOP_MS;
+
+  /** Reads a numeric literal (`12_000`) captured by `pattern` from a repository file. */
+  function numberIn(relativeToHere: string, pattern: RegExp): number {
+    const text = readFileSync(fileURLToPath(new URL(relativeToHere, import.meta.url)), 'utf8');
+    const match = pattern.exec(text);
+    expect(match, `${relativeToHere} no longer matches ${String(pattern)}`).not.toBeNull();
+    return Number((match?.[1] ?? '').replaceAll('_', ''));
+  }
+
+  it("exits inside Playwright's webServer grace", () => {
+    const grace = numberIn(
+      '../../../playwright.config.ts',
+      /gracefulShutdown:\s*\{\s*signal:\s*'SIGTERM',\s*timeout:\s*([\d_]+)\s*\}/u,
+    );
+    expect(grace).toBeGreaterThan(lifetimeMs);
+  });
+
+  it("exits inside the VS Code extension's service-supervisor grace", () => {
+    const grace = numberIn(
+      '../../vscode-extension/src/service/process.ts',
+      /export const DEFAULT_STOP_GRACE_MS = ([\d_]+);/u,
+    );
+    expect(grace).toBeGreaterThan(lifetimeMs);
+  });
+
+  it("reserves the launcher's worst case, with time left to revoke, and leaves the live sessions a real slice", () => {
+    const killConfirmMs = numberIn(
+      './dev-server/launcher.ts',
+      /const KILL_CONFIRM_MS = ([\d_]+);/u,
+    );
+    // The mirror the budget is derived from must track the launcher's private value.
+    expect(LAUNCHER_KILL_CONFIRM_MS).toBe(killConfirmMs);
+    // The launcher revokes a child's credential only after both waits, so the
+    // reserve needs strictly more than their sum for the revocation to land.
+    expect(LAUNCHER_REVOCATION_SLACK_MS).toBeGreaterThan(0);
+    expect(SHUTDOWN_BUDGET.launcherReserveMs).toBeGreaterThanOrEqual(
+      DEV_SERVER_STOP_GRACE_MS + killConfirmMs + LAUNCHER_REVOCATION_SLACK_MS,
+    );
+    const leastForSessions =
+      SHUTDOWN_BUDGET.totalMs -
+      SHUTDOWN_BUDGET.pipelineMs -
+      SHUTDOWN_BUDGET.launcherReserveMs -
+      SHUTDOWN_BUDGET.finalReserveMs;
+    expect(leastForSessions).toBeGreaterThanOrEqual(1_000);
   });
 });
 

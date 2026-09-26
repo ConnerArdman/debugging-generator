@@ -32,13 +32,16 @@
  *
  * IT FAILS CLOSED. Anything that leaves the check without a subject is an error (exit 2), never a
  * quiet pass: git missing, the directory not being a checkout, a `--path` that does not exist or
- * is not a directory, and a target under which git tracks no file at all. The last one is the
- * dangerous case, because it looks like success; it is raised where enumeration happens, so the
- * in-process callers fail closed with the command line.
+ * is not a directory, a target under which git tracks no file at all, and a tracked file under the
+ * target that exists but cannot be read (a permission denied, an I/O error). The last two are the
+ * dangerous cases, because both look like success: a file nobody read would otherwise count as a
+ * file without a marker. Both are raised inside the scan itself - the unreadable files are
+ * collected and reported together, each with its error code, once every other file was read - so
+ * the in-process callers fail closed with the command line.
  *
  * Usage:  node scripts/check-no-residual-instrumentation.mjs [--path <dir>] [--json] [--help]
  * Exits:  0 clean | 1 marker found or working tree dirty | 2 usage or environment error, which
- *         includes a target with no tracked file under it.
+ *         includes a target with no tracked file under it and a tracked file it cannot read.
  *
  * The script only reads. It writes nothing to disk, never opens anything inside `.git/` (the
  * repository's `origin` URL embeds a credential) and prints no file content beyond a sanitized
@@ -66,7 +69,10 @@ export const MARKERS = Object.freeze(['__DEBUGGEN__', '__DebuggenSpanHelper']);
 const EXIT_OK = 0;
 /** Exit code: a marker was found, or the working tree is dirty. */
 const EXIT_FINDINGS = 1;
-/** Exit code: the check could not be performed (usage, git, a missing or empty target). */
+/**
+ * Exit code: the check could not be performed (usage, git, a missing or empty target, a tracked
+ * file that cannot be read).
+ */
 const EXIT_ERROR = 2;
 
 /** Bytes inspected when deciding whether a tracked file is binary. */
@@ -77,6 +83,13 @@ const MAX_SCAN_BYTES = 16 * 1024 * 1024;
 const MAX_SNIPPET_LENGTH = 120;
 /** `git ls-files` on a large tree can produce a lot of output; give it room. */
 const GIT_MAX_BUFFER = 64 * 1024 * 1024;
+/**
+ * `lstat` error codes that mean a tracked path is simply not on disk: `ENOENT` for the path itself,
+ * `ENOTDIR` when a parent directory was replaced by a file. Git reports both as deletions, so the
+ * worktree assertion answers for them. Every other `lstat` error means the path may well exist and
+ * could not be examined, which is a file the scan did not read.
+ */
+const ABSENT_PATH_CODES = new Set(['ENOENT', 'ENOTDIR']);
 
 /**
  * A single marker occurrence.
@@ -89,11 +102,21 @@ const GIT_MAX_BUFFER = 64 * 1024 * 1024;
  */
 
 /**
- * A tracked file the scan deliberately did not read.
+ * A tracked file the scan deliberately did not read. A file it tried to read and could not is never
+ * one of these: that is the `file-unreadable` error (see {@link scanResidualMarkers}).
  *
  * @typedef {object} SkippedFile
  * @property {string} file Repository-relative POSIX path.
- * @property {'binary'|'symlink'|'not-a-regular-file'|'too-large'|'missing'|'unreadable'} reason
+ * @property {'binary'|'symlink'|'not-a-regular-file'|'too-large'|'missing'} reason
+ */
+
+/**
+ * A tracked file that exists, or may exist, but could not be examined or read.
+ *
+ * @typedef {object} UnreadableFile
+ * @property {string} file Repository-relative POSIX path.
+ * @property {string} code The failure's errno-style code, such as `EACCES` or `EIO`.
+ * @property {unknown} error The value the filesystem call threw, kept as the error's cause.
  */
 
 /**
@@ -352,6 +375,50 @@ function scanBuffer(file, buffer) {
 }
 
 /**
+ * The errno-style code a filesystem call failed with (`EACCES`, `EIO`, ...), or `UNKNOWN` when the
+ * thrown value carries none.
+ *
+ * @param {unknown} error
+ * @returns {string}
+ */
+function errorCode(error) {
+  const code =
+    typeof error === 'object' && error !== null
+      ? /** @type {{ code?: unknown }} */ (error).code
+      : undefined;
+  return typeof code === 'string' && code !== '' ? code : 'UNKNOWN';
+}
+
+/**
+ * The `file-unreadable` error for every tracked file the scan could not examine or read, each named
+ * with its error code on a line of its own so a long list stays legible in a CI log. The underlying
+ * errors travel as an `AggregateError` cause, so an in-process caller keeps the full detail.
+ *
+ * @param {string} target Repository-relative POSIX path that was scanned.
+ * @param {readonly UnreadableFile[]} unreadable At least one entry, in `git ls-files` order.
+ * @returns {ResidualCheckError}
+ */
+function unreadableFilesError(target, unreadable) {
+  const count = unreadable.length;
+  const listing = unreadable.map(({ file, code }) => `  ${file} (${code})`).join('\n');
+  return new ResidualCheckError(
+    'file-unreadable',
+    `${count} tracked ${plural(count, 'file')} under ${target} could not be read, so the marker ` +
+      `scan cannot vouch for ${count === 1 ? 'it' : 'them'} and this check cannot be performed:\n` +
+      `${listing}\n` +
+      'Make every listed file, and each directory above it, readable by the account running this ' +
+      'check - restore its permissions or ownership, or repair the storage behind an I/O error - ' +
+      'and re-run it.',
+    {
+      cause: new AggregateError(
+        unreadable.map((entry) => entry.error),
+        `${count} tracked ${plural(count, 'file')} could not be read`,
+      ),
+    },
+  );
+}
+
+/**
  * Scan every tracked file under `relDir` for the instrumentation markers and report what was
  * searched as well as what was found. `findMarkers` is the terse wrapper around this; the command
  * line uses the full result so its summary line can name the number of files scanned.
@@ -360,8 +427,12 @@ function scanBuffer(file, buffer) {
  * @param {string} [relDir] Repository-relative directory to scan. Defaults to `apps/demo-app`.
  * @returns {MarkerScanResult}
  * @throws {ResidualCheckError} When git is unavailable, `root` is not a checkout, `relDir` is
- *   missing, outside the repository or not a directory, or - code `target-empty` - git tracks no
- *   file under it, which leaves the marker assertion with no subject.
+ *   missing, outside the repository or not a directory; with code `target-empty` when git tracks no
+ *   file under it, which leaves the marker assertion with no subject; and with code
+ *   `file-unreadable` when a tracked file under it exists but could not be examined or read - a
+ *   permission denied, an I/O error - because a file nobody read cannot be reported clean. The
+ *   `file-unreadable` message names every such file with its error code and is raised only after
+ *   every other file was scanned, so one run reports them all.
  */
 export function scanResidualMarkers(root, relDir) {
   const repoRoot = resolveRepoRoot(root);
@@ -389,6 +460,11 @@ export function scanResidualMarkers(root, relDir) {
   const findings = [];
   /** @type {SkippedFile[]} */
   const skipped = [];
+  // Files the scan could not examine or read. They are collected rather than raised one at a time,
+  // so a single run names all of them, and raised after the loop: never a skip, because a file
+  // nobody read would otherwise count as a file without a marker.
+  /** @type {UnreadableFile[]} */
+  const unreadable = [];
   let filesScanned = 0;
 
   for (const file of files) {
@@ -396,10 +472,17 @@ export function scanResidualMarkers(root, relDir) {
     let stats;
     try {
       // lstat, not stat: a tracked symlink is never followed, so the scan cannot read outside the
-      // work tree. A deleted-but-tracked file lands here too and is surfaced by the worktree check.
+      // work tree. A deleted-but-tracked file lands here too and is surfaced by the worktree check;
+      // any other failure (a parent directory without search permission, an I/O error) leaves a
+      // file that may exist unexamined.
       stats = lstatSync(absolute);
-    } catch {
-      skipped.push({ file, reason: 'missing' });
+    } catch (error) {
+      const code = errorCode(error);
+      if (ABSENT_PATH_CODES.has(code)) {
+        skipped.push({ file, reason: 'missing' });
+      } else {
+        unreadable.push({ file, code, error });
+      }
       continue;
     }
     if (stats.isSymbolicLink()) {
@@ -417,8 +500,10 @@ export function scanResidualMarkers(root, relDir) {
     let buffer;
     try {
       buffer = readFileSync(absolute);
-    } catch {
-      skipped.push({ file, reason: 'unreadable' });
+    } catch (error) {
+      // lstat just found a regular file here, so whatever the code - EACCES, EIO, even an ENOENT
+      // from a file deleted mid-scan - its content was never searched.
+      unreadable.push({ file, code: errorCode(error), error });
       continue;
     }
     if (isBinary(buffer)) {
@@ -429,20 +514,26 @@ export function scanResidualMarkers(root, relDir) {
     findings.push(...scanBuffer(file, buffer));
   }
 
+  if (unreadable.length > 0) {
+    // Raised here rather than in the command line, like `target-empty` above, so that the
+    // in-process callers fail closed too instead of receiving "no marker" for unread files.
+    throw unreadableFilesError(target, unreadable);
+  }
+
   return { repoRoot, target, files, filesScanned, skipped, findings };
 }
 
 /**
  * Every instrumentation marker occurrence in tracked source under `relDir`. An empty array means
  * the `residual-marker` assertion holds - and it can only mean that, because a target with no
- * tracked file under it raises instead of returning an empty array (see
- * {@link scanResidualMarkers}).
+ * tracked file under it, and a target holding a tracked file that cannot be read, raise instead of
+ * returning an empty array (see {@link scanResidualMarkers}).
  *
  * @param {string} root Any path inside the repository; the git work-tree root is derived from it.
  * @param {string} [relDir] Repository-relative directory to scan. Defaults to `apps/demo-app`.
  * @returns {MarkerFinding[]}
  * @throws {ResidualCheckError} Everything {@link scanResidualMarkers} throws, including
- *   `target-empty`.
+ *   `target-empty` and `file-unreadable`.
  */
 export function findMarkers(root, relDir) {
   return scanResidualMarkers(root, relDir).findings;
@@ -618,8 +709,10 @@ function helpText() {
     '  0  clean',
     '  1  a marker was found, or the target has uncommitted changes',
     '  2  usage or environment error: unknown option, git unavailable, not a git repository, a',
-    '     missing target path, or a target with no tracked file under it (a complete checkout',
-    `     contains ${DEFAULT_TARGET_PATH}, and the check refuses to pass over an empty subject)`,
+    '     missing target path, a target with no tracked file under it (a complete checkout',
+    `     contains ${DEFAULT_TARGET_PATH}), or a tracked file under it that cannot be read, which`,
+    '     is listed with its error code: make it readable and re-run. The check refuses to pass',
+    '     over a subject it did not read.',
     '',
     'The check only reads: it writes nothing to disk and never opens anything inside .git/.',
   ].join('\n');

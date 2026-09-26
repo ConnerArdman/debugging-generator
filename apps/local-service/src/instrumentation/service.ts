@@ -23,19 +23,53 @@
  *   (AAP §0.4.2): `instrumentation.ready` carries `applied`, `runtimeHooks` and
  *   `unavailable` exactly as the installer returned them; `agent.config` and
  *   `server-agent.config` carry the installer's hook configuration and signal
- *   set; `instrumentation.failed` carries the installer's error.
- * - **Arms and disarms the two producers at capture time**
- *   ({@link InstrumentationService.armCapture},
+ *   set; `instrumentation.failed` carries the installer's error code, the
+ *   stage's fixed public copy for that code and a diagnostic reference in
+ *   place of the error's own message, and the error's hint only when it is
+ *   proven product text — the dev-server detection's exact relaunch command
+ *   standing in for an adapter's — else the code's default next step.
+ * - **Arms and disarms the two producers at capture time, judged by
+ *   receipts** ({@link InstrumentationService.armCapture},
  *   {@link InstrumentationService.disarmCapture}). `agent.config` requires a
  *   capture id, so arming belongs to the capture window; disarming sends the
  *   dormant page configuration and a preload configuration **without** a
  *   capture id, which is what makes the preload disable its instrumentations
- *   (AAP §0.5.1: runtime hooks are disabled, not merely idled).
+ *   (AAP §0.5.1: runtime hooks are disabled, not merely idled). Each frame goes
+ *   to its one recipient — `agent.config` to the connection carrying the
+ *   session's bound tab, `server-agent.config` to the project's preloads — and
+ *   the client registry's delivery receipt decides the outcome. A
+ *   producer-applied acknowledgement is not part of the AAP §0.4.2 protocol, so
+ *   that transport receipt *is* the acknowledgement. An arm whose page frame no
+ *   connection took is refused before the preload is told anything; an arm
+ *   whose preload is not connected proceeds with the page and reports every
+ *   server signal it lacks (AAP §0.5.5).
+ * - **Remembers what could not be delivered, and replays it**
+ *   ({@link ProducerReconciler}). A disarm that no connection took, for a
+ *   producer this process armed, stays pending — across `stopSession`, which
+ *   cleanup calls right after disarming — until a reconnecting producer
+ *   ({@link ProducerReconciler.producerConnected}), a rebinding tab
+ *   ({@link ProducerReconciler.reconcileBoundSession}) or a later configuration
+ *   settles it; {@link ProducerReconciler.onDormancyConfirmed} reports when a
+ *   session's pending set empties. A reconnecting producer is re-armed for the
+ *   project's open capture. A capture a restart interrupted is never resumed —
+ *   it would be advertised before any producer took its configuration — but
+ *   released ({@link ProducerReconciler.releaseInterruptedCapture}), so the
+ *   dormant configuration its producers are owed stays pending until they
+ *   take it. A preload that may hold an arming this service did not see
+ *   disarmed there — its credential predates the service, or predates the
+ *   project's last arming — is sent the capture-less configuration when it
+ *   connects.
  * - **Reports degradation honestly** (AAP §0.5.5): every unavailable signal is
  *   one sentence — "Could not enable ‹signal›: ‹reason›. Continuing with:
  *   ‹enabled list›." — emitted as a `running` progress row, never as a failure.
  *   The only failure is the installer's own `Err`, which is what "nothing at all
  *   could be enabled" means.
+ * - **Checks a row only once readiness confirms it** (AAP §0.5.5, prompt §11
+ *   Step 8): readiness is evaluated before any checklist row is sent; a signal
+ *   is shown ✓ — and named after "Continuing with:" — only when the capture
+ *   arms it *and* the verdict found a producer that will deliver it, every
+ *   other planned signal is shown ✗ with the verdict's reason and hint, and
+ *   "Ready to capture" closes the group last, only for a satisfied verdict.
  *
  * ## What it never does
  *
@@ -63,8 +97,11 @@
  *
  * ## Privacy
  *
- * Log records carry ids, counts, plan versions, signal names and error codes —
- * never a diff, never file content, never a credential (AAP §0.5.2). The
+ * Log records carry ids, counts, plan versions, signal names, error codes and a
+ * caught value's closed exception class (`describeException`) — never a diff,
+ * never file content, never a credential, and never an exception's own name or
+ * message (AAP §0.5.2). A caught value itself travels only under the logger's
+ * error key, whose serializer decides what of it is emitted. The
  * server-agent credential belongs to the dev-server launcher and never passes
  * through here.
  *
@@ -83,8 +120,11 @@ import {
   CAPTURE_SIGNALS,
   DISABLED_SERVER_AGENT_SIGNALS,
   DORMANT_AGENT_HOOK_CONFIG,
+  READINESS_HINT_MAX_LENGTH,
+  READINESS_REASON_MAX_LENGTH,
   SERVER_AGENT_SIGNAL_KEYS,
   actionIdentityKey,
+  buildReadiness,
   createAdapterRegistry,
   createBackupStore,
   deriveAgentHookConfig,
@@ -103,6 +143,9 @@ import {
   type InstrumentationPlan,
   type ModificationRecord,
   type ObservedReadinessInputs,
+  type Readiness,
+  type ReadinessSignal,
+  type ReadinessStatus,
   type ServerAgentSignals,
   type UnavailableSignal,
 } from '@debuggen/instrumentation';
@@ -128,20 +171,31 @@ import {
   isAbsolutePosix,
   isErr,
   isWindowsAbsolute,
+  newMessageId,
   normalizePosix,
   nowEpochMs,
   ok,
   toPosix,
+  type LogFields,
   type Logger,
   type Result,
 } from '@debuggen/shared';
 
 import type { ServiceConfig } from '../config.js';
-import { LOG_BINDING_KEYS } from '../logging.js';
+import { PRELOAD_DEPENDENT_SIGNALS } from '../dev-server/detect.js';
+import {
+  LOG_BINDING_KEYS,
+  LOG_ERROR_FIELD_KEY,
+  describeException,
+  type ExceptionDescription,
+} from '../logging.js';
 import type { CaptureOwner, SessionBroadcaster } from '../sessions/manager.js';
 import {
   CAPTURE_SIGNAL_LABELS,
   INSTRUMENTATION_ROW_ORDER,
+  authorProductText,
+  isProductAuthoredText,
+  publicFailureCopy,
   type InstalledSignals,
   type ProgressRow,
   type SessionProgress,
@@ -177,12 +231,33 @@ const LOG_SUBSYSTEM = 'instrumentation';
  */
 const UI_CLIENT_KINDS: readonly ClientKind[] = Object.freeze(['vscode', 'devtools'] as const);
 
+/** The client kind of a dev-server preload connection, which takes `server-agent.config`. */
+const SERVER_AGENT_KIND = 'server-agent' as const satisfies ClientKind;
+
+/** The client kind of a DevTools connection, which carries its bound tabs' page agents. */
+const DEVTOOLS_KIND = 'devtools' as const satisfies ClientKind;
+
+/** The page agent, as {@link DisarmCaptureOutcome.pending} names it; listed first. */
+const PAGE_AGENT_PRODUCER: ArmedProducer = 'page-agent';
+
+/** The dev-server preload, as {@link DisarmCaptureOutcome.pending} names it; listed second. */
+const SERVER_AGENT_PRODUCER: ArmedProducer = 'server-agent';
+
 /**
- * Who receives `agent.config`: the MAIN-world page agent, which owns no socket —
- * its frames travel under the bound tab's DevTools connection, which the client
- * registry resolves from this kind.
+ * The reason every server signal of a capture carries when the arm could not
+ * reach the dev-server preload (AAP §0.5.5): one line, closed by the sentence
+ * `buildDegradationNotice` builds around it.
  */
-const AGENT_CLIENT_KINDS: readonly ClientKind[] = Object.freeze(['agent'] as const);
+const PRELOAD_UNREACHABLE_REASON =
+  'the dev-server preload is not connected, so this capture collects nothing on the server';
+
+/** The next step of a server signal the arm could not reach, carried as the row's detail. */
+const PRELOAD_UNREACHABLE_HINT =
+  'Launch the dev server from Debug Generator so its Node preload connects; the capture picks the server signals up as soon as it does.';
+
+/** The next step when the page agent could not be sent its capture configuration. */
+const PAGE_AGENT_UNREACHABLE_HINT =
+  'Open DevTools on the page with the Debug Generator panel so the tab is bound and connected, then start the capture again.';
 
 /** The mode of an action installed as a runtime hook rather than a file patch. */
 const RUNTIME_ACTION_MODE = 'runtime' as const satisfies InstrumentationAction['mode'];
@@ -199,20 +274,6 @@ const MAX_FAILURE_MESSAGE_LENGTH = 2000;
 /** The protocol bound on `instrumentation.failed`'s hint. */
 const MAX_FAILURE_HINT_LENGTH = 1000;
 
-/**
- * The next step `instrumentation.failed` carries when the installer's error
- * brought none. Protocol requires a hint on this message because it is the
- * developer's only route back from a failed install.
- */
-export const DEFAULT_INSTALL_FAILURE_HINT =
-  'Review the reason reported for each signal, fix the setup it names, then plan the instrumentation again.';
-
-/**
- * The message `instrumentation.failed` carries when the installer's error
- * message cannot be sent as it stands (it was blank after normalisation).
- */
-const FALLBACK_FAILURE_MESSAGE = 'Instrumentation could not be installed for this session.';
-
 /** The enabled-list wording of a degradation notice when no label is enabled. */
 const NOTHING_ELSE_ENABLED = 'the signals that remain available';
 
@@ -221,6 +282,15 @@ const TRAILING_PUNCTUATION_PATTERN = /[\s.!?;:,]+$/u;
 
 /** Any run of whitespace, collapsed to one space in display text. */
 const WHITESPACE_RUN_PATTERN = /\s+/gu;
+
+/** The checklist status of a confirmed signal the readiness verdict raised no gap for. */
+const AVAILABLE_STATUS = 'available' as const satisfies ReadinessStatus;
+
+/** The checklist status of a confirmed signal the readiness verdict holds a gap for. */
+const DEGRADED_STATUS = 'degraded' as const satisfies ReadinessStatus;
+
+/** The checklist status of a planned signal readiness did not confirm. */
+const UNAVAILABLE_STATUS = 'unavailable' as const satisfies ReadinessStatus;
 
 // ---------------------------------------------------------------------------
 // Section B — injected ports
@@ -244,6 +314,29 @@ export interface ServerAgentConfigChannel {
    * (`SERVER_AGENT_NOT_READY` and friends) when none could.
    */
   sendToServerAgent(projectRoot: string, message: ProtocolMessage): Result<unknown, DebuggenError>;
+}
+
+/**
+ * The single-recipient delivery this module needs for `agent.config`.
+ *
+ * The MAIN-world page agent owns no socket: its frames travel under the
+ * DevTools connection that carries the session's bound tab (AAP §0.4.2). The
+ * client registry (`src/server/clients.ts`) resolves that one connection and
+ * says whether it took the frame — which is the receipt every arm and disarm
+ * here is judged by, because the AAP protocol has no producer acknowledgement
+ * message. Declared structurally, like {@link ServerAgentConfigChannel}; the
+ * registry satisfies it as it stands.
+ */
+export interface AgentConfigChannel {
+  /**
+   * Delivers `message` to the connection carrying the session's bound tab.
+   *
+   * @returns `Ok` when that connection took the frame; `Err` when none could —
+   * `TAB_NOT_BOUND` (no tab is bound), `TRANSPORT_DISCONNECTED` (the binding's
+   * connection is offline or the write failed), `UNAUTHORIZED` or
+   * `PROTOCOL_INVALID_MESSAGE` (the registry refused the frame).
+   */
+  sendToBoundTab(sessionId: string, message: ProtocolMessage): Result<unknown, DebuggenError>;
 }
 
 /**
@@ -296,9 +389,15 @@ export interface InstrumentationServiceDeps {
   readonly modifications: ModificationsRepo;
   /** The progress emitter both user interfaces render from. */
   readonly progress: SessionProgress;
-  /** The session fan-out for the editor, DevTools and page-agent recipients. */
+  /**
+   * The session fan-out for the user-interface frames (`instrumentation.plan`,
+   * `.ready`, `.failed`). Never used for a producer's configuration: a fan-out
+   * reports no receipt, and arming is judged by one.
+   */
   readonly broadcaster: SessionBroadcaster;
-  /** The single-recipient delivery for `server-agent.config`. */
+  /** The single-recipient delivery for `agent.config`, with its receipt. */
+  readonly agentChannel: AgentConfigChannel;
+  /** The single-recipient delivery for `server-agent.config`, with its receipt. */
   readonly serverAgentChannel: ServerAgentConfigChannel;
   /** The live conflict detector the install brackets. */
   readonly watcher: InstrumentationWatcher;
@@ -447,9 +546,30 @@ export interface ArmCaptureRequest {
   readonly plan?: InstrumentationPlan | undefined;
 }
 
-/** How a `server-agent.config` frame fared. */
+/**
+ * How a `server-agent.config` frame fared, judged by the client registry's
+ * delivery receipt: `delivered` (at least one preload connection of the
+ * project took it), `unreachable` (none did), `not-needed` (nothing had to be
+ * sent), or `skipped-other-owner` (another session holds the project's
+ * capture, so its configuration stays in force).
+ */
 export type ServerAgentDelivery =
   'delivered' | 'unreachable' | 'not-needed' | 'skipped-other-owner';
+
+/**
+ * A telemetry producer this service configures: the MAIN-world page agent of
+ * the bound tab, or the project's dev-server preload.
+ */
+export type ArmedProducer = 'page-agent' | 'server-agent';
+
+/**
+ * How an `agent.config` frame fared, judged by the client registry's delivery
+ * receipt: `delivered` (the bound tab's connection took it), `unreachable` (no
+ * online bound-tab connection did), `not-needed` (the capture enables no page
+ * hook, so nothing was sent), or `not-armed` (no capture is known to disarm, so
+ * nothing was sent).
+ */
+export type PageAgentDelivery = 'delivered' | 'unreachable' | 'not-needed' | 'not-armed';
 
 /** What an arm sent. */
 export interface ArmCaptureOutcome {
@@ -463,10 +583,25 @@ export interface ArmCaptureOutcome {
   readonly serverSignals: ServerAgentSignals;
   /**
    * `delivered`, `unreachable` (no preload connected — the capture degrades,
-   * AAP §0.5.5), or `not-needed` (the plan collects nothing server-side, so the
-   * preload is left disabled).
+   * AAP §0.5.5, and {@link unavailable} lists what it proceeds without), or
+   * `not-needed` (the plan collects nothing server-side, so the preload is left
+   * disabled).
    */
   readonly serverAgent: ServerAgentDelivery;
+  /**
+   * `delivered`, or `not-needed` when the capture enables no page hook. An arm
+   * whose page frame could not be delivered is an `Err`, never an outcome.
+   * Always set by this service; optional only so hand-built outcomes of other
+   * suites stay valid.
+   */
+  readonly pageAgent?: PageAgentDelivery | undefined;
+  /**
+   * The server signals this capture proceeds without because the preload could
+   * not be reached — one entry per enabled signal, each with its reason and the
+   * next step — and empty otherwise. Always set by this service; optional only
+   * so hand-built outcomes of other suites stay valid.
+   */
+  readonly unavailable?: readonly UnavailableSignal[] | undefined;
 }
 
 /** What {@link InstrumentationService.disarmCapture} is told. */
@@ -487,13 +622,32 @@ export interface DisarmCaptureOutcome {
   readonly sessionId: string;
   /** The capture the dormant `agent.config` named, when one was sent. */
   readonly captureId?: string | undefined;
-  /** Whether the dormant `agent.config` was sent. */
+  /**
+   * Whether the dormant `agent.config` was **delivered** — taken by the bound
+   * tab's connection — and not merely attempted.
+   */
   readonly agentDisarmed: boolean;
   /**
    * `delivered`, `unreachable`, or `skipped-other-owner` when another session
    * now holds the project's capture and its preload must stay armed.
    */
   readonly serverAgent: ServerAgentDelivery;
+  /**
+   * `delivered`, `unreachable`, or `not-armed` when no capture id is known, so
+   * no dormant frame was sent. Always set by this service; optional only so
+   * hand-built outcomes of other suites stay valid.
+   */
+  readonly pageAgent?: PageAgentDelivery | undefined;
+  /**
+   * The producers this service armed for the session that have not yet been
+   * delivered their dormant configuration — `page-agent` first, then
+   * `server-agent`. They are replayed when the producer reconnects
+   * ({@link ProducerReconciler.producerConnected},
+   * {@link ProducerReconciler.reconcileBoundSession}); an empty list means both
+   * producers are known to be dormant for this session. Always set by this
+   * service; optional only so hand-built outcomes of other suites stay valid.
+   */
+  readonly pending?: readonly ArmedProducer[] | undefined;
 }
 
 /** What {@link InstrumentationService.restoreArming} recomputes from a stored plan. */
@@ -571,6 +725,165 @@ export interface InstrumentationService {
   /** Stops all watching and clears all state. Idempotent. */
   dispose(): Promise<void>;
 }
+
+/** A producer connection that has just registered with the client registry. */
+export interface ProducerConnection {
+  /** The connection's kind; only `server-agent` and `devtools` are replayed to. */
+  readonly kind: ClientKind;
+  /** A `server-agent` connection's project root, from its credential's scope. */
+  readonly projectRoot?: string | undefined;
+  /** The sessions whose bound tabs a `devtools` connection carries. */
+  readonly sessionIds?: readonly string[] | undefined;
+  /**
+   * When the connection's credential was issued, in epoch milliseconds. A
+   * preload whose credential predates this service may still hold a
+   * configuration an earlier process armed, and one whose credential predates
+   * the project's last arming may have been armed then and missed the
+   * disarm, so either is sent the capture-less configuration even when no
+   * disarm is owed; one issued after both holds only what this service sent
+   * it. Omitted, the preload is treated as possibly holding an arming.
+   */
+  readonly credentialIssuedAt?: number | undefined;
+}
+
+/** What {@link ProducerReconciler.producerConnected} replayed. */
+export interface ProducerReplayOutcome {
+  /** The sessions whose open capture was re-armed on the reconnected producer. */
+  readonly rearmed: readonly string[];
+  /** The sessions whose outstanding disarm the replay delivered or superseded. */
+  readonly disarmed: readonly string[];
+  /**
+   * How the preload replay fared for a `server-agent` connection, and
+   * `not-applicable` for any other kind.
+   */
+  readonly serverAgent: ServerAgentDelivery | 'not-applicable';
+}
+
+/** What {@link ProducerReconciler.reconcileBoundSession} is told after a tab (re)binds. */
+export interface BoundSessionReconcileRequest {
+  readonly sessionId: string;
+  /** The session's project root. */
+  readonly projectRoot: string;
+  /** The session's open capture window, when it has one. */
+  readonly activeCaptureId?: string | undefined;
+  /** The session's most recent capture, from the store, when it has one. */
+  readonly lastCaptureId?: string | undefined;
+  /**
+   * When that capture started, in epoch milliseconds. A capture this service
+   * saw open is answered by its own record — the page holds it only if this
+   * service armed it and has not disarmed it — so its id alone sends nothing.
+   * Omitted, or earlier than this service, the capture belongs to an earlier
+   * process and its page agent is sent the dormant configuration unless this
+   * service already delivered it.
+   */
+  readonly lastCaptureStartedAt?: number | undefined;
+}
+
+/**
+ * What {@link ProducerReconciler.reconcileBoundSession} did:
+ * `capture-active` (a capture is open, so the caller re-arms instead; nothing
+ * sent), `dormant-delivered` (the bound tab's connection took the dormant
+ * `agent.config`), `dormant-unreachable` (it did not; any outstanding disarm is
+ * kept), `already-dormant` (this process already delivered the dormant
+ * configuration for that capture and nothing is outstanding), or
+ * `nothing-armed` (no capture is known, or the last one was opened by this
+ * service and is not armed in the page, so there is nothing to disarm).
+ */
+export type BoundSessionReconcileOutcome =
+  | 'capture-active'
+  | 'dormant-delivered'
+  | 'dormant-unreachable'
+  | 'already-dormant'
+  | 'nothing-armed';
+
+/**
+ * What {@link ProducerReconciler.releaseInterruptedCapture} is told about a
+ * capture window a restart ended: the previous process had armed it, and the
+ * session was failed, since no capture is continued across a restart.
+ */
+export interface InterruptedCaptureInput {
+  readonly sessionId: string;
+  /** The capture window the previous process held open. */
+  readonly captureId: string;
+  /** The session's project root. */
+  readonly projectRoot: string;
+  /**
+   * The stored plan the capture was opened with. Without it, which producers
+   * the capture armed is unknown, so both are treated as still holding it.
+   */
+  readonly plan?: InstrumentationPlan | undefined;
+}
+
+/**
+ * The producer-state half of the driver: what keeps this service's belief
+ * about the two producers true across disconnects and restarts.
+ *
+ * The AAP §0.4.2 protocol has no producer acknowledgement message — a producer
+ * applies `agent.config` / `server-agent.config` and says nothing — so the
+ * receipt of the producer's own connection is the acknowledgement this service
+ * can verify. A configuration that no connection took is remembered as
+ * outstanding and replayed when the producer comes back.
+ */
+export interface ProducerReconciler {
+  /**
+   * Replays outstanding configuration to a producer connection that has just
+   * registered: a preload is re-armed for the project's open capture or
+   * disabled when none is open; a DevTools connection's page agents are
+   * re-armed for their open captures or sent their outstanding dormant
+   * configuration. Never throws.
+   */
+  producerConnected(connection: ProducerConnection): ProducerReplayOutcome;
+
+  /**
+   * Returns a freshly bound tab's page agent to dormant when its session has no
+   * open capture — the path that disarms a page agent which outlived a service
+   * restart or a failed disarm.
+   *
+   * @returns The outcome, or `Err` for an empty session id or a relative
+   * project root.
+   */
+  reconcileBoundSession(
+    request: BoundSessionReconcileRequest,
+  ): Result<BoundSessionReconcileOutcome, DebuggenError>;
+
+  /**
+   * Disarms a capture window a restart ended. The producers the previous
+   * process armed for it — those the plan enables, or both when the plan is
+   * unknown — may still hold its configuration, so they are recorded as armed
+   * for it and then disarmed exactly as
+   * {@link InstrumentationService.disarmCapture} would: a dormant configuration
+   * no connection takes becomes outstanding, is replayed when the producer
+   * reconnects, and keeps the session's cleanup `partial` until then.
+   *
+   * @returns The disarm's outcome, or `Err` for invalid input.
+   */
+  releaseInterruptedCapture(
+    input: InterruptedCaptureInput,
+  ): Result<DisarmCaptureOutcome, DebuggenError>;
+
+  /**
+   * The producers of one session still owed their dormant configuration,
+   * `page-agent` first, then `server-agent`.
+   */
+  pendingDisarms(sessionId: string): readonly ArmedProducer[];
+
+  /**
+   * Subscribes to "every outstanding disarm of a session is settled": fired
+   * once whenever a replay, a supersession or a later disarm empties a
+   * session's previously non-empty pending set. A listener that throws is
+   * logged and never affects the others.
+   *
+   * @returns The unsubscribe function.
+   */
+  onDormancyConfirmed(listener: (sessionId: string) => void): () => void;
+}
+
+/**
+ * The full driver {@link createInstrumentationService} returns: the service
+ * surface every stage and route consumes, plus the producer reconciler that
+ * the connection and binding layers drive.
+ */
+export type InstrumentationDriver = InstrumentationService & ProducerReconciler;
 
 // ---------------------------------------------------------------------------
 // Section D — pure helpers
@@ -658,27 +971,53 @@ export function buildDegradationNotice(
 }
 
 /**
- * The labels of the signals a capture proceeds with, in the progress view's
- * display order: every signal the hook configuration, the signal set or a
- * runtime-hook entry enables, minus every signal reported unavailable.
+ * The page-agent hooks a capture of a plan version arms: the installer's
+ * configuration widened with the hooks of the plan's runtime actions.
  *
- * Read with the same rules the progress view's ✓ rows use — a runtime-hook entry
- * counts only when it is exactly a signal name or exactly a label — so the
- * degradation sentence and the checklist never disagree about what is enabled.
+ * This is the widening `armCapture` applies when it builds `agent.config` — a
+ * runtime hook an adapter left unarmed because no page agent had reported yet
+ * is armed at capture time, since arming one edits no file — so the checklist
+ * judges exactly the hooks the capture will send, no more and no fewer.
+ *
+ * @param agentHooks The configuration the installer (or the delta union) produced.
+ * @param actions The plan version's actions; only the runtime ones widen it.
+ * @returns The hooks the next capture arms.
  */
-function enabledSignalLabels(
+function captureAgentHooks(
+  agentHooks: AgentHookConfig,
+  actions: readonly InstrumentationAction[],
+): AgentHookConfig {
+  return unionAgentHooks(
+    agentHooks,
+    deriveAgentHookConfig(actions.filter((action) => action.mode === RUNTIME_ACTION_MODE)),
+  );
+}
+
+/**
+ * The capture signals an installed configuration arms, read with the rules the
+ * progress view's ✓ rows use: a page-agent hook flag, a preload flag or a
+ * non-empty `functions` list, and a runtime-hook entry that is exactly a signal
+ * name or exactly a label. A label arms every signal it stands for, because
+ * choosing one of them would be a guess; readiness then decides which of them
+ * a producer will actually deliver.
+ *
+ * Pure: the configuration is read, never kept.
+ *
+ * @example
+ * ```ts
+ * armedCaptureSignals(hooks, signals, ['Database tracing']); // ⊇ { 'prisma', 'pg' }
+ * ```
+ */
+function armedCaptureSignals(
   agentHooks: AgentHookConfig,
   serverSignals: ServerAgentSignals,
   runtimeHooks: readonly string[],
-  unavailable: readonly UnavailableSignal[],
-): readonly string[] {
-  const withdrawn = new Set<string>(unavailable.map((entry) => entry.signal));
-  const enabled = new Set<CaptureSignal>();
-  const hookLabels = new Set<string>();
+): ReadonlySet<CaptureSignal> {
+  const armed = new Set<CaptureSignal>();
 
   for (const key of AGENT_HOOK_KEYS) {
     if (agentHooks[key]) {
-      enabled.add(key);
+      armed.add(key);
     }
   }
 
@@ -686,33 +1025,181 @@ function enabledSignalLabels(
     const value = serverSignals[key];
 
     if (value === true || (Array.isArray(value) && value.length > 0)) {
-      enabled.add(key);
+      armed.add(key);
     }
   }
 
-  for (const hook of runtimeHooks) {
-    if (isCaptureSignal(hook)) {
-      enabled.add(hook);
-    } else {
-      hookLabels.add(hook);
-    }
-  }
-
-  const labels = new Set<string>();
+  const hookNames = new Set<string>(runtimeHooks);
 
   for (const signal of CAPTURE_SIGNALS) {
-    const label = CAPTURE_SIGNAL_LABELS[signal];
-
-    if (withdrawn.has(signal)) {
-      continue;
-    }
-
-    if (enabled.has(signal) || hookLabels.has(label)) {
-      labels.add(label);
+    if (hookNames.has(signal) || hookNames.has(CAPTURE_SIGNAL_LABELS[signal])) {
+      armed.add(signal);
     }
   }
 
+  return armed;
+}
+
+/**
+ * The signals the checklist may show ✓: every signal the readiness verdict
+ * found deliverable and does not hold the session back on, that the capture
+ * also arms, minus every signal the installer reported unavailable — in
+ * capture-signal order.
+ *
+ * Every condition is required. A deliverable signal nothing arms collects
+ * nothing, and an armed signal readiness did not confirm — a server signal with
+ * no connected preload, a page signal with no agent for the bound document —
+ * has no producer to collect it. A signal the verdict lists as blocking is
+ * never confirmed either, even when it also counts as deliverable: the one
+ * such case is a signal two producers share (`fetch`) whose page half is
+ * gated, and arming is not tracked per producer here, so a ✓ could stand for
+ * the half that will collect nothing. Showing any of these as enabled would
+ * present a failure as success (AAP §0.5.5).
+ *
+ * @param verdict The verdict's deliverable and blocking signals.
+ * @param armed What the capture arms ({@link armedCaptureSignals}).
+ * @param unavailable The installer's unavailable signals, each withdrawn.
+ * @returns The confirmed signals, frozen.
+ */
+function confirmedSignals(
+  verdict: Pick<ReadinessVerdict, 'deliverableSignals' | 'blocking'>,
+  armed: ReadonlySet<CaptureSignal>,
+  unavailable: readonly UnavailableSignal[],
+): readonly CaptureSignal[] {
+  const delivered = new Set<CaptureSignal>(verdict.deliverableSignals);
+  const withheld = new Set<string>([
+    ...verdict.blocking.map((gap) => gap.signal),
+    ...unavailable.map((entry) => entry.signal),
+  ]);
+
+  return Object.freeze(
+    CAPTURE_SIGNALS.filter(
+      (signal) => delivered.has(signal) && armed.has(signal) && !withheld.has(signal),
+    ),
+  );
+}
+
+/**
+ * The display labels of `signals`, de-duplicated by label and ordered as the
+ * progress view orders its ✓ rows, so the "Continuing with:" list and the
+ * checklist read the same.
+ */
+function labelsOfSignals(signals: readonly CaptureSignal[]): readonly string[] {
+  const labels = new Set<string>(signals.map((signal) => CAPTURE_SIGNAL_LABELS[signal]));
+
   return INSTRUMENTATION_ROW_ORDER.filter((label) => labels.has(label));
+}
+
+/**
+ * Rewrites a gap's reason or hint as readiness-row text: every C0, DEL and C1
+ * control character becomes a space — the readiness schema refuses all three,
+ * where {@link toDisplayLine} only rewrites the first two — whitespace runs
+ * collapse, the ends are trimmed and the text is clipped to `maxLength`.
+ *
+ * @param text The gap's text; anything but a string yields nothing.
+ * @param maxLength The schema's bound for the field.
+ * @returns The single-line text, or `undefined` when nothing printable remains,
+ * so the row omits the key instead of carrying a blank the schema refuses.
+ */
+function toReadinessText(text: unknown, maxLength: number): string | undefined {
+  if (typeof text !== 'string') {
+    return undefined;
+  }
+
+  let spaced = '';
+
+  for (const character of text) {
+    const code = character.codePointAt(0) ?? 0;
+    spaced += code < 0x20 || (code >= 0x7f && code <= 0x9f) ? ' ' : character;
+  }
+
+  const line = clip(spaced.replace(WHITESPACE_RUN_PATTERN, ' ').trim(), maxLength);
+
+  return line.length === 0 ? undefined : line;
+}
+
+/** The first gap naming `signal`, searching `sources` in the order given. */
+function gapFor(
+  signal: CaptureSignal,
+  sources: readonly (readonly UnavailableSignal[])[],
+): UnavailableSignal | undefined {
+  for (const source of sources) {
+    const gap = source.find((entry) => entry.signal === signal);
+
+    if (gap !== undefined) {
+      return gap;
+    }
+  }
+
+  return undefined;
+}
+
+/** One aggregate readiness row, carrying the gap's reason and hint when it has any. */
+function readinessRow(
+  signal: CaptureSignal,
+  status: ReadinessStatus,
+  gap: UnavailableSignal | undefined,
+): ReadinessSignal {
+  const reason = toReadinessText(gap?.reason, READINESS_REASON_MAX_LENGTH);
+  const hint = toReadinessText(gap?.hint, READINESS_HINT_MAX_LENGTH);
+
+  return {
+    signal,
+    status,
+    ...(reason === undefined ? {} : { reason }),
+    ...(hint === undefined ? {} : { hint }),
+  };
+}
+
+/**
+ * The aggregate readiness report the checklist is drawn from: one row per
+ * signal the plan needs, in the verdict's order.
+ *
+ * | Planned signal | Status | Reason and hint |
+ * | --- | --- | --- |
+ * | confirmed, no verdict gap | `available` | — |
+ * | confirmed, with a degraded gap in the verdict | `degraded` | the gap's |
+ * | not confirmed | `unavailable` | the verdict's blocking gap, else its degraded gap, else the installer's entry |
+ *
+ * The progress module turns an `unavailable` row into a ✗ row — "Could not
+ * enable ‹signal›: ‹reason›." with the hint (for a missing preload, the exact
+ * relaunch command) as its detail — unless the installer already reported that
+ * signal, and a `degraded` row into a ✓ row that explains itself.
+ *
+ * Built with `buildReadiness` and no adapter id, because the service's
+ * aggregate belongs to no single adapter. Every text is single-line, clipped
+ * to `READINESS_REASON_MAX_LENGTH` / `READINESS_HINT_MAX_LENGTH` and omitted
+ * when blank, so every row satisfies `readinessSignalSchema`.
+ *
+ * Pure apart from reading `now` once.
+ *
+ * @param verdict The readiness verdict of the installed plan version.
+ * @param confirmed The signals {@link confirmedSignals} kept.
+ * @param unavailable The installer's unavailable signals.
+ * @param now The clock `checkedAt` is read from.
+ * @returns The report.
+ */
+function buildConfirmedReadiness(
+  verdict: Pick<ReadinessVerdict, 'plannedSignals' | 'blocking' | 'degraded'>,
+  confirmed: readonly CaptureSignal[],
+  unavailable: readonly UnavailableSignal[],
+  now: () => number,
+): Readiness {
+  const kept = new Set<CaptureSignal>(confirmed);
+  const signals = verdict.plannedSignals.map((signal) => {
+    if (kept.has(signal)) {
+      const gap = gapFor(signal, [verdict.degraded]);
+      return readinessRow(signal, gap === undefined ? AVAILABLE_STATUS : DEGRADED_STATUS, gap);
+    }
+
+    return readinessRow(
+      signal,
+      UNAVAILABLE_STATUS,
+      gapFor(signal, [verdict.blocking, verdict.degraded, unavailable]),
+    );
+  });
+
+  return buildReadiness({ signals, now });
 }
 
 /**
@@ -767,12 +1254,45 @@ function unionServerSignals(
   return merged;
 }
 
+/** Whether one preload signal is enabled: a flag that is on, or a non-empty name list. */
+function isServerSignalEnabled(
+  signals: ServerAgentSignals,
+  key: keyof ServerAgentSignals,
+): boolean {
+  const value = signals[key];
+  return value === true || (Array.isArray(value) && value.length > 0);
+}
+
 /** Whether a preload signal set collects anything at all. */
 function collectsServerSignals(signals: ServerAgentSignals): boolean {
-  return SERVER_AGENT_SIGNAL_KEYS.some((key) => {
-    const value = signals[key];
-    return value === true || (Array.isArray(value) && value.length > 0);
-  });
+  return SERVER_AGENT_SIGNAL_KEYS.some((key) => isServerSignalEnabled(signals, key));
+}
+
+/** Whether a page-agent configuration enables any hook, so a capture needs the page agent. */
+function enablesAnyPageHook(hooks: AgentHookConfig): boolean {
+  return AGENT_HOOK_KEYS.some((key) => hooks[key]);
+}
+
+/** Whether the page agent collects `signal` itself under `hooks`. */
+function pageCollects(hooks: AgentHookConfig, signal: string): boolean {
+  return AGENT_HOOK_KEYS.some((key) => key === signal && hooks[key]);
+}
+
+/**
+ * The gaps of a capture whose preload could not be reached: one entry per
+ * enabled server signal, in the upstream key order, each with the same reason
+ * and next step. Pure.
+ */
+function preloadGaps(signals: ServerAgentSignals): readonly UnavailableSignal[] {
+  return Object.freeze(
+    SERVER_AGENT_SIGNAL_KEYS.filter((key) => isServerSignalEnabled(signals, key)).map((key) =>
+      Object.freeze({
+        signal: key,
+        reason: PRELOAD_UNREACHABLE_REASON,
+        hint: PRELOAD_UNREACHABLE_HINT,
+      }),
+    ),
+  );
 }
 
 /** Appends the entries of `extra` not already in `base`, keeping first occurrences. */
@@ -857,26 +1377,115 @@ function withPlanVersions(
 }
 
 /**
- * Projects an install error onto `instrumentation.failed`'s error shape:
- * `DebuggenError.toPayload()`'s code and message, and its hint — which protocol
- * requires on this message — or {@link DEFAULT_INSTALL_FAILURE_HINT} when the
- * error carried none. Both texts are made single-line and bounded.
+ * Projects an install error onto `instrumentation.failed`'s error shape — the
+ * frame both user interfaces display, so its text must be the product's, never
+ * the failure's own (CWE-209):
+ *
+ * - **message** — the fixed public copy of the `instrument` stage failing with
+ *   the error's code (`publicFailureCopy`), then `(ref: ‹ref›)`. Never the
+ *   error's message: `DebuggenError.from` keeps whatever an adapter or a
+ *   dependency threw, and the installer quotes an adapter's failure text, so
+ *   that message can name a path, a statement or a URL.
+ * - **hint** — which protocol requires on this frame — the error's own hint
+ *   only when it is proven product text (`isProductAuthoredText`): the exact
+ *   dev-server relaunch command `../dev-server/detect.ts` composed (see
+ *   {@link withServiceRelaunchHint}), or any other recovery step a product
+ *   builder registered. Otherwise the code's default next step: an installer
+ *   error's hint can be an adapter's own text — its failure's hint, or the
+ *   hint of the gap it reported — which may quote a path, a statement or a URL.
+ *   A proven hint is registered again in its display form, so the failed row
+ *   built from this frame proves it too.
+ * - **ref** — the diagnostic reference, which the failure's local `warn` and
+ *   `debug` records also carry, so a developer can match the frame to the log.
+ *
+ * Both texts are single-line and within protocol's bounds; the reference is
+ * never the part a bound cuts.
+ *
+ * @param error The install error.
+ * @param ref A fresh diagnostic reference (`newMessageId()`).
+ * @returns The frame's error.
  */
-function toFailedError(error: DebuggenError): InstrumentationFailedPayload['error'] {
+function toFailedError(error: DebuggenError, ref: string): InstrumentationFailedPayload['error'] {
   const wire = error.toPayload();
-  const message = clip(toDisplayLine(wire.message), MAX_FAILURE_MESSAGE_LENGTH);
-  const hint = clip(toDisplayLine(wire.hint ?? ''), MAX_FAILURE_HINT_LENGTH);
+  const copy = publicFailureCopy(INSTRUMENT_STAGE, wire.code);
+  const suffix = ` (ref: ${ref})`;
+  const summary = clip(copy.message, MAX_FAILURE_MESSAGE_LENGTH - suffix.length);
+  const statedHint = isProductAuthoredText(wire.hint)
+    ? clip(toDisplayLine(wire.hint), MAX_FAILURE_HINT_LENGTH)
+    : '';
 
   return {
     code: wire.code,
-    message: message.length === 0 ? FALLBACK_FAILURE_MESSAGE : message,
-    hint: hint.length === 0 ? DEFAULT_INSTALL_FAILURE_HINT : hint,
+    message: `${summary}${suffix}`,
+    hint:
+      statedHint.length === 0
+        ? clip(copy.hint, MAX_FAILURE_HINT_LENGTH)
+        : authorProductText(statedHint),
+    ref,
   };
 }
 
-/** The name of a thrown value, for a log record that must not carry its message. */
-function thrownName(thrown: unknown): string {
-  return thrown instanceof Error ? thrown.name : typeof thrown;
+/**
+ * Re-issues an installer error with the relaunch hint this service's own
+ * dev-server detection composed, when that is the recovery the developer needs
+ * and the error's own hint is not proven product text (AAP §0.5.5: if the dev
+ * server was not started with the preload, the hint carries the exact relaunch
+ * command).
+ *
+ * The installer's "nothing could be enabled" failure (`INSTRUMENTATION_UNAVAILABLE`)
+ * names its most actionable blocked signal in `details.blockedSignal` and
+ * carries that gap's hint, which for a preload-dependent signal is the
+ * adapter's own relaunch text — never registered, so {@link toFailedError}
+ * would replace it with fixed copy and the exact command would be lost. When
+ * the blocked signal depends on the preload and the detection collected for
+ * this install found the preload missing, the detection's `relaunchHint` —
+ * registered by `../dev-server/detect.ts` when it composed it — takes its
+ * place. The code, message and details are kept, and the original error is the
+ * cause, so the local diagnostic still holds what the installer said.
+ *
+ * Returns `error` itself in every other case, including a hint that is
+ * already proven and a detection whose hint this process did not compose.
+ *
+ * @param error The installer's error.
+ * @param devServer The dev-server detection readiness collected, if it ran.
+ * @returns The error to report.
+ */
+function withServiceRelaunchHint(
+  error: DebuggenError,
+  devServer: ReadinessEvidence['devServer'],
+): DebuggenError {
+  const blockedSignal = error.details?.['blockedSignal'];
+
+  if (
+    error.code !== 'INSTRUMENTATION_UNAVAILABLE' ||
+    isProductAuthoredText(error.hint) ||
+    devServer === undefined ||
+    devServer.preloadAttached ||
+    !isProductAuthoredText(devServer.relaunchHint) ||
+    !PRELOAD_DEPENDENT_SIGNALS.some((signal) => signal === blockedSignal)
+  ) {
+    return error;
+  }
+
+  return new DebuggenError(error.code, error.message, {
+    hint: devServer.relaunchHint,
+    ...(error.details === undefined ? {} : { details: error.details }),
+    cause: error,
+  });
+}
+
+/**
+ * The log fields of a caught value: its label in the closed exception
+ * taxonomy, its closed-vocabulary code when it carries one, and the value
+ * itself under {@link LOG_ERROR_FIELD_KEY}, where the service logger's error
+ * serializer — not this module — decides what of it a record may hold.
+ *
+ * Never the value's own `name`, `message` or `String(…)`: an exception this
+ * service did not author can carry a path, a statement or a credential in
+ * any of them (CWE-532), and `describeException` maps rather than copies.
+ */
+function exceptionFields(thrown: unknown): LogFields {
+  return { ...describeException(thrown), [LOG_ERROR_FIELD_KEY]: thrown };
 }
 
 // ---------------------------------------------------------------------------
@@ -916,11 +1525,69 @@ interface SessionState {
   readonly armedCaptureId?: string | undefined;
 }
 
-/** A collaborator that threw while this module was using it. Names only. */
-interface CollaboratorFailure {
+/**
+ * What this process knows about the two producers of one session, from the
+ * delivery receipts of the configurations it sent. Kept apart from
+ * {@link SessionState} because it describes live processes outside this one —
+ * a page agent and a preload stay armed whether or not this service still holds
+ * the session's plan — so it outlives `stopSession`. Replaced, never mutated.
+ */
+interface ProducerLedger {
+  /** The session's normalised project root. */
+  readonly projectRoot: string;
+  /**
+   * The capture whose armed `agent.config` the bound tab's connection took, not
+   * since followed by a delivered dormant one.
+   */
+  readonly pageArmedCaptureId?: string | undefined;
+  /**
+   * The capture whose armed `server-agent.config` a preload connection took,
+   * not since followed by a delivered capture-less one or superseded by another
+   * session's capture.
+   */
+  readonly serverArmedCaptureId?: string | undefined;
+  /**
+   * The capture whose armed `server-agent.config` no preload has taken yet;
+   * replayed when the project's preload connects.
+   */
+  readonly serverAwaitingCaptureId?: string | undefined;
+  /** The capture whose unreachable-preload degradation rows were emitted, so they are emitted once. */
+  readonly degradedCaptureId?: string | undefined;
+  /** The capture whose dormant `agent.config` this process delivered last. */
+  readonly dormantCaptureId?: string | undefined;
+}
+
+/**
+ * The disarms of one session that no producer connection has taken yet. Kept
+ * apart from {@link SessionState} so it survives `stopSession` — cleanup
+ * releases the session right after disarming it — and cleared only by a
+ * delivery, a supersession or `dispose`.
+ */
+interface PendingDisarm {
+  /** The session's normalised project root, which the preload replay is keyed by. */
+  readonly projectRoot: string;
+  /** The capture the outstanding dormant `agent.config` names, when the page is owed one. */
+  readonly pageCaptureId?: string | undefined;
+  /** Whether the preload is owed its capture-less configuration. */
+  readonly server: boolean;
+}
+
+/** How one producer configuration fared, with the channel's code when it was refused. */
+interface DeliveryAttempt {
+  readonly delivered: boolean;
+  /** The refusing channel's error code, or the thrown error's; set only when not delivered. */
+  readonly code?: string | undefined;
+}
+
+/**
+ * A collaborator that failed while this module was using it: the
+ * collaborator and step this module names, and the failure's closed
+ * {@link ExceptionDescription} — never text read off the thrown value, since
+ * the list travels in the details of the error an install returns.
+ */
+interface CollaboratorFailure extends ExceptionDescription {
   readonly collaborator: string;
   readonly step: string;
-  readonly errorName: string;
 }
 
 /** What a follow-up's delta resolved to. */
@@ -968,28 +1635,33 @@ const EMPTY_READY: ReadyFields = Object.freeze({
  *
  * Constructs the default adapter registry once (when none is injected) and
  * nothing else: no timer, no watcher, no I/O until a method is called. All state
- * — per-session arming, the watched-session set, the in-flight set and the
- * reload-prompt ledger — lives in this closure.
+ * — per-session arming, the producer ledger, the pending disarms and their
+ * listeners, the watched-session set, the in-flight set and the reload-prompt
+ * ledger — lives in this closure.
  *
  * @param deps The injected collaborators.
- * @returns The service.
+ * @returns The driver: the service surface and its producer reconciler.
  *
  * @example
  * ```ts
  * const instrumentation = createInstrumentationService({
  *   config, logger, modifications, progress, broadcaster: clients,
- *   serverAgentChannel: clients, watcher, agents, serverAgents, captures: manager,
+ *   agentChannel: clients, serverAgentChannel: clients, watcher, agents,
+ *   serverAgents, captures: manager,
  * });
  *
  * const installed = await instrumentation.install({ sessionId, projectRoot, plan, code, boundTab });
  * if (installed.ok && installed.value.readiness.satisfied) {
  *   await manager.transitionTo(sessionId, 'ready', { readinessSatisfied: true });
  * }
+ *
+ * // When a producer registers, replay what it is owed.
+ * instrumentation.producerConnected({ kind: 'server-agent', projectRoot });
  * ```
  */
 export function createInstrumentationService(
   deps: InstrumentationServiceDeps,
-): InstrumentationService {
+): InstrumentationDriver {
   const clock = deps.now ?? nowEpochMs;
   const serviceLog = deps.logger.child({ [LOG_BINDING_KEYS.subsystem]: LOG_SUBSYSTEM });
   const adapters = deps.adapters ?? createAdapterRegistry({ logger: serviceLog });
@@ -999,7 +1671,31 @@ export function createInstrumentationService(
   const watched = new Set<string>();
   const inFlight = new Set<string>();
   const reloadPrompts = new Set<string>();
+  /** Per session: what the producers were delivered; outlives `stopSession`. */
+  const ledgers = new Map<string, ProducerLedger>();
+  /** Per session: the disarms no producer connection has taken yet; outlives `stopSession`. */
+  const pending = new Map<string, PendingDisarm>();
+  const dormancyListeners = new Set<(sessionId: string) => void>();
   let disposed = false;
+
+  /**
+   * When this service came into being. A producer credential issued, or a
+   * capture opened, before it belongs to an earlier process, whose arming this
+   * one never saw; anything issued or opened since is answered by this
+   * service's own ledger and pending disarms.
+   */
+  const createdAt = clock();
+
+  /**
+   * When each project's preloads were last sent an armed configuration that a
+   * connection took, by project root. A project may have several preloads, and
+   * a delivery receipt counts the fan-out as a whole: one that was offline when
+   * a later capture-less configuration reached the others may still hold that
+   * arming. So a preload whose credential existed by then is disabled when it
+   * connects, whatever the pending disarms say. Kept until `dispose`; one entry
+   * per project ever armed.
+   */
+  const serverArmedAt = new Map<string, number>();
 
   /** The logger of one session's work: `subsystem` and `sessionId` bound in one call. */
   function sessionLog(sessionId: string): Logger {
@@ -1020,9 +1716,12 @@ export function createInstrumentationService(
     try {
       return call();
     } catch (thrown) {
-      const errorName = thrownName(thrown);
-      failures.push({ collaborator, step, errorName });
-      log.error('An instrumentation collaborator threw', { collaborator, step, errorName });
+      failures.push({ collaborator, step, ...describeException(thrown) });
+      log.error('An instrumentation collaborator threw', {
+        collaborator,
+        step,
+        ...exceptionFields(thrown),
+      });
       return undefined;
     }
   }
@@ -1038,9 +1737,12 @@ export function createInstrumentationService(
     try {
       return await call();
     } catch (thrown) {
-      const errorName = thrownName(thrown);
-      failures.push({ collaborator, step, errorName });
-      log.error('An instrumentation collaborator rejected', { collaborator, step, errorName });
+      failures.push({ collaborator, step, ...describeException(thrown) });
+      log.error('An instrumentation collaborator rejected', {
+        collaborator,
+        step,
+        ...exceptionFields(thrown),
+      });
       return undefined;
     }
   }
@@ -1069,29 +1771,253 @@ export function createInstrumentationService(
     });
   }
 
-  /** Delivers one `server-agent.config` frame to the project's preload connections. */
-  function deliverToServerAgent(
+  /**
+   * Delivers one `server-agent.config` frame to the project's preload
+   * connections, judged by the registry's receipt. A throw counts as not
+   * delivered and is logged by name only.
+   */
+  function deliverServerConfig(
     log: Logger,
     projectRoot: string,
     payload: ServerAgentConfigPayload,
-  ): ServerAgentDelivery {
+  ): DeliveryAttempt {
     try {
       const message = createEnvelope('server-agent.config', payload, { ts: clock() });
       const sent = deps.serverAgentChannel.sendToServerAgent(projectRoot, message);
 
       if (isErr(sent)) {
         log.info('No dev-server preload received the configuration', { code: sent.error.code });
-        return 'unreachable';
+        return { delivered: false, code: sent.error.code };
       }
 
-      return 'delivered';
+      return { delivered: true };
     } catch (thrown) {
-      log.error('Delivering the preload configuration threw', { errorName: thrownName(thrown) });
-      return 'unreachable';
+      log.error('Delivering the preload configuration threw', exceptionFields(thrown));
+      return { delivered: false, code: DebuggenError.from(thrown, 'TRANSPORT_DISCONNECTED').code };
     }
   }
 
-  /** The read-only view of one session's state. */
+  /**
+   * Delivers one `agent.config` frame to the connection carrying the session's
+   * bound tab, judged by the registry's receipt. A throw counts as not
+   * delivered and is logged by name only.
+   */
+  function deliverPageConfig(
+    log: Logger,
+    sessionId: string,
+    payload: AgentConfigPayload,
+  ): DeliveryAttempt {
+    try {
+      const message = createEnvelope('agent.config', payload, { ts: clock() });
+      const sent = deps.agentChannel.sendToBoundTab(sessionId, message);
+
+      if (isErr(sent)) {
+        log.info('No bound-tab connection received the page-agent configuration', {
+          code: sent.error.code,
+        });
+        return { delivered: false, code: sent.error.code };
+      }
+
+      return { delivered: true };
+    } catch (thrown) {
+      log.error('Delivering the page-agent configuration threw', exceptionFields(thrown));
+      return { delivered: false, code: DebuggenError.from(thrown, 'TRANSPORT_DISCONNECTED').code };
+    }
+  }
+
+  /**
+   * Builds and delivers the dormant `agent.config` of one capture — every hook
+   * false, which detaches the page agent's hooks (AAP §0.5.1). A payload the
+   * schema refuses is logged and counts as not delivered.
+   */
+  function deliverDormantPageConfig(
+    log: Logger,
+    sessionId: string,
+    captureId: string,
+  ): DeliveryAttempt {
+    const dormant = parseAgentConfigPayload({
+      sessionId,
+      captureId,
+      hooks: DORMANT_AGENT_HOOK_CONFIG,
+    });
+
+    if (isErr(dormant)) {
+      log.error('The dormant page-agent configuration was rejected and not sent', {
+        code: dormant.error.code,
+      });
+      return { delivered: false, code: dormant.error.code };
+    }
+
+    return deliverPageConfig(log, sessionId, dormant.value);
+  }
+
+  /**
+   * Builds and delivers the capture-less `server-agent.config` — the disabled
+   * signal set with no capture id, which makes the preload disable its
+   * instrumentations (AAP §0.5.1). A payload the schema refuses is logged and
+   * counts as not delivered.
+   */
+  function deliverDisabledServerConfig(log: Logger, projectRoot: string): DeliveryAttempt {
+    const disabled = parseServerAgentConfigPayload({ signals: DISABLED_SERVER_AGENT_SIGNALS });
+
+    if (isErr(disabled)) {
+      log.error('The capture-less preload configuration was rejected and not sent', {
+        code: disabled.error.code,
+      });
+      return { delivered: false, code: disabled.error.code };
+    }
+
+    return deliverServerConfig(log, projectRoot, disabled.value);
+  }
+
+  // -------------------------------------------------------------------------
+  // Producer bookkeeping — the ledger and the pending disarms
+  // -------------------------------------------------------------------------
+
+  /** One session's producer ledger, or an empty one rooted at `projectRoot`. */
+  function ledgerOf(sessionId: string, projectRoot: string): ProducerLedger {
+    return ledgers.get(sessionId) ?? { projectRoot };
+  }
+
+  /** Replaces one session's producer ledger; nothing is recorded after `dispose`. */
+  function writeLedger(sessionId: string, next: ProducerLedger): void {
+    if (!disposed) {
+      ledgers.set(sessionId, next);
+    }
+  }
+
+  /** The producers a pending entry names, in the stable order: page agent, then preload. */
+  function producersOf(entry: PendingDisarm | undefined): readonly ArmedProducer[] {
+    if (entry === undefined) {
+      return Object.freeze([]);
+    }
+
+    const producers: ArmedProducer[] = [];
+
+    if (entry.pageCaptureId !== undefined) {
+      producers.push(PAGE_AGENT_PRODUCER);
+    }
+
+    if (entry.server) {
+      producers.push(SERVER_AGENT_PRODUCER);
+    }
+
+    return Object.freeze(producers);
+  }
+
+  /** Tells every dormancy listener that a session's outstanding disarms are all settled. */
+  function notifyDormancy(sessionId: string): void {
+    for (const listener of [...dormancyListeners]) {
+      try {
+        listener(sessionId);
+      } catch (thrown) {
+        sessionLog(sessionId).error('A dormancy listener threw', exceptionFields(thrown));
+      }
+    }
+  }
+
+  /**
+   * Replaces one session's pending disarms — dropping the entry once it names
+   * no producer — and notifies the dormancy listeners when that empties a set
+   * that was not empty. Nothing is recorded after `dispose`.
+   */
+  function writePending(sessionId: string, next: PendingDisarm | undefined): void {
+    if (disposed) {
+      return;
+    }
+
+    const wasPending = producersOf(pending.get(sessionId)).length > 0;
+    const isPending = producersOf(next).length > 0;
+
+    if (next === undefined || !isPending) {
+      pending.delete(sessionId);
+    } else {
+      pending.set(sessionId, next);
+    }
+
+    if (wasPending && !isPending) {
+      sessionLog(sessionId).info('Every producer of the session is known to be dormant');
+      notifyDormancy(sessionId);
+    }
+  }
+
+  /**
+   * Settles a session's outstanding page disarm: its dormant configuration was
+   * delivered, or a later armed configuration superseded it.
+   *
+   * @returns Whether a page disarm was outstanding.
+   */
+  function settlePendingPage(sessionId: string): boolean {
+    const entry = pending.get(sessionId);
+
+    if (entry?.pageCaptureId === undefined) {
+      return false;
+    }
+
+    writePending(sessionId, { ...entry, pageCaptureId: undefined });
+    return true;
+  }
+
+  /**
+   * Records a preload configuration the project's preloads took. A capture-less
+   * one (no `armedFor`) disables the preload outright, so no session of the
+   * project has it armed any more; an armed one makes the preload follow that
+   * capture alone, so every other session's arm is superseded. Either way,
+   * every outstanding preload disarm of the project is settled.
+   *
+   * @returns The sessions whose outstanding preload disarm was settled.
+   */
+  function settleServerForProject(
+    projectRoot: string,
+    armedFor: { readonly sessionId: string; readonly captureId: string } | undefined,
+  ): readonly string[] {
+    if (armedFor !== undefined && !ledgers.has(armedFor.sessionId)) {
+      writeLedger(armedFor.sessionId, { projectRoot });
+    }
+
+    for (const [sessionId, ledger] of [...ledgers]) {
+      if (ledger.projectRoot !== projectRoot) {
+        continue;
+      }
+
+      if (armedFor?.sessionId === sessionId) {
+        writeLedger(sessionId, {
+          ...ledger,
+          serverArmedCaptureId: armedFor.captureId,
+          serverAwaitingCaptureId: undefined,
+        });
+      } else if (
+        ledger.serverArmedCaptureId !== undefined ||
+        ledger.serverAwaitingCaptureId !== undefined
+      ) {
+        writeLedger(sessionId, {
+          ...ledger,
+          serverArmedCaptureId: undefined,
+          serverAwaitingCaptureId: undefined,
+        });
+      }
+    }
+
+    const settled: string[] = [];
+
+    for (const [sessionId, entry] of [...pending]) {
+      if (entry.projectRoot === projectRoot && entry.server) {
+        settled.push(sessionId);
+        writePending(sessionId, { ...entry, server: false });
+      }
+    }
+
+    return Object.freeze(settled);
+  }
+
+  /**
+   * The read-only view of one session's state. Its `agentHooks` are the hooks
+   * {@link armCapture} sends for the active version ({@link armedPageHooks}),
+   * not the install-time configuration alone: a page hook the install could not
+   * arm because no page agent had reported yet is armed by every capture of
+   * that version, and a reader judging a capture by what it armed (the capture
+   * stage's interaction-hook diagnostic) must see it.
+   */
   function snapshotOf(state: SessionState): ArmingSnapshot {
     const config = state.configs.get(state.activePlanVersion);
 
@@ -1099,7 +2025,7 @@ export function createInstrumentationService(
       sessionId: state.sessionId,
       projectRoot: state.projectRoot,
       activePlanVersion: state.activePlanVersion,
-      agentHooks: config?.agentHooks ?? DORMANT_AGENT_HOOK_CONFIG,
+      agentHooks: config === undefined ? DORMANT_AGENT_HOOK_CONFIG : armedPageHooks(state, config),
       serverSignals: config?.serverSignals ?? DISABLED_SERVER_AGENT_SIGNALS,
       ...(state.armedCaptureId === undefined ? {} : { armedCaptureId: state.armedCaptureId }),
     };
@@ -1169,7 +2095,10 @@ export function createInstrumentationService(
       });
     } catch (thrown) {
       const error = DebuggenError.from(thrown, 'INTERNAL');
-      logger.error('The session backup store could not be opened', { code: error.code });
+      logger.error('The session backup store could not be opened', {
+        code: error.code,
+        ...exceptionFields(thrown),
+      });
       return err(error);
     }
 
@@ -1390,7 +2319,7 @@ export function createInstrumentationService(
     });
 
     if (isErr(installed)) {
-      return installed;
+      return err(withServiceRelaunchHint(installed.error, evidence.value.devServer));
     }
 
     return ok({
@@ -1463,7 +2392,7 @@ export function createInstrumentationService(
       failures.push({
         collaborator: 'protocol',
         step: 'instrumentation.plan',
-        errorName: payload.error.code,
+        ...describeException(payload.error),
       });
       log.error('The plan announcement was rejected and not sent', { code: payload.error.code });
       return;
@@ -1575,10 +2504,32 @@ export function createInstrumentationService(
   }
 
   /**
-   * The success branch: records the session's state, broadcasts
-   * `instrumentation.ready` with the installer's three fields as they are,
-   * reports degradation and the checklist from what was actually armed, and
-   * evaluates readiness.
+   * The success branch, in the order the progress view must read (AAP §0.5.5,
+   * prompt §11 Step 8):
+   *
+   * 1. Records the session's state and broadcasts `instrumentation.ready` with
+   *    the installer's three fields as they are.
+   * 2. Evaluates readiness **first**, with `announceReady: false`, so "Ready to
+   *    capture" cannot precede the rows it closes. A reload request the gate
+   *    emits is the only row that may come before the checklist.
+   * 3. Confirms the checklist: a signal is enabled only when the capture arms
+   *    it ({@link captureAgentHooks}, {@link armedCaptureSignals}) and the
+   *    verdict found it deliverable without blocking on it, minus the
+   *    installer's unavailable signals ({@link confirmedSignals}).
+   * 4. Emits one degradation row per unavailable signal, naming only the
+   *    confirmed signals after "Continuing with:".
+   * 5. Reports the checklist as the confirmed signals, the installer's
+   *    unavailable entries and an aggregate readiness report
+   *    ({@link buildConfirmedReadiness}) — never as the requested hook
+   *    configuration, signal set or runtime hooks, whose label rule would
+   *    re-add a ✓ for a signal readiness withdrew (a `Database tracing`
+   *    runtime hook with no connected preload).
+   * 6. Emits "Ready to capture" once, last, and only for a satisfied verdict.
+   *
+   * When readiness cannot be evaluated — a collaborator threw, or it answered
+   * `Err` — nothing is presented as enabled: the degradation rows name no
+   * signal, the checklist carries only the installer's ✗ rows, no ready row is
+   * emitted, and the error is returned.
    */
   async function completeInstall(
     failures: CollaboratorFailure[],
@@ -1653,7 +2604,7 @@ export function createInstrumentationService(
       failures.push({
         collaborator: 'protocol',
         step: 'instrumentation.ready',
-        errorName: readyPayload.error.code,
+        ...describeException(readyPayload.error),
       });
       log.error('The installer result was rejected by the ready schema and not sent', {
         code: readyPayload.error.code,
@@ -1665,31 +2616,9 @@ export function createInstrumentationService(
       );
     }
 
-    const enabledLabels = enabledSignalLabels(
-      config.agentHooks,
-      config.serverSignals,
-      runtimeHooks,
-      ready.unavailable,
-    );
-    const degradations = buildDegradationNotice(ready.unavailable, enabledLabels);
-
-    emitDegradations(failures, log, sessionId, ready.unavailable, enabledLabels);
-
-    const installed: InstalledSignals = {
-      hooks: config.agentHooks,
-      serverSignals: config.serverSignals,
-      runtimeHooks,
-      unavailable: ready.unavailable,
-    };
-
-    noteProgress(
-      log,
-      'reportInstrumentation',
-      attempt(failures, log, 'progress', 'reportInstrumentation', () =>
-        deps.progress.reportInstrumentation(sessionId, installed),
-      ),
-    );
-
+    // Readiness is judged before a single checklist row is sent, and told not
+    // to announce "Ready to capture" itself: that row closes the group below,
+    // after the rows it summarises.
     const verdict = await attemptAsync(failures, log, 'readiness', 'evaluateReadiness', () =>
       evaluateReadiness(
         {
@@ -1708,21 +2637,63 @@ export function createInstrumentationService(
           devServer: prepared.evidence.devServer,
           allowReloadPrompt: request.allowReloadPrompt,
           requireServerAgent: request.requireServerAgent,
+          announceReady: false,
           signal: request.signal,
         },
       ),
     );
 
-    if (verdict === undefined) {
-      return err(collaboratorError(failures, planVersion, ready.applied.length));
-    }
+    const reportChecklist = (installed: InstalledSignals): void => {
+      noteProgress(
+        log,
+        'reportInstrumentation',
+        attempt(failures, log, 'progress', 'reportInstrumentation', () =>
+          deps.progress.reportInstrumentation(sessionId, installed),
+        ),
+      );
+    };
 
-    if (isErr(verdict)) {
+    if (verdict === undefined || isErr(verdict)) {
+      // Without a verdict nothing is confirmed, so nothing is shown as
+      // enabled: the installer's gaps are still reported, as ✗ rows only.
+      emitDegradations(failures, log, sessionId, ready.unavailable, []);
+      reportChecklist({ unavailable: ready.unavailable });
+
+      if (verdict === undefined) {
+        return err(collaboratorError(failures, planVersion, ready.applied.length));
+      }
+
       log.error('Readiness could not be evaluated for the installed plan', {
         code: verdict.error.code,
         planVersion,
       });
       return err(withPlanVersions(verdict.error, { planVersion, activePlanVersion: planVersion }));
+    }
+
+    const armed = armedCaptureSignals(
+      captureAgentHooks(config.agentHooks, plan.instrumentationTargets),
+      config.serverSignals,
+      runtimeHooks,
+    );
+    const confirmed = confirmedSignals(verdict.value, armed, ready.unavailable);
+    const enabledLabels = labelsOfSignals(confirmed);
+    const degradations = buildDegradationNotice(ready.unavailable, enabledLabels);
+
+    emitDegradations(failures, log, sessionId, ready.unavailable, enabledLabels);
+    reportChecklist({
+      signals: confirmed,
+      unavailable: ready.unavailable,
+      readiness: buildConfirmedReadiness(verdict.value, confirmed, ready.unavailable, clock),
+    });
+
+    if (verdict.value.satisfied) {
+      noteProgress(
+        log,
+        'readyToCapture',
+        attempt(failures, log, 'progress', 'readyToCapture', () =>
+          deps.progress.readyToCapture(sessionId),
+        ),
+      );
     }
 
     if (failures.length > 0) {
@@ -1735,6 +2706,7 @@ export function createInstrumentationService(
       applied: ready.applied.length,
       runtimeHooks: ready.runtimeHooks.length,
       unavailableSignals: ready.unavailable.map((entry) => entry.signal),
+      confirmedSignals: confirmed,
       satisfied: verdict.value.satisfied,
     });
 
@@ -1753,11 +2725,23 @@ export function createInstrumentationService(
   }
 
   /**
-   * The failure branch: `instrumentation.failed` with the installer's error —
-   * never `instrumentation.ready` — the instrument stage's `failed` row, and the
+   * The failure branch: `instrumentation.failed` with the public projection of
+   * the installer's error (see {@link toFailedError}) — never
+   * `instrumentation.ready` — the instrument stage's `failed` row, and the
    * error returned with the plan version the session is left at. A failed delta
    * leaves the previous version active; the installer has already unwound what
    * the call applied.
+   *
+   * Both user-facing texts come from {@link toFailedError}: the fixed copy of
+   * the code, and a hint only when it is proven product text, so the failed
+   * row's `SessionFailure` carries nothing the installer copied from an
+   * adapter or an exception.
+   *
+   * The error itself is kept for the local log only, under
+   * {@link LOG_ERROR_FIELD_KEY} and the diagnostic reference the frame shows:
+   * a `warn` record, written at the default levels, where the serializer emits
+   * the closed error shape; and its `debug` twin with the same reference and
+   * error, where the serializer adds the redacted message, hint and stack.
    */
   function failInstall(
     failures: CollaboratorFailure[],
@@ -1770,7 +2754,8 @@ export function createInstrumentationService(
     const { sessionId, plan } = checked;
     const planVersion = plan.planVersion;
     const activePlanVersion = request.previousPlanVersion ?? prior?.activePlanVersion;
-    const failed = toFailedError(error);
+    const ref = newMessageId();
+    const failed = toFailedError(error, ref);
     const payload = parseInstrumentationFailedPayload({ sessionId, error: failed });
 
     if (isErr(payload)) {
@@ -1801,9 +2786,16 @@ export function createInstrumentationService(
 
     log.warn('The instrumentation install failed', {
       code: error.code,
+      ref,
       planVersion,
       activePlanVersion,
       collaboratorFailures: failures.length,
+      [LOG_ERROR_FIELD_KEY]: error,
+    });
+    log.debug('The diagnostic of a failed instrumentation install', {
+      code: error.code,
+      ref,
+      [LOG_ERROR_FIELD_KEY]: error,
     });
 
     return err(withPlanVersions(error, { planVersion, activePlanVersion }));
@@ -1859,7 +2851,7 @@ export function createInstrumentationService(
         const error = DebuggenError.from(thrown, 'INTERNAL');
         log.error('Preparing or running the install threw', {
           code: error.code,
-          errorName: thrownName(thrown),
+          ...exceptionFields(thrown),
         });
         prepared = err(error);
       }
@@ -1915,7 +2907,7 @@ export function createInstrumentationService(
       const error = DebuggenError.from(thrown, 'INTERNAL');
       serviceLog.error('An install ended with an unexpected throw', {
         code: error.code,
-        errorName: thrownName(thrown),
+        ...exceptionFields(thrown),
       });
       return err(error);
     } finally {
@@ -1926,6 +2918,90 @@ export function createInstrumentationService(
   // -------------------------------------------------------------------------
   // Arming — the capture window
   // -------------------------------------------------------------------------
+
+  /**
+   * The page hooks a capture of the session's active plan version arms: the
+   * installer's configuration, widened by the hooks of the plan's runtime
+   * actions. A page-agent hook an adapter could not arm at install time — the
+   * bound tab's agent had not reported yet, the usual order when the editor
+   * creates the session before the panel binds its tab — is armed now. Arming
+   * one edits no file, and a capture is admitted only after its readiness gate
+   * has re-evaluated the bound tab.
+   */
+  function armedPageHooks(state: SessionState, config: ProducerConfig): AgentHookConfig {
+    return unionAgentHooks(
+      config.agentHooks,
+      deriveAgentHookConfig(state.actions.filter((action) => action.mode === RUNTIME_ACTION_MODE)),
+    );
+  }
+
+  /**
+   * The error of an arm whose page frame no bound-tab connection took:
+   * `TAB_NOT_BOUND` when no tab is bound, `TRANSPORT_DISCONNECTED` for every
+   * other refusal, with the channel's own code as `details.reason`.
+   */
+  function pageUnreachableError(
+    log: Logger,
+    sessionId: string,
+    captureId: string,
+    channelCode: string | undefined,
+  ): DebuggenError {
+    const reason = channelCode ?? 'TRANSPORT_DISCONNECTED';
+    const unbound = reason === 'TAB_NOT_BOUND';
+
+    log.warn('The page agent could not be armed, so the capture was not armed', {
+      [LOG_BINDING_KEYS.captureId]: captureId,
+      reason,
+    });
+
+    return new DebuggenError(
+      unbound ? 'TAB_NOT_BOUND' : 'TRANSPORT_DISCONNECTED',
+      unbound
+        ? 'No Chrome tab is bound to this session, so the page agent could not be armed.'
+        : 'The DevTools connection of the session’s tab did not take the page-agent configuration, so the capture could not be armed.',
+      {
+        hint: PAGE_AGENT_UNREACHABLE_HINT,
+        details: { sessionId, captureId, reason },
+      },
+    );
+  }
+
+  /**
+   * Emits the AAP §0.5.5 rows for the server signals a capture proceeds
+   * without because the preload could not be reached, skipping every signal
+   * the install already reported unavailable. The "Continuing with" list keeps
+   * a signal the page agent still collects (`fetch` is both a page hook and a
+   * preload signal), so it never claims the page's share is gone.
+   */
+  function reportPreloadGaps(
+    log: Logger,
+    sessionId: string,
+    state: SessionState,
+    config: ProducerConfig,
+    agentHooks: AgentHookConfig,
+    gaps: readonly UnavailableSignal[],
+  ): void {
+    const reported = new Set(state.ready.unavailable.map((entry) => entry.signal));
+    const fresh = gaps.filter((gap) => !reported.has(gap.signal));
+
+    if (fresh.length === 0) {
+      return;
+    }
+
+    const withdrawn = [
+      ...state.ready.unavailable,
+      ...fresh.filter((gap) => !pageCollects(agentHooks, gap.signal)),
+    ];
+    // What the capture still proceeds with: the armed signals minus every one
+    // withdrawn, labelled as the progress view's ✓ rows are.
+    const gone = new Set<string>(withdrawn.map((entry) => entry.signal));
+    const armed = armedCaptureSignals(agentHooks, config.serverSignals, state.runtimeHooks);
+    const enabledLabels = labelsOfSignals(
+      CAPTURE_SIGNALS.filter((signal) => armed.has(signal) && !gone.has(signal)),
+    );
+
+    emitDegradations([], log, sessionId, fresh, enabledLabels);
+  }
 
   function restoreArming(input: RestoreArmingInput): Result<ArmingSnapshot, DebuggenError> {
     if (!isNonBlankString(input.sessionId)) {
@@ -2070,33 +3146,45 @@ export function createInstrumentationService(
       );
     }
 
-    // A page-agent hook an adapter could not arm at install time — the bound
-    // tab's agent had not reported yet, the usual order when the editor
-    // creates the session before the panel binds its tab — is armed now from
-    // the plan's runtime actions. Arming one edits no file, and a capture is
-    // admitted only after its readiness gate has re-evaluated the bound tab.
-    const agentHooks = unionAgentHooks(
-      config.agentHooks,
-      deriveAgentHookConfig(state.actions.filter((action) => action.mode === RUNTIME_ACTION_MODE)),
-    );
+    const agentHooks = armedPageHooks(state, config);
+    const pageRequired = enablesAnyPageHook(agentHooks);
+    const serverRequired = collectsServerSignals(config.serverSignals);
 
-    const agentPayload = parseAgentConfigPayload({
-      sessionId,
-      captureId,
-      hooks: agentHooks,
-    });
-
-    if (isErr(agentPayload)) {
-      log.error('The page-agent configuration was rejected and not sent', {
-        code: agentPayload.error.code,
+    if (!pageRequired && !serverRequired) {
+      log.warn('The capture enables no producer signal, so nothing was armed', {
+        [LOG_BINDING_KEYS.captureId]: captureId,
+        planVersion: state.activePlanVersion,
       });
-      return agentPayload;
+      return err(
+        new DebuggenError(
+          'INSTRUMENTATION_UNAVAILABLE',
+          'The session’s plan enables no page hook and no server signal, so a capture would collect nothing.',
+          {
+            hint: 'Plan the instrumentation again so it enables at least one signal, then start the capture.',
+            details: { sessionId, captureId, planVersion: state.activePlanVersion },
+          },
+        ),
+      );
     }
 
-    const collectsServer = collectsServerSignals(config.serverSignals);
+    let agentPayload: AgentConfigPayload | undefined;
+
+    if (pageRequired) {
+      const parsed = parseAgentConfigPayload({ sessionId, captureId, hooks: agentHooks });
+
+      if (isErr(parsed)) {
+        log.error('The page-agent configuration was rejected and not sent', {
+          code: parsed.error.code,
+        });
+        return parsed;
+      }
+
+      agentPayload = parsed.value;
+    }
+
     let serverPayload: ServerAgentConfigPayload | undefined;
 
-    if (collectsServer) {
+    if (serverRequired) {
       const parsed = parseServerAgentConfigPayload({
         sessionId,
         captureId,
@@ -2113,37 +3201,94 @@ export function createInstrumentationService(
       serverPayload = parsed.value;
     }
 
-    try {
-      const armed: AgentConfigPayload = agentPayload.value;
-      deps.broadcaster.broadcastToKinds(
-        sessionId,
-        AGENT_CLIENT_KINDS,
-        createEnvelope('agent.config', armed, { ts: clock() }),
+    // The page first: a capture whose page hooks cannot reach the page agent
+    // is refused before the preload is told anything, so nothing is armed and
+    // the caller can close the window it opened.
+    let pageAgent: PageAgentDelivery = 'not-needed';
+
+    if (agentPayload !== undefined) {
+      const page = deliverPageConfig(log, sessionId, agentPayload);
+
+      if (!page.delivered) {
+        return err(pageUnreachableError(log, sessionId, captureId, page.code));
+      }
+
+      pageAgent = 'delivered';
+    }
+
+    let serverAgent: ServerAgentDelivery = 'not-needed';
+    let serverCode: string | undefined;
+
+    if (serverPayload !== undefined) {
+      const server = deliverServerConfig(log, state.projectRoot, serverPayload);
+      serverAgent = server.delivered ? 'delivered' : 'unreachable';
+      serverCode = server.code;
+    }
+
+    if (serverAgent === 'unreachable' && pageAgent !== 'delivered') {
+      log.warn(
+        'No dev-server preload took the configuration and the plan collects nothing in the page; the capture was not armed',
+        {
+          [LOG_BINDING_KEYS.captureId]: captureId,
+          ...(serverCode === undefined ? {} : { code: serverCode }),
+        },
       );
-    } catch (thrown) {
-      log.error('Sending the page-agent configuration threw', { errorName: thrownName(thrown) });
       return err(
-        new DebuggenError('TRANSPORT_DISCONNECTED', 'The page agent could not be armed.', {
-          hint: 'Reopen the Debug Generator panel for the page, then start the capture again.',
-          details: { sessionId },
-          cause: thrown,
-        }),
+        new DebuggenError(
+          'SERVER_AGENT_NOT_READY',
+          'No dev-server preload is connected for this project, and the plan collects nothing in the page, so the capture could not be armed.',
+          {
+            hint: 'Launch the dev server from Debug Generator so its Node preload connects, then start the capture again.',
+            details: { sessionId, captureId, reason: serverCode ?? 'SERVER_AGENT_NOT_READY' },
+          },
+        ),
       );
     }
 
-    const serverAgent: ServerAgentDelivery =
-      serverPayload === undefined
-        ? 'not-needed'
-        : deliverToServerAgent(log, state.projectRoot, serverPayload);
+    // The page is armed and the preload is not: the capture proceeds with what
+    // it has and says what it lacks (AAP §0.5.5), once per capture however
+    // often the tab re-binds; the preload is armed when it connects.
+    const unavailable: readonly UnavailableSignal[] =
+      serverAgent === 'unreachable' ? preloadGaps(config.serverSignals) : Object.freeze([]);
+    const ledger = ledgerOf(sessionId, state.projectRoot);
+    const reportGaps = unavailable.length > 0 && ledger.degradedCaptureId !== captureId;
+
+    if (reportGaps) {
+      reportPreloadGaps(log, sessionId, state, config, agentHooks, unavailable);
+    }
 
     if (!disposed) {
       sessions.set(sessionId, { ...state, armedCaptureId: captureId });
     }
 
+    writeLedger(sessionId, {
+      ...ledger,
+      projectRoot: state.projectRoot,
+      ...(pageAgent === 'delivered'
+        ? { pageArmedCaptureId: captureId, dormantCaptureId: undefined }
+        : {}),
+      ...(serverAgent === 'unreachable' ? { serverAwaitingCaptureId: captureId } : {}),
+      ...(reportGaps ? { degradedCaptureId: captureId } : {}),
+    });
+
+    if (pageAgent === 'delivered') {
+      // The page now follows this capture, so a dormant frame still owed for an
+      // earlier one is moot.
+      settlePendingPage(sessionId);
+    }
+
+    if (serverAgent === 'delivered') {
+      // The preload serves the whole project and now follows this capture alone.
+      settleServerForProject(state.projectRoot, { sessionId, captureId });
+      recordServerArmed(state.projectRoot);
+    }
+
     log.info('Capture armed', {
       [LOG_BINDING_KEYS.captureId]: captureId,
       planVersion: state.activePlanVersion,
+      pageAgent,
       serverAgent,
+      unavailableSignals: unavailable.map((entry) => entry.signal),
     });
 
     return ok({
@@ -2153,6 +3298,8 @@ export function createInstrumentationService(
       agentHooks,
       serverSignals: config.serverSignals,
       serverAgent,
+      pageAgent,
+      unavailable,
     });
   }
 
@@ -2172,6 +3319,7 @@ export function createInstrumentationService(
     }
 
     const state = sessions.get(sessionId);
+    const known = ledgers.get(sessionId)?.projectRoot ?? pending.get(sessionId)?.projectRoot;
     let projectRoot: string;
 
     if (state !== undefined) {
@@ -2184,6 +3332,10 @@ export function createInstrumentationService(
       }
 
       projectRoot = normalized.value;
+    } else if (known !== undefined) {
+      // The session's plan state was released, but its producers are still
+      // known to this process — which is exactly when a disarm matters.
+      projectRoot = known;
     } else {
       return err(
         new DebuggenError(
@@ -2202,35 +3354,27 @@ export function createInstrumentationService(
       request.captureId !== undefined && isNonBlankString(request.captureId)
         ? request.captureId
         : state?.armedCaptureId;
-    let agentDisarmed = false;
+    const ledger = ledgerOf(sessionId, projectRoot);
+    const owed = pending.get(sessionId);
+
+    // The page agent. Its dormant frame is owed — and so becomes pending when
+    // no bound-tab connection takes it — only if this process delivered an
+    // armed configuration it has not since disarmed, or a disarm is already
+    // owed; a page that was never armed is not waited for.
+    let pageAgent: PageAgentDelivery;
+    let pageOwed = owed?.pageCaptureId;
 
     if (captureId === undefined) {
+      pageAgent = 'not-armed';
       log.info('No capture id is known, so the dormant page-agent configuration was not sent');
+    } else if (deliverDormantPageConfig(log, sessionId, captureId).delivered) {
+      pageAgent = 'delivered';
+      pageOwed = undefined;
     } else {
-      const dormant = parseAgentConfigPayload({
-        sessionId,
-        captureId,
-        hooks: DORMANT_AGENT_HOOK_CONFIG,
-      });
+      pageAgent = 'unreachable';
 
-      if (isErr(dormant)) {
-        log.error('The dormant page-agent configuration was rejected and not sent', {
-          code: dormant.error.code,
-        });
-      } else {
-        try {
-          const payload: AgentConfigPayload = dormant.value;
-          deps.broadcaster.broadcastToKinds(
-            sessionId,
-            AGENT_CLIENT_KINDS,
-            createEnvelope('agent.config', payload, { ts: clock() }),
-          );
-          agentDisarmed = true;
-        } catch (thrown) {
-          log.error('Sending the dormant page-agent configuration threw', {
-            errorName: thrownName(thrown),
-          });
-        }
+      if (ledger.pageArmedCaptureId !== undefined || pageOwed !== undefined) {
+        pageOwed = captureId;
       }
     }
 
@@ -2247,35 +3391,533 @@ export function createInstrumentationService(
 
     if ((owner !== undefined && owner.sessionId !== sessionId) || otherArmed) {
       serverAgent = 'skipped-other-owner';
+    } else if (deliverDisabledServerConfig(log, projectRoot).delivered) {
+      serverAgent = 'delivered';
+      // A disabled preload holds no session's capture, so every disarm the
+      // project owed its preload is settled with this one.
+      settleServerForProject(projectRoot, undefined);
     } else {
-      const disabled = parseServerAgentConfigPayload({ signals: DISABLED_SERVER_AGENT_SIGNALS });
-
-      if (isErr(disabled)) {
-        log.error('The capture-less preload configuration was rejected and not sent', {
-          code: disabled.error.code,
-        });
-        serverAgent = 'unreachable';
-      } else {
-        serverAgent = deliverToServerAgent(log, projectRoot, disabled.value);
-      }
+      serverAgent = 'unreachable';
     }
+
+    // Re-read after the project-wide settlement, which may have rewritten both.
+    const settledLedger = ledgerOf(sessionId, projectRoot);
+    const serverOwed =
+      (pending.get(sessionId)?.server ?? false) ||
+      (serverAgent === 'unreachable' && settledLedger.serverArmedCaptureId !== undefined);
+    const next: PendingDisarm = { projectRoot, pageCaptureId: pageOwed, server: serverOwed };
+    const outstanding = producersOf(next);
+
+    if (ledgers.has(sessionId) || pageAgent === 'delivered') {
+      writeLedger(sessionId, {
+        ...settledLedger,
+        // The capture is over: nothing is replayed to arm it any more.
+        serverAwaitingCaptureId: undefined,
+        ...(pageAgent === 'delivered'
+          ? { pageArmedCaptureId: undefined, dormantCaptureId: captureId }
+          : {}),
+      });
+    }
+
+    writePending(sessionId, next);
 
     if (state !== undefined && !disposed) {
       sessions.set(sessionId, { ...state, armedCaptureId: undefined });
     }
 
+    const agentDisarmed = pageAgent === 'delivered';
+
     log.info('Capture disarmed', {
       ...(captureId === undefined ? {} : { [LOG_BINDING_KEYS.captureId]: captureId }),
       agentDisarmed,
+      pageAgent,
       serverAgent,
+      pending: outstanding,
     });
+
+    if (outstanding.length > 0) {
+      log.warn(
+        'Producers still hold the capture configuration; their dormant configuration is replayed when they reconnect',
+        { pending: outstanding, pageAgent, serverAgent },
+      );
+    }
 
     return ok({
       sessionId,
       ...(captureId === undefined ? {} : { captureId }),
       agentDisarmed,
       serverAgent,
+      pageAgent,
+      pending: outstanding,
     });
+  }
+
+  // -------------------------------------------------------------------------
+  // Producer reconciliation — replay on reconnect, rebind and restart
+  // -------------------------------------------------------------------------
+
+  /**
+   * Records that a session's page agent took its dormant configuration for
+   * `captureId`: nothing is armed in the page any more, and an owed page disarm
+   * is settled.
+   */
+  function recordDormantPage(sessionId: string, projectRoot: string, captureId: string): void {
+    writeLedger(sessionId, {
+      ...ledgerOf(sessionId, projectRoot),
+      pageArmedCaptureId: undefined,
+      dormantCaptureId: captureId,
+    });
+    settlePendingPage(sessionId);
+  }
+
+  /**
+   * The capture that holds a project: the manager's answer when one is wired,
+   * otherwise the session this service has armed on the project.
+   */
+  function captureOwnerOf(projectRoot: string): CaptureOwner | undefined {
+    if (deps.captures !== undefined) {
+      return deps.captures.captureOwnerForProject(projectRoot);
+    }
+
+    for (const state of sessions.values()) {
+      if (state.projectRoot === projectRoot && state.armedCaptureId !== undefined) {
+        return { sessionId: state.sessionId, captureId: state.armedCaptureId };
+      }
+    }
+
+    return undefined;
+  }
+
+  /**
+   * Whether the capture this service armed for a session is still the
+   * project's open capture — so a reconnect never re-arms a window the manager
+   * has already closed.
+   */
+  function isOpenCapture(state: SessionState, captureId: string): boolean {
+    const owner = captureOwnerOf(state.projectRoot);
+    return owner?.sessionId === state.sessionId && owner.captureId === captureId;
+  }
+
+  /** Notes that a project's preloads were just sent an armed configuration a connection took. */
+  function recordServerArmed(projectRoot: string): void {
+    if (!disposed) {
+      serverArmedAt.set(projectRoot, clock());
+    }
+  }
+
+  /**
+   * Whether a preload of a project, whose credential was issued at
+   * `credentialIssuedAt`, may still hold an arming it was never seen to drop:
+   * its credential predates this service (an earlier process may have armed
+   * it), or it existed when the project was last armed (it may have been armed
+   * then and missed the capture-less configuration the others took), or this
+   * service owes the project's preloads a disarm. A credential issued after all
+   * of that has only ever been sent what this service would send it now.
+   */
+  function preloadMayHoldArmingFor(
+    projectRoot: string,
+    credentialIssuedAt: number | undefined,
+  ): boolean {
+    if (credentialIssuedAt === undefined || credentialIssuedAt < createdAt) {
+      return true;
+    }
+
+    const armedAt = serverArmedAt.get(projectRoot);
+
+    return (
+      (armedAt !== undefined && credentialIssuedAt <= armedAt) || preloadMayHoldArming(projectRoot)
+    );
+  }
+
+  /**
+   * Whether this service armed a project's preload for a capture it has not
+   * seen disarmed, or owes it a disarm: the two ways a preload this service
+   * configured can still hold a capture.
+   */
+  function preloadMayHoldArming(projectRoot: string): boolean {
+    for (const ledger of ledgers.values()) {
+      if (
+        ledger.projectRoot === projectRoot &&
+        (ledger.serverArmedCaptureId !== undefined || ledger.serverAwaitingCaptureId !== undefined)
+      ) {
+        return true;
+      }
+    }
+
+    for (const owed of pending.values()) {
+      if (owed.projectRoot === projectRoot && owed.server) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * A preload connected: re-arm it for the project's open capture, or disable
+   * it when no capture needs it — which also settles every preload disarm the
+   * project owed. With an open capture this service holds no arming for,
+   * nothing is sent: a capture the manager says is open is never switched off.
+   * Nor is anything sent to a preload that cannot hold an arming (see
+   * {@link preloadMayHoldArmingFor}): it has nothing to disable.
+   */
+  function replayToServerAgent(
+    rawProjectRoot: string | undefined,
+    credentialIssuedAt: number | undefined,
+  ): ProducerReplayOutcome {
+    const normalized = normalizeProjectRoot(rawProjectRoot);
+
+    if (isErr(normalized)) {
+      serviceLog.debug('A preload connected without a usable project root; nothing was replayed');
+      return { rearmed: [], disarmed: [], serverAgent: 'not-needed' };
+    }
+
+    const projectRoot = normalized.value;
+    const owner = captureOwnerOf(projectRoot);
+
+    if (owner !== undefined) {
+      const log = sessionLog(owner.sessionId);
+      const state = sessions.get(owner.sessionId);
+      const config = state?.configs.get(state.activePlanVersion);
+
+      if (
+        state === undefined ||
+        config === undefined ||
+        state.projectRoot !== projectRoot ||
+        state.armedCaptureId !== owner.captureId
+      ) {
+        log.warn(
+          'A preload connected while a capture is open that this service holds no arming for; nothing was sent',
+          { [LOG_BINDING_KEYS.captureId]: owner.captureId },
+        );
+        return { rearmed: [], disarmed: [], serverAgent: 'not-needed' };
+      }
+
+      if (collectsServerSignals(config.serverSignals)) {
+        const armed = parseServerAgentConfigPayload({
+          sessionId: owner.sessionId,
+          captureId: owner.captureId,
+          signals: config.serverSignals,
+        });
+
+        if (isErr(armed)) {
+          log.error('The preload configuration was rejected and not replayed', {
+            code: armed.error.code,
+          });
+          return { rearmed: [], disarmed: [], serverAgent: 'unreachable' };
+        }
+
+        const awaited = ledgers.get(owner.sessionId)?.serverAwaitingCaptureId === owner.captureId;
+
+        if (!deliverServerConfig(log, projectRoot, armed.value).delivered) {
+          return { rearmed: [], disarmed: [], serverAgent: 'unreachable' };
+        }
+
+        const settled = settleServerForProject(projectRoot, {
+          sessionId: owner.sessionId,
+          captureId: owner.captureId,
+        });
+        recordServerArmed(projectRoot);
+
+        log.info('The reconnected preload was re-armed for the open capture', {
+          [LOG_BINDING_KEYS.captureId]: owner.captureId,
+          awaited,
+          settledDisarms: settled.length,
+        });
+
+        return { rearmed: [owner.sessionId], disarmed: settled, serverAgent: 'delivered' };
+      }
+    }
+
+    // No capture needs the preload — none is open, or the open one collects
+    // nothing server-side — so it is disabled, whatever it last held. Only a
+    // preload that cannot hold any arming — its credential was issued by this
+    // service after the project was last armed, and nothing is owed — is sent
+    // nothing.
+    if (!preloadMayHoldArmingFor(projectRoot, credentialIssuedAt)) {
+      serviceLog.debug('A preload connected that holds no capture; nothing was replayed');
+      return { rearmed: [], disarmed: [], serverAgent: 'not-needed' };
+    }
+
+    if (!deliverDisabledServerConfig(serviceLog, projectRoot).delivered) {
+      return { rearmed: [], disarmed: [], serverAgent: 'unreachable' };
+    }
+
+    const settled = settleServerForProject(projectRoot, undefined);
+
+    serviceLog.info('The reconnected preload was sent its capture-less configuration', {
+      settledDisarms: settled.length,
+    });
+
+    return { rearmed: [], disarmed: settled, serverAgent: 'delivered' };
+  }
+
+  /**
+   * A DevTools connection registered: each session its bound tabs carry is
+   * re-armed for its open capture, or sent the dormant configuration it is
+   * owed.
+   */
+  function replayToPageAgents(sessionIds: readonly string[]): ProducerReplayOutcome {
+    const rearmed: string[] = [];
+    const disarmed: string[] = [];
+
+    for (const sessionId of new Set(sessionIds)) {
+      if (!isNonBlankString(sessionId)) {
+        continue;
+      }
+
+      const log = sessionLog(sessionId);
+      const state = sessions.get(sessionId);
+      const config = state?.configs.get(state.activePlanVersion);
+      const captureId = state?.armedCaptureId;
+
+      if (state !== undefined && config !== undefined && captureId !== undefined) {
+        const hooks = armedPageHooks(state, config);
+
+        if (enablesAnyPageHook(hooks) && isOpenCapture(state, captureId)) {
+          const armed = parseAgentConfigPayload({ sessionId, captureId, hooks });
+
+          if (isErr(armed)) {
+            log.error('The page-agent configuration was rejected and not replayed', {
+              code: armed.error.code,
+            });
+          } else if (deliverPageConfig(log, sessionId, armed.value).delivered) {
+            writeLedger(sessionId, {
+              ...ledgerOf(sessionId, state.projectRoot),
+              pageArmedCaptureId: captureId,
+              dormantCaptureId: undefined,
+            });
+            settlePendingPage(sessionId);
+            rearmed.push(sessionId);
+            log.info('The reconnected page agent was re-armed for the open capture', {
+              [LOG_BINDING_KEYS.captureId]: captureId,
+            });
+          }
+
+          continue;
+        }
+      }
+
+      const owed = pending.get(sessionId);
+
+      if (owed?.pageCaptureId === undefined) {
+        continue;
+      }
+
+      if (deliverDormantPageConfig(log, sessionId, owed.pageCaptureId).delivered) {
+        recordDormantPage(sessionId, owed.projectRoot, owed.pageCaptureId);
+        disarmed.push(sessionId);
+        log.info('The reconnected page agent was sent the dormant configuration it was owed', {
+          [LOG_BINDING_KEYS.captureId]: owed.pageCaptureId,
+        });
+      }
+    }
+
+    return { rearmed, disarmed, serverAgent: 'not-applicable' };
+  }
+
+  function producerConnected(connection: ProducerConnection): ProducerReplayOutcome {
+    const kind = connection.kind;
+
+    if (disposed) {
+      return { rearmed: [], disarmed: [], serverAgent: 'not-applicable' };
+    }
+
+    try {
+      if (kind === SERVER_AGENT_KIND) {
+        return replayToServerAgent(connection.projectRoot, connection.credentialIssuedAt);
+      }
+
+      if (kind === DEVTOOLS_KIND) {
+        return replayToPageAgents(connection.sessionIds ?? []);
+      }
+    } catch (thrown) {
+      serviceLog.error('Replaying configuration to a reconnected producer threw', {
+        kind,
+        ...exceptionFields(thrown),
+      });
+      return {
+        rearmed: [],
+        disarmed: [],
+        serverAgent: kind === SERVER_AGENT_KIND ? 'unreachable' : 'not-applicable',
+      };
+    }
+
+    return { rearmed: [], disarmed: [], serverAgent: 'not-applicable' };
+  }
+
+  function reconcileBoundSession(
+    request: BoundSessionReconcileRequest,
+  ): Result<BoundSessionReconcileOutcome, DebuggenError> {
+    const { sessionId } = request;
+
+    if (!isNonBlankString(sessionId)) {
+      return err(
+        wiringError(
+          'A bound tab was reconciled without a session id.',
+          'Pass the id of the session the tab was bound to.',
+          'sessionId',
+        ),
+      );
+    }
+
+    const projectRoot = normalizeProjectRoot(request.projectRoot);
+
+    if (isErr(projectRoot)) {
+      return projectRoot;
+    }
+
+    if (isNonBlankString(request.activeCaptureId)) {
+      // The capture continues in the tab; re-arming it is the binding route's call.
+      return ok('capture-active');
+    }
+
+    const log = sessionLog(sessionId);
+    const owedCaptureId = pending.get(sessionId)?.pageCaptureId;
+    const ledger = ledgers.get(sessionId);
+    const lastCaptureId = isNonBlankString(request.lastCaptureId)
+      ? request.lastCaptureId
+      : undefined;
+    // A capture this service saw open is answered by its own record: the page
+    // holds it only while this service has it armed there. One opened by an
+    // earlier process may still be armed in the page whatever this one knows.
+    const openedHere =
+      lastCaptureId !== undefined &&
+      request.lastCaptureStartedAt !== undefined &&
+      request.lastCaptureStartedAt >= createdAt;
+    const captureId =
+      owedCaptureId ?? ledger?.pageArmedCaptureId ?? (openedHere ? undefined : lastCaptureId);
+
+    if (captureId === undefined) {
+      return ok(
+        openedHere && ledger?.dormantCaptureId === lastCaptureId
+          ? 'already-dormant'
+          : 'nothing-armed',
+      );
+    }
+
+    if (
+      owedCaptureId === undefined &&
+      ledger?.dormantCaptureId === captureId &&
+      ledger.pageArmedCaptureId === undefined
+    ) {
+      return ok('already-dormant');
+    }
+
+    if (deliverDormantPageConfig(log, sessionId, captureId).delivered) {
+      recordDormantPage(sessionId, projectRoot.value, captureId);
+      log.info('The bound tab’s page agent was returned to dormant', {
+        [LOG_BINDING_KEYS.captureId]: captureId,
+        owed: owedCaptureId !== undefined,
+      });
+      return ok('dormant-delivered');
+    }
+
+    log.warn('The bound tab’s page agent could not be sent its dormant configuration', {
+      [LOG_BINDING_KEYS.captureId]: captureId,
+      owed: owedCaptureId !== undefined,
+    });
+    return ok('dormant-unreachable');
+  }
+
+  /**
+   * Which producers a plan arms for a capture: the page agent when any page
+   * hook is enabled (the installer's configuration widened by the plan's
+   * runtime actions, as {@link armedPageHooks} computes it), the preload when
+   * any server signal is.
+   */
+  function producersArmedBy(plan: InstrumentationPlan): {
+    readonly page: boolean;
+    readonly server: boolean;
+  } {
+    const config = deriveConfig(plan.instrumentationTargets);
+    const pageHooks = unionAgentHooks(
+      config.agentHooks,
+      deriveAgentHookConfig(
+        plan.instrumentationTargets.filter((action) => action.mode === RUNTIME_ACTION_MODE),
+      ),
+    );
+
+    return {
+      page: enablesAnyPageHook(pageHooks),
+      server: collectsServerSignals(config.serverSignals),
+    };
+  }
+
+  function releaseInterruptedCapture(
+    input: InterruptedCaptureInput,
+  ): Result<DisarmCaptureOutcome, DebuggenError> {
+    const { sessionId, captureId } = input;
+
+    if (!isNonBlankString(sessionId) || !isNonBlankString(captureId)) {
+      return err(
+        wiringError(
+          'An interrupted capture was released without a session id or a capture id.',
+          'Pass the session id and the id of the capture window the restart ended.',
+          isNonBlankString(sessionId) ? 'captureId' : 'sessionId',
+        ),
+      );
+    }
+
+    const projectRoot = normalizeProjectRoot(input.projectRoot);
+
+    if (isErr(projectRoot)) {
+      return projectRoot;
+    }
+
+    let armed = { page: true, server: true };
+
+    if (input.plan !== undefined) {
+      const parsed = parseInstrumentationPlan(input.plan);
+
+      if (isErr(parsed)) {
+        return parsed;
+      }
+
+      if (input.plan.sessionId !== sessionId) {
+        return err(
+          wiringError(
+            'An interrupted capture was released with a plan that belongs to a different session.',
+            'Release each capture with its own session’s stored plan.',
+            'plan.sessionId',
+          ),
+        );
+      }
+
+      armed = producersArmedBy(input.plan);
+    }
+
+    // What the previous process armed is what the producers may still hold, so
+    // the disarm below owes each of them its dormant configuration until a
+    // connection takes it.
+    writeLedger(sessionId, {
+      ...ledgerOf(sessionId, projectRoot.value),
+      projectRoot: projectRoot.value,
+      ...(armed.page ? { pageArmedCaptureId: captureId, dormantCaptureId: undefined } : {}),
+      ...(armed.server ? { serverArmedCaptureId: captureId } : {}),
+    });
+
+    sessionLog(sessionId).info(
+      'A capture the restart ended is disarmed; producers that may still hold it are owed their dormant configuration',
+      {
+        [LOG_BINDING_KEYS.captureId]: captureId,
+        planKnown: input.plan !== undefined,
+        pageArmed: armed.page,
+        serverArmed: armed.server,
+      },
+    );
+
+    return disarmCapture({ sessionId, captureId, projectRoot: projectRoot.value });
+  }
+
+  function onDormancyConfirmed(listener: (sessionId: string) => void): () => void {
+    if (!disposed) {
+      dormancyListeners.add(listener);
+    }
+
+    return () => {
+      dormancyListeners.delete(listener);
+    };
   }
 
   // -------------------------------------------------------------------------
@@ -2288,14 +3930,29 @@ export function createInstrumentationService(
     try {
       await deps.watcher.stopSession(sessionId);
     } catch (thrown) {
-      log.error('Stopping the conflict watcher for the session threw', {
-        errorName: thrownName(thrown),
-      });
+      log.error('Stopping the conflict watcher for the session threw', exceptionFields(thrown));
     }
 
     watched.delete(sessionId);
     sessions.delete(sessionId);
-    log.debug('Instrumentation state released for the session');
+
+    // What the producers still hold is not this session's plan state: an armed
+    // producer and an owed disarm are kept, so a later disarm or reconnect
+    // still settles them. Only a ledger with nothing armed is let go.
+    const ledger = ledgers.get(sessionId);
+
+    if (
+      ledger !== undefined &&
+      ledger.pageArmedCaptureId === undefined &&
+      ledger.serverArmedCaptureId === undefined &&
+      ledger.serverAwaitingCaptureId === undefined
+    ) {
+      ledgers.delete(sessionId);
+    }
+
+    log.debug('Instrumentation state released for the session', {
+      pending: producersOf(pending.get(sessionId)),
+    });
   }
 
   async function dispose(): Promise<void> {
@@ -2308,14 +3965,19 @@ export function createInstrumentationService(
     try {
       await deps.watcher.stopAll();
     } catch (thrown) {
-      serviceLog.error('Stopping the conflict watcher threw during shutdown', {
-        errorName: thrownName(thrown),
-      });
+      serviceLog.error(
+        'Stopping the conflict watcher threw during shutdown',
+        exceptionFields(thrown),
+      );
     }
 
     sessions.clear();
     watched.clear();
     reloadPrompts.clear();
+    ledgers.clear();
+    serverArmedAt.clear();
+    pending.clear();
+    dormancyListeners.clear();
   }
 
   return {
@@ -2331,5 +3993,10 @@ export function createInstrumentationService(
     isInstalling: (sessionId) => inFlight.has(sessionId),
     stopSession,
     dispose,
+    producerConnected,
+    reconcileBoundSession,
+    releaseInterruptedCapture,
+    pendingDisarms: (sessionId) => producersOf(pending.get(sessionId)),
+    onDormancyConfirmed,
   };
 }

@@ -73,6 +73,10 @@
  * extension page with `chrome.devtools` undefined. The copy is generic product vocabulary and
  * names nothing from any inspected application (AAP 0.5.4).
  *
+ * Whether the row is interactive is the composition root's decision, passed as `inert`: while a
+ * modal dialog is open the whole row is inert, and this file only forwards the flag to its
+ * `<header>`.
+ *
  * @example Wiring from the composition root:
  * ```tsx
  * const snapshot = usePanelSnapshot();
@@ -135,6 +139,15 @@ export interface HeaderProps {
 
   /** An extra class name for the `<header>` element, appended by the composition root. */
   className?: string | undefined;
+
+  /**
+   * Make the whole header row inert — the native `inert` attribute on the `<header>` — so none of
+   * its controls can be focused, clicked or reached by assistive technology. The composition root
+   * sets it while the modal pairing dialog is open, which is what makes that dialog genuinely
+   * modal: the connection pill, the target picker and the capture controls in this row sit behind
+   * it. Omitted or `false`, the attribute is absent.
+   */
+  inert?: boolean | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -274,6 +287,7 @@ export function Header(props: HeaderProps): ReactElement {
     sessionTitle,
     sessionStatus,
     className,
+    inert = false,
   } = props;
 
   const title = visibleTitle(sessionTitle);
@@ -286,7 +300,7 @@ export function Header(props: HeaderProps): ReactElement {
   const showControls = showConnection || showTargetPicker || showCaptureControls;
 
   return (
-    <header className={className}>
+    <header className={className} inert={inert}>
       <Stack direction="horizontal" gap={4} align="center" justify="between" wrap>
         <Stack direction="horizontal" gap={3} align="center" wrap>
           <Heading level={1} size="lg">

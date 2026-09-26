@@ -13,15 +13,28 @@
  *
  * ## What happens to every request, in this order
  *
- * 1. **Cap.** The structured context is built first, from typed upstream
- *    artifacts, and bounded by {@link CONTEXT_LIMITS}: text is cut with
- *    {@link capText}, lists with {@link capList}, source excerpts with
- *    {@link capExcerpt}, arbitrary artifacts with {@link toBoundedJson}, and the
- *    whole object by {@link applyPayloadBudget} (AAP §0.7.1, "context builder
- *    caps excerpt size and applies redaction"). Sections an upstream module has
- *    already bounded — the analysis stage input (`ANALYSIS_INPUT_LIMITS`), the
- *    project summary (`PROJECT_SUMMARY_LIMITS`), code excerpts
- *    (`CODE_QUERY_LIMITS`) — are serialised as they arrive, never re-truncated.
+ * 1. **Redact and cap.** The structured context is built first, from typed
+ *    upstream artifacts. The sections taken from the inspected page — the
+ *    selected element's tag, selector, visible text and component names, and
+ *    the bound tab's current URL — are redacted here with the telemetry layer's
+ *    own rules *before* anything is cut ({@link redactAndCapText} runs `scrub`
+ *    and then `redactTextUrls`, so every URL embedded in an element string —
+ *    a link's own address, an `href` in a selector, a path quoted in a label —
+ *    has its query values and fragment masked to `?`; {@link redactAndCapUrl}
+ *    runs `redactUrl`: query values and a fragment become `?`, userinfo becomes
+ *    `[redacted]`), because they come from the browser rather than from the
+ *    ingest checkpoint, and a cut made first could split a credential or a
+ *    query value out of reach of the rule that identifies it (AAP §0.5.2, "the
+ *    current URL (redacted)"). Neither cap leaves a split query pair the guard
+ *    would read as an unmasked value. Everything is then bounded by
+ *    {@link CONTEXT_LIMITS}: text is cut with {@link capText}, lists with
+ *    {@link capList}, source excerpts with {@link capExcerpt}, arbitrary
+ *    artifacts with {@link toBoundedJson}, and the whole object by
+ *    {@link applyPayloadBudget} (AAP §0.7.1, "context builder caps excerpt size
+ *    and applies redaction"). Sections an upstream module has already bounded —
+ *    the analysis stage input (`ANALYSIS_INPUT_LIMITS`), the project summary
+ *    (`PROJECT_SUMMARY_LIMITS`), code excerpts (`CODE_QUERY_LIMITS`) — are
+ *    serialised as they arrive, never re-truncated.
  * 2. **Derive.** Every prompt placeholder is derived from that same capped
  *    object with {@link toPromptJson}, so the rendered `prompt` and the
  *    structured `input` of the request can never disagree — the dual payload
@@ -33,9 +46,13 @@
  *    instruction prose: the only text it contributes is data — serialised
  *    artifacts and the injected `{{outputSchema}}` JSON Schema documents.
  * 4. **Guard.** `assertOutboundSafe` is the second privacy checkpoint of AAP
- *    §0.5.2. A denied pattern that survived ingest-time redaction aborts the
- *    call here, before a stage spends a provider call on it; the provider runs
- *    the same guard again before transport, deliberately (defence in depth).
+ *    §0.5.2. A denied pattern that survived ingest-time redaction, or this
+ *    builder's redaction of the page-derived sections, aborts the call here,
+ *    before a stage spends a provider call on it; the provider runs the same
+ *    guard again before transport, deliberately (defence in depth). Redacting
+ *    in step 1 is what lets an ordinary page (`/products?sort=price`), or a
+ *    selected link whose text is its own address, reach the model at all; the
+ *    guard stays the backstop, never the redactor.
  *
  * ## The developer's question travels in the prompt only
  *
@@ -108,6 +125,14 @@ import {
   tryCatch,
 } from '@debuggen/shared';
 import type { Logger, Result } from '@debuggen/shared';
+import {
+  formatUrlParts,
+  parseUrlParts,
+  redactQueryString,
+  redactTextUrls,
+  redactUrl,
+  scrub,
+} from '@debuggen/telemetry';
 import type { CaptureSummary } from '@debuggen/telemetry';
 
 import { ANALYSIS_INPUT_LIMITS, estimatePayloadBytes } from '../analysis/summarize.js';
@@ -219,7 +244,12 @@ export interface PipelineStageContext {
   readonly followUpQuestion?: string | undefined;
   /** The element the developer selected, when there is one. */
   readonly target?: SelectedTarget | undefined;
-  /** The bound tab's current URL, query values already masked upstream. */
+  /**
+   * The bound tab's current URL, as recorded. Page-derived, so never trusted
+   * to be redacted: every builder that places it in a request passes it
+   * through `redactUrl` first ({@link redactAndCapUrl}), which is idempotent on
+   * an address that was already masked upstream.
+   */
   readonly currentUrl?: string | undefined;
   /** The code-analysis handles, loaded once per run. */
   readonly code: PipelineCodeHandles;
@@ -252,7 +282,8 @@ export interface PipelineStageContextInit {
   readonly followUpQuestion?: string | undefined;
   /**
    * The page address to use instead of the session's bound tab URL — for
-   * instance the URL a `session.bind` just reported. Must already be masked.
+   * instance the URL a `session.bind` just reported. Stored as given; the
+   * context builder redacts it before it enters any request.
    */
   readonly currentUrl?: string | undefined;
   /** The capture being analysed, when there is one. */
@@ -470,6 +501,206 @@ export function capText(value: string, max: number): CappedText {
     cut -= 1;
   }
   return { text: `${value.slice(0, Math.max(0, cut))}${TRUNCATION_MARKER}`, truncated: true };
+}
+
+/** Any whitespace, by the same test the outbound guard's `url-query-value` rule applies. */
+const WHITESPACE_PATTERN = /\s/;
+
+/**
+ * The single token `text` holds, or `undefined` when it is empty or holds
+ * whitespace between two non-whitespace characters.
+ *
+ * Surrounding whitespace is ignored because the outbound guard ignores it: its
+ * `url-query-value` rule trims a string and examines it only when what remains
+ * is one whitespace-free run. `String.prototype.trim` and `\s` agree on what
+ * whitespace is, so a string is a token here exactly when the guard reads it
+ * as one; prose — anything else — is never examined by that rule.
+ */
+function soleToken(text: string): string | undefined {
+  const token = text.trim();
+  return token.length > 0 && !WHITESPACE_PATTERN.test(token) ? token : undefined;
+}
+
+/**
+ * Whether the outbound guard parses `token` as a URL and checks its query
+ * values: an absolute URL of any scheme the WHATWG parser accepts
+ * (`http://…`, `mailto:…`), or an origin-relative reference (`/path?…`). A
+ * protocol-relative `//host/…` is neither to the guard, and neither is a
+ * selector or a component name, whose query-shaped part the guard never reads.
+ */
+function isGuardParsedUrl(token: string): boolean {
+  return (token.startsWith('/') && !token.startsWith('//')) || URL.canParse(token);
+}
+
+/**
+ * Keeps a query masked across a cut: the one post-redaction cap step shared by
+ * {@link redactAndCapUrl} and {@link redactAndCapText}.
+ *
+ * `capped` is {@link capText}'s cut of text whose query values are already the
+ * mask `?`. A cut that lands in a masked value turns `sort=?` into `sort=…` or
+ * `sort=?…`, a value that is neither empty nor the mask, and the guard's
+ * `url-query-value` rule would refuse the whole request for it. So when the
+ * cut falls inside a value, the pair it split is dropped back to the preceding
+ * `&` (or the `?`) and the marker becomes a bare trailing segment — the same
+ * shape `redactUrl` itself gives a query it had to cut. A cut inside the
+ * authority or path leaves no query; a cut inside a parameter name leaves a
+ * bare name; a cut inside the fragment leaves every pair whole. Each of those,
+ * and text that was not cut, is returned as {@link capText} produced it.
+ *
+ * The structure is read with the telemetry layer's `parseUrlParts`, which splits
+ * at the first `#` and then the first `?` exactly as the WHATWG parser the
+ * guard uses does, and written back with `formatUrlParts`, which round-trips
+ * everything but the query verbatim. The result is never longer than `capped`.
+ *
+ * @param capped The cut of already-masked text.
+ * @returns The cut with no split query pair left behind.
+ */
+function keepCutQueryMasked(capped: CappedText): CappedText {
+  if (!capped.truncated) {
+    return capped;
+  }
+  const parts = parseUrlParts(capped.text);
+  const { query } = parts;
+  if (query === undefined || parts.fragment !== undefined) {
+    return capped;
+  }
+  const pairStart = query.lastIndexOf('&') + 1;
+  if (!query.includes('=', pairStart)) {
+    return capped;
+  }
+  return {
+    text: formatUrlParts({ ...parts, query: `${query.slice(0, pairStart)}${TRUNCATION_MARKER}` }),
+    truncated: true,
+  };
+}
+
+/**
+ * Re-masks the query of a single token the outbound guard parses as a URL, as
+ * the guard's parser delimits it; any other text is returned unchanged.
+ *
+ * `redactTextUrls` ends an embedded URL at a quote or an angle bracket and
+ * leaves trailing sentence punctuation outside it, which is right for a URL
+ * inside a label or a selector but not for a token the guard reads whole: to
+ * the WHATWG parser, `/reset?coupon=?.` carries the value `?.` and
+ * `/a[@href="/p?id=?"]` the value `?"]`, and either would refuse the request.
+ * So every pair of such a token's query is masked again with
+ * `redactQueryString` — idempotent on a value that is already `?`, so the
+ * common case comes back byte-identical — and the trailing characters the
+ * parser would have read as part of the last value go with it. A masked value
+ * is one character and every other part is kept as it was, so the result is
+ * never longer, except for a query `redactQueryString` has to bound — more than
+ * `MAX_QUERY_PAIRS` pairs, which takes over a thousand characters and so lies
+ * beyond every cap of {@link CONTEXT_LIMITS} — where it ends the query with a
+ * `[redacted]` segment; the caller re-caps that case.
+ *
+ * @param text Text whose embedded URLs are already masked and which is already cut.
+ * @returns The text, with the query the guard would examine masked in the guard's own terms.
+ */
+function maskGuardParsedQuery(text: string): string {
+  const token = soleToken(text);
+  if (token === undefined || !token.includes('?') || !isGuardParsedUrl(token)) {
+    return text;
+  }
+  const parts = parseUrlParts(text);
+  if (parts.query === undefined) {
+    return text;
+  }
+  return formatUrlParts({ ...parts, query: redactQueryString(parts.query) });
+}
+
+/**
+ * Redacts page-derived free text with the telemetry layer's `scrub` and masks
+ * every URL embedded in it with `redactTextUrls`, then caps the redacted form
+ * without ever leaving a query value the outbound guard would read as unmasked.
+ *
+ * Used for every string of a selected element — tag name, selector, visible
+ * text, component names — because the element is described by the browser,
+ * not by the ingest checkpoint, and nothing upstream of this builder has run
+ * the rules of AAP §0.5.2 over it. Two passes run over the whole value:
+ *
+ * 1. `scrub`: provider keys, bearer credentials, JWT-shaped strings,
+ *    private-key blocks and credentialed connection strings become
+ *    `[redacted]` wherever they sit in the text.
+ * 2. `redactTextUrls`: every URL embedded in the text — a link whose visible
+ *    text is its own address, an attribute selector such as
+ *    `a[href="/p?id=…"]`, a sentence quoting `/reset?coupon=…`, a component
+ *    label carrying `?x=…` — has each query value and a non-empty fragment
+ *    replaced by `?`, the same rule the current URL gets ("query values become
+ *    `?` per key"), while the parameter names and the text around it are kept.
+ *
+ * Everything else is kept verbatim, and both passes are idempotent, so
+ * already-clean text comes back unchanged. The order is the point: both passes
+ * see the whole value, so a credential or a query value that straddles the cap
+ * is replaced whole instead of leaving its head behind, and cutting redacted
+ * text exposes nothing new. A bare high-entropy run with no credential shape
+ * is left alone, exactly as the first checkpoint leaves it: the entropy rule is
+ * bound to key-like field names, and a selector or a label is not one.
+ *
+ * The cut is then made with {@link capText}. Prose — text with whitespace
+ * inside it — keeps that plain cut: the guard does not examine prose, and its
+ * values were masked before the cut. A result that is a single token is held
+ * to the guard's reading of it: a cut inside a masked pair drops that pair and
+ * ends with {@link TRUNCATION_MARKER}, as {@link redactAndCapUrl} does, and when
+ * the guard parses the token as a URL, its query is masked in the parser's own
+ * terms, so a standalone link such as `http://127.0.0.1:3000/reset?coupon=…`
+ * builds instead of refusing Stage 1.
+ *
+ * @example
+ * ```ts
+ * redactAndCapText(`Bearer ${token}`, 120).text; // 'Bearer [redacted]'
+ * redactAndCapText('Visit /reset?coupon=SPRING', 120).text; // 'Visit /reset?coupon=?'
+ * ```
+ *
+ * @param value The page-derived text.
+ * @param max The greatest length of the result, as {@link capText} counts it.
+ * @returns The redacted, capped text and whether the cap removed characters.
+ */
+export function redactAndCapText(value: string, max: number): CappedText {
+  const capped = capText(redactTextUrls(scrub(value)), max);
+  if (soleToken(capped.text) === undefined) {
+    return capped;
+  }
+  const kept = keepCutQueryMasked(capped);
+  const text = maskGuardParsedQuery(kept.text);
+  if (text.length <= max) {
+    return { text, truncated: kept.truncated };
+  }
+  // Only a query past `MAX_QUERY_PAIRS` grows when re-masked. Every value in it
+  // is now `?` or empty, so cutting it again cannot expose one.
+  return keepCutQueryMasked(capText(text, max));
+}
+
+/**
+ * Redacts a page address with the telemetry layer's `redactUrl`, then caps the
+ * redacted form without ever leaving a query value the outbound guard would
+ * read as unmasked.
+ *
+ * `redactUrl` keeps the scheme, host, port, path and every query parameter
+ * name in order, replaces each non-empty query value and a non-empty fragment
+ * with `?`, replaces userinfo with `[redacted]` and scrubs the path, so
+ * `http://127.0.0.1:3000/products?sort=price&page=2#details` becomes
+ * `http://127.0.0.1:3000/products?sort=?&page=?#?` — the route the model can
+ * match, and none of the values AAP §0.5.2 forbids storing or sending. It is
+ * idempotent, so an address that was masked upstream comes back unchanged.
+ *
+ * A plain {@link capText} of the redacted form is right everywhere except
+ * inside the query, where a cut into a masked value would leave a value the
+ * guard's `url-query-value` rule refuses; {@link keepCutQueryMasked} drops the
+ * pair such a cut split, back to the preceding `&` (or the `?`), and ends the
+ * query with the marker as a bare trailing segment.
+ *
+ * @example
+ * ```ts
+ * redactAndCapUrl('http://127.0.0.1:3000/products?sort=price', 2_048).text;
+ * // 'http://127.0.0.1:3000/products?sort=?'
+ * ```
+ *
+ * @param url The page address, as the browser reported it.
+ * @param max The greatest length of the result, as {@link capText} counts it.
+ * @returns The redacted, capped address and whether the cap removed characters.
+ */
+export function redactAndCapUrl(url: string, max: number): CappedText {
+  return keepCutQueryMasked(capText(redactUrl(url), max));
 }
 
 /** The outcome of {@link capList}. */
@@ -1889,7 +2120,26 @@ export function createContextBuilder(deps: ContextBuilderDeps): ContextBuilder {
   const signalOf = (request: StageBuildOptions): AbortSignal | undefined =>
     request.signal ?? request.context.signal;
 
-  /** The selected element as data: tag, selector, capped visible text and component chain. */
+  /** Redacts and caps one page-derived text of `section`, recording its name when shortened. */
+  const pageSectionText = (
+    value: string,
+    max: number,
+    section: string,
+    truncated: Set<string>,
+  ): string => {
+    const capped = redactAndCapText(value, max);
+    if (capped.truncated) {
+      truncated.add(section);
+    }
+    return capped.text;
+  };
+
+  /**
+   * The selected element as data: tag, selector, visible text and component
+   * chain, every string redacted before it is capped. The element was
+   * described by the page, so each of its strings is page content that no
+   * checkpoint has redacted yet.
+   */
   const targetSection = (
     target: SelectedTarget | undefined,
     truncated: Set<string>,
@@ -1902,17 +2152,32 @@ export function createContextBuilder(deps: ContextBuilderDeps): ContextBuilder {
       truncated.add('target');
     }
     return {
-      tagName: capSectionText(target.tagName, limits.maxStringChars, 'target', truncated),
-      selector: capSectionText(target.selector, limits.maxStringChars, 'target', truncated),
+      tagName: pageSectionText(target.tagName, limits.maxStringChars, 'target', truncated),
+      selector: pageSectionText(target.selector, limits.maxStringChars, 'target', truncated),
       ...(target.text !== undefined
         ? {
-            text: capSectionText(target.text, limits.maxTargetTextChars, 'target', truncated),
+            text: pageSectionText(target.text, limits.maxTargetTextChars, 'target', truncated),
           }
         : {}),
       componentChain: chain.items.map((name) =>
-        capSectionText(name, limits.maxStringChars, 'target', truncated),
+        pageSectionText(name, limits.maxStringChars, 'target', truncated),
       ),
     };
+  };
+
+  /** The bound tab's address, redacted and then capped, recording `currentUrl` when shortened. */
+  const currentUrlSection = (
+    url: string | undefined,
+    truncated: Set<string>,
+  ): string | undefined => {
+    if (url === undefined) {
+      return undefined;
+    }
+    const capped = redactAndCapUrl(url, limits.maxUrlChars);
+    if (capped.truncated) {
+      truncated.add('currentUrl');
+    }
+    return capped.text;
   };
 
   /** Reads the understand stage's question hints: every own property must be a list of strings. */
@@ -2038,10 +2303,7 @@ export function createContextBuilder(deps: ContextBuilderDeps): ContextBuilder {
       return hints;
     }
     const target = targetSection(context.target, truncated);
-    const currentUrl =
-      context.currentUrl !== undefined
-        ? capSectionText(context.currentUrl, limits.maxUrlChars, 'currentUrl', truncated)
-        : undefined;
+    const currentUrl = currentUrlSection(context.currentUrl, truncated);
     const projectSummary = boundSection(
       request.projectSummary ?? context.code.projectSummary,
       'projectSummary',

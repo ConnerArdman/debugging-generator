@@ -57,9 +57,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  MAX_MODIFICATION_DIFF_LENGTH,
   MODIFICATION_STATUSES,
   OPEN_MODIFICATION_STATUSES,
   SHA256_HEX_PATTERN,
@@ -71,7 +72,13 @@ import type {
   ModificationRecord,
   ModificationStatus,
 } from '@debuggen/instrumentation';
-import { parseSessionRecord } from '@debuggen/protocol';
+import {
+  MODIFICATIONS_PAGE_DIFF_BUDGET,
+  MODIFICATION_DIFF_MAX_BYTES,
+  modificationsDiffBytes,
+  parseSessionRecord,
+  utf8ByteLength,
+} from '@debuggen/protocol';
 import type { SessionRecord, SessionStatus } from '@debuggen/protocol';
 import { DEBUGGEN_ERROR_CODES, isErr, newSessionId, unwrap } from '@debuggen/shared';
 import type {
@@ -90,7 +97,7 @@ import {
   canTransitionModificationStatus,
   createModificationsRepo,
 } from './modifications-repo.js';
-import type { ModificationsRepo } from './modifications-repo.js';
+import type { ModificationCorroborationReader, ModificationsRepo } from './modifications-repo.js';
 import { createSessionsRepo } from './sessions-repo.js';
 import type { SessionsRepo } from './sessions-repo.js';
 
@@ -172,8 +179,8 @@ let logs: CapturedLog[];
 /** The session repository that writes the parent rows the foreign key needs. */
 let sessions: SessionsRepo;
 
-/** The repository under test. */
-let repo: ModificationsRepo;
+/** The repository under test, with the ingest path's metadata-only read. */
+let repo: ModificationsRepo & ModificationCorroborationReader;
 
 /** The synthetic digest handed out for each label in the current test. */
 let digests: Map<string, string>;
@@ -475,6 +482,7 @@ describe('port conformance', () => {
       'append',
       'updateStatus',
       'listBySession',
+      'listPageBySession',
       'listOpen',
       'listAllOpen',
       'get',
@@ -2287,6 +2295,180 @@ describe('queries', () => {
 });
 
 /* -------------------------------------------------------------------------------------------------
+ * The ingest path's metadata-only read
+ * ---------------------------------------------------------------------------------------------- */
+
+describe('listCorroborationsBySession', () => {
+  /** The corroboration facts a full record implies. */
+  function factsOf(records: readonly ModificationRecord[]): object[] {
+    return records.map((record) => ({
+      file: record.file,
+      status: record.status,
+      appliedAt: record.appliedAt,
+    }));
+  }
+
+  it('answers file, status and applied time only, in the append order listBySession keeps', async () => {
+    const applied = await seedInStatus('applied', { file: FILE_ONE });
+    clock += 1_000;
+    // Two appends inside one millisecond: only insertion order tells them apart.
+    const pendingTwo = await appendOk(makeRecord({ file: FILE_TWO }));
+    const pendingThree = await appendOk(makeRecord({ file: 'src/moduleThree.ts' }));
+    await appendOk(makeRecord({ sessionId: SESSION_B, file: FILE_ONE }));
+
+    const listed = unwrap(await repo.listCorroborationsBySession(SESSION_A));
+
+    expect(listed).toStrictEqual(factsOf([applied, pendingTwo, pendingThree]));
+    expect(listed).toStrictEqual(factsOf(unwrap(await repo.listBySession(SESSION_A))));
+    for (const fact of listed) {
+      expect(Object.keys(fact).sort()).toEqual(['appliedAt', 'file', 'status']);
+    }
+  });
+
+  it('keeps other sessions out and answers an empty list for a session with no records', async () => {
+    await appendOk(makeRecord({ sessionId: SESSION_B, file: FILE_ONE }));
+
+    expect(unwrap(await repo.listCorroborationsBySession(SESSION_A))).toEqual([]);
+    expect(unwrap(await repo.listCorroborationsBySession(SESSION_C))).toEqual([]);
+    expect(unwrap(await repo.listCorroborationsBySession(SESSION_B))).toHaveLength(1);
+  });
+
+  it('selects none of the columns only a restore or a display needs', async () => {
+    await appendOk(makeRecord({ diff: `${DIFF}\n+// ${SENTINEL}` }));
+    const statements: string[] = [];
+    const reader = createModificationsRepo({ store: recordingStore(store, statements) });
+
+    const listed = unwrap(await reader.listCorroborationsBySession(SESSION_A));
+
+    expect(listed).toHaveLength(1);
+    expect(statements).toHaveLength(1);
+    for (const sql of statements) {
+      for (const column of ['diff', 'backup_path', 'original_hash', 'instrumented_hash']) {
+        expect(sql).not.toContain(column);
+      }
+    }
+    expect(JSON.stringify(listed)).not.toContain(SENTINEL);
+  });
+
+  it('fails the read on a corrupt column, naming the column and never the value', async () => {
+    insertCorruptRow('mod_corruptfile0000', '', `${DIFF}\n+// ${SENTINEL}`);
+
+    const blankFile = await repo.listCorroborationsBySession(SESSION_A);
+
+    const fileError = expectRefusal(blankFile, 'STORE_ERROR');
+    expect(fileError.details).toMatchObject({
+      operation: 'listCorroborationsBySession',
+      column: 'file',
+    });
+    expect(errorText(fileError)).not.toContain(SENTINEL);
+
+    store.statement('DELETE FROM modifications WHERE id = ?').run('mod_corruptfile0000');
+    const record = await appendOk(makeRecord({ sessionId: SESSION_D }));
+    // Only a writer that switched the CHECK constraint off can store this status.
+    store.db.exec('PRAGMA ignore_check_constraints = ON');
+    store
+      .statement('UPDATE modifications SET status = ? WHERE id = ?')
+      .run('status-from-elsewhere', record.id);
+    store.db.exec('PRAGMA ignore_check_constraints = OFF');
+
+    const statusError = expectRefusal(
+      await repo.listCorroborationsBySession(SESSION_D),
+      'STORE_ERROR',
+    );
+    expect(statusError.details).toMatchObject({
+      operation: 'listCorroborationsBySession',
+      column: 'status',
+    });
+    expect(errorText(statusError)).not.toContain('status-from-elsewhere');
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * The source resolver's per-file patch evidence
+ * ---------------------------------------------------------------------------------------------- */
+
+describe('listPatchEvidenceBySessionFile', () => {
+  /** The patch evidence a full record implies. */
+  function evidenceOf(records: readonly ModificationRecord[]): object[] {
+    return records.map((record) => ({
+      file: record.file,
+      status: record.status,
+      appliedAt: record.appliedAt,
+      diff: record.diff,
+    }));
+  }
+
+  it('answers file, status, applied time and diff of one file only, in append order', async () => {
+    const applied = await seedInStatus('applied', { file: FILE_ONE, diff: `${DIFF}\n+// one` });
+    await appendOk(makeRecord({ file: FILE_TWO }));
+    // A delta of the same file, chained to the record it builds on.
+    const delta = await appendOk(
+      makeRecord({
+        file: FILE_ONE,
+        planVersion: 2,
+        originalHash: applied.instrumentedHash,
+        instrumentedHash: hashOf('instrumented:plan-2'),
+        previousRecordId: applied.id,
+        diff: `${DIFF}\n+// two`,
+      }),
+    );
+    await appendOk(makeRecord({ sessionId: SESSION_B, file: FILE_ONE }));
+
+    const listed = unwrap(await repo.listPatchEvidenceBySessionFile(SESSION_A, FILE_ONE));
+
+    expect(listed).toStrictEqual(evidenceOf([applied, delta]));
+    for (const fact of listed) {
+      expect(Object.keys(fact).sort()).toEqual(['appliedAt', 'diff', 'file', 'status']);
+    }
+  });
+
+  it('matches the stored file exactly and keeps other sessions out', async () => {
+    await appendOk(makeRecord({ file: FILE_ONE }));
+    await appendOk(makeRecord({ sessionId: SESSION_B, file: FILE_TWO }));
+
+    expect(unwrap(await repo.listPatchEvidenceBySessionFile(SESSION_A, `./${FILE_ONE}`))).toEqual(
+      [],
+    );
+    expect(
+      unwrap(await repo.listPatchEvidenceBySessionFile(SESSION_A, FILE_ONE.toUpperCase())),
+    ).toEqual([]);
+    expect(unwrap(await repo.listPatchEvidenceBySessionFile(SESSION_A, FILE_TWO))).toEqual([]);
+    expect(unwrap(await repo.listPatchEvidenceBySessionFile(SESSION_C, FILE_ONE))).toEqual([]);
+    expect(unwrap(await repo.listPatchEvidenceBySessionFile(SESSION_B, FILE_TWO))).toHaveLength(1);
+  });
+
+  it('reads with one statement that names no restore-only column', async () => {
+    await appendOk(makeRecord({ file: FILE_ONE }));
+    const statements: string[] = [];
+    const reader = createModificationsRepo({ store: recordingStore(store, statements) });
+
+    expect(unwrap(await reader.listPatchEvidenceBySessionFile(SESSION_A, FILE_ONE))).toHaveLength(
+      1,
+    );
+    expect(statements).toHaveLength(1);
+    for (const sql of statements) {
+      for (const column of ['backup_path', 'original_hash', 'instrumented_hash']) {
+        expect(sql).not.toContain(column);
+      }
+    }
+  });
+
+  it('fails the read on a corrupt column, naming the column and never the value', async () => {
+    insertCorruptRow('mod_corruptfile0000', '', `${DIFF}\n+// ${SENTINEL}`);
+
+    const refused = expectRefusal(
+      await repo.listPatchEvidenceBySessionFile(SESSION_A, ''),
+      'STORE_ERROR',
+    );
+    expect(refused.details).toMatchObject({
+      operation: 'listPatchEvidenceBySessionFile',
+      column: 'file',
+    });
+    expect(errorText(refused)).not.toContain(SENTINEL);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
  * Privacy
  * ---------------------------------------------------------------------------------------------- */
 
@@ -2613,3 +2795,353 @@ function insertCorruptRow(id: string, file: string, diff: string): void {
       diff,
     );
 }
+
+/**
+ * A {@link Store} that records the text of every statement the repository
+ * prepares and otherwise behaves exactly as `target`: the seam that shows
+ * which columns a read asks SQLite for.
+ */
+function recordingStore(target: Store, sink: string[]): Store {
+  return {
+    get path(): string {
+      return target.path;
+    },
+    get db(): DatabaseSync {
+      return target.db;
+    },
+    get schemaVersion(): number {
+      return target.schemaVersion;
+    },
+    get isClosed(): boolean {
+      return target.isClosed;
+    },
+    statement(sql: string) {
+      sink.push(sql);
+      return target.statement(sql);
+    },
+    transaction<T>(fn: () => T): T {
+      return target.transaction(fn);
+    },
+    checkpoint(): void {
+      target.checkpoint();
+    },
+    close(): void {
+      target.close();
+    },
+  };
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * listPageBySession — one diff-budgeted page of the journal
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * A diff of exactly `length` UTF-16 code units: the fixture diff, padded with
+ * `filler`, so the journal accepts it as the patcher's output.
+ *
+ * @param length The diff's `string.length`; at least the fixture diff's.
+ * @param filler One code unit of padding — `'+'` is one UTF-8 byte, `'€'` three.
+ * @returns The diff.
+ */
+function diffOfLength(length: number, filler = '+'): string {
+  return length <= DIFF.length ? DIFF : `${DIFF}${filler.repeat(length - DIFF.length)}`;
+}
+
+/** One statement call the page read made, as {@link recordStatementCalls} saw it. */
+interface StatementCall {
+  readonly sql: string;
+  readonly method: string;
+  readonly args: readonly unknown[];
+}
+
+/**
+ * Records every statement the store prepares for the rest of the test, and
+ * every `get`, `all` and `iterate` call made on it with its bound values — so
+ * a test can say which rows a read asked SQLite for, not only what it returned.
+ *
+ * @returns The calls, in order; filled as the test runs.
+ */
+function recordStatementCalls(): StatementCall[] {
+  const calls: StatementCall[] = [];
+  const statement = store.statement.bind(store);
+
+  vi.spyOn(store, 'statement').mockImplementation((sql: string) => {
+    const prepared = statement(sql);
+
+    return new Proxy(prepared, {
+      get(target, property, receiver): unknown {
+        const value: unknown = Reflect.get(target, property, receiver);
+
+        if (
+          typeof value === 'function' &&
+          (property === 'get' || property === 'all' || property === 'iterate')
+        ) {
+          return (...args: unknown[]): unknown => {
+            calls.push({ sql, method: property, args });
+            return Reflect.apply(value, target, args);
+          };
+        }
+
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+  });
+
+  return calls;
+}
+
+/** How many files {@link appendJournal} has patched, so every call names fresh ones. */
+let pagedFiles = 0;
+
+/**
+ * Appends `count` records of one session, each patching a file no earlier
+ * record patched so no chain rule applies, each carrying `diff` itself when
+ * it is a string, or the fixture diff padded to `diff` code units
+ * ({@link diffOfLength}) when it is a number.
+ *
+ * @param count How many records to append.
+ * @param diff Every record's diff, or its length in code units.
+ * @param sessionId The owning session.
+ * @returns The records as journalled, in append order.
+ */
+async function appendJournal(
+  count: number,
+  diff: number | string = DIFF.length,
+  sessionId: SessionId = SESSION_A,
+): Promise<ModificationRecord[]> {
+  const appended: ModificationRecord[] = [];
+
+  for (let index = 0; index < count; index += 1) {
+    pagedFiles += 1;
+    appended.push(
+      await appendOk(
+        makeRecord({
+          sessionId,
+          file: `src/paged${String(pagedFiles)}.ts`,
+          diff: typeof diff === 'number' ? diffOfLength(diff) : diff,
+        }),
+      ),
+    );
+  }
+
+  return appended;
+}
+
+describe('listPageBySession', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('pages the journal in the application order listBySession uses, with its total', async () => {
+    // Two appends share a millisecond: the rowid tie-breaker keeps append order.
+    const first = await appendJournal(2);
+    clock += 1;
+    const rest = await appendJournal(3);
+    await appendJournal(2, DIFF.length, SESSION_B);
+
+    const pages = [
+      unwrap(await repo.listPageBySession(SESSION_A, { limit: 2, offset: 0 })),
+      unwrap(await repo.listPageBySession(SESSION_A, { limit: 2, offset: 2 })),
+      unwrap(await repo.listPageBySession(SESSION_A, { limit: 2, offset: 4 })),
+    ];
+    const whole = unwrap(await repo.listBySession(SESSION_A));
+
+    expect(pages.map((page) => page.total)).toEqual([5, 5, 5]);
+    expect(pages.map((page) => page.records.length)).toEqual([2, 2, 1]);
+    expect(pages.flatMap((page) => page.records)).toEqual(whole);
+    expect(whole.map((record) => record.id)).toEqual(
+      [...first, ...rest].map((record) => record.id),
+    );
+    expect(pages.flatMap((page) => page.records).every((r) => r.sessionId === SESSION_A)).toBe(
+      true,
+    );
+  });
+
+  it('ends a page early rather than let its diffs exceed the default budget in UTF-8 bytes', async () => {
+    // A million code units of '€' each: three bytes a unit, so two diffs fit
+    // the 6 MiB budget and a third does not — although all three together hold
+    // fewer code units than the budget, which a code-unit measure would admit.
+    const records = await appendJournal(3, diffOfLength(1_000_000, '€'));
+    expect(records.reduce((units, record) => units + record.diff.length, 0)).toBeLessThan(
+      MODIFICATIONS_PAGE_DIFF_BUDGET,
+    );
+
+    const head = unwrap(await repo.listPageBySession(SESSION_A, { limit: 256, offset: 0 }));
+    const tail = unwrap(await repo.listPageBySession(SESSION_A, { limit: 256, offset: 2 }));
+
+    expect(head.total).toBe(3);
+    expect(head.records.map((record) => record.id)).toEqual(
+      records.slice(0, 2).map((record) => record.id),
+    );
+    expect(modificationsDiffBytes(head.records)).toBeLessThanOrEqual(
+      MODIFICATIONS_PAGE_DIFF_BUDGET,
+    );
+    expect(modificationsDiffBytes([...head.records, ...tail.records])).toBeGreaterThan(
+      MODIFICATIONS_PAGE_DIFF_BUDGET,
+    );
+    expect(tail.records.map((record) => record.id)).toEqual([records[2]?.id]);
+  });
+
+  it('always carries at least one record, even when one diff fills the whole budget', async () => {
+    // The largest diff the journal accepts, in bytes: every code unit '€'.
+    const records = await appendJournal(3, '€'.repeat(MAX_MODIFICATION_DIFF_LENGTH));
+    expect(MODIFICATIONS_PAGE_DIFF_BUDGET).toBe(MODIFICATION_DIFF_MAX_BYTES);
+
+    for (const [offset, record] of records.entries()) {
+      const page = unwrap(await repo.listPageBySession(SESSION_A, { limit: 256, offset }));
+
+      expect(page.records.map((kept) => kept.id)).toEqual([record.id]);
+      expect(modificationsDiffBytes(page.records)).toBe(MODIFICATION_DIFF_MAX_BYTES);
+    }
+  });
+
+  it('measures the record that ends a page and never reads it: no diff past the page is loaded', async () => {
+    await appendJournal(2, diffOfLength(1_000_000, '€'));
+    // The row past the budget is corrupt: reading it as a record would fail the page.
+    insertCorruptRow('mod_corruptpast0budget', 'src/pastBudget.ts', diffOfLength(1_000_000));
+    const calls = recordStatementCalls();
+
+    const head = unwrap(await repo.listPageBySession(SESSION_A, { limit: 256, offset: 0 }));
+
+    expect(head.records).toHaveLength(2);
+    expect(head.total).toBe(3);
+
+    // Three statements: the count, the measure, and a full read of exactly the
+    // two records the measure kept — the third row's diff was never asked for.
+    expect(calls.map((call) => call.method)).toEqual(['get', 'iterate', 'all']);
+    const [, measure, read] = calls;
+    expect(measure?.sql).toMatch(
+      /^SELECT id, octet_length\(diff\) AS diff_bytes FROM modifications/,
+    );
+    expect(measure?.args).toEqual([SESSION_A, 256, 0]);
+    expect(read?.sql).toMatch(/\bdiff\b/);
+    expect(read?.args).toEqual([SESSION_A, 2, 0]);
+
+    // The next page reads it as a record, and refuses it as corrupt.
+    const next = await repo.listPageBySession(SESSION_A, { limit: 256, offset: 2 });
+    const error = expectRefusal(next, 'STORE_ERROR');
+    expect(error.details?.['recordId']).toBe('mod_corruptpast0budget');
+  });
+
+  it('answers each diff length from the row header, without loading the diff', async () => {
+    await appendJournal(1);
+    const calls = recordStatementCalls();
+
+    unwrap(await repo.listPageBySession(SESSION_A, { limit: 1, offset: 0 }));
+
+    const measure = calls.find((call) => call.sql.includes('octet_length'));
+    expect(measure).toBeDefined();
+    // `EXPLAIN` exposes the opcode that reads `diff`: its P5 carries
+    // OPFLAG_BYTELENARG (0xc0), SQLite's instruction to compute the byte length
+    // from the record header rather than load the value.
+    const program = store.db
+      .prepare(`EXPLAIN ${measure?.sql ?? ''}`)
+      .all(SESSION_A, 1, 0)
+      .map((row) => ({ opcode: row['opcode'], p5: row['p5'] }));
+    expect(program).toContainEqual({ opcode: 'Column', p5: 0xc0 });
+  });
+
+  it('measures diffs in UTF-8 bytes, exactly as protocol counts them', async () => {
+    const samples = [
+      'plain ASCII text',
+      'two-byte é ü ß',
+      'three-byte € 中文',
+      'four-byte 𝄞 𐍈',
+      'emoji 😀 👩‍💻 🇪🇺',
+      'lone surrogate \ud800 stored as U+FFFD',
+    ];
+
+    for (const sample of samples) {
+      const measured = store.db.prepare('SELECT octet_length(?) AS bytes').get(sample)?.['bytes'];
+      expect(measured, sample).toBe(utf8ByteLength(sample));
+    }
+
+    // And for journalled diffs, as the page measures them.
+    const records = await appendJournal(1, `${DIFF}+// ${samples.join(' ')}\n`);
+    const stored = store.db
+      .prepare('SELECT octet_length(diff) AS bytes FROM modifications WHERE id = ?')
+      .get(records[0]?.id ?? '')?.['bytes'];
+    expect(stored).toBe(modificationsDiffBytes(records));
+    expect(stored).toBeGreaterThan(records[0]?.diff.length ?? 0);
+  });
+
+  it('refuses a first record whose diff alone exceeds the budget as a corrupt row', async () => {
+    // Only a row written past the journal's validation can measure this much.
+    insertCorruptRow(
+      'mod_oversizeddiff0',
+      'src/oversized.ts',
+      '€'.repeat(MAX_MODIFICATION_DIFF_LENGTH + 1),
+    );
+
+    const error = expectRefusal(
+      await repo.listPageBySession(SESSION_A, { limit: 10, offset: 0 }),
+      'STORE_ERROR',
+    );
+
+    expect(error.details?.['recordId']).toBe('mod_oversizeddiff0');
+    expect(error.cause).toMatchObject({
+      details: {
+        reason: 'diff-over-cap',
+        diffBytes: 3 * (MAX_MODIFICATION_DIFF_LENGTH + 1),
+        budgetBytes: MODIFICATIONS_PAGE_DIFF_BUDGET,
+      },
+    });
+    expect(JSON.stringify(error)).not.toContain('€');
+  });
+
+  it('counts without reading a record for limit 0, and answers an empty page past the end', async () => {
+    await appendJournal(3);
+    const prepared: string[] = [];
+    const statement = store.statement.bind(store);
+    vi.spyOn(store, 'statement').mockImplementation((sql: string) => {
+      prepared.push(sql);
+      return statement(sql);
+    });
+
+    expect(unwrap(await repo.listPageBySession(SESSION_A, { limit: 0, offset: 0 }))).toEqual({
+      records: [],
+      total: 3,
+    });
+    expect(unwrap(await repo.listPageBySession(SESSION_A, { limit: 10, offset: 3 }))).toEqual({
+      records: [],
+      total: 3,
+    });
+    expect(unwrap(await repo.listPageBySession(SESSION_A, { limit: 10, offset: 99 }))).toEqual({
+      records: [],
+      total: 3,
+    });
+    expect(prepared).toHaveLength(3);
+    expect(prepared.every((sql) => sql.startsWith('SELECT COUNT(*)'))).toBe(true);
+    expect(unwrap(await repo.listPageBySession(SESSION_C, { limit: 10, offset: 0 }))).toEqual({
+      records: [],
+      total: 0,
+    });
+  });
+
+  it('refuses a window outside its domain without reading anything', async () => {
+    await appendJournal(1);
+
+    for (const window of [
+      { limit: -1, offset: 0 },
+      { limit: 1.5, offset: 0 },
+      { limit: 10, offset: -1 },
+      { limit: 10, offset: Number.MAX_SAFE_INTEGER + 1 },
+      { limit: 10, offset: 0, maxDiffBytes: MODIFICATION_DIFF_MAX_BYTES - 1 },
+      // The code-unit cap is no longer enough: a page of it could not hold one
+      // diff of three-byte characters.
+      { limit: 10, offset: 0, maxDiffBytes: MAX_MODIFICATION_DIFF_LENGTH },
+    ]) {
+      const error = expectRefusal(await repo.listPageBySession(SESSION_A, window), 'STORE_ERROR');
+      expect(error.details?.['reason']).toBe('invalid-argument');
+    }
+  });
+
+  it('never logs a diff it pages', async () => {
+    await appendOk(makeRecord({ file: 'src/sentinel.ts', diff: SENTINEL_DIFF }));
+
+    const page = unwrap(await repo.listPageBySession(SESSION_A, { limit: 10, offset: 0 }));
+
+    expect(page.records[0]?.diff).toContain(SENTINEL);
+    expect(loggedText()).not.toContain(SENTINEL);
+  });
+});

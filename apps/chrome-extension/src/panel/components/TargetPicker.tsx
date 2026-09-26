@@ -19,21 +19,43 @@
  *   `onUseSelected`. The composition root binds them to the worker's
  *   `target.pick` and `target.selected` port requests. This file opens no port,
  *   no socket and no HTTP request, and writes nothing to the panel store.
- * - Reading the Elements panel's selection is the devtools page's job
+ * - Reading the Elements panel's selection is not this component's job
  *   (AAP 0.1.1, 0.7.1 Group 4). This file never evaluates anything in the
- *   inspected page and calls no `chrome.devtools` method: a second copy of that
- *   evaluation would drift from the one that matters, and would put a
- *   DevTools-only API into a document that must render without DevTools.
+ *   inspected page and reads no `chrome` global at all: the composition root
+ *   owns host detection and the evaluation, so this component renders the same
+ *   way in DevTools, in a plain extension page and under a unit test.
  *
- * ## Rendering without DevTools (AAP 0.8.3)
+ * ## When the controls are unavailable
  *
- * `tests/browser/panel-render.spec.ts` opens `panel.html` as a plain extension
- * page, where `chrome.devtools` is undefined. The composition root normally
- * says whether DevTools is present through `devtoolsAvailable`; only when it
- * does not, a defensive read decides — a `typeof` guard on `chrome`, then the
- * store's own never-throwing `readInspectedTabId`, which reads properties and
- * calls nothing. Absent DevTools, both controls render unavailable with a
- * `Tooltip` saying why; nothing throws and nothing blanks.
+ * Two facts the composition root knows decide it, in this order, and each has
+ * its own `Tooltip` explanation:
+ *
+ * 1. **DevTools is absent** (`devtoolsAvailable` false). AAP 0.8.3:
+ *    `tests/browser/panel-render.spec.ts` opens `panel.html` as a plain
+ *    extension page, where `chrome.devtools` is undefined; nothing throws and
+ *    nothing blanks.
+ * 2. **No session is bound to the inspected tab** (`sessionBound` false). Both
+ *    requests address the bound session, and the worker refuses either one
+ *    for a tab no session holds, so pressing them could only fail. The
+ *    tooltip says what to do instead.
+ *
+ * ## One element-targeting request at a time
+ *
+ * "Pick element" and "Use selected element" both change the session's target,
+ * so they share a single in-flight state: while a promise returned by either
+ * callback is pending, **both** controls are unavailable, report `aria-busy`
+ * and ignore presses, and the status region announces the wait. Neither can
+ * race the other, and the sibling of the pressed control says so too. The
+ * in-flight flag is a ref as well as state: two presses within one frame both
+ * run before React re-renders, and the second must see the first.
+ *
+ * A request can also outlive the promise its callback returned: "Use selected
+ * element" resolves on the service's verdict, but the optimistic pick stays on
+ * screen until the session record confirming it reaches the store. The
+ * composition root tracks that wait and passes it as the `busy` prop, which
+ * puts both controls in the same busy state. The two sources are combined,
+ * never substituted: the controls are busy while either one says so, and this
+ * component clears only the state it tracks itself.
  *
  * ## Unavailable controls stay reachable
  *
@@ -62,22 +84,27 @@
  *
  * Every value comes from the `SelectedTarget` the service confirmed or the
  * panel optimistically picked, and nothing else: `tagName` as a `Badge`, the
- * `selector` and the `url` byte-for-byte in `Code`, the optional visible `text`
- * as single-line `Text` with the full value in its `title`, and the
+ * `selector` and the `url` as given in `Code`, the optional visible `text` as
+ * single-line `Text` with the full value in its `title`, and the
  * `componentChain` — the React owner chain, nearest first — in the array's own
  * order with decorative separators. An absent `text` renders nothing; an empty
  * chain is the honest "no component information" answer and says so.
  *
- * The descriptor arrives already redacted (AAP 0.5.2): it is rendered as given,
- * never redacted again, rebuilt, decoded or logged.
+ * The composition root hands this component a descriptor that is already
+ * bounded by the shared `$0` descriptor parser and prepared for display
+ * (AAP 0.5.2): credential shapes are removed from every page-controlled field —
+ * `text`, `selector`, `tagName`, each component name, and the URL's userinfo,
+ * path and query keys — and query values and the fragment are masked. It is
+ * rendered as given, never redacted again, rebuilt, decoded or logged here.
  *
  * ## Failures belong to the caller
  *
- * A callback may return a promise. While it is pending the control reports
- * `aria-busy` and ignores further presses; when it settles either way the
- * control is operable again. A rejection is not caught here: it is re-surfaced
- * unchanged to the composition root, which owns error presentation — this
- * component neither swallows it nor renders an error of its own.
+ * A callback may return a promise. When it settles either way the controls are
+ * operable again. A synchronous throw or a rejection is handed, with the
+ * control that raised it, to `onActionError` — the composition root's error
+ * sink — and to nothing else: no detached promise is left rejecting, so the
+ * document never sees an unhandled rejection, and this component renders no
+ * error of its own.
  *
  * ## Design-system compliance (AAP 0.6.4)
  *
@@ -94,8 +121,6 @@ import { Badge, Button, Code, Stack, Text, Tooltip } from '@debuggen/panel-rende
 import type { SelectedTarget } from '@debuggen/protocol';
 import { useCallback, useRef, useState } from 'react';
 import type { ReactElement } from 'react';
-
-import { readInspectedTabId } from '../state/connection';
 
 /*
  * ===========================================================================
@@ -120,6 +145,16 @@ const USE_SELECTED_DESCRIPTION =
 /** Why both controls are unavailable when the panel is not hosted by DevTools. */
 const UNAVAILABLE_DESCRIPTION =
   'Element selection needs the Debug Generator panel in Chrome DevTools. Open DevTools on the page you are debugging and choose the Debug Generator tab.';
+
+/** Why both controls are unavailable while no session is bound to the inspected tab. */
+const NO_SESSION_DESCRIPTION =
+  'Element selection needs a Debug Generator session bound to this tab. Start one from the Debug Generator view in VS Code; these controls become available once this panel is bound.';
+
+/** Why both controls are unavailable while an element-targeting request is in flight. */
+const BUSY_DESCRIPTION = 'Waiting for the current element-targeting request to finish.';
+
+/** Announced politely while an element-targeting request is in flight. */
+const BUSY_ANNOUNCEMENT = 'Updating the session target.';
 
 /** The visible word for picker mode being on, beside the pressed surface. */
 const PICKER_ON_LABEL = 'Picker on';
@@ -166,6 +201,9 @@ const VISUALLY_HIDDEN_CLASS = 'dg-visually-hidden';
  * ===========================================================================
  */
 
+/** Which of the two controls raised a failure handed to `onActionError`. */
+export type TargetPickerAction = 'pick' | 'useSelected';
+
 /**
  * Props of {@link TargetPicker}.
  *
@@ -200,14 +238,34 @@ export interface TargetPickerProps {
   onUseSelected: () => Promise<void> | void;
 
   /**
-   * Whether the panel is hosted by DevTools, as the composition root knows it.
-   * When omitted, a defensive local read of `chrome.devtools` decides.
+   * Whether the panel is hosted by DevTools, as the composition root detected
+   * it. `false` renders both controls unavailable with an explanation; this
+   * component never reads a `chrome` global to find out for itself.
    */
-  devtoolsAvailable?: boolean | undefined;
+  devtoolsAvailable: boolean;
 
   /**
-   * An element-targeting request the caller tracks is in flight: both controls
-   * report `aria-busy` and ignore presses until it clears.
+   * Whether a session is bound to the inspected tab. Both requests address the
+   * bound session, so `false` renders both controls unavailable with an
+   * explanation of how to start one, instead of letting a press fail.
+   */
+  sessionBound: boolean;
+
+  /**
+   * The composition root's error sink: receives a callback's synchronous throw
+   * or rejection, with the control that raised it. It must not throw. Nothing
+   * else sees the failure — this component neither re-raises it nor renders it.
+   */
+  onActionError: (action: TargetPickerAction, cause: unknown) => void;
+
+  /**
+   * Whether an element-targeting request the composition root tracks is still
+   * in flight after the callback's own promise settled — the optimistic pick
+   * of "Use selected element" awaiting the session record that confirms it.
+   * While `true`, both controls take the same busy state as for a pending
+   * callback: `aria-busy`, unavailable, presses ignored, the wait announced.
+   * The caller owns this flag and clears it; omitted, only the callbacks'
+   * promises make the controls busy.
    *
    * @default false
    */
@@ -261,73 +319,88 @@ function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
 }
 
 /**
- * The `chrome.devtools` namespace when this document has one, else `undefined`.
+ * Why both controls are unavailable, or `undefined` when they can be used — in
+ * the documented precedence: DevTools absent, then no bound session.
  *
- * AAP 0.8.3: `tests/browser/panel-render.spec.ts` opens `panel.html` as a plain
- * extension page, where `chrome.devtools` is undefined, and a unit suite may run
- * with no `chrome` global at all — hence the `typeof` guard before any read.
- * Only properties are read, by {@link readInspectedTabId}; nothing is called.
+ * @param devtoolsAvailable Whether DevTools hosts the panel.
+ * @param sessionBound Whether a session is bound to the inspected tab.
  */
-function readChromeDevtools(): unknown {
-  return typeof chrome === 'undefined' ? undefined : chrome.devtools;
+function unavailableReason(devtoolsAvailable: boolean, sessionBound: boolean): string | undefined {
+  if (!devtoolsAvailable) {
+    return UNAVAILABLE_DESCRIPTION;
+  }
+  if (!sessionBound) {
+    return NO_SESSION_DESCRIPTION;
+  }
+  return undefined;
+}
+
+/** The one in-flight element-targeting request both controls share. */
+interface SharedTargetAction {
+  /** The control whose returned promise has not settled yet, or `undefined`. */
+  readonly running: TargetPickerAction | undefined;
+  /** Invokes `callback` for `action` unless unavailable or a request is in flight. */
+  readonly run: (action: TargetPickerAction, callback: () => Promise<void> | void) => void;
 }
 
 /**
- * The fallback answer to "is this panel hosted by DevTools": only when an
- * inspected tab id can be read. Never throws — `readInspectedTabId` treats a
- * missing or throwing API as absent.
- */
-function detectDevtoolsAvailable(): boolean {
-  return readInspectedTabId(readChromeDevtools) !== undefined;
-}
-
-/** A control's callback, tracked while the promise it returned is pending. */
-interface TrackedAction {
-  /** Whether a promise returned by the callback has not settled yet. */
-  readonly pending: boolean;
-  /** Invokes the callback unless blocked or already in flight. */
-  readonly run: () => void;
-}
-
-/**
- * Tracks one control's callback so the control can report `aria-busy` while
- * the promise it returned is pending, and ignore presses meanwhile.
+ * Tracks the element-targeting request of **both** controls in one state, so
+ * that while a promise returned by either callback is pending, neither
+ * control starts another one and both can say so.
  *
  * The in-flight flag is a ref as well as state: two presses within one frame
  * both run before React re-renders, and the second must see the first.
  *
- * A synchronous throw propagates out of the handler untouched. A rejection is
- * re-surfaced, not caught: `finally` clears the busy state and hands back a
- * promise that rejects with the caller's own reason, so an error the caller
- * did not handle reaches the document exactly as it would without this
- * component in between.
+ * Failures are settled here rather than re-raised: a synchronous throw, or a
+ * rejection, is handed to `onActionError` with the control that raised it. The
+ * returned promise is consumed with both `then` branches, so settling the
+ * pending state never creates a second, detached promise that rejects — which
+ * `finally` would, and which the document would report as an unhandled
+ * rejection.
  *
- * @param action The injected callback.
- * @param blocked Whether presses are currently refused (unavailable or busy).
- * @returns The pending flag and the guarded handler.
+ * @param unavailable Whether presses are refused regardless of this hook's own
+ *   request: the controls are unavailable, or the caller tracks a request that
+ *   is still in flight.
+ * @param onActionError The composition root's error sink.
+ * @returns The running control and the guarded invoker.
  */
-function useTrackedAction(action: () => Promise<void> | void, blocked: boolean): TrackedAction {
-  const [pending, setPending] = useState(false);
+function useSharedTargetAction(
+  unavailable: boolean,
+  onActionError: (action: TargetPickerAction, cause: unknown) => void,
+): SharedTargetAction {
+  const [running, setRunning] = useState<TargetPickerAction | undefined>(undefined);
   const inFlightRef = useRef(false);
 
-  const run = useCallback(() => {
-    if (blocked || inFlightRef.current) {
-      return;
-    }
-    const outcome = action();
-    if (!isPromiseLike(outcome)) {
-      return;
-    }
-    inFlightRef.current = true;
-    setPending(true);
-    const settle = (): void => {
-      inFlightRef.current = false;
-      setPending(false);
-    };
-    void Promise.resolve(outcome).finally(settle);
-  }, [action, blocked]);
+  const run = useCallback(
+    (action: TargetPickerAction, callback: () => Promise<void> | void): void => {
+      if (unavailable || inFlightRef.current) {
+        return;
+      }
+      let outcome: unknown;
+      try {
+        outcome = callback();
+      } catch (cause: unknown) {
+        onActionError(action, cause);
+        return;
+      }
+      if (!isPromiseLike(outcome)) {
+        return;
+      }
+      inFlightRef.current = true;
+      setRunning(action);
+      const settle = (): void => {
+        inFlightRef.current = false;
+        setRunning(undefined);
+      };
+      void Promise.resolve(outcome).then(settle, (cause: unknown) => {
+        settle();
+        onActionError(action, cause);
+      });
+    },
+    [unavailable, onActionError],
+  );
 
-  return { pending, run };
+  return { running, run };
 }
 
 /*
@@ -440,10 +513,14 @@ function TargetDescriptor(props: TargetDescriptorProps): ReactElement {
  * @example
  * // The composition root, reading the store and binding the port requests:
  * <TargetPicker
- *   target={snapshot.target.pending ?? snapshot.session?.target}
- *   pickerActive={pickerActive}
+ *   target={displayTarget}
+ *   pickerActive={snapshot.target.pickRequested}
+ *   busy={snapshot.target.pending !== undefined}
  *   onPick={togglePicker}
- *   onUseSelected={applySelectedElement}
+ *   onUseSelected={adoptSelectedElement}
+ *   devtoolsAvailable={devtoolsAvailable}
+ *   sessionBound={snapshot.connection.binding.kind === 'bound'}
+ *   onActionError={reportTargetActionFailure}
  * />
  */
 export function TargetPicker(props: TargetPickerProps): ReactElement {
@@ -453,44 +530,65 @@ export function TargetPicker(props: TargetPickerProps): ReactElement {
     onPick,
     onUseSelected,
     devtoolsAvailable,
-    busy = false,
+    sessionBound,
+    onActionError,
+    busy: trackedByCaller = false,
     className,
   } = props;
 
-  // The composition root's answer wins; the defensive read is the fallback only.
-  const available = devtoolsAvailable ?? detectDevtoolsAvailable();
-  const blocked = !available || busy;
+  const reason = unavailableReason(devtoolsAvailable, sessionBound);
+  const shared = useSharedTargetAction(reason !== undefined || trackedByCaller, onActionError);
+  // Busy while either source says so: a callback's promise this component
+  // tracks, or a request the composition root still tracks after it settled.
+  const busy = shared.running !== undefined || trackedByCaller;
+  // Unavailable for either cause, or waiting on a request of either control:
+  // both controls take the same state, so neither invites a racing press.
+  const blocked = reason !== undefined || busy;
+  const { run } = shared;
 
-  const pickAction = useTrackedAction(onPick, blocked);
-  const selectedAction = useTrackedAction(onUseSelected, blocked);
+  const handlePick = useCallback((): void => {
+    run('pick', onPick);
+  }, [run, onPick]);
+  const handleUseSelected = useCallback((): void => {
+    run('useSelected', onUseSelected);
+  }, [run, onUseSelected]);
+
+  const pickDescription = reason ?? (busy ? BUSY_DESCRIPTION : PICK_DESCRIPTION);
+  const useSelectedDescription = reason ?? (busy ? BUSY_DESCRIPTION : USE_SELECTED_DESCRIPTION);
+  let announcement = '';
+  if (busy) {
+    announcement = BUSY_ANNOUNCEMENT;
+  } else if (pickerActive) {
+    announcement = PICKER_ON_ANNOUNCEMENT;
+  }
 
   return (
     <Stack direction="horizontal" gap={2} align="center" wrap className={className}>
-      <Tooltip content={available ? PICK_DESCRIPTION : UNAVAILABLE_DESCRIPTION}>
+      <Tooltip content={pickDescription}>
         <Button
           variant="secondary"
           size="sm"
           aria-pressed={pickerActive}
-          aria-disabled={available ? undefined : true}
-          aria-busy={available && (busy || pickAction.pending) ? true : undefined}
+          aria-disabled={blocked ? true : undefined}
+          aria-busy={busy ? true : undefined}
           className={joinClassNames(
             pickerActive && ACTIVE_STATE_CLASS,
-            !available && DISABLED_STATE_CLASS,
+            blocked && DISABLED_STATE_CLASS,
           )}
-          onClick={pickAction.run}
+          onClick={handlePick}
         >
           {PICK_LABEL}
         </Button>
       </Tooltip>
 
-      <Tooltip content={available ? USE_SELECTED_DESCRIPTION : UNAVAILABLE_DESCRIPTION}>
+      <Tooltip content={useSelectedDescription}>
         <Button
           variant="secondary"
           size="sm"
-          aria-disabled={available ? undefined : true}
-          aria-busy={available && (busy || selectedAction.pending) ? true : undefined}
-          className={joinClassNames(!available && DISABLED_STATE_CLASS)}
-          onClick={selectedAction.run}
+          aria-disabled={blocked ? true : undefined}
+          aria-busy={busy ? true : undefined}
+          className={joinClassNames(blocked && DISABLED_STATE_CLASS)}
+          onClick={handleUseSelected}
         >
           {USE_SELECTED_LABEL}
         </Button>
@@ -505,7 +603,7 @@ export function TargetPicker(props: TargetPickerProps): ReactElement {
       {/* Always mounted, so a change of content is announced; out of flow, so
           it takes no gap in the row. */}
       <Text role="status" className={VISUALLY_HIDDEN_CLASS}>
-        {pickerActive ? PICKER_ON_ANNOUNCEMENT : ''}
+        {announcement}
       </Text>
 
       {target === undefined ? (

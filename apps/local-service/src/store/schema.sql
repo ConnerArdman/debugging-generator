@@ -358,6 +358,16 @@ CREATE INDEX IF NOT EXISTS idx_captures_session_id_active
 --                the optional source location) and the authoritative copy of
 --                the row; the flat columns exist for filtering and ordering.
 --
+-- Schema version 5, applied by ./migrations.ts rather than declared here, adds
+-- the nullable clock_offset_ms INTEGER column: the informational clock offset
+-- the producer of the event reported when it created it, in whole milliseconds,
+-- server clock minus producer clock, bounded by a CHECK built from
+-- CLOCK_OFFSET_BOUND_MS of the telemetry package. It projects the optional
+-- clockOffsetMs field of the event document, is NULL for rows written before
+-- that step and for events created before the first usable sample of their
+-- producer, and is never added to start_time or duration. It carries no index:
+-- the per-producer read is a rare diagnostic scoped to one session.
+--
 -- Only already-redacted events ever reach this table: redaction and the
 -- request-key computation both happen in the ingest path before insertion, so
 -- no header value, query-parameter value, request body, database row content or

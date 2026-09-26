@@ -67,7 +67,9 @@
  * 6. **`register({ propagator })`** — explicitly W3C trace context, since 2.0
  *    dropped environment-variable propagator configuration. `register()`
  *    installs the Node `AsyncLocalStorage` context manager itself, which is why
- *    this package needs no `@opentelemetry/context-async-hooks` dependency.
+ *    this package needs no `@opentelemetry/context-async-hooks` dependency —
+ *    and that context manager is the one process-global effect of these steps
+ *    that outlives teardown (see "The one global effect that stays" below).
  * 7. **Instrumentations** — `registerInstrumentations` **after** the provider is
  *    registered (so they bind to it) and **before** the application loads (so
  *    `pg` and Prisma are patched before the app requires them). That ordering is
@@ -83,29 +85,60 @@
  *
  * ## Nothing acquired is ever left unowned
  *
- * Six of those steps take something with a **process-global** effect — the
- * `diag` logger, the control object, the long-lived processor, the registered
- * provider and propagator, the `pg`/Prisma patches and
- * `globalThis.__DEBUGGEN__` — so each one is pushed onto a rollback ledger the
- * moment it exists, and for the instrumentations *before* the first instance is
- * constructed, because `InstrumentationBase` enables one in its constructor.
- * The failure path gives every one of them back in reverse order. AAP §0.5.1
- * requires that what remains loaded is an inert module with "no active patches,
- * no provider and no file changes", and that has to hold for an installation
- * that *failed part-way* exactly as it does for one that was torn down.
+ * Six of those steps take something with a **process-global** effect that this
+ * module gives back — the `diag` logger, the control object, the long-lived
+ * processor, the registered provider and propagator, the `pg`/Prisma patches
+ * and `globalThis.__DEBUGGEN__` — so each one is pushed onto a rollback ledger
+ * the moment it exists, and for the instrumentations *before* the first
+ * instance is constructed, because `InstrumentationBase` enables one in its
+ * constructor. The failure path gives every one of the six back in reverse
+ * order, and the shutdown sequence gives back the same six. AAP §0.5.1 requires
+ * that what remains loaded is an inert module with "no active patches, no
+ * provider and no file changes", and that has to hold for an installation that
+ * *failed part-way* exactly as it does for one that was torn down.
  *
  * Because {@link installPreload} returns synchronously, the ledger separates
  * what has to be *revoked* from what merely has to be *closed*: the global
- * effects (`diag`, the provider and propagator, the `pg`/Prisma patches, the
- * span helper) are undone before the `failed` result exists, and the closable
- * ones (the control socket, the exporter, the provider's processors) are drained
- * by the promise that result's `shutdown()` hands back, which a caller may
- * await. {@link RollbackStep} documents the split.
+ * effects it gives back (`diag`, the provider and propagator, the `pg`/Prisma
+ * patches, the span helper) are undone before the `failed` result exists, and
+ * the closable ones (the control socket, the exporter, the provider's
+ * processors) are drained by the promise that result's `shutdown()` hands back,
+ * which a caller may await. {@link RollbackStep} documents the split.
  *
  * Ownership of a *successful* installation is reserved on the global slot
  * **before** the first step runs ({@link bootstrap}), because the alternative —
  * installing first and claiming afterwards — has a window in which an active
  * preload exists that {@link shutdownPreload} cannot reach.
+ *
+ * ## The one global effect that stays
+ *
+ * `register()` has one more process-global effect, and nothing here gives it
+ * back: when no context manager is registered yet, the SDK's default
+ * `AsyncLocalStorageContextManager` becomes `@opentelemetry/api`'s global
+ * context manager. When one already is, the API refuses the duplicate and the
+ * existing manager stays; the same refusal keeps the first manager in place
+ * through every later capture's `register()`.
+ *
+ * It is left **deliberately**. Neither the failure path, nor
+ * {@link shutdownPreload}, nor `control.ts`'s disable path calls
+ * `context.disable()`, because that call disables and unregisters *whichever*
+ * manager is global at that moment, not specifically the one this module
+ * installed. That may be a manager the host registered first, and even when it
+ * is ours, the host's own tracing — Next.js's tracer, or the application's own
+ * OpenTelemetry calls — works through it too, so disabling it would disable
+ * another actor's context manager.
+ *
+ * It is inert after teardown. With the global provider and propagator back at
+ * the API's no-op defaults, a tracer resolved through the API records nothing
+ * and no `traceparent` is extracted or injected. A tracer Next.js cached before
+ * the teardown still consults {@link DebuggenCaptureSampler}, which answers
+ * `NOT_RECORD` with the capture gate closed, so no span is recorded. The manager
+ * does no work of its own: it only carries the context values callers set
+ * through `context.with()`, and once the span helper and the instrumentations
+ * are gone this module sets none. It is neither a patch nor a provider nor a
+ * file change, so AAP §0.5.1's "no active patches, no provider and no file
+ * changes" still describes the process. It goes away when the dev server is
+ * restarted without the preload.
  *
  * ## Instrumentations deliberately NOT installed
  *
@@ -349,10 +382,13 @@ export interface InactivePreload {
    * already opened — the control socket, the exporter, the provider's
    * processors — which begins the instant the failure is caught, so awaiting it
    * waits for that work to finish rather than starting it. Every *process-global*
-   * effect the attempt had is already undone before the `failed` result exists
-   * and is deliberately not part of this promise (see {@link RollbackStep}):
-   * awaiting is how a caller learns the process is quiet, never how it becomes
-   * clean.
+   * effect the attempt ledgered is already undone before the `failed` result
+   * exists and is deliberately not part of this promise (see
+   * {@link RollbackStep}): awaiting is how a caller learns the process is quiet,
+   * never how it becomes clean. The one global effect never undone — the
+   * `AsyncLocalStorage` context manager `register()` may have installed — is
+   * left on purpose and is inert; see "The one global effect that stays" in this
+   * module's overview.
    *
    * Idempotent and it never rejects, whatever the status.
    */
@@ -612,7 +648,7 @@ const noopShutdown = (): Promise<void> => Promise.resolve();
  * @param shutdown What the caller gets to await; defaults to
  * {@link noopShutdown}, which is right for every status but `failed` — a failed
  * attempt hands back the rollback of what it had already acquired, so the one
- * caller who wants to know the process is clean again can wait for it.
+ * caller who wants to know the process is quiet again can wait for it.
  * @returns The inactive installation.
  */
 function inactive(
@@ -742,15 +778,16 @@ class ProviderScopedSpanProcessor implements SpanProcessor {
  * One thing {@link installPreload} took from the process, and the way to give it
  * back.
  *
- * The installation acquires six resources with process-global effects, and a
- * throw between any two of them would otherwise leave the earlier ones live in
- * the developer's server owned by nobody — a registered provider still
- * collecting Next.js's spans, a `pg` still wrapped, a buffer still holding
- * evidence — while the function reports `failed`. So an entry is pushed here the
- * moment each resource exists — and, where the acquisition itself takes effect
- * in steps that can fail part-way (registering the provider, constructing and
- * configuring the instrumentations, installing the span helper), *before* it
- * begins — and the failure path runs the ledger in reverse.
+ * The installation acquires six resources with process-global effects that it
+ * gives back, and a throw between any two of them would otherwise leave the
+ * earlier ones live in the developer's server owned by nobody — a registered
+ * provider still collecting Next.js's spans, a `pg` still wrapped, a buffer
+ * still holding evidence — while the function reports `failed`. So an entry is
+ * pushed here the moment each resource exists — and, where the acquisition
+ * itself takes effect in steps that can fail part-way (registering the
+ * provider, constructing and configuring the instrumentations, installing the
+ * span helper), *before* it begins — and the failure path runs the ledger in
+ * reverse.
  *
  * ## Two kinds of undo, because the function that runs them cannot await
  *
@@ -771,6 +808,9 @@ class ProviderScopedSpanProcessor implements SpanProcessor {
  *   on each instrumentation instance that came into existence, and
  *   `uninstallSpanHelper()`. After a `failed` result exists, no global provider,
  *   no global propagator, no `pg`/Prisma patch and no `__DEBUGGEN__` remain.
+ *   No entry revokes the `AsyncLocalStorage` context manager `register()` may
+ *   have installed; it is the one global effect that stays, deliberately and
+ *   inertly (see this module's overview).
  * - `drain` — **asynchronous**, for what needs closing rather than revoking:
  *   `control.dispose()`, `processor.shutdown()` and `provider.shutdown()`. These
  *   are gathered into the one memoized, never-rejecting promise the `failed`
@@ -806,8 +846,8 @@ interface RollbackStep {
 }
 
 /**
- * Undo every process-global effect this attempt had, newest first, synchronously
- * and without raising.
+ * Undo every process-global effect this attempt ledgered, newest first,
+ * synchronously and without raising.
  *
  * Reversed for the same reason the drain is: the steps are ordered by
  * acquisition, and a global installed over an earlier one has to come off first.
@@ -884,20 +924,25 @@ async function drainAcquisitions(steps: readonly RollbackStep[], log: PreloadLog
  * no-op defaults: the same two calls, in the same order, that `control.ts`'s
  * disable path makes.
  *
- * Synchronous, and that is the point — these two are the registration's whole
- * process-global footprint, so they are the `revoke` half of the provider's
- * ledger entry and are gone before a `failed` result exists. What is left of the
- * registration is `provider.shutdown()`, which drains the provider's processors
- * (for this provider, {@link ProviderScopedSpanProcessor} — a flush, and
- * deliberately not a terminal shutdown of the long-lived processor, whose own
- * ledger step owns that) and is therefore the entry's `drain`.
+ * Synchronous, and that is the point — these two are the part of the
+ * registration's process-global footprint this module gives back, so they are
+ * the `revoke` half of the provider's ledger entry and are gone before a
+ * `failed` result exists. What is left of the registration to undo is
+ * `provider.shutdown()`, which drains the provider's processors (for this
+ * provider, {@link ProviderScopedSpanProcessor} — a flush, and deliberately not
+ * a terminal shutdown of the long-lived processor, whose own ledger step owns
+ * that) and is therefore the entry's `drain`.
  *
  * Both calls are guarded on their own so a host that refuses the first still
- * gets the second. `context.disable()` is deliberately **not** called;
- * `control.ts` does not call it either: the context manager `register()`
- * installs is the SDK's default `AsyncLocalStorage` one, and resetting the
- * global context manager would reach past our own installation into whatever the
- * host had before it.
+ * gets the second. `context.disable()` is deliberately **not** called, and
+ * `control.ts` does not call it either, so the third global `register()` takes
+ * — the SDK's default `AsyncLocalStorage` context manager, installed only when
+ * no context manager was registered before — is still installed after this
+ * runs. `context.disable()` disables and unregisters whichever manager is
+ * global, so it would reach past our own installation into the host's: a
+ * manager the host registered first, or ours while the host's own tracing still
+ * runs through it. With no provider and no propagator left, that manager is
+ * inert; see "The one global effect that stays" in this module's overview.
  *
  * @param log Where a call that failed is reported.
  */
@@ -1002,17 +1047,28 @@ function createShutdownSequence(
  * others to run, and the whole sequence resolves rather than rejecting: it is
  * awaited from a signal handler in the developer's own process.
  *
- * After it, the process holds none of the six process-global effects the
- * installation took — the same state the failure path of
+ * After it, the process holds none of the six process-global effects this
+ * module gives back — the same state the failure path of
  * {@link installPreload} leaves, which is what AAP §0.5.1's "no active
  * patches, no provider" requires of a preload that has been torn down.
  *
+ * One global effect of the installation does remain: the `AsyncLocalStorage`
+ * context manager `register()` installed, if no context manager was registered
+ * before it. It is left deliberately, because `context.disable()` disables
+ * whichever manager is global, and that can be another actor's context manager.
+ * It is also inert: with no provider and no propagator, a tracer resolved
+ * through the API is a no-op and a tracer cached earlier gets `NOT_RECORD` from
+ * {@link DebuggenCaptureSampler} now that the capture gate is closed, so no span
+ * is recorded, and the manager only carries the context values callers set —
+ * none of them from this module. See "The one global effect that stays" in this
+ * module's overview.
+ *
  * `globalThis.__DEBUGGEN__` goes first, synchronously, before the first
- * `await`: it is the one global effect `control.dispose()` does not own, and
- * revoking it before anything asynchronous begins mirrors the failure path,
- * which revokes every global effect before it drains anything. A patched
- * function called from then on runs its original body directly, because the
- * patch template branches on the helper's availability.
+ * `await`: `control.dispose()` does not own it, and revoking it before
+ * anything asynchronous begins mirrors the failure path, which revokes every
+ * ledgered global effect before it drains anything. A patched function called
+ * from then on runs its original body directly, because the patch template
+ * branches on the helper's availability.
  *
  * @param control Disposed first: it closes the socket, flushes, unwraps `pg`,
  * clears Prisma's hook and removes the global provider and propagator.
@@ -1066,15 +1122,18 @@ async function runShutdown(
  *
  * The whole sequence — every step of the order documented at the top of this
  * file — sits inside one `try/catch`. Every resource with a process-global
- * effect is registered with a {@link RollbackStep} the moment it is acquired —
- * and the instrumentations before the first of them is constructed, since
- * constructing one enables it — so a throw at any point gives back everything
- * taken up to it, newest first: one `warn` is emitted, every global effect is
- * revoked before this function returns, the close of what remains open starts
- * immediately and is what the `failed` result's `shutdown()` hands back, and the
- * developer keeps a working, untraced dev server whose process holds no
- * provider, no propagator, no patches and no span helper. **Nothing escapes this
- * function.**
+ * effect this module gives back is registered with a {@link RollbackStep} the
+ * moment it is acquired — and the instrumentations before the first of them is
+ * constructed, since constructing one enables it — so a throw at any point
+ * gives back everything ledgered up to it, newest first: one `warn` is emitted,
+ * every ledgered global effect is revoked before this function returns, the
+ * close of what remains open starts immediately and is what the `failed`
+ * result's `shutdown()` hands back, and the developer keeps a working, untraced
+ * dev server whose process holds no provider, no propagator, no patches and no
+ * span helper. The `AsyncLocalStorage` context manager `register()` may have
+ * installed is the one global effect left, deliberately and inertly (see "The
+ * one global effect that stays" in this module's overview). **Nothing escapes
+ * this function.**
  *
  * Synchronous by contract: `--import` evaluates this module, and
  * {@link bootstrap} calls this at module scope, so nothing here may block on
@@ -1191,9 +1250,12 @@ export function installPreload(options: PreloadInstallOptions = {}): PreloadInst
     // `disable()` calls are no-ops against the API's defaults and
     // `shutdown()` on a provider nobody registered simply flushes.
     //
-    // Both halves, because registration is both: the two `disable()` calls are
-    // the global effect and are revoked synchronously, while draining the
-    // provider's processors is asynchronous and belongs to the awaited half.
+    // Both halves, because registration is both: the two `disable()` calls undo
+    // the global effect this entry gives back — the provider and the propagator
+    // — and are revoked synchronously, while draining the provider's processors
+    // is asynchronous and belongs to the awaited half. The context manager
+    // registration may also install is deliberately not revoked (see
+    // `revokeGlobalTracing`).
     rollback.push({
       label: 'tracer provider registration',
       revoke: (): void => {
@@ -1207,7 +1269,8 @@ export function installPreload(options: PreloadInstallOptions = {}): PreloadInst
     //    propagator is passed explicitly because 2.0 dropped environment-variable
     //    propagator configuration; `register()` installs the Node
     //    `AsyncLocalStorage` context manager itself, so this package needs no
-    //    `@opentelemetry/context-async-hooks` dependency.
+    //    `@opentelemetry/context-async-hooks` dependency. That manager stays
+    //    installed after any teardown, by design (see the overview).
     provider.register({ propagator: new W3CTraceContextPropagator() });
 
     // 7. Instrumentations: after the provider, before the application's modules.
@@ -1303,9 +1366,11 @@ export function installPreload(options: PreloadInstallOptions = {}): PreloadInst
       { error: reason },
     );
 
-    // Give back everything this attempt took, newest first, so the process is
-    // left as it was found: no registered provider, no wrapped `pg`, no Prisma
-    // hook, no span helper, no live exporter, no open socket (AAP §0.5.1).
+    // Give back everything this attempt ledgered, newest first: no registered
+    // provider, no wrapped `pg`, no Prisma hook, no span helper, no live
+    // exporter, no open socket (AAP §0.5.1). The one thing not given back is
+    // the `AsyncLocalStorage` context manager, if `register()` got as far as
+    // installing it — left on purpose and inert (see the overview).
     //
     // The global half first, and *to completion*: this function returns
     // synchronously — module scope under `--import` — so a caller reading
@@ -1755,11 +1820,11 @@ function bootstrap(): PreloadInstallation {
     if (installation.status !== 'installed') {
       if (installation.status === 'failed') {
         // A failed attempt has already revoked every process-global effect it
-        // had, but the close of what it opened is still in flight — and until
-        // that settles this evaluation owns live work, which `shutdownPreload()`
-        // has to be able to reach. So the reservation stays, now delegating to
-        // that rollback, and the slot is given up only once it is over, which is
-        // what still lets a later evaluation retry.
+        // ledgered, but the close of what it opened is still in flight — and
+        // until that settles this evaluation owns live work, which
+        // `shutdownPreload()` has to be able to reach. So the reservation stays,
+        // now delegating to that rollback, and the slot is given up only once it
+        // is over, which is what still lets a later evaluation retry.
         owned = installation.shutdown;
         void releasePreloadSlotAfter(claimed, installation.shutdown(), log);
       } else {

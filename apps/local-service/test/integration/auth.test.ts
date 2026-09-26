@@ -32,6 +32,23 @@
  * exhaustive traversal table of click-to-source belongs to `source-open.test.ts`;
  * this file asserts only its role-and-scope half.
  *
+ * The editor's administrative operations are driven here too, because each is
+ * an access-boundary event: `POST /credentials/rotate` (what
+ * `debuggen.rotateServiceToken` calls) revokes every credential and closes every
+ * socket, `POST /dev-server/credential` mints a server-agent credential, and
+ * `POST /sessions/purge` (what `debuggen.purgeSessions` calls) runs the
+ * retention sweep. All three are rows of the route table, reachable by the
+ * editor credential alone. The retention sweep's own rules — which aged
+ * session goes, which conflict keeps one — belong to `src/store/retention.test.ts`.
+ *
+ * The revocation fence is driven over a raw `node:http` connection, because
+ * what it closes is a timing window no whole-request client can open: a
+ * request authenticated by the middleware whose body is held back part-way
+ * while a rotation lands on another connection. The body is released only
+ * once the middleware has provably authenticated the request, observed by a
+ * call-through spy on the service's own `authorizeHttpRequest` that changes
+ * nothing it does.
+ *
  * ## Conventions
  *
  * Paths, operation ids, close codes, windows and statuses come from protocol's
@@ -45,11 +62,14 @@
 
 import { randomBytes, randomInt, randomUUID } from 'node:crypto';
 import { readFile, stat } from 'node:fs/promises';
+import { request as httpRequest } from 'node:http';
+import type { IncomingHttpHeaders } from 'node:http';
 import { basename, dirname, join, relative } from 'node:path';
 
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  ACTING_TAB_HEADER,
   AUTHORIZATION_HEADER,
   AUTH_EXEMPT_OPERATIONS,
   CLIENT_HELLO_TIMEOUT_MS,
@@ -57,9 +77,11 @@ import {
   HTTP_ROUTES,
   PROTOCOL_VERSION,
   PROTOCOL_VERSION_MAJOR,
+  SESSION_PURGE_MAX_REPORTED_SESSIONS,
   WS_CLOSE_UNAUTHORIZED,
   buildPath,
   clientHelloPayloadSchema,
+  errorCodeSchema,
   formatBearer,
   healthResponseSchema,
   httpErrorResponseSchema,
@@ -77,6 +99,7 @@ import type {
   HttpOperationId,
   MessagePayload,
   ProtocolMessage,
+  SessionPurgeResponse,
   SessionRecord,
 } from '@debuggen/protocol';
 import { isErr, newId, newPanelId, newProducerId, newSessionId } from '@debuggen/shared';
@@ -84,12 +107,8 @@ import { SECURE_FILE_MODE, sha256Hex, sha256OfFile } from '@debuggen/shared/node
 import type { TelemetryEventIngress } from '@debuggen/telemetry';
 
 import {
-  DEV_SERVER_CREDENTIAL_METHOD,
-  DEV_SERVER_CREDENTIAL_PATH,
-  devServerCredentialResponseSchema,
-} from '../../src/dev-server/launcher.js';
-import {
   AUTH_FAILURE_REASONS,
+  AUTH_FILE_STAGE_SUFFIX,
   CREDENTIAL_ROLES,
   OPERATION_ROLES,
   PAIRING_CODE_ALPHABET,
@@ -103,7 +122,9 @@ import type {
   AuthenticatedOperation,
   PrincipalRole,
 } from '../../src/server/auth.js';
+import { DEFAULT_OFFLINE_GRACE_MS } from '../../src/server/clients.js';
 import { UNIFORM_PAIRING_REFUSAL_REASONS } from '../../src/server/routes/pair.js';
+import type { TabBinding } from '../../src/store/sessions-repo.js';
 
 import {
   HARNESS_TIMEOUTS,
@@ -114,6 +135,7 @@ import {
   startHarness,
   waitFor,
   waitUntil,
+  type CapturedLogRecord,
   type DevtoolsConnection,
   type DevtoolsCredential,
   type Harness,
@@ -166,6 +188,12 @@ const PREFLIGHT_METHOD = 'OPTIONS';
 const CACHE_CONTROL_HEADER = 'cache-control';
 const NO_STORE_DIRECTIVE = 'no-store';
 
+/** The error code of a request body the route's schema refuses — protocol's, not a literal. */
+const INVALID_BODY_CODE = errorCodeSchema.enum.PROTOCOL_INVALID_MESSAGE;
+
+/** The status of a request body the route's schema refuses. */
+const INVALID_BODY_STATUS = 400;
+
 /** A SHA-256 digest as the store keeps it: 64 lower-case hex characters. */
 const DIGEST_PATTERN = /^[0-9a-f]{64}$/;
 
@@ -185,6 +213,21 @@ const HELLO_WINDOW_TOLERANCE_MS = CLIENT_HELLO_TIMEOUT_MS / 10;
 /** A file every copy of the `sample-project` fixture holds. */
 const PROJECT_FILE = 'src/components/TrailCard.tsx';
 
+/**
+ * The debug record `src/server/ws.ts` writes once it has processed a socket's
+ * close — the point after which a closed editor connection's workspace is on
+ * its lease, which the scope test waits for before it looks.
+ */
+const CONNECTION_CLOSED_LOG = 'a WebSocket connection closed';
+
+/**
+ * The debug record the service's agent-readiness ledger (`src/main.ts`) writes,
+ * with the report's `tabId`, for every relayed `agent.ready` the WebSocket
+ * router accepted — the observable sign that a report reached the readiness
+ * gate, which the single-tab test counts per tab.
+ */
+const AGENT_READY_RECORDED_LOG = 'recorded a page-agent readiness report';
+
 /** The inspected tabs this suite speaks for, one per scenario so no binding is shared by accident. */
 const TABS = Object.freeze({
   acceptedOrigin: 111,
@@ -194,6 +237,12 @@ const TABS = Object.freeze({
   opener: 151,
   rotation: 131,
   repaired: 141,
+  /** The two tabs one credential multiplexes over one connection whose hello names no tab. */
+  muxFirst: 161,
+  muxSecond: 171,
+  /** A single-tab connection's hello tab, and another tab of the same credential it may not speak for. */
+  singleOwn: 181,
+  singleOther: 191,
 });
 
 /** The statements the at-rest checks read, over the two tables only the access boundary writes. */
@@ -251,15 +300,23 @@ function paramsFor(operation: HttpOperationId, sessionId: string): Record<string
 
 /**
  * A body the operation's route accepts for its method: none for a `GET`, a
- * `DataQuery` for `panel.data`, and `{}` for every other `POST` (the access
- * boundary answers before any body is read, so the body only matters where a
- * request is admitted).
+ * `DataQuery` for `panel.data`, the harness's own workspace folder for
+ * `devServer.credential`, and `{}` for every other `POST` (the access boundary
+ * answers before any body is read, so the body only matters where a request is
+ * admitted). Called at test time, after `beforeAll` has set {@link projectA}.
  */
 function requestBodyFor(operation: HttpOperationId): unknown {
   if (HTTP_ROUTES[operation].method !== 'POST') {
     return undefined;
   }
-  return operation === 'panel.data' ? { source: 'events' } : {};
+  switch (operation) {
+    case 'panel.data':
+      return { source: 'events' };
+    case 'devServer.credential':
+      return { projectRoot: projectA };
+    default:
+      return {};
+  }
 }
 
 /** A raw-fetch target for an operation, with its path parameters filled in. */
@@ -440,9 +497,20 @@ function expectSuccess(response: RawFetchResponse, operation: HttpOperationId, s
   ).toBe(true);
 }
 
-/** The request options that present a DevTools credential from the extension it was issued to. */
-function presenting(credential: DevtoolsCredential): Pick<RawFetchInit, 'token' | 'origin'> {
-  return { token: credential.token, origin: credential.origin };
+/**
+ * The request options that present a DevTools credential from the extension it
+ * was issued to — acting for `tabId` when one is given, as the service worker
+ * names the inspected tab on every session request.
+ */
+function presenting(
+  credential: DevtoolsCredential,
+  tabId?: number,
+): Pick<RawFetchInit, 'token' | 'origin' | 'headers'> {
+  return {
+    token: credential.token,
+    origin: credential.origin,
+    ...(tabId === undefined ? {} : { headers: { [ACTING_TAB_HEADER]: String(tabId) } }),
+  };
 }
 
 /** Every session the editor credential currently sees. */
@@ -465,17 +533,16 @@ function ingest(token: string, projectRoot: string, origin?: string): Promise<Ra
 }
 
 /**
- * Mints a server-agent credential through the folder-owned
- * `POST /dev-server/credential` route — the credential a dev server started
- * without the launcher runs with.
+ * Mints a server-agent credential through the route table's
+ * `devServer.credential` row — the credential a dev server started without the
+ * launcher runs with (`scripts/dev-instrumented.mjs` requests it with the editor
+ * credential). The reply is a fresh secret, so it must not be cached.
  */
 async function mintDevServerCredential(projectRoot: string): Promise<string> {
-  const response = await fetchRaw(
-    { path: DEV_SERVER_CREDENTIAL_PATH },
-    { method: DEV_SERVER_CREDENTIAL_METHOD, body: { projectRoot } },
-  );
-  expect(response.status).toBe(200);
-  const parsed = devServerCredentialResponseSchema.safeParse(response.json);
+  const response = await fetchRaw('devServer.credential', { body: { projectRoot } });
+  expectSuccess(response, 'devServer.credential');
+  expect(response.headers.get(CACHE_CONTROL_HEADER)).toContain(NO_STORE_DIRECTIVE);
+  const parsed = HTTP_ROUTES['devServer.credential'].response.safeParse(response.json);
   if (!parsed.success) {
     throw new Error('The dev-server credential reply does not satisfy its schema.');
   }
@@ -651,6 +718,63 @@ async function unbind(connection: DevtoolsConnection, tabId: number): Promise<vo
   expect(isErr(receipt.result)).toBe(false);
   expect(await connection.client.flush()).toBe(true);
   expect(connection.client.errorsFor(receipt.id)).toEqual([]);
+}
+
+/**
+ * Binds `tabId` to `session` over an already-open connection and relays the
+ * tab's `agent.ready`, each frame naming the tab it acts for — what the MV3
+ * service worker does for every inspected tab over its single connection.
+ */
+async function bindOver(
+  client: HarnessWsClient,
+  tabId: number,
+  session: SessionRecord,
+): Promise<void> {
+  const bound = await harness.bindTab(client, {
+    tabId,
+    url: session.devServerUrl,
+    origin: new URL(session.devServerUrl).origin,
+    sessionId: session.id,
+  });
+  if (isErr(bound)) {
+    throw new Error(`session.bind was refused with ${bound.error.code}.`);
+  }
+  expect(bound.value.payload.sessionId).toBe(session.id);
+
+  const receipt = client.send(
+    'agent.ready',
+    {
+      tabId,
+      documentId: newId('doc'),
+      producerId: newProducerId(),
+      url: session.devServerUrl,
+      installedBeforeReact: true,
+      reactDetected: true,
+    },
+    { sessionId: session.id, tabId },
+  );
+  expect(isErr(receipt.result)).toBe(false);
+  expect(await client.flush()).toBe(true);
+  expect(client.errorsFor(receipt.id)).toEqual([]);
+}
+
+/**
+ * A session of a fresh copy of the fixture, its dev server launched and its
+ * pipeline settled at the readiness gate — so a capture can open on it without
+ * contending with any other session for its project.
+ */
+async function sessionOfFreshProject(): Promise<SessionRecord> {
+  const projectRoot = (await harness.copyFixtureProject()).root;
+  const launched = await harness.launchDevServer(projectRoot);
+  if (isErr(launched)) {
+    throw new Error(`The stand-in dev server did not launch (${launched.error.code}).`);
+  }
+  const session = await harness.createSession({ projectRoot, question: QUESTION });
+  await harness.waitForSession(
+    session.id,
+    (record) => record.status === 'instrumenting' || record.status === 'ready',
+  );
+  return session;
 }
 
 /** Waits for the readiness gate to admit a session: "Ready to capture". */
@@ -836,12 +960,17 @@ describe('HTTP authentication', () => {
         `${operation} (${method}) without a credential`,
       );
     }
-    // The folder-owned credential route sits beside the table and behind the same gate.
-    const credentialRoute = await fetchRaw(
-      { path: DEV_SERVER_CREDENTIAL_PATH },
-      { method: DEV_SERVER_CREDENTIAL_METHOD, token: null, body: { projectRoot: projectA } },
-    );
-    expectRefusal(credentialRoute, 'missing-credential', 'the dev-server credential route');
+    // The table is the service's whole surface: the credential, rotation and
+    // purge operations are rows of it, swept above like every other.
+    for (const administrative of [
+      'devServer.credential',
+      'credentials.rotate',
+      'session.purge',
+    ] as const) {
+      expect(AUTHENTICATED_OPERATIONS, `${administrative} is a credentialed row`).toContain(
+        administrative,
+      );
+    }
   });
 
   it('refuses a malformed or unknown bearer value exactly as it refuses a missing one', async () => {
@@ -996,17 +1125,38 @@ describe('origin policy', () => {
       'the editor credential from an extension',
     );
 
-    // A DevTools credential: only from the extension it was issued to.
+    // A DevTools credential: from the extension it was issued to — and, on a GET,
+    // from no origin, because Chrome sends no `Origin` on the extension's GETs.
     const devtools = await bindDevtools(TABS.acceptedOrigin, sessionB);
     const target = targetFor('session.get', sessionB.id);
-    expectSuccess(await fetchRaw(target, presenting(devtools.credential)), 'session.get');
-    for (const origin of [undefined, webview, extension]) {
+    expectSuccess(
+      await fetchRaw(target, presenting(devtools.credential, TABS.acceptedOrigin)),
+      'session.get',
+    );
+    expectSuccess(
+      await fetchRaw(target, {
+        ...presenting(devtools.credential, TABS.acceptedOrigin),
+        origin: undefined,
+      }),
+      'session.get',
+    );
+    for (const origin of [webview, extension]) {
       expectRefusal(
         await fetchRaw(target, { token: devtools.credential.token, origin }),
         'origin-not-permitted-for-role',
-        `a DevTools credential from ${origin ?? 'no origin'}`,
+        `a DevTools credential from ${origin}`,
       );
     }
+    // A state-changing DevTools request still has to name the extension.
+    expectRefusal(
+      await fetchRaw(targetFor('capture.stop', sessionB.id), {
+        ...presenting(devtools.credential, TABS.acceptedOrigin),
+        origin: undefined,
+        body: {},
+      }),
+      'origin-not-permitted-for-role',
+      'a DevTools capture.stop from no origin',
+    );
     await unbind(devtools, TABS.acceptedOrigin);
   });
 
@@ -1238,7 +1388,7 @@ describe('pairing', () => {
     const devtools = await bindDevtools(TABS.paired, sessionB, credential);
     expect(devtools.client.authenticated).toBe(true);
     expectSuccess(
-      await fetchRaw(targetFor('session.get', sessionB.id), presenting(credential)),
+      await fetchRaw(targetFor('session.get', sessionB.id), presenting(credential, TABS.paired)),
       'session.get',
     );
 
@@ -1394,16 +1544,19 @@ describe('authorization by role and scope', () => {
     await waitUntilReady(sessionA);
     const notBound = AUTH_FAILURE_REASONS['session-not-bound'].code;
 
-    // Another tab's credential, bound to a different session, acts on nothing of sessionA.
+    // Another tab's credential, bound to a different session, acts on nothing of
+    // sessionA — whether it names its own tab or the tab sessionA is bound to.
     for (const operation of DEVTOOLS_OPERATIONS) {
-      expectRefusal(
-        await fetchRaw(targetFor(operation, sessionA.id), {
-          ...presenting(other.credential),
-          body: requestBodyFor(operation),
-        }),
-        'session-not-bound',
-        `another tab → ${operation}`,
-      );
+      for (const tabId of [TABS.other, TABS.own]) {
+        expectRefusal(
+          await fetchRaw(targetFor(operation, sessionA.id), {
+            ...presenting(other.credential, tabId),
+            body: requestBodyFor(operation),
+          }),
+          'session-not-bound',
+          `another tab (acting as ${String(tabId)}) → ${operation}`,
+        );
+      }
     }
     const openElsewhere = other.client.send('source.open', {
       sessionId: sessionA.id,
@@ -1418,7 +1571,7 @@ describe('authorization by role and scope', () => {
     expect(codesOf(other.client.errorsFor(selectElsewhere.id))).toEqual([notBound]);
 
     // The bound tab's own credential may do each of those things to its own session.
-    const ownInit = presenting(own.credential);
+    const ownInit = presenting(own.credential, TABS.own);
     const editorA = await harness.editor(projectA);
     const mark = editorA.received.length;
 
@@ -1468,11 +1621,328 @@ describe('authorization by role and scope', () => {
     // And the other tab is equally at home on the session it is bound to.
     expectSuccess(
       await fetchRaw(targetFor('panel.data', sessionB.id), {
-        ...presenting(other.credential),
+        ...presenting(other.credential, TABS.other),
         body: requestBodyFor('panel.data'),
       }),
       'panel.data',
     );
+  });
+
+  it('tells apart the tabs one credential multiplexes over one connection, over HTTP and WebSocket', async () => {
+    const first = await sessionOfFreshProject();
+    const second = await sessionOfFreshProject();
+    const notBound = AUTH_FAILURE_REASONS['session-not-bound'].code;
+    const operations = ['capture.start', 'panel.data', 'session.get'] as const;
+
+    // Exactly like the MV3 service worker: one credential, one connection, a
+    // hello naming no tab — every request and frame names the tab it acts for.
+    const credential = harness.issueDevtoolsCredential();
+    track('multiplexed devtools credential', credential.token);
+    const mux = await harness.ws({
+      client: 'devtools',
+      token: credential.token,
+      origin: credential.origin,
+    });
+    expect(mux.authenticated, mux.describe()).toBe(true);
+    expect(mux.identity.tabId).toBeUndefined();
+    await bindOver(mux, TABS.muxFirst, first);
+    await bindOver(mux, TABS.muxSecond, second);
+    await waitUntilReady(first);
+    await waitUntilReady(second);
+    const editorFirst = await harness.editor(first.projectRoot);
+
+    /** Sends `target.selected` and `source.open` for `session` acting as `tabId`; returns each frame's codes. */
+    const actOver = async (
+      client: HarnessWsClient,
+      session: SessionRecord,
+      tabId: number | undefined,
+    ): Promise<readonly (readonly string[])[]> => {
+      const options = tabId === undefined ? undefined : { tabId };
+      const select = client.send(
+        'target.selected',
+        { sessionId: session.id, target: targetOn(session) },
+        options,
+      );
+      const open = client.send(
+        'source.open',
+        { sessionId: session.id, location: locationOf(PROJECT_FILE) },
+        options,
+      );
+      expect(await client.flush()).toBe(true);
+      return [codesOf(client.errorsFor(select.id)), codesOf(client.errorsFor(open.id))];
+    };
+
+    // 1. The credential's other tab, and a request naming no tab at all, act on
+    //    nothing of the first tab's session — the credential alone is no tab.
+    const markBefore = editorFirst.received.length;
+    for (const operation of operations) {
+      expectRefusal(
+        await fetchRaw(targetFor(operation, first.id), {
+          ...presenting(credential, TABS.muxSecond),
+          body: requestBodyFor(operation),
+        }),
+        'session-not-bound',
+        `the second tab → ${operation} on the first tab's session`,
+      );
+      const unnamed = expectRefusal(
+        await fetchRaw(targetFor(operation, first.id), {
+          ...presenting(credential),
+          body: requestBodyFor(operation),
+        }),
+        'acting-tab-required',
+        `no acting tab → ${operation}`,
+      );
+      expect(unnamed.message).toBe(AUTH_FAILURE_REASONS['acting-tab-required'].message);
+    }
+    expect(await actOver(mux, first, TABS.muxSecond)).toEqual([[notBound], [notBound]]);
+    expect(await actOver(mux, first, undefined)).toEqual([[notBound], [notBound]]);
+    expect(sourceOpensSince(editorFirst, markBefore), 'nothing reached the editor').toEqual([]);
+
+    // A malformed acting tab is a malformed request, and only a DevTools
+    // principal may name a tab at all.
+    expectRefusal(
+      await fetchRaw(targetFor('session.get', first.id), {
+        token: credential.token,
+        origin: credential.origin,
+        headers: { [ACTING_TAB_HEADER]: `${String(TABS.muxFirst)}.5` },
+      }),
+      'acting-tab-invalid',
+    );
+    expectRefusal(
+      await fetchRaw(targetFor('session.get', first.id), {
+        headers: { [ACTING_TAB_HEADER]: String(TABS.muxFirst) },
+      }),
+      'acting-tab-not-permitted',
+      'the editor credential naming a tab',
+    );
+
+    // 2. The first tab may do each of those things to its own session, and the
+    //    second tab to its own.
+    const firstInit = presenting(credential, TABS.muxFirst);
+    expectSuccess(await fetchRaw(targetFor('session.get', first.id), firstInit), 'session.get');
+    expectSuccess(
+      await fetchRaw(targetFor('panel.data', first.id), {
+        ...firstInit,
+        body: requestBodyFor('panel.data'),
+      }),
+      'panel.data',
+    );
+    expectSuccess(
+      await fetchRaw(targetFor('capture.start', first.id), { ...firstInit, body: {} }),
+      'capture.start',
+    );
+    const markOwn = editorFirst.received.length;
+    expect(await actOver(mux, first, TABS.muxFirst)).toEqual([[], []]);
+    await waitFor(
+      editorFirst,
+      'source.open',
+      (message, index) => index >= markOwn && message.payload.sessionId === first.id,
+    );
+    expectSuccess(
+      await fetchRaw(targetFor('session.get', second.id), presenting(credential, TABS.muxSecond)),
+      'session.get',
+    );
+
+    // 3. A connection of the same credential that announced a tab in its hello
+    //    is a single-tab connection: it acts for that tab only.
+    const single = await harness.connectDevtools({ tabId: TABS.muxSecond, credential });
+    expect(await actOver(single.client, first, TABS.muxFirst)).toEqual([[notBound], [notBound]]);
+    await single.client.close();
+
+    // 4. Replacement: the second tab takes the first session over, after which
+    //    the displaced tab may act on it neither over HTTP nor over WebSocket.
+    // The tab's own former binding is announced as displaced first, so the wait
+    // is for the announcement of the new pair specifically.
+    const markRebind = mux.received.length;
+    const rebind = mux.send('session.bind', {
+      tabId: TABS.muxSecond,
+      url: first.devServerUrl,
+      origin: new URL(first.devServerUrl).origin,
+      sessionId: first.id,
+    });
+    await waitFor(
+      mux,
+      'session.bound',
+      (message, index) =>
+        index >= markRebind &&
+        message.payload.tabId === TABS.muxSecond &&
+        message.payload.sessionId === first.id &&
+        (message.payload.reason ?? 'bound') === 'bound',
+    );
+    expect(mux.errorsFor(rebind.id)).toEqual([]);
+    for (const operation of ['capture.stop', 'panel.data', 'session.get'] as const) {
+      expectRefusal(
+        await fetchRaw(targetFor(operation, first.id), {
+          ...firstInit,
+          body: requestBodyFor(operation),
+        }),
+        'session-not-bound',
+        `the displaced tab → ${operation}`,
+      );
+    }
+    expect(await actOver(mux, first, TABS.muxFirst)).toEqual([[notBound], [notBound]]);
+    const takeover = presenting(credential, TABS.muxSecond);
+    expectSuccess(await fetchRaw(targetFor('session.get', first.id), takeover), 'session.get');
+    expectSuccess(
+      await fetchRaw(targetFor('capture.stop', first.id), { ...takeover, body: {} }),
+      'capture.stop',
+    );
+    await mux.close();
+  });
+
+  it('holds a single-tab connection to its hello tab on every frame whose payload names a tab', async () => {
+    const ownSession = await sessionOfFreshProject();
+    const otherSession = await sessionOfFreshProject();
+    const notBound = AUTH_FAILURE_REASONS['session-not-bound'].code;
+    const own = TABS.singleOwn;
+    const other = TABS.singleOther;
+
+    /** The durable binding row of a tab. */
+    const storedBinding = (tabId: number): TabBinding | undefined => {
+      const read = harness.repos.sessions.getBindingByTab(tabId);
+      if (isErr(read)) {
+        throw new Error(`Reading the binding of tab ${String(tabId)} failed (${read.error.code}).`);
+      }
+      return read.value;
+    };
+    /** The bound tab a session's record mirrors. */
+    const boundTabOf = (session: SessionRecord): SessionRecord['boundTab'] => {
+      const read = harness.manager.get(session.id);
+      if (isErr(read)) {
+        throw new Error(`Reading session ${session.id} failed (${read.error.code}).`);
+      }
+      return read.value?.boundTab;
+    };
+    /** How many relayed readiness reports the ledger accepted for a tab. */
+    const reportsFor = (tabId: number): number =>
+      harness.logger
+        .withMessage(AGENT_READY_RECORDED_LOG)
+        .filter((record) => record.fields['tabId'] === tabId).length;
+    /** A page agent's `agent.ready` for `tabId`, from a fresh document of `session`'s page. */
+    const readyFor = (tabId: number, session: SessionRecord): MessagePayload<'agent.ready'> => ({
+      tabId,
+      documentId: newId('doc'),
+      producerId: newProducerId(),
+      url: session.devServerUrl,
+      installedBeforeReact: true,
+      reactDetected: true,
+    });
+
+    // The credential's other tab is bound, and its agent reported, over the
+    // multiplexing service-worker connection, whose hello names no tab.
+    const credential = harness.issueDevtoolsCredential();
+    track('single-tab devtools credential', credential.token);
+    const mux = await harness.ws({
+      client: 'devtools',
+      token: credential.token,
+      origin: credential.origin,
+    });
+    expect(mux.authenticated, mux.describe()).toBe(true);
+    await bindOver(mux, other, otherSession);
+    const otherBinding = storedBinding(other);
+    expect(otherBinding).toMatchObject({ sessionId: otherSession.id, tab: { tabId: other } });
+    const otherBoundTab = boundTabOf(otherSession);
+    expect(otherBoundTab).toMatchObject({ tabId: other });
+
+    // A connection of the same credential whose hello announced its own tab.
+    const single = await harness.connectDevtools({ tabId: own, credential });
+    expect(single.client.identity.tabId).toBe(own);
+    const muxMark = mux.received.length;
+    const otherReportsBefore = reportsFor(other);
+
+    // 1. It may not bind, navigate, unbind or report ready the other tab — not
+    //    by default, and not by also naming that tab on the envelope.
+    for (const envelope of [undefined, { tabId: other }]) {
+      const attempts = [
+        single.client.send(
+          'session.bind',
+          {
+            tabId: other,
+            url: ownSession.devServerUrl,
+            origin: new URL(ownSession.devServerUrl).origin,
+            sessionId: ownSession.id,
+          },
+          envelope,
+        ),
+        single.client.send(
+          'tab.navigated',
+          { tabId: other, url: ownSession.devServerUrl },
+          envelope,
+        ),
+        single.client.send('session.unbind', { tabId: other }, envelope),
+        single.client.send('agent.ready', readyFor(other, otherSession), envelope),
+        single.client.send('agent.ready', readyFor(other, otherSession), {
+          ...envelope,
+          sessionId: otherSession.id,
+        }),
+      ];
+      expect(await single.client.flush()).toBe(true);
+      for (const attempt of attempts) {
+        expect(isErr(attempt.result)).toBe(false);
+        expect(codesOf(single.client.errorsFor(attempt.id))).toEqual([notBound]);
+      }
+    }
+
+    // 2. None of it changed anything: the other tab's row, its record mirror,
+    //    its live binding and its readiness are exactly as they were, the own
+    //    session gained no tab, and no binding change was announced.
+    expect(storedBinding(other)).toEqual(otherBinding);
+    expect(boundTabOf(otherSession)).toEqual(otherBoundTab);
+    expect(boundTabOf(ownSession)).toBeUndefined();
+    expect(reportsFor(other)).toBe(otherReportsBefore);
+    expect(await mux.flush()).toBe(true);
+    expect(
+      mux.received.slice(muxMark).filter((message) => isMessageOfType(message, 'session.bound')),
+    ).toEqual([]);
+    expectSuccess(
+      await fetchRaw(targetFor('session.get', otherSession.id), presenting(credential, other)),
+      'session.get',
+    );
+    expectRefusal(
+      await fetchRaw(targetFor('session.get', ownSession.id), presenting(credential, other)),
+      'session-not-bound',
+      'the other tab → session.get on the own session',
+    );
+
+    // 3. The same frames for its own tab are accepted.
+    const bound = await harness.bindTab(single.client, {
+      tabId: own,
+      url: ownSession.devServerUrl,
+      origin: new URL(ownSession.devServerUrl).origin,
+      sessionId: ownSession.id,
+    });
+    if (isErr(bound)) {
+      throw new Error(
+        `session.bind of the connection's own tab was refused with ${bound.error.code}.`,
+      );
+    }
+    expect(bound.value.payload.sessionId).toBe(ownSession.id);
+    const ownReportsBefore = reportsFor(own);
+    const nextPage = new URL('/orders', ownSession.devServerUrl).toString();
+    const accepted = [
+      single.client.send('agent.ready', readyFor(own, ownSession), { sessionId: ownSession.id }),
+      single.client.send('tab.navigated', { tabId: own, url: nextPage }, { tabId: own }),
+    ];
+    expect(await single.client.flush()).toBe(true);
+    for (const receipt of accepted) {
+      expect(isErr(receipt.result)).toBe(false);
+      expect(single.client.errorsFor(receipt.id)).toEqual([]);
+    }
+    expect(reportsFor(own)).toBe(ownReportsBefore + 1);
+    expect(storedBinding(own)).toMatchObject({
+      sessionId: ownSession.id,
+      tab: { tabId: own, url: nextPage },
+    });
+    const unbound = single.client.send('session.unbind', { tabId: own });
+    expect(await single.client.flush()).toBe(true);
+    expect(single.client.errorsFor(unbound.id)).toEqual([]);
+    expect(storedBinding(own)).toBeUndefined();
+    expect(boundTabOf(ownSession)).toBeUndefined();
+
+    // The other tab's binding survived every one of those frames.
+    expect(storedBinding(other)).toEqual(otherBinding);
+    await single.client.close();
+    await mux.close();
   });
 
   it('confines a server-agent credential to exactly its own project', async () => {
@@ -1542,10 +2012,7 @@ describe('authorization by role and scope', () => {
         'devServer.launch outside the announced workspace',
       );
       expectRefusal(
-        await fetchRaw(
-          { path: DEV_SERVER_CREDENTIAL_PATH },
-          { method: DEV_SERVER_CREDENTIAL_METHOD, body: { projectRoot } },
-        ),
+        await fetchRaw('devServer.credential', { body: { projectRoot } }),
         'project-out-of-scope',
         'a dev-server credential outside the announced workspace',
       );
@@ -1555,23 +2022,27 @@ describe('authorization by role and scope', () => {
     // it. Session creation normalises the root and judges the result against the
     // scope; the dev-server routes refuse a `..` spelling before they get that far.
     // Either way the refusal names the project boundary and nothing is created.
+    // The protocol row of `devServer.credential` checks only the shape of its
+    // root; the service still refuses a relative one, which names no folder.
     const climbing = `${projectA}/../${basename(projectA)}-evil`;
     expectRefusal(
       await fetchRaw('session.create', { body: { projectRoot: climbing, question: QUESTION } }),
       'project-out-of-scope',
       'session.create through a traversal',
     );
+    const serverAgentRowsBefore = credentialRowsOf('server-agent').length;
     for (const refused of [
       await fetchRaw('devServer.launch', { body: { projectRoot: climbing } }),
-      await fetchRaw(
-        { path: DEV_SERVER_CREDENTIAL_PATH },
-        { method: DEV_SERVER_CREDENTIAL_METHOD, body: { projectRoot: climbing } },
-      ),
+      await fetchRaw('devServer.credential', { body: { projectRoot: climbing } }),
+      await fetchRaw('devServer.credential', { body: { projectRoot: basename(projectA) } }),
     ]) {
       expect(refused.status).toBeGreaterThanOrEqual(400);
       expect(refused.status).toBeLessThan(500);
       expect(refusalShape(refused).code).toBe(AUTH_FAILURE_REASONS['project-out-of-scope'].code);
     }
+    expect(credentialRowsOf('server-agent'), 'a refused root minted a credential').toHaveLength(
+      serverAgentRowsBefore,
+    );
 
     // A folder no live connection announces is out of scope …
     const projectC = (await harness.copyFixtureProject()).root;
@@ -1589,18 +2060,34 @@ describe('authorization by role and scope', () => {
     const created = await harness.createSession({ projectRoot: projectC, question: QUESTION });
     expect(created.projectRoot).toBe(projectC);
 
-    // … and only for as long as that connection lives.
+    // … for as long as that connection lives, and for the offline-grace lease
+    // once it drops: VS Code's deactivate() ends its sessions over HTTP after
+    // its socket has gone, and that request must still reach its own project …
+    const closesBefore = harness.logger.withMessage(CONNECTION_CLOSED_LOG).length;
     await announcing.close();
-    await waitUntil(async () => {
-      const response = await fetchRaw(targetFor('session.get', created.id));
-      return response.status === AUTH_FAILURE_REASONS['project-out-of-scope'].status
-        ? response
-        : undefined;
-    }, 'the closed connection no longer lends its folder to the editor credential');
+    await waitUntil(
+      () =>
+        harness.logger.withMessage(CONNECTION_CLOSED_LOG).length > closesBefore ? true : undefined,
+      'the service has processed the editor socket close',
+    );
+    requireClock().advance(DEFAULT_OFFLINE_GRACE_MS / 2);
+    expectSuccess(await fetchRaw(targetFor('session.get', created.id)), 'session.get');
+    expectSuccess(
+      await fetchRaw(targetFor('session.end', created.id), { body: {} }),
+      'session.end',
+    );
+
+    // … and no longer: once the lease has passed, the folder is out of scope.
+    requireClock().advance(DEFAULT_OFFLINE_GRACE_MS);
+    expectRefusal(
+      await fetchRaw(targetFor('session.get', created.id)),
+      'project-out-of-scope',
+      'session.get after the lease of the closed connection passed',
+    );
     expectRefusal(
       await fetchRaw('session.create', { body: { projectRoot: projectC, question: QUESTION } }),
       'project-out-of-scope',
-      'session.create after the announcing connection closed',
+      'session.create after the lease of the closed connection passed',
     );
   });
 
@@ -1645,11 +2132,205 @@ describe('authorization by role and scope', () => {
 });
 
 /* -------------------------------------------------------------------------------------------------
+ * Retention on request
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The record the sessions module writes once per answered `POST /sessions/purge`. */
+const PURGE_REQUEST_LOG = 'Ran the retention sweep on request';
+
+/** The record the retention sweep itself writes once per run. */
+const RETENTION_SWEEP_LOG = 'retention sweep finished';
+
+/** How many purge requests the single-flight check sends at once. */
+const CONCURRENT_PURGES = 4;
+
+/** One day of the retention window, in the milliseconds the sweep's cutoff is measured in. */
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
+/**
+ * Every session the editor sees, sorted by id: a purge must leave the set
+ * unchanged, while the list's own order follows `updatedAt`, which a pipeline
+ * still settling may move.
+ */
+async function heldSessionIds(): Promise<readonly string[]> {
+  return [...(await listSessionIds())].sort();
+}
+
+/** The records with `message` the service's logger wrote after `mark` records. */
+function logsSince(mark: number, message: string): readonly CapturedLogRecord[] {
+  return harness.logger.records.slice(mark).filter((record) => record.message === message);
+}
+
+/**
+ * Parses a purge reply with the route table's own response schema, after the
+ * shared success checks, and proves the conflict list is the bounded,
+ * de-duplicated one protocol promises.
+ */
+function purgeReportOf(response: RawFetchResponse): SessionPurgeResponse {
+  expectSuccess(response, 'session.purge');
+  expect(response.headers.get(CACHE_CONTROL_HEADER)).toContain(NO_STORE_DIRECTIVE);
+  const parsed = HTTP_ROUTES['session.purge'].response.safeParse(response.json);
+  if (!parsed.success) {
+    throw new Error('The purge reply does not satisfy its schema.');
+  }
+  const report = parsed.data;
+  expect(report.sessionsRetainedForConflicts).toHaveLength(
+    Math.min(report.sessionsRetainedForConflictsTotal, SESSION_PURGE_MAX_REPORTED_SESSIONS),
+  );
+  expect(new Set(report.sessionsRetainedForConflicts).size).toBe(
+    report.sessionsRetainedForConflicts.length,
+  );
+  return report;
+}
+
+/** The counts of everything a purge deletes along with an aged session. */
+function sessionContentDeleted(report: SessionPurgeResponse): Readonly<Record<string, number>> {
+  return {
+    sessionsDeleted: report.sessionsDeleted,
+    telemetryEventsDeleted: report.telemetryEventsDeleted,
+    panelsDeleted: report.panelsDeleted,
+    analysesDeleted: report.analysesDeleted,
+    modificationsDeleted: report.modificationsDeleted,
+    backupDirsDeleted: report.backupDirsDeleted,
+  };
+}
+
+/** What {@link sessionContentDeleted} reads when a purge found nothing aged. */
+const NOTHING_DELETED = Object.freeze({
+  sessionsDeleted: 0,
+  telemetryEventsDeleted: 0,
+  panelsDeleted: 0,
+  analysesDeleted: 0,
+  modificationsDeleted: 0,
+  backupDirsDeleted: 0,
+});
+
+describe('retention on request', () => {
+  it('runs the retention sweep for the editor and deletes nothing inside the retention window', async () => {
+    const before = await heldSessionIds();
+    const windowMs = harness.config.retentionDays * MS_PER_DAY;
+    const logMark = harness.logger.records.length;
+    const startedAt = harness.now();
+
+    // No body at all reads as the empty request the row declares.
+    const response = await fetchRaw('session.purge');
+    const endedAt = harness.now();
+    const report = purgeReportOf(response);
+
+    // The cutoff is the configured window measured back from the service's clock …
+    expect(report.cutoff).toBeGreaterThanOrEqual(startedAt - windowMs);
+    expect(report.cutoff).toBeLessThanOrEqual(endedAt - windowMs);
+    // … and every session this suite holds is newer than it, so each one survived.
+    expect(sessionContentDeleted(report)).toEqual(NOTHING_DELETED);
+    expect(await heldSessionIds()).toEqual(before);
+    // The reply is counts and session ids: it names no path on this machine.
+    for (const fact of [harness.home, projectA, projectB]) {
+      expect(response.text.includes(fact), 'the purge reply names local state').toBe(false);
+    }
+
+    // One request ran exactly one sweep of its own.
+    const answered = logsSince(logMark, PURGE_REQUEST_LOG);
+    expect(answered).toHaveLength(1);
+    expect(answered[0]?.fields['joinedRunningSweep']).toBe(false);
+    expect(logsSince(logMark, RETENTION_SWEEP_LOG)).toHaveLength(1);
+  });
+
+  it('answers concurrent purge requests from one running sweep instead of starting one each', async () => {
+    const before = await heldSessionIds();
+    const logMark = harness.logger.records.length;
+
+    const responses = await Promise.all(
+      Array.from({ length: CONCURRENT_PURGES }, () => fetchRaw('session.purge', { body: {} })),
+    );
+    for (const response of responses) {
+      expect(sessionContentDeleted(purgeReportOf(response))).toEqual(NOTHING_DELETED);
+    }
+
+    // Every request is answered and says whether it joined a sweep already
+    // running. Only the ones that did not started a sweep, so the sweeps run
+    // are exactly the requests that ran their own: a joiner never starts another.
+    const answered = logsSince(logMark, PURGE_REQUEST_LOG);
+    expect(answered).toHaveLength(CONCURRENT_PURGES);
+    const joined = answered.map((record) => record.fields['joinedRunningSweep']);
+    for (const flag of joined) {
+      expect(typeof flag).toBe('boolean');
+    }
+    const ranOwn = joined.filter((flag) => flag === false).length;
+    expect(ranOwn).toBeGreaterThanOrEqual(1);
+    expect(logsSince(logMark, RETENTION_SWEEP_LOG)).toHaveLength(ranOwn);
+    expect(await heldSessionIds()).toEqual(before);
+  });
+
+  it('refuses a purge from every credential but the editor’s, and any body with content, before a sweep runs', async () => {
+    const devtools = harness.issueDevtoolsCredential();
+    track('devtools credential', devtools.token);
+    const serverAgent = harness.issueServerAgentCredential(projectA);
+    track('server-agent credential', serverAgent.token);
+    const before = await heldSessionIds();
+    const logMark = harness.logger.records.length;
+
+    expectRefusal(
+      await fetchRaw('session.purge', { ...presenting(devtools), body: {} }),
+      'role-not-permitted',
+      'devtools → session.purge',
+    );
+    expectRefusal(
+      await fetchRaw('session.purge', { token: serverAgent.token, body: {} }),
+      'role-not-permitted',
+      'server-agent → session.purge',
+    );
+    // The operation has no parameters: a body naming a window or a session is refused whole.
+    for (const body of [{ retentionDays: 0 }, { sessionIds: [sessionA.id] }, 'not json']) {
+      const response = await fetchRaw('session.purge', { body });
+      expect(response.status, 'a purge body with content').toBe(INVALID_BODY_STATUS);
+      expect(refusalShape(response).code).toBe(INVALID_BODY_CODE);
+    }
+
+    expect(logsSince(logMark, PURGE_REQUEST_LOG)).toEqual([]);
+    expect(logsSince(logMark, RETENTION_SWEEP_LOG)).toEqual([]);
+    expect(await heldSessionIds()).toEqual(before);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
  * Rotation and revocation
  * ---------------------------------------------------------------------------------------------- */
 
 describe('rotation and revocation', () => {
-  it('revokes every credential, closes every socket with WS_CLOSE_UNAUTHORIZED and regenerates auth.json', async () => {
+  it('rotates nothing for another role, or for a body that is not the empty request the row declares', async () => {
+    const devtools = harness.issueDevtoolsCredential();
+    track('devtools credential', devtools.token);
+    const serverAgent = harness.issueServerAgentCredential(projectA);
+    track('server-agent credential', serverAgent.token);
+    const digestsBefore = storedDigests();
+    const authFileBefore = await sha256OfFile(harness.config.authFilePath);
+
+    // Only the editor may rotate; the role is judged before a body is read.
+    expectRefusal(
+      await fetchRaw('credentials.rotate', { ...presenting(devtools), body: {} }),
+      'role-not-permitted',
+      'devtools → credentials.rotate',
+    );
+    expectRefusal(
+      await fetchRaw('credentials.rotate', { token: serverAgent.token, body: {} }),
+      'role-not-permitted',
+      'server-agent → credentials.rotate',
+    );
+    // The editor's request must be exactly `{}`: an absent, extended or
+    // unparseable body is refused, so no stray request rotates by accident.
+    for (const body of [undefined, { force: true }, 'not json']) {
+      const response = await fetchRaw('credentials.rotate', { body });
+      expect(response.status, 'a rotation body that is not {}').toBe(INVALID_BODY_STATUS);
+      expect(refusalShape(response).code).toBe(INVALID_BODY_CODE);
+    }
+
+    // Every credential, auth.json and the editor's access are as they were.
+    expect(storedDigests()).toEqual(digestsBefore);
+    expect(await sha256OfFile(harness.config.authFilePath)).toBe(authFileBefore);
+    expectSuccess(await fetchRaw('session.list'), 'session.list');
+  });
+
+  it('revokes every credential through POST /credentials/rotate, closes every socket with WS_CLOSE_UNAUTHORIZED and regenerates auth.json', async () => {
     // What a running system holds when the developer rotates: an editor HTTP
     // client, the editor's socket, a paired DevTools socket, a dev server's
     // socket and credentials, an editor socket that is not a harness client at
@@ -1686,7 +2367,17 @@ describe('rotation and revocation', () => {
     const authFileBefore = await sha256OfFile(harness.config.authFilePath);
     await assertNoPlaintextAtRest();
 
-    const outcome = harness.rotateAll();
+    // The editor asks, as `debuggen.rotateServiceToken` does. The service closes
+    // every socket (this caller's own editor socket included) before it
+    // answers; the answer still arrives, on this request's own HTTP connection.
+    const rotation = await fetchRaw('credentials.rotate', { body: {} });
+    expectSuccess(rotation, 'credentials.rotate');
+    expect(rotation.headers.get(CACHE_CONTROL_HEADER)).toContain(NO_STORE_DIRECTIVE);
+    const parsedOutcome = HTTP_ROUTES['credentials.rotate'].response.safeParse(rotation.json);
+    if (!parsedOutcome.success) {
+      throw new Error('The rotation reply does not satisfy its schema.');
+    }
+    const outcome = parsedOutcome.data;
     expect(outcome.credentialsDeleted).toBe(rowsBefore);
     expect(outcome.socketsClosed).toBeGreaterThanOrEqual(held.length + 1);
 
@@ -1743,9 +2434,25 @@ describe('rotation and revocation', () => {
     const authFile = await stat(harness.config.authFilePath);
     expect(authFile.mode & PERMISSION_BITS).toBe(SECURE_FILE_MODE);
     expect(await sha256OfFile(harness.config.authFilePath)).not.toBe(authFileBefore);
+    // The journal that staged the new credential was removed once auth.json was published.
+    await expect(
+      stat(`${harness.config.authFilePath}${AUTH_FILE_STAGE_SUFFIX}`),
+    ).rejects.toMatchObject({ code: 'ENOENT' });
+    // The new credential reaches the editor only through that file, never through the reply.
     const newEditorToken = track('editor credential', harness.refreshEditorToken());
     expect(sha256Hex(newEditorToken)).not.toBe(sha256Hex(oldEditorToken));
     expect(remaining.has(sha256Hex(newEditorToken))).toBe(true);
+    expect(leaksIn(rotation.text), 'the rotation reply carries a credential').toEqual([]);
+
+    // No workspace lease survives the rotation: until a folder is announced
+    // again, the new credential reaches no project a revoked socket announced.
+    for (const session of [sessionA, sessionB]) {
+      expectRefusal(
+        await fetchRaw(targetFor('session.get', session.id), { token: newEditorToken }),
+        'project-out-of-scope',
+        'a folder only a revoked editor socket announced',
+      );
+    }
 
     // The re-read editor credential works, once its folder is announced again.
     expectSuccess(await fetchRaw('session.list', { token: newEditorToken }), 'session.list');
@@ -1770,6 +2477,319 @@ describe('rotation and revocation', () => {
 
   it('never holds a plaintext credential at rest or in a log record', async () => {
     expect(secrets.size).toBeGreaterThan(0);
+    await assertNoPlaintextAtRest();
+    assertNothingLogged();
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * The revocation fence across a stalled request body
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The record the access boundary writes when its revocation fence refuses a request. */
+const FENCE_REFUSAL_LOG =
+  'refused a request whose credential was retired after it was authenticated';
+
+/** The record the access boundary writes for every server-agent credential it mints. */
+const SERVER_AGENT_ISSUED_LOG = 'issued a server-agent credential';
+
+/** The record the access boundary writes once per completed rotation. */
+const ROTATION_LOG = 'rotated every service credential';
+
+/** The editor operations whose side effect the fence is proven on across a stalled body. */
+type StalledOperation = 'devServer.credential' | 'session.purge' | 'credentials.rotate';
+
+/** A request whose body is held back part-way after the middleware authenticated it. */
+interface StalledRequest {
+  /** Sends the rest of the body and resolves with the whole response. */
+  resume(): Promise<RawFetchResponse>;
+}
+
+/** A Node response's headers as a WHATWG `Headers`, the shape {@link RawFetchResponse} carries. */
+function headersOf(incoming: IncomingHttpHeaders): Headers {
+  const headers = new Headers();
+  for (const [name, value] of Object.entries(incoming)) {
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        headers.append(name, item);
+      }
+    } else if (value !== undefined) {
+      headers.set(name, value);
+    }
+  }
+  return headers;
+}
+
+/**
+ * Opens `operation` over a raw `node:http` connection presenting `token`,
+ * declares the whole body's `Content-Length`, writes only its first half, and
+ * resolves once the service's middleware has **authenticated** the request —
+ * so the credential was live when the principal was resolved, and the handler
+ * is now awaiting the rest of the body.
+ *
+ * Authentication is observed with a call-through spy on the service's own
+ * `authorizeHttpRequest` (the instance its middleware calls), restored before
+ * this returns: it records the verdict for this operation and digest and
+ * changes nothing the service does. The response, once {@link
+ * StalledRequest.resume} releases the body, passes the same CORS and leak
+ * checks as every {@link fetchRaw} reply.
+ */
+async function stallRequest(
+  operation: StalledOperation,
+  body: object,
+  token: string,
+): Promise<StalledRequest> {
+  const bytes = Buffer.from(JSON.stringify(body), 'utf8');
+  const split = Math.max(1, Math.floor(bytes.length / 2));
+  expect(bytes.length, 'a body long enough to hold part of it back').toBeGreaterThan(split);
+  const digest = sha256Hex(token);
+  const target = new URL(buildPath(operation), harness.url);
+  const spy = vi.spyOn(harness.auth, 'authorizeHttpRequest');
+  try {
+    const request = httpRequest({
+      hostname: target.hostname,
+      port: target.port,
+      path: target.pathname,
+      method: HTTP_ROUTES[operation].method,
+      // One connection of its own, closed after the reply, so teardown finds no socket.
+      agent: false,
+      headers: {
+        [AUTHORIZATION_HEADER]: formatBearer(token),
+        'content-type': 'application/json',
+        'content-length': String(bytes.length),
+        connection: 'close',
+      },
+    });
+    const response = new Promise<RawFetchResponse>((resolve, reject) => {
+      request.on('error', reject);
+      request.on('response', (incoming) => {
+        const chunks: Buffer[] = [];
+        incoming.on('data', (chunk: Buffer) => {
+          chunks.push(chunk);
+        });
+        incoming.on('error', reject);
+        incoming.on('end', () => {
+          const text = Buffer.concat(chunks).toString('utf8');
+          let json: unknown;
+          try {
+            json = text.length === 0 ? undefined : JSON.parse(text);
+          } catch {
+            json = undefined;
+          }
+          resolve({
+            status: incoming.statusCode ?? 0,
+            headers: headersOf(incoming.headers),
+            text,
+            json,
+          });
+        });
+      });
+    });
+    // A failure before `resume()` is awaited surfaces there; this keeps it
+    // from escaping as an unhandled rejection meanwhile.
+    void response.catch(() => undefined);
+    request.setTimeout(HARNESS_TIMEOUTS.request, () => {
+      request.destroy(new Error(`The stalled ${operation} request was not answered in time.`));
+    });
+    request.write(bytes.subarray(0, split));
+
+    await waitUntil(() => {
+      for (const [index, [authorization]] of spy.mock.calls.entries()) {
+        const outcome = spy.mock.results[index];
+        if (
+          authorization.operation === operation &&
+          outcome?.type === 'return' &&
+          !isErr(outcome.value) &&
+          outcome.value.value?.tokenHash === digest
+        ) {
+          return true;
+        }
+      }
+      return undefined;
+    }, `the middleware authenticated the stalled ${operation} request`);
+
+    return {
+      resume: async () => {
+        request.end(bytes.subarray(split));
+        const answered = await response;
+        expectNoCorsGrant(answered);
+        expect(
+          leaksIn(answered.text),
+          `a ${String(answered.status)} reply echoes a secret`,
+        ).toEqual([]);
+        inspectedResponses += 1;
+        return answered;
+      },
+    };
+  } finally {
+    spy.mockRestore();
+  }
+}
+
+/**
+ * Runs `rotate` and waits until each of the `held` editor connections was
+ * closed with `WS_CLOSE_UNAUTHORIZED`, so none of them is mistaken for a live
+ * announcement afterwards.
+ */
+async function rotateClosing(
+  held: readonly HarnessWsClient[],
+  rotate: () => Promise<void> | void,
+): Promise<void> {
+  const closesBefore = held.map((client) => client.closes.length);
+  await rotate();
+  for (const [index, client] of held.entries()) {
+    const record = await client.waitForClose(HARNESS_TIMEOUTS.message, closesBefore[index]);
+    expect(record.code, client.describe()).toBe(WS_CLOSE_UNAUTHORIZED);
+  }
+}
+
+/** Rotates every credential through `POST /credentials/rotate`, presenting `token`. */
+async function rotateThroughRoute(token: string, held: readonly HarnessWsClient[]): Promise<void> {
+  await rotateClosing(held, async () => {
+    expectSuccess(await fetchRaw('credentials.rotate', { token, body: {} }), 'credentials.rotate');
+  });
+}
+
+/**
+ * Re-establishes the editor after a rotation, as the extension does on 4401:
+ * re-reads `auth.json`, announces both fixture projects again, and proves the
+ * new credential is answered — so every later test finds the editor as it was.
+ */
+async function adoptRotatedEditor(): Promise<void> {
+  track('editor credential', harness.refreshEditorToken());
+  for (const projectRoot of [projectA, projectB]) {
+    expect((await harness.editor(projectRoot)).authenticated).toBe(true);
+  }
+  expectSuccess(await fetchRaw('session.list'), 'session.list');
+}
+
+/** Both fixture projects' live editor connections, opening one where none is authenticated. */
+async function announcedEditors(): Promise<readonly HarnessWsClient[]> {
+  return [await harness.editor(projectA), await harness.editor(projectB)];
+}
+
+describe('the revocation fence across a stalled request body', () => {
+  it('completes a stalled credential request and a stalled purge whose credential stayed live', async () => {
+    await announcedEditors();
+    const serverAgentBefore = digestsOf(credentialRowsOf('server-agent'));
+
+    const minting = await stallRequest(
+      'devServer.credential',
+      { projectRoot: projectA },
+      harness.editorToken,
+    );
+    const minted = await minting.resume();
+    expectSuccess(minted, 'devServer.credential');
+    expect(minted.headers.get(CACHE_CONTROL_HEADER)).toContain(NO_STORE_DIRECTIVE);
+    const parsed = HTTP_ROUTES['devServer.credential'].response.safeParse(minted.json);
+    if (!parsed.success) {
+      throw new Error('The dev-server credential reply does not satisfy its schema.');
+    }
+    const token = track('dev-server credential', parsed.data.token);
+    const serverAgentAfter = digestsOf(credentialRowsOf('server-agent'));
+    expect(serverAgentAfter).toHaveLength(serverAgentBefore.length + 1);
+    expect(serverAgentAfter).toContain(sha256Hex(token));
+
+    const logMark = harness.logger.records.length;
+    const purging = await stallRequest('session.purge', {}, harness.editorToken);
+    const purged = await purging.resume();
+    expect(sessionContentDeleted(purgeReportOf(purged))).toEqual(NOTHING_DELETED);
+    expect(logsSince(logMark, PURGE_REQUEST_LOG)).toHaveLength(1);
+    expect(logsSince(logMark, RETENTION_SWEEP_LOG)).toHaveLength(1);
+    expect(logsSince(logMark, FENCE_REFUSAL_LOG)).toEqual([]);
+  });
+
+  it('refuses a stalled credential request whose editor credential a rotation retired, and mints nothing', async () => {
+    const held = await announcedEditors();
+    const retired = harness.editorToken;
+    const stalled = await stallRequest('devServer.credential', { projectRoot: projectA }, retired);
+
+    // The rotation lands while the handler awaits the rest of the body. It
+    // deletes every credential, the one that authorized the stalled request included.
+    await rotateThroughRoute(retired, held);
+    expect(credentialRowsOf('server-agent')).toEqual([]);
+    const rowsAfterRotation = readRows(SELECT_CREDENTIALS);
+    const logMark = harness.logger.records.length;
+
+    const response = await stalled.resume();
+    const refusal = expectRefusal(
+      response,
+      'unknown-credential',
+      'a credential request resumed after its credential was rotated',
+    );
+    expect(refusal.message).toBe(AUTH_FAILURE_REASONS['unknown-credential'].message);
+    expect(response.headers.get(CACHE_CONTROL_HEADER)).toContain(NO_STORE_DIRECTIVE);
+    // No token in the reply, and no server-agent row behind it.
+    expect(bodyKeys(response)).not.toContain('token');
+    expect(HTTP_ROUTES['devServer.credential'].response.safeParse(response.json).success).toBe(
+      false,
+    );
+    expect(credentialRowsOf('server-agent')).toEqual([]);
+    expect(readRows(SELECT_CREDENTIALS)).toEqual(rowsAfterRotation);
+    expect(logsSince(logMark, SERVER_AGENT_ISSUED_LOG)).toEqual([]);
+    // The fence refused it, not the middleware: the middleware authenticated it before the rotation.
+    const fenced = logsSince(logMark, FENCE_REFUSAL_LOG);
+    expect(fenced).toHaveLength(1);
+    expect(fenced[0]?.fields['reason']).toBe('unknown-credential');
+    expect(fenced[0]?.fields['role']).toBe('vscode');
+
+    await adoptRotatedEditor();
+  });
+
+  it('refuses a stalled purge whose editor credential a rotation retired, before any sweep runs', async () => {
+    const held = await announcedEditors();
+    const before = await heldSessionIds();
+    const retired = harness.editorToken;
+    const stalled = await stallRequest('session.purge', {}, retired);
+
+    await rotateThroughRoute(retired, held);
+    const logMark = harness.logger.records.length;
+
+    const response = await stalled.resume();
+    expectRefusal(
+      response,
+      'unknown-credential',
+      'a purge resumed after its credential was rotated',
+    );
+    expect(bodyKeys(response)).not.toContain('sessionsDeleted');
+    expect(logsSince(logMark, PURGE_REQUEST_LOG)).toEqual([]);
+    expect(logsSince(logMark, RETENTION_SWEEP_LOG)).toEqual([]);
+    expect(logsSince(logMark, FENCE_REFUSAL_LOG)).toHaveLength(1);
+
+    await adoptRotatedEditor();
+    expect(await heldSessionIds()).toEqual(before);
+  });
+
+  it('refuses a stalled rotation whose credential a rotation outside the route retired, and rotates nothing more', async () => {
+    const held = await announcedEditors();
+    const retired = harness.editorToken;
+    const stalled = await stallRequest('credentials.rotate', {}, retired);
+
+    // The service's own rotateAll, called directly rather than through the
+    // route: the fence reads the store, so it sees a rotation whichever caller ran it.
+    await rotateClosing(held, () => {
+      harness.rotateAll();
+    });
+    const digestsAfterRotation = storedDigests();
+    const authFileAfterRotation = await sha256OfFile(harness.config.authFilePath);
+    const logMark = harness.logger.records.length;
+
+    const response = await stalled.resume();
+    expectRefusal(
+      response,
+      'unknown-credential',
+      'a rotation resumed after its credential was rotated',
+    );
+    // Nothing more was revoked: the credentials and auth.json the rotation left stand.
+    expect(storedDigests()).toEqual(digestsAfterRotation);
+    expect(await sha256OfFile(harness.config.authFilePath)).toBe(authFileAfterRotation);
+    expect(logsSince(logMark, ROTATION_LOG)).toEqual([]);
+    expect(logsSince(logMark, FENCE_REFUSAL_LOG)).toHaveLength(1);
+
+    await adoptRotatedEditor();
+  });
+
+  it('keeps every credential the fence saw out of the store and the log', async () => {
     await assertNoPlaintextAtRest();
     assertNothingLogged();
   });

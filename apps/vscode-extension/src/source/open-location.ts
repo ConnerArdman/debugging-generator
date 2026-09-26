@@ -7,6 +7,7 @@
  *   → a runtime port → the Chrome service worker → WebSocket `source.open`
  *   → the local service, which validates containment against the session's
  *     projectRoot → WebSocket to the VS Code client → THIS MODULE
+ *   → WebSocket `source.result` back to the service, relayed to the panel
  * ```
  *
  * Everything upstream of here is transport. This module is where a
@@ -36,6 +37,15 @@
  *   `projectRoot`**, re-checked here even though `apps/local-service`'s
  *   `source/open.ts` already checked it: the location is untrusted at every
  *   hop, and defence in depth is the stated design (AAP §0.2.3).
+ *
+ * ## The answer the panel is waiting for
+ *
+ * A click in the DevTools panel is not done when a frame was queued: the panel
+ * shows success only once the editor has opened the location. So every
+ * `source.open` the service forwards is answered with one `source.result`,
+ * built by {@link sourceResultFor} from what became of the attempt — `opened`,
+ * or `failed` with an error code and a constant sentence that repeats nothing
+ * the editor saw. `src/extension.ts` sends it; the service relays it.
  *
  * ## The one place the off-by-one lives
  *
@@ -76,6 +86,8 @@
 
 import * as vscode from 'vscode';
 
+import { parseSourceResultPayload } from '@debuggen/protocol';
+import type { SourceResultPayload } from '@debuggen/protocol';
 import {
   DebuggenError,
   err,
@@ -1190,5 +1202,167 @@ export async function openSourceLocation(
     logger?.error('Opening a source location failed unexpectedly', { code: error.code });
     showWarning(refusalMessage('Debug Generator could not open the source location.', error));
     return err(error);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The editor's answer: `source.result`
+// ---------------------------------------------------------------------------
+
+/**
+ * The `source.open` frame being answered, reduced to the two values the answer
+ * repeats: the session the frame named and the frame's own envelope `id`,
+ * which becomes the answer's `ref`.
+ */
+export interface ForwardedSourceOpen {
+  /** The `sessionId` of the `source.open` payload. */
+  readonly sessionId: string;
+
+  /**
+   * The `id` of the `source.open` envelope the service sent this editor. The
+   * service correlates the answer by this value alone and relays the outcome
+   * to the DevTools panel that asked under the id of *that* panel's frame.
+   */
+  readonly ref: string;
+}
+
+/**
+ * What became of one `source.open` the service forwarded to this editor — the
+ * input of {@link sourceResultFor}.
+ *
+ * - `opened` — {@link openSourceLocation} revealed the location.
+ * - `unknown-session` — no session this window can see carries the id the
+ *   frame named, so there is no project root to check containment against and
+ *   nothing was opened.
+ * - `not-opened` — {@link openSourceLocation} answered an `Err`. Only its
+ *   `code` is kept: the error's message names the location and its `cause` may
+ *   quote the absolute project root, and neither may leave the editor
+ *   (AAP §0.5.2).
+ * - `unexpected` — the attempt threw.
+ *
+ * `no-editor` has no counterpart here: it is the service's answer when no
+ * editor is connected, never an editor's.
+ */
+export type ForwardedSourceOpenOutcome =
+  | { readonly kind: 'opened' }
+  | { readonly kind: 'unknown-session' }
+  | { readonly kind: 'not-opened'; readonly code: DebuggenErrorCode }
+  | { readonly kind: 'unexpected' };
+
+/** The developer-facing sentence and next step of one `failed` answer. */
+interface SourceResultCopy {
+  readonly message: string;
+  readonly hint: string;
+}
+
+/** The answer for a session this window does not know. */
+const UNKNOWN_SESSION_COPY: SourceResultCopy = Object.freeze({
+  message:
+    'The VS Code window that received this source link does not know its session, so nothing was opened.',
+  hint: 'Open the session from the Debug Generator Sessions view in the VS Code window for its project, then click the link again.',
+});
+
+/**
+ * The answer for each code {@link openSourceLocation} reports a refusal or a
+ * failed reveal under. A code without an entry — anything the reveal primitive
+ * or a later change reports — gets {@link NOT_OPENED_FALLBACK_COPY}, and its
+ * code still travels, so the panel can tell the cases apart.
+ */
+const NOT_OPENED_COPY: Readonly<Partial<Record<DebuggenErrorCode, SourceResultCopy>>> =
+  Object.freeze({
+    PROTOCOL_INVALID_MESSAGE: {
+      message:
+        'VS Code refused the source location because it is not a valid project-relative location.',
+      hint: 'Capture again so the panel carries a fresh location, then click the link again.',
+    },
+    PATH_OUTSIDE_PROJECT: {
+      message:
+        "VS Code refused the source location because it is not inside the session's project.",
+      hint: 'A source link can only open a file inside the project the session was started for.',
+    },
+    PROJECT_NOT_FOUND: {
+      message: 'VS Code could not open the file this source link names.',
+      hint: 'The file may have been moved, renamed or deleted since the capture.',
+    },
+  });
+
+/** The answer for a failure whose code has no entry in {@link NOT_OPENED_COPY}. */
+const NOT_OPENED_FALLBACK_COPY: SourceResultCopy = Object.freeze({
+  message: 'VS Code could not open the source location.',
+  hint: 'The Debug Generator output channel in VS Code records the reason.',
+});
+
+/** The answer for an attempt that threw. */
+const UNEXPECTED_COPY: SourceResultCopy = Object.freeze({
+  message: 'VS Code could not open the source location because of an unexpected error.',
+  hint: 'Check the Debug Generator output channel in VS Code, then click the link again.',
+});
+
+/**
+ * Builds the `source.result` payload this editor answers a forwarded
+ * `source.open` with.
+ *
+ * Pure: no editor call, no I/O, no clock. `src/extension.ts` calls it once per
+ * forwarded frame, after {@link openSourceLocation} settled, and sends the
+ * payload through `ServiceClient.send`; the service relays it to the DevTools
+ * panel, which renders `opened` as done and a `failed` answer as the failure it
+ * is — never a queued frame as a success.
+ *
+ * Every `message` and `hint` is a constant sentence chosen by the outcome and
+ * the error code, so nothing the editor learned while trying — the location,
+ * an absolute path, a thrown value — reaches the panel. The payload is
+ * validated with the protocol's own `parseSourceResultPayload` before it is
+ * returned, so a `ref` the service would refuse (an envelope id longer than a
+ * `ref` may be) is an `Err` here rather than a frame the service drops.
+ *
+ * @param answered The frame being answered.
+ * @param outcome What became of it.
+ * @returns `ok(payload)`, or `err(error)` with `PROTOCOL_INVALID_MESSAGE` when
+ * the frame's identifiers cannot form a valid answer. Never throws.
+ *
+ * @example
+ * ```ts
+ * const opened = await openSourceLocation(payload.location, { projectRoot });
+ * const answer = sourceResultFor(
+ *   { sessionId: payload.sessionId, ref: message.id },
+ *   isOk(opened) ? { kind: 'opened' } : { kind: 'not-opened', code: opened.error.code },
+ * );
+ * if (isOk(answer)) {
+ *   client.send('source.result', answer.value);
+ * }
+ * ```
+ */
+export function sourceResultFor(
+  answered: ForwardedSourceOpen,
+  outcome: ForwardedSourceOpenOutcome,
+): Result<SourceResultPayload, DebuggenError> {
+  const { sessionId, ref } = answered;
+  switch (outcome.kind) {
+    case 'opened':
+      return parseSourceResultPayload({ sessionId, ref, status: 'opened' });
+    case 'unknown-session':
+      return parseSourceResultPayload({
+        sessionId,
+        ref,
+        status: 'failed',
+        error: { code: 'SESSION_NOT_FOUND', ...UNKNOWN_SESSION_COPY },
+      });
+    case 'not-opened':
+      return parseSourceResultPayload({
+        sessionId,
+        ref,
+        status: 'failed',
+        error: {
+          code: outcome.code,
+          ...(NOT_OPENED_COPY[outcome.code] ?? NOT_OPENED_FALLBACK_COPY),
+        },
+      });
+    case 'unexpected':
+      return parseSourceResultPayload({
+        sessionId,
+        ref,
+        status: 'failed',
+        error: { code: 'INTERNAL', ...UNEXPECTED_COPY },
+      });
   }
 }

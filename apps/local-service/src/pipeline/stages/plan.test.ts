@@ -130,11 +130,13 @@ import {
 } from '../context-builder.js';
 import type { CodeInvestigation } from './investigate.js';
 import {
+  authoredPlanShape,
   buildAdapterCatalog,
   buildRuntimeOnlyFallbackPlan,
   contextBoundResolver,
   createPlanStage,
   gateInstrumentationPlan,
+  refusedFieldPath,
   type PlanStageDeps,
   type PlanStageInput,
   type PlanStageResult,
@@ -1421,7 +1423,18 @@ describe('gateInstrumentationPlan', () => {
       (record) => record.level === 'error' && record.fields['step'] === 'normalize',
     );
     expect(defects).toHaveLength(1);
-    expect(defects[0]?.fields['input']).toEqual(UNCLAIMED_PLAN);
+    // The record locates the defect and describes the input by its closed shape only.
+    const fields = defects[0]?.fields ?? {};
+    expect(Object.keys(fields)).not.toContain('input');
+    expect(fields).toMatchObject({
+      stage: PLAN,
+      step: 'normalize',
+      code: outcome.error.code,
+      field: 'instrumentationTargets.0.type',
+      ...authoredPlanShape(UNCLAIMED_PLAN),
+    });
+    expect(fields['targetTypes']).toEqual({ 'state-tracking': 1 });
+    expect(log.records.map(serializeRecord).join('\n')).not.toContain(SENTINEL);
   });
 
   it('rejects a normaliser output that fails the internal schema, naming paths and codes only', () => {
@@ -1456,11 +1469,77 @@ describe('gateInstrumentationPlan', () => {
     expect(serializeError(outcome.error)).not.toContain('not-an-opaque-id');
     expect(serializeError(outcome.error)).not.toContain(SENTINEL);
     expect(vi.mocked(checkPlanFeasibility)).not.toHaveBeenCalled();
-    expect(
-      log.records.filter(
-        (record) => record.level === 'error' && record.fields['step'] === 'internal-validation',
-      ),
-    ).toHaveLength(1);
+    const defects = log.records.filter(
+      (record) => record.level === 'error' && record.fields['step'] === 'internal-validation',
+    );
+    expect(defects).toHaveLength(1);
+    const fields = defects[0]?.fields ?? {};
+    expect(Object.keys(fields)).not.toContain('input');
+    expect(fields).toMatchObject({
+      code: 'PLAN_INVALID',
+      issues,
+      issueCount: 1,
+      ...authoredPlanShape(MODEL_PLAN),
+    });
+    const logged = log.records.map(serializeRecord).join('\n');
+    expect(logged).not.toContain(SENTINEL);
+    expect(logged).not.toContain('not-an-opaque-id');
+  });
+
+  it('describes an authored plan by counts and closed action types only', () => {
+    const shape = authoredPlanShape(MODEL_PLAN);
+    expect(shape).toStrictEqual({
+      captureCount: 2,
+      targetCount: 2,
+      hypothesisCount: 1,
+      targetTypes: { 'fetch-tracking': 1, 'interaction-tracking': 1 },
+    });
+    expect(Object.isFrozen(shape)).toBe(true);
+    expect(Object.isFrozen(shape.targetTypes)).toBe(true);
+    // Keys are sorted, duplicates are counted, and an absent hypothesis list counts as none.
+    const repeated = authoredPlanShape({
+      ...UNCLAIMED_PLAN,
+      instrumentationTargets: [
+        ...MODEL_PLAN.instrumentationTargets,
+        ...MODEL_PLAN.instrumentationTargets,
+        ...UNCLAIMED_PLAN.instrumentationTargets,
+      ],
+    });
+    expect(Object.keys(repeated.targetTypes)).toStrictEqual([
+      'fetch-tracking',
+      'interaction-tracking',
+      'state-tracking',
+    ]);
+    expect(repeated.targetTypes).toEqual({
+      'fetch-tracking': 2,
+      'interaction-tracking': 2,
+      'state-tracking': 1,
+    });
+    expect(repeated.hypothesisCount).toBe(0);
+    expect(JSON.stringify(shape)).not.toContain(SENTINEL);
+  });
+
+  it('carries a normaliser’s field only when it is a structural path', () => {
+    const refusal = (field: unknown): DebuggenError =>
+      new DebuggenError('INSTRUMENTATION_UNAVAILABLE', 'Refused.', { details: { field } });
+    expect(refusedFieldPath(refusal('instrumentationTargets.2.file'))).toBe(
+      'instrumentationTargets.2.file',
+    );
+    expect(refusedFieldPath(refusal('context.previousActions.0'))).toBe(
+      'context.previousActions.0',
+    );
+    for (const field of [
+      `Explain ${SENTINEL} to me`,
+      `instrumentationTargets.0.${SENTINEL}!`,
+      'instrumentationTargets..file',
+      '',
+      `a${'.b'.repeat(80)}`,
+      7,
+      undefined,
+    ]) {
+      expect(refusedFieldPath(refusal(field))).toBeUndefined();
+    }
+    expect(refusedFieldPath(new DebuggenError('INTERNAL', 'No details.'))).toBeUndefined();
   });
 
   it('rejects a plan with no feasible action as infeasible, attaching the plan and its report', () => {
@@ -1903,11 +1982,13 @@ describe('createPlanStage', () => {
     expect(value.fallbackCause?.reason).toBe('normalization-failed');
     expect(value.repairs).toBe(0);
 
-    // The product-defect record, at error, carries the parsed input.
+    // The product-defect record, at error, describes the parsed input by its shape, never by value.
     const defects = h.fixture.contextLog.records.filter(
       (record) => record.level === 'error' && record.fields['step'] === 'normalize',
     );
     expect(defects).toHaveLength(1);
+    expect(defects[0]?.fields).toMatchObject(authoredPlanShape(UNCLAIMED_PLAN));
+    expect(Object.keys(defects[0]?.fields ?? {})).not.toContain('input');
 
     // Normalised twice — the model's plan, then the fallback — and feasibility ran only for the fallback.
     expect(vi.mocked(normalizePlan)).toHaveBeenCalledTimes(2);
@@ -2618,24 +2699,30 @@ describe('createPlanStage — boundaries', () => {
 // ===========================================================================
 
 /**
- * Everything a run surfaced, with the one value AAP §0.5.3 sanctions removed:
- * the parsed authoring input on an error-level product-defect record, which is
- * what whoever fixes the normaliser needs.
+ * A copy of an authoring-valid plan with {@link SENTINEL} planted in every
+ * free-prose field: the objective, each capture phrase, each target's
+ * rationale and each hypothesis. Types, files and symbols are left alone, so
+ * the plan meets the gate exactly as the original does.
  */
-function surfacedOutsideSanctionedInput(h: Harness, error?: DebuggenError): string {
-  const logged = h.fixture.contextLog.records.map((record) => {
-    const defect =
+function withProseSentinel(plan: InstrumentationPlanInput): InstrumentationPlanInput {
+  return {
+    objective: `${plan.objective} (${SENTINEL} objective)`,
+    capture: plan.capture.map((phrase) => `${phrase} ${SENTINEL}`),
+    instrumentationTargets: plan.instrumentationTargets.map((target) => ({
+      ...target,
+      rationale: `Rationale ${SENTINEL}.`,
+    })),
+    hypotheses: [`The ${SENTINEL} hypothesis.`],
+  };
+}
+
+/** The error-level product-defect records of a run, for any gate step. */
+function productDefectRecords(h: Harness): LogRecord[] {
+  return h.fixture.contextLog.records.filter(
+    (record) =>
       record.level === 'error' &&
-      (record.fields['step'] === 'normalize' || record.fields['step'] === 'internal-validation');
-    if (!defect) {
-      return serializeRecord(record);
-    }
-    const fields = Object.fromEntries(
-      Object.entries(record.fields).filter(([key]) => key !== 'input'),
-    );
-    return JSON.stringify({ message: record.message, fields });
-  });
-  return [...logged, ...(error !== undefined ? [serializeError(error)] : [])].join('\n');
+      (record.fields['step'] === 'normalize' || record.fields['step'] === 'internal-validation'),
+  );
 }
 
 /** A model answer the authoring schema refuses, carrying the sentinel in a valid field. */
@@ -2680,27 +2767,45 @@ describe('createPlanStage — privacy', () => {
     expect(everythingSurfaced(refused, refusedError)).not.toContain(SENTINEL);
   });
 
-  it('confines the sentinel to the sanctioned input field of the product-defect record', async () => {
-    const h = harness({ outcomes: [answer(UNCLAIMED_PLAN)], adapterRegistry: patchOnlyRegistry() });
+  it('keeps authored prose out of every record, at every level, of a normaliser defect', async () => {
+    const planted = withProseSentinel(UNCLAIMED_PLAN);
+    expect(instrumentationPlanInputSchema.safeParse(planted).success).toBe(true);
+    const h = harness({ outcomes: [answer(planted)], adapterRegistry: patchOnlyRegistry() });
 
     const error = expectErr(await h.run());
 
     const defects = defectRecords(h, 'normalize');
     expect(defects).toHaveLength(1);
-    expect(defects[0]?.fields['input']).toEqual(UNCLAIMED_PLAN);
-    expect(surfacedOutsideSanctionedInput(h, error)).not.toContain(SENTINEL);
+    const fields = defects[0]?.fields ?? {};
+    expect(Object.keys(fields)).not.toContain('input');
+    expect(fields).toMatchObject({
+      field: 'instrumentationTargets.0.type',
+      captureCount: 1,
+      targetCount: 1,
+      hypothesisCount: 1,
+      targetTypes: { 'state-tracking': 1 },
+    });
+    // The context logger records every level down to trace; none carries the prose.
+    expect(everythingSurfaced(h, error)).not.toContain(SENTINEL);
   });
 
-  it('confines the sentinel likewise on an internal-validation defect', async () => {
+  it('keeps authored prose out of every record, at every level, of an internal-validation defect', async () => {
     vi.mocked(normalizePlan).mockReturnValueOnce(ok(defectivePlan(3)));
-    const h = harness({ outcomes: [answer(MODEL_PLAN)] });
+    const planted = withProseSentinel(MODEL_PLAN);
+    expect(instrumentationPlanInputSchema.safeParse(planted).success).toBe(true);
+    const h = harness({ outcomes: [answer(planted)] });
 
     const value = expectOk(await h.run());
 
     expect(value.fallback).toBe(true);
-    expect(defectRecords(h, 'internal-validation')).toHaveLength(1);
-    expect(surfacedOutsideSanctionedInput(h)).not.toContain(SENTINEL);
-    expect(surfacedOutsideSanctionedInput(h)).not.toContain('not-an-opaque-id');
+    const defects = defectRecords(h, 'internal-validation');
+    expect(defects).toHaveLength(1);
+    const fields = defects[0]?.fields ?? {};
+    expect(Object.keys(fields)).not.toContain('input');
+    expect(fields).toMatchObject({ ...authoredPlanShape(planted), issueCount: 1 });
+    expect(productDefectRecords(h)).toHaveLength(1);
+    expect(everythingSurfaced(h)).not.toContain(SENTINEL);
+    expect(everythingSurfaced(h)).not.toContain('not-an-opaque-id');
   });
 
   it('logs no URL, statement, token, source body or prompt from model output', async () => {

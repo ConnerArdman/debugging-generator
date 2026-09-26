@@ -31,6 +31,14 @@
  * exemption channel. There is deliberately no inline `// allow-secret` pragma: an exemption that
  * never appears in a diff of one reviewed file is an exemption nobody reviews.
  *
+ * THE ALLOWLIST IS EXACT. A match is exempt only when its whole span lies inside an occurrence of
+ * an allowlisted literal at a path that literal lists, and the allowlist is consulted before
+ * overlapping matches are deduplicated. A longer value that merely contains the literal - the
+ * database URL with `?password=...`, `;password=...`, a path suffix, a fragment or a scheme prefix
+ * appended - is a different, longer match, and it is reported. The literal must also be the whole
+ * value on its line: an occurrence followed by anything other than closing punctuation before
+ * whitespace, a quote, a backtick or the end of the line (`<url>)password=...`) exempts nothing.
+ *
  * SELF-DETECTION. This file is tracked content and is scanned like any other, so every pattern is
  * assembled from concatenated fragments and no credential prefix, token body or key-file header
  * appears contiguously in its source. The same reason keeps the two allowlisted literals out of it:
@@ -47,9 +55,21 @@
  * precondition failure raised where enumeration happens, which makes it fail for in-process
  * callers and for the command line alike.
  *
+ * The same holds file by file. Every tracked file is scanned: one larger than 2 MiB is streamed
+ * in chunks rather than skipped, and a tracked symbolic link is scanned as its target text - the
+ * string git stores for it - without ever being followed. Only two kinds of entry are skipped,
+ * both because there is no text here to read: a positively identified binary (its extension and
+ * its leading bytes agree on a known format) and a submodule (gitlink). A tracked file the check
+ * cannot examine - absent from the work tree, replaced by an entry of another type than the index
+ * records (a directory, a symbolic link where git tracks a regular file, or a symbolic link in
+ * place of one of its directories), or unreadable - is reported as `unscanned` with the command
+ * that fixes it, and the run exits 2: a gate that passed over it would be certifying content it
+ * never saw.
+ *
  * Usage:  node scripts/check-secrets.mjs [--json] [--help]
  * Exits:  0 clean | 1 findings | 2 usage or environment error (unknown option, git unavailable,
- *         not a git repository, no tracked files, missing or malformed allowlist).
+ *         not a git repository, no tracked files, missing or malformed allowlist) or a tracked
+ *         file that could not be examined.
  *
  * The check only reads: it writes nothing to disk, and it prints at most the first four characters
  * of a matched value plus its length, because CI logs are public.
@@ -60,11 +80,21 @@
  * checkout, which is how the end-to-end cases drive a throwaway repository.
  */
 
+import { Buffer } from 'node:buffer';
 import { execFileSync } from 'node:child_process';
-import { lstatSync, readFileSync } from 'node:fs';
+import {
+  closeSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+  readSync,
+  readlinkSync,
+  realpathSync,
+} from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { StringDecoder } from 'node:string_decoder';
+import { fileURLToPath } from 'node:url';
 
 /* ---------------------------------------------------------------------------
  * Contract constants
@@ -143,11 +173,23 @@ export const DEFAULT_ALLOWLIST_PATH = path.join(SCRIPT_DIRECTORY, ALLOWLIST_FILE
 /** Repository-relative path of the allowlist, used in hints. */
 const ALLOWLIST_HINT_PATH = `scripts/${ALLOWLIST_FILENAME}`;
 
-/** Bytes inspected when deciding whether a tracked file is binary. */
-const BINARY_SNIFF_BYTES = 8192;
+/**
+ * Files larger than this are streamed in {@link STREAM_CHUNK_BYTES} chunks rather than read into
+ * memory at once. Size decides how a file is read, never whether it is scanned.
+ */
+export const MAX_SCAN_BYTES = 2 * 1024 * 1024;
 
-/** Files larger than this are reported as skipped rather than read into memory. */
-const MAX_SCAN_BYTES = 2 * 1024 * 1024;
+/**
+ * Bytes read per chunk when a file larger than {@link MAX_SCAN_BYTES} is streamed. Exported so the
+ * tests can place a multi-byte character across a chunk boundary.
+ */
+export const STREAM_CHUNK_BYTES = 1024 * 1024;
+
+/** Index mode of a gitlink: a submodule commit, whose content lives in another repository. */
+const GITLINK_MODE = '160000';
+
+/** Index mode of a symbolic link, whose tracked content is the link's target text. */
+const SYMLINK_MODE = '120000';
 
 /** `git ls-files` on a large tree produces a lot of output; give it room. */
 const GIT_MAX_BUFFER = 64 * 1024 * 1024;
@@ -159,23 +201,46 @@ const PREVIEW_PREFIX_LENGTH = 4;
 const PREVIEW_SUFFIX = '\u2026';
 
 /**
- * Extensions whose content is never text. Checked before the file is read so a tracked icon or
- * font is skipped without being loaded, and independently of the NUL sniff, which a small or
- * unusually encoded asset can slip past.
+ * The binary formats a tracked file may be skipped as: each format's extensions and the magic
+ * signatures its files begin with.
  *
- * @type {readonly string[]}
+ * Skipping requires positive identification - the extension names the format AND the leading
+ * bytes match one of its signatures. Either signal alone is what a committed credential could hide
+ * behind: renaming `credentials.txt` to `credentials.png` changes nothing about its content, and a
+ * stray NUL byte in an otherwise textual file does not make the rest of it unreadable. So a file
+ * with a binary extension but no matching signature, or with NUL bytes but no known binary
+ * extension, is scanned as text like every other file.
+ *
+ * @type {readonly { readonly format: string, readonly extensions: readonly string[],
+ *   readonly signatures: readonly Buffer[] }[]}
  */
-const BINARY_EXTENSIONS = Object.freeze([
-  '.png',
-  '.ico',
-  '.woff',
-  '.woff2',
-  '.jpg',
-  '.jpeg',
-  '.gif',
-  '.pdf',
-  '.vsix',
+const BINARY_FORMATS = Object.freeze([
+  binaryFormat('png', ['.png'], [Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])]),
+  binaryFormat('ico', ['.ico'], [Buffer.from([0x00, 0x00, 0x01, 0x00])]),
+  binaryFormat('jpeg', ['.jpg', '.jpeg'], [Buffer.from([0xff, 0xd8, 0xff])]),
+  binaryFormat('gif', ['.gif'], [Buffer.from('GIF87a', 'latin1'), Buffer.from('GIF89a', 'latin1')]),
+  binaryFormat('pdf', ['.pdf'], [Buffer.from('%PDF-', 'latin1')]),
+  binaryFormat('woff', ['.woff'], [Buffer.from('wOFF', 'latin1')]),
+  binaryFormat('woff2', ['.woff2'], [Buffer.from('wOF2', 'latin1')]),
+  binaryFormat('vsix', ['.vsix'], [Buffer.from([0x50, 0x4b, 0x03, 0x04])]),
 ]);
+
+/**
+ * One frozen entry of {@link BINARY_FORMATS}.
+ *
+ * @param {string} format Short format name, reported with the skipped file.
+ * @param {readonly string[]} extensions Lower-case extensions, leading dot included.
+ * @param {readonly Buffer[]} signatures Byte sequences a file of this format starts with.
+ * @returns {{ readonly format: string, readonly extensions: readonly string[],
+ *   readonly signatures: readonly Buffer[] }}
+ */
+function binaryFormat(format, extensions, signatures) {
+  return Object.freeze({
+    format,
+    extensions: Object.freeze([...extensions]),
+    signatures: Object.freeze([...signatures]),
+  });
+}
 
 /**
  * Files exempt from the `entropy` rule only.
@@ -465,7 +530,57 @@ function resolveAllowlist(value) {
  */
 
 /**
- * Every occurrence, on `line`, of an allowlisted literal that is permitted at `relPath`.
+ * Characters that end a value outright where they follow an allowlisted literal: whitespace, a
+ * double quote, a backtick and an angle bracket. None of them can appear unencoded inside a URI or
+ * inside the unquoted value of an assignment, so whatever comes after one is a separate token, and
+ * that token is judged by the rules on its own merits.
+ */
+const LITERAL_VALUE_BOUNDARY = /[\s"`<>]/;
+
+/**
+ * Closing punctuation that may stand between an allowlisted literal and the end of its value: the
+ * brackets and single quote that wrap a value (`('<url>')`, `(<url>)`, `[<url>]`), the separators
+ * that end a statement or list element (`;`, `,`) and the marks that end a sentence (`.`, `:`,
+ * `!`, `?`).
+ */
+const LITERAL_CLOSING_PUNCTUATION = new Set([')', ']', '}', "'", ';', ',', '.', ':', '!', '?']);
+
+/**
+ * Whether the literal ending at `end` is the whole of its value on `line`: nothing but closing
+ * punctuation lies between it and the end of the line or the next {@link LITERAL_VALUE_BOUNDARY}.
+ *
+ * This is the second half of the exact-value rule, and it exists because the connection-string
+ * match ends where a URI embedded in prose or code conventionally ends - at `)`, `'` or `]` - while
+ * RFC 3986 lets `)` and `'` continue a URI path. The extent of a match therefore cannot tell
+ * `See [the database](<url>).` from `DATABASE_URL=<url>)password=<secret>`: in both the match stops
+ * at the literal's last character. What follows the literal can. In the first, only closing
+ * punctuation runs to the end of the line; in the second, `password=<secret>` continues the value
+ * past the `)`, so the literal is a prefix of a longer value rather than the value itself, and
+ * AAP 0.3.4 exempts the exact placeholder only.
+ *
+ * @param {string} line
+ * @param {number} end Exclusive index of the literal's end in `line`.
+ * @returns {boolean}
+ */
+function literalStandsAlone(line, end) {
+  for (let index = end; index < line.length; index += 1) {
+    const character = line.charAt(index);
+    if (LITERAL_VALUE_BOUNDARY.test(character)) {
+      return true;
+    }
+    if (!LITERAL_CLOSING_PUNCTUATION.has(character)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Every occurrence, on `line`, of an allowlisted literal that is permitted at `relPath` and stands
+ * alone as a whole value (see {@link literalStandsAlone}).
+ *
+ * An occurrence that continues into a longer value is left out rather than recorded: it exempts
+ * nothing, so every match inside it is reported like any other credential.
  *
  * @param {Allowlist} allowlist
  * @param {string} relPath Repository-relative POSIX path.
@@ -481,11 +596,10 @@ function allowlistOccurrences(allowlist, relPath, line) {
     }
     let index = line.indexOf(literal.value);
     while (index !== -1) {
-      occurrences.push({
-        value: literal.value,
-        start: index,
-        end: index + literal.value.length,
-      });
+      const end = index + literal.value.length;
+      if (literalStandsAlone(line, end)) {
+        occurrences.push({ value: literal.value, start: index, end });
+      }
       index = line.indexOf(literal.value, index + 1);
     }
   }
@@ -495,20 +609,28 @@ function allowlistOccurrences(allowlist, relPath, line) {
 /**
  * The allowlisted literal that exempts this match, or `null`.
  *
- * The exemption is narrow on purpose, and narrow in both directions: the match either contains the
- * allowlisted literal (a connection string whose match spans host and database) or lies entirely
- * inside an occurrence of it (a value the literal quotes in full). A match that merely shares a
- * line with an allowlisted literal is still a finding.
+ * A match is exempt only when its whole span lies inside one occurrence of an allowlisted literal
+ * on the same line: `occurrence.start <= match.start` and `match.end <= occurrence.end`. The
+ * literal must therefore cover the entire matched value. The connection-string rule matches up to
+ * the URI's terminator, so the development database URL is exempt only where it stands alone:
+ * the same literal with anything appended or prepended - a `?password=` query, a `_prod` path
+ * suffix, a `#` fragment carrying a second credentialed authority, an `evil+` scheme prefix - is a
+ * longer match that extends past the literal and is reported like any other credential. Where the
+ * match cannot extend - the literal followed by `)`, `'` or `]` and then more of the value, as in
+ * `<url>)password=<secret>` - the occurrence itself is withheld by {@link allowlistOccurrences},
+ * because the literal is not the whole value there either.
+ *
+ * A match that merely *contains* the literal is deliberately not exempt. That direction is what
+ * let an allowlisted prefix launder whatever followed it, and AAP 0.3.4 exempts the exact
+ * placeholder, not every value it is a substring of. A match that shares a line with an
+ * allowlisted literal without lying inside it is a finding too.
  *
  * @param {readonly AllowlistOccurrence[]} occurrences
- * @param {{ start: number, end: number, text: string }} match
+ * @param {{ start: number, end: number }} match
  * @returns {string | null}
  */
 function suppressionFor(occurrences, match) {
   for (const occurrence of occurrences) {
-    if (match.text.includes(occurrence.value)) {
-      return occurrence.value;
-    }
     if (match.start >= occurrence.start && match.end <= occurrence.end) {
       return occurrence.value;
     }
@@ -624,24 +746,57 @@ const PRIVATE_KEY_PATTERN = new RegExp('-{5}BEGIN (?:' + PEM_LABELS.join('|') + 
 const PEM_PREFIX_PATTERN = /^-{5}BEGIN /;
 
 /**
- * Characters that terminate a URI embedded in code, prose, JSON or YAML. The match deliberately
- * runs past the `@` to the end of the URI: the allowlisted development database URL includes its
- * host, port and database name, so a match that stopped at the credential could never be compared
- * against it.
+ * Characters that always terminate a URI embedded in code, prose, JSON or YAML: whitespace, a
+ * quote or backtick, a closing bracket and an angle bracket.
+ *
+ * `)` stays here although RFC 3986 lets it appear in a path, because in Markdown and prose a URI
+ * is wrapped in parentheses far more often than it contains one, and the character after the `)`
+ * is then ordinary text: `[database](<url>).` or `(see <url>)and`. Treated like `;` and `,`, that
+ * `.` or letter would continue the match past the literal and report the exact placeholder in the
+ * documentation that is required to carry it. `]` and `}` close the arrays and objects a URI is an
+ * element of, for the same reason. The price is that a match cannot see a value continuing past
+ * one of them (`<url>)password=<secret>`); the allowlist closes that gap separately, by exempting a
+ * literal only where it is the whole value on its line (see {@link literalStandsAlone}).
  */
-const URI_TERMINATORS = '\\s\'"`,;)\\]}<>';
+const URI_HARD_TERMINATORS = '\\s\'"`)\\]}<>';
+
+/**
+ * RFC 3986 sub-delimiters that end a URI only where nothing that can continue one follows them.
+ *
+ * `;` and `,` are legal inside a URI path - `<url>;password=<secret>` and
+ * `<url>,<user>:<secret>@<host>` are each one URI, and not the allowlisted one - so treating them
+ * as hard terminators would cut the match at the allowlisted literal's last character and exempt
+ * everything after it. They are also how a statement, a list element or a clause ends:
+ * `connect(<url>);`, `[<url>, <url>]`, `<url>, then`. The character after the run tells the two
+ * readings apart: a run of them followed by whitespace, a quote, a hard terminator or the end of
+ * the line ends the URI before the run, and a run followed by any other character continues it,
+ * run included - so `;;password=` cannot hide behind a doubled delimiter either.
+ */
+const URI_SOFT_TERMINATORS = ';,';
+
+/** Every character that can end a URI, hard or soft. */
+const URI_TERMINATORS = URI_HARD_TERMINATORS + URI_SOFT_TERMINATORS;
+
+/** One character that continues a URI unconditionally: anything that is not a terminator. */
+const URI_BODY_CHAR = '[^' + URI_TERMINATORS + ']';
+
+/**
+ * The part of a connection string after its `@`: host, port, path, query and fragment, up to the
+ * URI's terminator. The match deliberately runs past the `@` to the end of the URI: the
+ * allowlisted development database URL includes its host, port and database name, so a match that
+ * stopped at the credential could never be compared against it.
+ *
+ * Backtracking stays linear. The two alternatives start with disjoint characters (a body character
+ * is never a sub-delimiter), so each position is consumed one way only; a sub-delimiter run gives
+ * back at most its own length when the lookahead rejects it; and nothing follows the repetition,
+ * so a shorter tail is never retried against a later token.
+ */
+const URI_TAIL =
+  '(?:' + URI_BODY_CHAR + '|[' + URI_SOFT_TERMINATORS + ']+(?=' + URI_BODY_CHAR + '))*';
 
 /** A URI carrying `user:password@`, with its authority and path captured for comparison. */
 const CONNECTION_STRING_PATTERN = new RegExp(
-  '\\b[a-z][a-z0-9+.-]*' +
-    ':\\/\\/' +
-    '[^/\\s:@]+' +
-    ':' +
-    '[^/\\s:@]+' +
-    '@' +
-    '[^' +
-    URI_TERMINATORS +
-    ']*',
+  '\\b[a-z][a-z0-9+.-]*' + ':\\/\\/' + '[^/\\s:@]+' + ':' + '[^/\\s:@]+' + '@' + URI_TAIL,
   'gi',
 );
 
@@ -1124,11 +1279,16 @@ function isExpressionValue(value, quoted) {
  * survivor is always the more specific rule - `sk-ant-` over `sk-`, a provider key over the
  * entropy heuristic that would also see it.
  *
- * @param {readonly RuleMatch[]} matches
- * @returns {RuleMatch[]}
+ * It runs only after the allowlist has partitioned a line's matches (see {@link scanLineInto}),
+ * once over the live matches and once over the exempt ones, never across the two: an exempt match
+ * must not absorb an overlapping live one that extends past the allowlisted literal.
+ *
+ * @template {{ start: number, end: number }} T
+ * @param {readonly T[]} matches
+ * @returns {T[]}
  */
 function dedupeOverlaps(matches) {
-  /** @type {RuleMatch[]} */
+  /** @type {T[]} */
   const accepted = [];
   for (const match of matches) {
     const overlaps = accepted.some((other) => match.start < other.end && other.start < match.end);
@@ -1457,7 +1617,7 @@ function contentFinding(relPath, lineNumber, match) {
  * Apply the rules that depend on the path alone, which is `env-file`.
  *
  * Kept separate from {@link scanContent} so the gate still reports a tracked `.env` file whose
- * content it deliberately did not read - a binary, oversized or deleted-but-tracked file.
+ * content it did not read - a binary, a submodule, or a file it could not examine.
  *
  * @param {string} filePath Repository-relative path.
  * @returns {Finding[]}
@@ -1484,6 +1644,95 @@ export function scanPath(filePath) {
 }
 
 /**
+ * Where one file's content findings accumulate while its lines are scanned.
+ *
+ * @typedef {object} ContentSink
+ * @property {Finding[]} findings Live findings, in line then column order.
+ * @property {AllowlistedFinding[]} allowlisted Matches an allowlist entry exempted.
+ */
+
+/**
+ * Apply every content rule to one line and append the results to `sink`.
+ *
+ * This is the only per-line pass. The in-memory path ({@link scanTextInto}) and the streamed path
+ * for oversized files ({@link streamScanFile}) both call it, so a file is judged identically
+ * whatever its size.
+ *
+ * SUPPRESS FIRST, THEN DEDUPE. Every rule's matches are collected in precedence order - the
+ * structural rules before the entropy heuristic, so a credential inside a URI is reported once, as
+ * the connection string a reviewer can act on - and each is classified against the allowlist
+ * before any overlap is resolved. Live and exempt matches are then deduplicated separately. The
+ * other order lets an exempt match absorb a live one: a higher-precedence match that lies inside
+ * the allowlisted literal would win the overlap, drop a lower-precedence match that extends past
+ * the literal, and then be exempted, so the credential beyond the literal would vanish from the
+ * report without ever having been compared against the allowlist.
+ *
+ * @param {string} relPath Repository-relative POSIX path.
+ * @param {Allowlist} allowlist Validated allowlist.
+ * @param {number} lineNumber 1-based.
+ * @param {string} line The line without its terminator.
+ * @param {ContentSink} sink
+ */
+function scanLineInto(relPath, allowlist, lineNumber, line, sink) {
+  if (line === '') {
+    return;
+  }
+  const matches = [
+    ...matchProviderKeys(line),
+    ...matchJwts(line),
+    ...matchPrivateKeys(line),
+    ...matchConnectionStrings(line),
+    ...matchEntropy(relPath, line),
+  ];
+  if (matches.length === 0) {
+    return;
+  }
+  const occurrences = allowlistOccurrences(allowlist, relPath, line);
+  /** @type {RuleMatch[]} */
+  const live = [];
+  /** @type {(RuleMatch & { allowlistValue: string })[]} */
+  const exempt = [];
+  for (const match of matches) {
+    const allowlistValue = occurrences.length === 0 ? null : suppressionFor(occurrences, match);
+    if (allowlistValue === null) {
+      live.push(match);
+    } else {
+      exempt.push({ ...match, allowlistValue });
+    }
+  }
+  const byStart = (/** @type {RuleMatch} */ left, /** @type {RuleMatch} */ right) =>
+    left.start - right.start;
+  for (const match of dedupeOverlaps(live).sort(byStart)) {
+    sink.findings.push(contentFinding(relPath, lineNumber, match));
+  }
+  for (const match of dedupeOverlaps(exempt).sort(byStart)) {
+    sink.allowlisted.push({
+      ...contentFinding(relPath, lineNumber, match),
+      allowlistValue: match.allowlistValue,
+    });
+  }
+}
+
+/**
+ * Apply every content rule to `text`, line by line, appending the results to `sink`.
+ *
+ * Lines are what `text.split(/\r?\n/)` yields - a `\r\n` pair and a bare `\n` both end a line, a
+ * lone `\r` does not - and are numbered from 1. {@link streamScanFile} reproduces exactly these
+ * semantics over a file too large to hold in memory.
+ *
+ * @param {string} relPath Repository-relative POSIX path.
+ * @param {Allowlist} allowlist Validated allowlist.
+ * @param {string} text File content as text.
+ * @param {ContentSink} sink
+ */
+function scanTextInto(relPath, allowlist, text, sink) {
+  const lines = text.split(/\r?\n/);
+  for (let index = 0; index < lines.length; index += 1) {
+    scanLineInto(relPath, allowlist, index + 1, lines[index] ?? '', sink);
+  }
+}
+
+/**
  * Scan one file's path and content against every rule, separating the findings the allowlist
  * exempted so a caller can report how many exemptions were used.
  *
@@ -1497,41 +1746,10 @@ export function scanPath(filePath) {
 export function scanContentWithSuppressions(filePath, content, allowlist) {
   const relPath = normalizeRepoPath(filePath);
   const list = resolveAllowlist(allowlist);
-  /** @type {Finding[]} */
-  const findings = scanPath(relPath);
-  /** @type {AllowlistedFinding[]} */
-  const allowlisted = [];
-  const text = typeof content === 'string' ? content : String(content ?? '');
-  const lines = text.split(/\r?\n/);
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index] ?? '';
-    if (line === '') {
-      continue;
-    }
-    // Rule order is precedence order: the structural rules run before the entropy heuristic, so a
-    // credential inside a URI is reported once, as the connection string a reviewer can act on.
-    const matches = dedupeOverlaps([
-      ...matchProviderKeys(line),
-      ...matchJwts(line),
-      ...matchPrivateKeys(line),
-      ...matchConnectionStrings(line),
-      ...matchEntropy(relPath, line),
-    ]).sort((left, right) => left.start - right.start);
-    if (matches.length === 0) {
-      continue;
-    }
-    const occurrences = allowlistOccurrences(list, relPath, line);
-    for (const match of matches) {
-      const finding = contentFinding(relPath, index + 1, match);
-      const allowlistValue = occurrences.length === 0 ? null : suppressionFor(occurrences, match);
-      if (allowlistValue === null) {
-        findings.push(finding);
-      } else {
-        allowlisted.push({ ...finding, allowlistValue });
-      }
-    }
-  }
-  return { findings, allowlisted };
+  /** @type {ContentSink} */
+  const sink = { findings: scanPath(relPath), allowlisted: [] };
+  scanTextInto(relPath, list, typeof content === 'string' ? content : String(content ?? ''), sink);
+  return sink;
 }
 
 /**
@@ -1631,73 +1849,489 @@ function resolveRepoRoot(hint) {
 }
 
 /**
- * Every file git tracks, repository-relative.
+ * One path in the index.
+ *
+ * @typedef {object} TrackedEntry
+ * @property {string} file Repository-relative POSIX path.
+ * @property {string} mode Octal index mode: `100644` or `100755` for a regular file,
+ *   {@link SYMLINK_MODE} for a symbolic link, {@link GITLINK_MODE} for a submodule.
+ */
+
+/**
+ * Every path git tracks, repository-relative, with its index mode.
  *
  * Tracked-only enumeration is the contract (AAP 0.3.4: the check "scans `git ls-files` content").
  * It keeps the gate deterministic - an untracked scratch file in one developer's tree cannot fail
  * the build - and it is the reason nothing under `.git/` is ever opened, because `git ls-files`
  * does not list it. Do not add a filesystem-walk fallback.
  *
+ * `--stage` is what carries the mode, which is the only way to tell a submodule (whose content is
+ * another repository's) from a directory that has replaced a tracked file (which is a work tree
+ * the check cannot vouch for). Each record is `<mode> <object> <stage>\t<path>`, and `-z` leaves
+ * the path unquoted. A path in an unresolved merge has one record per stage; it is listed once,
+ * as a gitlink only when every stage is one, so a conflict never turns a file into a skip.
+ *
  * @param {string} repoRoot Absolute work-tree root.
- * @returns {string[]} Tracked paths, repository-relative POSIX.
+ * @returns {TrackedEntry[]} In `git ls-files` order, one entry per path.
+ * @throws {CheckSecretsError} With code `git-failed` when a record cannot be parsed, because a
+ *   path the check cannot read from the listing is a path it would silently not scan.
  */
 function listTrackedFiles(repoRoot) {
-  return git(repoRoot, ['ls-files', '-z'])
-    .split('\0')
-    .filter((entry) => entry !== '')
-    .map((entry) => normalizeRepoPath(entry));
+  /** @type {Map<string, TrackedEntry>} */
+  const entries = new Map();
+  for (const record of git(repoRoot, ['ls-files', '-z', '--stage']).split('\0')) {
+    if (record === '') {
+      continue;
+    }
+    const tab = record.indexOf('\t');
+    const fields = tab === -1 ? [] : record.slice(0, tab).split(' ');
+    const mode = fields[0] ?? '';
+    if (fields.length !== 3 || !/^[0-7]{6}$/.test(mode)) {
+      throw new CheckSecretsError(
+        'git-failed',
+        `\`git ls-files -z --stage\` in ${repoRoot} produced a record this check cannot parse ` +
+          `(${JSON.stringify(record.slice(0, 120))}), so it cannot tell which files to scan`,
+      );
+    }
+    const file = normalizeRepoPath(record.slice(tab + 1));
+    const known = entries.get(file);
+    if (known === undefined || (known.mode === GITLINK_MODE && mode !== GITLINK_MODE)) {
+      entries.set(file, { file, mode });
+    }
+  }
+  return [...entries.values()];
 }
 
 /**
- * Whether a path names a file type that never holds text.
+ * The binary format a tracked file positively is, or `null` when it must be scanned as text.
  *
- * @param {string} relPath
- * @returns {boolean}
- */
-function hasBinaryExtension(relPath) {
-  const lower = relPath.toLowerCase();
-  return BINARY_EXTENSIONS.some((extension) => lower.endsWith(extension));
-}
-
-/**
- * Treat a file as binary when its first bytes contain a NUL, which is how tracked assets without a
- * known extension are skipped.
+ * Both signals have to agree (see {@link BINARY_FORMATS}): the extension selects the format, and
+ * the leading bytes must match one of its signatures.
  *
- * @param {Buffer} buffer
- * @returns {boolean}
+ * @param {string} relPath Repository-relative POSIX path.
+ * @param {Buffer} leading The file's first bytes; the whole file or its first chunk.
+ * @returns {string | null} The format name, for example `png`.
  */
-function isBinary(buffer) {
-  return buffer.subarray(0, BINARY_SNIFF_BYTES).includes(0);
+function identifyBinary(relPath, leading) {
+  const extension = path.posix.extname(relPath).toLowerCase();
+  const entry = BINARY_FORMATS.find((candidate) => candidate.extensions.includes(extension));
+  if (entry === undefined) {
+    return null;
+  }
+  const matches = entry.signatures.some(
+    (signature) =>
+      leading.length >= signature.length && leading.subarray(0, signature.length).equals(signature),
+  );
+  return matches ? entry.format : null;
 }
 
 /**
- * A tracked file the scan deliberately did not read.
+ * Raised by {@link fileRead} when the operating system refuses a read of a tracked file, so the
+ * scan can record that file as unscanned without also swallowing a defect in the scanner itself,
+ * which propagates as the internal error it is.
+ */
+class TrackedFileReadError extends Error {
+  /**
+   * @param {unknown} cause The error the filesystem call raised.
+   */
+  constructor(cause) {
+    super(cause instanceof Error ? cause.message : String(cause), {
+      cause: cause instanceof Error ? cause : undefined,
+    });
+    this.name = 'TrackedFileReadError';
+  }
+}
+
+/**
+ * Run one filesystem read of a tracked file, converting its failure into a
+ * {@link TrackedFileReadError}.
+ *
+ * @template T
+ * @param {() => T} operation
+ * @returns {T}
+ * @throws {TrackedFileReadError}
+ */
+function fileRead(operation) {
+  try {
+    return operation();
+  } catch (error) {
+    throw new TrackedFileReadError(error);
+  }
+}
+
+/**
+ * Stream a file larger than {@link MAX_SCAN_BYTES} through the per-line rule pass in
+ * {@link STREAM_CHUNK_BYTES} chunks, or identify it from its first chunk as a binary format.
+ *
+ * Line semantics are exactly those of `content.split(/\r?\n/)` in {@link scanTextInto}, so a file
+ * reports the same findings at the same lines and columns whichever path reads it:
+ *
+ *   - `\n` ends a line, and a `\r` immediately before it belongs to the terminator - including a
+ *     `\r` that ended the previous chunk while its `\n` opened this one, because the pieces of a
+ *     line are joined before the `\r` is stripped;
+ *   - a lone `\r`, and a `\r` at the very end of the file, stay in the line;
+ *   - lines are numbered from 1, and the text after the last `\n` is the final line.
+ *
+ * Bytes are decoded by one `StringDecoder` for the whole file, which holds back a multi-byte UTF-8
+ * sequence split across two chunks until its remaining bytes arrive, so a character straddling a
+ * chunk boundary decodes once, correctly, instead of as two replacement characters that would
+ * shift every later column on its line. Newlines are searched for in each decoded chunk only, and
+ * the pieces of a line are joined once when it ends, so a long line costs linear time.
+ *
+ * @param {number} fd Open descriptor of the file.
+ * @param {string} relPath Repository-relative POSIX path.
+ * @param {Allowlist} allowlist Validated allowlist.
+ * @param {ContentSink} sink
+ * @returns {{ kind: 'scanned' } | { kind: 'binary', format: string }}
+ * @throws {TrackedFileReadError} When a read fails; findings from the part already read stay in
+ *   `sink`, because they are real.
+ */
+function streamScanFile(fd, relPath, allowlist, sink) {
+  const chunk = Buffer.allocUnsafe(STREAM_CHUNK_BYTES);
+  const decoder = new StringDecoder('utf8');
+  /** @type {string[]} */
+  let pieces = [];
+  let lineNumber = 1;
+
+  /** @param {string} text Newly decoded text. */
+  const consume = (text) => {
+    let start = 0;
+    let newline = text.indexOf('\n');
+    while (newline !== -1) {
+      pieces.push(text.slice(start, newline));
+      let line = pieces.length === 1 ? (pieces[0] ?? '') : pieces.join('');
+      if (line.endsWith('\r')) {
+        line = line.slice(0, -1);
+      }
+      scanLineInto(relPath, allowlist, lineNumber, line, sink);
+      lineNumber += 1;
+      pieces = [];
+      start = newline + 1;
+      newline = text.indexOf('\n', start);
+    }
+    if (start < text.length) {
+      pieces.push(text.slice(start));
+    }
+  };
+
+  let position = 0;
+  for (;;) {
+    const offset = position;
+    const bytesRead = fileRead(() => readSync(fd, chunk, 0, chunk.length, offset));
+    if (offset === 0) {
+      const format = identifyBinary(relPath, chunk.subarray(0, bytesRead));
+      if (format !== null) {
+        return { kind: 'binary', format };
+      }
+    }
+    if (bytesRead === 0) {
+      break;
+    }
+    position += bytesRead;
+    consume(decoder.write(chunk.subarray(0, bytesRead)));
+  }
+  consume(decoder.end());
+  scanLineInto(relPath, allowlist, lineNumber, pieces.join(''), sink);
+  return { kind: 'scanned' };
+}
+
+/**
+ * Read and scan one regular file, or identify it as a binary format and skip it.
+ *
+ * A file up to {@link MAX_SCAN_BYTES} is read whole; a larger one is streamed by
+ * {@link streamScanFile}. Either way the leading bytes decide binary identification and every line
+ * goes through {@link scanLineInto}.
+ *
+ * @param {string} absolute Absolute path of the file.
+ * @param {string} relPath Repository-relative POSIX path.
+ * @param {number} size Size the work-tree entry reported.
+ * @param {Allowlist} allowlist Validated allowlist.
+ * @param {ContentSink} sink
+ * @returns {{ kind: 'scanned' } | { kind: 'binary', format: string }}
+ * @throws {TrackedFileReadError} When the file cannot be opened or read.
+ */
+function scanRegularFile(absolute, relPath, size, allowlist, sink) {
+  if (size <= MAX_SCAN_BYTES) {
+    const buffer = fileRead(() => readFileSync(absolute));
+    const format = identifyBinary(relPath, buffer);
+    if (format !== null) {
+      return { kind: 'binary', format };
+    }
+    scanTextInto(relPath, allowlist, buffer.toString('utf8'), sink);
+    return { kind: 'scanned' };
+  }
+  const fd = fileRead(() => openSync(absolute, 'r'));
+  try {
+    return streamScanFile(fd, relPath, allowlist, sink);
+  } finally {
+    fileRead(() => closeSync(fd));
+  }
+}
+
+/**
+ * `value` quoted for a POSIX shell when it needs quoting, so a remedy can be pasted as printed.
+ *
+ * @param {string} value
+ * @returns {string}
+ */
+function shellQuote(value) {
+  return /^[A-Za-z0-9_./@%+=:,-]+$/.test(value) ? value : `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+/**
+ * What kind of work-tree entry `stats` describes, for a message.
+ *
+ * @param {import('node:fs').Stats} stats
+ * @returns {string}
+ */
+function describeEntry(stats) {
+  if (stats.isSymbolicLink()) {
+    return 'symbolic link';
+  }
+  if (stats.isDirectory()) {
+    return 'directory';
+  }
+  if (stats.isFIFO()) {
+    return 'named pipe';
+  }
+  if (stats.isSocket()) {
+    return 'socket';
+  }
+  if (stats.isBlockDevice() || stats.isCharacterDevice()) {
+    return 'device node';
+  }
+  return 'non-regular entry';
+}
+
+/**
+ * What kind of entry git tracks under index `mode`, for a message. A gitlink never reaches a
+ * message (it is skipped before the work tree is consulted), so any mode other than
+ * {@link SYMLINK_MODE} is a regular file: `100644`, `100755`, or a legacy mode an old index may
+ * still record.
+ *
+ * @param {string} mode Octal index mode from {@link listTrackedFiles}.
+ * @returns {string}
+ */
+function describeTrackedMode(mode) {
+  const kind = mode === SYMLINK_MODE ? 'a symbolic link' : 'a regular file';
+  return `${kind} (index mode ${mode})`;
+}
+
+/**
+ * The nearest directory above `file`, repository-relative, that the work tree holds as a symbolic
+ * link, or `null` when every directory between the root and `file` is a real one.
+ *
+ * Git never tracks a path beneath a symbolic link (`git add` refuses one as "beyond a symbolic
+ * link"), so a link standing where the index records a directory is a local replacement of that
+ * directory. `lstat` leaves only the last component of a path unfollowed, so without this walk
+ * every tracked file under such a link would be read from wherever it points - content outside
+ * the checkout, or a benign stand-in - and reported as scanned in the tracked file's name.
+ *
+ * Many tracked files share each directory, so every answer is cached for the rest of the run and
+ * each directory is examined once, top-down: the walk costs one `lstat` per tracked directory.
+ *
+ * @param {string} repoRoot Absolute, canonical work-tree root.
+ * @param {string} file Repository-relative POSIX path of a tracked entry.
+ * @param {Map<string, string | null>} cache Answers so far, keyed by repository-relative directory.
+ * @returns {string | null} The linked directory, repository-relative.
+ * @throws {TrackedFileReadError} When a directory on the way cannot be stat-ed.
+ */
+function symlinkedAncestor(repoRoot, file, cache) {
+  const directory = path.posix.dirname(file);
+  if (directory === '.') {
+    return null;
+  }
+  const known = cache.get(directory);
+  if (known !== undefined) {
+    return known;
+  }
+  let found = symlinkedAncestor(repoRoot, directory, cache);
+  if (found === null) {
+    const stats = fileRead(() => lstatSync(path.join(repoRoot, directory)));
+    found = stats.isSymbolicLink() ? directory : null;
+  }
+  cache.set(directory, found);
+  return found;
+}
+
+/**
+ * How to make each kind of unscanned file examinable.
+ *
+ * @type {Readonly<Record<UnscannedFile['reason'], (file: string) => string>>}
+ */
+const UNSCANNED_REMEDIES = Object.freeze({
+  missing: (file) =>
+    `stage the deletion with \`git rm -- ${shellQuote(file)}\`, restore the file with ` +
+    `\`git checkout -- ${shellQuote(file)}\`, or, in a sparse checkout, run ` +
+    '`git sparse-checkout disable`',
+  'wrong-type': (file) =>
+    `move the entry aside and restore the tracked file with \`git checkout -- ${shellQuote(file)}\`, ` +
+    `or stage the replacement with \`git rm --cached -- ${shellQuote(file)}\` followed by ` +
+    '`git add`',
+  unreadable: (file) =>
+    'make the file and its parent directories readable to the account running this check ' +
+    `(for example \`chmod u+r -- ${shellQuote(file)}\`), then run the check again`,
+});
+
+/**
+ * @param {string} file
+ * @param {UnscannedFile['reason']} reason
+ * @param {string} detail
+ * @returns {{ kind: 'unscanned', entry: UnscannedFile }}
+ */
+function unscanned(file, reason, detail) {
+  return {
+    kind: 'unscanned',
+    entry: { file, reason, detail, remedy: UNSCANNED_REMEDIES[reason](file) },
+  };
+}
+
+/**
+ * Examine one tracked entry: scan its content into `sink`, or say why it was skipped or could not
+ * be examined.
+ *
+ * The index mode says what git tracks at the path, the work-tree entry says what stands there
+ * now, and the two are compared before anything is read, because a work-tree entry of another
+ * type is not the tracked content and reading it would certify something git does not store:
+ *
+ *   - A gitlink is skipped as `submodule` without touching the work tree: its content is another
+ *     repository's.
+ *   - A symbolic link where git tracks one (mode {@link SYMLINK_MODE}) is scanned as its target
+ *     text, which is the blob git stores for it. It is never followed: the target may lie outside
+ *     the checkout, and it is the link that is tracked.
+ *   - A regular file is read (streamed when large) and skipped only as a positively identified
+ *     binary. A regular file standing where git tracks a symbolic link is scanned too: that is how
+ *     a checkout with `core.symlinks=false` stores the link, as a file holding its target.
+ *   - Anything else is `unscanned`: `missing` when the path is absent from the work tree,
+ *     `unreadable` when the operating system refuses to stat or read it, and `wrong-type` when the
+ *     entry is not what git tracks - a directory or another non-regular entry, a symbolic link
+ *     where git tracks a regular file (its target text is not the file's content, and following it
+ *     would read a stand-in), or a path reached through a directory the work tree has replaced
+ *     with a symbolic link (see {@link symlinkedAncestor}). The detail names both types.
+ *
+ * @param {string} repoRoot Absolute, canonical work-tree root.
+ * @param {TrackedEntry} tracked
+ * @param {Allowlist} allowlist Validated allowlist.
+ * @param {ContentSink} sink
+ * @param {Map<string, string | null>} ancestry The run's {@link symlinkedAncestor} cache.
+ * @returns {{ kind: 'scanned' } | { kind: 'skipped', entry: SkippedFile } |
+ *   { kind: 'unscanned', entry: UnscannedFile }}
+ */
+function examineTrackedFile(repoRoot, tracked, allowlist, sink, ancestry) {
+  const { file, mode } = tracked;
+  if (mode === GITLINK_MODE) {
+    return { kind: 'skipped', entry: { file, reason: 'submodule' } };
+  }
+  const absolute = path.join(repoRoot, file);
+  let stats;
+  try {
+    stats = lstatSync(absolute);
+  } catch (error) {
+    const code = /** @type {{ code?: string }} */ (error).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') {
+      return unscanned(file, 'missing', 'git tracks this path but the work tree has nothing there');
+    }
+    return unscanned(file, 'unreadable', error instanceof Error ? error.message : String(error));
+  }
+
+  try {
+    // The path's own `lstat` above has already classified a missing or unreadable entry, so every
+    // directory on the way exists; only a race can make one fail here, reported as unreadable.
+    const linkedDirectory = symlinkedAncestor(repoRoot, file, ancestry);
+    if (linkedDirectory !== null) {
+      return unscanned(
+        file,
+        'wrong-type',
+        `the work tree holds a symbolic link at ${linkedDirectory} where git tracks a directory, ` +
+          `so this path, tracked as ${describeTrackedMode(mode)}, resolves through the link`,
+      );
+    }
+    if (stats.isSymbolicLink() && mode === SYMLINK_MODE) {
+      const target = fileRead(() => readlinkSync(absolute, 'utf8'));
+      scanTextInto(file, allowlist, target, sink);
+      return { kind: 'scanned' };
+    }
+    // A symbolic link where git tracks a regular file lands here too: `lstat` reports it as a
+    // link, never as a file.
+    if (!stats.isFile()) {
+      return unscanned(
+        file,
+        'wrong-type',
+        `the work tree holds a ${describeEntry(stats)} where git tracks ${describeTrackedMode(mode)}`,
+      );
+    }
+    const outcome = scanRegularFile(absolute, file, stats.size, allowlist, sink);
+    return outcome.kind === 'binary'
+      ? {
+          kind: 'skipped',
+          entry: { file, reason: 'binary', format: outcome.format, bytes: stats.size },
+        }
+      : outcome;
+  } catch (error) {
+    if (error instanceof TrackedFileReadError) {
+      return unscanned(file, 'unreadable', error.message);
+    }
+    throw error;
+  }
+}
+
+/**
+ * A tracked entry the scan did not read because it holds no text to read here.
  *
  * @typedef {object} SkippedFile
  * @property {string} file Repository-relative POSIX path.
- * @property {'binary'|'symlink'|'not-a-regular-file'|'too-large'|'missing'|'unreadable'} reason
- * @property {number} [bytes] Size, when it was known.
+ * @property {'binary'|'submodule'} reason `binary`: the extension and the leading bytes agree on a
+ *   format in {@link BINARY_FORMATS}. `submodule`: a gitlink, whose content is another
+ *   repository's.
+ * @property {string} [format] The identified format, for `binary`.
+ * @property {number} [bytes] Size in bytes, for `binary`.
+ */
+
+/**
+ * A tracked file the scan could not examine. Any one of these makes the run exit
+ * {@link EXIT_ERROR}, because a pass over it would certify content nobody read.
+ *
+ * @typedef {object} UnscannedFile
+ * @property {string} file Repository-relative POSIX path.
+ * @property {'missing'|'wrong-type'|'unreadable'} reason `missing`: absent from the work tree
+ *   (a deletion not yet staged, or a sparse checkout). `wrong-type`: the work-tree entry is not
+ *   the type git tracks there - a directory or another non-regular entry, a symbolic link where
+ *   git tracks a regular file, or a path beneath a directory replaced by a symbolic link.
+ *   `unreadable`: the operating system refused to stat or read it.
+ * @property {string} detail What happened, including the operating-system error when there was
+ *   one.
+ * @property {string} remedy The command or change that makes the file examinable.
  */
 
 /**
  * The report the command line prints and `--json` serializes.
  *
  * @typedef {object} CheckReport
- * @property {boolean} ok No findings.
- * @property {number} exitCode {@link EXIT_OK} or {@link EXIT_FINDINGS}.
+ * @property {boolean} ok No findings and no unscanned files.
+ * @property {number} exitCode {@link EXIT_ERROR} when any file is unscanned, otherwise
+ *   {@link EXIT_FINDINGS} when there are findings, otherwise {@link EXIT_OK}.
  * @property {string} repoRoot Absolute work-tree root that was scanned.
  * @property {string} allowlistPath Absolute path of the allowlist that was applied.
  * @property {readonly string[]} rules Rule ids that were enforced.
- * @property {number} filesTracked Files git tracks; never zero, because an empty tracked subject
+ * @property {number} filesTracked Paths git tracks; never zero, because an empty tracked subject
  *   is a precondition failure rather than a report (see {@link scanRepository}).
- * @property {number} filesScanned Files whose content was read and scanned.
+ * @property {number} filesScanned Files whose content - or, for a symbolic link, whose target
+ *   text - was read and scanned.
  * @property {Finding[]} findings Violations, in file then line then column order.
  * @property {AllowlistedFinding[]} allowlisted Matches an allowlist entry exempted.
- * @property {SkippedFile[]} skipped Files whose content was deliberately not read.
+ * @property {SkippedFile[]} skipped Binaries and submodules, which hold no text to read here.
+ * @property {UnscannedFile[]} unscanned Files that could not be examined; non-empty means the run
+ *   proves nothing and exits {@link EXIT_ERROR}.
  */
 
 /**
  * Scan a checkout: enumerate tracked files, apply every rule, and return the report.
+ *
+ * Every tracked entry ends up in exactly one of three places: scanned (counted in
+ * `filesScanned`), `skipped` (a positively identified binary or a submodule), or `unscanned` (see
+ * {@link examineTrackedFile}). An unscanned file does not throw - the rest of the tree is still
+ * scanned and reported, so one missing file does not hide a credential elsewhere - but it makes
+ * the report's `exitCode` {@link EXIT_ERROR} and `ok` false.
  *
  * @param {{ cwd?: string, root?: string, allowlist?: unknown, allowlistPath?: string }} [options]
  *   `cwd` (or its alias `root`) is any path inside the checkout to scan; it defaults to this
@@ -1732,75 +2366,40 @@ export function scanRepository(options = {}) {
         'checkout of the repository.',
     );
   }
-  /** @type {Finding[]} */
-  const findings = [];
-  /** @type {AllowlistedFinding[]} */
-  const allowlisted = [];
+  /** @type {ContentSink} */
+  const sink = { findings: [], allowlisted: [] };
   /** @type {SkippedFile[]} */
   const skipped = [];
+  /** @type {UnscannedFile[]} */
+  const unscannedFiles = [];
   let filesScanned = 0;
+  /** @type {Map<string, string | null>} */
+  const ancestry = new Map();
 
-  for (const relPath of files) {
-    const absolute = path.join(repoRoot, relPath);
-    // The path rules apply to every tracked file, including the ones whose content is skipped
-    // below: a tracked `.env` is a finding whether or not it is readable text.
-    const pathFindings = scanPath(relPath);
-
-    /** @type {SkippedFile | null} */
-    let skip = null;
-    /** @type {Buffer | null} */
-    let buffer = null;
-    let stats;
-    try {
-      stats = lstatSync(absolute);
-    } catch {
-      // Tracked but absent from the work tree: staged deletion, or a sparse checkout.
-      skip = { file: relPath, reason: 'missing' };
-      stats = null;
+  for (const tracked of files) {
+    // The path rules apply to every tracked entry, including one whose content is skipped or
+    // cannot be examined: a tracked `.env` is a finding whatever it holds.
+    sink.findings.push(...scanPath(tracked.file));
+    const outcome = examineTrackedFile(repoRoot, tracked, allowlist, sink, ancestry);
+    if (outcome.kind === 'scanned') {
+      filesScanned += 1;
+    } else if (outcome.kind === 'skipped') {
+      skipped.push(outcome.entry);
+    } else {
+      unscannedFiles.push(outcome.entry);
     }
-    if (stats !== null) {
-      if (stats.isSymbolicLink()) {
-        skip = { file: relPath, reason: 'symlink' };
-      } else if (!stats.isFile()) {
-        // A gitlink (submodule) or another non-regular entry: there is no content here to read.
-        skip = { file: relPath, reason: 'not-a-regular-file' };
-      } else if (hasBinaryExtension(relPath)) {
-        skip = { file: relPath, reason: 'binary', bytes: stats.size };
-      } else if (stats.size > MAX_SCAN_BYTES) {
-        // Reported rather than fatal: an oversized tracked file is a repository-hygiene problem of
-        // its own, and failing the secrets gate for it would only obscure that.
-        skip = { file: relPath, reason: 'too-large', bytes: stats.size };
-      } else {
-        try {
-          buffer = readFileSync(absolute);
-        } catch {
-          skip = { file: relPath, reason: 'unreadable', bytes: stats.size };
-        }
-      }
-    }
-    if (buffer !== null && isBinary(buffer)) {
-      skip = { file: relPath, reason: 'binary', bytes: buffer.length };
-      buffer = null;
-    }
-
-    if (buffer === null) {
-      findings.push(...pathFindings);
-      if (skip !== null) {
-        skipped.push(skip);
-      }
-      continue;
-    }
-
-    filesScanned += 1;
-    const result = scanContentWithSuppressions(relPath, buffer.toString('utf8'), allowlist);
-    findings.push(...result.findings);
-    allowlisted.push(...result.allowlisted);
   }
 
-  const ok = findings.length === 0;
+  const { findings, allowlisted } = sink;
+  let exitCode = EXIT_OK;
+  if (unscannedFiles.length > 0) {
+    exitCode = EXIT_ERROR;
+  } else if (findings.length > 0) {
+    exitCode = EXIT_FINDINGS;
+  }
   return {
-    ok,
-    exitCode: ok ? EXIT_OK : EXIT_FINDINGS,
+    ok: exitCode === EXIT_OK,
+    exitCode,
     repoRoot,
     allowlistPath,
     rules: RULE_IDS,
@@ -1809,6 +2408,7 @@ export function scanRepository(options = {}) {
     findings,
     allowlisted,
     skipped,
+    unscanned: unscannedFiles,
   };
 }
 
@@ -1841,7 +2441,8 @@ function findingsExplanation() {
 }
 
 /**
- * Render the human-readable report: findings first, summary last.
+ * Render the human-readable report: files that could not be examined first, because they void the
+ * run, then findings, then the summary.
  *
  * @param {CheckReport} report
  * @returns {string} Text ending in a newline.
@@ -1849,6 +2450,19 @@ function findingsExplanation() {
 function renderReport(report) {
   /** @type {string[]} */
   const lines = [];
+
+  if (report.unscanned.length > 0) {
+    const count = report.unscanned.length;
+    lines.push(
+      `check-secrets: could not examine ${count} tracked ${plural(count, 'file')}, so this run ` +
+        'proves nothing about the repository:',
+    );
+    for (const entry of report.unscanned) {
+      lines.push(`${entry.file}: ${entry.reason}: ${entry.detail}`);
+      lines.push(`    fix: ${entry.remedy}`);
+    }
+    lines.push('');
+  }
 
   for (const finding of report.findings) {
     lines.push(`${finding.file}:${finding.line}: ${finding.rule}: ${finding.message}`);
@@ -1866,7 +2480,10 @@ function renderReport(report) {
     `${report.allowlisted.length} allowlisted`,
   ];
   if (report.skipped.length > 0) {
-    parts.push(`${report.skipped.length} skipped (binary, symlink, oversized or absent)`);
+    parts.push(`${report.skipped.length} skipped (binary or submodule)`);
+  }
+  if (report.unscanned.length > 0) {
+    parts.push(`${report.unscanned.length} unscanned`);
   }
   lines.push(`check-secrets: ${parts.join(', ')}`);
 
@@ -1880,8 +2497,10 @@ function helpText() {
   return [
     'Usage: node scripts/check-secrets.mjs [options]',
     '',
-    'Fails when a file git tracks carries a credential. Every tracked file is read (binary,',
-    'oversized and non-regular files are skipped and reported) and checked against these rules:',
+    'Fails when a file git tracks carries a credential. Every tracked file is read - a file over',
+    '2 MiB is streamed, a symbolic link is read as its target text and never followed - and only',
+    'a positively identified binary (extension and leading bytes agree) or a submodule is skipped.',
+    'Each scanned file is checked against these rules:',
     '',
     ...RULES.map((rule) => `  ${rule.id.padEnd(18)} ${rule.summary}`),
     '',
@@ -1899,7 +2518,10 @@ function helpText() {
     '  0  no findings',
     '  1  at least one finding',
     '  2  the check could not run: unknown option, git unavailable, not a git repository, no',
-    '     tracked files to scan, or a missing or malformed allowlist',
+    '     tracked files to scan, or a missing or malformed allowlist; or a tracked file could not',
+    '     be examined (absent from the work tree, replaced by a directory or another non-regular',
+    '     entry, or unreadable), which the report lists as unscanned with the command that fixes',
+    '     it',
     '',
     'The check only reads: it writes nothing to disk and never opens anything inside .git/, whose',
     'config holds this repository\u2019s remote access token. Findings name the file and line, and',
@@ -1956,7 +2578,8 @@ function parseArgs(argv) {
  * @param {readonly string[]} [argv] Arguments after the script path, as in `process.argv.slice(2)`.
  * @param {{ cwd?: string, root?: string, allowlist?: unknown, allowlistPath?: string }} [options]
  *   Scan a different checkout or supply a different allowlist; see {@link scanRepository}.
- * @returns {Promise<number>} 0 no findings, 1 findings, 2 usage or environment error.
+ * @returns {Promise<number>} 0 no findings, 1 findings, 2 usage or environment error or a tracked
+ *   file that could not be examined.
  */
 export async function main(argv = [], options = {}) {
   /** @type {CliOptions} */
@@ -1977,6 +2600,16 @@ export async function main(argv = [], options = {}) {
   try {
     const report = scanRepository(options);
     process.stdout.write(cli.json ? `${JSON.stringify(report, null, 2)}\n` : renderReport(report));
+    if (report.unscanned.length > 0) {
+      // Exit 2 always explains itself on stderr, so a caller watching only that stream - or
+      // parsing --json from stdout - still learns why the gate refused to pass.
+      const count = report.unscanned.length;
+      process.stderr.write(
+        `check-secrets: unscanned: could not examine ${count} tracked ` +
+          `${plural(count, 'file')} (${report.unscanned.map((entry) => entry.file).join(', ')}); ` +
+          'the report lists each with the command that fixes it\n',
+      );
+    }
     return report.exitCode;
   } catch (error) {
     const code = error instanceof CheckSecretsError ? error.code : 'internal-error';
@@ -1991,10 +2624,40 @@ export async function main(argv = [], options = {}) {
   }
 }
 
-const invokedPath = process.argv[1];
-if (
-  invokedPath !== undefined &&
-  import.meta.url === pathToFileURL(path.resolve(invokedPath)).href
-) {
+/**
+ * `file` with every symbolic link resolved, or merely made absolute when it cannot be resolved.
+ *
+ * @param {string} file
+ * @returns {string}
+ */
+function canonicalPath(file) {
+  try {
+    return realpathSync(file);
+  } catch {
+    return path.resolve(file);
+  }
+}
+
+/**
+ * Whether this module is the process entry point, so importing it (the tests) never runs the
+ * command line.
+ *
+ * Both sides are canonicalized. Node reports `import.meta.url` as a real path but leaves
+ * `process.argv[1]` as typed, so comparing the two as they come makes a run through any symbolic
+ * link - a symlinked checkout, a linked workspace, macOS's `/tmp` - skip `main` entirely and exit 0
+ * without printing a word: a secrets gate that passes without looking, which is the one outcome it
+ * exists to rule out.
+ *
+ * @returns {boolean}
+ */
+function isEntryPoint() {
+  const entry = process.argv[1];
+  if (entry === undefined || entry === '') {
+    return false;
+  }
+  return canonicalPath(fileURLToPath(import.meta.url)) === canonicalPath(entry);
+}
+
+if (isEntryPoint()) {
   process.exitCode = await main(process.argv.slice(2));
 }

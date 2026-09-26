@@ -12,7 +12,21 @@
  * capabilities as injected callbacks, attaches them to Chrome's event surface
  * and supplies the decisions that belong to no single module — which tab a
  * panel inspects, when DevTools closing means `session.unbind`, which browser
- * navigation is a committed one.
+ * navigation is a committed one, and which service address is in force.
+ *
+ * That address is the setting the pairing dialog stores
+ * (`SERVICE_ENDPOINT_STORAGE_KEY`, validated by `parseServiceEndpoint`), else
+ * the environment's, else `DEFAULT_SERVICE_BASE_URL`. It is read at start-up
+ * and again before every pairing redemption, followed through
+ * `chrome.storage.local.onChanged`, and applied to both paths at once: the
+ * shared `HttpClient` is rebuilt for it and the socket is moved with
+ * `WsBridge.setServiceBaseUrl`. Until the first read of it succeeds the
+ * bridge's gate holds every socket and HTTP call, and a failed first read puts
+ * a refusal in force — fail closed: the devtools credential and a pairing code
+ * never go to an address the setting did not establish. Every HTTP call that
+ * names no deadline of its own is bounded by {@link SERVICE_REQUEST_TIMEOUT_MS};
+ * a hydration whose reads fail transiently is surfaced to the panel and tried
+ * again on {@link HYDRATION_RETRY_DELAYS_MS}.
  *
  * ## Manifest V3 lifetime (get this wrong and nothing else matters)
  *
@@ -36,44 +50,164 @@
  *   storage scan.
  *
  * Two recovery mechanisms coexist and neither substitutes for the other: the
- * `chrome.alarms` keepalive (created in exactly one place, `ws-bridge.ts`'s
- * `connect()`, and ticked from {@link KEEPALIVE_ALARM_NAME} here) covers worker
- * suspension, and the socket client's backoff covers a service restart. Both
+ * `chrome.alarms` keepalive (created only by `ws-bridge.ts` — by its
+ * `connect()`, and re-created by its open-socket heartbeat every
+ * `SOCKET_HEARTBEAT_INTERVAL_MS` — and ticked from {@link KEEPALIVE_ALARM_NAME}
+ * here) covers worker suspension, and the socket client's backoff covers a
+ * service restart; the heartbeat's health probe hands a socket whose service
+ * stopped answering to that backoff. Both
  * end in a status snapshot pushed to every panel, so "Connected · ‹session›",
  * "Reconnecting…", "Not paired", "Service not running" and "Tab left ‹origin›"
  * are observable without the panel polling (AAP §0.5.5).
  *
+ * ## Telemetry custody across a cold start
+ *
+ * The content bridge hands a batch over only once `port.postMessage` returns,
+ * and the page agent forgets it then — so a batch this worker drops is gone.
+ * A page load is what usually wakes the worker, and until `start()` has run
+ * `wsBridge.connect()` the socket client is `closed` and refuses every frame.
+ * The page agent's `agent.ready` and `telemetry.batch` frames therefore run
+ * through one ordered lane per tab ({@link createWorker}'s `inTabOrder`),
+ * each link waiting for {@link DebugGeneratorWorker.ready} and for the link
+ * before it: they reach the socket client in arrival order — a batch only
+ * once the service has confirmed its tab's route (see below). While start-up
+ * is pending a tab may have at most {@link COLD_START_HELD_EVENTS_PER_TAB}
+ * events waiting — the agent's own buffer bound — and events beyond it are
+ * refused and counted.
+ *
+ * Telemetry the capture is missing is shown, not only logged: events the
+ * worker could not hand to the service, and events the page reports it
+ * dropped before the batch (`droppedCount`), reach the tab's panels as a
+ * protocol `error` of fixed copy that names only a number
+ * ({@link telemetryLossNotice}), at most once per kind per tab every
+ * {@link TELEMETRY_LOSS_NOTICE_INTERVAL_MS} with the count accumulated in
+ * between. That includes frames the socket client queued and later
+ * discarded, which `ws-bridge.ts` reports by tab and event count. A notice
+ * that reached no panel of the tab is not forgotten: it is shown again when
+ * a panel is associated with the tab, or when an interval ends with one
+ * connected. Log lines about such loss carry counts and the tab only.
+ *
  * ## Where the inspected tab comes from
  *
- * A panel port names no tab: its `sender` is an extension page and no panel
- * request carries a tab id. The tab is known to the worker from exactly two
- * sources — the `devtools.hello` frame of the DevTools page, and the tab bound
- * to a session a reconnecting panel names in `session.snapshot`. A panel that
- * names no session is associated with the most recently announced DevTools
- * page that has no panel yet; a DevTools page announced after its panel
- * connected adopts the waiting panel. The worker, not the panel, sends the
- * protocol's `session.bind` (AAP §0.2.3).
+ * A panel port's `sender` names no tab (it is an extension page). The tab is
+ * known to the worker from two sources of the same trust — this extension's
+ * own pages, the only senders `PORT_PANEL` and `PORT_DEVTOOLS` accept — both
+ * reading `chrome.devtools.inspectedWindow.tabId`: the DevTools page's
+ * `devtools.hello`, and the `inspectedTabId` a panel running inside DevTools
+ * names in its `session.snapshot` request. A panel's tab is fixed for the life
+ * of its port, and it is set as follows ({@link associatePanel}):
  *
- * ## Contract gaps recorded here
+ * - A panel that names its inspected tab is associated with exactly that tab.
+ *   A name contradicting the port's existing association is refused and
+ *   answered unbound; the other tab is never hydrated.
+ * - A panel that names no tab (its page was opened outside DevTools) is
+ *   associated only when exactly one DevTools tab awaits a panel; with
+ *   several it stays unassociated, because nothing trustworthy says which.
+ *   Such a panel, once it has asked, is adopted by a DevTools page announced
+ *   later only when it is the one panel waiting and that page's tab the one
+ *   tab awaiting ({@link adoptWaitingPanel}).
+ * - The session a panel remembers and names in its snapshot request is
+ *   information only: it never chooses or assigns a tab, and a claim whose
+ *   session is bound elsewhere is logged and ignored.
  *
- * - `../shared/messages` declares no panel or devtools frame that carries the
- *   developer's consent to reload a tab whose agent arrived after React. The
- *   consented reload is therefore exposed as
- *   {@link DebugGeneratorWorker.requestConsentedReload} — the only caller of
- *   `agent-control.ts`'s `requestConsentedReload` — and never invoked from a
- *   timer, a readiness report or a navigation.
- * - A port failure frame carries `{ code, message }` only (`portErr` drops
- *   `details`), so a capture refused because another session holds it reaches
- *   the panel as `CAPTURE_ALREADY_ACTIVE` with the service's message; the
- *   owning session's id is logged here, not forwarded.
+ * Every session-scoped panel request is then held to "the session bound to
+ * this panel's tab" before the worker acts for it. The worker, not the panel,
+ * sends the protocol's `session.bind` (AAP §0.2.3).
+ *
+ * ## Every session-scoped action names the tab it acts for
+ *
+ * One socket and one paired DevTools credential serve every inspected tab, so
+ * the credential alone cannot tell the service whose session a request may
+ * touch. AAP §0.5.6 allows a DevTools principal to bind, select targets,
+ * capture, query panel data and open source "only for the session bound to
+ * that tab", and the service enforces it by the **acting tab** each action
+ * names — `x-debuggen-tab` on an HTTP request, the envelope's `tabId` on a
+ * frame — checked against its live binding table. The tab is always Chrome's
+ * attribution (a panel's associated tab, a bridge or DevTools port's sender),
+ * never a page's or a panel's own claim:
+ *
+ * - a panel request resolves its acting tab in `checkPanelScope`, and a panel
+ *   not yet associated with a tab is refused here rather than sent unscoped;
+ * - frames sent for a tab carry it: `source.open`, `target.selected`, the
+ *   binding frames and `agent.ready` (stamped from their payload's own tab by
+ *   `sendActingForPayloadTab`), and telemetry;
+ * - a telemetry batch is forwarded only for a tab whose binding the registry
+ *   holds, with that binding's session, one tab's batches strictly in order and
+ *   after the cold start has settled (`enqueueTelemetryBatch`) — and only once
+ *   the service has confirmed that binding on the current connection
+ *   (`wsBridge.awaitTabRoute`), so a batch is never queued into a socket that
+ *   a restarted service would answer with `TAB_NOT_BOUND`. The session and
+ *   capture the page agent stamped on a batch are pinned when it arrives and
+ *   can only reject it: a batch produced for another session or capture than
+ *   the tab's binding at send time is dropped, never relabelled.
+ *
+ * ## The consented reload and the capture conflict, over the panel port
+ *
+ * - **The one-click reload** (AAP §0.7.1 Group 2: readiness "asks for a
+ *   one-click reload, which the SW performs via `chrome.tabs.reload` on
+ *   consent and waits for the next `agent.ready`"). The panel's `page.reload`
+ *   request **is** the developer's consent, and its handler here is the only
+ *   caller of `agent-control.ts`'s `requestConsentedReload` — never a timer, a
+ *   readiness report or a navigation. The handler fails closed: it reloads
+ *   only the tab the consent names, and only when that tab is the requesting
+ *   connection's associated tab and is bound to the named session at the
+ *   moment of the reload — never a tab a stale or reconnecting panel was not
+ *   shown the offer for — on an origin the content scripts match, and only
+ *   while `agent.getReloadOffer`
+ *   says a reload is offered: the hook arrived after React, or no agent runs
+ *   in the tab at all (a page loaded before the extension). It answers once
+ *   the new document's `agent.ready`
+ *   arrives — or with a typed failure when the bounded wait expires — so the
+ *   hub's request timeout is set above that wait
+ *   ({@link WORKER_REQUEST_TIMEOUT_MS}). The offer itself reaches the panels
+ *   as the `reload` push and the snapshot's `reload` field, refreshed whenever
+ *   readiness, a reload, a content-script bridge or the tab's binding changes.
+ * - **The capture-ownership conflict** (AAP §0.4.2: `capture.start` for a
+ *   project another session already captures answers `409 { owningSessionId }`).
+ *   The `capture.start` handler answers the bridge's failure unchanged, and
+ *   `./messages`'s `portErr` projects it onto the port frame as
+ *   `CAPTURE_ALREADY_ACTIVE` with the service's message **and** the owning
+ *   session's id — the one `details` field a port failure may carry, admitted
+ *   only on that answer and only once the protocol's own schema accepts it
+ *   (`captureConflictOwningSessionId`) — so the panel can name the session
+ *   that holds the capture. The same validated id is what this worker logs.
+ * - `source.open` is a request-correlated round trip, not a fire-and-forget
+ *   send ({@link forwardSourceOpen}): the frame goes out under a freshly minted
+ *   id, and the panel's request is answered only by the service's
+ *   `source.result` — or its `error` frame — whose `ref` is that id, or by the
+ *   {@link SOURCE_OPEN_RESULT_TIMEOUT_MS} deadline. The port contract in
+ *   `../shared/messages` still types the answer `{ forwarded: boolean }`, and
+ *   its doc line there ("whether the socket took it") predates this; the
+ *   meaning is now: `forwarded: true` — the editor confirmed it opened the
+ *   location; `forwarded: false` — no VS Code window is connected, so the
+ *   panel hands the location to the editor-open URI instead. A refusal, an
+ *   editor failure and the deadline are typed failures. Because `portErr`
+ *   drops every other `details` field (above), the request's `ref` is logged here and does not
+ *   reach the panel, which mints its own reference for an unexpected failure.
+ *   The service answers a `source.open` its handler refused with a `failed`
+ *   `source.result`, which no panel receives; an `error` refusal made before
+ *   the handler ran quotes nothing from the request and is still withheld
+ *   from the relay to the panels ({@link isAnsweredSourceOpenRefusal}): the
+ *   request carries it, and the panel's general error state never shows it.
+ *   Withholding needs the request's id, so the worker never evicts an id
+ *   whose answer can still arrive ({@link SourceOpenRefLedger}): past
+ *   {@link SOURCE_OPEN_MAX_OUTSTANDING} unanswered requests a click is refused
+ *   `RATE_LIMITED` before it is sent. Either answer reaches the requesting
+ *   panel with its code and a fixed sentence, never the service's text.
  *
  * ## Privacy (AAP §0.5.2)
  *
  * Log lines carry lifecycle events, ids, counts, kinds and error codes only —
  * never a token, a pairing code, a URL (its path and query), a telemetry
- * attribute, a descriptor or a response body. URLs this worker produces for
- * the service (`session.bind`, `tab.navigated`) are query-redacted first by
- * {@link redactNavigationUrl}.
+ * attribute, a descriptor, a source location or a response body. URLs this
+ * worker produces for the service (`session.bind`, `tab.navigated`) are
+ * query-redacted first by {@link redactNavigationUrl}.
+ *
+ * A page agent frame is page-forgeable, so what it says is never logged or
+ * shown as text: an `agent.error` is reduced to its closed-vocabulary kind and
+ * that kind's fixed public sentence by {@link agentErrorReport}, and the
+ * page-supplied document and producer ids that `agent-control.ts` and
+ * `ws-bridge.ts` log are fingerprinted by `fingerprintPageId` first.
  *
  * Governed by AAP §0.7.1 Group 4, §0.2.3, §0.4.2, §0.5.5, §0.5.6 and §0.8.1
  * slices 4 and 6.
@@ -83,51 +217,109 @@
 
 import type {
   AnalysisResult,
+  ErrorPayload,
   MessagePayload,
   PanelSpec,
   SelectedTarget,
+  SendOutcome,
   SessionRecord,
+  SourceResultPayload,
+  Unsubscribe,
   WebSocketConstructorLike,
 } from '@debuggen/protocol';
 import {
   createEnvelope,
+  DEFAULT_WS_BACKOFF,
   HttpClient,
+  isPlainRecord,
+  MESSAGE_TYPE,
   parseErrorPayload,
   parseSessionBindPayload,
   parseTabNavigatedPayload,
+  sameSelectedTarget,
+  SOURCE_OPEN_RESULT_TIMEOUT_MS,
+  toErrorPayload,
 } from '@debuggen/protocol';
-import type { DebuggenError, Logger, Result, SessionId } from '@debuggen/shared';
-import { createConsoleLogger, err, ok } from '@debuggen/shared';
+import type { DebuggenErrorCode, LogFields, Logger, Result, SessionId } from '@debuggen/shared';
+import {
+  createConsoleLogger,
+  DebuggenError,
+  err,
+  isErr,
+  newMessageId,
+  noopLogger,
+  ok,
+} from '@debuggen/shared';
 
-import type { PanelBindingState, PanelSessionSnapshot, PortPush } from '../shared/messages';
+import type {
+  PageAgentErrorKind,
+  PageReloadResult,
+  PageTelemetryBatchPayload,
+  PanelBindingState,
+  PanelReloadState,
+  PanelSessionSnapshot,
+  PortPush,
+  PortReloadPush,
+  PortRequestPayloads,
+  PortResponsePayloads,
+  RelayedProtocolMessage,
+} from '../shared/messages';
 import {
   DEFAULT_SERVICE_BASE_URL,
   EXTENSION_CHANNEL,
+  fingerprintPageId,
+  isPageCaptureId,
   newPortRequestId,
+  PAGE_AGENT_ERROR_PUBLIC_MESSAGES,
+  pageAgentErrorKind,
+  PANEL_RELOAD_NOT_NEEDED,
+  PORT_CONTENT_BRIDGE,
   PORT_DEVTOOLS,
   PORT_PANEL,
   PORT_PROTOCOL_VERSION,
 } from '../shared/messages';
 
-import type { AgentControl, AgentTabsApi, DisarmReason, ReloadOutcome } from './agent-control';
-import { createAgentControl } from './agent-control';
+import type {
+  AgentControl,
+  AgentControlChange,
+  AgentTabsApi,
+  DisarmReason,
+  ReloadOutcome,
+} from './agent-control';
+import { createAgentControl, PENDING_READY_TIMEOUT_MS } from './agent-control';
 import type {
   CredentialStorageArea,
   CredentialStorageChangeEvent,
+  CredentialStorageChangeListener,
   DevtoolsCredentialStore,
 } from './auth';
-import { createDevtoolsCredentialStore } from './auth';
+import {
+  createDevtoolsCredentialStore,
+  parseServiceEndpoint,
+  readServiceEndpoint,
+  SERVICE_ENDPOINT_STORAGE_KEY,
+} from './auth';
 import type {
   DevtoolsConnection,
   PanelConnection,
+  ProtocolSend,
+  ProtocolSubscribe,
+  RelayPush,
   TabBindingRecord,
   WorkerAlarmsApi,
   WorkerConnection,
+  WorkerConnectionId,
   WorkerStatusSnapshot,
   WorkerTimerApi,
 } from './messages';
-import { isRelayedMessage, KEEPALIVE_ALARM_NAME, workerError } from './messages';
+import {
+  captureConflictOwningSessionId,
+  isRelayedMessage,
+  KEEPALIVE_ALARM_NAME,
+  workerError,
+} from './messages';
 import type {
+  BridgeMessageContext,
   BridgeMessageHandlers,
   DevtoolsMessageHandlers,
   PortClosedEvent,
@@ -135,11 +327,16 @@ import type {
   PortRequestContext,
   PortRequestHandlers,
 } from './ports';
-import { connectionPushFromStatus, createPortHub } from './ports';
+import {
+  connectionPushFromStatus,
+  createPortHub,
+  isLocalAppOrigin,
+  PORT_REQUEST_TIMEOUT_MS,
+} from './ports';
 import type { TabBindingChange, TabRegistry, TabRegistryStorageArea } from './tab-registry';
 import { createTabRegistry } from './tab-registry';
-import type { WsBridge } from './ws-bridge';
-import { captureConflictOwner, createWsBridge } from './ws-bridge';
+import type { WsBridge, WsBridgeStatus } from './ws-bridge';
+import { createWsBridge, TELEMETRY_ROUTE_WAIT_MS } from './ws-bridge';
 
 /*
  * ===========================================================================
@@ -157,14 +354,196 @@ const UNBOUND_STATE: PanelBindingState = Object.freeze({ kind: 'unbound' });
 const BINDABLE_PROTOCOLS: readonly string[] = ['http:', 'https:'];
 
 /**
- * How an `agent.error` frame's code is reported to the panel, in the shared
- * error vocabulary: the agent's codes are its own, while the panel's `error`
- * state renders `DEBUGGEN_ERROR_CODES` members only. `hooks-not-released` is a
- * partial return to dormant; every other code (`hooks-unavailable`,
- * `agent-family-unavailable`, `producer-failure`, any future one) means a
- * signal the capture asked for is not being supplied.
+ * How long the worker waits at each step of settling one selection, in
+ * milliseconds — the contract `@debuggen/protocol`'s `messages/target.ts`
+ * documents: a `target.selected` frame is **pending** until the service
+ * refuses it with an `error` whose `ref` is the frame's id or accepts it with
+ * the `session.updated` that carries the descriptor, and a frame the transport
+ * lost gets neither answer.
+ *
+ * - `verifyMs` — the bound on each `GET /sessions/:id` of a selection: the
+ *   read before the send (is the descriptor already the recorded target?) and
+ *   the read-back that decides a frame nothing answered. One loopback read.
+ * - `queuedMs` — the delivery deadline. A selection is never handed to the
+ *   socket client's outbound queue: while the socket is not open it is held
+ *   here, still pending, for at most the backoff's ceiling
+ *   (`DEFAULT_WS_BACKOFF.maxMs`, ten seconds) plus two seconds for the
+ *   reconnect's handshake. A selection the deadline abandons was never sent,
+ *   so no reconnect can flush it after its failure was reported.
+ * - `sentMs` — the frame was written to an open socket: the service validates
+ *   the binding and records the target in one turn, so three seconds is only
+ *   exceeded when the frame was lost with the socket.
+ *
+ * The longest path — the read before the send, the whole hold, the sent wait
+ * and the read-back, `2 × verifyMs + queuedMs + sentMs` (nineteen seconds) —
+ * stays inside the port hub's `PORT_REQUEST_TIMEOUT_MS` (twenty seconds), so
+ * the panel always receives this worker's verdict rather than a generic
+ * request timeout. Exported, frozen, so a unit test can hold that inequality.
  */
-const AGENT_ERROR_CODE_RELEASE = 'hooks-not-released';
+export const SELECTION_VERDICT_TIMEOUTS = Object.freeze({
+  sentMs: 3_000,
+  queuedMs: DEFAULT_WS_BACKOFF.maxMs + 2_000,
+  verifyMs: 2_000,
+});
+
+/**
+ * The message of a selection the service never settled — lost with a closed
+ * socket, or held until the delivery deadline for a socket that did not open.
+ * Constant, so it names no descriptor, URL or selector (AAP §0.5.2).
+ */
+const SELECTION_UNCONFIRMED_MESSAGE =
+  "The service did not confirm the selected element, so it is not the session's target.";
+
+/** The recovery hint of {@link SELECTION_UNCONFIRMED_MESSAGE}. */
+const SELECTION_UNCONFIRMED_HINT =
+  'Check that the Debug Generator service is running and this tab is still bound, then select the element again.';
+
+/**
+ * The message of a selection that was not sent because the worker's socket is
+ * closed — not reconnecting — so no wait could deliver it: the panel is not
+ * paired, or the service refused its credential.
+ */
+const SELECTION_UNSENT_MESSAGE =
+  'The Debug Generator panel is not connected to the service, so the selected element was not sent.';
+
+/** The recovery hint of {@link SELECTION_UNSENT_MESSAGE}. */
+const SELECTION_UNSENT_HINT =
+  'Pair the panel with the service (or start the service), then select the element again.';
+
+/**
+ * Why "Pick element" could not enter picker mode — picker mode is the page
+ * agent's picker, and no agent is connected for the inspected tab — with the
+ * two routes that still lead to a target: a reload, which starts the agent, or
+ * the explicit `$0` control. The recovery is part of the message itself
+ * because a port failure frame carries `{ code, message }` only (see the
+ * module notes), so a separate hint would never reach the panel.
+ */
+const PICKER_UNAVAILABLE_MESSAGE =
+  'The Debug Generator page agent is not running on the inspected page, so picker mode is unavailable. Reload the application page, or select the element in the Elements panel and press "Use selected element".';
+
+/**
+ * Why a picked element was dropped: the page agent described it in a document
+ * the tab no longer shows (a reload or a navigation came first). Constant, so
+ * it names no descriptor, URL or selector (AAP §0.5.2).
+ */
+const STALE_SELECTION_MESSAGE =
+  'The page changed before the element was reported, so it was not selected. Pick it again.';
+
+/**
+ * How much sooner than a panel request's own deadline an HTTP call to the
+ * service gives up, in milliseconds: five seconds.
+ */
+const SERVICE_REQUEST_DEADLINE_MARGIN_MS = 5_000;
+
+/**
+ * The deadline of every HTTP call the worker makes to the local service that
+ * names none of its own — the shared `HttpClient`'s `defaultTimeoutMs`:
+ * `PORT_REQUEST_TIMEOUT_MS` (20 s) less {@link SERVICE_REQUEST_DEADLINE_MARGIN_MS},
+ * so fifteen seconds.
+ *
+ * Without it, a service that accepts a connection and never answers leaves
+ * the call — and the port request, `session.snapshot` hydration or pairing
+ * redemption waiting on it — pending until the panel's port gives up with a
+ * bare timeout. Shorter than that port deadline, the call settles first, with
+ * the client's typed timeout failure and its hint, which the panel renders as
+ * a retryable error state (AAP §0.5.5). A call that sets its own `timeoutMs`
+ * (the health probe's `CLIENT_HELLO_TIMEOUT_MS`) keeps it.
+ */
+const SERVICE_REQUEST_TIMEOUT_MS = PORT_REQUEST_TIMEOUT_MS - SERVICE_REQUEST_DEADLINE_MARGIN_MS;
+
+/**
+ * What the developer can do when the stored service address could not be
+ * read before any read succeeded — the state the worker fails closed into.
+ * Opening the panel again re-reads it (its `session.snapshot` does), and so
+ * does a pairing attempt.
+ */
+const SERVICE_ADDRESS_UNREAD_HINT =
+  'Close and reopen DevTools to read the saved service address again; the extension contacts no service until it can.';
+
+/**
+ * When a failed background hydration of a tab's panels is tried again, in
+ * milliseconds after each failure, in order: 5 s, 15 s, then 30 s, after
+ * which the panel keeps its retryable error notice and recovers with the next
+ * reconnect's replay or its own resync. Only transient failures are retried
+ * ({@link RETRYABLE_HYDRATION_CODES}), only while the tab still has a panel,
+ * and a detach or a newer hydration cancels the pending try.
+ */
+export const HYDRATION_RETRY_DELAYS_MS: readonly number[] = Object.freeze([5_000, 15_000, 30_000]);
+
+/**
+ * The failure codes of a hydration read worth trying again: a transport that
+ * dropped or timed out, and a service whose own store failed. Everything else
+ * — an unknown session, a refused credential, a refused address — answers the
+ * same way on a second try.
+ */
+const RETRYABLE_HYDRATION_CODES: ReadonlySet<DebuggenErrorCode> = new Set<DebuggenErrorCode>([
+  'TRANSPORT_DISCONNECTED',
+  'STORE_ERROR',
+]);
+
+/**
+ * How much longer than agent-control's bounded wait for a reloaded document's
+ * `agent.ready` ({@link PENDING_READY_TIMEOUT_MS}) the port hub lets a panel
+ * request run: five seconds.
+ *
+ * A `page.reload` answer is decided only when that wait settles, and the
+ * wait starts after the handler has resolved the session's tab, so a hub
+ * timeout equal to the wait would answer first — with a generic `TIMEOUT`
+ * instead of the `AGENT_NOT_READY` that says the reloaded page never
+ * reported. The margin covers the handler's own lookups and the wait's timer
+ * firing late on a busy worker.
+ */
+const RELOAD_ANSWER_GRACE_MS = 5_000;
+
+/**
+ * The port hub's timeout for every panel request: the hub default
+ * ({@link PORT_REQUEST_TIMEOUT_MS}), raised when needed to outlast a
+ * consented reload's wait plus {@link RELOAD_ANSWER_GRACE_MS}. The hub's
+ * timeout is uniform across request kinds, so the other kinds share the
+ * raised bound; it stays below the panel's own request timeout
+ * (`PANEL_PORT_REQUEST_TIMEOUT_MS`, thirty seconds, in
+ * `../panel/state/connection.ts`), so the panel always hears the worker's
+ * typed answer rather than giving up first.
+ */
+const WORKER_REQUEST_TIMEOUT_MS = Math.max(
+  PORT_REQUEST_TIMEOUT_MS,
+  PENDING_READY_TIMEOUT_MS + RELOAD_ANSWER_GRACE_MS,
+);
+
+/**
+ * The most telemetry batches one tab may have waiting to be forwarded.
+ *
+ * A batch waits while the worker's cold start settles (the credential read,
+ * the binding hydration, the socket start), while the service confirms the
+ * tab's route after a (re)connect, and while the batches of the same tab
+ * ahead of it are forwarded — each for at most `TELEMETRY_ROUTE_WAIT_MS` from
+ * its arrival. The page agent (`@debuggen/telemetry`'s browser transport)
+ * posts batches of at most 200 events, flushes a partial one after 250 ms,
+ * and holds at most 5 000 events while the worker is away — so the backlog a
+ * revival receives from one tab is at most 25 batches. 64 covers that backlog
+ * plus the flushes made while the cold start settles, and bounds what one tab
+ * can make the worker hold. A batch beyond the bound is dropped and reported
+ * — counted and logged — never silently lost.
+ */
+const MAX_PENDING_TELEMETRY_BATCHES_PER_TAB = 64;
+
+/**
+ * How many times the lane hands one batch to the bridge: the send, and one
+ * more after the route was lost between its confirmation and the write (the
+ * socket dropped, or a reconnect has not been confirmed yet) — both within the
+ * batch's one overall deadline.
+ */
+const TELEMETRY_SEND_ATTEMPTS = 2;
+
+/**
+ * The send failures that mean "the route was lost before the write" and are
+ * worth waiting for the route again: the socket could not take the write, or
+ * the service's confirmation for the pair is not held on this connection.
+ */
+const TELEMETRY_ROUTE_LOSS_CODES: readonly DebuggenErrorCode[] = [
+  'TRANSPORT_DISCONNECTED',
+  'TAB_NOT_BOUND',
+];
 
 /*
  * ===========================================================================
@@ -213,10 +592,22 @@ export interface WorkerTabChange {
   readonly status?: string | undefined;
 }
 
-/** The field of a `chrome.tabs.Tab` the worker reads. */
+/**
+ * The fields of a `chrome.tabs.Tab` the worker reads; `chrome.tabs.Tab` is
+ * assignable to it as it is. Both URLs are present because the manifest holds
+ * the `tabs` permission.
+ */
 export interface WorkerTab {
-  /** The tab's URL; available because the manifest holds the `tabs` permission. */
+  /** The main frame's last **committed** URL (the old page's while a navigation is pending). */
   readonly url?: string | undefined;
+  /**
+   * The URL the tab is navigating to before that navigation commits (Chrome
+   * 79+), absent when no navigation is pending. A `loading` entry whose
+   * pending URL differs from {@link url} belongs to a load bound for another
+   * URL, whose commit arrives later as a `url` change — see
+   * {@link nextCommittedNavigation}.
+   */
+  readonly pendingUrl?: string | undefined;
 }
 
 /** The parts of `chrome.tabs` the worker uses. */
@@ -280,7 +671,14 @@ export interface DebugGeneratorWorker {
    * the socket started. Never rejects.
    */
   readonly ready: Promise<void>;
-  /** The shared HTTP client (one instance, so `setToken` after pairing reaches every call). */
+  /**
+   * The shared HTTP client in force — one instance at a time, so `setToken`
+   * after pairing reaches every call. A getter: a changed service address
+   * replaces the instance, with `defaultTimeoutMs` bounding every call that
+   * names no deadline of its own. A composition handle for inspection: it is
+   * not held back by the service-address gate the bridge applies, so the
+   * worker's own requests go through {@link wsBridge}, never through it.
+   */
   readonly httpClient: HttpClient;
   /** The devtools credential store. */
   readonly store: DevtoolsCredentialStore;
@@ -292,12 +690,6 @@ export interface DebugGeneratorWorker {
   readonly agent: AgentControl;
   /** The socket and HTTP bridge to the local service. */
   readonly wsBridge: WsBridge;
-  /**
-   * Reload a tab whose page agent was installed after React, with the
-   * developer's consent — see the module notes on this contract gap. Calling
-   * it **is** the consent; nothing in this module calls it on its own.
-   */
-  readonly requestConsentedReload: (tabId: TabId) => Promise<ReloadOutcome>;
   /** Remove every listener and subscription and release every resource. */
   readonly dispose: () => void;
 }
@@ -388,15 +780,118 @@ function urlFallbacks(redacted: string): readonly string[] {
   return candidates;
 }
 
+/**
+ * The last URL and load status seen for one tab: what
+ * {@link nextCommittedNavigation} de-duplicates a tab's navigation reports
+ * against. Worker-generation memory, never persisted.
+ */
+export interface NavigationMemo {
+  /** The tab's last committed URL, as far as its events have told. */
+  readonly url: string | undefined;
+  /** The last load `status` an event reported (`loading` or `complete`). */
+  readonly status: string | undefined;
+}
+
+/** What one `chrome.tabs.onUpdated` event means for a tab's committed navigations. */
+export interface NavigationStep {
+  /** The memo to keep for the tab's next event. */
+  readonly memo: NavigationMemo;
+  /** The committed URL to report as `tab.navigated`, or `undefined` when the event reports none. */
+  readonly url: string | undefined;
+}
+
+/**
+ * Decide whether one `chrome.tabs.onUpdated` event reports a committed
+ * navigation, so each committed load yields exactly one `tab.navigated` —
+ * and, during a capture, exactly one "Page reloaded during capture" entry.
+ *
+ * `chrome.webNavigation` would name commits directly, but the manifest's
+ * permission set is exactly `storage`, `alarms` and `tabs`, so the commit is
+ * derived from `changeInfo` and the tab:
+ *
+ * - A changed `url` that differs from the remembered one is a commit — a
+ *   cross-document one, or a same-document one through the history API — and
+ *   is reported with that URL.
+ * - A new `loading` cycle without a URL change is a reload, which commits a
+ *   new document at the same URL, and is reported with the committed URL
+ *   (`tab.url`, else the remembered one) — unless `tab.pendingUrl` names a
+ *   different URL. Then the load is bound for another URL: nothing has
+ *   committed yet, and its commit arrives as a `url` change.
+ *
+ * Chrome reports a URL-changing load in one of two orders, and each yields one
+ * report: a single `{ status: 'loading', url }` event, reported by the `url`
+ * rule; or `{ status: 'loading' }` when the load starts — `tab.url` still the
+ * old committed URL, `tab.pendingUrl` the destination, so it reports nothing —
+ * followed by `{ url }` at commit, reported with the committed URL. A pending
+ * navigation that ends without a `url` change (stopped, a download, a `204`)
+ * committed no document and reports nothing; so does one redirected back to
+ * the committed URL, which `tabs.onUpdated` cannot tell apart from it.
+ *
+ * A repeated event of the same load is de-duplicated against the memo: a `url`
+ * equal to the remembered one, or a second `loading` entry before the load
+ * completes. A `loading` entry is never suppressed because a `url` event came
+ * before it: a history-API change followed by a real reload is two
+ * navigations, and both are reported.
+ *
+ * Pure: the caller keeps the returned memo for the tab's next event.
+ *
+ * @example
+ * ```ts
+ * // A link from /a to /b, reported in the split order — one navigation:
+ * const loaded: NavigationMemo = { url: 'http://localhost:4400/a', status: 'complete' };
+ * const started = nextCommittedNavigation(
+ *   loaded,
+ *   { status: 'loading' },
+ *   { url: 'http://localhost:4400/a', pendingUrl: 'http://localhost:4400/b' },
+ * ); // started.url === undefined: nothing has committed yet
+ * const committed = nextCommittedNavigation(
+ *   started.memo,
+ *   { url: 'http://localhost:4400/b' },
+ *   { url: 'http://localhost:4400/b' },
+ * ); // committed.url === 'http://localhost:4400/b'
+ * ```
+ *
+ * @param previous The memo the tab's previous event left, or `undefined` for its first.
+ * @param changeInfo The event's change info.
+ * @param tab The tab as the event reports it.
+ * @returns The memo to keep and the committed URL to report, if any.
+ */
+export function nextCommittedNavigation(
+  previous: NavigationMemo | undefined,
+  changeInfo: WorkerTabChange,
+  tab: WorkerTab,
+): NavigationStep {
+  const committedUrl = tab.url ?? previous?.url;
+  const memo: NavigationMemo = {
+    url: changeInfo.url ?? committedUrl,
+    status: changeInfo.status ?? previous?.status,
+  };
+  if (changeInfo.url !== undefined) {
+    return { memo, url: changeInfo.url === previous?.url ? undefined : changeInfo.url };
+  }
+  if (changeInfo.status !== 'loading' || previous?.status === 'loading') {
+    return { memo, url: undefined };
+  }
+  const boundElsewhere = tab.pendingUrl !== undefined && tab.pendingUrl !== committedUrl;
+  return { memo, url: boundElsewhere ? undefined : committedUrl };
+}
+
 /** The session's latest validated analysis: the last of `analyses`, oldest first. */
 function latestAnalysis(record: SessionRecord): AnalysisResult | undefined {
   return record.analyses.length > 0 ? record.analyses[record.analyses.length - 1] : undefined;
 }
 
-/** A string field of an untrusted frame, or `undefined`. */
-function stringField(record: Readonly<Record<string, unknown>>, key: string): string | undefined {
-  const value = record[key];
-  return typeof value === 'string' && value.length > 0 ? value : undefined;
+/**
+ * The tab a protocol payload names, when it names one that is a Chrome tab id
+ * (a non-negative safe integer; `-1` is `chrome.tabs.TAB_ID_NONE`), or
+ * `undefined` for a payload that names none.
+ */
+function payloadTabId(payload: unknown): TabId | undefined {
+  if (!isPlainRecord(payload)) {
+    return undefined;
+  }
+  const tabId = payload.tabId;
+  return typeof tabId === 'number' && Number.isSafeInteger(tabId) && tabId >= 0 ? tabId : undefined;
 }
 
 /** Newest first: the ordering behind every "most recent connection" choice. */
@@ -412,6 +907,27 @@ function errorCode(result: Result<unknown, DebuggenError>): string | undefined {
 /** The name of a thrown value, for a log line that must not carry its message. */
 function errorName(cause: unknown): string {
   return cause instanceof Error ? cause.name : typeof cause;
+}
+
+/** A promise and the function that fulfils it. */
+interface Deferred<T> {
+  /** Fulfils once, with the first value passed to {@link Deferred.resolve}. */
+  readonly promise: Promise<T>;
+  /** Fulfil the promise; every call after the first is ignored, as for any promise. */
+  readonly resolve: (value: T) => void;
+}
+
+/**
+ * A promise fulfilled from outside its executor — how a wait is settled by
+ * whichever of several independent events (a frame, a timer, an abort) comes
+ * first. The executor runs synchronously, so `resolve` is bound on return.
+ */
+function deferred<T>(): Deferred<T> {
+  let resolve: (value: T) => void = () => undefined;
+  const promise = new Promise<T>((fulfil) => {
+    resolve = fulfil;
+  });
+  return { promise, resolve };
 }
 
 /** Whether a connection is a DevTools panel document. */
@@ -448,11 +964,980 @@ function disarmReasonFor(change: TabBindingChange): DisarmReason | undefined {
   }
 }
 
-/** The protocol error code an `agent.error` frame is shown under. */
-function agentErrorCode(
-  agentCode: string | undefined,
-): 'CLEANUP_PARTIAL' | 'INSTRUMENTATION_UNAVAILABLE' {
-  return agentCode === AGENT_ERROR_CODE_RELEASE ? 'CLEANUP_PARTIAL' : 'INSTRUMENTATION_UNAVAILABLE';
+/**
+ * Why a telemetry batch's context contradicts its tab's binding, or
+ * `undefined` when it does not.
+ *
+ * The context only ever **rejects**: an absent field agrees with anything, a
+ * capture is compared only when both sides name one, and nothing here chooses
+ * or authorizes a session — the binding does that.
+ *
+ * @param context The session and capture the batch was produced for.
+ * @param binding The tab's binding, as the registry holds it now.
+ */
+function telemetryContextConflict(
+  context: TelemetryBatchContext,
+  binding: TabBindingRecord,
+): Exclude<TelemetryDropReason, 'unbound'> | undefined {
+  if (context.sessionId !== undefined && context.sessionId !== binding.sessionId) {
+    return 'session-mismatch';
+  }
+  if (
+    context.captureId !== undefined &&
+    binding.captureId !== undefined &&
+    context.captureId !== binding.captureId
+  ) {
+    return 'capture-mismatch';
+  }
+  return undefined;
+}
+
+/** The protocol error codes a recognised `agent.error` is shown under. */
+export type AgentErrorProtocolCode = Extract<
+  ErrorPayload['code'],
+  'CLEANUP_PARTIAL' | 'INSTRUMENTATION_UNAVAILABLE'
+>;
+
+/**
+ * The protocol error code a recognised `agent.error` is shown under, in the
+ * shared error vocabulary: the agent's kinds are its own, while the panel's
+ * `error` state renders `DEBUGGEN_ERROR_CODES` members only.
+ * `hooks-not-released` is a partial return to dormant; every other kind — an
+ * unavailable signal or support family, a failed producer, an event or a
+ * control frame the page channel could not carry — means a signal the capture
+ * asked for is not being supplied in full.
+ *
+ * @param kind The frame's kind, as {@link pageAgentErrorKind} recognised it.
+ */
+function agentErrorCode(kind: PageAgentErrorKind): AgentErrorProtocolCode {
+  return kind === 'hooks-not-released' ? 'CLEANUP_PARTIAL' : 'INSTRUMENTATION_UNAVAILABLE';
+}
+
+/** What the worker logs and shows for one recognised `agent.error`. */
+export interface AgentErrorReport {
+  /**
+   * The frame's kind from the closed vocabulary — the only thing about the
+   * frame a log line carries.
+   */
+  readonly kind: PageAgentErrorKind;
+  /**
+   * The protocol `error` payload the tab's panels are shown: the kind's
+   * protocol code, its fixed public sentence and, only when the frame named a
+   * canonical capture id, that id as `ref`.
+   */
+  readonly error: ErrorPayload;
+}
+
+/**
+ * Classify a page agent's `agent.error` frame into what may be logged and
+ * shown about it, or `undefined` when it is not something the agent emits.
+ *
+ * Every byte of the frame was produced in the page's realm, so a page script
+ * can forge one with a URL, a token or any other private text in its `code`,
+ * `reason` or `message` (CWE-532, AAP §0.5.2). Nothing the frame says is
+ * therefore passed on as text: its kind is recognised against the closed
+ * vocabulary of `../shared/messages` ({@link pageAgentErrorKind}), the panel
+ * reads that kind's fixed sentence ({@link PAGE_AGENT_ERROR_PUBLIC_MESSAGES}),
+ * and `captureId` becomes the correlation `ref` only when it has the exact
+ * shape of a service-minted capture id ({@link isPageCaptureId}). The frame's
+ * own `message` is never read.
+ *
+ * Pure and total for a recognised kind: the payload is validated against the
+ * protocol's `error` schema, and should that schema ever refuse the `ref`, the
+ * report is still made — without it.
+ *
+ * @example
+ * ```ts
+ * agentErrorReport({ code: 'hooks-not-released', message: 'anything', captureId: 'cap_0123456789abcdef' });
+ * // → { kind: 'hooks-not-released',
+ * //     error: { code: 'CLEANUP_PARTIAL', message: PAGE_AGENT_ERROR_PUBLIC_MESSAGES['hooks-not-released'],
+ * //              ref: 'cap_0123456789abcdef' } }
+ * agentErrorReport({ code: 'token=abc' }); // → undefined
+ * ```
+ *
+ * @param payload The `agent.error` payload the bridge relayed.
+ * @returns The kind and the panel's payload, or `undefined` for an
+ * unrecognised frame, which is neither logged by value nor shown.
+ */
+export function agentErrorReport(
+  payload: Readonly<Record<string, unknown>>,
+): AgentErrorReport | undefined {
+  const kind = pageAgentErrorKind(payload);
+  if (kind === undefined) {
+    return undefined;
+  }
+  const code = agentErrorCode(kind);
+  const message = PAGE_AGENT_ERROR_PUBLIC_MESSAGES[kind];
+  const captureId = payload.captureId;
+  const withRef = isPageCaptureId(captureId)
+    ? parseErrorPayload({ code, message, ref: captureId })
+    : parseErrorPayload({ code, message });
+  const error: ErrorPayload = withRef.ok ? withRef.value : { code, message };
+  return { kind, error };
+}
+
+/**
+ * The most telemetry events one tab may have waiting for the worker's cold
+ * start ({@link DebugGeneratorWorker.ready}).
+ *
+ * The same bound as the page agent's own buffer (`MAX_BUFFERED_EVENTS` in
+ * `packages/telemetry/src/browser/transport.ts`; AAP §0.5.5: "the agent
+ * buffers up to 5 000 events in memory until the bridge returns"), so a
+ * revival holds no more than the page would have held for it. It is restated
+ * rather than imported because `@debuggen/telemetry` is a build-order
+ * devDependency of this workspace, never a runtime one. The bound is per tab:
+ * a page cannot use another tab's allowance, and one noisy page cannot starve
+ * the rest.
+ */
+export const COLD_START_HELD_EVENTS_PER_TAB = 5000;
+
+/**
+ * The shortest interval between two telemetry-loss notices of one kind on
+ * one tab's panels. Loss recorded inside the interval is accumulated and
+ * shown when it ends, so a burst yields one notice, not one per batch.
+ */
+export const TELEMETRY_LOSS_NOTICE_INTERVAL_MS = 5000;
+
+/**
+ * Why telemetry a page produced is missing from the capture.
+ *
+ * - `undelivered` — the worker received the events and could not hand them
+ *   to the service's socket: they arrived during a cold start beyond
+ *   {@link COLD_START_HELD_EVENTS_PER_TAB}, or the socket client refused them
+ *   after start-up (closed because the extension is not paired or its
+ *   credential was refused, or a frame the protocol refused), or it queued
+ *   them and then discarded them — dropped from its full outbound queue while
+ *   the service was unreachable, or cleared with the queue when the
+ *   credential was removed (`WsBridgeDeps.onTelemetryDropped`).
+ * - `dropped-in-page` — the batch's `droppedCount` reports events lost before
+ *   the batch left the page: the agent's buffer overflowed, or the content
+ *   bridge's rate budget refused them.
+ */
+export type TelemetryLossKind = 'undelivered' | 'dropped-in-page';
+
+/** The protocol error codes a telemetry-loss notice is shown under. */
+export type TelemetryLossProtocolCode = Extract<
+  ErrorPayload['code'],
+  'INSTRUMENTATION_UNAVAILABLE' | 'TRANSPORT_DISCONNECTED'
+>;
+
+/** The protocol code of each loss kind, in the shared error vocabulary. */
+const TELEMETRY_LOSS_CODES: Readonly<Record<TelemetryLossKind, TelemetryLossProtocolCode>> =
+  Object.freeze({
+    undelivered: 'TRANSPORT_DISCONNECTED',
+    'dropped-in-page': 'INSTRUMENTATION_UNAVAILABLE',
+  });
+
+/** "1 telemetry event" or "‹n› telemetry events". */
+function telemetryEventCount(events: number): string {
+  return events === 1 ? '1 telemetry event' : `${String(events)} telemetry events`;
+}
+
+/**
+ * The protocol `error` payload that tells the developer telemetry is missing
+ * from the capture: the kind's code and a fixed sentence whose only variable
+ * is the number of events.
+ *
+ * Nothing the page sent is quoted. The number is the worker's own count, or —
+ * for `dropped-in-page` — the batch's `droppedCount`, which the bridge port's
+ * guard admits only as a safe non-negative integer. An `undelivered` count is
+ * an upper bound, and says so: the socket client reports the first frame of
+ * a batch it refused, not how many earlier frames of that batch it took.
+ *
+ * @example
+ * ```ts
+ * telemetryLossNotice('undelivered', 3);
+ * // → { code: 'TRANSPORT_DISCONNECTED',
+ * //     message: 'Telemetry from this page did not reach the local service (up to 3 telemetry events), so the capture is incomplete.' }
+ * ```
+ *
+ * @param kind Why the events are missing.
+ * @param events How many; a positive safe integer.
+ * @returns A payload the protocol's strict `error` schema accepts.
+ */
+export function telemetryLossNotice(kind: TelemetryLossKind, events: number): ErrorPayload {
+  const code = TELEMETRY_LOSS_CODES[kind];
+  const count = telemetryEventCount(events);
+  const message =
+    kind === 'undelivered'
+      ? `Telemetry from this page did not reach the local service (up to ${count}), so the capture is incomplete.`
+      : `Telemetry was dropped inside the page before it was sent (${count}; its buffer or rate limit was exceeded), so the capture is incomplete.`;
+  const parsed = parseErrorPayload({ code, message });
+  return parsed.ok ? parsed.value : { code, message };
+}
+
+/**
+ * The answer to a panel's `page.reload`, from the consented reload's outcome:
+ * the reloaded document's readiness, or a failure in the shared error
+ * vocabulary — `AGENT_NOT_READY` when no `agent.ready` arrived within the
+ * bounded wait, `TAB_NOT_BOUND` when the tab could not be reloaded or was
+ * forgotten mid-wait, `SESSION_INVALID_STATE` when no reload was offered.
+ */
+function pageReloadAnswer(outcome: ReloadOutcome): Result<PageReloadResult, DebuggenError> {
+  switch (outcome.kind) {
+    case 'ready': {
+      const { documentId, installedBeforeReact, reactDetected } = outcome.readiness;
+      return ok({ documentId, installedBeforeReact, reactDetected });
+    }
+    case 'timeout':
+      return err(
+        workerError(
+          'AGENT_NOT_READY',
+          `The reloaded page did not report its agent within ${String(outcome.timeoutMs)} ms.`,
+          {
+            hint: 'Wait for the page to finish loading, then reload it again from the panel.',
+            details: { timeoutMs: outcome.timeoutMs },
+          },
+        ),
+      );
+    case 'no-tab':
+      return err(
+        workerError(
+          'TAB_NOT_BOUND',
+          outcome.reason === 'reload-failed'
+            ? 'Chrome could not reload the inspected tab.'
+            : 'The inspected tab closed or left the session while it reloaded.',
+          {
+            hint: 'Open DevTools on the application tab of this session.',
+            details: { reason: outcome.reason },
+          },
+        ),
+      );
+    case 'not-consented':
+      return err(
+        workerError('SESSION_INVALID_STATE', 'The inspected page does not need a reload.', {
+          hint: 'The page agent already observes this page.',
+          details: { reason: outcome.reason },
+        }),
+      );
+  }
+}
+
+/*
+ * ===========================================================================
+ * Section C2 — the `source.open` round trip
+ *
+ * A source click is answered by what the editor did, not by whether a socket
+ * queued a frame: the service replies to every `source.open` with a
+ * `source.result` correlated by `ref` (`opened`, `no-editor` or `failed`), or
+ * refuses it with an `error` frame carrying the same `ref`. The worker waits
+ * for the first of those, bounded by `SOURCE_OPEN_RESULT_TIMEOUT_MS` — which
+ * `@debuggen/protocol` fixes above the service's own editor deadline and below
+ * the port hub's twenty-second request ceiling, so the panel always receives a
+ * source-open outcome rather than a generic port timeout.
+ * ===========================================================================
+ */
+
+/** Everything {@link forwardSourceOpen} needs, injected so a unit suite can drive it with fakes. */
+export interface SourceOpenForwardDeps {
+  /** Sends the `source.open` frame: the socket bridge's `send`. */
+  readonly send: ProtocolSend;
+  /** Registers the `source.result` and `error` listeners: the socket bridge's `subscribe`. */
+  readonly subscribe: ProtocolSubscribe;
+  /** Arms and clears the answer deadline. */
+  readonly timers: WorkerTimerApi;
+  /**
+   * Mints the id of the `source.open` envelope — the value its answer's `ref`
+   * must equal. Defaults to `newMessageId`, whose ids fit the protocol's
+   * 64-character `ref` bound; a replacement must keep to that bound.
+   */
+  readonly newId?: (() => string) | undefined;
+  /**
+   * How long to wait for the answer, in milliseconds. Defaults to
+   * {@link SOURCE_OPEN_RESULT_TIMEOUT_MS}; a value that is not a positive
+   * finite number is replaced by that default rather than arming a deadline
+   * that fires at once or never.
+   */
+  readonly timeoutMs?: number | undefined;
+  /** Where outcomes are logged — ids, statuses and codes only. Defaults to `noopLogger`. */
+  readonly logger?: Logger | undefined;
+  /**
+   * Reserves the id of every `source.open` this worker sends, **before** it is
+   * sent, so the relay sink can withhold the service's correlated `error`
+   * frame from the panels' general error state: that refusal is answered
+   * through this request, whose failure the panel shows with fixed copy
+   * (see {@link isAnsweredSourceOpenRefusal}). A full ledger refuses the
+   * request before it is sent. Optional, so a unit suite can drive the round
+   * trip without one.
+   */
+  readonly refs?: SourceOpenRefLedger | undefined;
+  /**
+   * The inspected tab the request acts for — the panel's associated tab —
+   * sent as the frame's envelope `tabId`, which the service checks against its
+   * live binding (AAP §0.5.6). Absent only in a unit suite that drives the
+   * round trip without a tab.
+   */
+  readonly tabId?: TabId | undefined;
+}
+
+/**
+ * How many frames of an interrupted telemetry batch reached the socket — the
+ * `framesWritten` plus `framesQueued` the bridge reports on the failure; `0`
+ * for a failure that reports neither (the batch was refused before a frame).
+ */
+function framesHandedOver(error: DebuggenError): number {
+  const count = (key: string): number => {
+    const value = error.details?.[key];
+    return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : 0;
+  };
+  return count('framesWritten') + count('framesQueued');
+}
+
+/**
+ * One tab's ordered lane of page agent frames — its `agent.ready` reports and
+ * its telemetry batches: the promise its most recently queued frame settles
+ * on, which the next frame of the tab chains after, and the counts the lane's
+ * bounds are held to. It exists while frames of the tab are waiting and is
+ * forgotten once none is. Mutable by design — it is the worker's private
+ * bookkeeping, never shared or exposed.
+ */
+interface TelemetryLane {
+  /** The last link of the tab's chain; the next frame runs after it. */
+  tail: Promise<void>;
+  /** Links enqueued and not yet finished, `agent.ready` included. */
+  links: number;
+  /** Batches queued or being forwarded; bounded by `MAX_PENDING_TELEMETRY_BATCHES_PER_TAB`. */
+  pending: number;
+  /** Events of batches enqueued before start-up settled, not yet past it. */
+  heldEvents: number;
+}
+
+/** Why a lane dropped a batch it had accepted, before any send was attempted. */
+type TelemetryDropReason = 'unbound' | 'session-mismatch' | 'capture-mismatch';
+
+/** The page agent's `telemetry.batch` events, as the bridge port delivered them. */
+type BridgeTelemetryEvents = PageTelemetryBatchPayload['events'];
+
+/**
+ * One tab's burst of one kind of telemetry loss, shown at most once per
+ * {@link TELEMETRY_LOSS_NOTICE_INTERVAL_MS}. It ends when an interval passes
+ * with no further loss and its last notice reached a panel; until one has,
+ * it is kept, and shown again once a panel of the tab is connected.
+ */
+interface LossEpisode {
+  /** Events lost since the burst began, capped at the largest safe integer. */
+  total: number;
+  /** The total the last notice showed. */
+  shown: number;
+  /** The timer that ends the current interval. */
+  cooldown: number | undefined;
+  /**
+   * Whether the last notice reached at least one panel of the tab. `false`
+   * until its push has resolved, and after a push that found no panel.
+   */
+  seen: boolean;
+  /** How many notices of the burst were issued; orders their pushes' answers. */
+  notices: number;
+}
+
+/**
+ * The session and capture a telemetry batch belongs to, as far as they are
+ * known: the page agent's own stamp on the batch (context only — it can
+ * reject a batch, never route one), or what the lane verified before a send.
+ */
+interface TelemetryBatchContext {
+  /** The session the batch was produced for, when known. */
+  readonly sessionId: SessionId | undefined;
+  /** The capture the batch was produced for, when known. */
+  readonly captureId: PageTelemetryBatchPayload['captureId'];
+}
+
+/**
+ * A batch's overall delivery deadline: a signal the injected timers abort
+ * {@link TELEMETRY_ROUTE_WAIT_MS} after the batch arrived, and the release
+ * that clears the timer once the batch has settled.
+ */
+interface TelemetryDeadline {
+  /** Aborted when the deadline passes. */
+  readonly signal: AbortSignal;
+  /** Clear the deadline's timer; idempotent. */
+  readonly release: () => void;
+}
+
+/**
+ * One telemetry batch waiting on its tab's lane, with everything pinned when
+ * it **arrived**: its events, the page agent's own session and capture stamp,
+ * and its deadline. Nothing here is re-read from the page later.
+ */
+interface PendingTelemetryBatch {
+  /** The tab the batch came from — the bridge port's sender. */
+  readonly tabId: TabId;
+  /** The raw events, forwarded untouched. */
+  readonly events: PageTelemetryBatchPayload['events'];
+  /** Events the agent lost before this batch, for the log line after delivery. */
+  readonly droppedCount: number;
+  /** The page agent's session and capture stamp, pinned at arrival. */
+  readonly context: TelemetryBatchContext;
+  /** The batch's one overall deadline, started at arrival. */
+  readonly deadline: TelemetryDeadline;
+}
+
+/**
+ * The ids of the `source.open` frames this worker sent whose answer can still
+ * arrive, kept so the relay sink can recognise the service's refusal of one.
+ *
+ * The service answers a `source.open` its handler refuses with a `failed`
+ * `source.result`, which is relayed to no panel. Only a frame refused before
+ * the handler runs — payload validation, the sender's role, its tab's
+ * binding — is answered with an `error` frame, whose sentence quotes nothing
+ * from the request. That frame is session-less, and the port hub broadcasts a
+ * session-less relayed frame to every panel, whose session store would record
+ * it as its last failure — in another tab's panel too. The request itself
+ * settles on that frame, so the relay sink withholds it instead, and it can
+ * only do so while the id is here.
+ *
+ * So an id is **never evicted** while its answer can still arrive. It leaves
+ * only when:
+ *
+ * - its answer arrived — a `source.result`, or the `error` the relay sink
+ *   withholds;
+ * - its frame was never sent (the socket client refused it); or
+ * - the socket it was written to closed ({@link socketClosed}): the service
+ *   answers a frame on the connection it arrived on, so nothing can answer it
+ *   any more. A frame the client queued instead is written when the next
+ *   socket opens ({@link socketOpened}), and only then does that rule apply.
+ *
+ * The ledger is bounded by refusing, not by forgetting: {@link reserve}
+ * answers `false` once {@link SOURCE_OPEN_MAX_OUTSTANDING} ids await an
+ * answer, and the caller must then refuse the request **before** anything is
+ * sent (see {@link forwardSourceOpen}).
+ */
+export interface SourceOpenRefLedger {
+  /**
+   * Reserve an id for a `source.open` about to be sent, in the `queued` state
+   * (on no socket yet). `false` when the ledger is full — nothing was
+   * recorded, and the request must not be sent.
+   */
+  reserve(ref: string): boolean;
+  /**
+   * Record what the socket client did with the reserved frame: `'sent'` means
+   * it was written to the open socket; `'queued'` means it waits for the next
+   * one. An id not reserved is ignored.
+   */
+  sent(ref: string, outcome: SendOutcome): void;
+  /** Whether `ref` is the id of a sent `source.open` whose answer can still arrive. */
+  has(ref: string): boolean;
+  /** The answer to `ref` arrived, or its frame was never sent: forget it. */
+  forget(ref: string): void;
+  /**
+   * The socket client's queue is empty on an open socket: every queued frame
+   * has been written to it, so every queued id is now on that socket.
+   */
+  socketOpened(): void;
+  /**
+   * The socket closed: forget every id whose frame was written to it. Queued
+   * ids stay, since their frames go out on the next socket.
+   */
+  socketClosed(): void;
+  /** How many ids await an answer. */
+  readonly size: number;
+}
+
+/**
+ * How many `source.open` requests may await an answer at once. Answered ids
+ * leave at once, and ids on a closed socket with them, so the bound is reached
+ * only by that many clicks the service has not answered yet — far beyond what
+ * a developer clicks — and the request past it is refused before it is sent
+ * rather than displacing an id whose refusal could still arrive.
+ */
+export const SOURCE_OPEN_MAX_OUTSTANDING = 256;
+
+/**
+ * The failure a `source.open` is refused with, before anything is sent, while
+ * {@link SOURCE_OPEN_MAX_OUTSTANDING} requests await an answer.
+ */
+function sourceOpenSaturatedError(outstanding: number): DebuggenError {
+  return workerError(
+    'RATE_LIMITED',
+    'Too many source-open requests are still waiting for the local service to answer.',
+    {
+      hint: 'Wait a few seconds for the pending source links to open, then click again.',
+      details: { outstanding, limit: SOURCE_OPEN_MAX_OUTSTANDING },
+    },
+  );
+}
+
+/**
+ * Build a {@link SourceOpenRefLedger} holding at most `capacity` ids that
+ * await an answer. It never evicts one: past the bound, {@link
+ * SourceOpenRefLedger.reserve} refuses.
+ *
+ * @param capacity The number of ids kept; a value that is not a positive
+ * integer is replaced by {@link SOURCE_OPEN_MAX_OUTSTANDING}.
+ */
+export function createSourceOpenRefLedger(
+  capacity: number = SOURCE_OPEN_MAX_OUTSTANDING,
+): SourceOpenRefLedger {
+  const limit = Number.isInteger(capacity) && capacity > 0 ? capacity : SOURCE_OPEN_MAX_OUTSTANDING;
+  /** Each id with where its frame is: written to the open socket, or queued for the next. */
+  const refs = new Map<string, 'written' | 'queued'>();
+  return Object.freeze({
+    reserve(ref: string): boolean {
+      if (refs.has(ref)) {
+        // Ids are unique random values; a repeat is still one request.
+        return true;
+      }
+      if (refs.size >= limit) {
+        return false;
+      }
+      refs.set(ref, 'queued');
+      return true;
+    },
+    sent(ref: string, outcome: SendOutcome): void {
+      if (refs.has(ref)) {
+        refs.set(ref, outcome === 'sent' ? 'written' : 'queued');
+      }
+    },
+    has(ref: string): boolean {
+      return refs.has(ref);
+    },
+    forget(ref: string): void {
+      refs.delete(ref);
+    },
+    socketOpened(): void {
+      for (const ref of refs.keys()) {
+        refs.set(ref, 'written');
+      }
+    },
+    socketClosed(): void {
+      for (const [ref, where] of [...refs]) {
+        if (where === 'written') {
+          refs.delete(ref);
+        }
+      }
+    },
+    get size(): number {
+      return refs.size;
+    },
+  });
+}
+
+/** The two socket facts {@link createSourceOpenSocketTracker} reads. */
+export type SourceOpenSocketStatus = Pick<WsBridgeStatus, 'transport' | 'queuedFrameCount'>;
+
+/**
+ * Keep a {@link SourceOpenRefLedger} in step with the socket. The returned
+ * function is called at every status snapshot the socket bridge publishes —
+ * the bridge publishes on every transport change.
+ *
+ * When the socket stops being open, the ids written to it are forgotten: the
+ * service answers a frame on the connection it arrived on, so nothing can
+ * answer them any more. When it opens, the ids whose frames were queued are
+ * moved onto it once the socket client's queue has drained — checked at once
+ * and again on the next task, since the client flushes its queue as the
+ * socket opens. Until then they stay queued, which only keeps them longer.
+ *
+ * @param refs The worker's ledger of `source.open` ids awaiting an answer.
+ * @param status The socket's current state and queue length, or `undefined`
+ * before the bridge exists or after the worker was disposed.
+ * @param timers Schedules the next-task check.
+ * @param logger Where a close's forgotten count is logged — counts only.
+ * @returns The observer to call at every published status snapshot.
+ */
+export function createSourceOpenSocketTracker(
+  refs: SourceOpenRefLedger,
+  status: () => SourceOpenSocketStatus | undefined,
+  timers: WorkerTimerApi,
+  logger: Logger = noopLogger,
+): () => void {
+  let wasOpen = false;
+
+  /** Move the queued ids onto the open socket once its queue is empty. */
+  const promoteQueued = (): void => {
+    const current = status();
+    if (current !== undefined && current.transport === 'open' && current.queuedFrameCount === 0) {
+      refs.socketOpened();
+    }
+  };
+
+  return () => {
+    const current = status();
+    if (current === undefined) {
+      return;
+    }
+    const open = current.transport === 'open';
+    if (open) {
+      promoteQueued();
+      if (!wasOpen) {
+        timers.setTimeout(promoteQueued, 0);
+      }
+    } else if (wasOpen) {
+      const before = refs.size;
+      refs.socketClosed();
+      logger.debug('Forgot the source-open ids written to a closed socket.', {
+        forgotten: before - refs.size,
+        outstanding: refs.size,
+      });
+    }
+    wasOpen = open;
+  };
+}
+
+/**
+ * Whether a relayed frame is the service's `error` refusal of a `source.open`
+ * this worker sent — one the relay sink withholds from the panels, because the
+ * request it refuses already carries it to the panel (see
+ * {@link SourceOpenRefLedger}). Every other frame, including an `error` with no
+ * `ref` or with another request's, is relayed as before.
+ *
+ * @param message A frame the socket bridge is about to relay.
+ * @param refs The worker's ledger of sent `source.open` ids.
+ */
+export function isAnsweredSourceOpenRefusal(
+  message: RelayedProtocolMessage,
+  refs: Pick<SourceOpenRefLedger, 'has'>,
+): boolean {
+  if (message.type !== 'error') {
+    return false;
+  }
+  const { ref } = message.payload;
+  return ref !== undefined && refs.has(ref);
+}
+
+/**
+ * Wrap the socket bridge's relay sink so the service's `error` refusal of a
+ * sent `source.open` never reaches the panels: it is withheld, and its id
+ * forgotten, since that frame is the request's answer. Every other frame goes
+ * to `relay` unchanged, in order.
+ *
+ * @param refs The worker's ledger of unanswered `source.open` ids.
+ * @param relay The sink every other frame goes to (the port hub's `relayPush`).
+ * @param logger Where a withheld frame is logged — its type and code only.
+ * @returns A {@link RelayPush} for `createWsBridge`.
+ */
+export function createSourceOpenRelayFilter(
+  refs: SourceOpenRefLedger,
+  relay: RelayPush,
+  logger: Logger = noopLogger,
+): RelayPush {
+  return (message, tabId) => {
+    if (message.type === 'error' && isAnsweredSourceOpenRefusal(message, refs)) {
+      const { ref, code } = message.payload;
+      if (ref !== undefined) {
+        refs.forget(ref);
+      }
+      logger.debug('Withheld a source-open refusal from the panels; its request answers it.', {
+        type: message.type,
+        errorCode: code,
+      });
+      return;
+    }
+    relay(message, tabId);
+  };
+}
+
+/**
+ * The `source.open` port answer: `ok({ forwarded })` or a typed failure.
+ *
+ * `forwarded: true` — the editor confirmed it opened the location.
+ * `forwarded: false` — no VS Code window is connected; the panel hands the
+ * location to the editor-open URI instead.
+ */
+export type SourceOpenForwardResult = Result<PortResponsePayloads['source.open'], DebuggenError>;
+
+/** The failure reason recorded (in `details.reason`) when no answer arrived in time. */
+export const SOURCE_OPEN_TIMEOUT_REASON = 'source-open-timeout';
+
+/** The failure reason recorded when the panel's request was cancelled first. */
+export const SOURCE_OPEN_ABORTED_REASON = 'source-open-aborted';
+
+/** The failure for a request whose deadline passed with no correlated answer. */
+function sourceOpenTimeoutError(ref: string, timeoutMs: number): DebuggenError {
+  return workerError(
+    'TRANSPORT_DISCONNECTED',
+    'The local Debug Generator service did not answer the source-open request in time.',
+    {
+      hint: 'Check that the local service is running and VS Code is connected to it, then click the source link again.',
+      details: { reason: SOURCE_OPEN_TIMEOUT_REASON, ref, timeoutMs },
+    },
+  );
+}
+
+/**
+ * The failure for a request the port hub cancelled — the panel disconnected, or
+ * the hub's own request ceiling passed. The hub answers (or drops) the port
+ * request itself in both cases, so this value only ends the wait.
+ */
+function sourceOpenAbortedError(ref: string, reason: unknown): DebuggenError {
+  return workerError(
+    'TRANSPORT_DISCONNECTED',
+    'The source-open request was cancelled before the local service answered.',
+    { details: { reason: SOURCE_OPEN_ABORTED_REASON, ref }, cause: reason },
+  );
+}
+
+/**
+ * The sentence a `failed` `source.result` reaches the panel with. The
+ * service's own sentence and hint are not forwarded: a refusal's text can
+ * quote the refused path, and the panel chooses what to show from the code
+ * alone (`../panel/actions.ts`), so nothing past the code is needed there.
+ */
+export const SOURCE_OPEN_FAILED_MESSAGE =
+  'The local Debug Generator service could not open the source location.';
+
+/** The sentence a correlated `error` refusal reaches the panel with, for the same reason. */
+export const SOURCE_OPEN_REFUSED_MESSAGE =
+  'The local Debug Generator service refused the source-open request.';
+
+/**
+ * Map the service's `source.result` onto the port answer.
+ *
+ * A failure keeps the service's code from the closed vocabulary, with the
+ * request's `ref` in `details`, and carries {@link SOURCE_OPEN_FAILED_MESSAGE}
+ * in place of the service's sentence and hint (see there).
+ */
+function sourceResultOutcome(result: SourceResultPayload, log: Logger): SourceOpenForwardResult {
+  const fields = { sessionId: result.sessionId, ref: result.ref, status: result.status };
+  switch (result.status) {
+    case 'opened':
+      log.info('The editor opened a source location.', fields);
+      return ok({ forwarded: true });
+    case 'no-editor':
+      log.info('No editor is connected; the panel falls back to the editor-open URI.', fields);
+      return ok({ forwarded: false });
+    case 'failed': {
+      const { code } = result.error;
+      log.warn('A source-open request failed.', { ...fields, errorCode: code });
+      return err(workerError(code, SOURCE_OPEN_FAILED_MESSAGE, { details: { ref: result.ref } }));
+    }
+  }
+}
+
+/**
+ * Forward a panel's `source.open` to the local service and wait for the answer
+ * that belongs to it.
+ *
+ * The sequence, in the order that makes it race-free:
+ *
+ * 1. Mint the frame id. A request already cancelled is answered at once and
+ *    nothing is sent. Reserve the id in `deps.refs` next: while
+ *    {@link SOURCE_OPEN_MAX_OUTSTANDING} requests await an answer the ledger
+ *    refuses, and the request is answered `RATE_LIMITED` **before** anything
+ *    is sent — never by displacing an id whose refusal could still arrive.
+ * 2. Subscribe to `source.result` and `error` **before** sending, so an answer
+ *    cannot arrive between the send and the subscription. Only a frame whose
+ *    `payload.ref` equals the id is considered; a `source.result` must also
+ *    name the request's session, and one naming another is ignored (and
+ *    logged) rather than settling someone else's click.
+ * 3. Send `source.open` with that id, and record in `deps.refs` whether the
+ *    socket client wrote it or queued it for the next socket. The
+ *    payload is forwarded unmodified: the service validates the location
+ *    against the session's project root, and VS Code validates it again (AAP
+ *    §0.4.2). A send the socket client refuses — it is closed, or not yet
+ *    connected — is answered with its own failure.
+ * 4. Settle on the first of: the correlated `source.result`, the correlated
+ *    `error` frame, the deadline, or `signal` aborting. A settle-once latch
+ *    makes every later arrival a no-op, and every exit path removes both
+ *    subscriptions, the abort listener and the timer. The id leaves
+ *    `deps.refs` when a `source.result` answers it or the send failed; after
+ *    a deadline or a cancellation it stays, because its answer may still
+ *    arrive, and a correlated `error` is forgotten by the relay sink that
+ *    withholds it. The worker forgets the ids written to a socket once that
+ *    socket closes, since nothing can answer them any more
+ *    ({@link SourceOpenRefLedger.socketClosed}).
+ *
+ * Never rejects: an unexpected throw from an injected dependency is answered
+ * as an `INTERNAL` failure, after the same clean-up. Logs carry the session
+ * id, the `ref`, the status and the error code — never the location.
+ *
+ * @example
+ * ```ts
+ * const answer = await forwardSourceOpen(
+ *   { send: wsBridge.send, subscribe: wsBridge.subscribe, timers, logger: log },
+ *   { sessionId, location },
+ *   context.signal,
+ * );
+ * // ok({ forwarded: true }) — opened; ok({ forwarded: false }) — no editor.
+ * ```
+ *
+ * @param deps The socket's send and subscribe, the timers, and optional id
+ * source, deadline, logger and outstanding-id ledger.
+ * @param payload The panel's `source.open` payload, forwarded as it is.
+ * @param signal Aborts the wait when the port hub cancels the panel's request.
+ * @returns The port answer; see {@link SourceOpenForwardResult}.
+ */
+export function forwardSourceOpen(
+  deps: SourceOpenForwardDeps,
+  payload: MessagePayload<'source.open'>,
+  signal?: AbortSignal,
+): Promise<SourceOpenForwardResult> {
+  const log = deps.logger ?? noopLogger;
+  const { sessionId } = payload;
+  const timeoutMs =
+    deps.timeoutMs !== undefined && Number.isFinite(deps.timeoutMs) && deps.timeoutMs > 0
+      ? deps.timeoutMs
+      : SOURCE_OPEN_RESULT_TIMEOUT_MS;
+  const id = (deps.newId ?? newMessageId)();
+
+  if (signal?.aborted === true) {
+    log.debug('A source-open request was cancelled before it was sent.', { sessionId, ref: id });
+    return Promise.resolve(err(sourceOpenAbortedError(id, signal.reason)));
+  }
+
+  // Reserved before the listeners and the send, so a refusal the transport
+  // delivers synchronously is already recognised by the relay sink — and so a
+  // full ledger refuses this request before anything reaches the service.
+  if (deps.refs !== undefined && !deps.refs.reserve(id)) {
+    const outstanding = deps.refs.size;
+    log.warn('A source-open request was refused: too many await an answer.', {
+      sessionId,
+      ref: id,
+      errorCode: 'RATE_LIMITED',
+      outstanding,
+    });
+    return Promise.resolve(err(sourceOpenSaturatedError(outstanding)));
+  }
+
+  return new Promise<SourceOpenForwardResult>((resolve) => {
+    // One mutable record rather than separate `let`s: the timer handle is
+    // written after the closures below exist, and a timer API that fires
+    // synchronously must still find the latch closed. `handedOver` records
+    // whether `send` was reached, which decides whether the id may be
+    // forgotten when something throws.
+    const latch: { settled: boolean; timer: number | undefined; handedOver: boolean } = {
+      settled: false,
+      timer: undefined,
+      handedOver: false,
+    };
+    const releases: (() => void)[] = [];
+
+    /** Answer once, releasing every listener and the timer first. */
+    const settle = (outcome: SourceOpenForwardResult): void => {
+      if (latch.settled) {
+        return;
+      }
+      latch.settled = true;
+      if (latch.timer !== undefined) {
+        deps.timers.clearTimeout(latch.timer);
+        latch.timer = undefined;
+      }
+      for (const release of releases.splice(0)) {
+        try {
+          release();
+        } catch (cause: unknown) {
+          log.warn('Releasing a source-open listener failed.', {
+            ref: id,
+            error: errorName(cause),
+          });
+        }
+      }
+      resolve(outcome);
+    };
+
+    try {
+      releases.push(
+        deps.subscribe(MESSAGE_TYPE.SOURCE_RESULT, (message) => {
+          const result = message.payload;
+          if (result.ref !== id) {
+            return;
+          }
+          if (result.sessionId !== sessionId) {
+            log.warn('A source.result for this request named another session; it was ignored.', {
+              sessionId,
+              ref: id,
+            });
+            return;
+          }
+          // A `source.result` is relayed to no panel, so its id can go now.
+          deps.refs?.forget(id);
+          settle(sourceResultOutcome(result, log));
+        }),
+        deps.subscribe(MESSAGE_TYPE.ERROR, (message) => {
+          const refusal = message.payload;
+          if (refusal.ref !== id) {
+            return;
+          }
+          log.warn('The local service refused a source-open request.', {
+            sessionId,
+            ref: id,
+            errorCode: refusal.code,
+          });
+          settle(
+            err(workerError(refusal.code, SOURCE_OPEN_REFUSED_MESSAGE, { details: { ref: id } })),
+          );
+        }),
+      );
+
+      if (signal !== undefined) {
+        const onAbort = (): void => {
+          log.debug('A source-open request was cancelled while waiting for its answer.', {
+            sessionId,
+            ref: id,
+          });
+          settle(err(sourceOpenAbortedError(id, signal.reason)));
+        };
+        signal.addEventListener('abort', onAbort, { once: true });
+        releases.push(() => {
+          signal.removeEventListener('abort', onAbort);
+        });
+      }
+
+      latch.handedOver = true;
+      const sent: Result<SendOutcome, DebuggenError> = deps.send(
+        MESSAGE_TYPE.SOURCE_OPEN,
+        payload,
+        deps.tabId === undefined ? { id } : { id, tabId: deps.tabId },
+      );
+      if (!sent.ok) {
+        log.warn('A source.open request could not be forwarded.', {
+          sessionId,
+          ref: id,
+          errorCode: sent.error.code,
+        });
+        // Never sent, so never answered.
+        deps.refs?.forget(id);
+        settle(err(sent.error));
+        return;
+      }
+      // Written to the open socket, or queued for the next one: which decides
+      // when a closed socket makes the id unanswerable.
+      deps.refs?.sent(id, sent.value);
+      if (latch.settled) {
+        // Answered while the frame was being handed over.
+        return;
+      }
+      log.debug('A source.open request was forwarded; waiting for its result.', {
+        sessionId,
+        ref: id,
+        outcome: sent.value,
+      });
+      const handle = deps.timers.setTimeout(() => {
+        log.warn('A source-open request received no answer in time.', {
+          sessionId,
+          ref: id,
+          errorCode: 'TRANSPORT_DISCONNECTED',
+          timeoutMs,
+        });
+        settle(err(sourceOpenTimeoutError(id, timeoutMs)));
+      }, timeoutMs);
+      if (latch.settled) {
+        deps.timers.clearTimeout(handle);
+      } else {
+        latch.timer = handle;
+      }
+    } catch (cause: unknown) {
+      log.error('Forwarding a source-open request failed unexpectedly.', {
+        sessionId,
+        ref: id,
+        error: errorName(cause),
+      });
+      if (!latch.handedOver) {
+        // Nothing was sent, so nothing can answer it. Once `send` was reached
+        // the frame may have gone out, so the id stays until its socket closes.
+        deps.refs?.forget(id);
+      }
+      settle(
+        err(
+          DebuggenError.is(cause)
+            ? cause
+            : workerError('INTERNAL', 'The worker could not forward the source-open request.', {
+                details: { ref: id },
+                cause,
+              }),
+        ),
+      );
+    }
+  });
 }
 
 /*
@@ -469,12 +1954,6 @@ interface BindTarget {
   readonly origin: string;
 }
 
-/** The last URL and load status seen for one tab, to de-duplicate navigation reports. */
-interface NavigationMemo {
-  readonly url: string | undefined;
-  readonly status: string | undefined;
-}
-
 /** The parts of a bound session the panel renders from, as far as they exist. */
 interface SessionDetails {
   readonly session?: SessionRecord;
@@ -482,8 +1961,65 @@ interface SessionDetails {
   readonly analysis?: AnalysisResult;
 }
 
+/**
+ * The {@link SessionDetails} one read produced, and the first failure among
+ * its reads — kept apart so a snapshot answer spreads the details only.
+ */
+interface SessionDetailsRead {
+  readonly details: SessionDetails;
+  readonly failure: DebuggenError | undefined;
+}
+
 /** The protocol push that carries a relayed envelope. */
 type ProtocolPush = Extract<PortPush, { readonly kind: 'protocol' }>;
+
+/**
+ * How one selection was settled.
+ *
+ * - `accepted` — the descriptor is the session's recorded target: it already
+ *   was before anything was sent (`via: 'already-recorded'`, and no frame was
+ *   sent), or the service recorded it — observed as the matching
+ *   `session.updated` (`via: 'session.updated'`), or read back from the stored
+ *   session after nothing answered (`via: 'verified'`).
+ * - `refused` — the service answered with an `error` whose `ref` is the frame's
+ *   id; `error` carries the service's code and message.
+ * - `unconfirmed` — no verdict arrived and the stored session does not carry
+ *   the descriptor: the frame was lost, the socket did not open before the
+ *   delivery deadline (and the frame was never sent), or the request was
+ *   abandoned.
+ * - `unsent` — the socket is closed rather than reconnecting, or the socket
+ *   client refused the frame outright.
+ */
+type SelectionVerdict =
+  | {
+      readonly kind: 'accepted';
+      readonly via: 'already-recorded' | 'session.updated' | 'verified';
+    }
+  | { readonly kind: 'refused'; readonly error: DebuggenError }
+  | { readonly kind: 'unconfirmed'; readonly error: DebuggenError }
+  | { readonly kind: 'unsent'; readonly error: DebuggenError };
+
+/** What ended the wait for a verdict frame: one of the two answers, or neither. */
+type SelectionAnswer =
+  | { readonly kind: 'accepted' }
+  | { readonly kind: 'refused'; readonly payload: ErrorPayload }
+  | { readonly kind: 'timeout' }
+  | { readonly kind: 'aborted' };
+
+/**
+ * What ended a held selection's wait for an open socket: the socket opened,
+ * it closed for good (no reconnect is coming), the delivery deadline passed,
+ * or the panel that asked went away.
+ */
+type TransportWait = 'open' | 'closed' | 'timeout' | 'aborted';
+
+/** A one-shot timer on the injected timers, observed as a promise. */
+interface Countdown {
+  /** Fulfils when the timer fires; never settles once {@link Countdown.cancel} ran first. */
+  readonly elapsed: Promise<undefined>;
+  /** Release the timer if it has not fired. Idempotent. */
+  readonly cancel: () => void;
+}
 
 /**
  * Compose the worker: construct every background module once, wire them to
@@ -506,6 +2042,11 @@ type ProtocolPush = Extract<PortPush, { readonly kind: 'protocol' }>;
 export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
   const rootLogger = env.logger ?? createConsoleLogger({ name: 'extension', level: 'info' });
   const log = rootLogger.child({ component: 'service-worker' });
+  /**
+   * The service address used when none is stored: the environment's, else
+   * `DEFAULT_SERVICE_BASE_URL`. A stored setting (`SERVICE_ENDPOINT_STORAGE_KEY`,
+   * written by the pairing dialog) takes precedence over both.
+   */
   const serviceBaseUrl = env.serviceBaseUrl ?? DEFAULT_SERVICE_BASE_URL;
   const { runtime, tabs, alarms, storage, timers } = env;
 
@@ -517,14 +2058,51 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
   const announcedTabs = new Map<TabId, BindTarget>();
   /** The last URL and load status seen per tab. */
   const navigationMemo = new Map<TabId, NavigationMemo>();
-  /** A synchronous mirror of the bound tabs, for `primaryTabId`. */
-  const boundTabs = new Set<TabId>();
+  /**
+   * Panel connections that asked for a `session.snapshot` without naming an
+   * inspected tab and are still unassociated: the only panels a DevTools page
+   * announced later may adopt ({@link adoptWaitingPanel}). A panel that has
+   * not asked yet is never among them — it may still name its own tab. An id
+   * leaves the set when its panel is associated or disconnects.
+   */
+  const untabbedPanels = new Set<WorkerConnectionId>();
   /** Undo actions for every listener and subscription, run by `dispose`. */
   const teardown: (() => void)[] = [];
-  /** The tab of the most recent `devtools.hello`. */
-  let lastDevtoolsTab: TabId | undefined;
+  /**
+   * Each tab's ordered lane of page agent frames — see `inTabOrder` — present
+   * only while it has a frame pending.
+   */
+  const telemetryLanes = new Map<TabId, TelemetryLane>();
+  /**
+   * Each tab's latest `agent.ready` still waiting in its lane, until it has
+   * recorded the document's readiness. A `target.described` waits for it, so
+   * a pick that follows its own document's report is compared with the memo
+   * that report writes — not with the previous document's, which the lane
+   * (queued behind that tab's earlier batches) may not have replaced yet.
+   */
+  const readinessInFlight = new Map<TabId, Promise<void>>();
+  /** Per tab and loss kind: the burst being shown — see `recordTelemetryLoss`. */
+  const lossEpisodes = new Map<TabId, Map<TelemetryLossKind, LossEpisode>>();
+  /** Whether `ready` has settled; until then telemetry is held within a bound. */
+  let coldStartSettled = false;
+  /** Batches dropped since start because their tab's lane was full. */
+  let telemetryOverflowCount = 0;
+  /** Batches accepted onto a lane since start and then not delivered. */
+  let telemetryLossCount = 0;
+  /**
+   * The checks of the selections held for an open socket, run on every status
+   * the bridge publishes — the transport opening is always one of them.
+   */
+  const transportWatchers = new Set<() => void>();
   /** The pill status last published, to detect the transition to `connected`. */
   let lastPublishedStatus: WorkerStatusSnapshot['status'] | undefined;
+  /** The `source.open` ids this generation sent whose answer can still arrive. */
+  const sourceOpenRefs: SourceOpenRefLedger = createSourceOpenRefLedger();
+  /**
+   * The socket bridge, once constructed: read by the ledger's socket tracking,
+   * which the bridge can call into while it is still being constructed.
+   */
+  const socketHolder: { bridge: WsBridge | undefined } = { bridge: undefined };
   let disposed = false;
 
   /**
@@ -541,16 +2119,66 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
   // The shared HTTP client and the credential store
   // -------------------------------------------------------------------------
 
-  // One client for the whole worker. Its token delegates to the credential
-  // store, and the store redeems pairing codes through the client: a mutual
-  // reference, resolved with thunks that are dereferenced only inside calls,
-  // by which time both constants exist. Sharing the one instance is what makes
-  // the store's post-pairing `setToken` reach every call `ws-bridge.ts` makes.
-  const httpClient = new HttpClient({
-    baseUrl: serviceBaseUrl,
-    token: () => store.getToken(),
-    logger: rootLogger.child({ component: 'http-client' }),
+  /**
+   * One client for the whole worker at a time, for the service address in
+   * force. Its token delegates to the credential store, and the store redeems
+   * pairing codes through the client: a mutual reference, resolved with thunks
+   * that are dereferenced only inside calls, by which time both exist. Every
+   * consumer — the store, `ws-bridge.ts`, {@link DebugGeneratorWorker.httpClient}
+   * — reads it through a thunk, so the store's post-pairing `setToken` reaches
+   * every call, and a changed address ({@link applyServiceEndpoint}) replaces
+   * the client for every caller at once. A rebuilt client authenticates the
+   * same way: its token is the same delegation to the store.
+   */
+  function buildHttpClient(baseUrl: string): HttpClient {
+    return new HttpClient({
+      baseUrl,
+      token: () => store.getToken(),
+      logger: rootLogger.child({ component: 'http-client' }),
+      defaultTimeoutMs: SERVICE_REQUEST_TIMEOUT_MS,
+    });
+  }
+
+  let httpClient = buildHttpClient(serviceBaseUrl);
+
+  /**
+   * The service address in force: the configured one, or why it was refused.
+   * Starts as the environment's (or the default) and follows the stored
+   * setting from {@link start} on ({@link loadServiceEndpoint}).
+   */
+  let serviceEndpoint: Result<string, DebuggenError> = ok(serviceBaseUrl);
+  /**
+   * Bumped whenever a storage change is applied, so a storage read that
+   * started before it and lands after it is discarded rather than applied over
+   * the fresher value.
+   */
+  let serviceEndpointChanges = 0;
+  /**
+   * Whether the stored setting has been observed at least once — read
+   * successfully (a value, a refused value, or none stored) or delivered by a
+   * storage change. Until it has, the address in force is not trusted: a failed
+   * read puts a refusal in force instead of the environment's or the default
+   * address (AAP §0.5.6 — the credential and a pairing code go only to the
+   * service the developer chose). Once it has, a later transient read failure
+   * keeps the address the setting established.
+   */
+  let serviceEndpointVerified = false;
+  /**
+   * Opens {@link serviceEndpointSettled}; replaced by the promise's resolver
+   * below, and called once, by {@link establishServiceEndpoint}.
+   */
+  let openServiceEndpointGate: () => void = () => undefined;
+  /**
+   * The bridge's gate (`WsBridgeDeps.serviceEndpointSettled`): settles
+   * once the first read of the stored setting has been applied, whatever its
+   * outcome. Until then no socket opens and no HTTP call — authenticated or
+   * a pairing redemption — is issued at the provisional address.
+   */
+  const serviceEndpointSettled = new Promise<void>((resolve) => {
+    openServiceEndpointGate = resolve;
   });
+  /** The one run of {@link establishServiceEndpoint}, once it has started. */
+  let serviceEndpointEstablishment: Promise<void> | undefined;
 
   const store = createDevtoolsCredentialStore({
     storage: storage.local,
@@ -564,44 +2192,457 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
   // -------------------------------------------------------------------------
 
   /**
-   * Refuse a request whose panel inspects a tab bound to a different session
-   * than the one it names. A panel whose tab is not bound (or not known) is
-   * forwarded as it is: the service authorizes every devtools request against
-   * the session bound to the requesting credential's tab (AAP §0.5.6), so this
-   * is a consistency check, not the boundary.
+   * The inspected tab of the panel behind a request: the tab its connection
+   * was associated with, read live, because an association made while the
+   * request was in flight (its DevTools page announcing itself) counts. A
+   * panel's tab never changes once set, so reading it late cannot move it.
+   */
+  function inspectedTabOf(context: PortRequestContext): TabId | undefined {
+    if (context.tabId !== undefined) {
+      return context.tabId;
+    }
+    const connection = hub.getConnection(context.connectionId);
+    return connection !== undefined && isPanelConnection(connection) ? connection.tabId : undefined;
+  }
+
+  /**
+   * The scope rule every session-naming panel request passes before the
+   * worker acts for it with the devtools credential: a panel may act only for
+   * the session bound to the tab it inspects — the rule the service applies
+   * to the devtools role (AAP §0.5.6: capture, targets, panel data and
+   * `source.open` "only for the session bound to that tab").
+   *
+   * Refused with `TAB_NOT_BOUND` when the panel is not associated with an
+   * inspected tab yet, when that tab is bound to no session or to another
+   * session, or when the named session is bound to another tab. A session
+   * bound to no tab at all (ended, or its tab left) is refused as well: the
+   * service would refuse the devtools credential for it, and refusing here
+   * keeps a panel holding a stale session from acting on it.
+   *
+   * @returns The panel's inspected tab, to which the named session is bound.
    */
   async function checkPanelScope(
     sessionId: SessionId,
     context: PortRequestContext,
-  ): Promise<Result<SessionId, DebuggenError>> {
-    if (context.tabId === undefined) {
-      return ok(sessionId);
-    }
-    const binding = await registry.getBinding(context.tabId);
-    if (binding !== undefined && binding.sessionId !== sessionId) {
+  ): Promise<Result<TabId, DebuggenError>> {
+    const tabId = inspectedTabOf(context);
+    if (tabId === undefined) {
+      log.debug('A session request from a panel with no inspected tab was refused.', {
+        sessionId,
+      });
       return err(
-        workerError('TAB_NOT_BOUND', 'The inspected tab is bound to a different session.', {
-          hint: 'Reopen the Debug Generator panel so it picks up the current session.',
+        workerError('TAB_NOT_BOUND', 'This panel is not associated with an inspected tab yet.', {
+          hint: 'Open the Debug Generator panel from DevTools on the application tab.',
         }),
       );
     }
-    return ok(sessionId);
+    const [binding, sessionTab] = await Promise.all([
+      registry.getBinding(tabId),
+      registry.getTabForSession(sessionId),
+    ]);
+    if (binding?.sessionId === sessionId && sessionTab === tabId) {
+      return ok(tabId);
+    }
+    log.debug('A session request outside the panel tab scope was refused.', {
+      tabId,
+      sessionId,
+      boundSessionId: binding?.sessionId,
+      sessionTabId: sessionTab,
+    });
+    const message =
+      binding === undefined
+        ? 'The inspected tab is not bound to a session.'
+        : binding.sessionId !== sessionId
+          ? 'The inspected tab is bound to a different session.'
+          : 'The session is bound to another tab.';
+    return err(
+      workerError('TAB_NOT_BOUND', message, {
+        hint: 'Reopen the Debug Generator panel so it picks up the current session.',
+      }),
+    );
   }
 
-  /** The tab bound to a session, when it is the requesting panel's tab (or the panel names none). */
-  async function resolveSessionTab(
+  /**
+   * The tab a `target.pick` for a session reaches: the panel's inspected tab,
+   * under exactly the scope rule of {@link checkPanelScope}.
+   */
+  function resolveSessionTab(
     sessionId: SessionId,
     context: PortRequestContext,
   ): Promise<Result<TabId, DebuggenError>> {
-    const tabId = await registry.getTabForSession(sessionId);
-    if (tabId === undefined || (context.tabId !== undefined && context.tabId !== tabId)) {
-      return err(
-        workerError('TAB_NOT_BOUND', 'No inspected tab is bound to this session.', {
-          hint: 'Open DevTools on the application tab of this session.',
-        }),
-      );
+    return checkPanelScope(sessionId, context);
+  }
+
+  // -------------------------------------------------------------------------
+  // Element selection: the verdict on `target.selected`, and arming the picker
+  // -------------------------------------------------------------------------
+
+  /** The failure a selection nothing settled is reported with. */
+  function selectionUnconfirmed(): DebuggenError {
+    return workerError('TRANSPORT_DISCONNECTED', SELECTION_UNCONFIRMED_MESSAGE, {
+      hint: SELECTION_UNCONFIRMED_HINT,
+    });
+  }
+
+  /** The failure a selection held for a closed (not reconnecting) socket is reported with. */
+  function selectionUnsent(): DebuggenError {
+    return workerError('TRANSPORT_DISCONNECTED', SELECTION_UNSENT_MESSAGE, {
+      hint: SELECTION_UNSENT_HINT,
+    });
+  }
+
+  /**
+   * Start a one-shot timer on the injected timers. A cancelled countdown's
+   * promise never settles, and is released with its last reference.
+   */
+  function countdown(ms: number): Countdown {
+    const fired = deferred<undefined>();
+    const handle = timers.setTimeout(() => {
+      fired.resolve(undefined);
+    }, ms);
+    return {
+      elapsed: fired.promise,
+      cancel: () => {
+        timers.clearTimeout(handle);
+      },
+    };
+  }
+
+  /**
+   * The socket state a held selection acts on: `open` (send it now), `closed`
+   * (no reconnect is coming, so give up), or `undefined` while it is still
+   * connecting or reconnecting (keep holding).
+   */
+  function settledTransport(): 'open' | 'closed' | undefined {
+    const { transport } = wsBridge.getStatus();
+    return transport === 'open' || transport === 'closed' ? transport : undefined;
+  }
+
+  /**
+   * Hold a selection in the worker until the socket is open, without handing
+   * anything to the socket client — whose outbound queue would flush the frame
+   * on the next open, however long after its failure was reported.
+   *
+   * Woken by {@link publishStatus}: the bridge publishes a fresh status on every
+   * transport transition, the opening included, and it does so from the socket
+   * client's state hook, before that client flushes its own queue. The waiter
+   * resumes on a later microtask, so a frame sent on `open` is written directly
+   * rather than queued behind the flush.
+   *
+   * @param deadline The selection's delivery deadline.
+   * @param signal Aborted when the panel that asked is gone.
+   * @returns What ended the hold; `open` at once when the socket already is.
+   */
+  async function waitForOpenTransport(
+    deadline: Promise<undefined>,
+    signal: AbortSignal | undefined,
+  ): Promise<TransportWait> {
+    const current = settledTransport();
+    if (current !== undefined) {
+      return current;
     }
-    return ok(tabId);
+    if (signal?.aborted === true) {
+      return 'aborted';
+    }
+    const outcome = deferred<TransportWait>();
+    const watch = (): void => {
+      const state = settledTransport();
+      if (state !== undefined) {
+        outcome.resolve(state);
+      }
+    };
+    const onAbort = (): void => {
+      outcome.resolve('aborted');
+    };
+    transportWatchers.add(watch);
+    signal?.addEventListener('abort', onAbort, { once: true });
+    void deadline.then(() => {
+      outcome.resolve('timeout');
+    });
+    try {
+      return await outcome.promise;
+    } finally {
+      transportWatchers.delete(watch);
+      signal?.removeEventListener('abort', onAbort);
+    }
+  }
+
+  /** The verdict one answer stands for; a timeout or an abort settles nothing. */
+  function verdictOf(answer: SelectionAnswer): SelectionVerdict {
+    switch (answer.kind) {
+      case 'accepted':
+        return { kind: 'accepted', via: 'session.updated' };
+      case 'refused':
+        // The service's own code and message, so the panel reports the reason
+        // it was refused (`TAB_NOT_BOUND` for a foreign or stale selection).
+        return {
+          kind: 'refused',
+          error: new DebuggenError(answer.payload.code, answer.payload.message),
+        };
+      case 'timeout':
+      case 'aborted':
+        return { kind: 'unconfirmed', error: selectionUnconfirmed() };
+    }
+  }
+
+  /**
+   * Decide a selection no verdict frame answered by reading the session back:
+   * accepted when the stored target is the descriptor that was sent, otherwise
+   * unconfirmed — the frame was lost, or the service could not be asked.
+   */
+  async function verifySelection(
+    sessionId: SessionId,
+    target: SelectedTarget,
+    tabId: TabId,
+    signal: AbortSignal | undefined,
+  ): Promise<SelectionVerdict> {
+    const stored = await wsBridge.getSession(sessionId, {
+      signal,
+      tabId,
+      timeoutMs: SELECTION_VERDICT_TIMEOUTS.verifyMs,
+    });
+    if (stored.ok && sameSelectedTarget(stored.value.target, target)) {
+      return { kind: 'accepted', via: 'verified' };
+    }
+    log.debug('An unanswered selection is not the stored target.', {
+      sessionId,
+      errorCode: errorCode(stored),
+    });
+    return { kind: 'unconfirmed', error: selectionUnconfirmed() };
+  }
+
+  /**
+   * Settle one selection and resolve with the verdict — never on a send alone,
+   * because a sent frame is pending until the service settles it
+   * (`@debuggen/protocol`, `messages/target.ts`). Three steps, bounded as
+   * {@link SELECTION_VERDICT_TIMEOUTS} documents:
+   *
+   * 1. **Is it already the target?** The session is read once. When its
+   *    recorded target already satisfies `sameSelectedTarget` with the
+   *    descriptor, nothing would change, and no later `session.updated` or
+   *    read-back could tell a recorded frame from a lost one — so the answer is
+   *    accepted (`via: 'already-recorded'`) and **nothing is sent**. Otherwise
+   *    a later equal target is evidence of this change.
+   * 2. **Hold until the socket is open.** A selection is never handed to the
+   *    socket client's outbound queue, which would flush it on the next open —
+   *    after this worker reported its failure and the panel withdrew the pick.
+   *    While the socket reconnects the selection waits here, still pending,
+   *    until it opens or the delivery deadline passes; at the deadline it is
+   *    answered unconfirmed without ever having been sent. A closed socket
+   *    (not paired, credential refused) has no reconnect coming and is
+   *    answered unsent at once.
+   * 3. **Send and wait for the verdict** — {@link sendAndAwaitVerdict}.
+   *
+   * Every subscription, timer and abort listener is released before this
+   * resolves. Never rejects; nothing about the descriptor is logged.
+   *
+   * @param payload The selection, exactly as it is sent.
+   * @param tabId The inspected tab the selection acts for: every read and the
+   *   frame carry it (`x-debuggen-tab`, the envelope's `tabId`).
+   * @param signal Aborted when the panel that asked is gone.
+   * @returns The verdict.
+   */
+  async function sendSelectedTarget(
+    payload: MessagePayload<'target.selected'>,
+    tabId: TabId,
+    signal?: AbortSignal,
+  ): Promise<SelectionVerdict> {
+    const { sessionId, target } = payload;
+
+    const recorded = await wsBridge.getSession(sessionId, {
+      signal,
+      tabId,
+      timeoutMs: SELECTION_VERDICT_TIMEOUTS.verifyMs,
+    });
+    if (recorded.ok && sameSelectedTarget(recorded.value.target, target)) {
+      return { kind: 'accepted', via: 'already-recorded' };
+    }
+    if (!recorded.ok) {
+      // Proceeding unread: acceptance then rests on the service's confirming
+      // `session.updated` (or the read-back), which cannot distinguish a lost
+      // frame from a recorded one if the target already equalled the
+      // descriptor — the one case this read exists to rule out, and in which
+      // the session's target is the descriptor either way.
+      log.debug('The session could not be read before a selection was sent.', {
+        sessionId,
+        errorCode: recorded.error.code,
+      });
+    }
+    if (signal?.aborted === true) {
+      return { kind: 'unconfirmed', error: selectionUnconfirmed() };
+    }
+
+    const delivery = countdown(SELECTION_VERDICT_TIMEOUTS.queuedMs);
+    try {
+      const transport = await waitForOpenTransport(delivery.elapsed, signal);
+      switch (transport) {
+        case 'open':
+          return await sendAndAwaitVerdict(payload, tabId, delivery.elapsed, signal);
+        case 'closed':
+          return { kind: 'unsent', error: selectionUnsent() };
+        case 'timeout':
+        case 'aborted':
+          // Never handed to the transport, so no reconnect can deliver it later.
+          return { kind: 'unconfirmed', error: selectionUnconfirmed() };
+      }
+    } finally {
+      delivery.cancel();
+    }
+  }
+
+  /**
+   * Send one `target.selected` frame on the open socket and resolve with the
+   * service's verdict on it.
+   *
+   * The frame's envelope id is minted here and both answers are subscribed to
+   * **before** the send, so neither can arrive unobserved:
+   *
+   * 1. an `error` whose `ref` is that id — refused, with the service's code;
+   * 2. a `session.updated` of this session whose target satisfies
+   *    `sameSelectedTarget` with the descriptor sent — accepted. An update
+   *    carrying another target is some other change (or a later selection) and
+   *    settles nothing.
+   *
+   * When neither arrives within `sentMs` the frame went down with the socket,
+   * and the session is read back once; a verdict frame arriving meanwhile
+   * still wins.
+   *
+   * The socket was open when this was called, yet `send` can still answer
+   * `queued`: the socket closed between that check and the write, and the
+   * client queued the frame for its next connection. That narrow race is the
+   * only path on which a selection is queued. The frame then keeps the rest of
+   * the delivery deadline — at least `sentMs` — before the read-back decides
+   * it, and a reconnect after that verdict could still flush it; nothing short
+   * of an API to withdraw a queued frame closes that window.
+   *
+   * @param payload The selection, exactly as it is sent.
+   * @param tabId The inspected tab the selection acts for.
+   * @param deliveryDue The selection's delivery deadline.
+   * @param signal Aborted when the panel that asked is gone.
+   * @returns The verdict.
+   */
+  async function sendAndAwaitVerdict(
+    payload: MessagePayload<'target.selected'>,
+    tabId: TabId,
+    deliveryDue: Promise<undefined>,
+    signal: AbortSignal | undefined,
+  ): Promise<SelectionVerdict> {
+    const id = newMessageId();
+    const { sessionId, target } = payload;
+    // `first` settles the wait; `frame` only on a verdict frame, so one that
+    // arrives during the read-back can still decide the outcome.
+    const first = deferred<SelectionAnswer>();
+    const frame = deferred<SelectionAnswer>();
+    const answer = (value: SelectionAnswer): void => {
+      first.resolve(value);
+      frame.resolve(value);
+    };
+    const unsubscribes: Unsubscribe[] = [
+      wsBridge.subscribe(MESSAGE_TYPE.ERROR, (message) => {
+        if (message.payload.ref === id) {
+          answer({ kind: 'refused', payload: message.payload });
+        }
+      }),
+      wsBridge.subscribe(MESSAGE_TYPE.SESSION_UPDATED, (message) => {
+        const { session } = message.payload;
+        if (session.id === sessionId && sameSelectedTarget(session.target, target)) {
+          answer({ kind: 'accepted' });
+        }
+      }),
+    ];
+    const onAbort = (): void => {
+      first.resolve({ kind: 'aborted' });
+    };
+    const sentWait = countdown(SELECTION_VERDICT_TIMEOUTS.sentMs);
+    try {
+      const sent = wsBridge.send(MESSAGE_TYPE.TARGET_SELECTED, payload, { id, tabId });
+      if (!sent.ok) {
+        return { kind: 'unsent', error: sent.error };
+      }
+      if (signal?.aborted === true) {
+        onAbort();
+      } else {
+        signal?.addEventListener('abort', onAbort, { once: true });
+      }
+      const due =
+        sent.value === 'sent'
+          ? sentWait.elapsed
+          : Promise.all([sentWait.elapsed, deliveryDue]).then(() => undefined);
+      void due.then(() => {
+        first.resolve({ kind: 'timeout' });
+      });
+      const settled = await first.promise;
+      if (settled.kind !== 'timeout') {
+        return verdictOf(settled);
+      }
+      return await Promise.race([
+        frame.promise.then(verdictOf),
+        verifySelection(sessionId, target, tabId, signal),
+      ]);
+    } finally {
+      for (const unsubscribe of unsubscribes) {
+        unsubscribe();
+      }
+      sentWait.cancel();
+      signal?.removeEventListener('abort', onAbort);
+    }
+  }
+
+  /** Log a selection's verdict: its kind and error code, never the descriptor. */
+  function logSelectionVerdict(verdict: SelectionVerdict, fields: LogFields): void {
+    switch (verdict.kind) {
+      case 'accepted':
+        log.info('The service accepted a selected element.', { ...fields, via: verdict.via });
+        return;
+      case 'refused':
+        log.info('The service refused a selected element.', {
+          ...fields,
+          errorCode: verdict.error.code,
+        });
+        return;
+      case 'unconfirmed':
+        log.warn('The service did not confirm a selected element.', {
+          ...fields,
+          errorCode: verdict.error.code,
+        });
+        return;
+      case 'unsent':
+        log.warn('A selected element could not be sent to the service.', {
+          ...fields,
+          errorCode: verdict.error.code,
+        });
+        return;
+    }
+  }
+
+  /**
+   * Put a tab's page into picker mode — the one implementation behind
+   * `target.pick`, which the panel sends for its own "Pick element" and for
+   * the service's relayed `target.request` alike (the panel is the only
+   * arming authority, so a request is armed once).
+   *
+   * Picker mode is the page agent's picker and nothing else: the request goes
+   * through the ISOLATED-world bridge, and the element the developer then
+   * clicks arrives as `target.described`, forwarded as `target.selected`.
+   * DevTools is never asked on this path — describing the Elements panel's
+   * `$0` here would submit whatever happens to be selected there (often a
+   * default element) before the developer picked anything; `$0` is "Use
+   * selected element", the panel's explicit second control (AAP §0.7.3).
+   * Synchronous: it only posts on a port that already exists.
+   *
+   * @param tabId The bound tab.
+   * @returns Whether the page agent's bridge took the request; `false` when no
+   *   page agent is connected for the tab (an origin outside the host
+   *   permissions, or a document that predates the extension).
+   */
+  function armElementPicker(tabId: TabId): boolean {
+    return hub.sendToBridge(tabId, {
+      channel: EXTENSION_CHANNEL,
+      version: PORT_PROTOCOL_VERSION,
+      direction: 'downstream',
+      type: 'target.request',
+      payload: { requestId: newPortRequestId() },
+    });
   }
 
   const requestHandlers: PortRequestHandlers = {
@@ -612,25 +2653,37 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
       }
       // The proxy that keeps the panel free of any socket or `fetch`: the
       // `DataResult` is answered verbatim, paging echo included.
-      return wsBridge.queryPanelData(payload.sessionId, payload.query, { signal: context.signal });
+      return wsBridge.queryPanelData(payload.sessionId, payload.query, {
+        signal: context.signal,
+        tabId: scope.value,
+      });
     },
 
     'source.open': async (payload, context) => {
+      // A click is often what wakes a suspended worker. Until
+      // `wsBridge.connect()` has run, the socket client is `closed` and refuses
+      // the frame outright, so the cold-start work is awaited first.
+      await ready;
       const scope = await checkPanelScope(payload.sessionId, context);
       if (!scope.ok) {
         return scope;
       }
-      // Forwarded unmodified: the service validates the location against the
-      // session's project root, and VS Code validates it again (AAP §0.4.2).
-      const sent = wsBridge.send('source.open', payload);
-      if (!sent.ok) {
-        log.warn('A source.open request could not be forwarded.', {
-          sessionId: payload.sessionId,
-          errorCode: sent.error.code,
-        });
-        return sent;
-      }
-      return ok({ forwarded: true });
+      // Forwarded unmodified, acting for the panel's tab, then answered by
+      // what the editor did: see
+      // `forwardSourceOpen` and the module's contract-gap notes for how the
+      // result maps onto `{ forwarded }`.
+      return forwardSourceOpen(
+        {
+          send: wsBridge.send,
+          subscribe: wsBridge.subscribe,
+          timers,
+          logger: log,
+          refs: sourceOpenRefs,
+          tabId: scope.value,
+        },
+        payload,
+        context.signal,
+      );
     },
 
     'capture.start': async (payload, context) => {
@@ -638,15 +2691,19 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
       if (!scope.ok) {
         return scope;
       }
-      const started = await wsBridge.startCapture(payload.sessionId, { signal: context.signal });
+      const started = await wsBridge.startCapture(payload.sessionId, {
+        signal: context.signal,
+        tabId: scope.value,
+      });
       if (!started.ok) {
-        // The failure is answered unchanged so its code — `CAPTURE_ALREADY_ACTIVE`
-        // for the documented `409` — reaches the panel; the port frame cannot
-        // carry the owning session, so it is logged here instead.
+        // The failure is answered unchanged: `portErr` carries its code —
+        // `CAPTURE_ALREADY_ACTIVE` for the documented `409` — and, for that
+        // conflict, the schema-validated owning session, so the panel can name
+        // the session holding the capture. The log reads the same validated id.
         log.info('capture.start was refused.', {
           sessionId: payload.sessionId,
           errorCode: started.error.code,
-          owningSessionId: captureConflictOwner(started.error),
+          owningSessionId: captureConflictOwningSessionId('capture.start', started.error),
         });
       }
       return started;
@@ -657,7 +2714,10 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
       if (!scope.ok) {
         return scope;
       }
-      const stopped = await wsBridge.stopCapture(payload.sessionId, { signal: context.signal });
+      const stopped = await wsBridge.stopCapture(payload.sessionId, {
+        signal: context.signal,
+        tabId: scope.value,
+      });
       if (!stopped.ok) {
         log.info('capture.stop was refused.', {
           sessionId: payload.sessionId,
@@ -677,43 +2737,15 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
       if (!tab.ok) {
         return tab;
       }
-      const requestId = newPortRequestId();
-      // The page agent's picker, through the ISOLATED-world bridge; its answer
-      // arrives as `target.described` and is forwarded as `target.selected`.
-      if (
-        hub.sendToBridge(tab.value, {
-          channel: EXTENSION_CHANNEL,
-          version: PORT_PROTOCOL_VERSION,
-          direction: 'downstream',
-          type: 'target.request',
-          payload: { requestId },
-        })
-      ) {
+      if (armElementPicker(tab.value)) {
         return ok({ active: true });
       }
-      // No agent on the page (an origin outside the host permissions, or a
-      // document that predates the extension): the DevTools page can still
-      // describe the Elements panel's selection.
-      if (
-        hub.sendToDevtools(tab.value, {
-          channel: EXTENSION_CHANNEL,
-          version: PORT_PROTOCOL_VERSION,
-          direction: 'downstream',
-          type: 'devtools.describeRequest',
-          payload: { requestId },
-        })
-      ) {
-        return ok({ active: true });
-      }
-      return err(
-        workerError(
-          'AGENT_NOT_READY',
-          'Neither the page agent nor DevTools is connected for the tab.',
-          {
-            hint: 'Reload the application page, then pick the element again.',
-          },
-        ),
-      );
+      log.info('Picker mode could not be armed.', {
+        tabId: tab.value,
+        sessionId: payload.sessionId,
+        errorCode: 'AGENT_NOT_READY',
+      });
+      return err(workerError('AGENT_NOT_READY', PICKER_UNAVAILABLE_MESSAGE));
     },
 
     'target.selected': async (payload, context) => {
@@ -721,18 +2753,29 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
       if (!scope.ok) {
         return scope;
       }
-      const sent = wsBridge.send('target.selected', payload);
-      if (!sent.ok) {
-        log.warn('A target.selected request could not be forwarded.', {
-          sessionId: payload.sessionId,
-          errorCode: sent.error.code,
-        });
-        return sent;
-      }
-      return ok({ accepted: true });
+      // Answered on the service's verdict, never on the send: a refusal or a
+      // lost frame is a failure, so the panel withdraws its optimistic target
+      // and says why.
+      const verdict = await sendSelectedTarget(payload, scope.value, context.signal);
+      logSelectionVerdict(verdict, {
+        tabId: context.tabId,
+        sessionId: payload.sessionId,
+        source: 'panel',
+      });
+      return verdict.kind === 'accepted' ? ok({ accepted: true }) : err(verdict.error);
     },
 
     'pair.complete': async (payload) => {
+      // The dialog saves the service address just before it submits the code,
+      // so the code is redeemed at that address: read it now instead of
+      // relying on the storage change event having been delivered already.
+      const endpoint = await loadServiceEndpoint();
+      if (isErr(endpoint)) {
+        log.info('Pairing did not start: the service address is unusable.', {
+          errorCode: endpoint.error.code,
+        });
+        return err(endpoint.error);
+      }
       const paired = await store.completePairing(payload.code);
       // `STORE_ERROR` means the exchange succeeded and the credential is held
       // for this worker generation, only not saved — so the socket starts in
@@ -752,19 +2795,131 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
       // A cold start: the credential and the bindings must be read before the
       // answer, or a freshly revived worker would report a false "Not paired".
       await ready;
-      const tabId = await associatePanel(payload.sessionId, context);
-      const binding =
+      // Opening the panel again is the documented retry of a service address
+      // that could not be read: read it now if no read has established it.
+      await reloadUnverifiedServiceEndpoint();
+      // The answer describes the panel's own inspected tab and nothing else:
+      // the tab the panel names is its identity, and the session it names is
+      // information only (see `associatePanel`) — never a way to read another
+      // tab's binding or session.
+      const tabId = await associatePanel(payload, context);
+      const state =
         tabId === undefined ? UNBOUND_STATE : await registry.getPanelBindingState(tabId);
+      const binding = state.kind === 'bound' && state.tabId !== tabId ? UNBOUND_STATE : state;
+      if (binding !== state) {
+        log.error('A binding state for another tab was withheld from a panel snapshot.', {
+          tabId,
+        });
+      }
+      // Whether the one-click reload is offered for the panel's tab; a panel
+      // whose tab is not known yet receives it as a `reload` push once it is.
+      const reload = tabId === undefined ? undefined : await reloadStateFor(tabId);
       const status = wsBridge.snapshot();
       const snapshot: PanelSessionSnapshot = {
         connection: connectionPushFromStatus(status).state,
         binding,
+        ...(reload === undefined ? {} : { reload }),
       };
-      if (binding.kind !== 'bound' || !status.hasCredential) {
+      // Loss this panel's tab suffered while no panel saw it is shown to the
+      // panel after this answer, whichever it is — the answer would otherwise
+      // reset the notice the panel keeps.
+      if (tabId !== undefined) {
+        replayTelemetryLossAfterAnswer(tabId);
+      }
+      // `tabId` is re-tested only to narrow it: an unknown tab is `UNBOUND_STATE`.
+      if (tabId === undefined || binding.kind !== 'bound' || !status.hasCredential) {
         return ok(snapshot);
       }
-      const details = await loadSessionDetails(binding.sessionId, context.signal);
-      return ok({ ...snapshot, ...details });
+      const { details, failure } = await readSessionDetails(
+        binding.sessionId,
+        tabId,
+        context.signal,
+      );
+      if (failure === undefined) {
+        return ok({ ...snapshot, ...details });
+      }
+      // A read failed. A snapshot of only the parts that were read would
+      // replace what the panel shows with nothing — "No session yet" for a
+      // bound session. The failure is answered instead, which the panel keeps
+      // as its retryable error notice without discarding its state; the
+      // binding and the pill reach it as pushes, ahead of the answer, and the
+      // reads are tried again on the hydration retry schedule.
+      if (!context.signal.aborted) {
+        hub.pushToPanels(tabId, bindingPushFor(binding));
+        hub.pushToPanels(tabId, connectionPushFromStatus(status));
+        scheduleHydrationRetry(tabId, 0, failure);
+      }
+      return err(failure);
+    },
+
+    'page.reload': async (payload, context) => {
+      // The developer's click on the panel's one-click reload is the consent
+      // (AAP §0.7.1 Group 2), given for one tab: the panel's inspected tab,
+      // which the request names. Fail closed — this action reloads a page —
+      // unless that tab is this connection's associated tab (a fresh port not
+      // yet associated, or a panel associated elsewhere, is refused) and is
+      // bound to the named session right now (a session rebound to another
+      // tab since the offer was shown is refused). Nothing else is reloaded.
+      const tabId = payload.tabId;
+      if (context.tabId === undefined || context.tabId !== tabId) {
+        log.info('A page reload was refused: the panel does not inspect the tab it named.', {
+          tabId,
+          sessionId: payload.sessionId,
+          associated: context.tabId !== undefined,
+        });
+        return err(
+          workerError(
+            'TAB_NOT_BOUND',
+            'The reload was not requested from the panel of the tab it names.',
+            { hint: 'Wait for the Debug Generator panel to reconnect, then reload from it again.' },
+          ),
+        );
+      }
+      const binding = await registry.getBinding(tabId);
+      if (binding === undefined || binding.sessionId !== payload.sessionId) {
+        log.info('A page reload was refused: the tab is not bound to the named session.', {
+          tabId,
+          sessionId: payload.sessionId,
+        });
+        return err(
+          workerError('TAB_NOT_BOUND', 'The inspected tab is not bound to this session.', {
+            hint: 'Open DevTools on the application tab of this session.',
+          }),
+        );
+      }
+      // The offer the panel was shown, by the same rule `requestConsentedReload`
+      // applies: only an offered reload is performed, and one already in
+      // flight (`reloading`) is waited on, never started twice. Decided on the
+      // binding just checked, with no await before the reload is requested.
+      const offer = reloadOfferFor(binding);
+      if (offer.kind === 'not-needed') {
+        log.info('A page reload was refused: none is offered for the tab.', {
+          tabId,
+          sessionId: payload.sessionId,
+        });
+        return err(
+          workerError('SESSION_INVALID_STATE', 'The inspected page does not need a reload.', {
+            hint: 'The page agent already observes this page.',
+          }),
+        );
+      }
+      log.info('Reloading the inspected page with the developer’s consent.', {
+        tabId,
+        sessionId: payload.sessionId,
+        offer: offer.kind,
+        ...(offer.kind === 'offered' ? { reason: offer.reason } : {}),
+      });
+      const outcome = await agent.requestConsentedReload(tabId);
+      log.info('The consented page reload settled.', {
+        tabId,
+        sessionId: payload.sessionId,
+        outcome: outcome.kind,
+        // The document id is page-supplied: logged by its fingerprint only.
+        ...(outcome.kind === 'ready'
+          ? { document: fingerprintPageId(outcome.readiness.documentId) }
+          : {}),
+      });
+      return pageReloadAnswer(outcome);
     },
   };
 
@@ -775,94 +2930,798 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
   /**
    * Forward an element descriptor — from the page agent's picker or the
    * Elements panel's selection — as the protocol's `target.selected` for the
-   * session bound to its tab. The descriptor was bounded and redacted by the
-   * agent; it is forwarded verbatim and never logged.
+   * session bound to its tab, acting for that tab (the bridge or DevTools
+   * port's sender), and wait for the service's verdict on it. The descriptor
+   * was bounded and redacted by the agent; it is forwarded verbatim and never
+   * logged.
+   *
+   * The panel shows no optimistic target for this route — its target is the
+   * session record's, which only an accepted selection changes — so there is
+   * nothing to retract, only a failure to make visible. A refusal already
+   * reaches the panels as the service's own `error` frame, relayed like every
+   * `error`; a selection the transport lost has no frame at all, so the panels
+   * of the tab are told here. A frame the closed socket refused outright is
+   * only logged: the connection pill already shows that state.
+   *
+   * @param bridge The attribution of the agent's `target.described` frame,
+   *   checked again after the registry read; absent for the Elements panel's
+   *   selection, which arrives from the DevTools page rather than a bridge.
    */
   async function forwardSelectedTarget(
     tabId: TabId,
     target: SelectedTarget,
     source: 'agent' | 'devtools',
+    bridge?: BridgeMessageContext,
   ): Promise<void> {
     const binding = await registry.getBinding(tabId);
+    // An agent's descriptor must still come from the tab's current document
+    // once the registry has answered: the bridge may have been superseded
+    // while it read.
+    if (bridge !== undefined && isStaleBridgeFrame('target.described', bridge)) {
+      return;
+    }
     if (binding === undefined) {
       log.debug('A selected element on an unbound tab was not forwarded.', { tabId, source });
       return;
     }
-    const sent = wsBridge.send('target.selected', { sessionId: binding.sessionId, target });
-    log.info('Selected element forwarded.', {
-      tabId,
-      sessionId: binding.sessionId,
-      source,
-      errorCode: errorCode(sent),
-    });
+    const { sessionId } = binding;
+    const verdict = await sendSelectedTarget({ sessionId, target }, tabId);
+    logSelectionVerdict(verdict, { tabId, sessionId, source });
+    if (verdict.kind === 'unconfirmed') {
+      pushProtocol(
+        tabId,
+        createEnvelope(MESSAGE_TYPE.ERROR, toErrorPayload(verdict.error), { sessionId }),
+      );
+    }
   }
 
   /**
-   * Surface an `agent.error` on the tab's panels as a protocol `error` push,
-   * the one failure state the panel renders, and log only the agent's code.
-   * The payload is validated against the protocol's error schema first.
+   * Why a page-agent descriptor is not of the document the tab shows now, or
+   * `undefined` when it is.
+   *
+   * The service can compare a descriptor's URL with the binding's only as far
+   * as origin and path — the binding is stored query-redacted — so two loads of
+   * one URL, or a query change, are invisible to it. This worker knows the
+   * document itself: every bridge frame carries the page agent document of its
+   * bridge connection (`context.documentId`, from that bridge's `agent.ready`),
+   * and the agent controller holds the tab's current one. A descriptor from a
+   * bridge whose agent never announced a document (`unannounced`), or from a
+   * document the tab has since replaced (`superseded`), was described in a
+   * page the developer no longer sees.
+   */
+  function staleDocumentReason(
+    context: BridgeMessageContext,
+  ): 'unannounced' | 'superseded' | undefined {
+    if (context.documentId === undefined) {
+      return 'unannounced';
+    }
+    return agent.getReadiness(context.tabId)?.documentId === context.documentId
+      ? undefined
+      : 'superseded';
+  }
+
+  /**
+   * Drop a page-agent descriptor of a document the tab no longer shows, and —
+   * when the tab is bound — tell its panels, as a lost selection is told
+   * ({@link forwardSelectedTarget}): the developer picked an element and must
+   * learn that it did not become the target. Logs the tab and codes only.
+   */
+  async function dropStaleSelection(
+    tabId: TabId,
+    reason: 'unannounced' | 'superseded',
+  ): Promise<void> {
+    const binding = await registry.getBinding(tabId);
+    if (binding === undefined) {
+      log.debug('A selected element on an unbound tab was not forwarded.', {
+        tabId,
+        source: 'agent',
+      });
+      return;
+    }
+    log.info('A selected element of a document the tab no longer shows was dropped.', {
+      tabId,
+      sessionId: binding.sessionId,
+      errorCode: 'TAB_NOT_BOUND',
+      reason,
+    });
+    pushProtocol(
+      tabId,
+      createEnvelope(
+        MESSAGE_TYPE.ERROR,
+        toErrorPayload(workerError('TAB_NOT_BOUND', STALE_SELECTION_MESSAGE)),
+        { sessionId: binding.sessionId },
+      ),
+    );
+  }
+
+  /**
+   * Surface a recognised `agent.error` on the tab's panels as a protocol
+   * `error` push — the one failure state the panel renders — carrying the
+   * kind's fixed public sentence ({@link agentErrorReport}).
+   *
+   * The frame is page-forgeable, so nothing it says as text reaches a log line
+   * or the panel: a recognised frame is logged at `warn` with the tab and its
+   * closed-vocabulary kind only; an unrecognised one is not shown, and is
+   * logged at `debug` as a fixed line with the tab alone.
+   *
+   * The push is made only while the frame's bridge is still the tab's current
+   * one (see {@link isStaleBridgeFrame}).
    */
   async function reportAgentError(
-    tabId: TabId,
+    context: BridgeMessageContext,
     payload: Readonly<Record<string, unknown>>,
   ): Promise<void> {
-    const agentCode = stringField(payload, 'code');
-    log.warn('The page agent reported an error.', { tabId, agentCode: agentCode?.slice(0, 64) });
+    const { tabId } = context;
+    const report = agentErrorReport(payload);
+    if (report === undefined) {
+      log.debug('An unrecognised page-agent error frame was not shown.', {
+        tabId,
+        agentError: 'unrecognised',
+      });
+      return;
+    }
+    log.warn('The page agent reported an error.', { tabId, agentError: report.kind });
     const binding = await registry.getBinding(tabId);
-    const code = agentErrorCode(agentCode);
-    const captureId = stringField(payload, 'captureId');
-    const candidate = {
-      code,
-      message: stringField(payload, 'message') ?? agentCode ?? code,
-      ...(captureId === undefined ? {} : { ref: captureId }),
-    };
-    const parsed = parseErrorPayload(candidate);
-    const errorPayload = parsed.ok ? parsed : parseErrorPayload({ code, message: code });
-    if (!errorPayload.ok) {
+    if (isStaleBridgeFrame('agent.error', context)) {
       return;
     }
     pushProtocol(
       tabId,
       createEnvelope(
-        'error',
-        errorPayload.value,
+        MESSAGE_TYPE.ERROR,
+        report.error,
         binding === undefined ? undefined : { sessionId: binding.sessionId },
       ),
     );
   }
 
+  // -------------------------------------------------------------------------
+  // Telemetry custody: the per-tab chain, the cold-start hold, loss notices
+  // -------------------------------------------------------------------------
+
+  /** A tab's lane, created when its first waiting frame arrives. */
+  function laneFor(tabId: TabId): TelemetryLane {
+    const existing = telemetryLanes.get(tabId);
+    if (existing !== undefined) {
+      return existing;
+    }
+    const created: TelemetryLane = { tail: Promise.resolve(), links: 0, pending: 0, heldEvents: 0 };
+    telemetryLanes.set(tabId, created);
+    return created;
+  }
+
+  /**
+   * Run one page agent frame's work after every earlier frame of the same tab
+   * has settled, and after start-up has settled.
+   *
+   * The port hub dispatches each frame without waiting for the previous
+   * handler. Handlers that each awaited `ready` would be ordered only by the
+   * promise-reaction queue, which one more `await` in any of them would
+   * silently break; this chain makes arrival order the contract instead —
+   * `agent.ready` reaches the socket client before the batches its document
+   * sent after it, and batch n before batch n + 1, while different tabs never
+   * wait on each other. The work runs even once the worker is disposed, so it
+   * can release what it holds; it checks `disposed` itself. A link that throws
+   * is logged by name and the chain continues; the returned promise never
+   * rejects. The lane is forgotten once its last link has finished.
+   *
+   * @param tabId The tab the frame came from.
+   * @param frame The frame type, for the log line of a failed link.
+   * @param work The frame's hand-over; the next link waits for it to settle.
+   */
+  function inTabOrder(
+    tabId: TabId,
+    frame: string,
+    work: (lane: TelemetryLane) => void | Promise<void>,
+  ): Promise<void> {
+    const lane = laneFor(tabId);
+    lane.links += 1;
+    const link = lane.tail
+      .then(() => ready)
+      .then(() => work(lane))
+      .then(undefined, (cause: unknown) => {
+        log.error('A page agent frame could not be handed over.', {
+          tabId,
+          frame,
+          error: errorName(cause),
+        });
+      })
+      .then(() => {
+        lane.links -= 1;
+        if (lane.links === 0 && telemetryLanes.get(tabId) === lane) {
+          telemetryLanes.delete(tabId);
+        }
+      });
+    lane.tail = link;
+    return link;
+  }
+
+  /**
+   * The events of a batch the worker takes custody of, and how many of them
+   * wait for start-up. After start-up that is all of them, none waiting.
+   * Before, the tab's waiting events stay within
+   * {@link COLD_START_HELD_EVENTS_PER_TAB}: the oldest are kept — the order
+   * they are delivered in — and those beyond the bound are refused, counted
+   * and shown as undelivered, rather than held in unbounded memory.
+   */
+  function admitBatch(
+    lane: TelemetryLane,
+    tabId: TabId,
+    events: BridgeTelemetryEvents,
+  ): { readonly events: BridgeTelemetryEvents; readonly held: number } {
+    if (coldStartSettled) {
+      return { events, held: 0 };
+    }
+    const room = Math.max(0, COLD_START_HELD_EVENTS_PER_TAB - lane.heldEvents);
+    const admitted = events.length > room ? events.slice(0, room) : events;
+    const refused = events.length - admitted.length;
+    lane.heldEvents += admitted.length;
+    if (refused > 0) {
+      log.warn('Telemetry beyond the cold-start hold was dropped.', {
+        tabId,
+        dropped: refused,
+        held: lane.heldEvents,
+        limit: COLD_START_HELD_EVENTS_PER_TAB,
+      });
+      recordTelemetryLoss(tabId, 'undelivered', refused);
+    }
+    return { events: admitted, held: admitted.length };
+  }
+
+  /**
+   * Account for telemetry the capture is missing, and show it on the tab's
+   * panels without flooding them: the first loss of a burst is shown at once,
+   * loss during the following {@link TELEMETRY_LOSS_NOTICE_INTERVAL_MS} is
+   * accumulated, and the burst's running total is shown when the interval
+   * ends — so the latest notice, the one the panel keeps, names everything
+   * the burst lost. An interval with no further loss ends the burst, unless
+   * its last notice reached no panel: then the burst is kept and shown again
+   * once a panel of the tab is connected (see {@link endLossInterval} and
+   * {@link replayTelemetryLoss}).
+   */
+  function recordTelemetryLoss(tabId: TabId, kind: TelemetryLossKind, events: number): void {
+    if (disposed || events <= 0) {
+      return;
+    }
+    let episodes = lossEpisodes.get(tabId);
+    if (episodes === undefined) {
+      episodes = new Map();
+      lossEpisodes.set(tabId, episodes);
+    }
+    let episode = episodes.get(kind);
+    if (episode === undefined) {
+      episode = { total: 0, shown: 0, cooldown: undefined, seen: false, notices: 0 };
+      episodes.set(kind, episode);
+    }
+    episode.total = Math.min(Number.MAX_SAFE_INTEGER, episode.total + events);
+    if (episode.cooldown === undefined) {
+      showTelemetryLoss(tabId, kind, episode);
+    }
+  }
+
+  /** Whether a burst is still the tab's current one of its kind. */
+  function isCurrentEpisode(tabId: TabId, kind: TelemetryLossKind, episode: LossEpisode): boolean {
+    return lossEpisodes.get(tabId)?.get(kind) === episode;
+  }
+
+  /** Whether a panel of the tab is connected — one a notice pushed now would reach. */
+  function tabHasPanel(tabId: TabId): boolean {
+    return hub
+      .listConnections()
+      .filter(isPanelConnection)
+      .some((connection) => connection.tabId === tabId);
+  }
+
+  /**
+   * Show a burst's running total, and start the interval before the next
+   * notice. Whether the notice reached a panel is known once its push
+   * resolves, and is recorded only if the notice is still the latest of a
+   * burst that is still the tab's current one — a late answer about an older
+   * notice, or about a burst since forgotten, decides nothing.
+   */
+  function showTelemetryLoss(tabId: TabId, kind: TelemetryLossKind, episode: LossEpisode): void {
+    episode.shown = episode.total;
+    episode.seen = false;
+    episode.notices += 1;
+    const notice = episode.notices;
+    episode.cooldown = timers.setTimeout(() => {
+      endLossInterval(tabId, kind, episode);
+    }, TELEMETRY_LOSS_NOTICE_INTERVAL_MS);
+    background(
+      pushTelemetryLoss(tabId, kind, episode.total).then((panels) => {
+        if (episode.notices === notice && isCurrentEpisode(tabId, kind, episode)) {
+          episode.seen = panels > 0;
+        }
+      }),
+      'telemetry loss notice',
+    );
+  }
+
+  /**
+   * An interval ended. Show what it accumulated; else, when the last notice
+   * reached no panel, show it again if a panel of the tab is connected now,
+   * or keep the burst — with no timer — until one is ({@link replayTelemetryLoss})
+   * or more loss arrives, which is then shown at once with the grown total;
+   * else end the burst.
+   */
+  function endLossInterval(tabId: TabId, kind: TelemetryLossKind, episode: LossEpisode): void {
+    episode.cooldown = undefined;
+    if (disposed || !isCurrentEpisode(tabId, kind, episode)) {
+      return;
+    }
+    if (episode.total > episode.shown) {
+      showTelemetryLoss(tabId, kind, episode);
+      return;
+    }
+    if (!episode.seen) {
+      if (tabHasPanel(tabId)) {
+        showTelemetryLoss(tabId, kind, episode);
+      } else {
+        background(forgetLossOfClosedTab(tabId), 'telemetry loss of a closed tab');
+      }
+      return;
+    }
+    const episodes = lossEpisodes.get(tabId);
+    if (episodes !== undefined) {
+      episodes.delete(kind);
+      if (episodes.size === 0) {
+        lossEpisodes.delete(tabId);
+      }
+    }
+  }
+
+  /**
+   * A panel was just associated with the tab: show every burst of the tab
+   * whose last notice reached no panel and whose interval is not running. A
+   * burst whose interval is running is shown when that interval ends
+   * ({@link endLossInterval}), so no panel gets two notices of one kind
+   * within an interval. Once a replayed notice reaches the panel the burst is
+   * seen, and a later association replays nothing.
+   */
+  function replayTelemetryLoss(tabId: TabId): void {
+    if (disposed) {
+      return;
+    }
+    const episodes = lossEpisodes.get(tabId);
+    if (episodes === undefined) {
+      return;
+    }
+    for (const [kind, episode] of episodes) {
+      if (!episode.seen && episode.cooldown === undefined) {
+        log.debug('A telemetry loss notice no panel saw is shown again.', {
+          tabId,
+          loss: kind,
+          events: episode.total,
+        });
+        showTelemetryLoss(tabId, kind, episode);
+      }
+    }
+  }
+
+  /**
+   * Replay the tab's unseen loss notices once the answer being prepared for
+   * the panel has been posted: `ports.ts` posts a request's answer in the
+   * promise continuations that follow its handler, so a zero-delay task runs
+   * after it, and the answer cannot overwrite the notice the panel keeps.
+   */
+  function replayTelemetryLossAfterAnswer(tabId: TabId): void {
+    if (!lossEpisodes.has(tabId)) {
+      return;
+    }
+    timers.setTimeout(() => {
+      replayTelemetryLoss(tabId);
+    }, 0);
+  }
+
+  /**
+   * Push one loss notice ({@link telemetryLossNotice}) to the tab's panels as
+   * a protocol `error`, under the tab's bound session when there is one. The
+   * log line records how many panels it reached, so a notice issued while no
+   * panel of the tab was connected stays visible in the diagnostics.
+   *
+   * @returns How many panels the notice was posted to.
+   */
+  async function pushTelemetryLoss(
+    tabId: TabId,
+    kind: TelemetryLossKind,
+    events: number,
+  ): Promise<number> {
+    const binding = await registry.getBinding(tabId);
+    const panels = pushProtocol(
+      tabId,
+      createEnvelope(
+        MESSAGE_TYPE.ERROR,
+        telemetryLossNotice(kind, events),
+        binding === undefined ? undefined : { sessionId: binding.sessionId },
+      ),
+    );
+    log.info('A telemetry loss notice was pushed.', { tabId, loss: kind, events, panels });
+    return panels;
+  }
+
+  /** Cancel and forget the tab's loss notices: its tab closed, or the worker is disposed. */
+  function forgetTelemetryLoss(tabId: TabId): void {
+    const episodes = lossEpisodes.get(tabId);
+    if (episodes === undefined) {
+      return;
+    }
+    for (const episode of episodes.values()) {
+      if (episode.cooldown !== undefined) {
+        timers.clearTimeout(episode.cooldown);
+        episode.cooldown = undefined;
+      }
+    }
+    lossEpisodes.delete(tabId);
+  }
+
+  /**
+   * A burst kept for a panel waits only while its tab exists. `tabs.onRemoved`
+   * forgets a closing tab's bursts, but loss can still be recorded for it
+   * afterwards — its frames left in the socket client's queue are dropped
+   * later, while the service is unreachable — and such a burst would wait for
+   * a panel forever. A tab `tabs.get` cannot find is closed: its bursts are
+   * forgotten.
+   */
+  async function forgetLossOfClosedTab(tabId: TabId): Promise<void> {
+    const open = await Promise.resolve()
+      .then(() => tabs.get(tabId))
+      .then(
+        () => true,
+        () => false,
+      );
+    if (!open && !disposed && lossEpisodes.has(tabId)) {
+      log.debug('Telemetry loss of a closed tab was forgotten.', { tabId });
+      forgetTelemetryLoss(tabId);
+    }
+  }
+
+  /** Cancel every pending loss notice; part of `dispose`. */
+  function releaseTelemetryCustody(): void {
+    for (const tabId of [...lossEpisodes.keys()]) {
+      forgetTelemetryLoss(tabId);
+    }
+  }
+
+  /**
+   * Whether a page-bridge frame can no longer act: since the hub dispatched
+   * it, its connection was closed or superseded by a newer bridge for the
+   * tab, or its document was replaced. Every bridge handler asks after each
+   * wait and immediately before each side effect, so a frame that was current
+   * when it arrived cannot overwrite the readiness, the capture or the panel
+   * state of the document that replaced it. A stale frame is dropped with a
+   * debug line of ids only.
+   */
+  function isStaleBridgeFrame(
+    type: keyof BridgeMessageHandlers,
+    context: BridgeMessageContext,
+  ): boolean {
+    if (hub.isCurrentBridge(context)) {
+      return false;
+    }
+    log.debug('A frame from a superseded page bridge was dropped.', {
+      type,
+      tabId: context.tabId,
+      connectionId: context.connectionId,
+      // Page-supplied: logged by its fingerprint only.
+      document: fingerprintPageId(context.documentId),
+    });
+    return true;
+  }
+
+  /**
+   * Start one batch's overall delivery deadline: a signal the injected timers
+   * abort {@link TELEMETRY_ROUTE_WAIT_MS} after the batch arrived, so a batch
+   * waits at most that long however many batches of its tab are ahead of it,
+   * and a backlog behind an outage expires in step instead of one bound after
+   * another.
+   */
+  function startTelemetryDeadline(): TelemetryDeadline {
+    const controller = new AbortController();
+    let handle: number | undefined = timers.setTimeout(() => {
+      handle = undefined;
+      controller.abort();
+    }, TELEMETRY_ROUTE_WAIT_MS);
+    return {
+      signal: controller.signal,
+      release: () => {
+        if (handle !== undefined) {
+          timers.clearTimeout(handle);
+          handle = undefined;
+        }
+      },
+    };
+  }
+
+  /**
+   * Drop an accepted batch before any send: its tab has no binding, or the
+   * batch was produced for another session or capture than the tab's binding.
+   * Counts, ids and the reason only — never an event.
+   */
+  function dropTelemetryBatch(job: PendingTelemetryBatch, reason: TelemetryDropReason): void {
+    telemetryLossCount += 1;
+    const fields = {
+      tabId: job.tabId,
+      events: job.events.length,
+      reason,
+      lossCount: telemetryLossCount,
+    };
+    if (reason === 'unbound') {
+      log.debug('A telemetry batch from an unbound tab was dropped.', fields);
+      return;
+    }
+    log.info('A telemetry batch produced for another session or capture was dropped.', fields);
+  }
+
+  /**
+   * Report an accepted batch the service could not be reached for: its tab's
+   * route was not confirmed in time or was lost, or the send failed.
+   */
+  function reportTelemetryLoss(
+    job: PendingTelemetryBatch,
+    sessionId: SessionId,
+    stage: 'route' | 'send',
+    code: DebuggenErrorCode,
+  ): void {
+    telemetryLossCount += 1;
+    log.warn('A telemetry batch was dropped: it could not be delivered to the local service.', {
+      tabId: job.tabId,
+      sessionId,
+      events: job.events.length,
+      stage,
+      errorCode: code,
+      lossCount: telemetryLossCount,
+    });
+    recordTelemetryLoss(job.tabId, 'undelivered', job.events.length);
+  }
+
+  /**
+   * Forward one raw agent batch as `telemetry.event` frames for the session
+   * bound to its tab, once the service has confirmed that binding — or drop
+   * it, reporting why.
+   *
+   * 1. After the cold start (`ready`: the binding hydration, the credential
+   *    read and `wsBridge.connect()`), read the tab's binding. No binding, or
+   *    a binding that contradicts the session or capture the batch was
+   *    produced for (pinned at arrival), drops the batch: the page's stamp
+   *    only ever rejects, never routes.
+   * 2. Wait for the service to confirm the binding on the current connection
+   *    (`wsBridge.awaitTabRoute`), within the batch's deadline. After a
+   *    service restart this is what holds the batch until the re-announced
+   *    `session.bind` is answered, instead of letting it into a socket queue
+   *    the restarted service would refuse. A route that cannot be confirmed
+   *    drops the batch with a warning and the cumulative loss count.
+   * 3. Re-read the binding and check it still names the verified session (and
+   *    capture): a tab re-bound while the batch waited must not receive it —
+   *    a batch produced under one session is never sent as another's.
+   * 4. Send, scoped to the verified session. A route lost between the
+   *    confirmation and the write is awaited once more within the same
+   *    deadline; a second failure drops the batch and reports it.
+   *
+   * @param job The batch and what was pinned when it arrived.
+   */
+  async function forwardTelemetryBatch(job: PendingTelemetryBatch): Promise<void> {
+    await ready;
+    if (disposed) {
+      return;
+    }
+    const { tabId } = job;
+    const binding = await registry.getBinding(tabId);
+    if (binding === undefined) {
+      dropTelemetryBatch(job, 'unbound');
+      return;
+    }
+    const conflict = telemetryContextConflict(job.context, binding);
+    if (conflict !== undefined) {
+      dropTelemetryBatch(job, conflict);
+      return;
+    }
+    // What the tab's binding must still say at the write: the session verified
+    // now, and the capture the batch names (else the one the binding held).
+    const verified: TelemetryBatchContext = {
+      sessionId: binding.sessionId,
+      captureId: job.context.captureId ?? binding.captureId,
+    };
+    // The agent's loss report rides on the batch's first frame. Once a failed
+    // attempt got a frame onto the socket (written, or taken into the client's
+    // queue), a resend must not report the same loss a second time.
+    let lossHandedOver = false;
+    for (let attempt = 1; attempt <= TELEMETRY_SEND_ATTEMPTS; attempt += 1) {
+      const route = await wsBridge.awaitTabRoute(tabId, binding.sessionId, {
+        signal: job.deadline.signal,
+      });
+      if (disposed) {
+        return;
+      }
+      if (!route.ok) {
+        reportTelemetryLoss(job, binding.sessionId, 'route', route.error.code);
+        return;
+      }
+      const current = await registry.getBinding(tabId);
+      if (current === undefined) {
+        dropTelemetryBatch(job, 'unbound');
+        return;
+      }
+      const changed = telemetryContextConflict(verified, current);
+      if (changed !== undefined) {
+        dropTelemetryBatch(job, changed);
+        return;
+      }
+      // Where raw agent batches become protocol `telemetry.event` envelopes,
+      // chunked to the protocol's per-frame bound by the bridge. The agent's
+      // delivery context rides along: the capture it was armed for, which lets
+      // the service refuse a late batch of an earlier capture instead of
+      // filing it under the open one, and the events its bounded buffer
+      // discarded, which the service adds to the capture summary's coverage.
+      // Only defined values are passed, so an absent field stays absent.
+      const sent = wsBridge.sendTelemetryBatch(tabId, job.events, binding.sessionId, {
+        ...(job.context.captureId === undefined ? {} : { armedCaptureId: job.context.captureId }),
+        ...(job.droppedCount > 0 && !lossHandedOver ? { droppedCount: job.droppedCount } : {}),
+      });
+      if (sent.ok) {
+        if (job.droppedCount > 0) {
+          // The tab and the count only: the capture id is page-supplied and is
+          // never echoed into a log (AAP §0.5.2).
+          log.info('The page agent dropped events before this batch; the count was forwarded.', {
+            tabId,
+            dropped: job.droppedCount,
+          });
+        }
+        return;
+      }
+      lossHandedOver ||= framesHandedOver(sent.error) > 0;
+      if (
+        attempt < TELEMETRY_SEND_ATTEMPTS &&
+        TELEMETRY_ROUTE_LOSS_CODES.includes(sent.error.code)
+      ) {
+        log.debug('A telemetry batch lost its route before the write; waiting for it again.', {
+          tabId,
+          events: job.events.length,
+          errorCode: sent.error.code,
+        });
+        continue;
+      }
+      reportTelemetryLoss(job, binding.sessionId, 'send', sent.error.code);
+      return;
+    }
+  }
+
+  /**
+   * Queue one raw agent batch on its tab's ordered, bounded lane.
+   *
+   * Why a lane: the port hub invokes bridge handlers fire-and-forget, and a
+   * batch arriving on a cold wake must wait for the start-up work before it
+   * can be forwarded (see {@link forwardTelemetryBatch}) — the page has
+   * already removed it from its buffer, so dropping it would lose it. Waiting
+   * independently per batch would let a later batch overtake an earlier one
+   * whose binding read is slower, breaking the per-producer `seq` order the
+   * correlator relies on. Each tab's frames are therefore chained
+   * ({@link inTabOrder}): one starts only after the previous one of the same
+   * tab has settled, `agent.ready` included, while different tabs never wait
+   * on each other.
+   *
+   * Two bounds hold what one tab can make the worker keep, and what either
+   * refuses is counted, logged and shown to the tab's panels as undelivered
+   * telemetry ({@link recordTelemetryLoss}), never silently lost:
+   *
+   * - {@link MAX_PENDING_TELEMETRY_BATCHES_PER_TAB} batches on the lane — a
+   *   batch arriving at a full lane is dropped with a cumulative overflow
+   *   count;
+   * - while start-up is pending, {@link COLD_START_HELD_EVENTS_PER_TAB} events
+   *   ({@link admitBatch}): the oldest are kept, those beyond are refused.
+   *
+   * What the batch says about itself is pinned **here**, at arrival: the
+   * session and capture the page agent stamped on it, and its overall
+   * delivery deadline. The lane job compares them with the tab's binding when
+   * the batch's turn comes, so a batch produced under one binding is never
+   * relabelled with a later one.
+   *
+   * @param tabId The tab the batch came from — the bridge port's sender.
+   * @param batch The page agent's batch, as the port hub validated it.
+   */
+  function enqueueTelemetryBatch(tabId: TabId, batch: PageTelemetryBatchPayload): void {
+    if (disposed) {
+      return;
+    }
+    const waiting = telemetryLanes.get(tabId)?.pending ?? 0;
+    if (waiting >= MAX_PENDING_TELEMETRY_BATCHES_PER_TAB) {
+      telemetryOverflowCount += 1;
+      log.warn('A telemetry batch was dropped: too many batches are waiting for its tab.', {
+        tabId,
+        events: batch.events.length,
+        pending: waiting,
+        overflowCount: telemetryOverflowCount,
+      });
+      recordTelemetryLoss(tabId, 'undelivered', batch.events.length);
+      return;
+    }
+    const lane = laneFor(tabId);
+    const { events, held } = admitBatch(lane, tabId, batch.events);
+    if (events.length === 0 && batch.events.length > 0) {
+      // Every event was beyond the cold-start hold: refused and shown already.
+      if (lane.links === 0 && telemetryLanes.get(tabId) === lane) {
+        telemetryLanes.delete(tabId);
+      }
+      return;
+    }
+    lane.pending += 1;
+    const pending: PendingTelemetryBatch = {
+      tabId,
+      events,
+      droppedCount: batch.droppedCount,
+      context: { sessionId: batch.sessionId, captureId: batch.captureId },
+      deadline: startTelemetryDeadline(),
+    };
+    background(
+      inTabOrder(tabId, 'telemetry.batch', async () => {
+        // Past `ready`: the events no longer count against the cold-start hold.
+        lane.heldEvents -= held;
+        try {
+          await forwardTelemetryBatch(pending);
+        } catch (cause) {
+          log.error('A telemetry batch could not be forwarded.', {
+            tabId,
+            error: errorName(cause),
+          });
+        } finally {
+          pending.deadline.release();
+          lane.pending -= 1;
+        }
+      }),
+      'telemetry forwarding',
+    );
+  }
+
   const bridgeHandlers: BridgeMessageHandlers = {
-    'agent.ready': async (payload, context) => {
+    'agent.ready': (payload, context) => {
+      const { tabId } = context;
       // A page load is what usually wakes a suspended worker, so this report
       // routinely arrives while `start()` is still reading the credential.
       // Until `wsBridge.connect()` has run, the socket client is `closed` and
       // refuses the frame outright; once it has, the frame is queued and
-      // flushed after the hello. Waiting for `ready` turns a dropped report
-      // into a delivered one.
-      await ready;
-      // agent-control relays `agent.ready` upward with the tab filled in,
-      // memoizes readiness and re-delivers the tab's desired configuration.
-      const outcome = agent.handleAgentReady(context.tabId, payload);
-      log.debug('agent.ready handled.', { tabId: context.tabId, outcome: outcome.kind });
+      // flushed after the hello. The tab's lane waits for `ready`, which
+      // turns a dropped report into a delivered one and keeps it ahead of the
+      // batches its document sends after it — and gives a newer bridge for the
+      // tab time to supersede this one, which is why its attribution is
+      // checked there.
+      const recorded = inTabOrder(tabId, 'agent.ready', () => {
+        if (disposed || isStaleBridgeFrame('agent.ready', context)) {
+          return;
+        }
+        // agent-control relays `agent.ready` upward with the tab filled in,
+        // memoizes readiness and re-delivers the tab's desired configuration.
+        const outcome = agent.handleAgentReady(tabId, payload);
+        log.debug('agent.ready handled.', { tabId, outcome: outcome.kind });
+      });
+      // `inTabOrder` never rejects, so neither does this bookkeeping link.
+      readinessInFlight.set(tabId, recorded);
+      void recorded.then(() => {
+        if (readinessInFlight.get(tabId) === recorded) {
+          readinessInFlight.delete(tabId);
+        }
+      });
+      return recorded;
     },
 
     'telemetry.batch': (payload, context) => {
-      // Where raw agent batches become protocol `telemetry.event` envelopes,
-      // chunked to the protocol's per-frame bound by the bridge.
-      const sent = wsBridge.sendTelemetryBatch(context.tabId, payload.events);
-      if (!sent.ok) {
-        log.warn('A telemetry batch could not be sent.', {
-          tabId: context.tabId,
-          errorCode: sent.error.code,
-        });
+      // Checked on arrival, while the hub's dispatch is current: a batch from a
+      // superseded bridge never enters its tab's lane.
+      if (isStaleBridgeFrame('telemetry.batch', context)) {
         return;
       }
+      const { tabId } = context;
+      // Loss inside the page — the agent's buffer, the bridge's rate budget —
+      // is already final: it is shown now, whatever becomes of the batch.
       if (payload.droppedCount > 0) {
         log.info('The page agent dropped events before this batch.', {
-          tabId: context.tabId,
+          tabId,
           dropped: payload.droppedCount,
         });
+        recordTelemetryLoss(tabId, 'dropped-in-page', payload.droppedCount);
       }
+      // Like `agent.ready`, a batch routinely arrives while a woken worker is
+      // still starting; unlike it, batches must also keep their order. Both
+      // are the lane's job — this handler only queues, synchronously.
+      enqueueTelemetryBatch(tabId, payload);
     },
 
     'target.described': async (payload, context) => {
@@ -870,10 +3729,29 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
         log.debug('The page agent had no element to describe.', { tabId: context.tabId });
         return;
       }
-      await forwardSelectedTarget(context.tabId, payload.target, 'agent');
+      // The tab's readiness is recorded by the `agent.ready` handler, in the
+      // tab's lane after `ready`; awaiting both keeps a pick that follows its
+      // own document's report from being compared with a memo not yet
+      // written.
+      await ready;
+      await readinessInFlight.get(context.tabId);
+      // A newer bridge may have pinned the tab's next document while this
+      // frame waited: the pick was made in a page the developer no longer
+      // sees, so it is dropped — and, like any lost selection, told to the
+      // tab's panels rather than silently discarded.
+      if (isStaleBridgeFrame('target.described', context)) {
+        await dropStaleSelection(context.tabId, 'superseded');
+        return;
+      }
+      const stale = staleDocumentReason(context);
+      if (stale !== undefined) {
+        await dropStaleSelection(context.tabId, stale);
+        return;
+      }
+      await forwardSelectedTarget(context.tabId, payload.target, 'agent', context);
     },
 
-    'agent.error': (payload, context) => reportAgentError(context.tabId, payload),
+    'agent.error': (payload, context) => reportAgentError(context, payload),
   };
 
   // -------------------------------------------------------------------------
@@ -953,9 +3831,9 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
 
   const devtoolsHandlers: DevtoolsMessageHandlers = {
     'devtools.hello': async (payload, context) => {
-      // The inspected tab's only reliable source: remember it, adopt a panel
-      // that connected before this page announced itself, then bind.
-      lastDevtoolsTab = context.tabId;
+      // The DevTools window's inspected tab: adopt a panel that asked without
+      // naming a tab before this page announced itself (only when the match is
+      // one to one), then bind.
       adoptWaitingPanel(context.tabId);
       await ready;
       const target = await resolveBindTarget(context.tabId, payload.url);
@@ -991,10 +3869,15 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
   }
 
   /**
-   * The most recently announced DevTools tab that has no panel yet — the
-   * DevTools window whose panel is being opened. `undefined` when none waits.
+   * The announced DevTools tabs that have no panel yet — the DevTools windows
+   * whose panel is being opened (or reconnecting after a worker revival) —
+   * newest announcement first, each tab once. Empty when none waits. The
+   * order carries no authority: association never chooses by it.
+   *
+   * @param connectionId A panel connection not to count as some tab's panel
+   *   (the one being associated); omitted, every panel counts.
    */
-  function devtoolsTabAwaitingPanel(connectionId: string): TabId | undefined {
+  function devtoolsTabsAwaitingPanel(connectionId?: WorkerConnectionId): readonly TabId[] {
     const connections = hub.listConnections();
     const tabsWithPanels = new Set(
       connections
@@ -1004,65 +3887,209 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
     );
     const waiting = connections
       .filter(isDevtoolsConnection)
-      .filter(
-        (connection) => connection.tabId !== undefined && !tabsWithPanels.has(connection.tabId),
-      )
-      .sort(byNewest);
-    return waiting[0]?.tabId;
+      .sort(byNewest)
+      .map((connection) => connection.tabId)
+      .filter((tabId): tabId is TabId => tabId !== undefined && !tabsWithPanels.has(tabId));
+    return [...new Set(waiting)];
   }
 
   /**
-   * Associate a panel connection with its inspected tab, in order of
-   * certainty: the tab bound to the session the panel names (a panel
-   * reconnecting after an eviction), the tab it is already bound to, then the
-   * DevTools page awaiting a panel.
+   * Associate a panel connection with its inspected tab from its
+   * `session.snapshot` request, and answer the tab the snapshot may describe
+   * (`undefined`: answer unbound).
+   *
+   * The tab is the connection's identity: set once (`PortHub.bindPanelTab`
+   * never moves it) and only from a trusted source — the panel's own
+   * `inspectedTabId` (its `chrome.devtools.inspectedWindow.tabId`) or, for a
+   * panel that names none, the DevTools page that announced the one tab
+   * awaiting a panel. Nothing else chooses it: not the announcement order,
+   * and not the session the panel remembers (`request.sessionId`), which can
+   * have been bound to another tab while the port was down.
+   *
+   * - A named tab is associated as it is ({@link associateNamedPanel}).
+   * - With no named tab, the panel is associated only when exactly one
+   *   DevTools tab awaits a panel ({@link associateUnnamedPanel}); otherwise it
+   *   stays unassociated, and a DevTools page announced later may adopt it
+   *   ({@link adoptWaitingPanel}).
+   * - The claim is checked against the outcome for the log only
+   *   ({@link noteIgnoredClaim}).
    */
   async function associatePanel(
-    sessionId: SessionId | undefined,
+    request: PortRequestPayloads['session.snapshot'],
     context: PortRequestContext,
   ): Promise<TabId | undefined> {
-    if (sessionId !== undefined) {
-      const sessionTab = await registry.getTabForSession(sessionId);
-      if (sessionTab !== undefined) {
-        if (sessionTab !== context.tabId) {
-          hub.bindPanelTab(context.connectionId, sessionTab);
-        }
-        return sessionTab;
-      }
-    }
-    if (context.tabId !== undefined) {
-      return context.tabId;
-    }
-    const candidate = devtoolsTabAwaitingPanel(context.connectionId);
-    if (candidate !== undefined && hub.bindPanelTab(context.connectionId, candidate)) {
-      log.debug('Panel associated with its DevTools page.', { tabId: candidate });
-      return candidate;
-    }
-    return undefined;
+    const current = inspectedTabOf(context);
+    const tabId =
+      request.inspectedTabId === undefined
+        ? associateUnnamedPanel(context.connectionId, current)
+        : associateNamedPanel(context.connectionId, request.inspectedTabId, current);
+    await noteIgnoredClaim(request.sessionId, tabId, context.connectionId);
+    return tabId;
   }
 
   /**
-   * A DevTools page announced a tab after that window's panel connected (the
-   * order a worker revival can produce): bind the newest waiting panel to it
-   * and push the state its snapshot answer lacked.
+   * Associate a panel that named its inspected tab with exactly that tab.
+   *
+   * A panel already associated with another tab keeps that association — it
+   * is immutable — and its snapshot is refused: the contradiction is logged
+   * as an error and `undefined` answered, so neither tab is hydrated on its
+   * word. The named tab needs no DevTools announcement: the panel document is
+   * this extension's own page reading `chrome.devtools.inspectedWindow.tabId`,
+   * exactly as the DevTools page does.
+   */
+  function associateNamedPanel(
+    connectionId: WorkerConnectionId,
+    named: TabId,
+    current: TabId | undefined,
+  ): TabId | undefined {
+    untabbedPanels.delete(connectionId);
+    if (current === named) {
+      return named;
+    }
+    if (current !== undefined) {
+      log.error('A panel named an inspected tab its port is not associated with; refused.', {
+        connectionId,
+        tabId: current,
+        namedTabId: named,
+      });
+      return undefined;
+    }
+    if (!hub.bindPanelTab(connectionId, named)) {
+      // Everything since `current` was read is synchronous, so the panel is
+      // gone rather than bound elsewhere.
+      log.debug('A panel left before it could be associated.', { connectionId, tabId: named });
+      return undefined;
+    }
+    log.debug('Panel associated with the inspected tab it named.', { connectionId, tabId: named });
+    return named;
+  }
+
+  /**
+   * Associate a panel that named no inspected tab — its page was opened
+   * outside DevTools — with the DevTools tab awaiting a panel, when exactly
+   * one does. With none, or several, it stays unassociated (the choice would
+   * be a guess) and is remembered as waiting, for {@link adoptWaitingPanel}.
+   */
+  function associateUnnamedPanel(
+    connectionId: WorkerConnectionId,
+    current: TabId | undefined,
+  ): TabId | undefined {
+    if (current !== undefined) {
+      untabbedPanels.delete(connectionId);
+      return current;
+    }
+    const awaiting = devtoolsTabsAwaitingPanel(connectionId);
+    const only = awaiting.length === 1 ? awaiting[0] : undefined;
+    if (only === undefined) {
+      if (hub.getConnection(connectionId) !== undefined) {
+        untabbedPanels.add(connectionId);
+      }
+      log.debug(
+        awaiting.length === 0
+          ? 'Panel not associated yet: no DevTools page awaits a panel.'
+          : 'Panel left unassociated: it named no tab and several DevTools pages await a panel.',
+        { connectionId, awaiting: awaiting.length },
+      );
+      return undefined;
+    }
+    untabbedPanels.delete(connectionId);
+    if (!hub.bindPanelTab(connectionId, only)) {
+      log.debug('A panel left before it could be associated.', { connectionId, tabId: only });
+      return undefined;
+    }
+    log.debug('Panel associated with the only DevTools page awaiting one.', {
+      connectionId,
+      tabId: only,
+    });
+    return only;
+  }
+
+  /**
+   * Log a panel's session claim that the association outcome contradicts: a
+   * session bound to another tab, to no tab, or named by a panel left
+   * unassociated. The claim has no other effect.
+   */
+  async function noteIgnoredClaim(
+    claim: SessionId | undefined,
+    tabId: TabId | undefined,
+    connectionId: WorkerConnectionId,
+  ): Promise<void> {
+    if (claim === undefined) {
+      return;
+    }
+    const sessionTabId = await registry.getTabForSession(claim);
+    if (sessionTabId !== tabId || tabId === undefined) {
+      log.info('A stale session claim from a panel was ignored.', {
+        connectionId,
+        tabId,
+        sessionId: claim,
+        sessionTabId,
+      });
+    }
+  }
+
+  /**
+   * A DevTools page announced a tab after a panel that named no tab asked for
+   * its snapshot (the order a worker revival, or a panel page opened outside
+   * DevTools, can produce): associate that panel with the tab and push the
+   * state its snapshot answer lacked — but only when the match is one to one:
+   * exactly one such panel waits, and the announced tab is the only DevTools
+   * tab awaiting a panel. A panel that has not asked yet is never adopted
+   * (its request may still name its own tab), and a tab that already has a
+   * panel adopts nothing.
    */
   function adoptWaitingPanel(tabId: TabId): void {
     const panels = hub.listConnections().filter(isPanelConnection);
+    for (const connectionId of [...untabbedPanels]) {
+      const panel = panels.find((connection) => connection.connectionId === connectionId);
+      if (panel === undefined || panel.tabId !== undefined) {
+        untabbedPanels.delete(connectionId);
+      }
+    }
     if (panels.some((connection) => connection.tabId === tabId)) {
       return;
     }
-    const waiting = panels.filter((connection) => connection.tabId === undefined).sort(byNewest)[0];
-    if (waiting === undefined || !hub.bindPanelTab(waiting.connectionId, tabId)) {
+    const waiting = [...untabbedPanels];
+    const awaiting = devtoolsTabsAwaitingPanel();
+    const panelId = waiting.length === 1 ? waiting[0] : undefined;
+    if (panelId === undefined || awaiting.length !== 1 || awaiting[0] !== tabId) {
+      if (waiting.length > 0) {
+        log.debug('No waiting panel adopted: the match is not one to one.', {
+          tabId,
+          waitingPanels: waiting.length,
+          awaitingTabs: awaiting.length,
+        });
+      }
       return;
     }
-    log.debug('Waiting panel associated with the announced DevTools page.', { tabId });
-    background(pushTabStateToPanels(tabId), 'panel hydration');
+    const adopted = hub.bindPanelTab(panelId, tabId);
+    untabbedPanels.delete(panelId);
+    if (!adopted) {
+      return;
+    }
+    log.debug('Waiting panel associated with the announced DevTools page.', {
+      connectionId: panelId,
+      tabId,
+    });
+    // Loss no panel saw is shown after the hydration pushes, which could
+    // otherwise reset the notice the panel keeps.
+    background(
+      pushTabStateToPanels(tabId).finally(() => {
+        replayTelemetryLoss(tabId);
+      }),
+      'panel hydration',
+    );
   }
 
-  /** Push one relayed-type envelope to a tab's panels. */
-  function pushProtocol(tabId: TabId, envelope: unknown): void {
+  /**
+   * Push one relayed-type envelope to a tab's panels.
+   *
+   * @returns How many panels it was posted to; `0` for an envelope that is
+   * not a relayed type, or a tab with no panel connected.
+   */
+  function pushProtocol(tabId: TabId, envelope: unknown): number {
     if (!isRelayedMessage(envelope)) {
-      return;
+      return 0;
     }
     const push: ProtocolPush = {
       channel: EXTENSION_CHANNEL,
@@ -1071,19 +4098,31 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
       kind: 'protocol',
       message: envelope,
     };
-    hub.pushToPanels(tabId, push);
+    return hub.pushToPanels(tabId, push);
   }
 
   /**
    * The bound session's record, latest analysis and current panel, read over
-   * HTTP. A part the service cannot supply is omitted (and its code logged),
-   * because the panel renders every other part without it.
+   * HTTP acting for the tab bound to it, together with the first failure among
+   * its two reads. A part the
+   * service cannot supply is omitted from `details` (and its code logged);
+   * the failure is what a `session.snapshot` answers and what a background
+   * hydration surfaces, so a stalled or failing service reads as a retryable
+   * error rather than as a session with nothing in it.
+   *
+   * Both reads are bounded: by `signal` when the caller holds one, and always
+   * by the shared client's {@link SERVICE_REQUEST_TIMEOUT_MS} default.
+   *
+   * @param sessionId The session bound to `tabId`.
+   * @param tabId The inspected tab the reads act for.
+   * @param signal Aborts both reads, when the panel request that needs them ends.
    */
-  async function loadSessionDetails(
+  async function readSessionDetails(
     sessionId: SessionId,
+    tabId: TabId,
     signal?: AbortSignal,
-  ): Promise<SessionDetails> {
-    const options = signal === undefined ? undefined : { signal };
+  ): Promise<SessionDetailsRead> {
+    const options = { tabId, signal };
     const [session, current] = await Promise.all([
       wsBridge.getSession(sessionId, options),
       wsBridge.getCurrentPanel(sessionId, options),
@@ -1097,41 +4136,201 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
     }
     const analysis = session.ok ? latestAnalysis(session.value) : undefined;
     const panel = current.ok ? current.value.panel : null;
+    const failure = !session.ok ? session.error : !current.ok ? current.error : undefined;
     return {
-      ...(session.ok ? { session: session.value } : {}),
-      ...(analysis === undefined ? {} : { analysis }),
-      ...(panel === null ? {} : { panel }),
+      details: {
+        ...(session.ok ? { session: session.value } : {}),
+        ...(analysis === undefined ? {} : { analysis }),
+        ...(panel === null ? {} : { panel }),
+      },
+      failure,
     };
+  }
+
+  // -------------------------------------------------------------------------
+  // Background hydration: bounded, cancelled when its panels detach
+  // -------------------------------------------------------------------------
+
+  /**
+   * The hydration in flight per tab — the controller whose signal bounds its
+   * HTTP reads. At most one per tab: a newer hydration of the same tab aborts
+   * the older one, whose answer would only be overwritten.
+   */
+  const hydrations = new Map<TabId, AbortController>();
+
+  /** Start a tab's hydration, aborting the one it supersedes. */
+  function beginHydration(tabId: TabId): AbortController {
+    hydrations.get(tabId)?.abort();
+    const controller = new AbortController();
+    hydrations.set(tabId, controller);
+    return controller;
+  }
+
+  /** Forget a finished hydration, unless a newer one has replaced it. */
+  function endHydration(tabId: TabId, controller: AbortController): void {
+    if (hydrations.get(tabId) === controller) {
+      hydrations.delete(tabId);
+    }
+  }
+
+  /**
+   * Abort a tab's hydration in flight: the panels it was reading for are
+   * gone (the last one detached, or the tab closed), so its HTTP calls are
+   * cancelled instead of left to run to their deadline.
+   */
+  function cancelHydration(tabId: TabId, reason: string): void {
+    clearHydrationRetry(tabId);
+    const controller = hydrations.get(tabId);
+    if (controller === undefined) {
+      return;
+    }
+    hydrations.delete(tabId);
+    controller.abort();
+    log.debug('A background hydration was cancelled.', { tabId, reason });
+  }
+
+  /**
+   * The pending retry per tab: the timer handle, on the injected timers. At
+   * most one per tab; a detach, a newer schedule or disposal clears it.
+   */
+  const hydrationRetries = new Map<TabId, number>();
+
+  /** Clear a tab's pending hydration retry, if any. */
+  function clearHydrationRetry(tabId: TabId): void {
+    const handle = hydrationRetries.get(tabId);
+    if (handle !== undefined) {
+      hydrationRetries.delete(tabId);
+      timers.clearTimeout(handle);
+    }
+  }
+
+  /**
+   * Try a failed hydration of `tabId` again after the next delay of
+   * {@link HYDRATION_RETRY_DELAYS_MS}. Nothing is scheduled for a failure that
+   * would repeat itself, once the schedule is spent, or when the tab has no
+   * panel left to hydrate; the try itself re-checks that.
+   *
+   * @param attempt How many retries preceded this failure (0 for the first read).
+   */
+  function scheduleHydrationRetry(tabId: TabId, attempt: number, failure: DebuggenError): void {
+    if (disposed || !RETRYABLE_HYDRATION_CODES.has(failure.code) || !hasPanels(tabId)) {
+      return;
+    }
+    const delayMs = HYDRATION_RETRY_DELAYS_MS[attempt];
+    if (delayMs === undefined) {
+      log.info('A background hydration kept failing; no retry is left.', {
+        tabId,
+        errorCode: failure.code,
+      });
+      return;
+    }
+    clearHydrationRetry(tabId);
+    const handle = timers.setTimeout(() => {
+      if (hydrationRetries.get(tabId) !== handle) {
+        return;
+      }
+      hydrationRetries.delete(tabId);
+      if (disposed || !hasPanels(tabId)) {
+        return;
+      }
+      background(pushTabStateToPanels(tabId, attempt + 1), 'panel hydration retry');
+    }, delayMs);
+    hydrationRetries.set(tabId, handle);
+    log.debug('A background hydration will be retried.', { tabId, attempt: attempt + 1, delayMs });
+  }
+
+  /** Whether any panel document is associated with `tabId`. */
+  function hasPanels(tabId: TabId): boolean {
+    return hub
+      .listConnections()
+      .some((connection) => isPanelConnection(connection) && connection.tabId === tabId);
+  }
+
+  /** The binding push a hydration opens with, carrying the tab's binding state. */
+  function bindingPushFor(state: PanelBindingState): PortPush {
+    return {
+      channel: EXTENSION_CHANNEL,
+      version: PORT_PROTOCOL_VERSION,
+      direction: 'push',
+      kind: 'binding',
+      state,
+    };
+  }
+
+  /**
+   * Surface a background hydration's failure on the tab's panels as a
+   * protocol `error` push — the panel's non-blocking failure notice — so a
+   * stalled or failing service reads as a retryable error rather than as a
+   * session with nothing in it. The payload is validated against the
+   * protocol's error schema first; the message is the client's own constant
+   * sentence (a timeout names the operation and its deadline), never a
+   * response body.
+   */
+  function reportHydrationFailure(
+    tabId: TabId,
+    sessionId: SessionId,
+    failure: DebuggenError,
+  ): void {
+    const parsed = parseErrorPayload(toErrorPayload(failure));
+    const errorPayload = parsed.ok
+      ? parsed
+      : parseErrorPayload({ code: failure.code, message: failure.code });
+    if (!errorPayload.ok) {
+      return;
+    }
+    log.info('A background hydration failed.', { tabId, sessionId, errorCode: failure.code });
+    pushProtocol(tabId, createEnvelope(MESSAGE_TYPE.ERROR, errorPayload.value, { sessionId }));
   }
 
   /**
    * Bring a tab's newly associated panels up to date: its binding state and,
    * when bound, the session record, analysis and panel — what a
    * `session.snapshot` answer would have carried, as the pushes that carry
-   * them after it.
+   * them after it. A transient failure is surfaced and tried again
+   * ({@link scheduleHydrationRetry}).
+   *
+   * @param attempt How many retries preceded this run (0 for the first).
    */
-  async function pushTabStateToPanels(tabId: TabId): Promise<void> {
+  async function pushTabStateToPanels(tabId: TabId, attempt = 0): Promise<void> {
     await ready;
     const state = await registry.getPanelBindingState(tabId);
-    hub.pushToPanels(tabId, {
-      channel: EXTENSION_CHANNEL,
-      version: PORT_PROTOCOL_VERSION,
-      direction: 'push',
-      kind: 'binding',
-      state,
-    });
+    // The recipients are re-checked after the awaits: a panel that detached
+    // during them found no hydration to cancel, so none may start for it now.
+    if (disposed || !hasPanels(tabId)) {
+      return;
+    }
+    hub.pushToPanels(tabId, bindingPushFor(state));
+    await pushReloadState(tabId);
     if (state.kind !== 'bound' || !wsBridge.snapshot().hasCredential) {
       return;
     }
     const { sessionId } = state;
-    const details = await loadSessionDetails(sessionId);
+    const controller = beginHydration(tabId);
+    let read: SessionDetailsRead;
+    try {
+      read = await readSessionDetails(sessionId, tabId, controller.signal);
+    } finally {
+      endHydration(tabId, controller);
+    }
+    if (controller.signal.aborted) {
+      // Superseded, or its panels detached: nothing is left to update.
+      return;
+    }
+    const { details, failure } = read;
+    if (failure !== undefined) {
+      reportHydrationFailure(tabId, sessionId, failure);
+      scheduleHydrationRetry(tabId, attempt, failure);
+    }
     if (details.session !== undefined) {
-      pushProtocol(tabId, createEnvelope('session.updated', { session: details.session }));
+      pushProtocol(
+        tabId,
+        createEnvelope(MESSAGE_TYPE.SESSION_UPDATED, { session: details.session }),
+      );
     }
     if (details.analysis !== undefined) {
       pushProtocol(
         tabId,
-        createEnvelope('analysis.completed', { sessionId, analysis: details.analysis }),
+        createEnvelope(MESSAGE_TYPE.ANALYSIS_COMPLETED, { sessionId, analysis: details.analysis }),
       );
     }
     const { panel } = details;
@@ -1140,12 +4339,91 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
       // the schema's mutable inference, so the array is copied, not cast.
       pushProtocol(
         tabId,
-        createEnvelope('panel.generated', {
+        createEnvelope(MESSAGE_TYPE.PANEL_GENERATED, {
           sessionId,
           panelId: panel.id,
           panel: { ...panel, layout: [...panel.layout] },
         }),
       );
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // The one-click reload offer
+  // -------------------------------------------------------------------------
+
+  /**
+   * Whether a tab's panels are offered the one-click reload — the one answer
+   * both the `reload` pushes and the `page.reload` handler use. Never for a
+   * tab that holds no binding (a reload is offered only on the page a session
+   * observes), never for a bound page outside the origins the manifest's
+   * content scripts match (no reload can bring the agent there, so an
+   * `agent-missing` offer would only time out), and otherwise exactly what
+   * agent-control's consent rule says.
+   */
+  async function reloadStateFor(tabId: TabId): Promise<PanelReloadState> {
+    return reloadOfferFor(await registry.getBinding(tabId));
+  }
+
+  /**
+   * {@link reloadStateFor}'s rule for a binding already read — synchronous, so
+   * the `page.reload` handler decides on, and reloads, the very binding it
+   * checked, with no await in between.
+   */
+  function reloadOfferFor(binding: TabBindingRecord | undefined): PanelReloadState {
+    if (binding === undefined || !isLocalAppOrigin(binding.origin)) {
+      return PANEL_RELOAD_NOT_NEEDED;
+    }
+    return agent.getReloadOffer(binding.tabId);
+  }
+
+  /**
+   * Push a tab's current reload offer to its panels. The offer is read after
+   * the binding lookup settles, so of several pushes in flight each carries
+   * the latest state rather than the one current when it was scheduled.
+   */
+  async function pushReloadState(tabId: TabId): Promise<void> {
+    await ready;
+    const state = await reloadStateFor(tabId);
+    const push: PortReloadPush = {
+      channel: EXTENSION_CHANNEL,
+      version: PORT_PROTOCOL_VERSION,
+      direction: 'push',
+      kind: 'reload',
+      state,
+    };
+    const panels = hub.pushToPanels(tabId, push);
+    log.debug('Reload offer pushed.', { tabId, reload: state.kind, panels });
+  }
+
+  /**
+   * Refresh a tab's reload offer from a listener: no rejection escapes it, and
+   * nothing is scheduled once the worker is disposed.
+   */
+  function refreshReloadOffer(tabId: TabId, trigger: string): void {
+    if (disposed) {
+      return;
+    }
+    background(pushReloadState(tabId), `reload offer after ${trigger}`);
+  }
+
+  /**
+   * agent-control's state changes that move the offer: a readiness report, a
+   * consented reload starting or settling, and a tab's agent state cleared.
+   * A configuration routed or disarmed leaves readiness — and so the offer —
+   * as it was.
+   */
+  function handleAgentChange(change: AgentControlChange): void {
+    switch (change.kind) {
+      case 'agent-ready':
+      case 'reload-started':
+      case 'reload-settled':
+      case 'cleared':
+        refreshReloadOffer(change.tabId, change.kind);
+        return;
+      case 'config-routed':
+      case 'disarmed':
+        return;
     }
   }
 
@@ -1164,9 +4442,6 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
       return;
     }
     announcedTabs.delete(tabId);
-    if (lastDevtoolsTab === tabId) {
-      lastDevtoolsTab = undefined;
-    }
     await ready;
     const removed = await registry.unbind(tabId, 'devtools-closed');
     log.info('DevTools closed on a tab.', { tabId, unbound: removed !== undefined });
@@ -1179,17 +4454,23 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
    * reporting it, so the tab is unbound the same way.
    */
   async function handlePanelClosed(event: PortClosedEvent<PanelConnection>): Promise<void> {
+    untabbedPanels.delete(event.connection.connectionId);
     const tabId = event.connection.tabId;
     if (event.reason === 'disposed' || tabId === undefined) {
       return;
     }
-    const stillInspected = hub
-      .listConnections()
-      .some(
-        (connection) =>
-          (isDevtoolsConnection(connection) || isPanelConnection(connection)) &&
-          connection.tabId === tabId,
-      );
+    const connections = hub.listConnections();
+    // A hydration reads for the tab's panels; with the last one detached its
+    // reads — and its pending retry — have no recipient, so they are
+    // cancelled rather than left to run.
+    if (!hasPanels(tabId)) {
+      cancelHydration(tabId, 'panel-detached');
+    }
+    const stillInspected = connections.some(
+      (connection) =>
+        (isDevtoolsConnection(connection) || isPanelConnection(connection)) &&
+        connection.tabId === tabId,
+    );
     if (stillInspected) {
       return;
     }
@@ -1205,6 +4486,26 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
   // The modules, each constructed exactly once
   // -------------------------------------------------------------------------
 
+  /**
+   * The `send` handed to `tab-registry.ts` and `agent-control.ts`: a frame
+   * either module built, sent acting for the tab its own payload names.
+   *
+   * Every frame those modules send — `session.bind`, `session.unbind`,
+   * `tab.navigated`, `agent.ready` — is about exactly one tab, the tab it is
+   * sent for, and names it in its payload (taken from Chrome's port metadata,
+   * never from a page). Restating that tab as the envelope's acting tab makes
+   * the claim the frame already makes, which the protocol requires to agree;
+   * it puts these frames under the same per-tab check as every other frame
+   * this worker sends (AAP §0.5.6). An acting tab the caller supplied itself is
+   * kept unchanged, and a payload that names no tab is sent as it is.
+   * `wsBridge` is dereferenced only when a frame is sent, by which time it
+   * exists.
+   */
+  const sendActingForPayloadTab: ProtocolSend = (type, payload, options) => {
+    const tabId = options?.tabId === undefined ? payloadTabId(payload) : undefined;
+    return wsBridge.send(type, payload, tabId === undefined ? options : { ...options, tabId });
+  };
+
   const hub: PortHub = createPortHub({
     runtime,
     timers,
@@ -1214,6 +4515,10 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
     events: {
       onConnected: (connection) => {
         log.debug('Port connected.', { role: connection.role, tabId: connection.tabId });
+        if (connection.role === PORT_CONTENT_BRIDGE) {
+          // A page agent's bridge attached: an `agent-missing` offer no longer stands.
+          refreshReloadOffer(connection.tabId, 'bridge connected');
+        }
       },
       onPanelDisconnected: (event) => handlePanelClosed(event),
       onDevtoolsDisconnected: (event) => handleDevtoolsClosed(event),
@@ -1222,39 +4527,63 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
           tabId: event.connection.tabId,
           reason: event.reason,
         });
+        refreshReloadOffer(event.connection.tabId, 'bridge disconnected');
       },
     },
     resolveTabForSession: (sessionId) => registry.getTabForSession(sessionId),
+    // Raised above the consented reload's bounded wait, so a `page.reload`
+    // is answered by its own outcome rather than the hub's generic timeout.
+    requestTimeoutMs: WORKER_REQUEST_TIMEOUT_MS,
     logger: rootLogger,
   });
 
   const registry: TabRegistry = createTabRegistry({
     storage: storage.session,
-    send: (type, payload, options) => wsBridge.send(type, payload, options),
+    send: sendActingForPayloadTab,
     notify: hub.pushToPanels,
     logger: rootLogger,
   });
 
   const agent: AgentControl = createAgentControl({
     sendToBridge: hub.sendToBridge,
-    send: (type, payload, options) => wsBridge.send(type, payload, options),
+    send: sendActingForPayloadTab,
     resolveBinding: async (sessionId) => {
       const tabId = await registry.getTabForSession(sessionId);
       return tabId === undefined ? undefined : registry.getBinding(tabId);
     },
     tabs,
     timers,
+    // Tells a tab whose agent has not reported yet from one with no agent.
+    hasBridge: hub.hasBridge,
     pushStatus: hub.pushToPanels,
+    onChange: handleAgentChange,
     logger: rootLogger,
   });
 
   /**
    * Every status snapshot the bridge publishes: fanned out to every panel
-   * (the pill is global) and watched for the transition to `connected`, after
-   * which binds refused while the socket was closed are sent again.
+   * (the pill is global), handed to the selections held for an open socket
+   * ({@link waitForOpenTransport}), and watched for the transition to
+   * `connected`, after which binds refused while the socket was closed are
+   * sent again and every pending unbind is re-sent.
+   *
+   * The pending unbinds are the registry's persisted tombstones: an unbind
+   * decided while the socket was down (a tab that closed or left the app, a
+   * DevTools window that closed, a session that ended) sat only in the socket
+   * client's memory, and an eviction of this worker loses that queue — while
+   * the service keeps the binding across a dropped socket (AAP §0.5.5) and
+   * would go on routing the session's traffic to the tab. `ws-bridge.ts`
+   * re-announces only the bindings that remain, so this flush is what delivers
+   * the ones that ended. It cannot undo a newer binding: a tab never holds a
+   * record and a tombstone at once, and a bind for a tab retires its tombstone
+   * before `session.bind` leaves, both on the registry's own queue.
    */
   function publishStatus(snapshot: WorkerStatusSnapshot): void {
     hub.broadcastToPanels(snapshot);
+    trackSourceOpenSocket();
+    for (const watch of [...transportWatchers]) {
+      watch();
+    }
     const previous = lastPublishedStatus;
     lastPublishedStatus = snapshot.status;
     if (previous === snapshot.status) {
@@ -1262,38 +4591,208 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
     }
     log.info('Connection status changed.', { status: snapshot.status, previous });
     if (snapshot.status === 'connected') {
+      background(registry.flushPendingUnbinds(), 'flush pending unbinds after connect');
       background(rebindAnnouncedTabs('connected'), 'rebind after connect');
     }
   }
 
+  /** Keeps the source-open ledger in step with the socket; see `createSourceOpenSocketTracker`. */
+  const trackSourceOpenSocket = createSourceOpenSocketTracker(
+    sourceOpenRefs,
+    () => (disposed ? undefined : socketHolder.bridge?.getStatus()),
+    timers,
+    log,
+  );
+
   /**
-   * The tab `client.hello` names, read synchronously at every hello: the tab
-   * of the most recent DevTools page still connected, else a bound tab.
+   * The socket bridge's relay sink: every relayed frame goes to the port hub,
+   * except the service's `error` refusal of a `source.open` this worker sent.
+   * That frame is session-less, so the hub would broadcast it to every panel,
+   * whose session store records its raw sentence as the panel's last failure;
+   * the request it refuses already settles on it and reaches the panel as a
+   * typed failure shown with fixed copy (`../panel/actions.ts`).
    */
-  function primaryTabId(): TabId | undefined {
-    if (lastDevtoolsTab !== undefined && hasDevtools(lastDevtoolsTab)) {
-      return lastDevtoolsTab;
-    }
-    const first = boundTabs.values().next();
-    return first.done === true ? undefined : first.value;
-  }
+  const relayToPanels: RelayPush = createSourceOpenRelayFilter(
+    sourceOpenRefs,
+    (message, tabId) => {
+      hub.relayPush(message, tabId);
+    },
+    log,
+  );
 
   const wsBridge: WsBridge = createWsBridge({
     webSocketConstructor: env.webSocketConstructor,
-    httpClient,
+    // A thunk, dereferenced per request, so a client rebuilt for a changed
+    // service address serves the bridge's very next call.
+    httpClient: () => httpClient,
     tokenProvider: store.getToken,
     onUnauthorized: store.handleUnauthorized,
     hasCredential: store.hasToken,
     alarms,
     timers,
     random: env.random,
-    relayPush: hub.relayPush,
+    relayPush: relayToPanels,
     pushStatus: publishStatus,
     listBindings: registry.listBindings,
     serviceBaseUrl,
-    primaryTabId,
+    // Held until the stored setting has been read once: the address above is
+    // provisional until then, and nothing may be sent to it.
+    serviceEndpointSettled: () => serviceEndpointSettled,
+    // Telemetry the socket client queued and then discarded — its queue
+    // overflowed while the service was unreachable, or the credential was
+    // removed — is undelivered telemetry like any other. Only called from a
+    // bridge member, by which time every map `recordTelemetryLoss` uses exists.
+    onTelemetryDropped: (tabId, events) => {
+      recordTelemetryLoss(tabId, 'undelivered', events);
+    },
     logger: rootLogger,
   });
+  socketHolder.bridge = wsBridge;
+
+  // -------------------------------------------------------------------------
+  // The service address: stored setting > environment > default
+  // -------------------------------------------------------------------------
+
+  /**
+   * Put a service address in force on both paths: rebuild the shared
+   * `HttpClient` for it (the client's base URL is immutable) and move the
+   * socket with {@link WsBridge.setServiceBaseUrl}. A refusal is handed to the
+   * bridge as it is, which closes the socket, refuses HTTP and shows
+   * "Service not running" with the refusal's hint — a stored address that is
+   * unusable is never silently replaced by the default.
+   */
+  function applyServiceEndpoint(next: Result<string, DebuggenError>): void {
+    if (disposed) {
+      return;
+    }
+    serviceEndpoint = next;
+    if (isErr(next)) {
+      log.warn('The configured service address is unusable.', {
+        errorCode: next.error.code,
+        rule: next.error.details?.rule,
+      });
+      wsBridge.setServiceBaseUrl(next.error);
+      return;
+    }
+    if (httpClient.baseUrl !== next.value) {
+      httpClient = buildHttpClient(next.value);
+      log.info('The service address changed.', {
+        accepted: httpClient.configurationError === undefined,
+      });
+    }
+    wsBridge.setServiceBaseUrl(next.value);
+  }
+
+  /**
+   * The refusal put in force when the stored setting could not be read and no
+   * earlier read established an address: failing closed, because the
+   * environment's or the default address may belong to another process, and
+   * the socket would hand it the devtools credential.
+   */
+  function unreadEndpointRefusal(cause?: unknown): DebuggenError {
+    return workerError(
+      'STORE_ERROR',
+      'The saved service address could not be read, so the extension is not connecting to any service.',
+      { hint: SERVICE_ADDRESS_UNREAD_HINT, ...(cause === undefined ? {} : { cause }) },
+    );
+  }
+
+  /**
+   * The address a stored setting calls for: the stored one, the environment's
+   * (or the default) when none is stored, the refusal when the stored value is
+   * unusable. When storage could not be read: `undefined` — keep the address
+   * in force — once an earlier observation of the setting established it, and
+   * a refusal ({@link unreadEndpointRefusal}) before any did.
+   */
+  function endpointFromSetting(
+    stored: Result<string | undefined, DebuggenError>,
+  ): Result<string, DebuggenError> | undefined {
+    if (isErr(stored)) {
+      if (stored.error.code !== 'STORE_ERROR') {
+        return err(stored.error);
+      }
+      return serviceEndpointVerified ? undefined : err(unreadEndpointRefusal(stored.error));
+    }
+    return ok(stored.value ?? serviceBaseUrl);
+  }
+
+  /**
+   * Read the stored setting and put it in force. A read overtaken by a storage
+   * change is discarded — the change was applied when it arrived, and is the
+   * fresher value. A read that succeeded — whatever it found — verifies the
+   * setting ({@link serviceEndpointVerified}); a failed one never does.
+   *
+   * @returns The address in force afterwards, or why it is refused.
+   */
+  async function loadServiceEndpoint(): Promise<Result<string, DebuggenError>> {
+    const changesBefore = serviceEndpointChanges;
+    const stored = await readServiceEndpoint(storage.local, log);
+    if (changesBefore !== serviceEndpointChanges) {
+      return serviceEndpoint;
+    }
+    const next = endpointFromSetting(stored);
+    if (!isErr(stored) || stored.error.code !== 'STORE_ERROR') {
+      serviceEndpointVerified = true;
+    }
+    if (next !== undefined) {
+      applyServiceEndpoint(next);
+    }
+    return serviceEndpoint;
+  }
+
+  /**
+   * The cold start's first read of the setting, which opens the bridge's gate
+   * ({@link serviceEndpointSettled}) whatever it found. A read that fails, or
+   * a fault in applying it, leaves a refusal in force when the gate opens —
+   * never the provisional address. Runs once; later calls return that run.
+   */
+  function establishServiceEndpoint(): Promise<void> {
+    serviceEndpointEstablishment ??= (async () => {
+      try {
+        await loadServiceEndpoint();
+      } catch (cause) {
+        log.error('Putting the stored service address in force failed.', {
+          error: errorName(cause),
+        });
+        if (!serviceEndpointVerified) {
+          applyServiceEndpoint(err(unreadEndpointRefusal()));
+        }
+      } finally {
+        openServiceEndpointGate();
+      }
+    })();
+    return serviceEndpointEstablishment;
+  }
+
+  /**
+   * Read the setting again while no read has established it — the retry
+   * behind a panel's snapshot, a pairing attempt and the install or startup
+   * connect. A no-op once it is established; storage changes are followed as
+   * they arrive.
+   */
+  async function reloadUnverifiedServiceEndpoint(): Promise<void> {
+    if (!serviceEndpointVerified) {
+      await loadServiceEndpoint();
+    }
+  }
+
+  /**
+   * Follow the setting as the pairing dialog (or any other extension context)
+   * writes it, validated again here: storage is shared, and what it holds is
+   * untrusted data.
+   */
+  const handleServiceEndpointChange: CredentialStorageChangeListener = (changes) => {
+    const change = changes[SERVICE_ENDPOINT_STORAGE_KEY];
+    if (change === undefined) {
+      return;
+    }
+    serviceEndpointChanges += 1;
+    // The change carries the setting's new value: an observation of it as
+    // good as a successful read.
+    serviceEndpointVerified = true;
+    const stored = change.newValue;
+    applyServiceEndpoint(stored === undefined ? ok(serviceBaseUrl) : parseServiceEndpoint(stored));
+  };
 
   // -------------------------------------------------------------------------
   // Binding changes and committed navigations
@@ -1301,11 +4800,6 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
 
   /** Keep the page agent in step with the tab's binding. */
   function handleBindingChange(change: TabBindingChange): void {
-    if (change.current === undefined) {
-      boundTabs.delete(change.tabId);
-    } else {
-      boundTabs.add(change.tabId);
-    }
     switch (change.kind) {
       case 'recorded':
         if (
@@ -1318,6 +4812,8 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
         // was attributed to no session; re-relay it so the readiness gate sees
         // the tab's current document.
         agent.reannounce(change.tabId);
+        // A newly bound tab may need the one-click reload offered.
+        refreshReloadOffer(change.tabId, 'binding recorded');
         return;
       case 'updated':
         return;
@@ -1326,6 +4822,8 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
         if (reason !== undefined) {
           agent.disarm(change.tabId, reason);
         }
+        // An unbound tab is never offered a reload; withdraw a standing offer.
+        refreshReloadOffer(change.tabId, 'binding removed');
         return;
       }
     }
@@ -1333,33 +4831,19 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
 
   /**
    * The URL of a committed navigation this `tabs.onUpdated` event reports, or
-   * `undefined` when it reports none.
-   *
-   * `chrome.webNavigation` would name commits directly, but the manifest's
-   * permission set is exactly `storage`, `alarms` and `tabs`, so the commit is
-   * derived from `changeInfo`: a changed `url` (a cross-document commit, or a
-   * same-document one through the history API) that differs from the last URL
-   * seen, or a new `loading` cycle without a URL change — a reload, which
-   * commits a new document at the same URL. A repeated event of the same load
-   * is de-duplicated against the remembered URL and status.
+   * `undefined` when it reports none — {@link nextCommittedNavigation} over the
+   * tab's remembered URL and status, whose memo is kept for the tab's next
+   * event. A load Chrome reports in two events (the `loading` entry naming a
+   * `pendingUrl`, then the `url` at commit) therefore reports once.
    */
   function committedNavigationUrl(
     tabId: TabId,
     changeInfo: WorkerTabChange,
     tab: WorkerTab,
   ): string | undefined {
-    const previous = navigationMemo.get(tabId);
-    navigationMemo.set(tabId, {
-      url: changeInfo.url ?? tab.url ?? previous?.url,
-      status: changeInfo.status ?? previous?.status,
-    });
-    if (changeInfo.url !== undefined) {
-      return changeInfo.url === previous?.url ? undefined : changeInfo.url;
-    }
-    if (changeInfo.status === 'loading' && previous?.status !== 'loading') {
-      return tab.url ?? previous?.url;
-    }
-    return undefined;
+    const step = nextCommittedNavigation(navigationMemo.get(tabId), changeInfo, tab);
+    navigationMemo.set(tabId, step.memo);
+    return step.url;
   }
 
   /**
@@ -1368,6 +4852,14 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
    * controller re-arms the new document (same origin) or clears the
    * configuration (different origin). Unbound tabs are not reported, to keep
    * the service free of every other tab's browsing.
+   *
+   * A bound tab that commits a document with no URL form the service accepts
+   * (`chrome://`, `about:blank`, `file:`, an extension page) has left the app
+   * just as surely as one that moved to another web origin, so it is never
+   * dropped silently: the registry ends the binding with a sanitized
+   * `session.unbind { tabId }` alone — the URL never leaves the worker — and
+   * shows the panel "Tab left ‹origin›", and the agent controller clears the
+   * tab's configuration, exactly as for a reported cross-origin navigation.
    */
   async function handleTabUpdated(
     tabId: TabId,
@@ -1389,33 +4881,17 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
         : urlFallbacks(redacted).find(
             (candidate) => parseTabNavigatedPayload({ tabId, url: candidate }).ok,
           );
-    if (reported === undefined) {
-      log.debug('A navigation of a bound tab has no URL the service accepts.', { tabId });
-      return;
-    }
-    const decision = await registry.handleNavigated({ tabId, url: reported });
+    const decision =
+      reported === undefined
+        ? await registry.handleUnreportableNavigation(tabId)
+        : await registry.handleNavigated({ tabId, url: reported });
     const outcome = agent.handleNavigationDecision(decision);
     log.info('Committed navigation of a bound tab.', {
       tabId,
+      reportable: reported !== undefined,
       decision: decision.kind,
       agent: outcome.kind,
     });
-  }
-
-  /** The service asked for a target: let the DevTools page offer its selection too. */
-  async function forwardTargetRequest(payload: MessagePayload<'target.request'>): Promise<void> {
-    const tabId = await registry.getTabForSession(payload.sessionId);
-    if (tabId === undefined) {
-      return;
-    }
-    const delivered = hub.sendToDevtools(tabId, {
-      channel: EXTENSION_CHANNEL,
-      version: PORT_PROTOCOL_VERSION,
-      direction: 'downstream',
-      type: 'target.request',
-      payload,
-    });
-    log.debug('target.request forwarded to DevTools.', { tabId, delivered });
   }
 
   // -------------------------------------------------------------------------
@@ -1425,7 +4901,7 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
   // -------------------------------------------------------------------------
 
   teardown.push(
-    wsBridge.subscribe('agent.config', (message) => {
+    wsBridge.subscribe(MESSAGE_TYPE.AGENT_CONFIG, (message) => {
       background(
         agent.applyConfig(message.payload).then((outcome) => {
           log.debug('agent.config applied.', {
@@ -1433,10 +4909,10 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
             outcome: outcome.kind,
           });
         }),
-        'agent.config',
+        MESSAGE_TYPE.AGENT_CONFIG,
       );
     }),
-    wsBridge.subscribe('session.bound', (message) => {
+    wsBridge.subscribe(MESSAGE_TYPE.SESSION_BOUND, (message) => {
       // The authoritative binding write, the announced replacement included.
       background(
         registry.applyBound(message.payload).then((applied) => {
@@ -1446,29 +4922,46 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
             errorCode: errorCode(applied),
           });
         }),
-        'session.bound',
+        MESSAGE_TYPE.SESSION_BOUND,
       );
     }),
-    wsBridge.subscribe('capture.started', (message) => {
+    wsBridge.subscribe(MESSAGE_TYPE.CAPTURE_STARTED, (message) => {
       // Stored on the bound tab, so a reload mid-capture continues the same capture.
-      background(registry.handleCaptureStarted(message.payload), 'capture.started');
+      background(registry.handleCaptureStarted(message.payload), MESSAGE_TYPE.CAPTURE_STARTED);
     }),
-    wsBridge.subscribe('capture.stopped', (message) => {
-      background(registry.handleCaptureStopped(message.payload), 'capture.stopped');
+    wsBridge.subscribe(MESSAGE_TYPE.CAPTURE_STOPPED, (message) => {
+      background(registry.handleCaptureStopped(message.payload), MESSAGE_TYPE.CAPTURE_STOPPED);
     }),
-    wsBridge.subscribe('session.updated', (message) => {
+    wsBridge.subscribe(MESSAGE_TYPE.SESSION_UPDATED, (message) => {
       // An ended session unbinds its tab; the binding change disarms the agent.
-      background(registry.handleSessionUpdated(message.payload), 'session.updated');
+      background(registry.handleSessionUpdated(message.payload), MESSAGE_TYPE.SESSION_UPDATED);
     }),
-    wsBridge.subscribe('cleanup.completed', (message) => {
-      background(registry.handleSessionEnded(message.payload.sessionId), 'cleanup.completed');
+    wsBridge.subscribe(MESSAGE_TYPE.CLEANUP_COMPLETED, (message) => {
+      background(
+        registry.handleSessionEnded(message.payload.sessionId),
+        MESSAGE_TYPE.CLEANUP_COMPLETED,
+      );
     }),
-    wsBridge.subscribe('session.created', () => {
+    wsBridge.subscribe(MESSAGE_TYPE.SESSION_CREATED, () => {
       background(rebindAnnouncedTabs('session-created'), 'rebind after session.created');
     }),
-    wsBridge.subscribe('target.request', (message) => {
-      // The panel enters picker mode from the relayed frame itself.
-      background(forwardTargetRequest(message.payload), 'target.request');
+    wsBridge.subscribe(MESSAGE_TYPE.TARGET_REQUEST, (message) => {
+      // The service asked the bound tab for a target (the editor's
+      // `POST /sessions/:id/target/request`, AAP §0.4.2: it "asks the panel to
+      // enter picker mode"). `ws-bridge.ts` relays the frame to the tab's
+      // panels, and the panel is the one arming authority: it enters picker
+      // mode and arms the page agent through `target.pick`, reporting a
+      // failure and leaving picker mode when that fails. Arming here as well
+      // would arm twice, and nothing is sent to the DevTools page, whose
+      // Elements selection must not become the target unasked.
+      log.debug('target.request relayed to the panels, which arm picker mode.', {
+        sessionId: message.payload.sessionId,
+      });
+    }),
+    wsBridge.subscribe(MESSAGE_TYPE.SOURCE_RESULT, (message) => {
+      // An answer to a request whose port request already timed out still
+      // retires its id, so the ledger holds only requests awaiting one.
+      sourceOpenRefs.forget(message.payload.ref);
     }),
     registry.onChange(handleBindingChange),
     store.onStateChange((state) => {
@@ -1494,15 +4987,19 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
   /** Start (or keep) the socket once the cold-start work has settled. */
   function ensureConnected(trigger: string): void {
     background(
-      ready.then(() => wsBridge.connect()),
+      ready.then(async () => {
+        await reloadUnverifiedServiceEndpoint();
+        await wsBridge.connect();
+      }),
       `connect on ${trigger}`,
     );
   }
 
   // Installed, updated or a profile started: start the socket when a
-  // credential exists. The keepalive alarm is created by `wsBridge.connect()`
-  // and nowhere else, only when there is a socket to keep alive, and
-  // `alarms.create` replaces an alarm of the same name, so this is idempotent.
+  // credential exists. The keepalive alarm is created only by the bridge — by
+  // `wsBridge.connect()`, and re-created by its heartbeat while a socket is
+  // open — so only when there is a socket to keep alive, and `alarms.create`
+  // replaces an alarm of the same name, so this is idempotent.
   listen(runtime.onInstalled, (details) => {
     log.info('Extension installed or updated.', { reason: details.reason });
     ensureConnected('installed');
@@ -1526,6 +5023,14 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
   listen(tabs.onRemoved, (tabId) => {
     navigationMemo.delete(tabId);
     announcedTabs.delete(tabId);
+    cancelHydration(tabId, 'tab-closed');
+    // Batches already queued still settle on their own lane (and find the tab
+    // unbound once the unbind below lands; one waiting for the tab's route
+    // ends when the service withdraws it, or at its deadline); the entry
+    // itself is released now.
+    telemetryLanes.delete(tabId);
+    // A closed tab has no panel left to be told of its loss.
+    forgetTelemetryLoss(tabId);
     agent.clear(tabId);
     background(
       registry.unbind(tabId, 'tab-closed').then((removed) => {
@@ -1536,6 +5041,13 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
       'tab removal',
     );
   });
+
+  // The service address the pairing dialog saves takes effect at once, on the
+  // socket and on every HTTP call; the credential store adds its own listener
+  // to the same event for the credential's key.
+  if (storage.local.onChanged !== undefined) {
+    listen(storage.local.onChanged, handleServiceEndpointChange);
+  }
 
   // The keepalive tick; every other alarm belongs to no module here.
   listen(alarms.onAlarm, (alarm) => {
@@ -1564,22 +5076,36 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
   // Cold start — after every listener exists
   // -------------------------------------------------------------------------
 
-  /** Hydrate the bindings, read the credential and, with one, open the socket. */
+  /**
+   * Hydrate the bindings, put the stored service address in force, read the
+   * credential and, with one, open the socket — at that address.
+   */
   async function start(): Promise<void> {
-    const bindings = await registry.reload();
-    for (const binding of bindings) {
-      boundTabs.add(binding.tabId);
+    try {
+      const bindings = await registry.reload();
+      await establishServiceEndpoint();
+      await wsBridge.connect();
+      log.info('Worker started.', {
+        bindings: bindings.length,
+        status: wsBridge.snapshot().status,
+      });
+    } finally {
+      // A start-up that failed before the read still reads the setting and
+      // opens the gate, so pairing and the next connect are not held forever
+      // — with a refusal in force when the read fails. A no-op otherwise.
+      await establishServiceEndpoint();
     }
-    await wsBridge.connect();
-    log.info('Worker started.', {
-      bindings: bindings.length,
-      status: wsBridge.snapshot().status,
-    });
   }
 
-  const ready: Promise<void> = start().then(undefined, (cause: unknown) => {
-    log.error('Worker start-up failed.', { error: errorName(cause) });
-  });
+  // `coldStartSettled` flips inside the chain, so every continuation of
+  // `ready` already sees start-up as settled.
+  const ready: Promise<void> = start()
+    .then(undefined, (cause: unknown) => {
+      log.error('Worker start-up failed.', { error: errorName(cause) });
+    })
+    .then(() => {
+      coldStartSettled = true;
+    });
 
   function dispose(): void {
     if (disposed) {
@@ -1593,22 +5119,32 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
         log.warn('Releasing a listener failed.', { error: errorName(cause) });
       }
     }
+    for (const tabId of new Set([...hydrations.keys(), ...hydrationRetries.keys()])) {
+      cancelHydration(tabId, 'disposed');
+    }
+    releaseTelemetryCustody();
     agent.dispose();
     hub.disposeAll();
     store.dispose();
+    // Queued batches settle without sending: `forwardTelemetryBatch` checks
+    // `disposed` once the cold start has settled, a batch waiting for its
+    // route is released by the bridge's close below, and each job clears its
+    // own deadline timer as it settles.
+    telemetryLanes.clear();
     background(wsBridge.close(), 'close');
     log.info('Worker disposed.');
   }
 
   return Object.freeze({
     ready,
-    httpClient,
+    get httpClient(): HttpClient {
+      return httpClient;
+    },
     store,
     hub,
     registry,
     agent,
     wsBridge,
-    requestConsentedReload: (tabId: TabId) => agent.requestConsentedReload(tabId),
     dispose,
   });
 }

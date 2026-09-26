@@ -62,15 +62,18 @@
  *     `unionDurationMs` and the rest — takes part in either building or
  *     verifying a fixture. A test that reused the implementation's own
  *     arithmetic would agree with it whatever it computed.
- *   - **Layout is absent, and stubbed only where a case is about it.**
- *     happy-dom reports a zero-width viewport, so most cases draw in the
- *     component's unmeasured mode — a fixed 1 000-unit coordinate space
- *     stretched to the container, with labels fitted by the deterministic
- *     estimate, and a bounded window of tree rows — and its geometry is
- *     arithmetic a case can assert exactly. The measured-canvas cases give the
- *     chart's viewport, and nothing else, a `clientWidth`; the scrolling cases
- *     give the tree's viewport and rows, and nothing else, their block sizes.
- *     Every such spy is restored by `afterEach`; no global layout is faked.
+ *   - **Layout is absent, and never stubbed.** happy-dom lays nothing out, and
+ *     the component reads no size: the chart always draws in its fixed
+ *     1 000-unit logical space, with labels fitted by the deterministic advance
+ *     estimate in the same units, and the tree always renders one page of
+ *     rows, the page holding its tab stop, which its row controls and its
+ *     keys turn by count — so every case runs exactly as a browser would, and
+ *     its geometry and its paging are arithmetic a case can assert exactly. No
+ *     layout API (`getBoundingClientRect`, `ResizeObserver`, `client*`,
+ *     `offset*`, `scroll*` sizes) is spied on or faked anywhere. The one spy on
+ *     an element method is on `scrollIntoView`, a request the component makes
+ *     of the browser rather than a size it reads: it records whether a
+ *     selection made elsewhere asked for its row to be revealed.
  *   - **Generic fixture vocabulary only** (AAP 0.5.2, 0.5.4): operation names, a
  *     file path and a symbol that belong to no application, demonstration or
  *     otherwise. `scripts/check-no-hardcoding.mjs` scans this text with the rest
@@ -80,10 +83,8 @@
  *     element already obtained semantically, since no `jest-dom` matcher is
  *     available in this repository.
  *   - **No timers, no fake clocks, no arbitrary waits.** Post-resolution
- *     assertions go through `await screen.findBy…`, interactions through
- *     `userEvent`, and the one asynchronous hand-over that is not a query —
- *     the virtualizer taking the render over once it has measured — through
- *     `waitFor` on the state it produces.
+ *     assertions go through `await screen.findBy…` and interactions through
+ *     `userEvent`.
  *
  * @see ./FlameChart for the component, its states, its notes and its classes.
  * @see ../host/DataProvider for the seam the stubs below implement.
@@ -104,7 +105,7 @@ import type {
   TraceNode,
   TraceTree,
 } from '@debuggen/telemetry';
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { ReactElement } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -114,8 +115,7 @@ import { DataProviderContext, PanelSessionContext, createDataProvider } from '..
 import type { DataProvider, DataQueryResolver, DataQueryResponse } from '../host/DataProvider';
 import { PanelActionsContext, PanelSelectionContext } from '../host/PanelActions';
 import type { PanelActions, PanelEventRef, PanelSelectionState } from '../host/PanelActions';
-import { formatDuration, formatCount } from '../utils/format';
-import { estimateTextWidth } from '../utils/measure';
+import { estimateTextWidth, formatDuration, formatCount } from '../utils/format';
 import { kindColorVar, kindInkColorVar } from '../utils/color';
 import { FlameChart } from './FlameChart';
 
@@ -746,9 +746,9 @@ function frameList(): HTMLElement {
 /**
  * Its RENDERED rows, in document order.
  *
- * The tree is virtualized, so this is every row only while the list is short
- * enough to render whole — every fixture below except the one built to prove
- * the window is bounded.
+ * The tree renders one page of rows, the page holding its tab stop, so this
+ * is every row only while the list is short enough to be one page — every
+ * fixture below except the ones built to prove the tree is paged.
  */
 function frameRows(): HTMLElement[] {
   return within(frameList()).getAllByRole('treeitem');
@@ -1027,32 +1027,6 @@ function viewBoxOf(): readonly number[] {
   return (canvas().getAttribute('viewBox') ?? '').split(' ').map(Number);
 }
 
-/**
- * Gives the chart's scroll viewport — and no other element — a laid-out inner
- * width, as a browser would report it.
- *
- * happy-dom performs no layout, so every element reports a `clientWidth` of
- * `0` and the chart draws in its unmeasured mode. The spy answers `width` for
- * `.dg-flame__viewport` alone and defers to happy-dom for everything else, and
- * the suite's `afterEach` restores the prototype, so the stub cannot reach
- * another case.
- *
- * @param width The inner width to report, in CSS pixels.
- */
-function layOutFlameViewport(width: number): void {
-  const native = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'clientWidth');
-
-  vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockImplementation(function clientWidth(
-    this: HTMLElement,
-  ): number {
-    if (this.classList.contains('dg-flame__viewport')) {
-      return width;
-    }
-    const fallback: unknown = native?.get?.call(this);
-    return typeof fallback === 'number' ? fallback : 0;
-  });
-}
-
 /** The single query a stub provider received, failing on any other count. */
 function soleQuery(stub: StubProvider): DataQuery {
   expect(stub.queries).toHaveLength(1);
@@ -1292,6 +1266,14 @@ const SHORT_SIBLINGS_ROOT_MS = 1000;
 /** How many back-to-back 1 ms siblings it holds. */
 const SHORT_SIBLING_COUNT = 40;
 
+/** One sibling of {@link shortSiblingsTree} that resolved to a place in the project. */
+interface SourcedSibling {
+  /** The sibling's 0-based index among the root's children. */
+  readonly index: number;
+  /** The location it resolved to. */
+  readonly source: SourceLocation;
+}
+
 /**
  * A root holding `count` consecutive 1 ms operations.
  *
@@ -1299,15 +1281,20 @@ const SHORT_SIBLING_COUNT = 40;
  * ended. Drawn, each is a thousandth of the canvas and is widened to the
  * scale's minimum visible width, so neighbours overlap: exactly the shape that
  * painted frames over one another before rows were packed. At a few hundred
- * siblings it is also the long list the virtualization case needs, and at a
- * few thousand the trace the row bound stops short of.
+ * siblings it is also the long list the bounded-tree cases need, and at a few
+ * thousand the trace the drawn-row budget pages through.
  *
  * @param count How many siblings. The root's window is
  * {@link SHORT_SIBLINGS_ROOT_MS}, widened to one millisecond per sibling when
  * there are more, so every child lies inside it.
+ * @param sourced The one sibling that carries a resolved location, if any —
+ * for the cases that open a source from a row past the tree's first page.
  * @returns The correlated trace.
  */
-function shortSiblingsTree(count: number = SHORT_SIBLING_COUNT): TraceTree {
+function shortSiblingsTree(
+  count: number = SHORT_SIBLING_COUNT,
+  sourced?: SourcedSibling,
+): TraceTree {
   const root = makeEvent({
     id: 'event-example-0100',
     spanId: spanIdFor(100),
@@ -1332,6 +1319,7 @@ function shortSiblingsTree(count: number = SHORT_SIBLING_COUNT): TraceTree {
         duration: 1,
         seq: index + 1,
         ingestSeq: index + 2,
+        source: sourced !== undefined && sourced.index === index ? sourced.source : undefined,
       }),
       [],
       1,
@@ -1469,25 +1457,28 @@ function deepChain(levels: number): TraceTree {
 
 /*
  * ---------------------------------------------------------------------------
- * Row-bounded traces, for the partial-result notice
+ * Traces larger than one drawing, for the drawn-row budget
  *
- * The step is the component's own default row bound, restated so the counts
- * below are stated numbers rather than whatever the traversal currently does.
+ * The budget is the component's own — `../utils/scale`'s `MAX_DRAWN_ROWS` —
+ * restated so the counts below are stated numbers rather than whatever the
+ * window currently does.
  * ---------------------------------------------------------------------------
  */
 
-/** The traversal's default row bound, and the step "Show more" raises it by. */
-const ROW_BOUND_STEP = 2000;
+/** The most operations the chart draws at once, however often more is asked for. */
+const DRAWN_ROW_BUDGET = 2000;
 
 /**
- * Siblings under one root for the row-bound case: with the root, one
- * operation more than two steps, so the bound is raised twice — once by a
- * whole step, then capped at the trace's own count.
+ * Siblings under one root for the paging cases: with the root, two whole
+ * windows and one operation more, so the last window holds a single frame.
  */
-const ROW_BOUNDED_SIBLING_COUNT = 2 * ROW_BOUND_STEP;
+const PAGED_SIBLING_COUNT = 2 * DRAWN_ROW_BUDGET;
 
-/** The label of the control that raises the row bound. */
-const SHOW_MORE_NAME = 'Show more operations';
+/** The control that moves the drawn window back. */
+const PREVIOUS_NAME = 'Previous operations';
+
+/** The control that moves the drawn window on. */
+const NEXT_NAME = 'Next operations';
 
 /** The badge every partial result carries. */
 const PARTIAL_RESULT_BADGE = 'Partial result';
@@ -1496,20 +1487,20 @@ const PARTIAL_RESULT_BADGE = 'Partial result';
 const DEPTH_ENDED_CHAIN_LEVELS = 40;
 
 /**
- * A trace whose walk ends on exactly the row bound because the DEPTH bound cut
- * the rest — the case a row-bound notice would misreport.
+ * A trace whose operations within the depth bound number exactly one drawn
+ * window while the trace itself holds more — the chain levels below the bound
+ * — which is the case a paging control would misreport: no page holds them.
  *
  * One root holds a chain of {@link DEPTH_ENDED_CHAIN_LEVELS} levels and enough
  * 1 ms leaves that the operations the depth bound lets through — the root,
  * chain levels 1 … {@link ICICLE_DEPTH_BOUND}, and the leaves — number exactly
- * {@link ROW_BOUND_STEP}, while the trace itself holds more than that: the
- * chain levels below the bound.
+ * {@link DRAWN_ROW_BUDGET}.
  *
  * @returns The correlated trace.
  */
 function depthEndedTree(): TraceTree {
   const reachableChainLevels = ICICLE_DEPTH_BOUND;
-  const leafCount = ROW_BOUND_STEP - 1 - reachableChainLevels;
+  const leafCount = DRAWN_ROW_BUDGET - 1 - reachableChainLevels;
   const windowMs = leafCount + DEEP_CHAIN_ROOT_DURATION_MS;
   const rootSpanId = spanIdFor(3000);
 
@@ -2248,17 +2239,76 @@ describe('FlameChart interactions', () => {
   });
 });
 
-/** How many 1 ms siblings the virtualization case lists under its root. */
+/** How many 1 ms siblings the bounded-tree cases list under their root. */
 const LONG_SIBLING_COUNT = 499;
 
 /**
- * The most rows the tree may put in the document while nothing is measured.
+ * The most rows the tree may put in the document at once.
  *
- * Deliberately looser than the component's own window: the contract is that
- * the list is BOUNDED, not what the bound is, and a case pinned to the exact
- * window would fail on a tuning change that broke nothing.
+ * Deliberately looser than the component's own page: the contract of the
+ * cases that use it is that the list is BOUNDED, not what the bound is, and a
+ * case pinned to the exact page would fail on a tuning change that broke
+ * nothing.
  */
 const RENDERED_ROW_CEILING = 100;
+
+/**
+ * How many rows one page of the tree holds: the component's text-row budget.
+ *
+ * Pinned exactly, unlike {@link RENDERED_ROW_CEILING}, by the cases that turn
+ * pages: the page's own statement names its rows — "Rows 61–120 of …" — and
+ * those numbers are what a reader hears.
+ */
+const TEXT_ROW_BUDGET = 60;
+
+/** The row control that turns the tree to the page before its own. */
+const PREVIOUS_ROWS_NAME = 'Previous rows';
+
+/** The row control that turns the tree to the page after its own. */
+const NEXT_ROWS_NAME = 'Next rows';
+
+/**
+ * The tree's page statement, as the chart words it: which rows of the list
+ * the page shows, of how many.
+ *
+ * Spelled out here rather than read back from the component, so a case pins
+ * the words a reader hears.
+ *
+ * @param start The page's first row, 0-based among the tree's rows.
+ * @param count How many rows the page shows.
+ * @param total How many rows the tree lists in all.
+ * @returns The sentence.
+ */
+function rowPageStatement(start: number, count: number, total: number): string {
+  return count === 1
+    ? `Row ${formatCount(start + 1)} of ${formatCount(total)} in this list is shown.`
+    : `Rows ${formatCount(start + 1)}–${formatCount(start + count)} of ${formatCount(
+        total,
+      )} in this list are shown.`;
+}
+
+/**
+ * The first row of the last page of a tree of `total` rows: pages are aligned
+ * at multiples of {@link TEXT_ROW_BUDGET}.
+ */
+function lastPageStart(total: number): number {
+  return Math.floor((total - 1) / TEXT_ROW_BUDGET) * TEXT_ROW_BUDGET;
+}
+
+/** A resolved location carried by one sibling past the tree's first page. */
+const LATER_SOURCE: SourceLocation = {
+  file: 'src/example/steps.ts',
+  line: 212,
+  column: 5,
+  symbol: 'runLaterStep',
+  resolvedBy: 'code-graph',
+  confidence: 0.8,
+};
+
+/** The accessible name of {@link LATER_SOURCE}'s chip (`SourceLink`'s own shape). */
+const LATER_CHIP_NAME = `Open ${LATER_SOURCE.file}:${String(LATER_SOURCE.line)}:${String(
+  LATER_SOURCE.column,
+)}`;
 
 describe('FlameChart keyboard', () => {
   it('is one tab stop, however many rows and controls it holds', async () => {
@@ -2494,24 +2544,33 @@ describe('FlameChart keyboard', () => {
   });
 });
 
-describe('FlameChart virtualization', () => {
-  it('renders a bounded window of a long tree while every row states its place', async () => {
+describe('FlameChart bounded tree', () => {
+  it('renders one page of a long tree while every row states its place', async () => {
     const tree = shortSiblingsTree(LONG_SIBLING_COUNT);
     const stub = resolvingProvider(tree);
     const user = userEvent.setup();
+    const rowTotal = tree.nodeCount;
+    const lastStart = lastPageStart(rowTotal);
 
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
 
     await screen.findByRole('tree');
 
-    // Every frame is drawn on the canvas, but only a window of rows is in the
-    // document: this test DOM measures nothing, which is the bounded state a
-    // real browser starts in too.
-    expect(tree.nodeCount).toBe(LONG_SIBLING_COUNT + 1);
-    expect(drawnFrames()).toHaveLength(tree.nodeCount);
+    // Every frame is drawn on the canvas, but only one page of rows is in the
+    // document, and the statement beside the row controls says which. The
+    // page is a count, not a measurement: nothing is laid out here, and the
+    // same rows render in a browser.
+    expect(rowTotal).toBe(LONG_SIBLING_COUNT + 1);
+    expect(drawnFrames()).toHaveLength(rowTotal);
     const rendered = frameRows();
-    expect(rendered.length).toBeGreaterThan(0);
-    expect(rendered.length).toBeLessThan(RENDERED_ROW_CEILING);
+    expect(rendered).toHaveLength(TEXT_ROW_BUDGET);
+    const statement = screen.getByText(rowPageStatement(0, TEXT_ROW_BUDGET, rowTotal));
+
+    // The rows sit in normal flow, owned by the tree directly: no positioning
+    // wrapper, and no scroll height advertised from an estimate of row sizes.
+    expect(rendered.every((row) => row.parentElement === frameList())).toBe(true);
+    expect(frameList().querySelector('.dg-virtual-row')).toBeNull();
+    expect(frameList().style.getPropertyValue('--dgc-virtual-total')).toBe('');
 
     // Each rendered row still states its level and its position among ALL of
     // its siblings, not among the rendered ones.
@@ -2526,22 +2585,209 @@ describe('FlameChart virtualization', () => {
     expect(firstChild.getAttribute('aria-setsize')).toBe(String(LONG_SIBLING_COUNT));
     expect(firstChild.getAttribute('aria-posinset')).toBe('1');
 
-    // End reaches the last row, which the window follows, and it is focused.
+    // End reaches the last row, on the last page, which the tree turns to,
+    // and it is focused.
     await user.tab();
     await user.keyboard('{End}');
     const last = focusedRow();
     expect(nameOfRow(last)).toBe(`example.step.${String(LONG_SIBLING_COUNT - 1).padStart(3, '0')}`);
     expect(last.getAttribute('aria-posinset')).toBe(String(LONG_SIBLING_COUNT));
     expect(last.getAttribute('aria-setsize')).toBe(String(LONG_SIBLING_COUNT));
-    expect(frameRows().length).toBeLessThan(RENDERED_ROW_CEILING);
+    expect(statement.textContent).toBe(rowPageStatement(lastStart, rowTotal - lastStart, rowTotal));
+    expect(frameRows()).toHaveLength(rowTotal - lastStart);
     expect(tabStops()).toEqual([last]);
 
-    // ArrowUp from there stays inside the window, and Home goes back to the top.
+    // ArrowUp from there stays on that page, and Home goes back to the first.
     await user.keyboard('{ArrowUp}');
     expect(focusedRow().getAttribute('aria-posinset')).toBe(String(LONG_SIBLING_COUNT - 1));
+    expect(statement.textContent).toBe(rowPageStatement(lastStart, rowTotal - lastStart, rowTotal));
     await user.keyboard('{Home}');
     expect(nameOfRow(focusedRow())).toBe('example.batch');
-    expect(frameRows().length).toBeLessThan(RENDERED_ROW_CEILING);
+    expect(statement.textContent).toBe(rowPageStatement(0, TEXT_ROW_BUDGET, rowTotal));
+    expect(frameRows()).toHaveLength(TEXT_ROW_BUDGET);
+  });
+
+  it('turns to a later page by pointer, where a row’s source chip opens its own location', async () => {
+    // The sibling past the first page that resolved to a location: its row is
+    // row 72 of the tree (the root is the first), on the second page.
+    const sourcedIndex = TEXT_ROW_BUDGET + 10;
+    const tree = shortSiblingsTree(LONG_SIBLING_COUNT, {
+      index: sourcedIndex,
+      source: LATER_SOURCE,
+    });
+    const spies = makeActions();
+    const user = userEvent.setup();
+    const rowTotal = tree.nodeCount;
+    const target = pagedSiblingName(sourcedIndex);
+
+    // Taken BEFORE the render, as in the first-page source case: a component
+    // that added a field to the fixture in place must not pass.
+    const expectedKeys = Object.keys({ ...LATER_SOURCE }).sort();
+
+    renderComponent(makeNode(), {
+      provider: resolvingProvider(tree).provider,
+      actions: spies.actions,
+    });
+    await screen.findByRole('tree');
+
+    // On the first page the row is not mounted, and neither is its chip.
+    expect(frameRows()).toHaveLength(TEXT_ROW_BUDGET);
+    expect(frameNames()).not.toContain(target);
+    expect(screen.queryByRole('button', { name: LATER_CHIP_NAME })).toBeNull();
+
+    // One click on the row control turns to the next page, which mounts it,
+    // and asks the browser — once, by the least distance — to bring that
+    // page's first row into the tree's viewport, so the page opens at its
+    // top. The spy records the request; nothing is laid out or measured.
+    const reveal = spyOnReveal();
+    await user.click(pagingControl(NEXT_ROWS_NAME));
+    expect(
+      screen.getByText(rowPageStatement(TEXT_ROW_BUDGET, TEXT_ROW_BUDGET, rowTotal)),
+    ).toBeDefined();
+    const [pageFirst] = frameRows();
+    if (pageFirst === undefined) {
+      throw new Error('the second page rendered no rows');
+    }
+    expect(nameOfRow(pageFirst)).toBe(pagedSiblingName(TEXT_ROW_BUDGET - 1));
+    expect(revealedElements(reveal)).toEqual([pageFirst]);
+    expect(reveal).toHaveBeenLastCalledWith(ROW_REVEAL_OPTIONS);
+    const row = rowNamed(target);
+    const treeIndex = TEXT_ROW_BUDGET + frameRows().indexOf(row);
+    expect(treeIndex).toBe(sourcedIndex + 1);
+    expect(treeIndex).toBeGreaterThan(TEXT_ROW_BUDGET);
+    expect(row.getAttribute('aria-posinset')).toBe(String(sourcedIndex + 1));
+
+    // Its chip hands the host that very location, once, and selects nothing.
+    await user.click(within(row).getByRole('button', { name: LATER_CHIP_NAME }));
+    expect(spies.onOpenSource).toHaveBeenCalledTimes(1);
+    const [call] = spies.onOpenSource.mock.calls;
+    if (call === undefined) {
+      throw new Error('the open-source handler recorded no call');
+    }
+    expect(call[0]).toEqual(LATER_SOURCE);
+    expect(Object.keys(call[0]).sort()).toEqual(expectedKeys);
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+    expect(spies.onExpand).not.toHaveBeenCalled();
+
+    // Turning the page drew nothing new and dropped nothing: the canvas still
+    // draws every frame.
+    expect(drawnFrames()).toHaveLength(rowTotal);
+  });
+
+  it('states which rows are shown, and spends each row control at its end', async () => {
+    const tree = shortSiblingsTree(LONG_SIBLING_COUNT);
+    const spies = makeActions();
+    const user = userEvent.setup();
+    const rowTotal = tree.nodeCount;
+    const lastStart = lastPageStart(rowTotal);
+
+    renderComponent(makeNode(), {
+      provider: resolvingProvider(tree).provider,
+      actions: spies.actions,
+    });
+    await screen.findByRole('tree');
+
+    // The first page: stated politely, so every page is announced, with only
+    // the control that can turn it enabled.
+    const statement = screen.getByText(rowPageStatement(0, TEXT_ROW_BUDGET, rowTotal));
+    expect(statement.getAttribute('aria-live')).toBe('polite');
+    expect(pagingControl(PREVIOUS_ROWS_NAME).disabled).toBe(true);
+    expect(pagingControl(NEXT_ROWS_NAME).disabled).toBe(false);
+
+    // Every page in turn, to the last: the same statement element says which
+    // rows it shows, exactly those rows are mounted, and the one tab stop
+    // moved to the page's first row — a row that is in the document.
+    for (let start = TEXT_ROW_BUDGET; start < rowTotal; start += TEXT_ROW_BUDGET) {
+      await user.click(pagingControl(NEXT_ROWS_NAME));
+      const count = Math.min(TEXT_ROW_BUDGET, rowTotal - start);
+      expect(statement.isConnected).toBe(true);
+      expect(statement.textContent).toBe(rowPageStatement(start, count, rowTotal));
+      expect(frameRows()).toHaveLength(count);
+      expect(tabStops().map(nameOfRow)).toEqual([pagedSiblingName(start - 1)]);
+      expect(pagingControl(PREVIOUS_ROWS_NAME).disabled).toBe(false);
+    }
+
+    // The last page spends its control, and the focus it held moves to the
+    // other control rather than to the document.
+    expect(statement.textContent).toBe(rowPageStatement(lastStart, rowTotal - lastStart, rowTotal));
+    expect(pagingControl(NEXT_ROWS_NAME).disabled).toBe(true);
+    expect(document.activeElement).toBe(pagingControl(PREVIOUS_ROWS_NAME));
+
+    // And back to the first page, where the other control is spent in turn.
+    for (let start = lastStart - TEXT_ROW_BUDGET; start >= 0; start -= TEXT_ROW_BUDGET) {
+      await user.click(pagingControl(PREVIOUS_ROWS_NAME));
+      expect(statement.textContent).toBe(rowPageStatement(start, TEXT_ROW_BUDGET, rowTotal));
+    }
+    expect(pagingControl(PREVIOUS_ROWS_NAME).disabled).toBe(true);
+    expect(document.activeElement).toBe(pagingControl(NEXT_ROWS_NAME));
+    expect(tabStops().map(nameOfRow)).toEqual(['example.batch']);
+
+    // The keyboard turns it too: Enter on the focused control, which keeps
+    // its focus, and Shift+Tab back past the other control enters the tree on
+    // the new page's first row.
+    await user.keyboard('{Enter}');
+    expect(statement.textContent).toBe(
+      rowPageStatement(TEXT_ROW_BUDGET, TEXT_ROW_BUDGET, rowTotal),
+    );
+    expect(document.activeElement).toBe(pagingControl(NEXT_ROWS_NAME));
+    await user.tab({ shift: true });
+    expect(document.activeElement).toBe(pagingControl(PREVIOUS_ROWS_NAME));
+    await user.tab({ shift: true });
+    expect(nameOfRow(focusedRow())).toBe(pagedSiblingName(TEXT_ROW_BUDGET - 1));
+    expect(tabStops()).toEqual([focusedRow()]);
+
+    // Turning pages is neither a selection nor a disclosure.
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+    expect(spies.onExpand).not.toHaveBeenCalled();
+  });
+
+  it('turns the page when a key steps past either edge of it, keeping one tab stop', async () => {
+    const tree = shortSiblingsTree(LONG_SIBLING_COUNT);
+    const user = userEvent.setup();
+    const rowTotal = tree.nodeCount;
+    const lastStart = lastPageStart(rowTotal);
+
+    renderComponent(makeNode(), {
+      provider: resolvingProvider(tree).provider,
+      actions: makeActions().actions,
+    });
+    await screen.findByRole('tree');
+    const statement = screen.getByText(rowPageStatement(0, TEXT_ROW_BUDGET, rowTotal));
+
+    // Down to the last row of the first page: still the first page.
+    await user.tab();
+    expect(nameOfRow(focusedRow())).toBe('example.batch');
+    await user.keyboard(`{ArrowDown>${String(TEXT_ROW_BUDGET - 1)}/}`);
+    expect(nameOfRow(focusedRow())).toBe(pagedSiblingName(TEXT_ROW_BUDGET - 2));
+    expect(statement.textContent).toBe(rowPageStatement(0, TEXT_ROW_BUDGET, rowTotal));
+
+    // One more step leaves the page: the next page is mounted in its place,
+    // and its first row holds focus and the one tab stop.
+    await user.keyboard('{ArrowDown}');
+    const first = focusedRow();
+    expect(nameOfRow(first)).toBe(pagedSiblingName(TEXT_ROW_BUDGET - 1));
+    expect(statement.textContent).toBe(
+      rowPageStatement(TEXT_ROW_BUDGET, TEXT_ROW_BUDGET, rowTotal),
+    );
+    expect(frameRows()).toHaveLength(TEXT_ROW_BUDGET);
+    expect(frameRows()[0]).toBe(first);
+    expect(frameNames()).not.toContain('example.batch');
+    expect(tabStops()).toEqual([first]);
+    expect(tabbableInTree()).toEqual([first]);
+
+    // ArrowUp steps back across the edge, onto the last row of the first page.
+    await user.keyboard('{ArrowUp}');
+    expect(nameOfRow(focusedRow())).toBe(pagedSiblingName(TEXT_ROW_BUDGET - 2));
+    expect(statement.textContent).toBe(rowPageStatement(0, TEXT_ROW_BUDGET, rowTotal));
+    expect(tabStops()).toEqual([focusedRow()]);
+
+    // End and Home turn to the last and the first page.
+    await user.keyboard('{End}');
+    expect(statement.textContent).toBe(rowPageStatement(lastStart, rowTotal - lastStart, rowTotal));
+    expect(tabStops()).toEqual([focusedRow()]);
+    await user.keyboard('{Home}');
+    expect(statement.textContent).toBe(rowPageStatement(0, TEXT_ROW_BUDGET, rowTotal));
+    expect(tabStops()).toEqual([focusedRow()]);
   });
 });
 
@@ -2570,7 +2816,8 @@ describe('FlameChart honesty', () => {
     const notice = screen.getByText(/arrived incomplete/i);
     expect(notice.textContent).toMatch(/narrow the query or capture a shorter interaction/i);
     expect(badge.parentElement).toBe(notice.parentElement);
-    expect(screen.queryByRole('button', { name: SHOW_MORE_NAME })).toBeNull();
+    expect(screen.queryByRole('button', { name: PREVIOUS_NAME })).toBeNull();
+    expect(screen.queryByRole('button', { name: NEXT_NAME })).toBeNull();
 
     // The picture says so too, and the notice precedes it.
     expect(canvas().getAttribute('aria-label')).toMatch(/arrived incomplete/i);
@@ -2613,10 +2860,10 @@ describe('FlameChart honesty', () => {
     ).toBe(true);
     expect(notes.some((note) => /folded, hiding \d+ operations/i.test(note))).toBe(true);
 
-    // Neither reduction is a partial result: no larger bound would lift either,
-    // so there is no badge and no control to offer.
+    // Neither reduction is a partial result, and no page holds what either
+    // leaves out, so there is no badge and no control to offer.
     expect(screen.queryByText(PARTIAL_RESULT_BADGE)).toBeNull();
-    expect(screen.queryByRole('button', { name: SHOW_MORE_NAME })).toBeNull();
+    expect(screen.queryByRole('button', { name: NEXT_NAME })).toBeNull();
 
     // The picture and the list agree about what is on screen.
     expect(canvas().querySelectorAll('rect.dg-flame__frame')).toHaveLength(rows.length);
@@ -2891,23 +3138,22 @@ describe('FlameChart hover detail and dismissal', () => {
 
 /*
  * ---------------------------------------------------------------------------
- * Marks and reveals on the virtualized tree
+ * Marks and reveals on the bounded tree
  *
- * The tree renders only a window of its rows, so the selected or hovered
+ * The tree renders only one page of its rows, so the selected or hovered
  * frame's row may not be in the document. Both marks are keyed by frame id and
- * land whenever that row renders; a selection made anywhere but the tree
- * scrolls its row into the tree's own viewport once, and a hover never scrolls
- * it. happy-dom lays nothing out, so the cases that exercise scrolling give
- * the tree's viewport and rows — and no other element — a size through spies
- * the suite's `afterEach` restores.
+ * land whenever that row renders. A selection made anywhere but the tree takes
+ * the tab stop — and with it the rendered page — to its row, and asks the
+ * browser, once, to scroll that row into the tree's own viewport by the least
+ * distance; a hover never does, and neither does the tree's own activation.
+ *
+ * The request is the component's side of the reveal, and the browser does the
+ * rest from its own layout. happy-dom scrolls nothing, so the cases record the
+ * request itself with a spy on `scrollIntoView` — happy-dom's own no-op, called
+ * through — which the suite's `afterEach` restores. No size, offset or scroll
+ * position is read or faked.
  * ---------------------------------------------------------------------------
  */
-
-/** The block size the laid-out cases give the tree's viewport, in CSS pixels. */
-const TREE_VIEWPORT_HEIGHT = 40;
-
-/** The block size the laid-out cases give every tree row, in CSS pixels. */
-const TREE_ROW_HEIGHT = 32;
 
 /** The index, among the long tree's siblings, of the one a host selects. */
 const FAR_SIBLING_INDEX = 300;
@@ -2918,106 +3164,33 @@ function longSibling(index: number): { readonly eventId: string; readonly name: 
   return { eventId: `event-example-short-${suffix}`, name: `example.step.${suffix}` };
 }
 
-/** The tree's scroll container: the role-less viewport around the tree. */
-function treeViewport(): HTMLElement {
-  const viewport = frameList().closest('.dg-virtual-viewport');
-
-  if (!(viewport instanceof HTMLElement)) {
-    throw new Error('the frame tree is not inside its scroll viewport');
-  }
-
-  return viewport;
-}
+/**
+ * The options the tree hands `scrollIntoView`: the least distance on both
+ * axes, confined to the nearest scroll container — the tree's own viewport —
+ * so the page never moves.
+ */
+const ROW_REVEAL_OPTIONS = { block: 'nearest', inline: 'nearest', container: 'nearest' };
 
 /**
- * Lays out the tree's viewport and its rows in normal flow, as a browser
- * would: the viewport is {@link TREE_VIEWPORT_HEIGHT} tall at the top of the
- * page, and the row at index `n` spans `[n, n + 1)` row heights of its content,
- * moved up by however far the viewport is scrolled.
+ * Records every `scrollIntoView` request, calling through to happy-dom's own
+ * no-op. A behaviour spy: it observes what the component asks of the browser,
+ * and answers no layout question.
  */
-function layOutTreeInFlow(): void {
-  const nativeHeight = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'clientHeight');
-
-  vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockImplementation(function clientHeight(
-    this: HTMLElement,
-  ): number {
-    if (this.classList.contains('dg-virtual-viewport')) {
-      return TREE_VIEWPORT_HEIGHT;
-    }
-    const fallback: unknown = nativeHeight?.get?.call(this);
-    return typeof fallback === 'number' ? fallback : 0;
-  });
-
-  vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(
-    function getBoundingClientRect(this: HTMLElement): DOMRect {
-      if (this.classList.contains('dg-virtual-viewport')) {
-        return new DOMRect(0, 0, 0, TREE_VIEWPORT_HEIGHT);
-      }
-      const index = this.getAttribute('data-frame-index');
-      const viewport = this.closest('.dg-virtual-viewport');
-      if (this.getAttribute('role') === 'treeitem' && index !== null && viewport !== null) {
-        const top = Number(index) * TREE_ROW_HEIGHT - viewport.scrollTop;
-        return new DOMRect(0, top, 0, TREE_ROW_HEIGHT);
-      }
-      // happy-dom's own answer for every other element: no layout, no box.
-      return new DOMRect();
-    },
-  );
+function spyOnReveal(): Mock<Element['scrollIntoView']> {
+  return vi.spyOn(Element.prototype, 'scrollIntoView');
 }
 
-/** The block size the virtualized case gives the tree's viewport: eight bands. */
-const VIRTUAL_VIEWPORT_HEIGHT = TREE_VIEWPORT_HEIGHT * 8;
-
-/**
- * Gives the tree's viewport and its positioned rows the sizes the virtualizer
- * reads — the viewport's `offsetHeight`, `clientHeight` and `scrollHeight`,
- * and each row wrapper's `offsetHeight` — so it measures a viewport, takes
- * over the render from the unmeasured window, and may scroll the viewport as
- * far as `rowCount` rows reach.
- *
- * @param rowCount How many rows the tree lists, which sets its scroll range.
- */
-function layOutTreeForVirtualizer(rowCount: number): void {
-  const sized = (
-    property: 'offsetHeight' | 'clientHeight' | 'scrollHeight',
-    size: (element: HTMLElement) => number | undefined,
-  ): void => {
-    const native =
-      Object.getOwnPropertyDescriptor(Element.prototype, property) ??
-      Object.getOwnPropertyDescriptor(HTMLElement.prototype, property);
-
-    vi.spyOn(HTMLElement.prototype, property, 'get').mockImplementation(function measured(
-      this: HTMLElement,
-    ): number {
-      const stated = size(this);
-      if (stated !== undefined) {
-        return stated;
-      }
-      const fallback: unknown = native?.get?.call(this);
-      return typeof fallback === 'number' ? fallback : 0;
-    });
-  };
-
-  const isViewport = (element: HTMLElement): boolean =>
-    element.classList.contains('dg-virtual-viewport');
-
-  sized('offsetHeight', (element) => {
-    if (isViewport(element)) {
-      return VIRTUAL_VIEWPORT_HEIGHT;
-    }
-    return element.classList.contains('dg-virtual-row') ? TREE_ROW_HEIGHT : undefined;
-  });
-  sized('clientHeight', (element) => (isViewport(element) ? VIRTUAL_VIEWPORT_HEIGHT : undefined));
-  sized('scrollHeight', (element) =>
-    isViewport(element) ? rowCount * TREE_ROW_HEIGHT : undefined,
-  );
+/** The elements `scrollIntoView` was called on, in call order. */
+function revealedElements(reveal: Mock<Element['scrollIntoView']>): unknown[] {
+  return reveal.mock.contexts;
 }
 
-describe('FlameChart marks and reveals on the virtualized tree', () => {
+describe('FlameChart marks and reveals on the bounded tree', () => {
   it('marks a host selection far down a long tree, and keys the hover mark by frame', async () => {
     const tree = shortSiblingsTree(LONG_SIBLING_COUNT);
     const far = longSibling(FAR_SIBLING_INDEX);
     const near = longSibling(10);
+    const reveal = spyOnReveal();
     const user = userEvent.setup();
 
     render(
@@ -3028,15 +3201,20 @@ describe('FlameChart marks and reveals on the virtualized tree', () => {
     );
     await screen.findByRole('tree');
 
-    // Unmeasured, the tree renders a bounded window anchored on its tab stop,
-    // which starts on the selected frame: so the selected row is rendered,
-    // marked in every way a row states selection, and is the one stop.
+    // The tree renders the page holding its tab stop, which starts on the
+    // selected frame: so the selected row is rendered, marked in every way a
+    // row states selection, and is the one stop.
     expect(frameRows().length).toBeLessThan(RENDERED_ROW_CEILING);
     const selectedRow = rowNamed(far.name);
     expect(currentRowNames()).toEqual([far.name]);
     expect(selectedRow.getAttribute('aria-selected')).toBe('true');
     expect(tabStops()).toEqual([selectedRow]);
     expect(selectedFrameNames()).toEqual([far.name]);
+
+    // The host's selection arrived from elsewhere, so its row was revealed —
+    // once, and without taking focus.
+    expect(revealedElements(reveal)).toEqual([selectedRow]);
+    expect(document.activeElement).toBe(document.body);
 
     // The hover mark lands on the rendered row of the frame under the pointer.
     await user.hover(frameNamed(far.name));
@@ -3054,10 +3232,13 @@ describe('FlameChart marks and reveals on the virtualized tree', () => {
     expect(hoveredRowNames()).toEqual([far.name]);
     expect(fireEvent.keyDown(document.body, { key: 'Escape' })).toBe(true);
     expect(hoveredRowNames()).toEqual([]);
+
+    // No hover asked for a reveal.
+    expect(reveal).toHaveBeenCalledTimes(1);
   });
 
-  it('scrolls a selection made elsewhere into the tree’s viewport, never one made in the tree', async () => {
-    layOutTreeInFlow();
+  it('asks the browser to reveal a selection made elsewhere, never one made in the tree', async () => {
+    const reveal = spyOnReveal();
     const spies = makeActions();
     const context = { provider: resolvingProvider(CHAIN_TREE).provider, actions: spies.actions };
     const user = userEvent.setup();
@@ -3065,21 +3246,20 @@ describe('FlameChart marks and reveals on the virtualized tree', () => {
     const { rerender } = render(selectionHostedChart({ selection: undefined }, context));
     await screen.findByRole('tree');
 
-    const viewport = treeViewport();
-    expect(viewport.scrollTop).toBe(0);
+    // Nothing is selected, so nothing is revealed.
+    expect(reveal).not.toHaveBeenCalled();
 
-    // Another view selects the handler, the third row: [64, 96) below a 40 px
-    // band. The viewport moves the least that shows it whole — its bottom edge
-    // to the band's — and neither focus nor the page moves.
+    // Another view selects the handler: its row is asked, once, to come into
+    // the tree's viewport by the least distance, and focus does not move.
     rerender(selectionHostedChart({ selection: { eventId: HANDLER_EVENT.id } }, context));
     expect(currentRowNames()).toEqual([HANDLER_EVENT.name]);
-    expect(viewport.scrollTop).toBe(3 * TREE_ROW_HEIGHT - TREE_VIEWPORT_HEIGHT);
+    expect(revealedElements(reveal)).toEqual([rowNamed(HANDLER_EVENT.name)]);
+    expect(reveal).toHaveBeenLastCalledWith(ROW_REVEAL_OPTIONS);
     expect(document.activeElement).toBe(document.body);
-    expect(document.documentElement.scrollTop).toBe(0);
 
     // A row activated in the tree is one the reader is looking at: when the
-    // host records that selection, the tree stays where the reader left it.
-    viewport.scrollTop = 0;
+    // host records that selection, nothing is revealed.
+    reveal.mockClear();
     await user.click(nameControlOf(rowNamed(REQUEST_EVENT.name)));
     expect(spies.onSelectEvent).toHaveBeenLastCalledWith({
       eventId: REQUEST_EVENT.id,
@@ -3088,51 +3268,39 @@ describe('FlameChart marks and reveals on the virtualized tree', () => {
     });
     rerender(selectionHostedChart({ selection: { eventId: REQUEST_EVENT.id } }, context));
     expect(currentRowNames()).toEqual([REQUEST_EVENT.name]);
-    expect(viewport.scrollTop).toBe(0);
+    expect(reveal).not.toHaveBeenCalled();
 
     // Each new selection from elsewhere is revealed once, and a re-render for
-    // any other reason scrolls nothing.
+    // any other reason reveals nothing.
     rerender(selectionHostedChart({ selection: { eventId: HANDLER_EVENT.id } }, context));
-    expect(viewport.scrollTop).toBe(3 * TREE_ROW_HEIGHT - TREE_VIEWPORT_HEIGHT);
-    viewport.scrollTop = 0;
+    expect(revealedElements(reveal)).toEqual([rowNamed(HANDLER_EVENT.name)]);
     rerender(selectionHostedChart({ selection: { eventId: HANDLER_EVENT.id } }, context));
-    expect(viewport.scrollTop).toBe(0);
+    expect(reveal).toHaveBeenCalledTimes(1);
   });
 
-  it('asks the virtualizer to reveal a selection whose row is outside its window', async () => {
+  it('brings a selection made elsewhere into the rendered rows before revealing it', async () => {
     const tree = shortSiblingsTree(LONG_SIBLING_COUNT);
-    layOutTreeForVirtualizer(tree.nodeCount);
     const far = longSibling(FAR_SIBLING_INDEX);
+    const reveal = spyOnReveal();
     const context = { provider: resolvingProvider(tree).provider, actions: makeActions().actions };
 
     const { rerender } = render(selectionHostedChart({ selection: undefined }, context));
     await screen.findByRole('tree');
 
-    // Measured, the virtualizer drives the render: its rows are positioned,
-    // the window is bounded, and the far sibling is not in it.
-    await waitFor(() => {
-      expect(frameList().querySelector('.dg-virtual-row')).not.toBeNull();
-    });
+    // The window opens at the top of the list, and the far sibling is not in it.
     expect(frameRows().length).toBeLessThan(RENDERED_ROW_CEILING);
     expect(frameNames()).not.toContain(far.name);
-    const viewport = treeViewport();
-    expect(viewport.scrollTop).toBe(0);
+    expect(tabStops().map((row) => nameOfRow(row))).toEqual(['example.batch']);
 
-    // A host selection of it scrolls the tree's own viewport until its row —
-    // the root, then the siblings, so at index FAR_SIBLING_INDEX + 1 — lies
-    // whole inside the viewport, and the window follows.
+    // A host selection of it moves the tab stop, and the rendered rows with
+    // it, to its row — which is then asked, once, to come into view. The list
+    // stays bounded and focus stays where the reader left it.
     rerender(selectionHostedChart({ selection: { eventId: far.eventId } }, context));
-
-    const rowStart = (FAR_SIBLING_INDEX + 1) * TREE_ROW_HEIGHT;
-    await waitFor(() => {
-      expect(viewport.scrollTop).toBeGreaterThanOrEqual(
-        rowStart + TREE_ROW_HEIGHT - VIRTUAL_VIEWPORT_HEIGHT,
-      );
-    });
-    expect(viewport.scrollTop).toBeLessThanOrEqual(rowStart);
-    await waitFor(() => {
-      expect(currentRowNames()).toEqual([far.name]);
-    });
+    const selectedRow = rowNamed(far.name);
+    expect(currentRowNames()).toEqual([far.name]);
+    expect(tabStops()).toEqual([selectedRow]);
+    expect(revealedElements(reveal)).toEqual([selectedRow]);
+    expect(reveal).toHaveBeenLastCalledWith(ROW_REVEAL_OPTIONS);
     expect(frameRows().length).toBeLessThan(RENDERED_ROW_CEILING);
     expect(document.activeElement).toBe(document.body);
   });
@@ -3143,24 +3311,15 @@ describe('FlameChart marks and reveals on the virtualized tree', () => {
  * The canvas's coordinate system
  *
  * The chain above spans 120 ms: the interaction [0, 120], the request [4, 104]
- * and the handler [10, 90]. A 600 px canvas therefore draws 5 px per
- * millisecond and every edge lands on a whole pixel; the 1 000-unit fallback
- * draws 25/3 units per millisecond. The two widths below are the component's
- * own bounds, restated so a case asserts a stated number.
+ * and the handler [10, 90]. The canvas is always the same fixed 1 000-unit
+ * logical space, whatever its container, so it draws 25/3 units per
+ * millisecond and every placement below is exact arithmetic. The numbers are
+ * the component's own geometry, restated so a case asserts a stated number.
  * ---------------------------------------------------------------------------
  */
 
-/** The coordinate width the chart lays out at when nothing is measured. */
-const FALLBACK_CANVAS_WIDTH = 1000;
-
-/** The narrowest canvas a measured chart draws; a narrower viewport scrolls. */
-const MIN_MEASURED_CANVAS_WIDTH = 320;
-
-/** The inner width the measured case gives the viewport, in CSS pixels. */
-const MEASURED_VIEWPORT_WIDTH = 600;
-
-/** A viewport narrower than {@link MIN_MEASURED_CANVAS_WIDTH}. */
-const NARROW_VIEWPORT_WIDTH = 200;
+/** The width of the canvas's logical space: `../utils/scale`'s `CHART_VIEWBOX_WIDTH`. */
+const CANVAS_VIEWBOX_WIDTH = 1000;
 
 /** The gap between a frame's left edge and its label, in user units. */
 const LABEL_INSET = 4;
@@ -3172,30 +3331,33 @@ const LABEL_INSET = 4;
 const MIN_VISIBLE_BAR_WIDTH = 2;
 
 describe('FlameChart canvas', () => {
-  it('draws a measured canvas in the viewport’s own pixels, unscaled', async () => {
-    layOutFlameViewport(MEASURED_VIEWPORT_WIDTH);
+  it('draws in one fixed 1 000-unit space that its container sizes', async () => {
     const stub = resolvingProvider(CHAIN_TREE);
 
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
 
     await screen.findByRole('tree');
 
-    // As wide as the viewport, with a viewBox of the same size: one user unit
-    // is one CSS pixel, so neither the frames nor the text are scaled — and no
-    // `preserveAspectRatio="none"` is left to stretch glyphs.
+    // Relational width over a fixed logical space exactly as tall as what it
+    // draws, scaled uniformly from its top-left corner: nothing is stretched,
+    // and nothing about the container was read to decide any of it.
     const picture = canvas();
     const [minX, minY, boxWidth, boxHeight] = viewBoxOf();
-    expect(picture.getAttribute('width')).toBe(String(MEASURED_VIEWPORT_WIDTH));
-    expect([minX, minY, boxWidth]).toEqual([0, 0, MEASURED_VIEWPORT_WIDTH]);
-    expect(String(boxHeight)).toBe(picture.getAttribute('height'));
-    expect(picture.hasAttribute('preserveAspectRatio')).toBe(false);
+    expect(picture.getAttribute('width')).toBe('100%');
+    expect([minX, minY, boxWidth]).toEqual([0, 0, CANVAS_VIEWBOX_WIDTH]);
+    expect(picture.getAttribute('height')).toBe(String(boxHeight));
+    expect(picture.getAttribute('preserveAspectRatio')).toBe('xMinYMin meet');
 
-    // Every frame is its share of the trace's window in pixels: 5 px per ms.
-    expect(drawnFrame(INTERACTION_EVENT.name)).toMatchObject({ x: 0, width: 600 });
-    expect(drawnFrame(REQUEST_EVENT.name)).toMatchObject({ x: 20, width: 500 });
-    expect(drawnFrame(HANDLER_EVENT.name)).toMatchObject({ x: 50, width: 400 });
+    // Exact per-mille placements of the 120 ms window.
+    expect(drawnFrame(INTERACTION_EVENT.name)).toMatchObject({ x: 0, width: CANVAS_VIEWBOX_WIDTH });
+    const request = drawnFrame(REQUEST_EVENT.name);
+    expect(request.x).toBeCloseTo((4 / 120) * CANVAS_VIEWBOX_WIDTH, 6);
+    expect(request.width).toBeCloseTo((100 / 120) * CANVAS_VIEWBOX_WIDTH, 6);
+    const handler = drawnFrame(HANDLER_EVENT.name);
+    expect(handler.x).toBeCloseTo((10 / 120) * CANVAS_VIEWBOX_WIDTH, 6);
+    expect(handler.width).toBeCloseTo((80 / 120) * CANVAS_VIEWBOX_WIDTH, 6);
 
-    // Labels sit inside their frames at the inset, and fit whole at this size.
+    // Labels sit inside their frames at the inset, and fit whole at these widths.
     for (const event of CHAIN_EVENTS) {
       const frame = drawnFrame(event.name);
       expect(frame.label).toBe(event.name);
@@ -3203,69 +3365,25 @@ describe('FlameChart canvas', () => {
     }
   });
 
-  it('scrolls a canvas it will not squeeze below its minimum width', async () => {
-    layOutFlameViewport(NARROW_VIEWPORT_WIDTH);
-    const stub = resolvingProvider(CHAIN_TREE);
-
-    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
-
-    await screen.findByRole('tree');
-
-    // Wider than its viewport, so the viewport scrolls: the frames keep a
-    // legible width and the text keeps its size.
-    expect(canvas().getAttribute('width')).toBe(String(MIN_MEASURED_CANVAS_WIDTH));
-    expect(viewBoxOf()[2]).toBe(MIN_MEASURED_CANVAS_WIDTH);
-    expect(drawnFrame(INTERACTION_EVENT.name)).toMatchObject({
-      x: 0,
-      width: MIN_MEASURED_CANVAS_WIDTH,
-    });
-  });
-
-  it('stretches a fixed 1 000-unit space across its container where nothing is measured', async () => {
-    const stub = resolvingProvider(CHAIN_TREE);
-
-    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
-
-    await screen.findByRole('tree');
-
-    // The layout-free mode: relational width, the fallback coordinate space,
-    // and a horizontal-only stretch so the frames still span the container.
-    const picture = canvas();
-    expect(picture.getAttribute('width')).toBe('100%');
-    expect(viewBoxOf().slice(0, 3)).toEqual([0, 0, FALLBACK_CANVAS_WIDTH]);
-    expect(picture.getAttribute('preserveAspectRatio')).toBe('none');
-
-    // Exact per-mille placements of the 120 ms window.
-    expect(drawnFrame(INTERACTION_EVENT.name)).toMatchObject({ x: 0, width: 1000 });
-    const request = drawnFrame(REQUEST_EVENT.name);
-    expect(request.x).toBeCloseTo((4 / 120) * FALLBACK_CANVAS_WIDTH, 6);
-    expect(request.width).toBeCloseTo((100 / 120) * FALLBACK_CANVAS_WIDTH, 6);
-    const handler = drawnFrame(HANDLER_EVENT.name);
-    expect(handler.x).toBeCloseTo((10 / 120) * FALLBACK_CANVAS_WIDTH, 6);
-    expect(handler.width).toBeCloseTo((80 / 120) * FALLBACK_CANVAS_WIDTH, 6);
-  });
-
-  it('packs overlapping siblings at the width the canvas is drawn at', async () => {
-    // Forty back-to-back 1 ms siblings under a 1 000 ms root. At 600 px a
-    // sibling measures 0.6 px and is widened to the scale's 2 px minimum, so
-    // four of them stack over one point — 2.4 px of starts is the first gap
-    // wide enough — and the depth needs four rows. The unmeasured 1 000-unit
-    // space draws each at 1 unit widened to 2, so only two stack.
-    layOutFlameViewport(MEASURED_VIEWPORT_WIDTH);
+  it('packs overlapping siblings at the logical width they are drawn at', async () => {
+    // Forty back-to-back 1 ms siblings under a 1 000 ms root. Each is one unit
+    // of the 1 000-unit space, widened to the scale's two-unit minimum, so two
+    // of them stack over one point — the next one only touches the first —
+    // and the depth needs two sub-rows.
     const stub = resolvingProvider(shortSiblingsTree());
 
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
 
     await screen.findByRole('tree');
 
-    // Drawn in the viewport's pixels, and still never one bar over another.
-    expect(canvas().getAttribute('width')).toBe(String(MEASURED_VIEWPORT_WIDTH));
-    expect(drawnFrameNamed('example.batch')).toMatchObject({ x: 0, width: 600 });
-    expect(drawnFrameNamed('example.step.001').x).toBeCloseTo(0.6, 6);
+    // Never one bar over another.
+    expect(canvas().getAttribute('width')).toBe('100%');
+    expect(drawnFrameNamed('example.batch')).toMatchObject({ x: 0, width: CANVAS_VIEWBOX_WIDTH });
+    expect(drawnFrameNamed('example.step.001').x).toBeCloseTo(1, 6);
     expect(drawnFrameNamed('example.step.001').width).toBe(MIN_VISIBLE_BAR_WIDTH);
     expect(sameRowOverlaps()).toEqual([]);
 
-    // The root's row and the siblings' four, each below the root; the canvas
+    // The root's row and the siblings' two, each below the root; the canvas
     // is as tall as the rows it draws.
     const root = drawnFrameNamed('example.batch');
     const siblingRows = new Set(
@@ -3273,43 +3391,32 @@ describe('FlameChart canvas', () => {
         .filter((frame) => frame.name !== 'example.batch')
         .map((frame) => frame.y),
     );
-    expect(siblingRows.size).toBe(4);
+    expect(siblingRows.size).toBe(2);
     for (const y of siblingRows) {
       expect(y).toBeGreaterThan(root.y);
     }
-    expect(icicleRows()).toHaveLength(5);
-    expect(viewBoxOf()[3]).toBeGreaterThan(Math.max(...siblingRows));
-
-    // The same trace without layout packs into the two rows its own widths need.
-    cleanup();
-    vi.restoreAllMocks();
-    renderComponent(makeNode(), {
-      provider: resolvingProvider(shortSiblingsTree()).provider,
-      actions: makeActions().actions,
-    });
-    await screen.findByRole('tree');
-    expect(canvas().getAttribute('width')).toBe('100%');
-    expect(sameRowOverlaps()).toEqual([]);
     expect(icicleRows()).toHaveLength(3);
+    expect(viewBoxOf()[3]).toBeGreaterThan(Math.max(...siblingRows));
   });
 });
 
 /*
  * ---------------------------------------------------------------------------
- * Frame labels, fitted by measured width
+ * Frame labels, fitted in logical units
  *
- * Every trace below spans 1 000 ms, so the 1 000-unit fallback draws exactly
- * one unit per millisecond. In that mode labels are fitted with the measure's
- * estimate at the 11 px label size: 0.6 em = 6.6 units per narrow grapheme
- * (the ellipsis included) and 1.25 em = 13.75 units per wide one. The long
- * name is 243 UTF-16 units: a 133-grapheme head, one emoji — a single code
- * point outside the BMP, so a surrogate pair — and a 108-grapheme tail, with
- * no whitespace anywhere near a cut, so each expected label below is a hand
- * calculation rather than a re-run of the fitting search.
+ * Every trace below spans 1 000 ms, so the fixed 1 000-unit canvas draws
+ * exactly one unit per millisecond. Labels are fitted in those units with the
+ * deterministic advance estimate at the 11-unit label size: 0.6 em = 6.6 units
+ * per narrow grapheme (the ellipsis included) and 1.25 em = 13.75 units per
+ * wide one. The label and its frame scale together, so a fit holds at every
+ * panel width. The long name is 243 UTF-16 units: a 133-grapheme head, one
+ * emoji — a single code point outside the BMP, so a surrogate pair — and a
+ * 108-grapheme tail, with no whitespace anywhere near a cut, so each expected
+ * label below is a hand calculation rather than a re-run of the fitting search.
  * ---------------------------------------------------------------------------
  */
 
-/** The label font size the estimate assumes, in CSS pixels. */
+/** The label font size the estimate assumes, in user units. */
 const LABEL_FONT_SIZE = 11;
 
 /** The truncation mark a fitted label ends with: U+2026. */
@@ -3382,8 +3489,8 @@ function labelTree(children: readonly LabelFixtureChild[]): TraceTree {
 /**
  * Asserts the properties every drawn label owes its frame: it is the name or a
  * prefix of it ending in the ellipsis, it keeps every surrogate pair whole, and
- * it fits between the insets — measured with the same estimate the layout-free
- * mode fits with.
+ * it fits between the insets — measured with the same estimate, in the same
+ * logical units, the component fits with.
  *
  * @param frame The frame as the canvas drew it.
  * @param name The frame's recorded name.
@@ -3417,7 +3524,7 @@ function frameLabels(): string[] {
 }
 
 describe('FlameChart frame labels', () => {
-  it('cuts a long name to its frame by measured width, with the ellipsis inside the frame', async () => {
+  it('cuts a long name to its frame in logical units, with the ellipsis inside the frame', async () => {
     const stub = resolvingProvider(
       labelTree([{ name: LONG_FRAME_NAME, offsetMs: 0, durationMs: 900 }]),
     );
@@ -3483,29 +3590,81 @@ describe('FlameChart frame labels', () => {
     expect(labels).toEqual(['example.root', 'set']);
     expect(labels.some((text) => text.includes('aggregate'))).toBe(false);
   });
-
-  it('re-fits every label to the frame widths of a measured canvas', async () => {
-    layOutFlameViewport(MEASURED_VIEWPORT_WIDTH);
-    const stub = resolvingProvider(
-      labelTree([{ name: LONG_FRAME_NAME, offsetMs: 0, durationMs: 900 }]),
-    );
-
-    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
-
-    await screen.findByRole('tree');
-
-    // 900 ms of a 1 000 ms window on a 600 px canvas is 540 px, leaving 532:
-    // 79 graphemes and the ellipsis are 528, an 80th would reach 534.6.
-    const frame = drawnFrame(LONG_FRAME_NAME);
-    expect(frame.width).toBeCloseTo(540, 6);
-    const label = expectLabelInsideFrame(frame, LONG_FRAME_NAME);
-    expect(label).toBe(`example.${'aggregate-'.repeat(7)}a${ELLIPSIS_MARK}`);
-  });
 });
 
-describe('FlameChart partial results', () => {
-  it('states the row bound as N of M and shows more on request, one step at a time', async () => {
-    const tree = shortSiblingsTree(ROW_BOUNDED_SIBLING_COUNT);
+/**
+ * The drawn window's statement, as the chart words it: the operations drawn
+ * and, for each side that holds any, how many it leaves undrawn.
+ *
+ * Spelled out here rather than read back from the component, so a case pins
+ * the words a reader hears.
+ *
+ * @param start The first drawn operation's 0-based index among the shown ones.
+ * @param count How many are drawn.
+ * @param total How many are shown in all.
+ * @returns The sentence.
+ */
+function windowStatement(start: number, count: number, total: number): string {
+  const drawn =
+    count === 1
+      ? `Operation ${formatCount(start + 1)} of ${formatCount(total)} is drawn`
+      : `Operations ${formatCount(start + 1)}–${formatCount(start + count)} of ${formatCount(
+          total,
+        )} are drawn`;
+  const before = start;
+  const after = total - start - count;
+  const sides = [
+    ...(before > 0 ? [`${formatCount(before)} before`] : []),
+    ...(after > 0 ? [`${formatCount(after)} after`] : []),
+  ];
+
+  return sides.length === 0
+    ? `${drawn}.`
+    : `${drawn}; ${sides.join(' and ')} ${before + after === 1 ? 'is' : 'are'} not.`;
+}
+
+/**
+ * A paging control, obtained by role and name: one of the operations controls
+ * above the canvas, or one of the row controls beneath the tree.
+ *
+ * @param name {@link PREVIOUS_NAME} or {@link NEXT_NAME}, or
+ * {@link PREVIOUS_ROWS_NAME} or {@link NEXT_ROWS_NAME}.
+ * @returns The control, typed as the button it is.
+ */
+function pagingControl(name: string): HTMLButtonElement {
+  const control = screen.getByRole('button', { name });
+
+  if (!(control instanceof HTMLButtonElement)) {
+    throw new Error(`the "${name}" control is not a button`);
+  }
+
+  return control;
+}
+
+/** The long trace's sibling at `index` among the root's children: its name. */
+function pagedSiblingName(index: number): string {
+  return `example.step.${String(index).padStart(3, '0')}`;
+}
+
+/**
+ * The time a case that draws full windows is allowed, in milliseconds.
+ *
+ * Each full window is two thousand frames with their labels and titles, which
+ * the test DOM builds in about a second; a case that pages through
+ * several windows exceeds the runner's five-second default on a shared, loaded
+ * machine without anything being wrong. Generous, not unbounded: a window that
+ * never settles still fails the case.
+ */
+const WINDOW_CASE_TIMEOUT_MS = 30_000;
+
+/*
+ * Every case below draws at least one full window, so the group runs under
+ * {@link WINDOW_CASE_TIMEOUT_MS} rather than the default.
+ */
+describe('FlameChart drawn-row budget', { timeout: WINDOW_CASE_TIMEOUT_MS }, () => {
+  it('never draws more than the budget, and pages a window through the whole trace', async () => {
+    const tree = shortSiblingsTree(PAGED_SIBLING_COUNT);
+    const total = tree.nodeCount;
     const spies = makeActions();
     const user = userEvent.setup();
 
@@ -3516,53 +3675,78 @@ describe('FlameChart partial results', () => {
 
     await screen.findByRole('tree');
 
-    // The first step: the walk stopped at the default bound, and the notice,
-    // the canvas and the tree all state the same subset of the same total.
-    const total = formatCount(tree.nodeCount);
-    const firstSentence = `Showing ${formatCount(ROW_BOUND_STEP)} of ${total} operations.`;
-    expect(screen.getByText(PARTIAL_RESULT_BADGE)).toBeDefined();
-    const notice = screen.getByText(firstSentence);
-    expect(notice.getAttribute('aria-live')).toBe('polite');
-    expect(canvas().getAttribute('aria-label')).toContain(firstSentence);
-    expect(canvas().querySelectorAll('rect.dg-flame__frame')).toHaveLength(ROW_BOUND_STEP);
-    expect(frameRows()[1]?.getAttribute('aria-setsize')).toBe(String(ROW_BOUND_STEP - 1));
-
-    // A whole step more.
-    await user.click(screen.getByRole('button', { name: SHOW_MORE_NAME }));
-    const secondSentence = `Showing ${formatCount(2 * ROW_BOUND_STEP)} of ${total} operations.`;
-    expect(screen.getByText(secondSentence)).toBeDefined();
-    expect(canvas().getAttribute('aria-label')).toContain(secondSentence);
-    expect(canvas().querySelectorAll('rect.dg-flame__frame')).toHaveLength(2 * ROW_BOUND_STEP);
-
-    // Then capped at the trace's own count: everything is drawn, the notice —
-    // the same live element, so the change is announced — now says so, and
-    // focus, whose control is gone, lands on the tree's tab stop rather than on
-    // the document.
-    await user.click(screen.getByRole('button', { name: SHOW_MORE_NAME }));
-    expect(canvas().querySelectorAll('rect.dg-flame__frame')).toHaveLength(tree.nodeCount);
+    // The first window: one budget's worth of frames, and a statement — in the
+    // notice and in the canvas's text alternative alike — of what is drawn and
+    // what follows undrawn. Paging is not a partial result: every operation
+    // is one page away.
+    expect(total).toBe(PAGED_SIBLING_COUNT + 1);
+    const first = windowStatement(0, DRAWN_ROW_BUDGET, total);
+    const statement = screen.getByText(first);
+    expect(statement.getAttribute('aria-live')).toBe('polite');
+    expect(canvas().getAttribute('aria-label')).toContain(first);
+    expect(drawnFrames()).toHaveLength(DRAWN_ROW_BUDGET);
     expect(screen.queryByText(PARTIAL_RESULT_BADGE)).toBeNull();
-    expect(notice.isConnected).toBe(true);
-    expect(notice.getAttribute('aria-live')).toBe('polite');
-    expect(notice.textContent).toBe(`Showing all ${total} operations.`);
-    expect(screen.queryByRole('button', { name: SHOW_MORE_NAME })).toBeNull();
-    expect(canvas().getAttribute('aria-label')).not.toMatch(/showing/i);
-    expect(tabStops()).toHaveLength(1);
-    expect(document.activeElement).toBe(tabStops()[0]);
+    expect(pagingControl(PREVIOUS_NAME).disabled).toBe(true);
+    expect(pagingControl(NEXT_NAME).disabled).toBe(false);
 
-    // Showing more is neither a selection nor a disclosure.
+    // A row states its place among ALL of its siblings, drawn or not.
+    expect(frameRows()[1]?.getAttribute('aria-setsize')).toBe(String(PAGED_SIBLING_COUNT));
+
+    // The next window MOVES the drawing rather than growing it: the same
+    // number of frames, the operations after the first window, and the same
+    // live statement element, so the page is announced.
+    await user.click(pagingControl(NEXT_NAME));
+    expect(statement.isConnected).toBe(true);
+    expect(statement.textContent).toBe(windowStatement(DRAWN_ROW_BUDGET, DRAWN_ROW_BUDGET, total));
+    expect(drawnFrames()).toHaveLength(DRAWN_ROW_BUDGET);
+    expect(drawnFrames()[0]?.name).toBe(pagedSiblingName(DRAWN_ROW_BUDGET - 1));
+    expect(drawnFrames().some((frame) => frame.name === 'example.batch')).toBe(false);
+    const [firstOfSecond] = frameRows();
+    expect(firstOfSecond?.getAttribute('aria-level')).toBe('2');
+    expect(firstOfSecond?.getAttribute('aria-posinset')).toBe(String(DRAWN_ROW_BUDGET));
+    expect(firstOfSecond?.getAttribute('aria-setsize')).toBe(String(PAGED_SIBLING_COUNT));
+    expect(pagingControl(PREVIOUS_NAME).disabled).toBe(false);
+
+    // The last window holds the single operation left. Its control is spent,
+    // and the focus it held moves to the other control, not to the document.
+    await user.click(pagingControl(NEXT_NAME));
+    expect(statement.textContent).toBe(windowStatement(2 * DRAWN_ROW_BUDGET, 1, total));
+    expect(drawnFrames()).toHaveLength(1);
+    expect(pagingControl(NEXT_NAME).disabled).toBe(true);
+    expect(document.activeElement).toBe(pagingControl(PREVIOUS_NAME));
+
+    // However often more is asked for, the drawing never exceeds the budget.
+    for (const name of [PREVIOUS_NAME, PREVIOUS_NAME, NEXT_NAME, NEXT_NAME, NEXT_NAME, NEXT_NAME]) {
+      const control = pagingControl(name);
+      if (!control.disabled) {
+        await user.click(control);
+      }
+      expect(drawnFrames().length).toBeLessThanOrEqual(DRAWN_ROW_BUDGET);
+      expect(frameRows().length).toBeLessThanOrEqual(DRAWN_ROW_BUDGET);
+    }
+
+    // Back to the first window, the statement is the first one again.
+    await user.click(pagingControl(PREVIOUS_NAME));
+    await user.click(pagingControl(PREVIOUS_NAME));
+    expect(statement.textContent).toBe(first);
+    expect(document.activeElement).toBe(pagingControl(NEXT_NAME));
+
+    // Paging is neither a selection nor a disclosure.
     expect(spies.onSelectEvent).not.toHaveBeenCalled();
     expect(spies.onExpand).not.toHaveBeenCalled();
   });
 
-  it('starts from the default bound again when the node’s query changes', async () => {
-    const tree = shortSiblingsTree(ROW_BOUNDED_SIBLING_COUNT);
+  it('starts from the first window again when the node’s query changes', async () => {
+    const tree = shortSiblingsTree(PAGED_SIBLING_COUNT);
     const context = { provider: resolvingProvider(tree).provider, actions: makeActions().actions };
     const user = userEvent.setup();
 
     const { rerender } = render(hostedChart(makeNode(), context));
     await screen.findByRole('tree');
-    await user.click(screen.getByRole('button', { name: SHOW_MORE_NAME }));
-    expect(canvas().querySelectorAll('rect.dg-flame__frame')).toHaveLength(2 * ROW_BOUND_STEP);
+    await user.click(pagingControl(NEXT_NAME));
+    expect(
+      screen.getByText(windowStatement(DRAWN_ROW_BUDGET, DRAWN_ROW_BUDGET, tree.nodeCount)),
+    ).toBeDefined();
 
     rerender(
       hostedChart(
@@ -3571,14 +3755,217 @@ describe('FlameChart partial results', () => {
       ),
     );
 
-    const sentence = `Showing ${formatCount(ROW_BOUND_STEP)} of ${formatCount(
-      tree.nodeCount,
-    )} operations.`;
-    expect(await screen.findByText(sentence)).toBeDefined();
-    expect(canvas().querySelectorAll('rect.dg-flame__frame')).toHaveLength(ROW_BOUND_STEP);
+    expect(
+      await screen.findByText(windowStatement(0, DRAWN_ROW_BUDGET, tree.nodeCount)),
+    ).toBeDefined();
+    expect(drawnFrames()).toHaveLength(DRAWN_ROW_BUDGET);
+    expect(drawnFrames()[0]?.name).toBe('example.batch');
   });
 
-  it('offers no more rows when the depth bound, not the row bound, ended the walk', async () => {
+  it('opens the rows of a newly drawn window, and of a changed query, on their first page', async () => {
+    const tree = shortSiblingsTree(PAGED_SIBLING_COUNT);
+    const context = { provider: resolvingProvider(tree).provider, actions: makeActions().actions };
+    const user = userEvent.setup();
+    const firstPage = rowPageStatement(0, TEXT_ROW_BUDGET, DRAWN_ROW_BUDGET);
+
+    const { rerender } = render(hostedChart(makeNode(), context));
+    await screen.findByRole('tree');
+
+    // Two pages into the first drawn window's rows.
+    const rowsShown = screen.getByText(firstPage);
+    await user.click(pagingControl(NEXT_ROWS_NAME));
+    await user.click(pagingControl(NEXT_ROWS_NAME));
+    expect(rowsShown.textContent).toBe(
+      rowPageStatement(2 * TEXT_ROW_BUDGET, TEXT_ROW_BUDGET, DRAWN_ROW_BUDGET),
+    );
+    expect(frameNames()[0]).toBe(pagedSiblingName(2 * TEXT_ROW_BUDGET - 1));
+
+    // The next drawn window lists other rows, and opens on its first page with
+    // the tab stop on its first row.
+    await user.click(pagingControl(NEXT_NAME));
+    expect(rowsShown.textContent).toBe(firstPage);
+    expect(frameNames()[0]).toBe(pagedSiblingName(DRAWN_ROW_BUDGET - 1));
+    expect(tabStops().map(nameOfRow)).toEqual([pagedSiblingName(DRAWN_ROW_BUDGET - 1)]);
+
+    // Paged straight back, the first drawn window opens on its first page too,
+    // not on the page the reader left it at.
+    await user.click(pagingControl(PREVIOUS_NAME));
+    expect(rowsShown.textContent).toBe(firstPage);
+    expect(tabStops().map(nameOfRow)).toEqual(['example.batch']);
+
+    // A changed query starts over as well.
+    await user.click(pagingControl(NEXT_ROWS_NAME));
+    expect(rowsShown.textContent).toBe(
+      rowPageStatement(TEXT_ROW_BUDGET, TEXT_ROW_BUDGET, DRAWN_ROW_BUDGET),
+    );
+    rerender(
+      hostedChart(
+        makeNode({ query: { source: 'trace', filter: { traceId: OTHER_TRACE_ID } } }),
+        context,
+      ),
+    );
+    expect(await screen.findByText(firstPage)).toBeDefined();
+    expect(frameNames()[0]).toBe('example.batch');
+    expect(tabStops().map(nameOfRow)).toEqual(['example.batch']);
+  });
+
+  it('pages to the window holding a selection made elsewhere, and lets the reader page away', async () => {
+    const tree = shortSiblingsTree(PAGED_SIBLING_COUNT);
+    const context = { provider: resolvingProvider(tree).provider, actions: makeActions().actions };
+    const user = userEvent.setup();
+    const total = tree.nodeCount;
+
+    // Sibling 3 000 is operation 3 001 of the walk (the root is the first), so
+    // it is drawn by the second window.
+    const far = longSibling(3000);
+    const { rerender } = render(
+      selectionHostedChart({ selection: { eventId: far.eventId } }, context),
+    );
+    await screen.findByRole('tree');
+
+    const second = windowStatement(DRAWN_ROW_BUDGET, DRAWN_ROW_BUDGET, total);
+    const statement = screen.getByText(second);
+    expect(selectedFrameNames()).toEqual([far.name]);
+    expect(currentRowNames()).toEqual([far.name]);
+
+    // The reader may page away from it: the selection is not drawn there, so
+    // nothing carries its mark, and nothing pulls the window back.
+    await user.click(pagingControl(PREVIOUS_NAME));
+    const first = windowStatement(0, DRAWN_ROW_BUDGET, total);
+    expect(statement.textContent).toBe(first);
+    expect(selectedFrameNames()).toEqual([]);
+    expect(currentRowNames()).toEqual([]);
+    rerender(selectionHostedChart({ selection: { eventId: far.eventId } }, context));
+    expect(statement.textContent).toBe(first);
+
+    // A NEW selection outside the window moves it again, and clearing the
+    // selection leaves the window where it is.
+    const other = longSibling(2500);
+    rerender(selectionHostedChart({ selection: { eventId: other.eventId } }, context));
+    expect(statement.textContent).toBe(second);
+    expect(selectedFrameNames()).toEqual([other.name]);
+    expect(currentRowNames()).toEqual([other.name]);
+
+    rerender(selectionHostedChart({ selection: undefined }, context));
+    expect(statement.textContent).toBe(second);
+    expect(selectedFrameNames()).toEqual([]);
+  });
+
+  it('crosses the drawn window with the arrow keys, Home and End', async () => {
+    const tree = shortSiblingsTree(PAGED_SIBLING_COUNT);
+    const user = userEvent.setup();
+    const total = tree.nodeCount;
+
+    renderComponent(makeNode(), {
+      provider: resolvingProvider(tree).provider,
+      actions: makeActions().actions,
+    });
+    await screen.findByRole('tree');
+    const statement = screen.getByText(windowStatement(0, DRAWN_ROW_BUDGET, total));
+
+    // The paging controls come first in the Tab order — "Previous operations"
+    // is disabled on the first page, so one stop — and the tree after them.
+    await user.tab();
+    expect(document.activeElement).toBe(pagingControl(NEXT_NAME));
+    await user.tab();
+    expect(nameOfRow(focusedRow())).toBe('example.batch');
+
+    // End reaches the trace's last operation, on the last page.
+    await user.keyboard('{End}');
+    expect(nameOfRow(focusedRow())).toBe(pagedSiblingName(PAGED_SIBLING_COUNT - 1));
+    expect(statement.textContent).toBe(windowStatement(2 * DRAWN_ROW_BUDGET, 1, total));
+    expect(tabStops()).toEqual([focusedRow()]);
+
+    // ArrowUp past the first drawn row lands on the last row of the window
+    // before it, and ArrowDown past the last drawn row on the first of the next.
+    await user.keyboard('{ArrowUp}');
+    expect(nameOfRow(focusedRow())).toBe(pagedSiblingName(PAGED_SIBLING_COUNT - 2));
+    expect(statement.textContent).toBe(windowStatement(DRAWN_ROW_BUDGET, DRAWN_ROW_BUDGET, total));
+    await user.keyboard('{ArrowDown}');
+    expect(nameOfRow(focusedRow())).toBe(pagedSiblingName(PAGED_SIBLING_COUNT - 1));
+    expect(statement.textContent).toBe(windowStatement(2 * DRAWN_ROW_BUDGET, 1, total));
+
+    // ArrowLeft steps out to a parent drawn on another page.
+    await user.keyboard('{ArrowLeft}');
+    expect(nameOfRow(focusedRow())).toBe('example.batch');
+    expect(statement.textContent).toBe(windowStatement(0, DRAWN_ROW_BUDGET, total));
+    expect(tabStops()).toEqual([focusedRow()]);
+
+    // Home from anywhere is the trace's first operation.
+    await user.keyboard('{End}');
+    await user.keyboard('{Home}');
+    expect(nameOfRow(focusedRow())).toBe('example.batch');
+    expect(statement.textContent).toBe(windowStatement(0, DRAWN_ROW_BUDGET, total));
+  });
+
+  it('keeps folding working across windows, and pages over what is left open', async () => {
+    const tree = shortSiblingsTree(PAGED_SIBLING_COUNT);
+    const spies = makeActions();
+    const user = userEvent.setup();
+    const total = tree.nodeCount;
+
+    const container = renderComponent(makeNode(), {
+      provider: resolvingProvider(tree).provider,
+      actions: spies.actions,
+    });
+    await screen.findByRole('tree');
+
+    // From the second page, the tab stop is its first row; ArrowLeft steps out
+    // to the root, one page back, and ArrowLeft again folds it.
+    await user.click(pagingControl(NEXT_NAME));
+    await user.tab();
+    expect(nameOfRow(focusedRow())).toBe(pagedSiblingName(DRAWN_ROW_BUDGET - 1));
+    await user.keyboard('{ArrowLeft}');
+    expect(nameOfRow(focusedRow())).toBe('example.batch');
+    await user.keyboard('{ArrowLeft}');
+
+    // One operation is left open, so the whole of it is drawn: no statement,
+    // no controls, and the fold note counts what it hides.
+    expect(spies.onExpand).toHaveBeenLastCalledWith(NODE_ID, spanIdFor(100), false);
+    expect(drawnFrames()).toHaveLength(1);
+    expect(screen.queryByRole('button', { name: NEXT_NAME })).toBeNull();
+    expect(screen.queryByText(/are drawn;/)).toBeNull();
+    const notes = Array.from(container.querySelectorAll('.dg-flame__note')).map(
+      (note) => note.textContent ?? '',
+    );
+    expect(
+      notes.some((note) =>
+        note.includes(`1 subtree is folded, hiding ${formatCount(PAGED_SIBLING_COUNT)} operations`),
+      ),
+    ).toBe(true);
+
+    // Opening it again pages over every operation once more, from the first.
+    await user.keyboard('{ArrowRight}');
+    expect(spies.onExpand).toHaveBeenLastCalledWith(NODE_ID, spanIdFor(100), true);
+    expect(screen.getByText(windowStatement(0, DRAWN_ROW_BUDGET, total))).toBeDefined();
+    expect(drawnFrames()).toHaveLength(DRAWN_ROW_BUDGET);
+    expect(nameOfRow(focusedRow())).toBe('example.batch');
+  });
+
+  it('lists a tree that holds more than it declares only as far as its own count allows', async () => {
+    // One window's worth of siblings and the root, declaring ten nodes: the
+    // walk stops at one window — the floor under a count it cannot believe —
+    // and the partial-result notice says the rest is not listed.
+    const actual = shortSiblingsTree(DRAWN_ROW_BUDGET);
+    const tree: TraceTree = { ...actual, nodeCount: 10 };
+
+    renderComponent(makeNode(), {
+      provider: resolvingProvider(tree).provider,
+      actions: makeActions().actions,
+    });
+    await screen.findByRole('tree');
+
+    const sentence = `This trace holds more operations than it reports, so only the first ${formatCount(
+      DRAWN_ROW_BUDGET,
+    )} operations of it are listed.`;
+    const notice = screen.getByText(sentence);
+    expect(screen.getByText(PARTIAL_RESULT_BADGE).parentElement).toBe(notice.parentElement);
+    expect(canvas().getAttribute('aria-label')).toContain(sentence);
+    expect(drawnFrames()).toHaveLength(DRAWN_ROW_BUDGET);
+    expect(screen.queryByRole('button', { name: NEXT_NAME })).toBeNull();
+  });
+
+  it('offers no paging when the depth bound, not the budget, left operations out', async () => {
     const tree = depthEndedTree();
 
     const container = renderComponent(makeNode(), {
@@ -3588,12 +3975,14 @@ describe('FlameChart partial results', () => {
 
     await screen.findByRole('tree');
 
-    // The trace holds more than the bound, and the walk produced exactly the
-    // bound — yet every operation a larger bound could reach is already here.
-    expect(tree.nodeCount).toBeGreaterThan(ROW_BOUND_STEP);
+    // The trace holds more than one window, and every operation the depth
+    // bound lets through is already drawn: no page holds the rest.
+    expect(tree.nodeCount).toBeGreaterThan(DRAWN_ROW_BUDGET);
+    expect(drawnFrames().length).toBeLessThanOrEqual(DRAWN_ROW_BUDGET);
     expect(screen.queryByText(PARTIAL_RESULT_BADGE)).toBeNull();
-    expect(screen.queryByRole('button', { name: SHOW_MORE_NAME })).toBeNull();
-    expect(canvas().getAttribute('aria-label')).not.toMatch(/showing/i);
+    expect(screen.queryByRole('button', { name: PREVIOUS_NAME })).toBeNull();
+    expect(screen.queryByRole('button', { name: NEXT_NAME })).toBeNull();
+    expect(canvas().getAttribute('aria-label')).not.toMatch(/are drawn;/);
 
     // What is left out is the depth bound's, and its note says so.
     expect(

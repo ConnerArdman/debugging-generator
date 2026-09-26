@@ -33,42 +33,30 @@
  * extra sub-rows of that depth rather than painted over one another, and every
  * sub-row of a depth still sits above the next depth.
  *
- * ## THE CANVAS IS LAID OUT IN CSS PIXELS
+ * ## A FIXED LOGICAL CANVAS, SIZED BY CSS
  *
- * `../utils/measure`'s `useChartCanvas` reports the inner width of the scroll
- * viewport, and the canvas is drawn exactly that wide with a `viewBox` of the
- * same size (`resolveCanvasWidth` in `../utils/scale`), so one user unit is one
- * CSS pixel. A frame's `x` and width are its share of the trace's window in
- * real pixels, and the text is never scaled: the 11 px label role renders at
- * 11 px, with square glyphs, at every panel width. A viewport narrower than
- * `MIN_CANVAS_WIDTH` scrolls the canvas horizontally instead of squeezing it.
- * The measurement is taken while the viewport's ref attaches, before the first
- * paint, and is kept current by a `ResizeObserver` inside the hook. Row packing
- * (above) reads the bars at those widths, so a resize that widens or narrows
- * the minimum-width bars re-packs the rows it changes.
+ * The icicle is drawn in one fixed coordinate space: a `viewBox`
+ * `CHART_VIEWBOX_WIDTH` (1 000) user units wide — `../utils/scale`'s constant,
+ * shared with the timeline — and exactly as tall as the rows it draws. The
+ * `<svg>` declares `width="100%"` and its logical height, and
+ * `preserveAspectRatio="xMinYMin meet"`, so the stylesheet sizes it
+ * relationally to its container and the drawing scales uniformly — a glyph is
+ * never stretched sideways — anchored at its top-left corner. Nothing here
+ * reads the size of any element: every frame's `x` and width are its share of
+ * the trace's window in per-mille of the canvas, every row is at the scale's
+ * own pitch, and the whole drawing is a pure function of the data, identical in
+ * a browser and in a test DOM that lays nothing out. Row packing (above) reads
+ * the bars at those logical widths.
  *
- * A frame's label is fitted to its frame by measuring it in the label font
- * (`fitTextToWidth`): the longest grapheme prefix that fits, ending in an
- * ellipsis, or no label at all. A character budget cannot do this — glyph
- * advances differ, an emoji is about two columns wide — and a budget that is
- * wrong by one glyph paints the ellipsis past the frame, where nobody sees it.
- *
- * The only other measurement is the text equivalent's rows, taken by
- * `@tanstack/react-virtual` after they have painted: the tree renders a bounded
- * window of rows before any measurement arrives, so it too is complete on its
- * first paint and under a test DOM.
- *
- * ## WITHOUT LAYOUT, A FIXED COORDINATE SPACE
- *
- * Where no width can be measured — a test DOM without layout reports zero —
- * the canvas lays out at `DEFAULT_CANVAS_WIDTH` user units, declares
- * `width="100%"` and stretches that drawing across its container
- * (`preserveAspectRatio="none"`, so the frames still span the container and
- * the rows keep their pitch). Labels are fitted by the measure's deterministic
- * estimate, which errs towards "does not fit". Every coordinate in that mode is
- * a round per-mille of the trace's window, which is what the layout-free suite
- * asserts against. A browser that lays the panel out leaves the mode in the
- * commit that mounts the viewport.
+ * A frame's label is fitted to its frame in the same logical units
+ * (`../utils/format`'s `fitTextToWidth`), by the deterministic advance
+ * estimate of the label's type role — `.dg-flame__frame-label` is set in
+ * `monoSm`, eleven units tall — which errs towards "does not fit": the longest
+ * grapheme prefix that fits, ending in an ellipsis, or no label at all. The
+ * label and its frame scale together, so a fit decided once holds at every
+ * panel width. A character budget cannot do this — glyph advances differ, an
+ * emoji is about two columns wide — and a budget that is wrong by one glyph
+ * paints the ellipsis past the frame, where nobody sees it.
  *
  * ## THE CHART IS AN IMAGE; THE LIST IS THE INTERFACE
  *
@@ -85,12 +73,16 @@
  *
  * The tree is ONE tab stop with a roving tab index, as the waterfall's is —
  * the arrow keys move between rows, open and fold subtrees, Enter selects and
- * Shift+Enter opens the source — and it is VIRTUALIZED (AAP 0.6.1: long lists
- * virtualize through `@tanstack/react-virtual`): only the rows in its scroll
- * viewport are in the document, plus the active row, which stays rendered when
- * scrolled away so it keeps focus and the tab stop, while each row still
- * states its level and its position among its siblings. See `FlameFrameTree`
- * for both.
+ * Shift+Enter opens the source — and it is BOUNDED and PAGED: of the drawn
+ * window's rows, one page of at most `TREE_ROW_BUDGET` (60) is in the
+ * document, the page that holds the tab stop. "Previous rows" and "Next rows"
+ * beneath the tree turn that page by pointer or keyboard, a polite statement
+ * beside them says which rows are shown — "Rows 61–120 of 2,000 in this list
+ * are shown." — and a key that steps past either edge of the page turns it
+ * too, so every row of the drawn window, and every source chip on one, is
+ * reachable without the keyboard. Each row still states its level and its
+ * position among all of its siblings. Nothing about it is measured. See
+ * `FlameFrameTree` for both.
  *
  * ## EVIDENCE IS NEVER DROPPED, AND NEVER QUIETLY
  *
@@ -98,19 +90,38 @@
  * there is no server page to load and no honest way to show part of a trace
  * silently. Every reduction is reported above the chart.
  *
- * Two reductions are PARTIAL RESULTS and share one notice — the "Partial
- * result" badge the timeline uses, a sentence saying what is shown and a way to
- * see more. The layout's own row bound (`../utils/scale`'s
- * `DEFAULT_MAX_TRACE_ROWS`) is stated as "Showing N of M operations", where M
- * is the trace's own node count, with a "Show more operations" control that
- * raises the bound by the same step for as long as the trace holds more (once
- * a step shows everything, the notice goes and focus moves from its control to
- * the tree's tab stop); the bound returns to its default whenever the node's
- * query changes. A walk the depth bound ended is never reported as row-bounded,
- * since no larger bound would show more of it. A trace the
- * correlator itself bounded says so and gives the refine route instead —
- * narrowing the query or capturing a shorter interaction — because nothing
- * more of it is held in memory to show.
+ * ## THE DRAWN-ROW BUDGET IS ABSOLUTE
+ *
+ * A capture can hold far more operations than one SVG can carry: a hundred
+ * thousand frames is a hundred thousand bars, labels and handlers, and a
+ * DevTools panel that mounts them freezes. So the walk covers the whole trace,
+ * but the icicle — and the tree beneath it — never holds more than
+ * `../utils/scale`'s `MAX_DRAWN_ROWS` operations at once, however often the
+ * reader asks for more. Asking for more MOVES a window of at most that many
+ * operations over the ordered walk (`windowRows`) instead of growing it:
+ * "Previous operations" and "Next operations" page it, the tree's arrow keys,
+ * Home and End cross into the neighbouring window when they step past an edge,
+ * and a selection made in another view pages to the window holding its frame.
+ * The window is stated beside its controls — "Operations 2,001–4,000 of 9,500
+ * are drawn; 2,000 before and 5,500 after are not." — in a polite live region,
+ * so every page is announced, and it returns to the first window whenever the
+ * node's query changes. Folding a subtree shortens the walk the window pages
+ * over; it never un-draws anything silently.
+ *
+ * The tree pages the drawn window's rows the same way, one level down: its
+ * page is a `windowRows` window of `TREE_ROW_BUDGET` rows over the drawn
+ * window's frames, and a newly drawn window or a changed query opens it on
+ * the first page again (or on the page of the tab stop a key or a selection
+ * carried there).
+ *
+ * Two reductions are PARTIAL RESULTS — part of the trace is not held here at
+ * all — and share one notice with the "Partial result" badge the timeline
+ * uses. A trace the correlator itself bounded says so and gives the refine
+ * route — narrowing the query or capturing a shorter interaction — because
+ * nothing more of it is held in memory to show. A trace that holds more
+ * operations than its own node count declares is walked only as far as that
+ * count (and never less than one window), and the notice says the rest is not
+ * listed, rather than walking a malformed tree without limit.
  *
  * The rest are notes: a subtree past the depth this layout draws, a subtree
  * folded for legibility, a record re-attached to the root because its parent
@@ -144,8 +155,10 @@
  *
  *   `dg-flame`                    the block
  *   `dg-flame__note`              a provenance or honesty note above the chart
- *   `dg-flame__viewport`          the scroll container the canvas sits in
- *   `dg-flame__canvas`            the `<svg>`
+ *   `dg-flame__viewport`          the scroll container the canvas sits in,
+ *                                 which caps a tall drawing's block size
+ *   `dg-flame__canvas`            the `<svg>`, sized relationally to its
+ *                                 container over its fixed `viewBox`
  *   `dg-flame__axis`              the time axis group
  *   `dg-flame__axis-tick`         one tick rule
  *   `dg-flame__axis-label`        one tick label
@@ -155,9 +168,12 @@
  *   `dg-flame__frame-label`       the label drawn inside a frame, inked from
  *                                 `--dgc-frame-ink` (the ink paired with the
  *                                 frame's fill, so the label clears 4.5:1)
- *   `dg-flame__equivalent`        the text equivalent: a virtualized tree in
- *                                 the shared `dg-virtual-viewport`,
- *                                 `dg-virtual-canvas` and `dg-virtual-row`
+ *   `dg-flame__equivalent`        the text equivalent: a paged tree in the
+ *                                 shared scroll viewport (`dg-virtual-viewport`,
+ *                                 whose block size the stylesheet caps) and
+ *                                 list canvas (`dg-virtual-canvas`), with its
+ *                                 row pager beneath it, both laid out by
+ *                                 `Stack`
  *   `dg-flame__equivalent-row`    one frame's treeitem, indented by
  *                                 `--dgc-depth`
  *   `dg-flame__toggle`            a row's disclosure control, or the empty box
@@ -181,15 +197,21 @@
  * leaves a bubble its owner holds open to that owner), and the primitive closes
  * its own hovered or focused bubble on Escape.
  *
- * Both marks are keyed by frame id, not by rendered row, because the tree is
- * virtualized and the marked row may be outside its window: the mark lands the
- * moment the row renders. The hovered row is never scrolled to — the list
- * would jump under a pointer sweeping the canvas — while a selection made
- * anywhere but the tree itself scrolls its row into the tree's viewport once.
+ * Both marks are keyed by frame id, not by rendered row, because the tree
+ * renders one page of its rows and the marked row may be on another: the mark
+ * lands the moment the row renders. The hovered row is never scrolled to — the
+ * list would jump under a pointer sweeping the canvas — while a selection made
+ * anywhere but the tree itself takes the tree's tab stop, and with it the
+ * page, to its row and asks the browser to scroll that row into the tree's own
+ * viewport once, by the least distance (`scrollIntoView`, `block: 'nearest'`,
+ * confined to the nearest scroll container where the platform supports it),
+ * so no offset is ever computed here. A page turned by its row controls asks
+ * the same of its first row, so the new page opens at its top.
  *
- * @see ../utils/scale for every coordinate: the canvas width, the time scale,
- * the depth layout, the bounded traversal and the axis ticks.
- * @see ../utils/measure for the viewport width and the label measure.
+ * @see ../utils/scale for every coordinate: the fixed canvas width, the time
+ * scale, the depth layout, the bounded traversal, the drawn-row window and the
+ * axis ticks.
+ * @see ../utils/format for the label fit and its advance estimate.
  * @see ../host/PanelActions for the interaction contract.
  * @see ../styles/components.css for the implementation of the classes above.
  */
@@ -205,7 +227,6 @@ import type {
   TraceNode,
   TraceTree,
 } from '@debuggen/telemetry';
-import { defaultRangeExtractor, useVirtualizer } from '@tanstack/react-virtual';
 import clsx from 'clsx';
 import { ChevronDown, ChevronRight, Flame } from 'lucide-react';
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -233,8 +254,11 @@ import { Text } from '../primitives/Text';
 import { Tooltip } from '../primitives/Tooltip';
 import { kindColorVar, kindInkColorVar } from '../utils/color';
 import {
+  DEFAULT_LABEL_FONT_SIZE,
   ELLIPSIS,
   countedNoun,
+  createEstimateMeasure,
+  fitTextToWidth,
   formatCount,
   formatCountOf,
   formatDuration,
@@ -244,38 +268,48 @@ import {
   pluralize,
   truncate,
 } from '../utils/format';
-import { fitTextToWidth, useChartCanvas } from '../utils/measure';
-import type { TextMeasure } from '../utils/measure';
-import type { CountedNoun } from '../utils/format';
+import type { CountedNoun, TextMeasure } from '../utils/format';
 import {
-  DEFAULT_MAX_TRACE_ROWS,
+  CHART_VIEWBOX_WIDTH,
+  MAX_DRAWN_ROWS,
   alignHairline,
   flattenTraceRows,
   generateAxisTicks,
-  isMeasuredWidth,
   layoutHeight,
+  nextWindowStart,
   placeSpanDuration,
-  resolveCanvasWidth,
+  previousWindowStart,
   rowY,
   timeScaleForTrace,
+  windowContains,
+  windowRows,
+  windowStartFor,
 } from '../utils/scale';
+import type { FlatTraceRow, RowWindow } from '../utils/scale';
 import { SourceLink } from './SourceLink';
 
 /*
  * ---------------------------------------------------------------------------
  * Geometry
  *
- * Every constant below is in SVG user units, the permitted structural form of
- * AAP 0.6.4 — not a CSS length and not a design token. A measured canvas maps
- * one user unit to one CSS pixel, so these are pixel distances on screen; the
- * unmeasured fallback stretches them horizontally with the rest of its
- * drawing. The canvas width is not a constant at all: it is the viewport's
- * measured width, resolved per render by `resolveCanvasWidth`. The vertical
- * rhythm is NOT restated here either: row height and row gutter come from
- * `../utils/scale`, so this view shares one pitch with the timeline and the
- * waterfall.
+ * Every constant below is in SVG user units of the fixed logical canvas, the
+ * permitted structural form of AAP 0.6.4 — not a CSS length and not a design
+ * token. The stylesheet scales the whole drawing uniformly to its container,
+ * so these keep their proportions to the frames and the text at every panel
+ * width. The canvas width is not restated here: it is `../utils/scale`'s
+ * `CHART_VIEWBOX_WIDTH`, which the timeline shares. Neither is the vertical
+ * rhythm: row height and row gutter come from `../utils/scale`, so this view
+ * shares one pitch with the timeline and the waterfall.
  * ---------------------------------------------------------------------------
  */
+
+/**
+ * Measures a frame label in logical units: the deterministic advance estimate
+ * of the labels' type role (`.dg-flame__frame-label` is set in `monoSm`, whose
+ * size is `DEFAULT_LABEL_FONT_SIZE` units). One instance for the module,
+ * because it depends on nothing a render can change.
+ */
+const LABEL_MEASURE: TextMeasure = createEstimateMeasure(DEFAULT_LABEL_FONT_SIZE);
 
 /** The band the time axis occupies above the first depth row, in user units. */
 const AXIS_BAND_HEIGHT = 16;
@@ -412,8 +446,11 @@ const MALFORMED_TRACE_EXPECTED =
  */
 const PARTIAL_RESULT_LABEL = 'Partial result';
 
-/** The control that raises the traversal's row bound by one step. */
-const SHOW_MORE_LABEL = 'Show more operations';
+/** The control that moves the drawn window to the operations before it. */
+const PREVIOUS_WINDOW_LABEL = 'Previous operations';
+
+/** The control that moves the drawn window to the operations after it. */
+const NEXT_WINDOW_LABEL = 'Next operations';
 
 /**
  * The partial-result sentence for a trace the correlator itself bounded, with
@@ -464,6 +501,21 @@ export interface FlameChartProps {
 interface FlameFrame {
   /** This frame's identity within the view: its span id, made unique. */
   readonly frameId: string;
+  /**
+   * The frame's position among every SHOWN operation of the whole walk — the
+   * index the drawn window pages over, whether or not this frame's window is
+   * the one on screen.
+   */
+  readonly shownIndex: number;
+  /** The parent's {@link shownIndex}; absent at a root. */
+  readonly parentShownIndex: number | undefined;
+  /**
+   * The frame's 1-based position among the shown operations that share its
+   * parent, across the whole walk: its `aria-posinset`.
+   */
+  readonly posInSet: number;
+  /** How many shown operations share its parent, across the whole walk: its `aria-setsize`. */
+  readonly setSize: number;
   /** The captured event's own id — what a selection names. */
   readonly eventId: string;
   /** The span id. */
@@ -555,9 +607,83 @@ interface PlacedFrame {
   readonly label: string | undefined;
 }
 
-/** Everything one resolved trace yields: both representations and their notes. */
-interface FlameModel {
-  /** Every shown frame, in the traversal's order — the list's rows. */
+/**
+ * The counts every note and notice is worded from. Facts about the whole walk,
+ * never about the drawn window alone, so a statement about the trace reads the
+ * same on every page of it.
+ */
+interface TraceFacts {
+  /** How many operations a fold is hiding. */
+  readonly foldedAway: number;
+  /** How many subtrees are folded. */
+  readonly foldCount: number;
+  /** How many operations the walk visited within its bounds, shown or folded away. */
+  readonly walkedCount: number;
+  /**
+   * Whether the walk stopped at the trace's own declared node count with more
+   * of the tree unvisited — a tree that holds more than it says it does.
+   */
+  readonly walkBounded: boolean;
+  /** Whether the depth bound left the children of some frame undrawn. */
+  readonly depthClamped: boolean;
+  /** Whether the correlator itself truncated the trace. */
+  readonly treeTruncated: boolean;
+  /** How many records the correlator re-attached. */
+  readonly orphanCount: number;
+  /** How many roots the trace arrived with. */
+  readonly rootCount: number;
+  /** How many span ids the correlator saw more than once. */
+  readonly duplicateCount: number;
+  /** The whole trace's duration, in milliseconds. */
+  readonly totalDurationMs: number;
+  /** How many nodes the trace declares it holds, at every depth. */
+  readonly nodeCount: number;
+}
+
+/**
+ * One operation the walk SHOWS — visited within the depth bound and not hidden
+ * by a folded ancestor — with the identity and the place in the hierarchy that
+ * drawing it needs, and none of its geometry.
+ *
+ * The walk yields one of these per shown operation of the whole trace: data,
+ * and no DOM. Only the drawn window's become {@link FlameFrame}s and bars.
+ */
+interface ShownRow {
+  /** The traversal's row, borrowing its trace node read-only. */
+  readonly row: FlatTraceRow;
+  /** The frame id the operation is known by: its span id, made unique. */
+  readonly frameId: string;
+  /** The parent's index among the shown operations; absent at a root. */
+  readonly parentShownIndex: number | undefined;
+  /** Its 1-based position among the shown operations that share its parent. */
+  readonly posInSet: number;
+  /** Whether its subtree can be folded — it has children the depth bound kept. */
+  readonly foldable: boolean;
+  /** Whether its subtree is folded away right now. */
+  readonly folded: boolean;
+}
+
+/**
+ * The walk of one resolved trace under the reader's folds: every shown
+ * operation, in order, and the facts the notes state. The drawn window is cut
+ * from it by {@link drawWindow}, so paging never walks the trace again.
+ */
+interface FlameWalk extends TraceFacts {
+  /** The trace walked; absent for an unresolved, empty or unusable one. */
+  readonly tree: TraceTree | undefined;
+  /** Every shown operation, in the traversal's order: what the window pages over. */
+  readonly shown: readonly ShownRow[];
+  /**
+   * How many shown operations share each parent, keyed by the parent's shown
+   * index — {@link ROOT_PARENT_KEY} for the roots — so a drawn row states its
+   * place among ALL of its siblings, not among the ones its window holds.
+   */
+  readonly setSizes: ReadonlyMap<number, number>;
+}
+
+/** What one render draws: the window's frames in both representations, and the facts. */
+interface FlameModel extends TraceFacts {
+  /** The drawn window's frames, in the traversal's order — the list's rows. */
   readonly frames: readonly FlameFrame[];
   /**
    * The icicle's drawn rows, top to bottom, each holding frames that never
@@ -575,48 +701,28 @@ interface FlameModel {
     readonly offset: number;
     readonly label: string;
   }[];
-  /** How many frames a fold is hiding. */
-  readonly foldedAway: number;
-  /** How many subtrees are folded. */
-  readonly foldCount: number;
-  /**
-   * How many operations this view holds: every frame the traversal visited
-   * within its bounds, shown or folded away. The `N` of "Showing N of M".
-   */
-  readonly walkedCount: number;
-  /**
-   * Whether the traversal stopped at its row bound with more of the trace in
-   * memory — the reduction "Show more operations" lifts.
-   */
-  readonly rowBounded: boolean;
-  /** Whether the depth bound left the children of some frame undrawn. */
-  readonly depthClamped: boolean;
-  /** Whether the correlator itself truncated the trace. */
-  readonly treeTruncated: boolean;
-  /** How many records the correlator re-attached. */
-  readonly orphanCount: number;
-  /** How many roots the trace arrived with. */
-  readonly rootCount: number;
-  /** How many span ids the correlator saw more than once. */
-  readonly duplicateCount: number;
-  /** The whole trace's duration, in milliseconds. */
-  readonly totalDurationMs: number;
-  /** How many nodes the trace holds, at every depth. */
-  readonly nodeCount: number;
-  /** The greatest depth shown. */
+  /** The greatest depth drawn. */
   readonly shownDepth: number;
+  /**
+   * The drawn window over the walk's shown operations: which are drawn, and
+   * how many precede and follow them undrawn. Never more than
+   * {@link MAX_DRAWN_ROWS}.
+   */
+  readonly window: RowWindow;
 }
 
-/** The model an unresolved, empty or unusable trace yields. */
-const EMPTY_MODEL: FlameModel = {
-  frames: [],
-  icicleRows: [],
-  canvasHeight: AXIS_BAND_HEIGHT,
-  ticks: [],
+/**
+ * The key the roots are counted under when shown operations are grouped by
+ * their parent's shown index, which is never negative.
+ */
+const ROOT_PARENT_KEY = -1;
+
+/** The facts of an unresolved, empty or unusable trace. */
+const EMPTY_FACTS: TraceFacts = {
   foldedAway: 0,
   foldCount: 0,
   walkedCount: 0,
-  rowBounded: false,
+  walkBounded: false,
   depthClamped: false,
   treeTruncated: false,
   orphanCount: 0,
@@ -624,28 +730,45 @@ const EMPTY_MODEL: FlameModel = {
   duplicateCount: 0,
   totalDurationMs: 0,
   nodeCount: 0,
+};
+
+/** The walk an unresolved, empty or unusable trace yields. */
+const EMPTY_WALK: FlameWalk = {
+  ...EMPTY_FACTS,
+  tree: undefined,
+  shown: [],
+  setSizes: new Map(),
+};
+
+/** The model an unresolved, empty or unusable trace yields. */
+const EMPTY_MODEL: FlameModel = {
+  ...EMPTY_FACTS,
+  frames: [],
+  icicleRows: [],
+  canvasHeight: AXIS_BAND_HEIGHT,
+  ticks: [],
   shownDepth: 0,
+  window: windowRows(0),
 };
 
 /**
- * The coordinate system one render lays the icicle out in.
+ * The drawn window a reader has paged to, tagged with the query it was paged
+ * for and with the selection it had already accounted for.
  *
- * Resolved by the component from its viewport's measurement on every render,
- * and a dependency of the model's memo, so a resize re-lays the frames and a
- * render that changes nothing reuses them.
+ * Tagged rather than reset by an effect: a window whose identity no longer
+ * matches the node's query is simply not read, so a changed query starts at
+ * the first window on the very render that shows it. The selection key is
+ * what lets a reader page AWAY from a selected frame: the window is moved to a
+ * selection only when the selection is newer than the window (see
+ * `FlameChart`).
  */
-interface FlameCanvas {
-  /**
-   * The canvas width in user units: the viewport's inner width in CSS pixels
-   * when it has been measured, else `DEFAULT_CANVAS_WIDTH`.
-   */
-  readonly width: number;
-  /**
-   * Measures a string in the frame labels' font, in user units: the rendered
-   * font's canvas metrics where the platform has them, else the deterministic
-   * estimate. Stable until the font changes, so it is a sound memo dependency.
-   */
-  readonly measureText: TextMeasure;
+interface WindowState {
+  /** The node and query the window was paged for. */
+  readonly identity: string;
+  /** The first drawn operation's index among the shown operations. */
+  readonly start: number;
+  /** The selected frame's id when the window was set; `undefined` for none. */
+  readonly selectionKey: string | undefined;
 }
 
 /**
@@ -862,10 +985,13 @@ function canvasTextAlternative(model: FlameModel, title: string | undefined): st
     LEVEL_NOUN,
   )} deep, ${formatDuration(model.totalDurationMs)} from the first to the last.`;
 
-  // A partial picture says so in the same words the notice beside it uses.
+  // A partial picture says so in the same words the notices beside it use.
   const partial: string[] = [];
-  if (model.rowBounded) {
-    partial.push(rowBoundSentence(model));
+  if (isWindowed(model.window)) {
+    partial.push(windowSentence(model.window));
+  }
+  if (model.walkBounded) {
+    partial.push(walkBoundSentence(model));
   }
   if (model.treeTruncated) {
     partial.push('The trace itself arrived incomplete.');
@@ -977,15 +1103,17 @@ function selfTimeMsOf(node: TraceNode): number {
  * The label to draw inside a bar of `width` user units, or `undefined` when
  * none fits.
  *
- * The name is fitted by its measured advance in the label font, never by a
- * character count: `fitTextToWidth` keeps the whole name when it fits the bar
- * less {@link LABEL_INSET} on each side, and otherwise the longest grapheme
- * prefix that fits with an ellipsis appended. So a label never extends past its
- * bar, a truncated label's ellipsis is always inside the bar where a reader can
- * see it, and a cut never splits an emoji, a flag or a combining sequence. A
+ * The name is fitted by its estimated advance in the label's type role, in the
+ * same logical units as the bar ({@link LABEL_MEASURE}), never by a character
+ * count: `fitTextToWidth` keeps the whole name when it fits the bar less
+ * {@link LABEL_INSET} on each side, and otherwise the longest grapheme prefix
+ * that fits with an ellipsis appended. So a label never extends past its bar, a
+ * truncated label's ellipsis is always inside the bar where a reader can see
+ * it, and a cut never splits an emoji, a flag or a combining sequence. A
  * character budget could promise none of that: glyph advances differ (an emoji
  * is about two columns wide), and a budget wrong by one glyph paints the
- * ellipsis past the edge.
+ * ellipsis past the edge. The bar and its label scale together with the
+ * canvas, so the fit holds at every panel width.
  *
  * A bar too narrow for a legible fragment carries no label at all — one
  * narrower than {@link MIN_LABEL_WIDTH}, or one that cannot hold
@@ -995,15 +1123,14 @@ function selfTimeMsOf(node: TraceNode): number {
  *
  * @param name The operation's recorded name.
  * @param width The bar's width, in the canvas's user units.
- * @param measureText Measures a string in the label font, in the same units.
  * @returns The text to draw, or `undefined` for no label.
  */
-function frameLabelText(name: string, width: number, measureText: TextMeasure): string | undefined {
+function frameLabelText(name: string, width: number): string | undefined {
   if (!(width >= MIN_LABEL_WIDTH)) {
     return undefined;
   }
 
-  return fitTextToWidth(name, width - LABEL_INSET * 2, measureText, {
+  return fitTextToWidth(name, width - LABEL_INSET * 2, LABEL_MEASURE, {
     minGraphemes: MIN_LABEL_CHARS,
   })?.text;
 }
@@ -1108,17 +1235,48 @@ function packIcicleRows(
 }
 
 /**
- * Turns a resolved trace into the two representations this component renders.
+ * The count a trace declares for itself, made usable as a bound: a finite,
+ * positive count rounded down, and `0` for anything else.
+ */
+function declaredCount(value: number): number {
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+}
+
+/**
+ * Walks a resolved trace under the reader's folds: every operation the depth
+ * bound reaches, in order, reduced to the ones no folded ancestor hides.
  *
  * ## One traversal, top-down, bounded, and not recursive
  *
  * `../utils/scale`'s `flattenTraceRows` performs the walk over an explicit
  * stack, so a malformed or deeply recursive tree cannot overflow the
  * JavaScript call stack of a DevTools panel, and it preserves the canonical
- * sibling order the
- * correlator settled — parent before child, then start time, then the
- * producer's sequence, then the store's arrival number. Nothing here re-sorts
- * it: an order that differs between two views of one capture is unreadable.
+ * sibling order the correlator settled — parent before child, then start time,
+ * then the producer's sequence, then the store's arrival number. Nothing here
+ * re-sorts it: an order that differs between two views of one capture is
+ * unreadable.
+ *
+ * ## The walk covers the whole trace; drawing does not
+ *
+ * The window a reader pages over, the place a row states among its siblings
+ * and the counts the notes give are all facts about the WHOLE trace, so the
+ * walk visits every node the depth bound reaches. What it yields is data — one
+ * small record per shown operation, borrowing the trace node — with no
+ * geometry and no DOM: {@link drawWindow} turns at most {@link MAX_DRAWN_ROWS}
+ * of those records into frames and bars, and paging re-cuts the window from
+ * this same walk rather than walking again.
+ *
+ * ## The walk is bounded by what the trace says it holds
+ *
+ * The traversal takes a bound, and the trace declares its own node count,
+ * which a well-formed tree meets exactly. So the walk stops at that count —
+ * never below one drawn window, so a count that cannot be believed still draws
+ * what fits — and visits ONE operation of lookahead past it. Producing that
+ * extra operation is the exact answer to "does this tree hold more than it
+ * says" (`walkBounded`), which the layout's `truncated` flag cannot give,
+ * because the depth bound sets it too; it costs one node rather than a second
+ * walk, and it keeps a malformed tree from being walked without limit while
+ * its excess is still stated rather than dropped silently.
  *
  * ## Folding is a filter over the full walk, never a shorter walk
  *
@@ -1128,112 +1286,56 @@ function packIcicleRows(
  * stable while subtrees open and close: a row's index is a property of the
  * trace, not of what happens to be unfolded.
  *
- * ## Ancestry is collected on the way down
+ * ## Siblings are counted across the whole walk
  *
- * A trace node has no parent pointer, so the walk's `parentRowIndex` is used to
- * extend the parent's own chain as each row is produced. A parent always
- * precedes its children in a pre-order walk, so the chain is always available
- * by the time a child needs it, and no row is ever searched for upward.
- *
- * ## Geometry is in the canvas's own units
- *
- * The time scale maps the trace's window onto `[0, canvas.width]`, and the axis
- * ticks are spaced over that same range, so a measured canvas places every
- * frame and tick in CSS pixels and a narrow one carries fewer ticks rather
- * than overlapping labels. Each frame's label is fitted to that frame's width
- * with `canvas.measureText`, which measures in the same units.
- *
- * ## Rows are packed, not assigned by depth alone
- *
- * Each depth's bars are packed into as many sub-rows as their drawn extents
- * need so that no two bars on one row overlap (see {@link packIcicleRows}); a
- * depth whose siblings are disjoint keeps a single row. The extents are read
- * in the same canvas units, after the scale's minimum-width clamp, so the
- * packing answers for the bars as they are painted at this width: a narrower
- * canvas widens more short bars to the minimum and may need more sub-rows.
- *
- * ## The row bound is the caller's, and it is reported exactly
- *
- * The traversal walks ONE operation past `maxRows` and keeps only the first
- * `maxRows` rows (its `visibleRows` window). Whether it produced that extra
- * operation is the exact answer to "does the trace hold more than this view
- * shows" — which the layout's `truncated` flag cannot give, because the depth
- * bound sets it too — and it costs one node rather than a second walk. The
- * model says so (`rowBounded`) and carries the count it holds and the trace's
- * own node count, which is what the partial-result notice states. The depth
- * bound is reported separately (`depthClamped`), because raising the row bound
- * does not lift it.
+ * Each shown operation's position among the shown operations that share its
+ * parent is numbered here in one forward pass — a parent precedes its children
+ * in a pre-order walk — so a drawn row's `aria-posinset` of `aria-setsize` is
+ * its place among ALL of its siblings, on whichever page each of them is drawn.
  *
  * @param tree The resolved trace, read and never mutated.
  * @param folds Which frames the developer has explicitly opened or closed, by
  * frame id; a frame absent from the map takes the default for its depth.
- * @param canvas The coordinate system to lay the icicle out in, and the
- * measure its labels are fitted with.
- * @param maxRows The most operations this view shows.
- * @returns The frames, their bars packed into drawn rows, the axis and every
- * count a note is rendered from.
+ * @returns Every shown operation, in order, and the facts the notes are
+ * worded from.
  */
-function buildModel(
-  tree: TraceTree | undefined,
-  folds: ReadonlyMap<string, boolean>,
-  canvas: FlameCanvas,
-  maxRows: number,
-): FlameModel {
+function walkTrace(tree: TraceTree | undefined, folds: ReadonlyMap<string, boolean>): FlameWalk {
   if (tree === undefined || tree.nodeCount === 0 || tree.roots.length === 0) {
-    return EMPTY_MODEL;
+    return EMPTY_WALK;
   }
 
+  const walkBound = Math.max(declaredCount(tree.nodeCount), MAX_DRAWN_ROWS);
   const layout = flattenTraceRows(tree, {
     maxDepth: MAX_ICICLE_DEPTH,
-    maxRows: maxRows + 1,
-    visibleRows: maxRows,
+    maxRows: walkBound + 1,
   });
-  const scale = timeScaleForTrace(tree, [0, canvas.width]);
-  const axis = generateAxisTicks(scale);
+  // The lookahead operation exists only when the tree holds more than the
+  // bound; it is counted, never shown.
+  const walkBounded = layout.totalRowCount > walkBound;
+  const visited = Math.min(layout.rows.length, walkBound);
 
-  const frames: FlameFrame[] = [];
-  const barsByDepth: UnrowedFrame[][] = [];
+  const shown: ShownRow[] = [];
+  const setSizes = new Map<number, number>();
 
-  /**
-   * Every visited row's name, its named ancestor chain and how many ancestors
-   * it has in all, by row index — the last so a chain cut to
-   * {@link MAX_ANCESTRY_NAMES} can say that it was.
-   */
-  const nameByRow: string[] = [];
-  const ancestryByRow: (readonly string[])[] = [];
-  const ancestorCountByRow: number[] = [];
+  /** Every shown row's index among the shown operations, by row index. */
+  const shownIndexByRow: (number | undefined)[] = [];
 
-  /** Rows hidden because an ancestor is folded, and rows that are folded. */
-  const hiddenRows = new Set<number>();
-  const foldedRows = new Set<number>();
+  /** Rows whose descendants are hidden: hidden themselves, or folded. */
+  const closedRows = new Set<number>();
 
   /** Span ids already used as a frame id, so a duplicate cannot collide. */
   const usedSpanIds = new Set<string>();
 
-  /** Every shown row's frame id, by row index, so a child can name its parent. */
-  const frameIdByRow: (string | undefined)[] = [];
-
   let foldedAway = 0;
-  let shownDepth = 0;
+  let foldCount = 0;
   let depthClamped = false;
 
-  for (const row of layout.rows) {
-    const { event } = row.node;
-    const parentIndex = row.parentRowIndex;
-    const parentName = parentIndex === undefined ? undefined : nameByRow[parentIndex];
-    const parentAncestry = parentIndex === undefined ? undefined : ancestryByRow[parentIndex];
-    const ancestry =
-      parentName === undefined
-        ? []
-        : [...(parentAncestry ?? []), parentName].slice(-MAX_ANCESTRY_NAMES);
-    const ancestorCount =
-      parentIndex === undefined || parentName === undefined
-        ? 0
-        : (ancestorCountByRow[parentIndex] ?? 0) + 1;
-
-    nameByRow[row.rowIndex] = event.name;
-    ancestryByRow[row.rowIndex] = ancestry;
-    ancestorCountByRow[row.rowIndex] = ancestorCount;
+  for (let index = 0; index < visited; index += 1) {
+    const row = layout.rows[index];
+    if (row === undefined) {
+      continue;
+    }
+    const parentRow = row.parentRowIndex;
 
     // Read before the fold check: a clamp inside a folded subtree is still a
     // clamp, and the note about it must not depend on what is open.
@@ -1241,19 +1343,17 @@ function buildModel(
       depthClamped = true;
     }
 
-    if (parentIndex !== undefined && (hiddenRows.has(parentIndex) || foldedRows.has(parentIndex))) {
+    if (parentRow !== undefined && closedRows.has(parentRow)) {
       // An ancestor is folded, so this row is not shown — and neither is
       // anything below it, which the next iterations resolve through this set.
-      hiddenRows.add(row.rowIndex);
+      closedRows.add(row.rowIndex);
       foldedAway += 1;
       continue;
     }
 
-    const frameId = usedSpanIds.has(event.spanId)
-      ? `${event.spanId}#${String(row.rowIndex)}`
-      : event.spanId;
-    usedSpanIds.add(event.spanId);
-    frameIdByRow[row.rowIndex] = frameId;
+    const spanId = row.node.event.spanId;
+    const frameId = usedSpanIds.has(spanId) ? `${spanId}#${String(row.rowIndex)}` : spanId;
+    usedSpanIds.add(spanId);
 
     // A frame whose children the depth bound already dropped has nothing left
     // to fold, so it offers no control: the note about the bound is the honest
@@ -1263,11 +1363,150 @@ function buildModel(
     const folded = foldable && (opened === undefined ? row.depth >= AUTO_FOLD_DEPTH : !opened);
 
     if (folded) {
-      foldedRows.add(row.rowIndex);
+      closedRows.add(row.rowIndex);
+      foldCount += 1;
     }
 
+    const parentShownIndex = parentRow === undefined ? undefined : shownIndexByRow[parentRow];
+    const siblingKey = parentShownIndex ?? ROOT_PARENT_KEY;
+    const posInSet = (setSizes.get(siblingKey) ?? 0) + 1;
+    setSizes.set(siblingKey, posInSet);
+
+    shownIndexByRow[row.rowIndex] = shown.length;
+    shown.push({ row, frameId, parentShownIndex, posInSet, foldable, folded });
+  }
+
+  return {
+    tree,
+    shown,
+    setSizes,
+    foldedAway,
+    foldCount,
+    walkedCount: visited,
+    walkBounded,
+    depthClamped,
+    treeTruncated: tree.truncated,
+    orphanCount: tree.orphanCount,
+    rootCount: tree.roots.length,
+    duplicateCount: tree.duplicateSpanIds.length,
+    totalDurationMs: tree.totalDuration,
+    nodeCount: tree.nodeCount,
+  };
+}
+
+/** The facts of a walk, without the walk itself: what a drawn model carries. */
+function factsOf(walk: FlameWalk): TraceFacts {
+  return {
+    foldedAway: walk.foldedAway,
+    foldCount: walk.foldCount,
+    walkedCount: walk.walkedCount,
+    walkBounded: walk.walkBounded,
+    depthClamped: walk.depthClamped,
+    treeTruncated: walk.treeTruncated,
+    orphanCount: walk.orphanCount,
+    rootCount: walk.rootCount,
+    duplicateCount: walk.duplicateCount,
+    totalDurationMs: walk.totalDurationMs,
+    nodeCount: walk.nodeCount,
+  };
+}
+
+/**
+ * A shown operation's nearest ancestors' names, outermost first: at most
+ * {@link MAX_ANCESTRY_NAMES} of them.
+ *
+ * Read UP the walk's parent links rather than carried down the walk, because
+ * only a drawn frame needs its breadcrumb: the chain is at most that many
+ * steps, so the cost is paid per drawn frame, not per walked operation. Every
+ * ancestor of a shown operation is itself shown — a fold hides whole subtrees
+ * — so every link resolves.
+ *
+ * @param shown The walk's shown operations.
+ * @param entry The operation whose ancestry is wanted.
+ * @returns The names, outermost first.
+ */
+function ancestryOf(shown: readonly ShownRow[], entry: ShownRow): readonly string[] {
+  const names: string[] = [];
+  let parentIndex = entry.parentShownIndex;
+
+  while (parentIndex !== undefined && names.length < MAX_ANCESTRY_NAMES) {
+    const ancestor = shown[parentIndex];
+    if (ancestor === undefined) {
+      break;
+    }
+    names.push(ancestor.row.node.event.name);
+    parentIndex = ancestor.parentShownIndex;
+  }
+
+  return names.reverse();
+}
+
+/**
+ * Draws one window of a walk: at most {@link MAX_DRAWN_ROWS} of its shown
+ * operations as frames, their bars packed into rows, and the axis.
+ *
+ * ## The budget is absolute
+ *
+ * The window is `windowRows` over the walk's shown operations at the budget,
+ * so however large the trace and whichever page the reader is on, the icicle
+ * and the tree beneath it are built from at most that many frames. The frames
+ * of every other page are not built at all.
+ *
+ * ## Geometry is in the fixed logical canvas
+ *
+ * The time scale maps the WHOLE trace's window onto
+ * `[0, CHART_VIEWBOX_WIDTH]` on every page, so a frame keeps its horizontal
+ * place whichever window draws it, and the axis ticks are spaced over that
+ * same range. Each frame's label is fitted to that frame's width in the same
+ * units ({@link frameLabelText}). Nothing is read from the page, so the
+ * drawing is a pure function of the walk and the window.
+ *
+ * ## Rows are packed, not assigned by depth alone
+ *
+ * Each depth's bars are packed into as many sub-rows as their drawn extents
+ * need so that no two bars on one row overlap (see {@link packIcicleRows}); a
+ * depth whose siblings are disjoint keeps a single row. The extents are read
+ * in the same logical units, after the scale's minimum-width clamp, so the
+ * packing answers for the bars as they are painted. A window that opens below
+ * the root holds no frame at the shallower depths, and those depths draw no
+ * row.
+ *
+ * @param walk The walk to draw a window of.
+ * @param start The first shown operation to draw; sanitised by `windowRows`.
+ * @returns The window's frames, their bars packed into drawn rows, the axis
+ * and every fact a note is rendered from.
+ */
+function drawWindow(walk: FlameWalk, start: number): FlameModel {
+  const window = windowRows(walk.shown.length, start, MAX_DRAWN_ROWS);
+  const { tree } = walk;
+
+  if (tree === undefined || window.count === 0) {
+    return EMPTY_MODEL;
+  }
+
+  const scale = timeScaleForTrace(tree, [0, CHART_VIEWBOX_WIDTH]);
+  const axis = generateAxisTicks(scale);
+
+  const frames: FlameFrame[] = [];
+  const barsByDepth: UnrowedFrame[][] = [];
+  let shownDepth = 0;
+
+  for (let shownIndex = window.start; shownIndex < window.end; shownIndex += 1) {
+    const entry = walk.shown[shownIndex];
+    if (entry === undefined) {
+      continue;
+    }
+
+    const { row, parentShownIndex } = entry;
+    const { event } = row.node;
+    const ancestry = ancestryOf(walk.shown, entry);
+
     const frame: FlameFrame = {
-      frameId,
+      frameId: entry.frameId,
+      shownIndex,
+      parentShownIndex,
+      posInSet: entry.posInSet,
+      setSize: walk.setSizes.get(parentShownIndex ?? ROOT_PARENT_KEY) ?? entry.posInSet,
       eventId: event.id,
       spanId: event.spanId,
       traceId: event.traceId,
@@ -1276,7 +1515,8 @@ function buildModel(
       tier: event.tier,
       status: event.status,
       depth: row.depth,
-      parentFrameId: parentIndex === undefined ? undefined : frameIdByRow[parentIndex],
+      parentFrameId:
+        parentShownIndex === undefined ? undefined : walk.shown[parentShownIndex]?.frameId,
       startTime: event.startTime,
       durationMs: usableDurationMs(event.duration),
       selfTimeMs: selfTimeMsOf(row.node),
@@ -1287,9 +1527,11 @@ function buildModel(
       lineageAmbiguous: row.lineageAmbiguous,
       source: event.source,
       ancestry,
-      ancestryTruncated: ancestorCount > ancestry.length,
-      foldable,
-      folded,
+      // A shown frame has one shown ancestor per level above it, so its depth
+      // is how many ancestors it has in all.
+      ancestryTruncated: row.depth > ancestry.length,
+      foldable: entry.foldable,
+      folded: entry.folded,
       childrenBeyondDepth: row.childrenTruncated,
     };
 
@@ -1306,7 +1548,7 @@ function buildModel(
       x: geometry.x,
       width: geometry.width,
       height: row.height,
-      label: frameLabelText(event.name, geometry.width, canvas.measureText),
+      label: frameLabelText(event.name, geometry.width),
     };
 
     const bucket = barsByDepth[row.depth];
@@ -1317,41 +1559,25 @@ function buildModel(
     }
   }
 
-  // Dense by construction — a shown frame's ancestors are all shown, so no
-  // depth between the root and the deepest shown row can be empty — and built
-  // through a defaulted read so a gap could never become a hole in the array.
-  const depthBars: readonly (readonly UnrowedFrame[])[] =
-    frames.length === 0
-      ? []
-      : Array.from({ length: shownDepth + 1 }, (_unused, depth) => barsByDepth[depth] ?? []);
+  // Built through a defaulted read so a depth the window holds no frame at —
+  // above a window that opens below the root — is an empty bucket, which packs
+  // into no row, and never a hole in the array.
+  const depthBars: readonly (readonly UnrowedFrame[])[] = Array.from(
+    { length: shownDepth + 1 },
+    (_unused, depth) => barsByDepth[depth] ?? [],
+  );
   const icicleRows = packIcicleRows(depthBars);
 
-  // The lookahead operation was produced only when the trace holds more than
-  // the bound shows within the depth this layout draws — so a walk the depth
-  // bound ended on exactly `maxRows` rows is not row-bounded, and "Show more
-  // operations" is offered only when it would reveal something.
-  const rowBounded = layout.totalRowCount > maxRows;
-
   return {
+    ...factsOf(walk),
     frames,
     icicleRows,
     // Sized by the rows actually drawn, which is the depth count only when no
     // depth needed a second row.
     canvasHeight: AXIS_BAND_HEIGHT + layoutHeight(icicleRows.length),
     ticks: axis.ticks,
-    foldedAway,
-    foldCount: foldedRows.size,
-    // What the window kept, never the lookahead operation past it.
-    walkedCount: layout.rows.length,
-    rowBounded,
-    depthClamped,
-    treeTruncated: tree.truncated,
-    orphanCount: tree.orphanCount,
-    rootCount: tree.roots.length,
-    duplicateCount: tree.duplicateSpanIds.length,
-    totalDurationMs: tree.totalDuration,
-    nodeCount: tree.nodeCount,
     shownDepth,
+    window,
   };
 }
 
@@ -1410,52 +1636,71 @@ function notesFor(model: FlameModel): readonly string[] {
   return notes;
 }
 
-/**
- * What the traversal's row bound left out, as the sentence the notice and the
- * canvas's text alternative both state: "Showing N of M operations." — where M
- * is the trace's own node count.
- *
- * A trace that reports no more nodes than the walk produced cannot be believed
- * about its total, so its sentence names only what is shown, never an M that
- * would read as "everything".
- */
-function rowBoundSentence(model: FlameModel): string {
-  return model.nodeCount > model.walkedCount
-    ? `Showing ${formatCount(model.walkedCount)} of ${pluralOperations(model.nodeCount)}.`
-    : `Showing the first ${pluralOperations(model.walkedCount)} of this trace.`;
+/** Whether a window leaves part of its walk undrawn, so its statement and controls are owed. */
+function isWindowed(window: RowWindow): boolean {
+  return window.count < window.total;
 }
 
 /**
- * The partial-result notice's sentences, or none when the view draws all it
- * was given: the row bound it can lift, then the correlator's own truncation,
- * which only a narrower query or capture can.
+ * Which operations the drawn window holds, as the sentence beside its controls
+ * and the canvas's text alternative both state it: "Operations 2,001–4,000 of
+ * 9,500 are drawn; 2,000 before and 5,500 after are not." — counted among the
+ * shown operations, which is what the controls page over. Only the sides that
+ * hold undrawn operations are named, and a one-operation window names its one
+ * operation.
+ *
+ * @param window The drawn window.
+ * @returns The sentence.
+ */
+function windowSentence(window: RowWindow): string {
+  const total = formatCount(window.total);
+  const drawn =
+    window.count === 1
+      ? `Operation ${formatCount(window.start + 1)} of ${total} is drawn`
+      : `Operations ${formatCount(window.start + 1)}–${formatCount(window.end)} of ${total} are drawn`;
+
+  const undrawn: string[] = [];
+  if (window.before > 0) {
+    undrawn.push(`${formatCount(window.before)} before`);
+  }
+  if (window.after > 0) {
+    undrawn.push(`${formatCount(window.after)} after`);
+  }
+
+  return undrawn.length === 0
+    ? `${drawn}.`
+    : `${drawn}; ${undrawn.join(' and ')} ${pluralize(window.before + window.after, IS_VERB)} not.`;
+}
+
+/**
+ * What a walk bounded at the trace's own declared count left out, as the
+ * partial-result notice and the canvas's text alternative both state it. The
+ * declared count is not repeated, because it is the number that was wrong.
+ */
+function walkBoundSentence(model: FlameModel): string {
+  return `This trace holds more operations than it reports, so only the first ${pluralOperations(
+    model.walkedCount,
+  )} of it are listed.`;
+}
+
+/**
+ * The partial-result notice's sentences, or none when every operation of the
+ * trace is held here: a walk the trace's own count bounded, then the
+ * correlator's own truncation, which only a narrower query or capture can
+ * lift. The drawn window is not among them — every operation it leaves out is
+ * one page away — and is stated beside its own controls instead.
  */
 function partialSentencesFor(model: FlameModel): readonly string[] {
   const sentences: string[] = [];
 
-  if (model.rowBounded) {
-    sentences.push(rowBoundSentence(model));
+  if (model.walkBounded) {
+    sentences.push(walkBoundSentence(model));
   }
   if (model.treeTruncated) {
     sentences.push(TRUNCATED_TRACE_NOTE);
   }
 
   return sentences;
-}
-
-/**
- * The row bound after one "Show more operations": one default step higher,
- * capped at the trace's own node count when that count is larger than the
- * bound in force. A trace whose count cannot be believed still moves by one
- * step, so the control always reveals something the walk left out.
- *
- * @param maxRows The row bound in force.
- * @param nodeCount The trace's own node count.
- * @returns The next row bound.
- */
-function nextRowBound(maxRows: number, nodeCount: number): number {
-  const stepped = maxRows + DEFAULT_MAX_TRACE_ROWS;
-  return nodeCount > maxRows ? Math.min(stepped, nodeCount) : stepped;
 }
 
 /** Where a tick's label sits relative to its rule, so no label overhangs. */
@@ -1470,48 +1715,66 @@ function tickAnchor(index: number, count: number): 'start' | 'middle' | 'end' {
 }
 
 /**
- * The id of the drawn frame the panel's selection stands for, or `undefined`
- * when nothing is selected or the selected event is not among the drawn frames
- * (a folded subtree, a frame past the depth bound, another trace).
+ * The index, among a walk's shown operations, of the one the panel's
+ * selection stands for, or `undefined` when nothing is selected or the
+ * selected event is not shown (a folded subtree, a frame past the depth bound,
+ * another trace).
  *
- * The frame carrying the selected event id wins. Failing that, the first frame
- * that names the same trace **and** the same span — the other pairing
- * `matchesPanelSelection` accepts — so a selection reported by a view that drew
- * the span under another record's id still lands here. At most one frame is
- * returned, so the picture and the list mark the same single frame even for a
- * span id the correlator saw twice.
+ * Searched over the whole walk, not the drawn window, so a selection made in
+ * another view is found on whichever page draws it. The operation carrying the
+ * selected event id wins. Failing that, the first that names the same trace
+ * **and** the same span — the other pairing `matchesPanelSelection` accepts —
+ * so a selection reported by a view that drew the span under another record's
+ * id still lands here. At most one operation is returned, so the picture and
+ * the list mark the same single frame even for a span id the correlator saw
+ * twice.
  *
- * @param frames The drawn frames, in the order both representations draw them.
+ * @param shown The walk's shown operations, in order.
  * @param selection The panel's selection, as `useViewSelection` returns it.
- * @returns The selected frame's id, if that frame is drawn.
+ * @returns The selected operation's shown index, if it is shown.
  */
-function selectedFrameIdOf(
-  frames: readonly FlameFrame[],
+function shownIndexOfSelection(
+  shown: readonly ShownRow[],
   selection: PanelSelection | undefined,
-): string | undefined {
+): number | undefined {
   if (selection === undefined) {
     return undefined;
   }
 
-  const frame =
-    frames.find((candidate) => candidate.eventId === selection.eventId) ??
-    frames.find((candidate) => matchesPanelSelection(selection, candidate));
+  const byEventId = shown.findIndex((entry) => entry.row.node.event.id === selection.eventId);
+  if (byEventId >= 0) {
+    return byEventId;
+  }
 
-  return frame?.frameId;
+  // Without both hints the pairing can only match by event id, already tried.
+  if (selection.traceId === undefined || selection.spanId === undefined) {
+    return undefined;
+  }
+
+  const bySpan = shown.findIndex((entry) => {
+    const { event } = entry.row.node;
+    return matchesPanelSelection(selection, {
+      eventId: event.id,
+      spanId: event.spanId,
+      traceId: event.traceId,
+    });
+  });
+
+  return bySpan >= 0 ? bySpan : undefined;
 }
 
 /*
  * ---------------------------------------------------------------------------
- * The text equivalent: a virtualized tree
+ * The text equivalent: a bounded, paged tree
  *
  * The rows beneath the canvas are a `role="tree"` of flat `role="treeitem"`
- * rows. Flat rather than nested groups, because only a window of them is in
+ * rows. Flat rather than nested groups, because only one page of them is in
  * the document: each row states its place in the hierarchy itself — its level
- * (`aria-level`), its position among the visible rows that share its parent
- * (`aria-posinset` of `aria-setsize`), whether its subtree is open
- * (`aria-expanded`, on a row that can fold) and whether it is the selected
- * frame (`aria-selected`) — so a reader is told the same structure whichever
- * rows happen to be rendered.
+ * (`aria-level`), its position among ALL the shown operations that share its
+ * parent, on whichever page they are drawn (`aria-posinset` of
+ * `aria-setsize`), whether its subtree is open (`aria-expanded`, on a row that
+ * can fold) and whether it is the selected frame (`aria-selected`) — so a
+ * reader is told the same structure whichever rows happen to be rendered.
  *
  * ## One tab stop
  *
@@ -1522,10 +1785,13 @@ function selectedFrameIdOf(
  * a row stay real pointer-activatable buttons but carry `tabIndex={-1}`; the
  * keyboard reaches their intents from the row:
  *
- *   - **ArrowDown / ArrowUp** — the next and previous row.
- *   - **Home / End** — the first and last row.
+ *   - **ArrowDown / ArrowUp** — the next and previous operation, turning the
+ *     tree's page when the step leaves it and paging the drawn window when
+ *     the step leaves that.
+ *   - **Home / End** — the trace's first and last operation, likewise.
  *   - **ArrowRight** — open a folded row, then step into its first child.
- *   - **ArrowLeft** — fold an open row, then step out to its parent.
+ *   - **ArrowLeft** — fold an open row, then step out to its parent, on
+ *     whichever page the parent is drawn.
  *   - **Enter / Space** — select the frame (`onSelectEvent`).
  *   - **Shift+Enter** — open the frame's source (`onOpenSource`), on a row
  *     that resolved to one while the host offers the action; advertised
@@ -1536,65 +1802,65 @@ function selectedFrameIdOf(
  * accessible name, a pointer tooltip on its name, and, for the keyboard, the
  * same detail revealed by that name's own `Tooltip`, held open by the row
  * (its controlled `open`) while the row itself holds focus that no pointer
- * press caused. The primitive measures and places that bubble exactly as it
- * places a hovered one, so it opens at the name and follows a scroll of the
- * list, rather than painting at the viewport's corner as an unplaced fixed
- * bubble would. It describes nothing then (`describesTrigger={false}`, so it
- * is `aria-hidden`): a screen reader already hears the detail as the row's
- * name.
+ * press caused. The primitive places that bubble exactly as it places a
+ * hovered one, so it opens at the name and follows a scroll of the list,
+ * rather than painting at the viewport's corner as an unplaced fixed bubble
+ * would. It describes nothing then (`describesTrigger={false}`, so it is
+ * `aria-hidden`): a screen reader already hears the detail as the row's name.
  *
- * ## Only the rows in view are rendered
+ * ## Pages of rows, turned explicitly
  *
- * A large trace draws thousands of frames, and one list row per frame is tens
- * of thousands of elements and a page tens of thousands of pixels tall (AAP
- * 0.6.1: long lists virtualize through `@tanstack/react-virtual`). The rows
- * render inside the package's shared `dg-virtual-viewport` / `dg-virtual-canvas`
- * / `dg-virtual-row` triplet, exactly as `../primitives/DataTable` renders its
- * rows: the viewport is the role-less scroll container the stylesheet caps,
- * the canvas is the tree itself and advertises the whole list's height through
- * `--dgc-virtual-total`, and each row sits in a `role="presentation"`
- * positioning wrapper offset by `--dgc-virtual-start`. `DataTable` itself is
- * not composed here because it is a flat grid: it has no levels and no folding,
- * which are the whole of this view's structure.
+ * The drawn window can hold thousands of frames, and one list row per frame is
+ * tens of thousands of elements. So the tree renders, in normal flow, ONE PAGE
+ * of at most {@link TREE_ROW_BUDGET} of those rows: `../utils/scale`'s
+ * `windowRows` over the drawn window's frames — the shown operations, so a
+ * fold shortens what is paged — at an aligned start, `windowStartFor` of the
+ * row holding the tab stop. The page therefore always holds the tab stop, and
+ * the tab stop is always a rendered row. Three things turn it:
  *
- * Before any viewport has been measured — the first paint of a real browser,
- * and every test DOM, which measures nothing — the rows render in normal flow,
- * bounded to a window of {@link TREE_WINDOW_ROWS} anchored on the active row so
- * the tab stop is always one of them. These rows are measured by the
- * virtualizer after they paint; nothing the canvas draws depends on them.
+ *   - **The row controls.** "Previous rows" and "Next rows" beneath the tree
+ *     move the tab stop to the first row of the page before or after
+ *     (`previousWindowStart`, `nextWindowStart`) without moving focus, so a
+ *     pointer reaches every row — and every source chip — of the drawn
+ *     window. Each is disabled at its end, and a control disabled by its own
+ *     activation hands its focus to the other one (or, were neither left, to
+ *     the tab stop), exactly as the operations controls do. A polite
+ *     statement beside them names the page: "Rows 61–120 of 2,000 in this
+ *     list are shown."
+ *   - **The keys.** A key that moves the tab stop past either edge of the page
+ *     turns it to the page holding the row it reached.
+ *   - **A selection made elsewhere.** It takes the tab stop to its row, and so
+ *     the page to the page holding it.
+ *
+ * The tab stop — and so the page — belongs to one drawn window of one query
+ * (the `identity` prop): a newly drawn window or a changed query opens on its
+ * first page, unless the key or the selection that caused the change carried
+ * the tab stop to a row of it. Paging is a count, not a measurement — nothing
+ * about the list's viewport or its rows is read — so it renders identically in
+ * a browser and in a test DOM. The rows sit inside the package's shared scroll
+ * viewport (`dg-virtual-viewport`, whose block size the stylesheet caps) and
+ * list canvas (`dg-virtual-canvas`), which is the tree itself. `DataTable` is
+ * not composed here because it is a flat grid: it has no levels and no
+ * folding, which are the whole of this view's structure.
  * ---------------------------------------------------------------------------
  */
 
 /**
- * The frame COUNT above which the text equivalent renders a window of rows
- * rather than all of them, and the size of the window it renders while no
- * viewport has been measured: 60.
+ * The text-row budget: the most rows of the tree one page mounts, 60.
  *
- * The count `../primitives/DataTable` uses for both, for the same two reasons:
- * sixty rows is the largest list this package renders whole, and it exceeds
- * the window the virtualizer settles on inside this list's scroll cap in
- * `../styles/components.css` — about a dozen rows, plus the overscan on each
- * side — so the bound never shows fewer rows than the viewport holds.
+ * The count `../primitives/DataTable` renders whole, and several times what
+ * this list's scroll cap in `../styles/components.css` shows at once — about a
+ * dozen rows — so a page can be scrolled through before a control or a key
+ * turns it, while a drawn window of thousands of frames never mounts more
+ * than this many rows of controls at once.
  */
-const TREE_WINDOW_ROWS = 60;
+const TREE_ROW_BUDGET = 60;
 
-/** How many rows beyond each edge of the viewport are rendered. A count. */
-const TREE_OVERSCAN_ROWS = 8;
+/** The control that turns the tree to the page of rows before its own. */
+const PREVIOUS_ROWS_LABEL = 'Previous rows';
 
-/**
- * The starting guess for one row's height, in CSS pixels.
- *
- * A measurement hint rather than a style value: it never reaches a class, a
- * declaration or a custom property. It seeds the virtualizer's scroll range
- * until each rendered row has been measured at its real, CSS-driven height,
- * and it is the hint `../primitives/DataTable` seeds its rows with — one dense
- * line of the small type role between two spacing steps — so being wrong only
- * costs a scrollbar that settles as rows are measured.
- */
-const TREE_ESTIMATED_ROW_HEIGHT = 32;
-
-/** The key a root is counted under when rows are grouped by their parent. */
-const ROOT_PARENT_KEY = -1;
+/** The control that turns the tree to the page of rows after its own. */
+const NEXT_ROWS_LABEL = 'Next rows';
 
 /** The chord that opens a row's source, as `aria-keyshortcuts` spells it. */
 const OPEN_SOURCE_SHORTCUT = 'Shift+Enter';
@@ -1605,41 +1871,69 @@ const OPEN_SOURCE_KEYS: readonly string[] = ['Shift', 'Enter'];
 /** The controls nested inside a row, which own their own clicks and keys. */
 const NESTED_CONTROL_SELECTOR = 'button, a[href], input, select, textarea';
 
-/** The attribute a treeitem carries its index among the visible rows in. */
+/** The attribute a treeitem carries its index among the drawn window's rows in. */
 const FRAME_INDEX_ATTRIBUTE = 'data-frame-index';
 
 /** What a row says when the depth bound, rather than a fold, hid its children. */
 const DEPTH_BOUND_ROW_NOTE = `nested calls below ${String(MAX_ICICLE_DEPTH)} levels are not shown`;
 
-/** One visible row of the tree, with its place among its siblings. */
+/**
+ * One row of the tree: a drawn frame and its accessible name. Its place in the
+ * hierarchy — level, parent, position among ALL of its siblings — is the
+ * frame's own, counted over the whole walk (see {@link walkTrace}).
+ */
 interface FlameTreeItem {
   /** The frame the row lists. */
   readonly frame: FlameFrame;
-  /** The index of the row it is nested in, among the visible rows; absent at a root. */
-  readonly parentIndex: number | undefined;
-  /** How many visible rows share its parent: its `aria-setsize`. */
-  readonly setSize: number;
-  /** Its 1-based position among them: its `aria-posinset`. */
-  readonly posInSet: number;
   /** Its accessible name: every fact the row and its detail carry. */
   readonly description: string;
 }
 
 /** The tree's rows and a frame-id lookup into them, from one pass. */
 interface FlameTreeIndex {
-  /** The visible rows, in the order the canvas draws them. */
+  /** The rows, one per drawn frame, in the order the canvas draws them. */
   readonly items: readonly FlameTreeItem[];
   /** Frame id to row index. */
   readonly indexById: ReadonlyMap<string, number>;
 }
 
-/** A half-open range of row indices. */
-interface RowRange {
-  /** The first index in the range. */
-  readonly start: number;
-  /** One past the last index in the range. */
-  readonly end: number;
+/**
+ * The row the reader last moved the tab stop to in the tree — by a key, a
+ * click, focus or a row control — the selection that was in force when they
+ * did, and the tree it was moved in.
+ *
+ * The selection is recorded so a NEWER selection — one made on the canvas or
+ * in another view after the reader navigated — takes the tab stop back to its
+ * own row, while the reader's position wins for as long as the selection has
+ * not changed since (see `FlameFrameTree`'s `activeIndex`). The identity is
+ * recorded so a move belongs to one drawn window of one query: under any other
+ * it is not read, and it is discarded, so the tree opens on its first page
+ * there and does not jump back to an old position when the reader pages the
+ * drawn window back to it.
+ */
+interface TreeNavigation {
+  /** The frame the reader moved to. */
+  readonly frameId: string;
+  /** The selected frame's id when they did; `undefined` for none. */
+  readonly selectionKey: string | undefined;
+  /** The tree the move was made in: {@link treeIdentityFor} of its drawn window. */
+  readonly identity: string;
 }
+
+/**
+ * Where a step past the drawn window's edge landed: the operation's frame id,
+ * and the identity of the drawn window that holds it — the window the step
+ * pages to, so the tab stop the step sets is read there.
+ */
+interface TreeReach {
+  /** The frame id of the operation stepped to. */
+  readonly frameId: string;
+  /** {@link treeIdentityFor} of the drawn window holding it. */
+  readonly identity: string;
+}
+
+/** Which of the tree's row controls turned its page, for the focus handoff. */
+type RowControlSide = 'previous' | 'next';
 
 /** The one reveal a selection is owed, as `FlameFrameTree` tracks it. */
 interface SelectionReveal {
@@ -1651,7 +1945,7 @@ interface SelectionReveal {
 
 /** The treeitem an event landed in, and its index. */
 interface TreeItemHit {
-  /** The row's index among the visible rows. */
+  /** The row's index among the drawn window's rows. */
   readonly index: number;
   /** The treeitem element itself. */
   readonly element: HTMLElement;
@@ -1689,97 +1983,75 @@ function frameDescription(frame: FlameFrame): string {
 }
 
 /**
- * Indexes the visible rows once: each row's parent row and its position among
- * the visible rows that share that parent.
+ * Indexes the drawn frames once: one row each, with its accessible name, and
+ * the frame-id lookup the marks and the tab stop resolve through.
  *
- * The frames arrive in pre-order, so a parent always precedes its children and
- * one forward pass numbers every sibling set.
- *
- * @param frames The shown frames, in traversal order.
+ * @param frames The drawn frames, in traversal order.
  * @returns The rows and the frame-id lookup.
  */
 function buildTreeIndex(frames: readonly FlameFrame[]): FlameTreeIndex {
   const indexById = new Map<string, number>();
-  for (const [index, frame] of frames.entries()) {
-    indexById.set(frame.frameId, index);
-  }
-
-  const parentIndexes = frames.map((frame) =>
-    frame.parentFrameId === undefined ? undefined : indexById.get(frame.parentFrameId),
-  );
-
-  const setSizes = new Map<number, number>();
-  const positions: number[] = [];
-  for (const parentIndex of parentIndexes) {
-    const key = parentIndex ?? ROOT_PARENT_KEY;
-    const position = (setSizes.get(key) ?? 0) + 1;
-    setSizes.set(key, position);
-    positions.push(position);
-  }
-
   const items = frames.map((frame, index): FlameTreeItem => {
-    const parentIndex = parentIndexes[index];
-    return {
-      frame,
-      parentIndex,
-      setSize: setSizes.get(parentIndex ?? ROOT_PARENT_KEY) ?? 1,
-      posInSet: positions[index] ?? 1,
-      description: frameDescription(frame),
-    };
+    indexById.set(frame.frameId, index);
+    return { frame, description: frameDescription(frame) };
   });
 
   return { items, indexById };
 }
 
 /**
- * The rows that render in normal flow, whenever the virtualizer is not the
- * thing driving the render.
+ * The identity of the tree one drawn window of one query lists: what a
+ * {@link TreeNavigation} is tagged with, so the tab stop — and the page it
+ * holds — belongs to exactly one such tree.
  *
- * A short list renders whole. A long one that nothing has measured yet renders
- * a window of {@link TREE_WINDOW_ROWS} rows ANCHORED ON THE ACTIVE ROW, which
- * is a correctness requirement: the active row holds the tab stop, and a tab
- * stop that is not in the document leaves the tree unreachable by Tab. The
- * window opens {@link TREE_OVERSCAN_ROWS} rows ahead of the anchor, so a row
- * reached by ArrowUp is already there, and is clamped inside the list at both
- * ends — the same arithmetic `../primitives/DataTable` applies.
- *
- * @param windowed Whether the list is long enough to be windowed at all.
- * @param rowCount How many rows exist.
- * @param activeIndex The row holding the tab stop, or `-1` with no rows.
- * @returns The half-open range of row indices to render in flow.
+ * @param queryIdentity The node and query the drawn window was paged for.
+ * @param windowStart The drawn window's first operation among the shown ones.
+ * @returns The identity.
  */
-function flowRowRange(windowed: boolean, rowCount: number, activeIndex: number): RowRange {
-  if (!windowed) {
-    return { start: 0, end: rowCount };
-  }
-
-  const windowRows = Math.min(TREE_WINDOW_ROWS, rowCount);
-  const earliestStart = activeIndex - windowRows + 1;
-  const anchored = Math.max(activeIndex - TREE_OVERSCAN_ROWS, earliestStart);
-  const start = Math.min(Math.max(anchored, 0), rowCount - windowRows);
-
-  return { start, end: start + windowRows };
+function treeIdentityFor(queryIdentity: string, windowStart: number): string {
+  return `${queryIdentity}@${String(windowStart)}`;
 }
 
 /**
- * The virtualizer's window with the active row added to it, when scrolling
- * has taken the viewport away from that row.
+ * The page of the tree's rows that renders in the document: the aligned page
+ * of at most {@link TREE_ROW_BUDGET} rows that holds the tab stop.
  *
- * The active row is the tree's one tab stop and may hold focus. Kept in the
- * document at its own offset — outside the viewport, so nothing on screen
- * changes — it keeps that focus through a scroll and keeps Tab entering the
- * tree where the reader left it, rather than at whichever row is on screen.
+ * Holding the tab stop is a correctness requirement: a tab stop that is not in
+ * the document leaves the tree unreachable by Tab. The page is aligned
+ * (`windowStartFor`), so it is the very page the row controls reach by
+ * `nextWindowStart` and `previousWindowStart` from the first one, and
+ * `windowRows` keeps it inside the list — a list that a fold shortened under
+ * the page shows its last page rather than nothing. A list of at most one
+ * budget is one page and renders whole. Pure arithmetic over counts: nothing
+ * about the list is measured.
  *
- * @param indexes The window the default extractor chose, in ascending order.
+ * @param rowCount How many rows the drawn window holds.
  * @param activeIndex The row holding the tab stop, or `-1` with no rows.
- * @returns The indexes to render, in ascending order.
+ * @returns The page of rows to render.
  */
-function withActiveIndex(indexes: readonly number[], activeIndex: number): number[] {
-  if (activeIndex < 0 || indexes.includes(activeIndex)) {
-    return [...indexes];
-  }
+function treePageOf(rowCount: number, activeIndex: number): RowWindow {
+  return windowRows(
+    rowCount,
+    windowStartFor(Math.max(activeIndex, 0), TREE_ROW_BUDGET),
+    TREE_ROW_BUDGET,
+  );
+}
 
-  return [...indexes, activeIndex].sort((left, right) => left - right);
+/**
+ * Which rows of the tree a page holds, as the statement beside its row
+ * controls says it: "Rows 61–120 of 2,000 in this list are shown." — counted
+ * among the drawn window's rows, which is what the tree lists and what the
+ * controls page over. A one-row page names its one row.
+ *
+ * @param page The rendered page, from {@link treePageOf}.
+ * @returns The sentence.
+ */
+function treePageSentence(page: RowWindow): string {
+  const total = formatCount(page.total);
+
+  return page.count === 1
+    ? `Row ${formatCount(page.start + 1)} of ${total} in this list is shown.`
+    : `Rows ${formatCount(page.start + 1)}–${formatCount(page.end)} of ${total} in this list are shown.`;
 }
 
 /**
@@ -1812,7 +2084,7 @@ function treeItemAt(target: EventTarget, tree: Element): TreeItemHit | undefined
  * The rendered treeitem at a row index, if that row is in the document.
  *
  * @param viewport The tree's scroll container, or `null` before it mounts.
- * @param index The row's index among the visible rows.
+ * @param index The row's index among the drawn window's rows.
  * @returns The treeitem element, or `undefined` when it is not rendered.
  */
 function treeRowIn(viewport: Element | null, index: number): HTMLElement | undefined {
@@ -1821,43 +2093,45 @@ function treeRowIn(viewport: Element | null, index: number): HTMLElement | undef
 }
 
 /**
- * The scroll offset that brings a rendered row fully into its tree's viewport,
- * moving it as little as possible, or `undefined` when it is already fully
- * visible.
+ * The options a row reveal hands the browser's own `scrollIntoView`.
  *
- * "Nearest" semantics, as `scrollIntoView({ block: 'nearest' })` gives, but
- * confined to the tree's own scroll container so the page never moves: a row
- * above the visible band is brought to its top, a row below it to its bottom
- * edge — and a row taller than the band keeps its top edge in view. A viewport
- * with no visible band (nothing laid out yet, or a DOM without layout) yields
- * `undefined`, because no offset would reveal anything.
- *
- * @param viewport The tree's scroll container.
- * @param row The rendered treeitem to reveal.
- * @returns The offset to scroll the viewport to, or `undefined` to leave it.
+ * `container: 'nearest'` (CSSOM View) confines the scroll to the row's nearest
+ * scroll container — the tree's own viewport — so the page never moves. It is
+ * newer than the DOM library's `ScrollIntoViewOptions`, hence the widened type;
+ * a browser that predates it ignores the member and scrolls by the least
+ * distance in every ancestor instead, which still reveals the row.
  */
-function revealScrollTop(viewport: HTMLElement, row: HTMLElement): number | undefined {
-  const viewportSize = viewport.clientHeight;
+type RowRevealOptions = ScrollIntoViewOptions & {
+  readonly container?: 'all' | 'nearest';
+};
 
-  if (!(viewportSize > 0)) {
-    return undefined;
+/**
+ * Least-distance reveal: a row already in view stays put; one above or below
+ * the visible band is brought just to its near edge.
+ */
+const ROW_REVEAL_OPTIONS: RowRevealOptions = {
+  block: 'nearest',
+  inline: 'nearest',
+  container: 'nearest',
+};
+
+/**
+ * Asks the browser to scroll a rendered row into its tree's viewport, moving
+ * it as little as possible.
+ *
+ * The browser does the arithmetic from its own layout, so nothing here reads a
+ * size, an offset or a scroll position. An environment whose elements have no
+ * `scrollIntoView` (some test DOMs) is left as it is: there is no viewport to
+ * scroll there, and the row is already in the document.
+ *
+ * @param row The rendered treeitem to reveal.
+ */
+function revealTreeRow(row: HTMLElement): void {
+  if (typeof row.scrollIntoView !== 'function') {
+    return;
   }
 
-  const scrollOffset = viewport.scrollTop;
-  const box = row.getBoundingClientRect();
-  const rowStart =
-    box.top - viewport.getBoundingClientRect().top - viewport.clientTop + scrollOffset;
-  const rowEnd = rowStart + box.height;
-
-  if (rowStart < scrollOffset) {
-    return Math.max(rowStart, 0);
-  }
-
-  if (rowEnd > scrollOffset + viewportSize) {
-    return Math.max(Math.min(rowEnd - viewportSize, rowStart), 0);
-  }
-
-  return undefined;
+  row.scrollIntoView(ROW_REVEAL_OPTIONS);
 }
 
 /**
@@ -1925,8 +2199,20 @@ function frameDetail(frame: FlameFrame): ReactElement {
 
 /** The props of {@link FlameFrameTree}. */
 interface FlameFrameTreeProps {
-  /** The shown frames, in traversal order: one row each. */
+  /** The drawn window's frames, in traversal order: one row each. */
   readonly frames: readonly FlameFrame[];
+  /**
+   * The drawn window over the walk's shown operations: where `frames` sit in
+   * the whole walk, so a key that steps past either end of them knows which
+   * operation it is stepping to.
+   */
+  readonly rowWindow: RowWindow;
+  /**
+   * The identity of the tree these frames make: {@link treeIdentityFor} of
+   * the node's query and the drawn window's start. The tab stop, and with it
+   * the page of rows, is kept only while it does not change.
+   */
+  readonly identity: string;
   /** The tree's accessible name. */
   readonly label: string;
   /**
@@ -1936,6 +2222,21 @@ interface FlameFrameTreeProps {
    * is scrolled into the tree's viewport once (see the section above).
    */
   readonly selectedFrameId: string | undefined;
+  /**
+   * The frame id of the operation the panel's selection stands for anywhere in
+   * the walk, drawn or not — the selection's identity, which paging does not
+   * change. A selection newer than the reader's last move in the tree takes
+   * the tab stop to its row.
+   */
+  readonly selectionKey: string | undefined;
+  /**
+   * Moves the drawn window to the one holding the operation at `shownIndex`
+   * among the walk's shown operations, and returns that operation's frame id
+   * and the identity of the tree that window makes — or `undefined` when no
+   * such operation exists. What a key that steps past the drawn window calls,
+   * so the step lands on the operation it named.
+   */
+  readonly onReach: (shownIndex: number) => TreeReach | undefined;
   /**
    * The frame under the pointer on the canvas, if any. Its row carries
    * `dg-is-hovered` whenever it is rendered; the tree is not scrolled to it.
@@ -1950,22 +2251,27 @@ interface FlameFrameTreeProps {
 }
 
 /**
- * The keyboard-reachable text equivalent of the icicle: a virtualized tree
- * with a single roving tab stop. See the section above for its structure, its
- * keys and what renders before anything has been measured.
+ * The keyboard-reachable text equivalent of the icicle: a paged tree with a
+ * single roving tab stop. See the section above for its structure, its keys
+ * and the page of rows it renders: the page that holds that stop.
  *
  * @param props The props, as documented on {@link FlameFrameTreeProps}.
- * @returns The scroll viewport holding the tree.
+ * @returns The scroll viewport holding the tree and, when the tree holds more
+ * rows than one page, the row controls and statement beneath it.
  */
 function FlameFrameTree(props: FlameFrameTreeProps): ReactElement {
   const {
     frames,
+    rowWindow,
+    identity,
     label,
     selectedFrameId,
+    selectionKey,
     hoveredFrameId,
     onSelect: reportSelect,
     onToggle,
     onOpenSource,
+    onReach,
   } = props;
 
   const viewportRef = useRef<HTMLDivElement>(null);
@@ -1976,8 +2282,22 @@ function FlameFrameTree(props: FlameFrameTreeProps): ReactElement {
   /** Set by a pointer press, so the focus it causes reveals no detail. */
   const pointerFocusRef = useRef(false);
 
-  /** The row the keyboard or a click last made active, by frame id. */
-  const [navigatedFrameId, setNavigatedFrameId] = useState<string | undefined>(undefined);
+  /**
+   * The row the keyboard, a click, focus or a row control last made active,
+   * the selection it was made under and the tree it was made in.
+   */
+  const [navigation, setNavigation] = useState<TreeNavigation | undefined>(undefined);
+
+  /** The two row controls, for the focus handoff when one is spent. */
+  const previousRowsRef = useRef<HTMLButtonElement | null>(null);
+  const nextRowsRef = useRef<HTMLButtonElement | null>(null);
+
+  /**
+   * Which row control turned the page, read once the page it asked for has
+   * rendered: that page's first row is revealed, and a control the page
+   * disabled hands its focus on rather than dropping it to the document.
+   */
+  const rowsPagedFromRef = useRef<RowControlSide | undefined>(undefined);
 
   /** The row whose detail is revealed for the keyboard, by frame id. */
   const [revealedFrameId, setRevealedFrameId] = useState<string | undefined>(undefined);
@@ -2004,103 +2324,124 @@ function FlameFrameTree(props: FlameFrameTreeProps): ReactElement {
 
   const { items, indexById } = useMemo(() => buildTreeIndex(frames), [frames]);
   const rowCount = items.length;
-  const windowed = rowCount > TREE_WINDOW_ROWS;
+
+  // A move made in another tree — another drawn window, another query — is
+  // not read here, and it is discarded, so the page opens at the top of this
+  // tree and a reader who pages the drawn window back later finds its first
+  // page rather than an old position. Discarded during this render (React's
+  // documented way to adjust state from what a render observes): the next
+  // pass finds no stale move and stores nothing. A move a key made INTO this
+  // tree across the drawn window's edge carries this tree's identity already
+  // (`onReach`), so it is kept.
+  const storedNavigation =
+    navigation !== undefined && navigation.identity === identity ? navigation : undefined;
+  if (navigation !== undefined && storedNavigation === undefined) {
+    setNavigation(undefined);
+  }
 
   const navigatedIndex =
-    navigatedFrameId === undefined ? undefined : indexById.get(navigatedFrameId);
+    storedNavigation === undefined ? undefined : indexById.get(storedNavigation.frameId);
   const selectedIndex = selectedFrameId === undefined ? undefined : indexById.get(selectedFrameId);
-  const activeIndex = rowCount === 0 ? -1 : (navigatedIndex ?? selectedIndex ?? 0);
 
-  // Called unconditionally, as a hook must be; it drives nothing while the
-  // list is short enough to render whole. `react-hooks/incompatible-library`
-  // reports that this API returns functions the React Compiler cannot memoize,
-  // so it skips auto-memoizing this component; that is accepted rather than
-  // worked around, because AAP 0.6.1 names this library as the mechanism for
-  // long lists and nothing the virtualizer returns is handed to a memoized
-  // component.
-  // eslint-disable-next-line react-hooks/incompatible-library -- AAP 0.6.1 mandates this API for long lists
-  const virtualizer = useVirtualizer<HTMLDivElement, HTMLDivElement>({
-    count: rowCount,
-    getScrollElement: () => viewportRef.current,
-    estimateSize: () => TREE_ESTIMATED_ROW_HEIGHT,
-    overscan: TREE_OVERSCAN_ROWS,
-    enabled: windowed,
-    // Required under React 19.3, as `../primitives/DataTable` records: the
-    // adapter's default flushes every measurement and scroll notification
-    // synchronously, which lands while React is rendering or committing. The
-    // adapter's own batched re-render is what `false` selects.
-    useFlushSync: false,
-    // Measurements follow the frame, not the position, so a fold that shifts
-    // the rows below it does not hand one row's height to another.
-    getItemKey: (index) => items[index]?.frame.frameId ?? index,
-    // The active row is always rendered, at its own offset, even when the
-    // viewport is scrolled away from it: it is the tree's one tab stop and may
-    // hold focus, and a row unmounted by a scroll would drop that focus to the
-    // document and move the stop to whatever row happens to be on screen.
-    rangeExtractor: (range) => withActiveIndex(defaultRangeExtractor(range), activeIndex),
-  });
+  // The tab stop: the reader's own last move while the selection is the one
+  // they moved under; the selected row once a NEWER selection arrives — from
+  // the canvas, another view or this tree's own activation — which is the row
+  // a tree hands focus to on entry; the reader's row again while the selection
+  // is not drawn; and the first row when neither is. A window paged by a key
+  // or a control does not change the selection's identity, so it never takes
+  // the stop from the row the reader stepped to.
+  const navigationIsCurrent =
+    storedNavigation !== undefined && storedNavigation.selectionKey === selectionKey;
+  const activeIndex =
+    rowCount === 0
+      ? -1
+      : ((navigationIsCurrent ? navigatedIndex : undefined) ??
+        selectedIndex ??
+        navigatedIndex ??
+        0);
+  const activeFrameId = items[activeIndex]?.frame.frameId;
 
-  const virtualItems = virtualizer.getVirtualItems();
-  const viewportHeight = virtualizer.scrollRect === null ? 0 : virtualizer.scrollRect.height;
-
-  // THE MEASUREMENT GATE: the virtualizer drives the render only once it has
-  // measured a viewport AND produced a window. Until then the rows render in
-  // normal flow, bounded by `flowRowRange`.
-  const isVirtualized = windowed && virtualItems.length > 0 && viewportHeight > 0;
-
-  const flowRange = flowRowRange(windowed, rowCount, activeIndex);
-  const flowRangeIsWindowed = !isVirtualized && flowRange.end - flowRange.start < rowCount;
-
-  // The tab stop has to exist in the document whenever rows render. Under the
-  // virtualizer the range extractor keeps the active row rendered however far
-  // the viewport scrolls; should a window ever arrive without it all the same,
-  // the topmost rendered row takes the stop, so Tab still enters the tree, and
-  // the key handlers read the origin row's own index, so navigation continues
-  // from wherever the reader actually entered.
-  const activeIsRendered = isVirtualized
-    ? virtualItems.some((item) => item.index === activeIndex)
-    : activeIndex >= flowRange.start && activeIndex < flowRange.end;
-  const firstRenderedIndex = isVirtualized
-    ? virtualItems[0]?.index
-    : rowCount === 0
-      ? undefined
-      : flowRange.start;
-  const tabStopIndex =
-    activeIsRendered || firstRenderedIndex === undefined ? activeIndex : firstRenderedIndex;
+  // The rendered rows: the page that holds the tab stop, so the stop is always
+  // one of them, every key that moves it past an edge turns the page, and the
+  // row controls turn it by moving the stop.
+  const page = treePageOf(rowCount, activeIndex);
+  const paged = isWindowed(page);
 
   /**
-   * Makes a row active and asks for it to take focus once it is rendered:
-   * scrolled into the window first, focused by the effect below second.
+   * Makes the operation at `target` — an index among the WALK's shown
+   * operations, not among the drawn rows — the active row, and asks for it to
+   * take focus once it is rendered. A row of the drawn window on another page
+   * of the tree turns the page to it, since the page is the one holding the
+   * tab stop. An operation outside the drawn window is reached by paging the
+   * window to it first (`onReach`), so ArrowDown past the last drawn row lands
+   * on the first row of the next window, End on the trace's last operation,
+   * and ArrowLeft on a parent drawn in an earlier window; the move is tagged
+   * with the identity of the tree that window makes, so it is read there. The
+   * target is clamped to the walk, so a key at either end stays put.
    */
   const moveActive = (target: number): void => {
-    const clamped = Math.min(Math.max(target, 0), rowCount - 1);
-    const item = items[clamped];
-
-    if (item === undefined) {
+    if (rowWindow.total === 0) {
       return;
     }
 
-    if (clamped === activeIndex && activeIsRendered) {
-      // Already the active row — a key pressed at an end of the list, or from
+    const clamped = Math.min(Math.max(target, 0), rowWindow.total - 1);
+    const local = clamped - rowWindow.start;
+    const item = windowContains(rowWindow, clamped) ? items[local] : undefined;
+
+    if (item !== undefined && local === activeIndex) {
+      // Already the active row — a key pressed at an end of the trace, or from
       // a control inside the row: focus returns to the row itself, and there
       // is nothing to re-render or to leave pending.
-      treeRowIn(viewportRef.current, clamped)?.focus();
+      treeRowIn(viewportRef.current, local)?.focus();
+      return;
+    }
+
+    const reached: TreeReach | undefined =
+      item === undefined ? onReach(clamped) : { frameId: item.frame.frameId, identity };
+    if (reached === undefined) {
       return;
     }
 
     focusPendingRef.current = true;
-    setNavigatedFrameId(item.frame.frameId);
-    if (isVirtualized) {
-      virtualizer.scrollToIndex(clamped);
+    setNavigation({ frameId: reached.frameId, selectionKey, identity: reached.identity });
+  };
+
+  /**
+   * Turns the page to the one starting at row `start` — a row control's
+   * activation — by moving the tab stop to that row. Focus stays on the
+   * control, so the reader can keep turning; the effect below reveals the new
+   * page's first row and hands the focus of a control the page disabled on.
+   *
+   * @param start The first row of the page to show, among the drawn rows.
+   * @param side The control that asked for it.
+   */
+  const showRowsFrom = (start: number, side: RowControlSide): void => {
+    const item = items[start];
+    if (item === undefined || start === page.start) {
+      return;
     }
+
+    rowsPagedFromRef.current = side;
+    focusPendingRef.current = false;
+    setNavigation({ frameId: item.frame.frameId, selectionKey, identity });
+  };
+
+  const handlePreviousRows = (): void => {
+    showRowsFrom(previousWindowStart(page), 'previous');
+  };
+
+  const handleNextRows = (): void => {
+    showRowsFrom(nextWindowStart(page), 'next');
   };
 
   // Focus follows the active row, but only when a key asked for it, and only
-  // once the row is in the document: under the virtualizer it may not have
-  // been when the key was pressed, so the request survives until the commit
-  // that renders it.
+  // in the commit that renders it: a step that turns the page or pages the
+  // drawn window renders the row after the key was pressed, so the request
+  // survives until then. Focusing the row is also what brings it into the
+  // tree's viewport — the browser's own focus scrolling, not an offset
+  // computed here.
   useEffect(() => {
-    if (!focusPendingRef.current || activeIndex < 0 || !activeIsRendered) {
+    if (!focusPendingRef.current || activeIndex < 0) {
       return;
     }
 
@@ -2112,7 +2453,50 @@ function FlameFrameTree(props: FlameFrameTreeProps): ReactElement {
 
     focusPendingRef.current = false;
     candidate.focus();
-  }, [activeIndex, activeIsRendered]);
+    // Keyed by the active FRAME as well as its index: a step into another
+    // window can land on the same row index of a different page.
+  }, [activeFrameId, activeIndex]);
+
+  // A page turned by a row control, once it has rendered. Its first row — the
+  // tab stop the control moved — is asked into the tree's viewport by the
+  // least distance, so the new page opens at its top however far the reader
+  // had scrolled the old one (the browser's arithmetic, not an offset computed
+  // here). Then the focus handoff the operations controls make: a control
+  // that can still turn keeps its focus, a reader who has moved elsewhere is
+  // left there, and only the focus of a control this very page disabled is
+  // handed on — to the other control, or, were neither left, to the tab stop.
+  // Turning a page never changes how many rows there are, so it cannot remove
+  // the controls; the tab stop takes the focus only if neither control can.
+  useEffect(() => {
+    const pagedFrom = rowsPagedFromRef.current;
+    if (pagedFrom === undefined) {
+      return;
+    }
+    rowsPagedFromRef.current = undefined;
+
+    const stop = activeIndex < 0 ? undefined : treeRowIn(viewportRef.current, activeIndex);
+    if (stop !== undefined) {
+      revealTreeRow(stop);
+    }
+
+    const activated = pagedFrom === 'previous' ? previousRowsRef.current : nextRowsRef.current;
+    const counterpart = pagedFrom === 'previous' ? nextRowsRef.current : previousRowsRef.current;
+    if (activated !== null && !activated.disabled) {
+      return;
+    }
+
+    const ownerDocument = viewportRef.current?.ownerDocument;
+    const active = ownerDocument?.activeElement ?? null;
+    if (active !== null && active !== activated && active !== ownerDocument?.body) {
+      return;
+    }
+
+    if (counterpart !== null && !counterpart.disabled) {
+      counterpart.focus();
+      return;
+    }
+    stop?.focus();
+  }, [activeFrameId, activeIndex]);
 
   // The selected row is brought into the tree's viewport when the SELECTION
   // moves to it from elsewhere — the canvas, another view, an evidence chip —
@@ -2122,16 +2506,14 @@ function FlameFrameTree(props: FlameFrameTreeProps): ReactElement {
   //   Once per selection: armed when the selected frame changes (the first
   //   commit counts) and spent when done.
   //   Never for this tree's own activation: that row is already in view.
-  //   Only a rendered row, placed the way the render is driven: under the
-  //   virtualizer by `scrollToIndex`, which reaches a row outside the window
-  //   and leaves a row already in view where it is; in normal flow by the
-  //   row's own box, once the commit that renders it — and only while the
-  //   flow is the whole list, since a flow window does not sit at its true
-  //   offset and the virtualizer takes over from it.
-  //   Never focus, never the page, never the tab stop: only the tree's own
-  //   viewport scrolls, and the roving stop is not moved here — it follows
-  //   the reader's navigation first and the selection only until then (see
-  //   `activeIndex`).
+  //   Only a rendered row, in the commit that renders it. A newer selection
+  //   takes the tab stop, and the rendered page is the one holding the tab
+  //   stop, so the selected row is rendered by the time this runs.
+  //   By the browser, by the least distance (`revealTreeRow`): nothing here
+  //   reads a size, an offset or a scroll position.
+  //   Never focus, never the tab stop: the roving stop follows the reader's
+  //   navigation first and the selection only until then (see `activeIndex`),
+  //   and focus stays wherever the reader left it.
   useEffect(() => {
     const reveal = selectionRevealRef.current;
 
@@ -2147,25 +2529,14 @@ function FlameFrameTree(props: FlameFrameTreeProps): ReactElement {
       return;
     }
 
-    if (isVirtualized) {
-      reveal.pending = false;
-      virtualizer.scrollToIndex(selectedIndex);
-      return;
-    }
-
-    const viewport = viewportRef.current;
-    const row = treeRowIn(viewport, selectedIndex);
-
-    if (flowRangeIsWindowed || viewport === null || row === undefined) {
+    const row = treeRowIn(viewportRef.current, selectedIndex);
+    if (row === undefined) {
       return;
     }
 
     reveal.pending = false;
-    const target = revealScrollTop(viewport, row);
-    if (target !== undefined) {
-      viewport.scrollTop = target;
-    }
-  }, [flowRangeIsWindowed, isVirtualized, selectedFrameId, selectedIndex, virtualizer]);
+    revealTreeRow(row);
+  }, [selectedFrameId, selectedIndex]);
 
   const handleKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>): void => {
     const hit = treeItemAt(event.target, event.currentTarget);
@@ -2220,13 +2591,15 @@ function FlameFrameTree(props: FlameFrameTreeProps): ReactElement {
         event.preventDefault();
         onSelect(frame);
         return;
+      // Every step is addressed in the WALK's shown operations (the frame's
+      // `shownIndex`), so it reaches across the drawn window's edges.
       case 'ArrowDown':
         event.preventDefault();
-        moveActive(hit.index + 1);
+        moveActive(frame.shownIndex + 1);
         return;
       case 'ArrowUp':
         event.preventDefault();
-        moveActive(hit.index - 1);
+        moveActive(frame.shownIndex - 1);
         return;
       case 'Home':
         event.preventDefault();
@@ -2234,7 +2607,7 @@ function FlameFrameTree(props: FlameFrameTreeProps): ReactElement {
         return;
       case 'End':
         event.preventDefault();
-        moveActive(rowCount - 1);
+        moveActive(rowWindow.total - 1);
         return;
       case 'ArrowRight':
         event.preventDefault();
@@ -2242,9 +2615,10 @@ function FlameFrameTree(props: FlameFrameTreeProps): ReactElement {
           onToggle(frame);
           return;
         }
-        // The first child immediately follows its parent in a pre-order walk.
-        if (items[hit.index + 1]?.parentIndex === hit.index) {
-          moveActive(hit.index + 1);
+        // An open, foldable frame has children the walk showed, and in a
+        // pre-order walk its first child is the very next shown operation.
+        if (frame.foldable) {
+          moveActive(frame.shownIndex + 1);
         }
         return;
       case 'ArrowLeft':
@@ -2253,8 +2627,8 @@ function FlameFrameTree(props: FlameFrameTreeProps): ReactElement {
           onToggle(frame);
           return;
         }
-        if (item.parentIndex !== undefined) {
-          moveActive(item.parentIndex);
+        if (frame.parentShownIndex !== undefined) {
+          moveActive(frame.parentShownIndex);
         }
         return;
       default:
@@ -2278,7 +2652,7 @@ function FlameFrameTree(props: FlameFrameTreeProps): ReactElement {
     }
 
     focusPendingRef.current = false;
-    setNavigatedFrameId(item.frame.frameId);
+    setNavigation({ frameId: item.frame.frameId, selectionKey, identity });
     setRevealedFrameId(
       event.target === hit.element && !fromPointer ? item.frame.frameId : undefined,
     );
@@ -2316,36 +2690,18 @@ function FlameFrameTree(props: FlameFrameTreeProps): ReactElement {
     onSelect(item.frame);
   };
 
-  // The canvas advertises the whole list's height from the first paint while a
-  // window is rendered, so the scrollbar is right before anything is measured.
-  // The stylesheet reads it as a MINIMUM, so an estimate never clips a row.
-  const canvasStyle: CssVariableStyle | undefined =
-    isVirtualized || flowRangeIsWindowed
-      ? { '--dgc-virtual-total': String(virtualizer.getTotalSize()) }
-      : undefined;
-
   /**
-   * One row inside its positioning wrapper. A plain function called during
-   * this render, so the virtualized and the in-flow paths render identical
-   * markup and differ only in geometry.
+   * One row, a treeitem owned by the tree directly. A plain function called
+   * during this render.
    *
    * @param item The row.
-   * @param index Its index among the visible rows.
-   * @param offset Its offset in CSS pixels while the virtualizer positions rows.
+   * @param index Its index among the drawn window's rows.
    */
-  const renderItem = (
-    item: FlameTreeItem,
-    index: number,
-    offset: number | undefined,
-  ): ReactElement => {
+  const renderItem = (item: FlameTreeItem, index: number): ReactElement => {
     const { frame } = item;
-    const positioned = offset !== undefined;
     const selected = frame.frameId === selectedFrameId;
     const revealed = frame.frameId === revealedFrameId;
     const canOpenSource = frame.source !== undefined && onOpenSource !== undefined;
-    const wrapperStyle: CssVariableStyle | undefined = positioned
-      ? { '--dgc-virtual-start': String(offset) }
-      : undefined;
     const depthStyle: CssVariableStyle = { '--dgc-depth': String(frame.depth) };
 
     // Out of the Tab order, as every control inside a row is: the row is the
@@ -2366,179 +2722,202 @@ function FlameFrameTree(props: FlameFrameTreeProps): ReactElement {
     return (
       <div
         key={frame.frameId}
-        // Removes the wrapper from the accessibility tree, so the treeitem is
-        // owned by the tree directly. It carries no other ARIA attribute,
-        // because any one would void the role.
-        role="presentation"
-        className={positioned ? 'dg-virtual-row' : undefined}
-        data-index={index}
-        // Measured only while the virtualizer's window is real.
-        ref={isVirtualized ? virtualizer.measureElement : undefined}
-        style={wrapperStyle}
+        role="treeitem"
+        className={clsx(
+          'dg-flame__equivalent-row',
+          frame.frameId === hoveredFrameId && 'dg-is-hovered',
+          selected && 'dg-is-selected',
+          frame.orphaned && 'dg-is-orphan',
+        )}
+        style={depthStyle}
+        aria-level={frame.depth + 1}
+        aria-setsize={frame.setSize}
+        aria-posinset={frame.posInSet}
+        aria-expanded={frame.foldable ? !frame.folded : undefined}
+        aria-selected={selected}
+        aria-current={selected ? 'true' : undefined}
+        aria-label={item.description}
+        aria-keyshortcuts={canOpenSource ? OPEN_SOURCE_SHORTCUT : undefined}
+        // The roving tab index: one row of the whole tree is in the Tab order,
+        // and the rendered page is the one holding it, so it is always one of
+        // them.
+        tabIndex={index === activeIndex ? 0 : -1}
+        data-frame-index={index}
       >
-        <div
-          role="treeitem"
-          className={clsx(
-            'dg-flame__equivalent-row',
-            frame.frameId === hoveredFrameId && 'dg-is-hovered',
-            selected && 'dg-is-selected',
-            frame.orphaned && 'dg-is-orphan',
-          )}
-          style={depthStyle}
-          aria-level={frame.depth + 1}
-          aria-setsize={item.setSize}
-          aria-posinset={item.posInSet}
-          aria-expanded={frame.foldable ? !frame.folded : undefined}
-          aria-selected={selected}
-          aria-current={selected ? 'true' : undefined}
-          aria-label={item.description}
-          aria-keyshortcuts={canOpenSource ? OPEN_SOURCE_SHORTCUT : undefined}
-          // The roving tab index: one row of the whole tree is in the Tab order.
-          tabIndex={index === tabStopIndex ? 0 : -1}
-          data-frame-index={index}
-        >
-          {frame.foldable ? (
-            <Button
-              className="dg-flame__toggle"
-              variant="ghost"
-              size="sm"
-              iconOnly
-              aria-expanded={!frame.folded}
-              // The kind follows the name, as in the waterfall's own
-              // disclosures, so a browser request and the server request
-              // answering it — one name, two frames — read apart.
-              aria-label={
-                frame.folded
-                  ? `Expand the ${pluralNestedCalls(frame.childCount)} inside ${frame.name} (${formatKindLabel(frame.kind)})`
-                  : `Collapse the ${pluralNestedCalls(frame.childCount)} inside ${frame.name} (${formatKindLabel(frame.kind)})`
-              }
-              icon={
-                frame.folded ? (
-                  <ChevronRight aria-hidden="true" className="dg-icon" />
-                ) : (
-                  <ChevronDown aria-hidden="true" className="dg-icon" />
-                )
-              }
-              // Out of the Tab order: ArrowRight and ArrowLeft on the row are
-              // the keyboard route to the same disclosure.
-              tabIndex={-1}
-              onClick={() => {
-                onToggle(frame);
-              }}
-            />
-          ) : (
-            // An empty box in the toggle's place, which is what keeps a leaf's
-            // name aligned with the foldable rows at its depth.
-            <span className="dg-flame__toggle" aria-hidden="true" />
-          )}
-
-          {/* One `Tooltip` in two forms, so the name has exactly one
-              `role="tooltip"` at all times and its button is never remounted
-              — nor its focus lost — by the switch. For a pointer, or focus on
-              the name itself, it is the primitive's own. For the keyboard —
-              the treeitem itself focused — this row holds it open (`open`),
-              with the Shift+Enter hint where it applies; the primitive
-              measures and places it like the hovered form, so it opens at the
-              name and follows the list's scroll instead of painting at the
-              viewport's corner, while the tree's own handler keeps Escape. It
-              describes nothing then (`describesTrigger`), because the
-              treeitem's name already carries the same facts and a reader must
-              not hear them twice. Below the name in both forms, so a row's
-              detail covers the rows after it rather than the ones above. */}
-          <Tooltip
-            className="dg-flame__tooltip"
-            placement="bottom"
-            open={revealed ? true : undefined}
-            describesTrigger={!revealed}
-            content={
-              revealed ? (
-                <>
-                  {frameDetail(frame)}
-                  {canOpenSource ? (
-                    <>
-                      {' · '}
-                      <Kbd keys={OPEN_SOURCE_KEYS} /> opens the source
-                    </>
-                  ) : null}
-                </>
+        {frame.foldable ? (
+          <Button
+            className="dg-flame__toggle"
+            variant="ghost"
+            size="sm"
+            iconOnly
+            aria-expanded={!frame.folded}
+            // The kind follows the name, as in the waterfall's own
+            // disclosures, so a browser request and the server request
+            // answering it — one name, two frames — read apart.
+            aria-label={
+              frame.folded
+                ? `Expand the ${pluralNestedCalls(frame.childCount)} inside ${frame.name} (${formatKindLabel(frame.kind)})`
+                : `Collapse the ${pluralNestedCalls(frame.childCount)} inside ${frame.name} (${formatKindLabel(frame.kind)})`
+            }
+            icon={
+              frame.folded ? (
+                <ChevronRight aria-hidden="true" className="dg-icon" />
               ) : (
-                frameDetail(frame)
+                <ChevronDown aria-hidden="true" className="dg-icon" />
               )
             }
-          >
-            {nameControl}
-          </Tooltip>
+            // Out of the Tab order: ArrowRight and ArrowLeft on the row are
+            // the keyboard route to the same disclosure.
+            tabIndex={-1}
+            onClick={() => {
+              onToggle(frame);
+            }}
+          />
+        ) : (
+          // An empty box in the toggle's place, which is what keeps a leaf's
+          // name aligned with the foldable rows at its depth.
+          <span className="dg-flame__toggle" aria-hidden="true" />
+        )}
 
-          <Badge color={kindColorVar(frame.kind)}>{formatKindLabel(frame.kind)}</Badge>
+        {/* One `Tooltip` in two forms, so the name has exactly one
+            `role="tooltip"` at all times and its button is never remounted
+            — nor its focus lost — by the switch. For a pointer, or focus on
+            the name itself, it is the primitive's own. For the keyboard —
+            the treeitem itself focused — this row holds it open (`open`),
+            with the Shift+Enter hint where it applies; the primitive places
+            it like the hovered form, so it opens at the name and follows the
+            list's scroll instead of painting at the viewport's corner, while
+            the tree's own handler keeps Escape. It
+            describes nothing then (`describesTrigger`), because the
+            treeitem's name already carries the same facts and a reader must
+            not hear them twice. Below the name in both forms, so a row's
+            detail covers the rows after it rather than the ones above. */}
+        <Tooltip
+          className="dg-flame__tooltip"
+          placement="bottom"
+          open={revealed ? true : undefined}
+          describesTrigger={!revealed}
+          content={
+            revealed ? (
+              <>
+                {frameDetail(frame)}
+                {canOpenSource ? (
+                  <>
+                    {' · '}
+                    <Kbd keys={OPEN_SOURCE_KEYS} /> opens the source
+                  </>
+                ) : null}
+              </>
+            ) : (
+              frameDetail(frame)
+            )
+          }
+        >
+          {nameControl}
+        </Tooltip>
 
+        <Badge color={kindColorVar(frame.kind)}>{formatKindLabel(frame.kind)}</Badge>
+
+        <Text as="span" size="xs" tone="muted">
+          {formatTierLabel(frame.tier)}
+        </Text>
+
+        {frame.status === 'error' ? (
+          <Badge tone="danger">{formatStatusLabel(frame.status)}</Badge>
+        ) : null}
+
+        {/* Both numbers are durations, so the one that is not labelled on
+            screen is labelled for a reader: "own time" carries its own
+            visible caption because it is the number a developer is least
+            likely to guess the meaning of. */}
+        <Text as="span" className="dg-visually-hidden">
+          duration
+        </Text>
+        <DurationCell ms={frame.durationMs} size="sm" />
+
+        <Text as="span" size="xs" tone="muted">
+          own
+        </Text>
+        <DurationCell ms={frame.selfTimeMs} size="sm" />
+
+        {frame.childrenBeyondDepth ? (
           <Text as="span" size="xs" tone="muted">
-            {formatTierLabel(frame.tier)}
+            {DEPTH_BOUND_ROW_NOTE}
           </Text>
+        ) : null}
 
-          {frame.status === 'error' ? (
-            <Badge tone="danger">{formatStatusLabel(frame.status)}</Badge>
-          ) : null}
-
-          {/* Both numbers are durations, so the one that is not labelled on
-              screen is labelled for a reader: "own time" carries its own
-              visible caption because it is the number a developer is least
-              likely to guess the meaning of. */}
-          <Text as="span" className="dg-visually-hidden">
-            duration
-          </Text>
-          <DurationCell ms={frame.durationMs} size="sm" />
-
-          <Text as="span" size="xs" tone="muted">
-            own
-          </Text>
-          <DurationCell ms={frame.selfTimeMs} size="sm" />
-
-          {frame.childrenBeyondDepth ? (
-            <Text as="span" size="xs" tone="muted">
-              {DEPTH_BOUND_ROW_NOTE}
-            </Text>
-          ) : null}
-
-          {frame.source === undefined ? null : (
-            <SourceLink location={frame.source} compact tabIndex={-1} />
-          )}
-        </div>
+        {frame.source === undefined ? null : (
+          <SourceLink location={frame.source} compact tabIndex={-1} />
+        )}
       </div>
     );
   };
 
   return (
     <div className="dg-flame__equivalent">
-      {/* The scroll container, deliberately role-less: the tree inside it owns
-          the treeitems, and a role here would insert a foreign node between
-          them. The stylesheet caps its height, which is what gives the
-          virtualizer a viewport to window against. */}
-      <div className="dg-virtual-viewport" ref={viewportRef}>
-        <div
-          role="tree"
-          aria-label={label}
-          className="dg-virtual-canvas"
-          style={canvasStyle}
-          onKeyDown={handleKeyDown}
-          onFocus={handleFocus}
-          onBlur={handleBlur}
-          onPointerDown={handlePointerDown}
-          onClick={handleClick}
-        >
-          {isVirtualized
-            ? virtualItems.map((virtualItem) => {
-                const item = items[virtualItem.index];
-                return item === undefined
-                  ? null
-                  : renderItem(item, virtualItem.index, virtualItem.start);
-              })
-            : // The flow range, sliced; the slice offset is added back so each
-              // row keeps its TRUE index among the visible rows.
-              items
-                .slice(flowRange.start, flowRange.end)
-                .map((item, offset) => renderItem(item, flowRange.start + offset, undefined))}
+      {/* The tree, then its row controls: the spacing between them is the
+          layout primitive's, and the controls follow the tree in the Tab
+          order, so the tree stays the next stop after the operations
+          controls above the canvas. */}
+      <Stack direction="vertical" gap={1}>
+        {/* The scroll container, deliberately role-less: the tree inside it
+            owns the treeitems, and a role here would insert a foreign node
+            between them. The stylesheet caps its height, so a page of rows
+            scrolls inside it rather than lengthening the page. */}
+        <div className="dg-virtual-viewport" ref={viewportRef}>
+          <div
+            role="tree"
+            aria-label={label}
+            className="dg-virtual-canvas"
+            onKeyDown={handleKeyDown}
+            onFocus={handleFocus}
+            onBlur={handleBlur}
+            onPointerDown={handlePointerDown}
+            onClick={handleClick}
+          >
+            {/* The rendered page, sliced; its start is added back so each row
+                keeps its TRUE index among the drawn window's rows. */}
+            {items
+              .slice(page.start, page.end)
+              .map((item, offset) => renderItem(item, page.start + offset))}
+          </div>
         </div>
-      </div>
+
+        {paged ? (
+          // The page and the controls that turn it, offered only while the
+          // drawn window holds more rows than one page. The statement is
+          // polite and live, so each page is announced — never
+          // `role="status"`, which is the loading placeholder's — and it
+          // keeps its element while the reader pages, because both controls
+          // stay mounted: a control at the end of its side is disabled rather
+          // than removed, and its focus is handed to the other one (see the
+          // effect above). Real buttons, so a pointer and the keyboard turn
+          // the page alike.
+          <Stack direction="horizontal" gap={2} align="center" wrap>
+            <Text as="p" size="xs" tone="muted" aria-live="polite">
+              {treePageSentence(page)}
+            </Text>
+            <Button
+              ref={previousRowsRef}
+              variant="secondary"
+              size="sm"
+              disabled={page.before === 0}
+              onClick={handlePreviousRows}
+            >
+              {PREVIOUS_ROWS_LABEL}
+            </Button>
+            <Button
+              ref={nextRowsRef}
+              variant="secondary"
+              size="sm"
+              disabled={page.after === 0}
+              onClick={handleNextRows}
+            >
+              {NEXT_ROWS_LABEL}
+            </Button>
+          </Stack>
+        ) : null}
+      </Stack>
     </div>
   );
 }
@@ -2589,16 +2968,12 @@ export function FlameChart(props: FlameChartProps): ReactElement {
    * The frame under the pointer on the canvas, whose tree row carries
    * `dg-is-hovered` — the author-drawn hover detail a pointer user can dismiss,
    * where the frame's SVG title is the user agent's and cannot be. Kept by
-   * frame id, so the mark lands whenever the virtualized tree renders the row.
+   * frame id, so the mark lands whenever the bounded tree renders the row.
    */
   const [hoveredFrameId, setHoveredFrameId] = useState<string | undefined>(undefined);
   const hovering = hoveredFrameId !== undefined;
 
-  /**
-   * The block: the document the hover's Escape listener is attached to, and
-   * the subtree a focus handoff after "Show more operations" finds the tree's
-   * tab stop in.
-   */
+  /** The block: the document the hover's Escape listener is attached to. */
   const blockRef = useRef<HTMLDivElement | null>(null);
 
   /**
@@ -2620,73 +2995,133 @@ export function FlameChart(props: FlameChartProps): ReactElement {
   const emptyCapture = status === 'success' && data === null;
   const tree = looksLikeTraceTree(data) ? data : undefined;
 
-  // The viewport's inner width, measured while its ref attaches and kept
-  // current on resize, and a measure in the frame labels' font
-  // (`.dg-flame__frame-label` is set in `monoSm`). Called before any early
-  // return, as the rules of hooks require; the ref only attaches once the
-  // chart itself renders.
-  const {
-    ref: viewportRef,
-    width: viewportWidth,
-    measureText,
-  } = useChartCanvas<HTMLDivElement>({ font: 'monoSm' });
-  const measured = isMeasuredWidth(viewportWidth);
-  const canvasWidth = resolveCanvasWidth(viewportWidth);
-
   /**
-   * The traversal's row bound, as raised by "Show more operations", tagged
-   * with the query it was raised for.
-   *
-   * Tagged rather than reset by an effect: a bound whose identity no longer
-   * matches the node's query is simply not read, so a changed query starts
-   * from the default bound on the very render that shows it, with no frame
-   * drawn against a bound meant for another trace.
+   * The drawn window the reader has paged to, tagged with the query it was
+   * paged for and the selection it had accounted for (see {@link WindowState}).
    */
-  const [raisedBound, setRaisedBound] = useState<
-    { readonly identity: string; readonly maxRows: number } | undefined
-  >(undefined);
+  const [windowState, setWindowState] = useState<WindowState | undefined>(undefined);
   const queryIdentity = `${node.id}|${JSON.stringify(query)}`;
-  const boundRaised = raisedBound !== undefined && raisedBound.identity === queryIdentity;
-  const maxRows = boundRaised ? raisedBound.maxRows : DEFAULT_MAX_TRACE_ROWS;
+  const storedWindow =
+    windowState !== undefined && windowState.identity === queryIdentity ? windowState : undefined;
 
-  // One model for both representations: the measured canvas lays the frames
-  // out and fits their labels, the row bound decides how much of the trace is
-  // walked, and the packing is done at the width the bars are painted at.
-  const model = useMemo(
-    () => buildModel(tree, folds, { width: canvasWidth, measureText }, maxRows),
-    [tree, folds, canvasWidth, measureText, maxRows],
+  // The whole walk under the reader's folds: data and no geometry, rebuilt
+  // only when the trace or a fold changes — never by paging.
+  const walk = useMemo(() => walkTrace(tree, folds), [tree, folds]);
+
+  // The selected operation anywhere in the walk, drawn or not, and its frame
+  // id: the selection's identity, which paging does not change.
+  const selectedShownIndex = useMemo(
+    () => shownIndexOfSelection(walk.shown, selection),
+    [walk, selection],
   );
-  const selectedFrameId = selectedFrameIdOf(model.frames, selection);
+  const selectionKey =
+    selectedShownIndex === undefined ? undefined : walk.shown[selectedShownIndex]?.frameId;
+
+  // A selection NEWER than the window — made on another view, or the one a
+  // host starts with — whose operation the window does not draw moves the
+  // window to the one holding it, so the frame and its row carry the mark the
+  // reader asked for. Newer is what keeps a reader free to page away from a
+  // selection: paging records the selection it was done under, and only a
+  // different one moves the window again. The move is stored during this
+  // render (React's documented way to adjust state from what a render
+  // observes; the next pass finds the selection accounted for and stores
+  // nothing), so it sticks when the selection is later cleared.
+  const requestedWindow = windowRows(walk.shown.length, storedWindow?.start ?? 0, MAX_DRAWN_ROWS);
+  const revealStart =
+    selectedShownIndex !== undefined &&
+    selectionKey !== storedWindow?.selectionKey &&
+    !windowContains(requestedWindow, selectedShownIndex)
+      ? windowStartFor(selectedShownIndex, MAX_DRAWN_ROWS)
+      : undefined;
+  if (revealStart !== undefined) {
+    setWindowState({ identity: queryIdentity, start: revealStart, selectionKey });
+  }
+  const windowStart = revealStart ?? requestedWindow.start;
+
+  // One model for both representations, cut from the walk at the window: the
+  // canvas lays the frames out in its fixed logical space and fits their
+  // labels there, so it is a pure function of the walk and the window. At most
+  // `MAX_DRAWN_ROWS` frames.
+  const model = useMemo(() => drawWindow(walk, windowStart), [walk, windowStart]);
+  const rowWindow = model.window;
+  const selectedFrameId =
+    selectedShownIndex !== undefined && windowContains(rowWindow, selectedShownIndex)
+      ? selectionKey
+      : undefined;
+
+  /** The two paging controls, for the focus handoff below. */
+  const previousControlRef = useRef<HTMLButtonElement | null>(null);
+  const nextControlRef = useRef<HTMLButtonElement | null>(null);
 
   /**
-   * Set when "Show more operations" was activated, and read once the rows it
-   * asked for have rendered: when the bound now covers the whole trace, the
-   * control that held focus has gone, and focus moves to the tree's tab stop
-   * rather than falling back to the document.
+   * Which paging control was activated, read once the window it asked for has
+   * rendered: a control that paged to the last window on its side is disabled
+   * by that very page, and the focus it held moves to the other control rather
+   * than falling back to the document.
    */
-  const focusAfterShowMore = useRef(false);
+  const pagedFromRef = useRef<'previous' | 'next' | undefined>(undefined);
 
-  const handleShowMore = useCallback((): void => {
-    focusAfterShowMore.current = true;
-    setRaisedBound({ identity: queryIdentity, maxRows: nextRowBound(maxRows, model.nodeCount) });
-  }, [maxRows, model.nodeCount, queryIdentity]);
+  /** Moves the drawn window to `start`, under the selection in force. */
+  const pageTo = useCallback(
+    (start: number): void => {
+      setWindowState({ identity: queryIdentity, start, selectionKey });
+    },
+    [queryIdentity, selectionKey],
+  );
+
+  const handlePrevious = useCallback((): void => {
+    pagedFromRef.current = 'previous';
+    pageTo(previousWindowStart(rowWindow));
+  }, [pageTo, rowWindow]);
+
+  const handleNext = useCallback((): void => {
+    pagedFromRef.current = 'next';
+    pageTo(nextWindowStart(rowWindow));
+  }, [pageTo, rowWindow]);
+
+  // The tree's way past the drawn window's edges: the operation a key stepped
+  // to is paged into view, and its frame id is handed back — with the
+  // identity of the tree the window it lands in makes — so the tree can put
+  // the tab stop, its page and focus on it once it renders.
+  const handleReach = useCallback(
+    (shownIndex: number): TreeReach | undefined => {
+      const target = walk.shown[shownIndex];
+      if (target === undefined) {
+        return undefined;
+      }
+      const start = windowContains(rowWindow, shownIndex)
+        ? rowWindow.start
+        : windowStartFor(shownIndex, MAX_DRAWN_ROWS);
+      if (start !== rowWindow.start) {
+        pageTo(start);
+      }
+      return { frameId: target.frameId, identity: treeIdentityFor(queryIdentity, start) };
+    },
+    [pageTo, queryIdentity, rowWindow, walk],
+  );
 
   useEffect(() => {
-    if (!focusAfterShowMore.current) {
+    const pagedFrom = pagedFromRef.current;
+    if (pagedFrom === undefined) {
       return;
     }
-    focusAfterShowMore.current = false;
-    const block = blockRef.current;
-    const active = block?.ownerDocument.activeElement;
-    // Only a focus that was lost is handed on: while the control remains, it
-    // keeps focus, and a reader who has moved elsewhere is left where they are.
-    if (
-      block === null ||
-      (active !== null && active !== undefined && active !== block.ownerDocument.body)
-    ) {
+    pagedFromRef.current = undefined;
+
+    const activated =
+      pagedFrom === 'previous' ? previousControlRef.current : nextControlRef.current;
+    const counterpart =
+      pagedFrom === 'previous' ? nextControlRef.current : previousControlRef.current;
+    // A control that can still page keeps its focus, and a reader who has
+    // moved elsewhere is left where they are: only the focus of a control this
+    // page disabled is handed on.
+    if (activated === null || !activated.disabled) {
       return;
     }
-    block.querySelector<HTMLElement>('[role="treeitem"][tabindex="0"]')?.focus();
+    const active = activated.ownerDocument.activeElement;
+    if (active !== null && active !== activated && active !== activated.ownerDocument.body) {
+      return;
+    }
+    counterpart?.focus();
   }, [model]);
 
   const handleSelect = useCallback(
@@ -2831,15 +3266,7 @@ export function FlameChart(props: FlameChartProps): ReactElement {
 
   const notes = notesFor(model);
   const partialSentences = partialSentencesFor(model);
-  const partial = partialSentences.length > 0;
-  // Once the reader has raised the bound, the notice stays mounted: a live
-  // region that is removed announces nothing, so the step that reveals the last
-  // operations must update it instead — to the count now shown in full.
-  const noticeText = partial
-    ? partialSentences.join(' ')
-    : boundRaised
-      ? `Showing all ${pluralOperations(model.walkedCount)}.`
-      : undefined;
+  const windowed = isWindowed(rowWindow);
   const listLabel = `${node.title ?? CATALOG_ENTRY.label}: ${pluralOperations(
     model.frames.length,
   )}, innermost last`;
@@ -2852,51 +3279,73 @@ export function FlameChart(props: FlameChartProps): ReactElement {
         </Text>
       ))}
 
-      {noticeText === undefined ? null : (
+      {partialSentences.length === 0 ? null : (
         // Beside the canvas it qualifies, in the shape the timeline and the
-        // dependency graph share: the badge, what is shown of what exists, and
-        // the way to see more — a control while more is in memory, the refine
-        // route when it is not. Polite and live, so the count a step reveals is
-        // announced; never `role="status"`, which is the loading placeholder's.
-        // The badge and the control hold fixed slots, so the live text keeps
-        // its element when either goes.
+        // dependency graph share: the badge and what is not held here, with
+        // the refine route. No control, because nothing more is in memory.
         <Stack direction="horizontal" gap={2} align="center" wrap>
-          {partial ? (
-            <Badge tone="warning" variant="outline">
-              {PARTIAL_RESULT_LABEL}
-            </Badge>
-          ) : null}
-          <Text as="p" size="xs" tone="muted" aria-live="polite">
-            {noticeText}
+          <Badge tone="warning" variant="outline">
+            {PARTIAL_RESULT_LABEL}
+          </Badge>
+          <Text as="p" size="xs" tone="muted">
+            {partialSentences.join(' ')}
           </Text>
-          {model.rowBounded ? (
-            <Button variant="secondary" size="sm" onClick={handleShowMore}>
-              {SHOW_MORE_LABEL}
-            </Button>
-          ) : null}
         </Stack>
       )}
 
-      <div className="dg-flame__viewport" ref={viewportRef}>
+      {windowed ? (
+        // The drawn window and the controls that page it. The statement is
+        // polite and live, so each page is announced — never `role="status"`,
+        // which is the loading placeholder's — and it keeps its element while
+        // the reader pages, because both controls stay mounted: a control at
+        // the end of its side is disabled rather than removed, and its focus is
+        // handed to the other one (see the effect above).
+        <Stack direction="horizontal" gap={2} align="center" wrap>
+          <Text as="p" size="xs" tone="muted" aria-live="polite">
+            {windowSentence(rowWindow)}
+          </Text>
+          <Button
+            ref={previousControlRef}
+            variant="secondary"
+            size="sm"
+            disabled={rowWindow.before === 0}
+            onClick={handlePrevious}
+          >
+            {PREVIOUS_WINDOW_LABEL}
+          </Button>
+          <Button
+            ref={nextControlRef}
+            variant="secondary"
+            size="sm"
+            disabled={rowWindow.after === 0}
+            onClick={handleNext}
+          >
+            {NEXT_WINDOW_LABEL}
+          </Button>
+        </Stack>
+      ) : null}
+
+      <div className="dg-flame__viewport">
         {/* A picture with a text alternative, deliberately: the rows beneath it
             are the representation a keyboard and a screen reader use, so the
             canvas announces what it shows instead of exposing one node per
             bar (AAP 0.6.4).
 
-            Measured, the canvas is `canvasWidth` CSS pixels wide with a
-            `viewBox` of the same size, so one user unit is one pixel and
-            nothing is scaled; the default `preserveAspectRatio` then has no
-            ratio to reconcile. Unmeasured (no layout), the fallback coordinate
-            space is stretched across the container instead — see the module
-            note. */}
+            One fixed logical space, whatever the container: the `viewBox` is
+            `CHART_VIEWBOX_WIDTH` units wide and exactly as tall as the drawn
+            rows, the element takes its container's width (`width="100%"`)
+            and declares the drawing's logical height, and
+            `xMinYMin meet` scales it uniformly from its top-left corner —
+            never stretching a bar or a label out of proportion. Nothing reads
+            the element's size; see the module note. */}
         <svg
           className="dg-flame__canvas"
           role="img"
           aria-label={canvasTextAlternative(model, node.title)}
-          viewBox={`0 0 ${String(canvasWidth)} ${String(model.canvasHeight)}`}
-          width={measured ? canvasWidth : '100%'}
+          viewBox={`0 0 ${String(CHART_VIEWBOX_WIDTH)} ${String(model.canvasHeight)}`}
+          width="100%"
           height={model.canvasHeight}
-          preserveAspectRatio={measured ? undefined : 'none'}
+          preserveAspectRatio="xMinYMin meet"
         >
           <g className="dg-flame__axis">
             {model.ticks.map((tick, index) => {
@@ -2993,18 +3442,24 @@ export function FlameChart(props: FlameChartProps): ReactElement {
           depth, in the same order the canvas draws them. It is the keyboard
           path and the screen-reader path, and it carries every frame the
           canvas draws — anything neither shows is named in a note above. It
-          is ONE tab stop and renders only the rows in view (see
+          is ONE tab stop and renders one page of rows, the page holding that
+          stop, with the row controls that turn it by pointer or keyboard (see
           `FlameFrameTree`); the shared selection and the frame under the
           pointer are handed to it by frame id, so a row carries its marks
-          whenever it is rendered. */}
+          whenever it is rendered, and its identity names this drawn window of
+          this query, so a new one opens on its first page. */}
       <FlameFrameTree
         frames={model.frames}
+        rowWindow={rowWindow}
+        identity={treeIdentityFor(queryIdentity, rowWindow.start)}
         label={listLabel}
         selectedFrameId={selectedFrameId}
+        selectionKey={selectionKey}
         hoveredFrameId={hoveredFrameId}
         onSelect={handleSelect}
         onToggle={handleToggle}
         onOpenSource={actions?.onOpenSource}
+        onReach={handleReach}
       />
     </div>
   );

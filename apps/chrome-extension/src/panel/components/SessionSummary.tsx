@@ -81,8 +81,8 @@
  * Every visual value resolves through a renderer component — `Section`, `Stack`, `Badge`, `Text`,
  * `Code`, `DataTable`, `EmptyState`, `LoadingState`, `ErrorState` — and so through the `--dg-*`
  * tokens behind them. This file writes no inline style, no length, no colour and no class name of
- * its own; the `DataTable` column widths are relational grid tracks (`ch` minimums, `fr` shares),
- * the vocabulary that primitive's `width` prop accepts.
+ * its own; each `DataTable` column declares a semantic width role for its content, which the
+ * primitive resolves to a token-built grid track, so the column geometry is the design system's.
  *
  * ## Boundaries
  *
@@ -100,6 +100,7 @@ import {
   EmptyState,
   ErrorState,
   LoadingState,
+  MODIFICATION_STATUS_TONE,
   Section,
   Stack,
   Text,
@@ -301,16 +302,27 @@ const PROGRESS_STATUS_PRESENTATION: Readonly<Record<ProgressStatus, BadgePresent
 };
 
 /**
- * The five journal statuses (`MODIFICATION_STATUSES`, AAP 0.5.1). A conflict is a refusal to
- * overwrite the developer's edit, not a failure of the tool, so it is a `warning`; a write that
- * aborted is the `danger`. A reverted record needs nothing further, so it is `neutral`.
+ * The tone of each journal status: the design system's shared `MODIFICATION_STATUS_TONE`, the
+ * same table the editor webview's `ModificationsList` draws from, so one status reads in one
+ * colour on both surfaces. The renderer keys it by the five status literals; annotating it with
+ * the protocol's union here makes a status added upstream a compile error until that table covers
+ * it.
+ */
+const MODIFICATION_STATUS_TONES: Readonly<Record<ModificationStatus, BadgeTone>> =
+  MODIFICATION_STATUS_TONE;
+
+/**
+ * The five journal statuses (`MODIFICATION_STATUSES`, AAP 0.5.1): the shared tone, plus the word
+ * and the glyph this surface prints beside it. A conflict is a refusal to overwrite the
+ * developer's edit, not a failure of the tool, so its tone is a `warning`; a write that aborted is
+ * the `danger`; a reverted record was restored and verified, so it is a `success`.
  */
 const MODIFICATION_STATUS_PRESENTATION: Readonly<Record<ModificationStatus, BadgePresentation>> = {
-  pending: { tone: 'info', label: 'Pending', glyph: '◌' },
-  applied: { tone: 'accent', label: 'Applied', glyph: '●' },
-  reverted: { tone: 'neutral', label: 'Reverted', glyph: '↺' },
-  conflict: { tone: 'warning', label: 'Conflict', glyph: '!' },
-  failed: { tone: 'danger', label: 'Failed', glyph: '✕' },
+  pending: { tone: MODIFICATION_STATUS_TONES.pending, label: 'Pending', glyph: '◌' },
+  applied: { tone: MODIFICATION_STATUS_TONES.applied, label: 'Applied', glyph: '●' },
+  reverted: { tone: MODIFICATION_STATUS_TONES.reverted, label: 'Reverted', glyph: '↺' },
+  conflict: { tone: MODIFICATION_STATUS_TONES.conflict, label: 'Conflict', glyph: '!' },
+  failed: { tone: MODIFICATION_STATUS_TONES.failed, label: 'Failed', glyph: '✕' },
 };
 
 /** The four session cleanup statuses (`CLEANUP_STATUSES`, AAP 0.5.1). */
@@ -478,8 +490,15 @@ const ENABLED_GLYPH = '✓';
  *
  * Module-level and pure, so the grid receives the same column array on every render. No column is
  * sortable: the rows come from the store in journal order — the order cleanup reverses — and
- * `DataTable` never re-orders rows itself, so a sort control would be inert. The widths are
- * relational tracks: `ch` minimums sized for each column's widest form, `fr` shares of the rest.
+ * `DataTable` never re-orders rows itself, so a sort control would be inert.
+ *
+ * Each width is the `DataTable` role for the column's content, never a length: the file path is a
+ * `name`, the plan version an `ordinal` (a fixed track, so the figures never drift), the journal
+ * status a `status` badge, and the applied-at value a `label`, because it is a full localised date
+ * and time rather than a short clock time. Every role has a non-zero floor, so a narrow dock
+ * scrolls the grid horizontally instead of squeezing a column to nothing. The file and status
+ * columns take the same roles as the VS Code webview's modification list, so the two surfaces size
+ * the same content alike.
  */
 const MODIFICATION_COLUMNS: readonly DataTableColumn<ModificationRecord>[] = [
   {
@@ -487,7 +506,7 @@ const MODIFICATION_COLUMNS: readonly DataTableColumn<ModificationRecord>[] = [
     header: FILE_HEADER,
     rowHeader: true,
     sortable: false,
-    width: 'minmax(24ch, 3fr)',
+    width: 'name',
     // The path is shown, not linked: a modification record carries no line or column, and a
     // fabricated position would open the wrong place (AAP 0.4.2).
     cell: (row) => (
@@ -501,7 +520,7 @@ const MODIFICATION_COLUMNS: readonly DataTableColumn<ModificationRecord>[] = [
     header: PLAN_HEADER,
     align: 'end',
     sortable: false,
-    width: '7ch',
+    width: 'ordinal',
     cell: (row) => (
       <Text size="xs" numeric>
         {String(row.planVersion)}
@@ -512,14 +531,14 @@ const MODIFICATION_COLUMNS: readonly DataTableColumn<ModificationRecord>[] = [
     key: 'status',
     header: STATUS_HEADER,
     sortable: false,
-    width: 'minmax(14ch, 1fr)',
+    width: 'status',
     cell: (row) => renderStatusBadge(MODIFICATION_STATUS_PRESENTATION[row.status]),
   },
   {
     key: 'appliedAt',
     header: APPLIED_AT_HEADER,
     sortable: false,
-    width: 'minmax(22ch, 1fr)',
+    width: 'label',
     cell: (row) => {
       const applied = formatTimestamp(row.appliedAt);
       return applied === undefined ? null : (

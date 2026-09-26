@@ -96,6 +96,7 @@ import { createSessionsRepo } from './sessions-repo.js';
 import type { SessionsRepo } from './sessions-repo.js';
 import {
   CANONICAL_ORDER_BY,
+  CAPTURE_ARRIVAL_TRACKER_CAPACITY,
   DEFAULT_PURGE_BATCH_SIZE,
   DELETE_OLDER_THAN_BATCH_SQL,
   DELETE_SESSION_BATCH_SQL,
@@ -106,6 +107,7 @@ import {
   PANEL_DURATION_DESC_ORDER_BY,
   PANEL_SECONDARY_ORDER_BY,
   PANEL_START_ASC_ORDER_BY,
+  PRODUCER_LOSS_LEDGER_CAPACITY,
   TELEMETRY_DEFAULT_GROUP_KEY,
   TELEMETRY_GROUP_KEYS,
   TELEMETRY_QUERY_DEFAULT_LIMIT,
@@ -115,11 +117,13 @@ import {
   isTelemetryGroupKey,
 } from './telemetry-repo.js';
 import type {
+  CaptureGeneration,
   PersistableTelemetryEvent,
   TelemetryGroupPage,
   TelemetryPage,
   TelemetryQuery,
   TelemetryRepo,
+  TelemetryScanFilter,
 } from './telemetry-repo.js';
 
 /* -------------------------------------------------------------------------------------------------
@@ -469,19 +473,29 @@ describe('the contract', () => {
     const members = [
       'insertMany',
       'query',
+      'scanEvents',
       'queryGroups',
       'listByTrace',
       'listByCapture',
+      'pageCaptureForSummary',
       'listByRequestKey',
       'listChildren',
       'getBySpanId',
       'listTraceIds',
+      'firstTraceId',
       'countByKind',
+      'captureStamp',
+      'captureGeneration',
       'existingEventIds',
       'existingTraceIds',
       'partitionKnownEventIds',
       'partitionKnownTraceIds',
       'countBySession',
+      'captureWatermark',
+      'beginProducerLossAccounting',
+      'recordProducerLoss',
+      'producerLoss',
+      'releaseProducerLoss',
       'deleteBySession',
       'deleteOlderThan',
     ] as const;
@@ -2750,6 +2764,191 @@ describe('the convenience readers', () => {
     expect(unwrap(repo.listTraceIds(SESSION_B))).toEqual([]);
   });
 
+  it('names the trace of the earliest event, session-wide and per capture, ties by arrival', () => {
+    // Two traces of CAPTURE_A1 whose earliest events share that capture's
+    // earliest instant, the higher id stored first; a third that starts later
+    // but is stored before both; CAPTURE_A2's trace, earliest in the session;
+    // and SESSION_B's trace at that same instant, stored before it under a
+    // lower id, which a read that lost the session scope would answer instead.
+    const [sessionBTrace, captureA2Trace] = [newTraceId(), newTraceId()].sort();
+    const [lowTrace, highTrace] = [newTraceId(), newTraceId()].sort();
+    const laterTrace = newTraceId();
+
+    if (
+      sessionBTrace === undefined ||
+      captureA2Trace === undefined ||
+      lowTrace === undefined ||
+      highTrace === undefined
+    ) {
+      throw new Error('The fixture minted fewer trace ids than it sorted.');
+    }
+
+    insertOk([
+      buildEvent({ traceId: sessionBTrace, sessionId: SESSION_B, captureId: CAPTURE_B1 }),
+      buildEvent({ traceId: laterTrace, startTime: BASE_TIME + 5 }),
+      buildEvent({ traceId: highTrace, startTime: BASE_TIME + 2 }),
+      buildEvent({ traceId: lowTrace, startTime: BASE_TIME + 9 }),
+      buildEvent({ traceId: lowTrace, startTime: BASE_TIME + 2 }),
+      buildEvent({ traceId: highTrace, startTime: BASE_TIME + 3 }),
+      buildEvent({ traceId: captureA2Trace, captureId: CAPTURE_A2, startTime: BASE_TIME }),
+    ]);
+
+    // Every scope whose earliest instant belongs to one trace: the lookup and
+    // the listing agree.
+    const untied: readonly (readonly [string, string | undefined, string])[] = [
+      [SESSION_A, undefined, captureA2Trace],
+      [SESSION_A, CAPTURE_A2, captureA2Trace],
+      [SESSION_B, undefined, sessionBTrace],
+      [SESSION_B, CAPTURE_B1, sessionBTrace],
+    ];
+
+    for (const [sessionId, captureId, expected] of untied) {
+      const first = unwrap(repo.firstTraceId(sessionId, captureId));
+
+      expect(first).toBe(expected);
+      expect(first).toBe(unwrap(repo.listTraceIds(sessionId, captureId))[0]);
+    }
+
+    // CAPTURE_A1's earliest instant is shared by two traces: the lookup takes
+    // the one whose event arrived first, the listing the smaller id.
+    expect(unwrap(repo.firstTraceId(SESSION_A, CAPTURE_A1))).toBe(highTrace);
+    expect(unwrap(repo.listTraceIds(SESSION_A, CAPTURE_A1))).toEqual([
+      lowTrace,
+      highTrace,
+      laterTrace,
+    ]);
+  });
+
+  it('follows start time, then arrival, over tied, interleaved captures and after a purge', async () => {
+    // Six traces over forty events whose start times repeat every seven
+    // milliseconds, stored out of start order and interleaved across both
+    // captures, so the earliest instant of every scope is shared by several
+    // traces and only the arrival tie-break decides.
+    const traces = Array.from({ length: 6 }, () => newTraceId());
+    const stored = insertOk(
+      Array.from({ length: 40 }, (_unused, index) =>
+        buildEvent({
+          traceId: cycle(traces, (index * 5) % traces.length),
+          captureId: index % 3 === 0 ? CAPTURE_A2 : CAPTURE_A1,
+          startTime: BASE_TIME + ((index * 3) % 7) + 1,
+        }),
+      ),
+    );
+
+    /** The in-memory oracle: the trace of the scope's earliest event in (start, arrival) order. */
+    function earliestTrace(
+      events: readonly TelemetryEvent[],
+      captureId: string | undefined,
+    ): string | undefined {
+      const [earliest] = events
+        .filter(
+          (event) =>
+            event.sessionId === SESSION_A &&
+            (captureId === undefined || event.captureId === captureId),
+        )
+        .sort(
+          (left, right) => left.startTime - right.startTime || left.ingestSeq - right.ingestSeq,
+        );
+
+      return earliest?.traceId;
+    }
+
+    function assertFollows(events: readonly TelemetryEvent[]): void {
+      for (const captureId of [undefined, CAPTURE_A1, CAPTURE_A2, CAPTURE_B1]) {
+        expect(unwrap(repo.firstTraceId(SESSION_A, captureId))).toBe(
+          earliestTrace(events, captureId),
+        );
+      }
+    }
+
+    // The fixture is only a tie-break test if the tie is real.
+    expect(
+      new Set(
+        stored.filter((event) => event.startTime === BASE_TIME + 1).map((event) => event.traceId),
+      ).size,
+    ).toBeGreaterThan(1);
+    assertFollows(stored);
+
+    // Removing the earliest instants moves every scope's answer to the
+    // earliest arrival among the rows that remain.
+    const purged = unwrap(await repo.deleteOlderThan(BASE_TIME + 3, { sessionIds: [SESSION_A] }));
+
+    expect(purged).toBeGreaterThan(0);
+    assertFollows(stored.filter((event) => event.startTime >= BASE_TIME + 3));
+  });
+
+  it('moves to the next earliest arrival when a purge removes the earliest rows', async () => {
+    // One trace alone at the earliest instant, then two traces tied at the
+    // next one: the later-arriving of the two under the smaller id, so arrival
+    // order and trace-id order disagree about which comes first.
+    const [smallTrace, largeTrace] = [newTraceId(), newTraceId()].sort();
+    const earliestTraceId = newTraceId();
+
+    if (smallTrace === undefined || largeTrace === undefined) {
+      throw new Error('The fixture minted fewer trace ids than it sorted.');
+    }
+
+    insertOk([
+      buildEvent({ traceId: earliestTraceId, startTime: BASE_TIME }),
+      buildEvent({ traceId: largeTrace, startTime: BASE_TIME + 1 }),
+      buildEvent({ traceId: smallTrace, startTime: BASE_TIME + 1 }),
+    ]);
+
+    for (const captureId of [undefined, CAPTURE_A1]) {
+      expect(unwrap(repo.firstTraceId(SESSION_A, captureId))).toBe(earliestTraceId);
+      expect(unwrap(repo.listTraceIds(SESSION_A, captureId))[0]).toBe(earliestTraceId);
+    }
+
+    expect(unwrap(await repo.deleteOlderThan(BASE_TIME + 1, { sessionIds: [SESSION_A] }))).toBe(1);
+
+    for (const captureId of [undefined, CAPTURE_A1]) {
+      expect(unwrap(repo.firstTraceId(SESSION_A, captureId))).toBe(largeTrace);
+      expect(unwrap(repo.listTraceIds(SESSION_A, captureId))[0]).toBe(smallTrace);
+    }
+
+    unwrap(await repo.deleteBySession(SESSION_A));
+
+    expect(unwrap(repo.firstTraceId(SESSION_A))).toBeUndefined();
+    expect(unwrap(repo.firstTraceId(SESSION_A, CAPTURE_A1))).toBeUndefined();
+  });
+
+  it('answers undefined for a session or capture that holds no event', () => {
+    expect(unwrap(repo.firstTraceId(SESSION_A))).toBeUndefined();
+    expect(unwrap(repo.firstTraceId(SESSION_A, CAPTURE_A1))).toBeUndefined();
+
+    insertOk([buildEvent()]);
+
+    expect(unwrap(repo.firstTraceId(SESSION_A, CAPTURE_A2))).toBeUndefined();
+    expect(unwrap(repo.firstTraceId(SESSION_B))).toBeUndefined();
+    // A capture of another session narrows to nothing rather than reaching it.
+    expect(unwrap(repo.firstTraceId(SESSION_B, CAPTURE_A1))).toBeUndefined();
+  });
+
+  it('refuses a blank session or capture exactly as listTraceIds does', () => {
+    const cases = [
+      [() => repo.firstTraceId(''), () => repo.listTraceIds(''), 'blank-session-id'],
+      [
+        () => repo.firstTraceId(SESSION_A, ''),
+        () => repo.listTraceIds(SESSION_A, ''),
+        'blank-filter',
+      ],
+    ] as const;
+
+    for (const [first, listed, reason] of cases) {
+      const refusal = first();
+      const reference = listed();
+
+      if (!isErr(refusal) || !isErr(reference)) {
+        throw new Error('A blank argument was accepted.');
+      }
+
+      expect(refusal.error.code).toBe('STORE_ERROR');
+      expect(refusal.error.details?.['reason']).toBe(reason);
+      expect(refusal.error.details?.['reason']).toBe(reference.error.details?.['reason']);
+      expect(refusal.error.details?.['operation']).toBe('firstTraceId');
+    }
+  });
+
   it('counts by kind, zero-filled over the whole vocabulary', () => {
     insertOk([
       buildEvent({ kind: 'render' }),
@@ -2806,6 +3005,763 @@ describe('the convenience readers', () => {
           record.message === 'ignored telemetry rows whose kind is outside the vocabulary',
       ),
     ).toBe(true);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * The capture stamp
+ * ---------------------------------------------------------------------------------------------- */
+
+/*
+ * Why the stamp exists: `../panels/data.ts` checks whether a capture's stored
+ * summary still covers every event the capture holds, against the stamp's
+ * count. That is only sound if every change to the capture's rows moves the
+ * stamp — an insert, a purge, and the case that defeats a count alone, a
+ * delete offset by an insert — and if nothing outside the capture does.
+ * Validating a cache without recounting is `captureGeneration`'s job, below.
+ */
+describe('captureStamp', () => {
+  /** The stamp of one capture of {@link SESSION_A}, failing the test on a refusal. */
+  function stampOf(captureId: string, sessionId: string = SESSION_A): unknown {
+    return unwrap(repo.captureStamp(sessionId, captureId));
+  }
+
+  it('stamps a capture holding no event { count: 0, maxIngestSeq: 0 }', () => {
+    expect(stampOf(CAPTURE_A1)).toEqual({ count: 0, maxIngestSeq: 0 });
+
+    insertOk([buildEvent({ sessionId: SESSION_B, captureId: CAPTURE_B1 })]);
+
+    // Another session's capture holds nothing for this session.
+    expect(stampOf(CAPTURE_B1)).toEqual({ count: 0, maxIngestSeq: 0 });
+    expect(stampOf(CAPTURE_B1, SESSION_B)).toEqual({ count: 1, maxIngestSeq: 1 });
+  });
+
+  it('grows with every stored batch and ignores writes to any other capture', () => {
+    const written = insertOk([
+      buildEvent({ startTime: BASE_TIME + 2 }),
+      buildEvent({ startTime: BASE_TIME }),
+      buildEvent({ startTime: BASE_TIME + 1 }),
+    ]);
+    const highest = Math.max(...written.map((event) => event.ingestSeq));
+    const afterFirst = stampOf(CAPTURE_A1);
+
+    expect(afterFirst).toEqual({ count: 3, maxIngestSeq: highest });
+
+    insertOk([
+      buildEvent({ captureId: CAPTURE_A2 }),
+      buildEvent({ sessionId: SESSION_B, captureId: CAPTURE_B1 }),
+    ]);
+
+    expect(stampOf(CAPTURE_A1)).toEqual(afterFirst);
+    expect(stampOf(CAPTURE_A2)).toEqual({ count: 1, maxIngestSeq: highest + 1 });
+
+    const [later] = insertOk([buildEvent({ startTime: BASE_TIME + 3 })]);
+
+    expect(stampOf(CAPTURE_A1)).toEqual({ count: 4, maxIngestSeq: later?.ingestSeq });
+  });
+
+  it('stands still for an idempotent replay, which stores no row', () => {
+    const batch = [buildEvent(), buildEvent({ startTime: BASE_TIME + 1 })];
+
+    insertOk(batch);
+
+    const before = stampOf(CAPTURE_A1);
+
+    // The replay consumes arrival numbers without storing a row, and the
+    // stamp describes stored rows only.
+    expect(unwrap(repo.insertMany(batch)).skipped).toBe(batch.length);
+    expect(stampOf(CAPTURE_A1)).toEqual(before);
+  });
+
+  it('moves on a purge, and on a delete offset by an insert that a count alone would miss', async () => {
+    const written = insertOk([
+      buildEvent({ startTime: BASE_TIME }),
+      buildEvent({ startTime: BASE_TIME + 5 }),
+      buildEvent({ startTime: BASE_TIME + 6 }),
+    ]);
+    const highest = Math.max(...written.map((event) => event.ingestSeq));
+
+    // A retention purge of the oldest row: one fewer, the same highest number.
+    expect(unwrap(await repo.deleteOlderThan(BASE_TIME + 1, { sessionIds: [SESSION_A] }))).toBe(1);
+
+    const purged = unwrap(repo.captureStamp(SESSION_A, CAPTURE_A1));
+
+    expect(purged).toEqual({ count: 2, maxIngestSeq: highest });
+
+    // Remove the newest row and store one more: the count is back where it
+    // was, and only the never-reused arrival number tells the two apart.
+    store.statement('DELETE FROM telemetry_events WHERE ingest_seq = ?').run(highest);
+
+    const shrunk = unwrap(repo.captureStamp(SESSION_A, CAPTURE_A1));
+
+    expect(shrunk.count).toBe(1);
+    expect(shrunk.maxIngestSeq).toBeLessThan(highest);
+
+    const [replacement] = insertOk([buildEvent({ startTime: BASE_TIME + 7 })]);
+    const replaced = unwrap(repo.captureStamp(SESSION_A, CAPTURE_A1));
+
+    expect(replaced.count).toBe(purged.count);
+    expect(replaced.maxIngestSeq).toBe(replacement?.ingestSeq);
+    expect(replaced.maxIngestSeq).toBeGreaterThan(purged.maxIngestSeq);
+    expect(replaced).not.toEqual(purged);
+
+    // A whole-session purge empties it.
+    unwrap(await repo.deleteBySession(SESSION_A));
+
+    expect(stampOf(CAPTURE_A1)).toEqual({ count: 0, maxIngestSeq: 0 });
+  });
+
+  it('refuses a blank session, and a capture that is blank or missing', () => {
+    const cases = [
+      [() => repo.captureStamp('', CAPTURE_A1), 'blank-session-id'],
+      [() => repo.captureStamp(SESSION_A, ''), 'blank-capture-id'],
+      // What a JavaScript caller, or an optional chain, can hand the method.
+      [() => repo.captureStamp(SESSION_A, undefined as unknown as string), 'blank-capture-id'],
+    ] as const;
+
+    for (const [call, reason] of cases) {
+      const refusal = call();
+
+      if (!isErr(refusal)) {
+        throw new Error('A blank argument was accepted.');
+      }
+
+      expect(refusal.error.code).toBe('STORE_ERROR');
+      expect(refusal.error.details?.['reason']).toBe(reason);
+      expect(refusal.error.details?.['operation']).toBe('captureStamp');
+    }
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * The capture generation
+ * ---------------------------------------------------------------------------------------------- */
+
+/*
+ * Why the generation exists: `../panels/data.ts` validates its cached capture
+ * aggregates on every panel node, so the check must not read the capture. That
+ * is only sound if every change to the capture's rows moves the generation —
+ * this connection's inserts and purges through the ledger, any other
+ * connection's commit through `data_version`, a rolled-back caller
+ * transaction by restamping — and if a read, or a write elsewhere, does not.
+ */
+describe('captureGeneration', () => {
+  /** The generation of one capture of {@link SESSION_A}, failing the test on a refusal. */
+  function generationOf(
+    captureId: string = CAPTURE_A1,
+    reader: TelemetryRepo = repo,
+  ): CaptureGeneration {
+    return unwrap(reader.captureGeneration(SESSION_A, captureId));
+  }
+
+  it('stands still across reads of every kind when nothing was written', () => {
+    insertOk([buildEvent(), buildEvent({ startTime: BASE_TIME + 1 })]);
+
+    const before = generationOf();
+
+    unwrap(repo.query({ sessionId: SESSION_A, captureId: CAPTURE_A1 }));
+    unwrap(repo.scanEvents({ sessionId: SESSION_A, captureId: CAPTURE_A1 }, 10));
+    unwrap(repo.captureStamp(SESSION_A, CAPTURE_A1));
+    unwrap(repo.firstTraceId(SESSION_A, CAPTURE_A1));
+
+    expect(generationOf()).toEqual(before);
+    expect(before.writes).toBeGreaterThan(0);
+  });
+
+  it('answers writes 0 for a capture this connection stored nothing into', () => {
+    expect(generationOf()).toMatchObject({ purges: 0, writes: 0 });
+
+    insertOk([buildEvent({ captureId: CAPTURE_A2 })]);
+
+    expect(generationOf(CAPTURE_A1).writes).toBe(0);
+    expect(generationOf(CAPTURE_A2).writes).toBeGreaterThan(0);
+  });
+
+  it('moves on a batch that stores a row of the capture, and on no other insert', () => {
+    const batch = [buildEvent(), buildEvent({ startTime: BASE_TIME + 1 })];
+
+    insertOk(batch);
+
+    const afterFirst = generationOf();
+
+    // Rows of another capture of the same session, and of another session.
+    insertOk([
+      buildEvent({ captureId: CAPTURE_A2 }),
+      buildEvent({ sessionId: SESSION_B, captureId: CAPTURE_B1 }),
+    ]);
+
+    expect(generationOf()).toEqual(afterFirst);
+
+    // An idempotent replay consumes arrival numbers and stores nothing.
+    expect(unwrap(repo.insertMany(batch)).skipped).toBe(batch.length);
+    expect(generationOf()).toEqual(afterFirst);
+
+    // A replay carrying one new row of the capture does store one.
+    insertOk([...batch, buildEvent({ startTime: BASE_TIME + 2 })]);
+
+    const afterSecond = generationOf();
+
+    expect(afterSecond.writes).not.toBe(afterFirst.writes);
+    expect(afterSecond.dataVersion).toBe(afterFirst.dataVersion);
+    expect(afterSecond.purges).toBe(afterFirst.purges);
+  });
+
+  it('stands still for a refused batch, which stores nothing', () => {
+    const before = generationOf();
+    const refused = repo.insertMany([
+      buildEvent(),
+      // A capture of another session: the whole batch rolls back.
+      buildEvent({ sessionId: SESSION_A, captureId: CAPTURE_B1 }),
+    ]);
+
+    expect(isErr(refused)).toBe(true);
+    expect(generationOf()).toEqual(before);
+  });
+
+  it('moves after a purge batch that removed rows, and not after one that removed nothing', async () => {
+    insertOk([
+      buildEvent({ startTime: BASE_TIME }),
+      buildEvent({ startTime: BASE_TIME + 5 }),
+      buildEvent({ startTime: BASE_TIME + 9 }),
+      buildEvent({ sessionId: SESSION_B, captureId: CAPTURE_B1, startTime: BASE_TIME }),
+    ]);
+
+    const initial = generationOf();
+
+    // Purges that match no row: nothing changed, nothing moves.
+    expect(unwrap(await repo.deleteOlderThan(BASE_TIME - 1))).toBe(0);
+    expect(unwrap(await repo.deleteOlderThan(BASE_TIME - 1, { sessionIds: [SESSION_A] }))).toBe(0);
+    expect(unwrap(await repo.deleteBySession(newSessionId()))).toBe(0);
+    expect(generationOf()).toEqual(initial);
+
+    // Each purge form that removed a row moves it.
+    expect(unwrap(await repo.deleteOlderThan(BASE_TIME + 1, { sessionIds: [SESSION_A] }))).toBe(1);
+
+    const afterSessionPurge = generationOf();
+
+    expect(afterSessionPurge.purges).not.toBe(initial.purges);
+    expect(afterSessionPurge.writes).toBe(initial.writes);
+
+    // A purge of another session's rows moves every capture's generation too:
+    // the ledger records purges per connection, which errs towards
+    // recomputing and never towards a stale answer.
+    expect(unwrap(await repo.deleteOlderThan(BASE_TIME + 1))).toBe(1);
+
+    const afterGlobalPurge = generationOf();
+
+    expect(afterGlobalPurge.purges).not.toBe(afterSessionPurge.purges);
+
+    expect(unwrap(await repo.deleteBySession(SESSION_A))).toBe(2);
+    expect(generationOf().purges).not.toBe(afterGlobalPurge.purges);
+  });
+
+  it('is shared by every repository over one store', () => {
+    const other = createTelemetryRepo({ store });
+
+    expect(generationOf(CAPTURE_A1, other)).toEqual(generationOf());
+
+    const written = other.insertMany([buildEvent()]);
+
+    expect(isErr(written)).toBe(false);
+
+    const afterOther = generationOf();
+
+    expect(afterOther.writes).toBeGreaterThan(0);
+    expect(generationOf(CAPTURE_A1, other)).toEqual(afterOther);
+  });
+
+  it('moves dataVersion when another connection commits a write', () => {
+    const second = unwrap(openStore({ databasePath: store.path }));
+
+    try {
+      const before = generationOf();
+      const written = createTelemetryRepo({ store: second }).insertMany([buildEvent()]);
+
+      expect(isErr(written)).toBe(false);
+
+      const after = generationOf();
+
+      // This connection's ledger knows nothing of the other's write; the
+      // database header does.
+      expect(after.dataVersion).not.toBe(before.dataVersion);
+      expect(after.writes).toBe(before.writes);
+      expect(after.purges).toBe(before.purges);
+      expect(unwrap(repo.captureStamp(SESSION_A, CAPTURE_A1)).count).toBe(1);
+    } finally {
+      second.close();
+    }
+  });
+
+  it('reads no telemetry row: one pragma and the ledger', () => {
+    seedPlanFixture();
+
+    const texts: string[] = [];
+    const recorded = createTelemetryRepo({ store: recordingStore(store, texts) });
+
+    unwrap(recorded.captureGeneration(SESSION_A, CAPTURE_A1));
+
+    expect(texts).toEqual(['PRAGMA data_version']);
+    expect(statementsRunBy((reader) => reader.captureGeneration(SESSION_A, CAPTURE_A1))).toEqual(
+      [],
+    );
+  });
+
+  it('restamps an insert whose enclosing transaction rolled back', () => {
+    const before = generationOf();
+    let inside: CaptureGeneration | undefined;
+
+    expect(() =>
+      store.transaction(() => {
+        insertOk([buildEvent()]);
+        inside = generationOf();
+
+        // Stable while the enclosing transaction is open.
+        expect(generationOf()).toEqual(inside);
+
+        throw new Error('the caller rolls its transaction back');
+      }),
+    ).toThrow('the caller rolls its transaction back');
+
+    const after = generationOf();
+
+    // The row is gone, and nothing computed inside the transaction validates.
+    expect(unwrap(repo.captureStamp(SESSION_A, CAPTURE_A1)).count).toBe(0);
+    expect(inside?.writes).not.toBe(before.writes);
+    expect(after.writes).not.toBe(inside?.writes);
+    expect(after.dataVersion).toBe(before.dataVersion);
+
+    // Settled once, then stable.
+    expect(generationOf()).toEqual(after);
+  });
+
+  it('restamps an insert whose enclosing transaction committed, then stands still', () => {
+    let inside: CaptureGeneration | undefined;
+
+    store.transaction(() => {
+      insertOk([buildEvent()]);
+      inside = generationOf();
+    });
+
+    const after = generationOf();
+
+    expect(unwrap(repo.captureStamp(SESSION_A, CAPTURE_A1)).count).toBe(1);
+    expect(after.writes).not.toBe(inside?.writes);
+    expect(generationOf()).toEqual(after);
+  });
+
+  it('refuses a blank session, and a capture that is blank or missing', () => {
+    const cases = [
+      [() => repo.captureGeneration('', CAPTURE_A1), 'blank-session-id'],
+      [() => repo.captureGeneration(SESSION_A, ''), 'blank-capture-id'],
+      // What a JavaScript caller, or an optional chain, can hand the method.
+      [() => repo.captureGeneration(SESSION_A, undefined as unknown as string), 'blank-capture-id'],
+    ] as const;
+
+    for (const [call, reason] of cases) {
+      const refusal = call();
+
+      if (!isErr(refusal)) {
+        throw new Error('A blank argument was accepted.');
+      }
+
+      expect(refusal.error.code).toBe('STORE_ERROR');
+      expect(refusal.error.details?.['reason']).toBe(reason);
+      expect(refusal.error.details?.['operation']).toBe('captureGeneration');
+    }
+  });
+
+  it('reports a data version that is not a safe integer as a corrupt column', () => {
+    for (const value of ['7', 2 ** 53, null]) {
+      const faked = new Proxy(store, {
+        get(target, property): unknown {
+          if (property === 'statement') {
+            return (sql: string): unknown =>
+              sql === 'PRAGMA data_version'
+                ? { get: () => ({ data_version: value }) }
+                : target.statement(sql);
+          }
+
+          const member: unknown = Reflect.get(target, property, target);
+
+          return typeof member === 'function' ? member.bind(target) : member;
+        },
+      });
+      const refusal = createTelemetryRepo({ store: faked }).captureGeneration(
+        SESSION_A,
+        CAPTURE_A1,
+      );
+
+      if (!isErr(refusal)) {
+        throw new Error(`A data version of ${String(value)} was accepted.`);
+      }
+
+      expect(refusal.error.code).toBe('STORE_ERROR');
+      expect(refusal.error.details?.['column']).toBe('data_version');
+    }
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * The full-slice scan
+ * ---------------------------------------------------------------------------------------------- */
+
+/*
+ * Why the scan exists: the panel-data aggregates are only true over every
+ * selected event, and a page walk to collect them costs a COUNT and an OFFSET
+ * per page. `scanEvents` must therefore answer exactly what that walk would —
+ * the same rows, the same order, the same refusals — in one count and one
+ * ordered read, and must say "incomplete" rather than answer a prefix.
+ */
+describe('scanEvents', () => {
+  /** A ceiling far above every fixture here, for the reads expected to be complete. */
+  const UNBOUNDED = 100_000;
+
+  /** How many events {@link seedScanFixture} stores: enough for CAPTURE_A1 alone to span two pages. */
+  const SCAN_FIXTURE_EVENTS = 6_600;
+
+  /** The kinds the fixture cycles through, covering all three tiers. */
+  const SCAN_KINDS: readonly TelemetryKind[] = [
+    'interaction',
+    'fetch',
+    'render',
+    'db.query',
+    'http.server',
+    'function',
+  ];
+
+  /** The component names the fixture's renders carry. */
+  const COMPONENTS = ['Cart', 'Header', 'Price'] as const;
+
+  /** What {@link seedScanFixture} hands the cases to filter on. */
+  interface ScanFixture {
+    readonly traceId: string;
+    readonly requestKey: string;
+    readonly stored: readonly TelemetryEvent[];
+  }
+
+  /**
+   * Stores {@link SCAN_FIXTURE_EVENTS} events: every eleventh in SESSION_B,
+   * every seventh of the rest in CAPTURE_A2, the others — more than one
+   * 5 000-row page — in CAPTURE_A1. Start times repeat every thousand events,
+   * so the id secondary key decides most of the order; kinds, tiers,
+   * durations, traces, components and request keys all vary, so every filter
+   * field selects a proper, non-empty subset.
+   */
+  function seedScanFixture(): ScanFixture {
+    const traces = Array.from({ length: 12 }, () => newTraceId());
+    const requestKeys = ['0a', '1b', '2c'].map((seed) => requestKeyOf(seed));
+    const events = Array.from({ length: SCAN_FIXTURE_EVENTS }, (_unused, index) => {
+      const kind = cycle(SCAN_KINDS, index);
+      // Which pass over the kinds this event belongs to: the index every
+      // per-kind attribute cycles by, so a kind's events do not all land on
+      // the same value.
+      const round = Math.floor(index / SCAN_KINDS.length);
+      const inSessionB = index % 11 === 0;
+
+      return buildEvent({
+        sessionId: inSessionB ? SESSION_B : SESSION_A,
+        captureId: inSessionB ? CAPTURE_B1 : index % 7 === 0 ? CAPTURE_A2 : CAPTURE_A1,
+        traceId: cycle(traces, Math.floor(index / 5)),
+        kind,
+        tier: cycle(allowedTiersFor(kind), round),
+        startTime: BASE_TIME + (index % 1_000),
+        duration: (index % 9) + 0.5,
+        attributes:
+          kind === 'fetch'
+            ? { [REQUEST_KEY_ATTRIBUTE]: cycle(requestKeys, round) }
+            : kind === 'render'
+              ? { component: cycle(COMPONENTS, round) }
+              : {},
+      });
+    });
+
+    return {
+      traceId: cycle(traces, 1),
+      requestKey: cycle(requestKeys, 0),
+      stored: insertOk(events),
+    };
+  }
+
+  /** Every `query` page of a filter under `start_asc`, walked by `nextOffset` and concatenated. */
+  function everyQueryPage(filter: TelemetryScanFilter): {
+    readonly rows: TelemetryEvent[];
+    readonly total: number;
+    readonly pages: number;
+  } {
+    const rows: TelemetryEvent[] = [];
+    let offset: number | undefined = 0;
+    let total = 0;
+    let pages = 0;
+
+    while (offset !== undefined) {
+      const page: TelemetryPage = unwrap(
+        repo.query({ ...filter, sort: 'start_asc', limit: TELEMETRY_QUERY_MAX_LIMIT, offset }),
+      );
+
+      rows.push(...page.rows);
+      total = page.total;
+      pages += 1;
+      offset = page.nextOffset;
+    }
+
+    return { rows, total, pages };
+  }
+
+  /**
+   * A store handle that runs `before` the moment the scan's ordered read is
+   * prepared — after its count — and is otherwise the real store: the window
+   * in which another connection's write lands.
+   */
+  function storeWritingBeforeTheRead(real: Store, before: () => void): Store {
+    const statement: Store['statement'] = (sql) => {
+      if (sql.startsWith('SELECT ingest_seq, event') && sql.includes(PANEL_START_ASC_ORDER_BY)) {
+        before();
+      }
+
+      return real.statement(sql);
+    };
+
+    return new Proxy(real, {
+      get(target, property): unknown {
+        if (property === 'statement') {
+          return statement;
+        }
+
+        const value: unknown = Reflect.get(target, property, target);
+
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+  }
+
+  it('reads exactly the rows every query page holds, concatenated, under every filter field', () => {
+    const fixture = seedScanFixture();
+    const filters: readonly (readonly [string, TelemetryScanFilter])[] = [
+      ['session', { sessionId: SESSION_A }],
+      ['capture', { sessionId: SESSION_A, captureId: CAPTURE_A1 }],
+      ['traceId', { sessionId: SESSION_A, traceId: fixture.traceId }],
+      ['kinds', { sessionId: SESSION_A, captureId: CAPTURE_A1, kinds: ['render', 'db.query'] }],
+      ['tier', { sessionId: SESSION_A, tier: 'server' }],
+      ['tiers', { sessionId: SESSION_A, captureId: CAPTURE_A1, tiers: ['browser', 'db'] }],
+      ['minDuration', { sessionId: SESSION_A, captureId: CAPTURE_A1, minDuration: 6.5 }],
+      ['component', { sessionId: SESSION_A, captureId: CAPTURE_A1, component: 'Cart' }],
+      ['requestKey', { sessionId: SESSION_A, requestKey: fixture.requestKey }],
+      [
+        'requestKey of one capture',
+        { sessionId: SESSION_A, captureId: CAPTURE_A1, requestKey: fixture.requestKey },
+      ],
+    ];
+
+    for (const [label, filter] of filters) {
+      const walked = everyQueryPage(filter);
+      const scan = unwrap(repo.scanEvents(filter, UNBOUNDED));
+
+      // A case selecting nothing, or everything, would prove nothing.
+      expect(walked.total, label).toBeGreaterThan(0);
+      expect(walked.total, label).toBeLessThan(fixture.stored.length);
+      expect(scan.complete, label).toBe(true);
+      expect(scan.total, label).toBe(walked.total);
+      expect(scan.skipped, label).toBeUndefined();
+      expect(scan.rows, label).toEqual(walked.rows);
+    }
+
+    // The capture case is the one larger than a page: the walk needed two,
+    // and the scan read them in one traversal.
+    expect(everyQueryPage({ sessionId: SESSION_A, captureId: CAPTURE_A1 }).pages).toBe(2);
+  });
+
+  it('refuses exactly the filters query refuses, with the same reasons', () => {
+    const cases: readonly TelemetryScanFilter[] = [
+      { sessionId: '' },
+      { sessionId: SESSION_A, captureId: '' },
+      { sessionId: SESSION_A, kinds: ['kind.from.another.build' as TelemetryKind] },
+      { sessionId: SESSION_A, tier: 'edge' as TelemetryTier },
+      { sessionId: SESSION_A, minDuration: Number.NaN },
+    ];
+
+    for (const filter of cases) {
+      const scanned = repo.scanEvents(filter, UNBOUNDED);
+      const paged = repo.query(filter);
+
+      if (!isErr(scanned) || !isErr(paged)) {
+        throw new Error('A filter query refuses was accepted.');
+      }
+
+      expect(scanned.error.code).toBe(paged.error.code);
+      expect(scanned.error.details?.['reason']).toBe(paged.error.details?.['reason']);
+      expect(scanned.error.details?.['operation']).toBe('scanEvents');
+    }
+  });
+
+  it('answers an over-ceiling selection from the count alone, reading no row', () => {
+    insertOk(
+      Array.from({ length: 10 }, (_unused, index) => buildEvent({ startTime: BASE_TIME + index })),
+    );
+
+    const filter = { sessionId: SESSION_A, captureId: CAPTURE_A1 };
+    const selects = statementsRunBy((reader) => reader.scanEvents(filter, 9));
+
+    expect(selects).toHaveLength(1);
+    expect(selects[0]).toMatch(/^SELECT COUNT\(\*\) AS total FROM telemetry_events WHERE /u);
+    expect(unwrap(repo.scanEvents(filter, 9))).toEqual({ rows: [], total: 10, complete: false });
+  });
+
+  it('is complete at exactly the ceiling, from one count and one ordered read with no offset', () => {
+    const written = insertOk(
+      Array.from({ length: 10 }, (_unused, index) =>
+        buildEvent({ startTime: BASE_TIME + (index % 3) }),
+      ),
+    );
+    const filter = { sessionId: SESSION_A, captureId: CAPTURE_A1 };
+    const selects = statementsRunBy((reader) => reader.scanEvents(filter, 10));
+    const scan = unwrap(repo.scanEvents(filter, 10));
+
+    expect(selects).toHaveLength(2);
+    expect(selects[0]).toMatch(/^SELECT COUNT\(\*\)/u);
+    expect(selects[1]).toContain(`ORDER BY ${PANEL_START_ASC_ORDER_BY} LIMIT ?`);
+    expect(selects[1]).not.toContain('OFFSET');
+    expect(scan.complete).toBe(true);
+    expect(scan.total).toBe(10);
+    expect(scan.rows.map((event) => event.id)).toEqual(
+      [...written]
+        .sort((left, right) => left.startTime - right.startTime || (left.id < right.id ? -1 : 1))
+        .map((event) => event.id),
+    );
+  });
+
+  it('counts a row that no longer validates as skipped, and reports it by arrival number alone', () => {
+    const written = insertOk([
+      buildEvent({ startTime: BASE_TIME }),
+      buildEvent({ startTime: BASE_TIME + 1, attributes: { note: SENTINEL } }),
+      buildEvent({ startTime: BASE_TIME + 2 }),
+    ]);
+    const [, poisoned] = written;
+
+    if (poisoned === undefined) {
+      throw new Error('The fixture stored fewer events than it built.');
+    }
+
+    // A truncated document that still carries the sentinel: the skip must not
+    // leak it.
+    store
+      .statement('UPDATE telemetry_events SET event = ? WHERE ingest_seq = ?')
+      .run(`{"attributes":{"note":"${SENTINEL}"`, poisoned.ingestSeq);
+
+    const scan = unwrap(repo.scanEvents({ sessionId: SESSION_A }, UNBOUNDED));
+
+    expect(scan.complete).toBe(true);
+    expect(scan.rows.map((event) => event.id)).toEqual(
+      written.filter((event) => event !== poisoned).map((event) => event.id),
+    );
+    expect(scan.skipped).toBe(1);
+    expect(scan.total).toBe(3);
+
+    const warning = logs.find(
+      (record) =>
+        record.message === 'skipped telemetry rows that no longer match the event schema' &&
+        record.fields['operation'] === 'scanEvents',
+    );
+
+    expect(warning?.level).toBe('warn');
+    expect(warning?.fields).toMatchObject({ skipped: 1, ingestSeqs: [poisoned.ingestSeq] });
+    expect(loggedText()).not.toContain(SENTINEL);
+
+    // A skipped row still counts against the ceiling: it is a selected row.
+    expect(unwrap(repo.scanEvents({ sessionId: SESSION_A }, 2))).toEqual({
+      rows: [],
+      total: 3,
+      complete: false,
+    });
+  });
+
+  it('answers a filter narrowed to nothing without a statement', () => {
+    insertOk([buildEvent()]);
+
+    for (const filter of [
+      { sessionId: SESSION_A, kinds: [] },
+      { sessionId: SESSION_A, tiers: [] },
+    ] as const) {
+      expect(statementsRunBy((reader) => reader.scanEvents(filter, UNBOUNDED))).toEqual([]);
+      expect(unwrap(repo.scanEvents(filter, UNBOUNDED))).toEqual({
+        rows: [],
+        total: 0,
+        complete: true,
+      });
+    }
+  });
+
+  it('counts only under maxRows 0, complete exactly when nothing is selected', () => {
+    insertOk([buildEvent(), buildEvent({ startTime: BASE_TIME + 1 })]);
+
+    const selected = { sessionId: SESSION_A, captureId: CAPTURE_A1 };
+    const empty = { sessionId: SESSION_A, captureId: CAPTURE_A2 };
+
+    for (const filter of [selected, empty]) {
+      expect(statementsRunBy((reader) => reader.scanEvents(filter, 0))).toHaveLength(1);
+    }
+
+    expect(unwrap(repo.scanEvents(selected, 0))).toEqual({ rows: [], total: 2, complete: false });
+    expect(unwrap(repo.scanEvents(empty, 0))).toEqual({ rows: [], total: 0, complete: true });
+  });
+
+  it('refuses a row ceiling that is not a whole number of rows', () => {
+    for (const maxRows of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 53]) {
+      const refusal = repo.scanEvents({ sessionId: SESSION_A }, maxRows);
+
+      if (!isErr(refusal)) {
+        throw new Error(`A row ceiling of ${String(maxRows)} was accepted.`);
+      }
+
+      expect(refusal.error.code).toBe('STORE_ERROR');
+      expect(refusal.error.details?.['reason']).toBe('invalid-max-rows');
+      expect(refusal.error.details?.['operation']).toBe('scanEvents');
+    }
+
+    // The largest whole ceiling is accepted, and bounds the read one row past it.
+    insertOk([buildEvent()]);
+
+    expect(unwrap(repo.scanEvents({ sessionId: SESSION_A }, Number.MAX_SAFE_INTEGER)).total).toBe(
+      1,
+    );
+  });
+
+  it('answers incomplete when the selection outgrows the ceiling between the count and the read', () => {
+    insertOk(
+      Array.from({ length: 3 }, (_unused, index) => buildEvent({ startTime: BASE_TIME + index })),
+    );
+
+    const racing = createTelemetryRepo({
+      store: storeWritingBeforeTheRead(store, () => {
+        insertOk([buildEvent({ startTime: BASE_TIME + 9 })]);
+      }),
+    });
+
+    // Counted three, within the ceiling; met four once the read ran.
+    expect(unwrap(racing.scanEvents({ sessionId: SESSION_A }, 3))).toEqual({
+      rows: [],
+      total: 4,
+      complete: false,
+    });
+  });
+
+  it('reports the rows it read when the selection shrank between the count and the read', () => {
+    const written = insertOk(
+      Array.from({ length: 3 }, (_unused, index) => buildEvent({ startTime: BASE_TIME + index })),
+    );
+    const [removed, ...kept] = written;
+
+    const racing = createTelemetryRepo({
+      store: storeWritingBeforeTheRead(store, () => {
+        store
+          .statement('DELETE FROM telemetry_events WHERE ingest_seq = ?')
+          .run(removed?.ingestSeq ?? 0);
+      }),
+    });
+    const scan = unwrap(racing.scanEvents({ sessionId: SESSION_A }, 3));
+
+    expect(scan.complete).toBe(true);
+    expect(scan.total).toBe(2);
+    expect(scan.rows.map((event) => event.id)).toEqual(kept.map((event) => event.id));
   });
 });
 
@@ -2947,6 +3903,927 @@ describe('the existence lookups', () => {
       expect(result.error.code).toBe('STORE_ERROR');
       expect(result.error.details?.['reason']).toBe('blank-session-id');
     }
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * The capture summary's bounded read (AAP §0.5.5)
+ * ---------------------------------------------------------------------------------------------- */
+
+describe('pageCaptureForSummary', () => {
+  /** Each stored document's length for one capture of session A, read directly, in canonical order. */
+  function storedLengths(captureId: string): number[] {
+    return store
+      .statement(
+        `SELECT event FROM telemetry_events WHERE session_id = ? AND capture_id = ? ORDER BY ${CANONICAL_ORDER_BY}`,
+      )
+      .all(SESSION_A, captureId)
+      .map((row) => String(row['event']).length);
+  }
+
+  /** The sum of a slice of lengths. */
+  function sumOf(lengths: readonly number[]): number {
+    return lengths.reduce((total, length) => total + length, 0);
+  }
+
+  it('pages one capture in canonical order and reports the stored size of every page', () => {
+    // Inserted latest-first with documents of growing size, so arrival order,
+    // canonical order and size order all differ.
+    const written = insertOk(
+      Array.from({ length: 7 }, (_, index) =>
+        buildEvent({
+          startTime: BASE_TIME + (7 - index),
+          attributes: { note: 'x'.repeat(index * 100) },
+        }),
+      ),
+    );
+    insertOk([buildEvent({ captureId: CAPTURE_A2 })]);
+    const canonical = [...written].sort(compareEventsCanonical).map((event) => event.id);
+    const lengths = storedLengths(CAPTURE_A1);
+
+    const first = unwrap(
+      repo.pageCaptureForSummary(SESSION_A, CAPTURE_A1, { limit: 3, offset: 0 }),
+    );
+    const second = unwrap(
+      repo.pageCaptureForSummary(SESSION_A, CAPTURE_A1, {
+        limit: 3,
+        offset: first.nextOffset ?? -1,
+      }),
+    );
+    const last = unwrap(
+      repo.pageCaptureForSummary(SESSION_A, CAPTURE_A1, {
+        limit: 3,
+        offset: second.nextOffset ?? -1,
+      }),
+    );
+
+    expect(first).toMatchObject({ rowsRead: 3, skipped: 0, nextOffset: 3 });
+    expect(first.storedChars).toBe(sumOf(lengths.slice(0, 3)));
+    expect(second).toMatchObject({ rowsRead: 3, skipped: 0, nextOffset: 6 });
+    expect(second.storedChars).toBe(sumOf(lengths.slice(3, 6)));
+    // A short page is the capture's end: it names no next offset.
+    expect(last).toEqual({
+      rows: [expect.objectContaining({ id: canonical[6] })],
+      rowsRead: 1,
+      skipped: 0,
+      storedChars: lengths[6],
+    });
+    expect([...first.rows, ...second.rows, ...last.rows].map((event) => event.id)).toEqual(
+      canonical,
+    );
+    expect(sumOf([first, second, last].map((page) => page.storedChars))).toBe(sumOf(lengths));
+  });
+
+  it('answers one more, empty and terminal page when the last row closes a full page', () => {
+    insertOk([buildEvent(), buildEvent()]);
+
+    const full = unwrap(repo.pageCaptureForSummary(SESSION_A, CAPTURE_A1, { limit: 2, offset: 0 }));
+    const after = unwrap(
+      repo.pageCaptureForSummary(SESSION_A, CAPTURE_A1, { limit: 2, offset: 2 }),
+    );
+
+    expect(full.nextOffset).toBe(2);
+    expect(after).toEqual({ rows: [], rowsRead: 0, skipped: 0, storedChars: 0 });
+  });
+
+  it('counts an unreadable row as read and sized, and leaves it out of the rows', () => {
+    const [kept, poisoned] = insertOk([
+      buildEvent({ startTime: BASE_TIME }),
+      buildEvent({ startTime: BASE_TIME + 1 }),
+    ]);
+    const damaged = `{"name":"${SENTINEL}"`;
+    store
+      .statement('UPDATE telemetry_events SET event = ? WHERE id = ?')
+      .run(damaged, poisoned?.id ?? '');
+    logs.length = 0;
+
+    const page = unwrap(
+      repo.pageCaptureForSummary(SESSION_A, CAPTURE_A1, { limit: 10, offset: 0 }),
+    );
+
+    expect(page.rows.map((event) => event.id)).toEqual([kept?.id]);
+    expect(page).toMatchObject({ rowsRead: 2, skipped: 1 });
+    expect(page.storedChars).toBe(sumOf(storedLengths(CAPTURE_A1)));
+    expect(logs.filter((record) => record.level === 'warn')).toHaveLength(1);
+    expect(loggedText()).not.toContain(SENTINEL);
+  });
+
+  it('clamps a page to the store ceiling and reads nothing for a page of zero', () => {
+    insertOk([buildEvent()]);
+
+    const clamped = unwrap(
+      repo.pageCaptureForSummary(SESSION_A, CAPTURE_A1, {
+        limit: TELEMETRY_QUERY_MAX_LIMIT + 1,
+        offset: 0,
+      }),
+    );
+    const none = statementsRunBy((reader) =>
+      reader.pageCaptureForSummary(SESSION_A, CAPTURE_A1, { limit: 0, offset: 0 }),
+    );
+
+    expect(clamped.rowsRead).toBe(1);
+    expect(
+      unwrap(repo.pageCaptureForSummary(SESSION_A, CAPTURE_A1, { limit: 0, offset: 0 })),
+    ).toEqual({ rows: [], rowsRead: 0, skipped: 0, storedChars: 0 });
+    expect(none).toEqual([]);
+  });
+
+  it('runs one statement per page, and no count of the window', () => {
+    insertOk([buildEvent(), buildEvent()]);
+
+    const selects = statementsRunBy((reader) =>
+      reader.pageCaptureForSummary(SESSION_A, CAPTURE_A1, { limit: 1, offset: 0 }),
+    );
+
+    expect(selects).toHaveLength(1);
+    expect(selects[0]).not.toContain('COUNT(');
+  });
+
+  it('is scoped to one capture of one session', () => {
+    insertOk([
+      buildEvent({ captureId: CAPTURE_A2 }),
+      buildEvent({ sessionId: SESSION_B, captureId: CAPTURE_B1 }),
+    ]);
+
+    expect(
+      unwrap(repo.pageCaptureForSummary(SESSION_A, CAPTURE_A1, { limit: 10, offset: 0 })).rowsRead,
+    ).toBe(0);
+    expect(
+      unwrap(repo.pageCaptureForSummary(SESSION_A, CAPTURE_B1, { limit: 10, offset: 0 })).rowsRead,
+    ).toBe(0);
+    expect(
+      unwrap(repo.pageCaptureForSummary(SESSION_A, CAPTURE_A2, { limit: 10, offset: 0 })).rowsRead,
+    ).toBe(1);
+  });
+
+  it.each([
+    {
+      label: 'a blank session',
+      sessionId: '',
+      captureId: CAPTURE_A1,
+      limit: 1,
+      offset: 0,
+      reason: 'blank-session-id',
+    },
+    {
+      label: 'a blank capture',
+      sessionId: SESSION_A,
+      captureId: '',
+      limit: 1,
+      offset: 0,
+      reason: 'blank-capture-id',
+    },
+    {
+      label: 'a fractional limit',
+      sessionId: SESSION_A,
+      captureId: CAPTURE_A1,
+      limit: 1.5,
+      offset: 0,
+      reason: 'invalid-limit',
+    },
+    {
+      label: 'a negative limit',
+      sessionId: SESSION_A,
+      captureId: CAPTURE_A1,
+      limit: -1,
+      offset: 0,
+      reason: 'invalid-limit',
+    },
+    {
+      label: 'a negative offset',
+      sessionId: SESSION_A,
+      captureId: CAPTURE_A1,
+      limit: 1,
+      offset: -1,
+      reason: 'invalid-offset',
+    },
+    {
+      label: 'a NaN offset',
+      sessionId: SESSION_A,
+      captureId: CAPTURE_A1,
+      limit: 1,
+      offset: Number.NaN,
+      reason: 'invalid-offset',
+    },
+  ])('refuses $label', ({ sessionId, captureId, limit, offset, reason }) => {
+    expect(refusalReason(repo.pageCaptureForSummary(sessionId, captureId, { limit, offset }))).toBe(
+      reason,
+    );
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * The capture watermark and the producer-loss ledger — the stop barrier's inputs (AAP §0.5.5)
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The enumerated reason of a refusal, failing the test when the call succeeded. */
+function refusalReason(result: Result<unknown, DebuggenError>): unknown {
+  if (!isErr(result)) {
+    throw new Error('The call was expected to be refused.');
+  }
+
+  expect(result.error.code).toBe('STORE_ERROR');
+
+  return result.error.details?.['reason'];
+}
+
+describe('captureWatermark', () => {
+  /** The watermark of a capture nothing arrived for. */
+  const NOTHING = { eventCount: 0, lastIngestSeq: 0 } as const;
+
+  /**
+   * Opens and closes `count` further captures of session A — after closing
+   * its open one — so a batch may name more captures than the tracker holds.
+   */
+  function seedClosedCaptures(count: number): string[] {
+    const sessions = createSessionsRepo({ store, now: () => BASE_TIME });
+    const captures = Array.from({ length: count }, () => newCaptureId());
+
+    unwrap(sessions.stopCapture({ captureId: CAPTURE_A2, stoppedAt: BASE_TIME }));
+
+    for (const captureId of captures) {
+      unwrap(
+        sessions.startCapture({
+          sessionId: SESSION_A,
+          planVersion: 1,
+          captureId,
+          startedAt: BASE_TIME,
+        }),
+      );
+      unwrap(sessions.stopCapture({ captureId, stoppedAt: BASE_TIME }));
+    }
+
+    return captures;
+  }
+
+  it('answers zero arrivals and arrival number zero for a capture nothing arrived for', () => {
+    expect(unwrap(repo.captureWatermark(SESSION_A, CAPTURE_A1))).toEqual(NOTHING);
+  });
+
+  it('advances with every stored row, to the highest arrival number the capture holds', () => {
+    const first = insertOk([buildEvent(), buildEvent()]);
+    const afterFirst = unwrap(repo.captureWatermark(SESSION_A, CAPTURE_A1));
+
+    expect(afterFirst).toEqual({
+      eventCount: 2,
+      lastIngestSeq: Math.max(...first.map((event) => event.ingestSeq)),
+    });
+
+    const [late] = insertOk([buildEvent({ startTime: BASE_TIME - 50 })]);
+    const afterSecond = unwrap(repo.captureWatermark(SESSION_A, CAPTURE_A1));
+
+    // A late batch whose events started earlier still moves the watermark:
+    // it is the arrival number, not the start time, that is watched.
+    expect(afterSecond).toEqual({ eventCount: 3, lastIngestSeq: late?.ingestSeq });
+    expect(afterSecond.lastIngestSeq).toBeGreaterThan(afterFirst.lastIngestSeq);
+  });
+
+  it('does not move for a replay the store suppressed as the identical event', () => {
+    const batch = [buildEvent(), buildEvent()];
+
+    insertOk(batch);
+    const before = unwrap(repo.captureWatermark(SESSION_A, CAPTURE_A1));
+
+    insertOk(batch);
+
+    expect(unwrap(repo.captureWatermark(SESSION_A, CAPTURE_A1))).toEqual(before);
+  });
+
+  it('is scoped to one capture of one session', () => {
+    insertOk([
+      buildEvent({ captureId: CAPTURE_A1 }),
+      buildEvent({ captureId: CAPTURE_A2 }),
+      buildEvent({ captureId: CAPTURE_A2 }),
+      buildEvent({ sessionId: SESSION_B, captureId: CAPTURE_B1 }),
+    ]);
+
+    expect(unwrap(repo.captureWatermark(SESSION_A, CAPTURE_A1)).eventCount).toBe(1);
+    expect(unwrap(repo.captureWatermark(SESSION_A, CAPTURE_A2)).eventCount).toBe(2);
+    expect(unwrap(repo.captureWatermark(SESSION_B, CAPTURE_B1)).eventCount).toBe(1);
+    // Another session's capture holds nothing of this session's.
+    expect(unwrap(repo.captureWatermark(SESSION_A, CAPTURE_B1))).toEqual(NOTHING);
+  });
+
+  it('reads the in-memory tracker without preparing a single statement', () => {
+    const texts: string[] = [];
+    const recorded = createTelemetryRepo({ store: recordingStore(store, texts) });
+    const written = unwrap(recorded.insertMany([buildEvent(), buildEvent(), buildEvent()]));
+
+    texts.length = 0;
+
+    // Polled as the stop barrier polls it: the cost never depends on the rows.
+    for (let poll = 0; poll < 50; poll += 1) {
+      expect(unwrap(recorded.captureWatermark(SESSION_A, CAPTURE_A1))).toEqual({
+        eventCount: 3,
+        lastIngestSeq: Math.max(...written.events.map((event) => event.ingestSeq)),
+      });
+    }
+
+    expect(texts).toEqual([]);
+  });
+
+  it('does not move for a batch that was refused and rolled back', () => {
+    insertOk([buildEvent()]);
+    const before = unwrap(repo.captureWatermark(SESSION_A, CAPTURE_A1));
+
+    // The second element names session A's capture under session B, which
+    // rolls back the first element too.
+    const refused = repo.insertMany([
+      buildEvent(),
+      buildEvent({ sessionId: SESSION_B, captureId: CAPTURE_A1 }),
+    ]);
+
+    expect(refusalReason(refused)).toBe('capture-session-mismatch');
+    expect(unwrap(repo.captureWatermark(SESSION_A, CAPTURE_A1))).toEqual(before);
+    expect(unwrap(repo.captureWatermark(SESSION_B, CAPTURE_A1))).toEqual(NOTHING);
+  });
+
+  it('counts the arrivals committed through its own instance only', () => {
+    const [stored] = insertOk([buildEvent()]);
+
+    // A restarted service: the rows are stored, but none arrived through it.
+    const restarted = createTelemetryRepo({ store });
+
+    expect(unwrap(restarted.captureWatermark(SESSION_A, CAPTURE_A1))).toEqual(NOTHING);
+
+    const [late] = unwrap(restarted.insertMany([buildEvent()])).events;
+
+    expect(unwrap(restarted.captureWatermark(SESSION_A, CAPTURE_A1))).toEqual({
+      eventCount: 1,
+      lastIngestSeq: late?.ingestSeq,
+    });
+    expect(unwrap(repo.captureWatermark(SESSION_A, CAPTURE_A1))).toEqual({
+      eventCount: 1,
+      lastIngestSeq: stored?.ingestSeq,
+    });
+  });
+
+  it('forgets a released capture, and moves again with its next arrival', () => {
+    const [first] = insertOk([buildEvent()]);
+
+    unwrap(repo.releaseProducerLoss(SESSION_A, CAPTURE_A1));
+
+    expect(unwrap(repo.captureWatermark(SESSION_A, CAPTURE_A1))).toEqual(NOTHING);
+    expect(
+      logs.find((record) => record.message === 'released the producer loss accounting of a capture')
+        ?.fields,
+    ).toMatchObject({ released: false, releasedArrivals: true });
+
+    const [next] = insertOk([buildEvent()]);
+    const after = unwrap(repo.captureWatermark(SESSION_A, CAPTURE_A1));
+
+    expect(after).toEqual({ eventCount: 1, lastIngestSeq: next?.ingestSeq });
+    expect(after.lastIngestSeq).toBeGreaterThan(first?.ingestSeq ?? Number.POSITIVE_INFINITY);
+  });
+
+  it('stays within its bound, forgetting the capture written to least recently', () => {
+    expect(CAPTURE_ARRIVAL_TRACKER_CAPACITY).toBe(512);
+
+    const captures = seedClosedCaptures(CAPTURE_ARRIVAL_TRACKER_CAPACITY + 1);
+    const [refreshed, forgotten] = captures;
+    const overflow = captures.at(-1);
+
+    if (refreshed === undefined || forgotten === undefined || overflow === undefined) {
+      throw new Error('The bound fixture needs at least three captures.');
+    }
+
+    // Fill the tracker exactly, then write to the oldest capture again so it
+    // becomes the most recent: the next new capture forgets the second one.
+    insertOk(
+      captures
+        .slice(0, CAPTURE_ARRIVAL_TRACKER_CAPACITY)
+        .map((captureId) => buildEvent({ captureId })),
+    );
+    insertOk([buildEvent({ captureId: refreshed })]);
+
+    expect(logs.some((record) => record.fields['arrivalsEvicted'] !== undefined)).toBe(false);
+
+    insertOk([buildEvent({ captureId: overflow })]);
+
+    expect(unwrap(repo.captureWatermark(SESSION_A, forgotten))).toEqual(NOTHING);
+    expect(unwrap(repo.captureWatermark(SESSION_A, refreshed)).eventCount).toBe(2);
+    expect(unwrap(repo.captureWatermark(SESSION_A, overflow)).eventCount).toBe(1);
+    expect(logs.filter((record) => record.fields['arrivalsEvicted'] === 1)).toHaveLength(1);
+
+    // A forgotten capture that receives another batch still reads as moved:
+    // the arrival number of any new row is above every earlier one.
+    const [late] = insertOk([buildEvent({ captureId: forgotten })]);
+
+    expect(unwrap(repo.captureWatermark(SESSION_A, forgotten))).toEqual({
+      eventCount: 1,
+      lastIngestSeq: late?.ingestSeq,
+    });
+  });
+
+  it('refuses a blank session or capture id', () => {
+    expect(refusalReason(repo.captureWatermark('', CAPTURE_A1))).toBe('blank-session-id');
+    expect(refusalReason(repo.captureWatermark(SESSION_A, ''))).toBe('blank-capture-id');
+  });
+});
+
+describe('the producer-loss ledger', () => {
+  /** The ledger's total for one capture of session A, whatever its verdict. */
+  function droppedFor(captureId: string, sessionId: string = SESSION_A): number {
+    return unwrap(repo.producerLoss(sessionId, captureId)).droppedEvents;
+  }
+
+  it('answers zero, unaccounted, for a capture no window opening began', () => {
+    expect(unwrap(repo.producerLoss(SESSION_A, CAPTURE_A1))).toEqual({
+      droppedEvents: 0,
+      accounted: false,
+    });
+  });
+
+  it('accumulates every report of one capture, whichever producer sent it', () => {
+    expect(
+      unwrap(
+        repo.recordProducerLoss({
+          sessionId: SESSION_A,
+          captureId: CAPTURE_A1,
+          producerId: PRODUCER_BROWSER,
+          droppedEvents: 3,
+        }),
+      ),
+    ).toBe(3);
+    expect(
+      unwrap(
+        repo.recordProducerLoss({
+          sessionId: SESSION_A,
+          captureId: CAPTURE_A1,
+          producerId: PRODUCER_SERVER,
+          droppedEvents: 4,
+        }),
+      ),
+    ).toBe(7);
+    expect(
+      unwrap(
+        repo.recordProducerLoss({ sessionId: SESSION_A, captureId: CAPTURE_A1, droppedEvents: 5 }),
+      ),
+    ).toBe(12);
+
+    // Never begun, so the running total is a lower bound, not an accounting.
+    expect(unwrap(repo.producerLoss(SESSION_A, CAPTURE_A1))).toEqual({
+      droppedEvents: 12,
+      accounted: false,
+    });
+  });
+
+  it('keeps each capture of each session apart', () => {
+    unwrap(
+      repo.recordProducerLoss({ sessionId: SESSION_A, captureId: CAPTURE_A1, droppedEvents: 2 }),
+    );
+    unwrap(
+      repo.recordProducerLoss({ sessionId: SESSION_A, captureId: CAPTURE_A2, droppedEvents: 9 }),
+    );
+    unwrap(
+      repo.recordProducerLoss({ sessionId: SESSION_B, captureId: CAPTURE_B1, droppedEvents: 1 }),
+    );
+
+    expect(droppedFor(CAPTURE_A1)).toBe(2);
+    expect(droppedFor(CAPTURE_A2)).toBe(9);
+    expect(droppedFor(CAPTURE_B1, SESSION_B)).toBe(1);
+    expect(droppedFor(CAPTURE_B1)).toBe(0);
+  });
+
+  it('changes nothing for a report of zero', () => {
+    expect(
+      unwrap(
+        repo.recordProducerLoss({ sessionId: SESSION_A, captureId: CAPTURE_A1, droppedEvents: 0 }),
+      ),
+    ).toBe(0);
+    unwrap(
+      repo.recordProducerLoss({ sessionId: SESSION_A, captureId: CAPTURE_A1, droppedEvents: 6 }),
+    );
+
+    expect(
+      unwrap(
+        repo.recordProducerLoss({ sessionId: SESSION_A, captureId: CAPTURE_A1, droppedEvents: 0 }),
+      ),
+    ).toBe(6);
+    expect(
+      logs.filter((record) => record.message === 'recorded a producer loss report'),
+    ).toHaveLength(1);
+  });
+
+  it('forgets the least recently reported capture once its bound is passed', () => {
+    expect(PRODUCER_LOSS_LEDGER_CAPACITY).toBe(512);
+
+    const captures = Array.from({ length: PRODUCER_LOSS_LEDGER_CAPACITY + 1 }, () =>
+      newCaptureId(),
+    );
+    const report = (captureId: string): number =>
+      unwrap(repo.recordProducerLoss({ sessionId: SESSION_A, captureId, droppedEvents: 1 }));
+
+    // Fill the ledger exactly, then report the oldest capture again so it
+    // becomes the most recent: the next new capture evicts the second one.
+    for (const captureId of captures.slice(0, PRODUCER_LOSS_LEDGER_CAPACITY)) {
+      report(captureId);
+    }
+
+    const [refreshed, forgotten, kept] = captures;
+    const overflow = captures.at(-1);
+
+    if (refreshed === undefined || forgotten === undefined || kept === undefined) {
+      throw new Error('The eviction fixture needs at least three captures.');
+    }
+    if (overflow === undefined) {
+      throw new Error('The eviction fixture needs an overflowing capture.');
+    }
+
+    expect(report(refreshed)).toBe(2);
+    expect(logs.some((record) => record.fields['evicted'] !== undefined)).toBe(false);
+
+    expect(report(overflow)).toBe(1);
+
+    expect(droppedFor(forgotten)).toBe(0);
+    expect(droppedFor(refreshed)).toBe(2);
+    expect(droppedFor(kept)).toBe(1);
+    expect(droppedFor(overflow)).toBe(1);
+    expect(logs.filter((record) => record.fields['evicted'] === 1)).toHaveLength(1);
+  });
+
+  it('saturates at the safe-integer range instead of losing precision', () => {
+    unwrap(
+      repo.recordProducerLoss({
+        sessionId: SESSION_A,
+        captureId: CAPTURE_A1,
+        droppedEvents: Number.MAX_SAFE_INTEGER - 1,
+      }),
+    );
+
+    expect(
+      unwrap(
+        repo.recordProducerLoss({ sessionId: SESSION_A, captureId: CAPTURE_A1, droppedEvents: 5 }),
+      ),
+    ).toBe(Number.MAX_SAFE_INTEGER);
+  });
+
+  it.each([
+    { label: 'a negative count', droppedEvents: -1 },
+    { label: 'a fractional count', droppedEvents: 1.5 },
+    { label: 'NaN', droppedEvents: Number.NaN },
+    { label: 'Infinity', droppedEvents: Number.POSITIVE_INFINITY },
+    { label: 'a count past the safe-integer range', droppedEvents: Number.MAX_SAFE_INTEGER + 1 },
+  ])('refuses $label and leaves the total unchanged', ({ droppedEvents }) => {
+    unwrap(
+      repo.recordProducerLoss({ sessionId: SESSION_A, captureId: CAPTURE_A1, droppedEvents: 4 }),
+    );
+
+    expect(
+      refusalReason(
+        repo.recordProducerLoss({ sessionId: SESSION_A, captureId: CAPTURE_A1, droppedEvents }),
+      ),
+    ).toBe('invalid-dropped-count');
+    expect(droppedFor(CAPTURE_A1)).toBe(4);
+  });
+
+  it('refuses a blank session, capture or producer id', () => {
+    expect(
+      refusalReason(
+        repo.recordProducerLoss({ sessionId: '', captureId: CAPTURE_A1, droppedEvents: 1 }),
+      ),
+    ).toBe('blank-session-id');
+    expect(
+      refusalReason(
+        repo.recordProducerLoss({ sessionId: SESSION_A, captureId: '', droppedEvents: 1 }),
+      ),
+    ).toBe('blank-capture-id');
+    expect(
+      refusalReason(
+        repo.recordProducerLoss({
+          sessionId: SESSION_A,
+          captureId: CAPTURE_A1,
+          producerId: '',
+          droppedEvents: 1,
+        }),
+      ),
+    ).toBe('blank-filter');
+    expect(refusalReason(repo.producerLoss('', CAPTURE_A1))).toBe('blank-session-id');
+    expect(refusalReason(repo.producerLoss(SESSION_A, ''))).toBe('blank-capture-id');
+    expect(droppedFor(CAPTURE_A1)).toBe(0);
+  });
+
+  it('logs identifiers and counts only', () => {
+    unwrap(
+      repo.recordProducerLoss({
+        sessionId: SESSION_A,
+        captureId: CAPTURE_A1,
+        producerId: PRODUCER_BROWSER,
+        droppedEvents: 8,
+      }),
+    );
+
+    const line = logs.find((record) => record.message === 'recorded a producer loss report');
+
+    expect(line?.fields).toMatchObject({
+      subsystem: 'store',
+      repo: 'telemetry',
+      operation: 'recordProducerLoss',
+      sessionId: SESSION_A,
+      captureId: CAPTURE_A1,
+      producerId: PRODUCER_BROWSER,
+      droppedEvents: 8,
+      total: 8,
+    });
+  });
+
+  describe('accounting from the window opening', () => {
+    /** Begins accounting for one capture of session A, failing the test on a refusal. */
+    function begin(captureId: string): void {
+      unwrap(repo.beginProducerLossAccounting(SESSION_A, captureId));
+    }
+
+    /** Records one discarded event for one capture of session A. */
+    function reportOne(captureId: string): number {
+      return unwrap(repo.recordProducerLoss({ sessionId: SESSION_A, captureId, droppedEvents: 1 }));
+    }
+
+    /** `count` fresh capture ids, in the order they are opened. */
+    function freshCaptures(count: number): string[] {
+      return Array.from({ length: count }, () => newCaptureId());
+    }
+
+    it('accounts for a capture from the moment its window opened', () => {
+      begin(CAPTURE_A2);
+
+      expect(unwrap(repo.producerLoss(SESSION_A, CAPTURE_A2))).toEqual({
+        droppedEvents: 0,
+        accounted: true,
+      });
+
+      unwrap(
+        repo.recordProducerLoss({ sessionId: SESSION_A, captureId: CAPTURE_A2, droppedEvents: 3 }),
+      );
+      unwrap(
+        repo.recordProducerLoss({ sessionId: SESSION_A, captureId: CAPTURE_A2, droppedEvents: 2 }),
+      );
+
+      expect(unwrap(repo.producerLoss(SESSION_A, CAPTURE_A2))).toEqual({
+        droppedEvents: 5,
+        accounted: true,
+      });
+      expect(
+        logs
+          .filter((record) => record.message === 'recorded a producer loss report')
+          .map((record) => record.fields['accounted']),
+      ).toEqual([true, true]);
+    });
+
+    it('adopts a total recorded before the opening, and logs identifiers and counts only', () => {
+      unwrap(
+        repo.recordProducerLoss({ sessionId: SESSION_A, captureId: CAPTURE_A2, droppedEvents: 4 }),
+      );
+
+      expect(unwrap(repo.producerLoss(SESSION_A, CAPTURE_A2))).toEqual({
+        droppedEvents: 4,
+        accounted: false,
+      });
+
+      begin(CAPTURE_A2);
+
+      expect(unwrap(repo.producerLoss(SESSION_A, CAPTURE_A2))).toEqual({
+        droppedEvents: 4,
+        accounted: true,
+      });
+
+      const line = logs.find(
+        (record) => record.message === 'began producer loss accounting for a capture',
+      );
+
+      expect(line?.level).toBe('debug');
+      expect(line?.fields).toMatchObject({
+        subsystem: 'store',
+        repo: 'telemetry',
+        operation: 'beginProducerLossAccounting',
+        sessionId: SESSION_A,
+        captureId: CAPTURE_A2,
+        adopted: 4,
+      });
+    });
+
+    it('keeps the running total across a repeated opening', () => {
+      begin(CAPTURE_A2);
+      unwrap(
+        repo.recordProducerLoss({ sessionId: SESSION_A, captureId: CAPTURE_A2, droppedEvents: 6 }),
+      );
+      begin(CAPTURE_A2);
+
+      expect(unwrap(repo.producerLoss(SESSION_A, CAPTURE_A2))).toEqual({
+        droppedEvents: 6,
+        accounted: true,
+      });
+    });
+
+    it('reads every capture as unaccounted after a restart, even one it hears a loss for', () => {
+      begin(CAPTURE_A2);
+      unwrap(
+        repo.recordProducerLoss({ sessionId: SESSION_A, captureId: CAPTURE_A2, droppedEvents: 7 }),
+      );
+
+      // A restarted service: a second repository over the same store, whose
+      // ledger never saw the window open.
+      const restarted = createTelemetryRepo({ store });
+
+      expect(unwrap(restarted.producerLoss(SESSION_A, CAPTURE_A2))).toEqual({
+        droppedEvents: 0,
+        accounted: false,
+      });
+      expect(
+        unwrap(
+          restarted.recordProducerLoss({
+            sessionId: SESSION_A,
+            captureId: CAPTURE_A2,
+            droppedEvents: 2,
+          }),
+        ),
+      ).toBe(2);
+      expect(unwrap(restarted.producerLoss(SESSION_A, CAPTURE_A2))).toEqual({
+        droppedEvents: 2,
+        accounted: false,
+      });
+      // The original instance's accounting is its own.
+      expect(unwrap(repo.producerLoss(SESSION_A, CAPTURE_A2))).toEqual({
+        droppedEvents: 7,
+        accounted: true,
+      });
+    });
+
+    it('forgets a released capture, so a later report is only a lower bound', () => {
+      begin(CAPTURE_A2);
+      reportOne(CAPTURE_A2);
+      unwrap(repo.releaseProducerLoss(SESSION_A, CAPTURE_A2));
+
+      expect(unwrap(repo.producerLoss(SESSION_A, CAPTURE_A2))).toEqual({
+        droppedEvents: 0,
+        accounted: false,
+      });
+
+      reportOne(CAPTURE_A2);
+
+      expect(unwrap(repo.producerLoss(SESSION_A, CAPTURE_A2))).toEqual({
+        droppedEvents: 1,
+        accounted: false,
+      });
+
+      // Releasing a capture the ledger does not hold is not an error.
+      unwrap(repo.releaseProducerLoss(SESSION_A, CAPTURE_B1));
+
+      expect(
+        logs
+          .filter(
+            (record) => record.message === 'released the producer loss accounting of a capture',
+          )
+          .map((record) => [record.level, record.fields['captureId'], record.fields['released']]),
+      ).toEqual([
+        ['debug', CAPTURE_A2, true],
+        ['debug', CAPTURE_B1, false],
+      ]);
+    });
+
+    it('frees the capacity a released capture held', () => {
+      const captures = freshCaptures(PRODUCER_LOSS_LEDGER_CAPACITY);
+
+      for (const captureId of captures) {
+        begin(captureId);
+      }
+
+      const [released] = captures;
+
+      if (released === undefined) {
+        throw new Error('The capacity fixture needs at least one capture.');
+      }
+
+      unwrap(repo.releaseProducerLoss(SESSION_A, released));
+
+      const [next] = freshCaptures(1);
+
+      if (next === undefined) {
+        throw new Error('The capacity fixture needs a next capture.');
+      }
+
+      begin(next);
+
+      expect(logs.some((record) => record.fields['evicted'] !== undefined)).toBe(false);
+      expect(unwrap(repo.producerLoss(SESSION_A, next)).accounted).toBe(true);
+      expect(
+        captures.slice(1).every((captureId) => {
+          return unwrap(repo.producerLoss(SESSION_A, captureId)).accounted;
+        }),
+      ).toBe(true);
+    });
+
+    it('forgets a partial entry before any open capture', () => {
+      const captures = freshCaptures(PRODUCER_LOSS_LEDGER_CAPACITY - 1);
+
+      for (const captureId of captures) {
+        begin(captureId);
+      }
+
+      // The most recently touched entry, but the only one never begun.
+      const [partial, opened] = freshCaptures(2);
+
+      if (partial === undefined || opened === undefined) {
+        throw new Error('The eviction fixture needs two more captures.');
+      }
+
+      reportOne(partial);
+      begin(opened);
+
+      expect(unwrap(repo.producerLoss(SESSION_A, partial))).toEqual({
+        droppedEvents: 0,
+        accounted: false,
+      });
+      expect(
+        [...captures, opened].every(
+          (captureId) => unwrap(repo.producerLoss(SESSION_A, captureId)).accounted,
+        ),
+      ).toBe(true);
+      expect(
+        logs.some(
+          (record) => record.message === 'forgot the producer loss accounting of a begun capture',
+        ),
+      ).toBe(false);
+    });
+
+    it('drops a partial report rather than an open capture when the bound is full of them', () => {
+      const captures = freshCaptures(PRODUCER_LOSS_LEDGER_CAPACITY);
+
+      for (const captureId of captures) {
+        begin(captureId);
+      }
+
+      const [stray] = freshCaptures(1);
+
+      if (stray === undefined) {
+        throw new Error('The eviction fixture needs a stray capture.');
+      }
+
+      expect(reportOne(stray)).toBe(1);
+      expect(unwrap(repo.producerLoss(SESSION_A, stray))).toEqual({
+        droppedEvents: 0,
+        accounted: false,
+      });
+      expect(
+        captures.every((captureId) => unwrap(repo.producerLoss(SESSION_A, captureId)).accounted),
+      ).toBe(true);
+    });
+
+    it('reads an evicted open capture as unaccounted, and warns that it did', () => {
+      const captures = freshCaptures(PRODUCER_LOSS_LEDGER_CAPACITY);
+
+      for (const captureId of captures) {
+        begin(captureId);
+      }
+
+      const [refreshed, forgotten] = captures;
+      const [overflow] = freshCaptures(1);
+
+      if (refreshed === undefined || forgotten === undefined || overflow === undefined) {
+        throw new Error('The eviction fixture needs three captures.');
+      }
+
+      // A report touches the oldest open capture, so the second one is now
+      // the least recently touched.
+      reportOne(refreshed);
+      begin(overflow);
+
+      expect(unwrap(repo.producerLoss(SESSION_A, forgotten))).toEqual({
+        droppedEvents: 0,
+        accounted: false,
+      });
+      expect(unwrap(repo.producerLoss(SESSION_A, refreshed))).toEqual({
+        droppedEvents: 1,
+        accounted: true,
+      });
+      expect(unwrap(repo.producerLoss(SESSION_A, overflow)).accounted).toBe(true);
+
+      const warnings = logs.filter(
+        (record) => record.message === 'forgot the producer loss accounting of a begun capture',
+      );
+
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]?.level).toBe('warn');
+      expect(warnings[0]?.fields).toMatchObject({
+        operation: 'beginProducerLossAccounting',
+        evictedAccounted: 1,
+        capacity: PRODUCER_LOSS_LEDGER_CAPACITY,
+      });
+    });
+
+    it('refuses a blank session or capture id when beginning or releasing', () => {
+      expect(refusalReason(repo.beginProducerLossAccounting('', CAPTURE_A2))).toBe(
+        'blank-session-id',
+      );
+      expect(refusalReason(repo.beginProducerLossAccounting(SESSION_A, ''))).toBe(
+        'blank-capture-id',
+      );
+      expect(refusalReason(repo.releaseProducerLoss('', CAPTURE_A2))).toBe('blank-session-id');
+      expect(refusalReason(repo.releaseProducerLoss(SESSION_A, ''))).toBe('blank-capture-id');
+      expect(unwrap(repo.producerLoss(SESSION_A, CAPTURE_A2))).toEqual({
+        droppedEvents: 0,
+        accounted: false,
+      });
+    });
   });
 });
 
@@ -3769,6 +5646,14 @@ describe('the index each reader is answered from', () => {
       statements: [{ from: [CAPTURE_INDEX] }, { from: [CAPTURE_INDEX] }],
     },
     {
+      // The capture summary's walk: one ordered range of the capture index per
+      // page, and no count beside it.
+      reader: 'pageCaptureForSummary',
+      read: (reader) =>
+        reader.pageCaptureForSummary(SESSION_A, CAPTURE_A1, { limit: 250, offset: 0 }),
+      statements: [{ from: [CAPTURE_INDEX] }],
+    },
+    {
       reader: 'existingEventIds',
       read: (reader, fixture) => reader.existingEventIds(SESSION_A, fixture.eventIds),
       statements: [{ from: [EVENT_ID_INDEX] }],
@@ -3920,6 +5805,132 @@ describe('the index each reader is answered from', () => {
       unwrap(repo.query({ sessionId: SESSION_A, captureId: CAPTURE_B1, requestKey })).total,
     ).toBe(0);
     expect(unwrap(repo.listByRequestKey(SESSION_A, requestKey)).total).toBe(3);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * The bounded lookups the panel-data resolver takes
+ * ---------------------------------------------------------------------------------------------- */
+
+/*
+ * `firstTraceId` and `captureStamp` exist so that the resolver's per-node work
+ * does not re-read the capture: the first replaces grouping and sorting every
+ * trace to keep one — one ordered probe, however many events tie at the
+ * earliest instant — and the second replaces re-reading every event to learn
+ * how many the capture holds. Each is pinned to the plan that makes it
+ * bounded. (`captureGeneration`, the cache check, reads no telemetry at all;
+ * its own block pins that.)
+ */
+describe('the bounded lookups the panel-data resolver takes', () => {
+  /** The plan of the one telemetry read a lookup ran, joined. */
+  function planOfOnly(read: (reader: TelemetryRepo) => Result<unknown, DebuggenError>): string {
+    const selects = statementsRunBy(read);
+
+    expect(selects).toHaveLength(1);
+
+    const [sql] = selects;
+
+    if (sql === undefined) {
+      throw new Error('The lookup ran no telemetry read.');
+    }
+
+    return queryPlan(sql).join(' | ');
+  }
+
+  /** The plan `firstTraceId` must be answered from, per scope: one ordered probe. */
+  const FIRST_TRACE_PLANS = [
+    [
+      'a capture',
+      CAPTURE_A1,
+      `SEARCH telemetry_events USING INDEX ${CAPTURE_INDEX} (session_id=? AND capture_id=?)`,
+    ],
+    [
+      'a session',
+      undefined,
+      `SEARCH telemetry_events USING INDEX ${SESSION_PURGE_INDEX} (session_id=?)`,
+    ],
+  ] as const;
+
+  it.each(FIRST_TRACE_PLANS)(
+    'reads the first trace of %s as one ordered index probe, with no sort and no scan',
+    (_scope, captureId, expected) => {
+      seedPlanFixture();
+
+      // Without statistics — the store never runs ANALYZE — and with them, so
+      // the plan does not rest on the planner's defaults. The capture index's
+      // implicit rowid key and the purge index's explicit `ingest_seq` both
+      // yield `start_time, ingest_seq` order, so LIMIT 1 stops at one entry.
+      for (const analyzed of [false, true]) {
+        if (analyzed) {
+          store.db.exec('ANALYZE');
+        }
+
+        const plan = planOfOnly((reader) => reader.firstTraceId(SESSION_A, captureId));
+
+        expect(plan).toBe(expected);
+        expect(plan).not.toContain('TEMP B-TREE');
+        expect(plan).not.toContain('SCAN telemetry_events');
+      }
+    },
+  );
+
+  it('answers the first-arrived trace of twenty thousand events tied at one instant', () => {
+    // Every event of CAPTURE_A1 at one start time, each under its own trace,
+    // the trace ids stored in descending order so the smallest id arrives
+    // last: the case a minimum over the tied rows would have to walk in full.
+    const TIED_EVENTS = 20_000;
+    const traces = Array.from({ length: TIED_EVENTS }, () => newTraceId())
+      .sort()
+      .reverse();
+    const stored = insertOk(
+      traces.map((traceId) => buildEvent({ traceId, startTime: BASE_TIME + 1 })),
+    );
+    const [firstArrived] = stored;
+
+    expect(firstArrived?.traceId).toBe(traces[0]);
+
+    for (const captureId of [CAPTURE_A1, undefined]) {
+      const selects = statementsRunBy((reader) => reader.firstTraceId(SESSION_A, captureId));
+
+      expect(selects).toHaveLength(1);
+      expect(unwrap(repo.firstTraceId(SESSION_A, captureId))).toBe(firstArrived?.traceId);
+    }
+
+    // The listing breaks the same tie by trace id instead.
+    expect(unwrap(repo.listTraceIds(SESSION_A, CAPTURE_A1))[0]).toBe(traces.at(-1));
+  });
+
+  it('stamps a capture from its index entries alone', () => {
+    seedPlanFixture();
+
+    const plan = planOfOnly((reader) => reader.captureStamp(SESSION_A, CAPTURE_A1));
+
+    expect(plan).toBe(
+      `SEARCH telemetry_events USING COVERING INDEX ${CAPTURE_INDEX} (session_id=? AND capture_id=?)`,
+    );
+  });
+
+  it('answers over the plan fixture exactly as the unbounded readers do', () => {
+    // Every fixture event has its own start time, so no scope's earliest
+    // instant is shared by two traces and the listing's first entry is the
+    // lookup's answer too.
+    seedPlanFixture();
+
+    for (const captureId of [undefined, CAPTURE_A1, CAPTURE_A2]) {
+      expect(unwrap(repo.firstTraceId(SESSION_A, captureId))).toBe(
+        unwrap(repo.listTraceIds(SESSION_A, captureId))[0],
+      );
+    }
+
+    for (const captureId of [CAPTURE_A1, CAPTURE_A2]) {
+      const page = unwrap(repo.listByCapture(SESSION_A, captureId, { limit: 0 }));
+      const stamp = unwrap(repo.captureStamp(SESSION_A, captureId));
+      const highest = unwrap(
+        repo.listByCapture(SESSION_A, captureId, { limit: TELEMETRY_QUERY_MAX_LIMIT }),
+      ).rows.reduce((max, event) => Math.max(max, event.ingestSeq), 0);
+
+      expect(stamp).toEqual({ count: page.total, maxIngestSeq: highest });
+    }
   });
 });
 

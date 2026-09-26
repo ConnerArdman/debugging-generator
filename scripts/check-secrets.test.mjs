@@ -42,8 +42,10 @@
  * `git status` must stay clean - and skips itself when `git` is unavailable rather than failing.
  */
 
-import { execFileSync } from 'node:child_process';
+import { Buffer } from 'node:buffer';
+import { execFileSync, spawnSync } from 'node:child_process';
 import {
+  copyFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -70,7 +72,9 @@ import {
   EXIT_ERROR,
   EXIT_FINDINGS,
   EXIT_OK,
+  MAX_SCAN_BYTES,
   RULE_IDS,
+  STREAM_CHUNK_BYTES,
   isEnvFileViolation,
   isKeyLikeName,
   loadAllowlist,
@@ -1227,6 +1231,127 @@ describe('connection-string', () => {
 const DATABASE_URL_PATHS =
   ALLOWLIST.literals.find((literal) => literal.value === DEV_DATABASE_URL)?.files ?? [];
 
+/**
+ * A password assembled at runtime for the bypass variants below, so no credentialed value is a
+ * literal in this tracked file.
+ */
+const RUNTIME_PASSWORD = cycle(URLSAFE_CHARS.slice(20), 24);
+
+/**
+ * Values that contain the allowlisted database URL yet are not it. Each is how a real credential
+ * could be smuggled past an allowlist that exempted any match containing the literal: a password
+ * appended as a query parameter, a suffix that turns the path into a different database, a
+ * fragment carrying a second credentialed authority (in either order), a scheme prefix, and the
+ * same authority on a different port. Three more append through the RFC 3986 sub-delimiters `;`
+ * and `,`, which may appear inside a URI path, so the placeholder followed by one of them and a
+ * character that continues a URI is a longer, different URI rather than the placeholder ending at
+ * a statement or list separator. `pattern` is the scheme the finding must report.
+ *
+ * @type {readonly { label: string, value: string, pattern: string }[]}
+ */
+const ALLOWLIST_BYPASS_VARIANTS = [
+  {
+    label: 'a query appends a password',
+    value: assemble(DEV_DATABASE_URL, '?password=', RUNTIME_PASSWORD),
+    pattern: 'postgresql',
+  },
+  {
+    label: 'a semicolon path parameter appends a password',
+    value: assemble(DEV_DATABASE_URL, ';password=', RUNTIME_PASSWORD),
+    pattern: 'postgresql',
+  },
+  {
+    label: 'a doubled semicolon appends a password',
+    value: assemble(DEV_DATABASE_URL, ';;password=', RUNTIME_PASSWORD),
+    pattern: 'postgresql',
+  },
+  {
+    label: 'a comma appends a second credentialed host',
+    value: assemble(
+      DEV_DATABASE_URL,
+      ',',
+      'admin',
+      ':',
+      RUNTIME_PASSWORD,
+      '@db.internal',
+      ':5432/app',
+    ),
+    pattern: 'postgresql',
+  },
+  {
+    label: 'a suffix extends the path',
+    value: assemble(DEV_DATABASE_URL, '_prod'),
+    pattern: 'postgresql',
+  },
+  {
+    label: 'a fragment carries a second credentialed authority',
+    value: assemble(DEV_DATABASE_URL, '#', FOREIGN_CONNECTION_STRING),
+    pattern: 'postgresql',
+  },
+  {
+    label: 'the placeholder rides in the fragment of a credentialed URI',
+    value: assemble(
+      'postgresql',
+      '://',
+      'root',
+      ':',
+      RUNTIME_PASSWORD,
+      '@db.internal',
+      ':5432/app',
+      '#',
+      DEV_DATABASE_URL,
+    ),
+    pattern: 'postgresql',
+  },
+  {
+    label: 'a scheme prefix is prepended',
+    value: assemble('evil+', DEV_DATABASE_URL),
+    pattern: 'evil+postgresql',
+  },
+  {
+    label: 'the port differs',
+    value: DEV_DATABASE_URL.replace(':5432/', ':5433/'),
+    pattern: 'postgresql',
+  },
+];
+
+/**
+ * The placeholder continued past a character that ends the connection-string match - `)`, `'` or
+ * `]`, which close a URI wrapped in prose or code - by more of the same value. The match stops at
+ * the literal's last character here, so its extent alone would lie inside the occurrence; what
+ * reports these is the whole-value rule, which withholds an occurrence followed by anything other
+ * than closing punctuation before whitespace, a quote, a backtick or the end of the line. RFC 3986
+ * lets `)` and `'` continue a URI path, so each is a different value from the placeholder.
+ *
+ * @type {readonly { label: string, value: string }[]}
+ */
+const ALLOWLIST_CONTINUATION_VARIANTS = [
+  {
+    label: 'a closing parenthesis is followed by a password',
+    value: assemble(DEV_DATABASE_URL, ')password=', RUNTIME_PASSWORD),
+  },
+  {
+    label: 'a closing parenthesis and a query append a password',
+    value: assemble(DEV_DATABASE_URL, ')?password=', RUNTIME_PASSWORD),
+  },
+  {
+    label: 'a single quote is followed by a second credentialed host',
+    value: assemble(
+      DEV_DATABASE_URL,
+      "'",
+      'admin',
+      ':',
+      RUNTIME_PASSWORD,
+      '@db.internal',
+      ':5432/app',
+    ),
+  },
+  {
+    label: 'a closing bracket is followed by a password',
+    value: assemble(DEV_DATABASE_URL, ']password=', RUNTIME_PASSWORD),
+  },
+];
+
 describe('the reviewed allowlist is the only exemption channel', () => {
   it.each([...DATABASE_URL_PATHS])('exempts the database placeholder at %s', (relPath) => {
     const result = scanContentWithSuppressions(
@@ -1275,11 +1400,175 @@ describe('the reviewed allowlist is the only exemption channel', () => {
     expect(result.findings[0].pattern).toBe('mysql');
   });
 
+  it.each(ALLOWLIST_BYPASS_VARIANTS)(
+    'reports the database placeholder at an allowlisted path when $label',
+    ({ value, pattern }) => {
+      // Each variant contains the allowlisted literal, and each is a longer connection-string match
+      // that extends past it: the exemption covers the exact placeholder (AAP 0.3.4), never a value
+      // it is a substring of. `.env.example` is a path the entry lists, so the path is not what
+      // reports it - the span is.
+      expect(DATABASE_URL_PATHS).toContain('.env.example');
+      const line = `DATABASE_URL=${value}`;
+      const result = scanContentWithSuppressions(
+        '.env.example',
+        [...PROSE_BEFORE, line, ...PROSE_AFTER].join('\n'),
+        ALLOWLIST,
+      );
+      expect(result.allowlisted).toEqual([]);
+      const finding = expectSingleFinding(result.findings, {
+        rule: 'connection-string',
+        pattern,
+        file: '.env.example',
+        column: columnOf(line, value),
+      });
+      expectValueNeverPrinted(finding, value);
+    },
+  );
+
+  it.each(ALLOWLIST_CONTINUATION_VARIANTS)(
+    'reports the database placeholder at an allowlisted path when $label',
+    ({ value }) => {
+      // The connection-string match ends at the `)`, `'` or `]` and so lies exactly inside the
+      // occurrence; the occurrence is what is withheld, because the value runs on past it.
+      expect(DATABASE_URL_PATHS).toContain('.env.example');
+      const line = `DATABASE_URL=${value}`;
+      const result = scanContentWithSuppressions(
+        '.env.example',
+        [...PROSE_BEFORE, line, ...PROSE_AFTER].join('\n'),
+        ALLOWLIST,
+      );
+      expect(result.allowlisted).toEqual([]);
+      const finding = expectSingleFinding(result.findings, {
+        rule: 'connection-string',
+        pattern: 'postgresql',
+        file: '.env.example',
+        column: columnOf(line, value),
+      });
+      expectValueNeverPrinted(finding, DEV_DATABASE_URL);
+      expect(finding.message).not.toContain(RUNTIME_PASSWORD);
+
+      // The same line without the continuation is the exact placeholder and stays exempt.
+      const exact = scanContentWithSuppressions(
+        '.env.example',
+        [...PROSE_BEFORE, `DATABASE_URL=${DEV_DATABASE_URL}`, ...PROSE_AFTER].join('\n'),
+        ALLOWLIST,
+      );
+      expect(exact.findings).toEqual([]);
+      expect(exact.allowlisted).toHaveLength(1);
+    },
+  );
+
+  it('still exempts the exact placeholder wherever a URI terminator ends it', () => {
+    // The control for the variants above: quoting, a list separator, a closing bracket and the end
+    // of the line all terminate the match at the literal's last character, so it lies inside the
+    // occurrence and stays exempt at an allowlisted path. A `;` or `,` ends the URI when the end of
+    // the line, whitespace, a quote or a hard terminator follows it - a statement terminator, a
+    // list separator, a clause - and a Markdown link ends at its `)`. A value wrapped in quotes,
+    // parentheses, brackets or angle brackets is still the whole value: only closing punctuation
+    // lies between the literal and the next whitespace, quote, backtick or the end of the line.
+    for (const line of [
+      `DATABASE_URL="${DEV_DATABASE_URL}"`,
+      `| \`DATABASE_URL\` | \`${DEV_DATABASE_URL}\` |`,
+      `urls: [${DEV_DATABASE_URL}, ${DEV_DATABASE_URL}]`,
+      `DATABASE_URL=${DEV_DATABASE_URL}`,
+      `DATABASE_URL=${DEV_DATABASE_URL};`,
+      `DATABASE_URL=${DEV_DATABASE_URL}; next`,
+      `Point DATABASE_URL at ${DEV_DATABASE_URL}, then run the migration.`,
+      `const url = connect('${DEV_DATABASE_URL}');`,
+      `See [the demo database](${DEV_DATABASE_URL}).`,
+      `DATABASE_URL='${DEV_DATABASE_URL}'`,
+      `(the Compose default is ${DEV_DATABASE_URL})`,
+      `urls: [${DEV_DATABASE_URL}]`,
+      `<${DEV_DATABASE_URL}>`,
+      `DATABASE_URL=${DEV_DATABASE_URL} # the Compose default`,
+    ]) {
+      const result = scanContentWithSuppressions(
+        'README.md',
+        [...PROSE_BEFORE, line, ...PROSE_AFTER].join('\n'),
+        ALLOWLIST,
+      );
+      expect(result.findings).toEqual([]);
+      expect(result.allowlisted.length).toBeGreaterThan(0);
+      for (const entry of result.allowlisted) {
+        expect(entry.allowlistValue).toBe(DEV_DATABASE_URL);
+        expect(entry.rule).toBe('connection-string');
+      }
+    }
+  });
+
+  it('consults the allowlist before resolving overlaps, so an exempt match hides nothing', () => {
+    // Two rules see overlapping spans that start at the same character. The provider-key match
+    // stops at the `!` and lies exactly inside the allowlisted example token, so it is exempt - the
+    // token is followed only by the closing marks `!?`, so it is the whole value by the
+    // whole-value rule. The entropy rule measures the complete unquoted value, which runs on past
+    // the token through those marks, so it extends beyond the literal and is live. Deduplicating
+    // first - the order this gate once used - keeps the higher-precedence provider-key match,
+    // drops the entropy match as its overlap, and then exempts the survivor: zero findings, and
+    // the value beyond the literal is never compared against the allowlist at all. Classifying
+    // first reports it.
+    const token = `${FORGE_CLASSIC_PREFIX}${cycle(WORD_CHARS, 36)}`;
+    const allowlist = normalizeAllowlist({
+      version: 1,
+      literals: [{ value: token, reason: 'documented example token', files: ['docs/notes.md'] }],
+    });
+    const extended = `${token}!?`;
+    const line = `api_token=${extended}`;
+    // The shapes this case depends on, asserted rather than assumed.
+    expect(isKeyLikeName('api_token')).toBe(true);
+    expect(shannonEntropy(extended)).toBeGreaterThan(ENTROPY_MIN_BITS_PER_CHAR);
+    expect(extended.length).toBeGreaterThan(ENTROPY_MIN_LENGTH);
+
+    const result = scanContentWithSuppressions(
+      'docs/notes.md',
+      [...PROSE_BEFORE, line, ...PROSE_AFTER].join('\n'),
+      allowlist,
+    );
+
+    const finding = expectSingleFinding(result.findings, {
+      rule: 'entropy',
+      pattern: 'api_token',
+      file: 'docs/notes.md',
+      column: columnOf(line, token),
+    });
+    expectValueNeverPrinted(finding, extended);
+    // The exempt half is still accounted for, as the provider-key match inside the literal.
+    expect(result.allowlisted).toHaveLength(1);
+    expect(result.allowlisted[0]).toMatchObject({
+      rule: 'provider-key',
+      pattern: FORGE_CLASSIC_PREFIX,
+      column: columnOf(line, token),
+      allowlistValue: token,
+    });
+
+    // Without the appended punctuation every match lies inside the literal and nothing is live.
+    const exact = scanContentWithSuppressions(
+      'docs/notes.md',
+      [...PROSE_BEFORE, `api_token=${token}`, ...PROSE_AFTER].join('\n'),
+      allowlist,
+    );
+    expect(exact.findings).toEqual([]);
+    expect(exact.allowlisted).toHaveLength(1);
+
+    // Followed by punctuation that continues the value (`@`, `#`, `$` ...), the token is not the
+    // whole value, so its occurrence exempts nothing and the match inside it is reported too.
+    const continued = scanContentWithSuppressions(
+      'docs/notes.md',
+      [...PROSE_BEFORE, `api_token=${token}${PUNCTUATION_CHARS}`, ...PROSE_AFTER].join('\n'),
+      allowlist,
+    );
+    expect(continued.allowlisted).toEqual([]);
+    expect(continued.findings).toHaveLength(1);
+    expect(continued.findings[0]).toMatchObject({
+      rule: 'provider-key',
+      column: columnOf(`api_token=${token}${PUNCTUATION_CHARS}`, token),
+    });
+  });
+
   it('exempts a match that an allowlisted literal quotes in full', () => {
-    // The exemption is narrow in both directions: a match may contain the allowlisted literal (a
-    // connection string whose match spans host and database) or lie entirely inside an occurrence
-    // of it (a documented example whose literal quotes the value). This is the second direction,
-    // driven through a caller-supplied allowlist so the committed one stays exactly as reviewed.
+    // The literal must cover the whole match. Here it is a documented example line and the
+    // provider-key match lies entirely inside it, so the match is exempt at the listed path and
+    // reported at every other. Driven through a caller-supplied allowlist so the committed one
+    // stays exactly as reviewed.
     const quoted = `EXAMPLE_TOKEN=${FORGE_CLASSIC_PREFIX}${cycle(WORD_CHARS, 36)}`;
     const allowlist = normalizeAllowlist({
       version: 1,
@@ -1489,9 +1778,11 @@ describe('content this repository legitimately commits', () => {
 /* ---------------------------------------------------------------------------
  * The command line, end to end over a throwaway checkout
  *
- * One thin block: the rule coverage above needs neither git nor a checkout, and keeping it that
- * way is what makes it fast and hermetic. What is left to prove here is the wiring - tracked-file
- * enumeration, the report and the exit codes - so there are two scanning cases, not twelve.
+ * The rule coverage above needs neither git nor a checkout, and keeping it that way is what makes
+ * it fast and hermetic. What is left to prove here is the wiring - tracked-file enumeration, the
+ * report and the exit codes - and what the gate does with each kind of tracked entry: a binary it
+ * may skip only when positively identified, an oversized file it streams, a symbolic link it reads
+ * as target text, a submodule it skips, and a file it cannot examine, which fails the run.
  * ------------------------------------------------------------------------ */
 
 /**
@@ -1526,7 +1817,7 @@ function createThrowawayRepository() {
  *
  * @param {string} directory
  * @param {string} relPath
- * @param {string} content
+ * @param {string | Uint8Array} content Text, written as UTF-8, or raw bytes.
  */
 function trackFile(directory, relPath, content) {
   const absolute = path.join(directory, relPath);
@@ -1543,9 +1834,11 @@ function trackFile(directory, relPath, content) {
  *
  * @param {readonly string[]} argv
  * @param {{ cwd?: string, allowlist?: unknown, allowlistPath?: string }} [options]
+ * @param {typeof main} [entry] The `main` to drive; defaults to the statically imported one, and
+ *   a case that injects a filesystem failure passes the copy built against it.
  * @returns {Promise<{ exitCode: number, stdout: string, stderr: string }>}
  */
-async function runCli(argv, options = {}) {
+async function runCli(argv, options = {}, entry = main) {
   let stdout = '';
   let stderr = '';
   const outSpy = vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
@@ -1557,13 +1850,102 @@ async function runCli(argv, options = {}) {
     return true;
   });
   try {
-    const exitCode = await main(argv, options);
+    const exitCode = await entry(argv, options);
     return { exitCode, stdout, stderr };
   } finally {
     outSpy.mockRestore();
     errSpy.mockRestore();
   }
 }
+
+/**
+ * Runs `use` against a freshly imported copy of the gate whose `node:fs` has the given overrides
+ * merged over the real one.
+ *
+ * Why it exists: an unreadable tracked file is a fail-closed path - the run must exit 2 rather
+ * than certify content it never read - and a mode bit cannot provoke it for a privileged account.
+ * The test host runs as root, which `chmod` does not stop, so the failure is injected instead and
+ * the case asserts the propagation on every account.
+ *
+ * The overrides delegate to the real implementation for every path they do not fail, so the rest
+ * of the throwaway repository - and the committed allowlist - is genuinely read. The module
+ * registry is reset before the import so the copy binds to the injected module, and again
+ * afterwards, passed or thrown, so every later case imports the genuine gate. This file's own
+ * `node:fs` bindings were resolved when it loaded and are untouched.
+ *
+ * @param {(real: typeof import('node:fs')) => Partial<typeof import('node:fs')>} overrides
+ * @param {(injected: typeof import('./check-secrets.mjs')) => Promise<void>} use
+ * @returns {Promise<void>}
+ */
+async function withInjectedFs(overrides, use) {
+  vi.resetModules();
+  vi.doMock('node:fs', async () => {
+    const real = /** @type {typeof import('node:fs')} */ (await vi.importActual('node:fs'));
+    return { ...real, ...overrides(real) };
+  });
+  try {
+    await use(await import('./check-secrets.mjs'));
+  } finally {
+    vi.doUnmock('node:fs');
+    vi.resetModules();
+  }
+}
+
+/**
+ * The error a filesystem call reports when the account may not access `target`, which is what
+ * `EACCES` on a mode-`0000` file looks like to an unprivileged process.
+ *
+ * @param {string} syscall
+ * @param {string} target
+ * @returns {Error}
+ */
+function accessDenied(syscall, target) {
+  return Object.assign(new Error(`EACCES: injected failure, ${syscall} '${target}'`), {
+    code: 'EACCES',
+    syscall,
+    path: target,
+  });
+}
+
+/**
+ * Whether a path a filesystem call received names `relPath` inside some checkout.
+ *
+ * @param {unknown} target
+ * @param {string} relPath Repository-relative POSIX path.
+ * @returns {boolean}
+ */
+function namesTrackedPath(target, relPath) {
+  return (
+    typeof target === 'string' && target.endsWith(path.sep + relPath.split('/').join(path.sep))
+  );
+}
+
+/**
+ * One fixture per binary format the gate may skip: the format's extension and the leading bytes
+ * that identify it, padded with a few bytes of body so the file is more than its signature.
+ *
+ * @type {readonly { format: string, file: string, bytes: Uint8Array }[]}
+ */
+const BINARY_FIXTURES = [
+  {
+    format: 'png',
+    file: 'assets/icon.png',
+    lead: [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a],
+  },
+  { format: 'ico', file: 'assets/favicon.ico', lead: [0x00, 0x00, 0x01, 0x00] },
+  { format: 'jpeg', file: 'assets/photo.jpg', lead: [0xff, 0xd8, 0xff, 0xe0] },
+  { format: 'jpeg', file: 'assets/photo.jpeg', lead: [0xff, 0xd8, 0xff, 0xdb] },
+  { format: 'gif', file: 'assets/old.gif', lead: [...Buffer.from('GIF87a', 'latin1')] },
+  { format: 'gif', file: 'assets/new.gif', lead: [...Buffer.from('GIF89a', 'latin1')] },
+  { format: 'pdf', file: 'docs/manual.pdf', lead: [...Buffer.from('%PDF-1.7', 'latin1')] },
+  { format: 'woff', file: 'fonts/body.woff', lead: [...Buffer.from('wOFF', 'latin1')] },
+  { format: 'woff2', file: 'fonts/body.woff2', lead: [...Buffer.from('wOF2', 'latin1')] },
+  { format: 'vsix', file: 'dist/extension.vsix', lead: [0x50, 0x4b, 0x03, 0x04] },
+].map(({ format, file, lead }) => ({
+  format,
+  file,
+  bytes: Uint8Array.from([...lead, 0x00, 0x01, 0x02, 0xfe, 0xff]),
+}));
 
 describe('the command line', () => {
   it.skipIf(!GIT_AVAILABLE)(
@@ -1721,45 +2103,480 @@ describe('the command line', () => {
   );
 
   it.skipIf(!GIT_AVAILABLE)(
-    'accounts for every file it deliberately did not read, and still applies the path rules',
+    'skips only a positively identified binary, and scans a disguised or NUL-laden file as text',
     async () => {
       const directory = createThrowawayRepository();
-      // A tracked environment file is a finding whether or not its content is readable text, so
-      // this one is written as binary on purpose.
+      for (const fixture of BINARY_FIXTURES) {
+        trackFile(directory, fixture.file, fixture.bytes);
+      }
+      // The extension alone decides nothing: a `.png` holding text, and a `.jpg` that carries
+      // another format's signature, are both scanned.
+      const disguised = FORGE_CLASSIC_PREFIX + cycle(WORD_CHARS, 36);
+      trackFile(
+        directory,
+        'public/icon.png',
+        `not really an image\n${fixtureAssignment(disguised)}\n`,
+      );
+      const mislabelled = Buffer.concat([
+        Buffer.from(BINARY_FIXTURES[0].bytes),
+        Buffer.from(`\n${fixtureAssignment(disguised)}\n`),
+      ]);
+      trackFile(directory, 'public/photo.jpg', mislabelled);
+      // The PNG signature itself contains line feeds, so the credential's line is counted from the
+      // decoded bytes exactly as the gate counts it.
+      const mislabelledLine =
+        mislabelled.toString('utf8').split(/\r?\n/).indexOf(fixtureAssignment(disguised)) + 1;
+      expect(mislabelledLine).toBeGreaterThan(1);
+      // Nor does a NUL byte: the rest of the file is still text a credential can sit in.
+      const embedded = SHORT_KEY_PREFIX + cycle(URLSAFE_CHARS, 32);
+      trackFile(directory, 'assets/blob.bin', `head\u0000\u0000\n${fixtureAssignment(embedded)}\n`);
+      // A tracked environment file is a finding whatever its content, NUL bytes included.
       trackFile(directory, '.env', 'PORT=3000\n\u0000\u0000binary tail\n');
-      trackFile(directory, 'public/icon.png', 'not really a PNG, but the extension decides\n');
-      trackFile(directory, 'assets/blob.bin', `head\u0000${cycle(URLSAFE_CHARS, 32)}\n`);
-      trackFile(directory, 'docs/gone.md', '# Staged, then removed from the work tree\n');
-      rmSync(path.join(directory, 'docs/gone.md'), { force: true });
       trackFile(directory, 'docs/notes.md', '# Notes\n');
-      symlinkSync('notes.md', path.join(directory, 'docs/link.md'));
-      execFileSync('git', ['add', '--', 'docs/link.md'], { cwd: directory, stdio: 'ignore' });
-      // Oversized: reported rather than fatal, because an oversized tracked file is a hygiene
-      // problem of its own and failing the secrets gate for it would only obscure that.
-      trackFile(directory, 'data/dump.sql', 'a'.repeat(2 * 1024 * 1024 + 1));
+
+      const { exitCode, stdout, stderr } = await runCli(['--json'], { cwd: directory });
+
+      expect(exitCode).toBe(EXIT_FINDINGS);
+      expect(stderr).toBe('');
+      const report = JSON.parse(stdout);
+      expect(report.unscanned).toEqual([]);
+      expect(report.filesTracked).toBe(BINARY_FIXTURES.length + 5);
+      expect(report.filesScanned).toBe(5);
+      expect(
+        [...report.skipped].sort((left, right) => left.file.localeCompare(right.file)),
+      ).toEqual(
+        [...BINARY_FIXTURES]
+          .sort((left, right) => left.file.localeCompare(right.file))
+          .map(({ format, file, bytes }) => ({
+            file,
+            reason: 'binary',
+            format,
+            bytes: bytes.length,
+          })),
+      );
+      expect(
+        report.findings.map(
+          (/** @type {{ file: string, line: number, rule: string }} */ finding) => ({
+            file: finding.file,
+            line: finding.line,
+            rule: finding.rule,
+          }),
+        ),
+      ).toEqual([
+        { file: '.env', line: 1, rule: 'env-file' },
+        { file: 'assets/blob.bin', line: 2, rule: 'provider-key' },
+        { file: 'public/icon.png', line: 2, rule: 'provider-key' },
+        { file: 'public/photo.jpg', line: mislabelledLine, rule: 'provider-key' },
+      ]);
+      expect(stdout).not.toContain(disguised);
+      expect(stdout).not.toContain(embedded);
+
+      const text = await runCli([], { cwd: directory });
+      expect(text.stdout).toContain(`${BINARY_FIXTURES.length} skipped (binary or submodule)`);
+    },
+    20_000,
+  );
+
+  it.skipIf(!GIT_AVAILABLE)(
+    'streams a file over the in-memory limit and reports its credentials at the exact positions',
+    async () => {
+      // Layout, by byte offset: a CRLF whose `\r` ends the first chunk and whose `\n` opens the
+      // second, on a line that carries a credential; then a three-byte character whose first byte
+      // ends the second chunk; then, on the file's last line with no newline after it, a second
+      // credential. A reader that split lines per chunk would miscount the lines, and one that
+      // decoded chunks independently would turn the character into replacement characters and
+      // shift the column of everything after it.
+      const filler = '# Filler line, deliberately free of any matchable shape.\n';
+      /**
+       * ASCII text of exactly `bytes` bytes, ending in a newline.
+       *
+       * @param {number} bytes
+       * @returns {string}
+       */
+      const fillerOf = (bytes) => {
+        const whole = Math.floor(bytes / filler.length);
+        const rest = bytes - whole * filler.length;
+        return filler.repeat(whole) + (rest > 0 ? `${'.'.repeat(rest - 1)}\n` : '');
+      };
+      const first = FORGE_CLASSIC_PREFIX + cycle(WORD_CHARS, 36);
+      const last = VENDOR_KEY_PREFIX + cycle(URLSAFE_CHARS, 40);
+      const crlfLine = fixtureAssignment(first);
+      const straddled = '\u20ac';
+      const lastLinePrefix = 'Price in euro ';
+      const lastLine = `${lastLinePrefix}${straddled} ${fixtureAssignment(last)}`;
+
+      // `head` fills the first chunk exactly, so its closing `\r` is the chunk's last byte; the
+      // `\n` that completes the pair opens `middle`, which stops one byte short of the second
+      // chunk's end, so the euro sign's first byte is that chunk's last. `middle` also carries a
+      // lone `\r`, which `split(/\r?\n/)` keeps inside its line: a reader that ended lines on it
+      // would number every later line one too high.
+      const loneReturn = '# A lone carriage return\r stays inside its line.\n';
+      const head = fillerOf(STREAM_CHUNK_BYTES - 1 - crlfLine.length) + crlfLine + '\r';
+      const middle =
+        `\n${loneReturn}` +
+        fillerOf(STREAM_CHUNK_BYTES - 2 - loneReturn.length - lastLinePrefix.length) +
+        lastLinePrefix;
+      const content = head + middle + lastLine.slice(lastLinePrefix.length);
+
+      // The layout is asserted, not assumed.
+      expect(Buffer.byteLength(head)).toBe(STREAM_CHUNK_BYTES);
+      expect(Buffer.byteLength(head + middle)).toBe(2 * STREAM_CHUNK_BYTES - 1);
+      expect(Buffer.byteLength(straddled)).toBe(3);
+      expect(Buffer.byteLength(content)).toBeGreaterThan(MAX_SCAN_BYTES);
+      expect(content.endsWith('\n')).toBe(false);
+
+      const directory = createThrowawayRepository();
+      trackFile(directory, 'data/dump.sql', content);
+      // An oversized binary is still identified, from the first chunk.
+      const bigImage = Buffer.alloc(MAX_SCAN_BYTES + 1);
+      Buffer.from(BINARY_FIXTURES[0].bytes).copy(bigImage);
+      trackFile(directory, 'assets/poster.png', bigImage);
 
       const { exitCode, stdout } = await runCli(['--json'], { cwd: directory });
 
       expect(exitCode).toBe(EXIT_FINDINGS);
       const report = JSON.parse(stdout);
-      expect(report.filesTracked).toBe(7);
-      expect(report.findings).toHaveLength(1);
-      expect(report.findings[0]).toMatchObject({ file: '.env', rule: 'env-file', line: 1 });
-      // Skipped files are reported rather than passed over in silence.
-      const skipped = new Map(
-        report.skipped.map((entry) => [entry.file, /** @type {string} */ (entry.reason)]),
-      );
-      expect(skipped.get('.env')).toBe('binary');
-      expect(skipped.get('public/icon.png')).toBe('binary');
-      expect(skipped.get('assets/blob.bin')).toBe('binary');
-      expect(skipped.get('docs/gone.md')).toBe('missing');
-      expect(skipped.get('docs/link.md')).toBe('symlink');
-      expect(skipped.get('data/dump.sql')).toBe('too-large');
-      // Only `docs/notes.md` was readable text.
+      expect(report.unscanned).toEqual([]);
       expect(report.filesScanned).toBe(1);
+      expect(report.skipped).toEqual([
+        { file: 'assets/poster.png', reason: 'binary', format: 'png', bytes: MAX_SCAN_BYTES + 1 },
+      ]);
 
+      const lines = content.split(/\r?\n/);
+      const crlfLineNumber = lines.indexOf(crlfLine) + 1;
+      expect(crlfLineNumber).toBeGreaterThan(1);
+      expect(lines.at(-1)).toBe(lastLine);
+      expect(report.findings).toHaveLength(2);
+      expect(report.findings[0]).toMatchObject({
+        file: 'data/dump.sql',
+        line: crlfLineNumber,
+        column: columnOf(crlfLine, first),
+        pattern: FORGE_CLASSIC_PREFIX,
+      });
+      expect(report.findings[1]).toMatchObject({
+        file: 'data/dump.sql',
+        line: lines.length,
+        column: columnOf(lastLine, last),
+        pattern: VENDOR_KEY_PREFIX,
+      });
+      // And exactly what the in-memory reader reports over the same text.
+      expect(report.findings).toEqual(scanContent('data/dump.sql', content, ALLOWLIST));
+    },
+    30_000,
+  );
+
+  it.skipIf(!GIT_AVAILABLE)(
+    'scans a tracked symbolic link as the target text git stores, and never follows it',
+    async () => {
+      const directory = createThrowawayRepository();
+      trackFile(directory, 'docs/notes.md', '# Notes\n');
+      // A link's tracked content is its target string, so a credential there is committed.
+      mkdirSync(path.join(directory, 'config'));
+      symlinkSync(FOREIGN_CONNECTION_STRING, path.join(directory, 'config/database'));
+      // Following a link would read content that is not this repository's: the target of this
+      // one carries a credential, and the gate must not report it, because what git tracks is the
+      // path.
+      const outside = path.join(createTemporaryDirectory(), 'outside.txt');
+      writeFileSync(
+        outside,
+        `${fixtureAssignment(FORGE_CLASSIC_PREFIX + cycle(WORD_CHARS, 36))}\n`,
+      );
+      symlinkSync(outside, path.join(directory, 'docs/outside.md'));
+      symlinkSync('notes.md', path.join(directory, 'docs/link.md'));
+      execFileSync('git', ['add', '--', 'config/database', 'docs/outside.md', 'docs/link.md'], {
+        cwd: directory,
+        stdio: 'ignore',
+      });
+
+      const { exitCode, stdout } = await runCli(['--json'], { cwd: directory });
+
+      expect(exitCode).toBe(EXIT_FINDINGS);
+      const report = JSON.parse(stdout);
+      expect(report.filesTracked).toBe(4);
+      expect(report.filesScanned).toBe(4);
+      expect(report.skipped).toEqual([]);
+      expect(report.unscanned).toEqual([]);
+      expect(report.findings).toHaveLength(1);
+      expect(report.findings[0]).toMatchObject({
+        file: 'config/database',
+        line: 1,
+        column: 1,
+        rule: 'connection-string',
+        pattern: 'mysql',
+      });
+      expect(stdout).not.toContain(FOREIGN_CONNECTION_PASSWORD);
+    },
+    20_000,
+  );
+
+  it.skipIf(!GIT_AVAILABLE)(
+    'exits 2 when a symbolic link stands where git tracks a regular file or one of its directories',
+    async () => {
+      // Two regular files carrying nothing secret-shaped are tracked, then replaced in the work
+      // tree - never staged - by links to benign stand-ins: one file directly, one through its
+      // directory. Git stores those files' content, not a link's target text or the stand-in a link
+      // points at, so scanning either would certify content the check never read.
+      const directory = createThrowawayRepository();
+      trackFile(directory, 'docs/notes.md', '# Notes\n');
+      trackFile(directory, 'config/settings.md', '# Settings\n');
+      trackFile(directory, 'guides/setup.md', '# Setup\n');
+      const standIns = createTemporaryDirectory();
+      writeFileSync(path.join(standIns, 'benign.md'), '# Benign stand-in\n');
+      writeFileSync(path.join(standIns, 'setup.md'), '# Benign setup stand-in\n');
+      rmSync(path.join(directory, 'config/settings.md'));
+      symlinkSync(path.join(standIns, 'benign.md'), path.join(directory, 'config/settings.md'));
+      rmSync(path.join(directory, 'guides'), { recursive: true });
+      symlinkSync(standIns, path.join(directory, 'guides'), 'dir');
+      // The reverse mismatch is how a `core.symlinks=false` checkout stores a tracked link: a
+      // regular file holding the target text. That file is the link's content and is scanned.
+      symlinkSync('notes.md', path.join(directory, 'docs/link.md'));
+      execFileSync('git', ['add', '--', 'docs/link.md'], { cwd: directory, stdio: 'ignore' });
+      rmSync(path.join(directory, 'docs/link.md'));
+      writeFileSync(path.join(directory, 'docs/link.md'), 'notes.md');
+      const status = execFileSync('git', ['status', '--porcelain'], {
+        cwd: directory,
+        encoding: 'utf8',
+      });
+      // The fixture is what it claims to be: git itself sees each replacement as unstaged.
+      expect(status).toContain('AT config/settings.md');
+      expect(status).toContain('AD guides/setup.md');
+      expect(status).toContain('AT docs/link.md');
+
+      const { exitCode, stdout, stderr } = await runCli(['--json'], { cwd: directory });
+
+      expect(exitCode).toBe(EXIT_ERROR);
+      const report = JSON.parse(stdout);
+      expect(report.ok).toBe(false);
+      expect(report.filesTracked).toBe(4);
+      // `docs/notes.md` and the checked-out link `docs/link.md`; neither replaced file.
+      expect(report.filesScanned).toBe(2);
+      expect(report.skipped).toEqual([]);
+      expect(report.findings).toEqual([]);
+      expect(report.unscanned).toHaveLength(2);
+      const [linkedFile, linkedDirectory] = report.unscanned;
+      expect(linkedFile).toMatchObject({ file: 'config/settings.md', reason: 'wrong-type' });
+      expect(linkedFile.detail).toContain('symbolic link where git tracks a regular file');
+      expect(linkedFile.detail).toContain('index mode 100644');
+      expect(linkedFile.remedy).toContain('git checkout -- config/settings.md');
+      expect(linkedDirectory).toMatchObject({ file: 'guides/setup.md', reason: 'wrong-type' });
+      expect(linkedDirectory.detail).toContain(
+        'symbolic link at guides where git tracks a directory',
+      );
+      expect(linkedDirectory.remedy).toContain('git checkout -- guides/setup.md');
+      expect(stderr).toContain('config/settings.md');
+      expect(stderr).toContain('guides/setup.md');
+
+      // The remedy the report prints is the one that makes the file examinable again.
+      execFileSync('git', ['checkout', '--', 'config/settings.md', 'guides/setup.md'], {
+        cwd: directory,
+        stdio: 'ignore',
+      });
+      const restored = scanRepository({ cwd: directory });
+      expect(restored.exitCode).toBe(EXIT_OK);
+      expect(restored.filesScanned).toBe(4);
+      expect(restored.unscanned).toEqual([]);
+    },
+    20_000,
+  );
+
+  it.skipIf(!GIT_AVAILABLE)(
+    'exits 2 when a directory above a tracked file cannot be stat-ed',
+    async () => {
+      // Checking a file's directories for a symbolic link stats each of them. The file's own
+      // `lstat` succeeding makes a failure there a race rather than a state, so it is injected: the
+      // file is reported as unreadable, never as scanned.
+      const directory = createThrowawayRepository();
+      trackFile(directory, 'docs/notes.md', '# Notes\n');
+      trackFile(directory, 'vault/notes.md', '# Behind a directory that cannot be stat-ed\n');
+
+      await withInjectedFs(
+        (real) => ({
+          lstatSync: /** @type {typeof real.lstatSync} */ (
+            (/** @type {any} */ target, /** @type {any} */ options) => {
+              if (namesTrackedPath(target, 'vault')) {
+                throw accessDenied('lstat', target);
+              }
+              return real.lstatSync(target, options);
+            }
+          ),
+        }),
+        async (injected) => {
+          const { exitCode, stdout } = await runCli(['--json'], { cwd: directory }, injected.main);
+
+          expect(exitCode).toBe(EXIT_ERROR);
+          const report = JSON.parse(stdout);
+          expect(report.filesScanned).toBe(1);
+          expect(report.unscanned).toHaveLength(1);
+          expect(report.unscanned[0]).toMatchObject({
+            file: 'vault/notes.md',
+            reason: 'unreadable',
+          });
+          expect(report.unscanned[0].detail).toContain('EACCES');
+        },
+      );
+    },
+    20_000,
+  );
+
+  it.skipIf(!GIT_AVAILABLE)(
+    'exits 2 and names each tracked file it could not examine, while still scanning the rest',
+    async () => {
+      const directory = createThrowawayRepository();
+      trackFile(directory, 'docs/notes.md', '# Notes\n');
+      // A deletion not yet staged: tracked, but absent from the work tree.
+      trackFile(directory, 'docs/gone.md', '# Staged, then removed from the work tree\n');
+      rmSync(path.join(directory, 'docs/gone.md'), { force: true });
+      // A directory standing where git tracks a file.
+      trackFile(directory, 'docs/replaced.md', '# Replaced by a directory\n');
+      rmSync(path.join(directory, 'docs/replaced.md'), { force: true });
+      mkdirSync(path.join(directory, 'docs/replaced.md', 'nested'), { recursive: true });
+      // A credential elsewhere is still found and reported: one unexaminable file must not hide
+      // the rest of the tree.
+      const credential = FORGE_CLASSIC_PREFIX + cycle(WORD_CHARS, 36);
+      trackFile(directory, 'src/config.ts', `${fixtureAssignment(credential)}\n`);
+
+      const { exitCode, stdout, stderr } = await runCli(['--json'], { cwd: directory });
+
+      expect(exitCode).toBe(EXIT_ERROR);
+      const report = JSON.parse(stdout);
+      expect(report.ok).toBe(false);
+      expect(report.exitCode).toBe(EXIT_ERROR);
+      expect(report.filesTracked).toBe(4);
+      expect(report.filesScanned).toBe(2);
+      expect(report.skipped).toEqual([]);
+      expect(report.findings).toHaveLength(1);
+      expect(report.findings[0]).toMatchObject({ file: 'src/config.ts', rule: 'provider-key' });
+      expect(report.unscanned).toHaveLength(2);
+      const [gone, replaced] = report.unscanned;
+      expect(gone).toMatchObject({ file: 'docs/gone.md', reason: 'missing' });
+      expect(gone.remedy).toContain('git rm -- docs/gone.md');
+      expect(gone.remedy).toContain('git checkout -- docs/gone.md');
+      expect(gone.remedy).toContain('git sparse-checkout disable');
+      expect(replaced).toMatchObject({ file: 'docs/replaced.md', reason: 'wrong-type' });
+      expect(replaced.detail).toContain('directory');
+      expect(replaced.remedy).toContain('git checkout -- docs/replaced.md');
+      expect(stderr).toContain('unscanned');
+      expect(stderr).toContain('docs/gone.md');
+      expect(stderr).toContain('docs/replaced.md');
+
+      // The text report leads with them, because they void the run.
       const text = await runCli([], { cwd: directory });
-      expect(text.stdout).toContain('6 skipped');
+      expect(text.exitCode).toBe(EXIT_ERROR);
+      expect(
+        text.stdout.startsWith('check-secrets: could not examine 2 tracked files, so this run'),
+      ).toBe(true);
+      expect(text.stdout).toContain('docs/gone.md: missing:');
+      expect(text.stdout).toContain('docs/replaced.md: wrong-type:');
+      expect(text.stdout).toContain('    fix: ');
+      expect(text.stdout).toContain('2 unscanned');
+
+      // An in-process caller gets the same verdict rather than a thrown error or a pass.
+      const inProcess = scanRepository({ cwd: directory });
+      expect(inProcess.ok).toBe(false);
+      expect(inProcess.exitCode).toBe(EXIT_ERROR);
+    },
+    20_000,
+  );
+
+  it.skipIf(!GIT_AVAILABLE)(
+    'exits 2 on any account when a tracked file cannot be read, whatever its size',
+    async () => {
+      // The host that runs this suite is root, which no mode bit stops, so the refusals are
+      // injected into the gate's `node:fs` (see `withInjectedFs`): `lstat` for one file, `open`
+      // for a small one and for one large enough to be streamed.
+      const directory = createThrowawayRepository();
+      trackFile(directory, 'docs/notes.md', '# Notes\n');
+      trackFile(directory, 'docs/locked.md', '# Unreadable\n');
+      trackFile(directory, 'docs/hidden.md', '# Cannot be stat-ed\n');
+      trackFile(directory, 'data/locked.sql', '-- Unreadable dump.\n'.repeat(MAX_SCAN_BYTES / 16));
+
+      await withInjectedFs(
+        (real) => ({
+          lstatSync: /** @type {typeof real.lstatSync} */ (
+            (/** @type {any} */ target, /** @type {any} */ options) => {
+              if (namesTrackedPath(target, 'docs/hidden.md')) {
+                throw accessDenied('lstat', target);
+              }
+              return real.lstatSync(target, options);
+            }
+          ),
+          readFileSync: /** @type {typeof real.readFileSync} */ (
+            (/** @type {any} */ target, /** @type {any} */ options) => {
+              if (namesTrackedPath(target, 'docs/locked.md')) {
+                throw accessDenied('open', target);
+              }
+              return real.readFileSync(target, options);
+            }
+          ),
+          openSync: /** @type {typeof real.openSync} */ (
+            (/** @type {any} */ target, /** @type {any} */ flags, /** @type {any} */ mode) => {
+              if (
+                namesTrackedPath(target, 'docs/locked.md') ||
+                namesTrackedPath(target, 'data/locked.sql')
+              ) {
+                throw accessDenied('open', target);
+              }
+              return real.openSync(target, flags, mode);
+            }
+          ),
+        }),
+        async (injected) => {
+          const { exitCode, stdout, stderr } = await runCli(
+            ['--json'],
+            { cwd: directory },
+            injected.main,
+          );
+
+          expect(exitCode).toBe(EXIT_ERROR);
+          const report = JSON.parse(stdout);
+          expect(report.ok).toBe(false);
+          expect(report.filesScanned).toBe(1);
+          expect(report.findings).toEqual([]);
+          const byFile = new Map(
+            report.unscanned.map(
+              (/** @type {{ file: string }} */ entry) => /** @type {const} */ ([entry.file, entry]),
+            ),
+          );
+          expect([...byFile.keys()].sort()).toEqual([
+            'data/locked.sql',
+            'docs/hidden.md',
+            'docs/locked.md',
+          ]);
+          for (const entry of byFile.values()) {
+            expect(entry).toMatchObject({ reason: 'unreadable' });
+            expect(entry.detail).toContain('EACCES');
+            expect(entry.remedy).toContain('chmod');
+          }
+          expect(stderr).toContain('unscanned');
+        },
+      );
+    },
+    30_000,
+  );
+
+  it.skipIf(!GIT_AVAILABLE)(
+    'skips a submodule, whose content is another repository, and still exits 0',
+    async () => {
+      const directory = createThrowawayRepository();
+      trackFile(directory, 'docs/notes.md', '# Notes\n');
+      // A gitlink records a commit of another repository; nothing is checked out at its path.
+      execFileSync(
+        'git',
+        ['update-index', '--add', '--cacheinfo', `160000,${cycle(HEX_CHARS, 40)},vendor/sub`],
+        { cwd: directory, stdio: 'ignore' },
+      );
+      expect(existsSync(path.join(directory, 'vendor/sub'))).toBe(false);
+
+      const { exitCode, stdout, stderr } = await runCli(['--json'], { cwd: directory });
+
+      expect(exitCode).toBe(EXIT_OK);
+      expect(stderr).toBe('');
+      const report = JSON.parse(stdout);
+      expect(report.ok).toBe(true);
+      expect(report.filesTracked).toBe(2);
+      expect(report.filesScanned).toBe(1);
+      expect(report.skipped).toEqual([{ file: 'vendor/sub', reason: 'submodule' }]);
+      expect(report.unscanned).toEqual([]);
     },
     20_000,
   );
@@ -1893,4 +2710,54 @@ describe('the command line', () => {
       expect(stdout).toContain(ruleId);
     }
   });
+
+  it.skipIf(!GIT_AVAILABLE)(
+    'runs the scan when invoked through a symbolic link to the checkout',
+    () => {
+      // Node reports the module's own URL as a real path but leaves the script argument as typed,
+      // so an entry-point test that compared the two as they come would skip `main` here and exit
+      // 0 without a word: a gate that passes without looking. The checkout carries a credential,
+      // so only a scan that really ran can produce the exit code asserted below.
+      const root = createTemporaryDirectory();
+      const checkout = path.join(root, 'checkout');
+      mkdirSync(path.join(checkout, 'scripts'), { recursive: true });
+      execFileSync('git', ['init', '-q'], { cwd: checkout, stdio: 'ignore' });
+      for (const name of ['check-secrets.mjs', ALLOWLIST_FILENAME]) {
+        copyFileSync(path.join(SCRIPT_DIRECTORY, name), path.join(checkout, 'scripts', name));
+      }
+      execFileSync('git', ['add', '--', 'scripts'], { cwd: checkout, stdio: 'ignore' });
+      const credential = FORGE_CLASSIC_PREFIX + cycle(WORD_CHARS, 36);
+      trackFile(checkout, 'src/config.ts', `${fixtureAssignment(credential)}\n`);
+      const link = path.join(root, 'linked-checkout');
+      symlinkSync(checkout, link, 'dir');
+
+      // Run from a directory outside the checkout, with no git variables that could point the
+      // scan anywhere but the script's own repository.
+      const env = { ...process.env };
+      delete env.GIT_DIR;
+      delete env.GIT_WORK_TREE;
+      delete env.GIT_INDEX_FILE;
+      const result = spawnSync(
+        process.execPath,
+        [path.join(link, 'scripts', 'check-secrets.mjs'), '--json'],
+        { cwd: createTemporaryDirectory(), env, encoding: 'utf8' },
+      );
+
+      expect(result.error).toBeUndefined();
+      expect(result.status).toBe(EXIT_FINDINGS);
+      const report = JSON.parse(result.stdout);
+      expect(report.repoRoot).toBe(realpathSync(checkout));
+      expect(report.filesTracked).toBe(3);
+      expect(report.filesScanned).toBe(3);
+      expect(report.findings).toHaveLength(1);
+      expect(report.findings[0]).toMatchObject({
+        file: 'src/config.ts',
+        line: 1,
+        rule: 'provider-key',
+        pattern: FORGE_CLASSIC_PREFIX,
+      });
+      expect(result.stdout).not.toContain(credential);
+    },
+    20_000,
+  );
 });

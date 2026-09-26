@@ -8,6 +8,15 @@
  * the data provider, the actions and the theme the composition root already
  * built — to the renderer's `PanelHost`, unchanged.
  *
+ * The one thing it adds is the panel's identity. The injected provider is
+ * bound, with the renderer's `bindPanelIdentity`, to the rendered
+ * specification's own `id`, so every query a node of this panel makes names
+ * the panel it belongs to and the service answers it from the capture that
+ * panel was generated from. Without the binding a node would read live
+ * evidence — the session's open or most recent capture — and an older panel
+ * still on screen after a newer capture started would draw that capture's data
+ * under its own findings. The specification itself is not touched.
+ *
  * ## What happens one layer down, and therefore not here
  *
  * `PanelHost` already renders, for every specification it is given:
@@ -74,10 +83,11 @@
  *
  * ## Boundaries
  *
- * Presentational and pure: no state, no effect, no store access, no transport
- * (no socket, request or port, and no `DataProvider.query` call of its own —
- * every view resolves its own query through the renderer's query hook) and no
- * `chrome.*` API. It therefore renders unchanged in the panel page opened
+ * Presentational and pure: no state (its one hook is the memo that keeps the
+ * panel-bound provider's identity stable), no effect, no store access, no
+ * transport (no socket, request or port, and no `DataProvider.query` call of
+ * its own — every view resolves its own query through the renderer's query
+ * hook) and no `chrome.*` API. It therefore renders unchanged in the panel page opened
  * directly as an extension page with `chrome.devtools` undefined, which is how
  * the browser suite renders a stored specification. It provides no context,
  * because `PanelHost` provides all of them, and it wraps nothing around
@@ -95,9 +105,10 @@
  *
  * @module apps/chrome-extension/src/panel/components/PanelView
  */
-import { ErrorState, LoadingState, PanelHost } from '@debuggen/panel-renderer';
+import { bindPanelIdentity, ErrorState, LoadingState, PanelHost } from '@debuggen/panel-renderer';
 import type { DataProvider, PanelActions } from '@debuggen/panel-renderer';
 import type { PanelSpec } from '@debuggen/panel-schema';
+import { useMemo } from 'react';
 import type { ReactElement } from 'react';
 
 import type { PanelTheme } from '../theme';
@@ -132,9 +143,10 @@ export interface PanelViewError {
  * Props of {@link PanelView}.
  *
  * `dataProvider` and `actions` are built **once** by the composition root and
- * passed down; this component creates neither, and their identities must stay
- * stable across renders because `PanelHost` keys its query effects and memos on
- * them. `theme` is required even though `PanelHost` treats it as optional: the
+ * passed down; this component creates neither — it only wraps the provider,
+ * memoized, with the rendered panel's identity — and their identities must
+ * stay stable across renders because `PanelHost` keys its query effects and
+ * memos on them. `theme` is required even though `PanelHost` treats it as optional: the
  * composition root resolved it once for the whole panel document, and
  * forwarding it explicitly keeps the generated panel and the chrome around it
  * from ever rendering in different token sets.
@@ -150,7 +162,13 @@ export interface PanelViewProps {
    */
   spec: PanelSpec | undefined;
 
-  /** How the views beneath `PanelHost` resolve their data queries. Stable identity. */
+  /**
+   * How the views beneath `PanelHost` resolve their data queries. Stable
+   * identity. Bound here to the rendered specification's `id` before it
+   * reaches `PanelHost`, so every node reads the capture that panel was
+   * generated from; the provider passed in is not modified and keeps serving
+   * the composition root's live reads.
+   */
   dataProvider: DataProvider;
 
   /** What the panel's interactions do: select an event, open a source location. */
@@ -251,6 +269,19 @@ export function PanelView(props: PanelViewProps): ReactElement | null {
     id,
   } = props;
 
+  // Every node of the rendered panel reads the capture that panel was
+  // generated from: the injected provider is bound to the specification's own
+  // id, so each query it makes names this panel. Memoized on the provider and
+  // the id — before the early returns, as hooks must be — so the bound
+  // provider keeps one identity for as long as this panel is on screen (the
+  // renderer keys its query effects on it) and a newly rendered panel version
+  // gets a new one, which resolves its views again against its own capture.
+  const panelId = spec?.id;
+  const panelProvider = useMemo(
+    () => (panelId === undefined ? dataProvider : bindPanelIdentity(dataProvider, panelId)),
+    [dataProvider, panelId],
+  );
+
   // The whole render path for a panel. See the guard rails in the module
   // header: the specification is forwarded as it is — no node is filtered,
   // re-ordered or substituted, no head is added, and `meta.fallback` is left
@@ -259,7 +290,7 @@ export function PanelView(props: PanelViewProps): ReactElement | null {
     return (
       <PanelHost
         spec={spec}
-        dataProvider={dataProvider}
+        dataProvider={panelProvider}
         actions={actions}
         selectedEventId={selectedEventId}
         theme={theme}

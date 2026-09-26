@@ -28,7 +28,16 @@
  * - **The raw error is never analysis.** The rejected payload's values and the
  *   formatted issues appear in no stored panel, analysis, session record,
  *   progress row or broadcast payload; only the captured logs hold the
- *   rejection.
+ *   rejection. A terminal provider failure's own hint — unproven text quoting
+ *   a URL query value, a SQL literal and a path — reaches neither the stored
+ *   rows nor the editor's or the DevTools panel's frames nor any default-level
+ *   log record: the `failed` row shows the code's copy, and the failure's
+ *   `debug` diagnostic under the row's reference is the one place it goes.
+ * - **No log record carries the model's prose (CWE-532).** A normaliser defect
+ *   is logged by closed fields only — provenance, counts, the thrown error's
+ *   code and class — and a private sentinel written into a schema-valid answer
+ *   and into what the defective normaliser throws appears in no record the
+ *   service writes, while the validated fallback panel is still stored.
  * - **Resolvers decide, both ways.** A panel citing a trace the capture does
  *   not hold is `invalid` — not `unverifiable` — because the service hands
  *   `createEvidenceResolvers` to `SemanticValidationOptions`; and the genuine
@@ -115,8 +124,15 @@ import {
   PANEL_FAILURE_POLICY,
   createPanelValidator,
 } from '../../src/panels/validate.js';
-import type { PanelValidator } from '../../src/panels/validate.js';
+import type { PanelStructuredNormalizer, PanelValidator } from '../../src/panels/validate.js';
 import { GENERATE_PANEL_STAGE } from '../../src/pipeline/stages/generate-panel.js';
+import { LOG_ERROR_FIELD_KEY } from '../../src/logging.js';
+import {
+  FAILURE_COPY_BY_CODE,
+  STAGE_FAILURE_DIAGNOSTIC_MESSAGE,
+  STAGE_FAILURE_LOG_MESSAGE,
+  publicFailureCopy,
+} from '../../src/sessions/progress.js';
 import {
   STAGE_STATUS,
   allowedTransitions,
@@ -182,14 +198,58 @@ const INSTALLED_STATUSES: readonly SessionStatus[] = Object.freeze([
 /** The statuses a completed capture settles in once analysis and panel generation have run. */
 const SETTLED_STATUSES: readonly SessionStatus[] = Object.freeze(['generated', 'failed']);
 
-/** The provider failure the terminal scenario scripts; passed through unchanged (AAP §0.5.5). */
+/**
+ * The provider failure the terminal scenario scripts. Its code is passed
+ * through (AAP §0.5.5); its own text stays in the service log, and the
+ * `failed` row shows the public copy of that code instead (CWE-209).
+ */
 const PROVIDER_OUTAGE_MESSAGE = 'The scripted panel provider is unavailable for this capture.';
+
+/**
+ * The private fragments of the provider's own recovery hint in the terminal
+ * scenario: a URL query value, an inline SQL literal and an absolute path —
+ * what a hint propagated from a dependency can quote.
+ */
+const PROVIDER_OUTAGE_HINT_FRAGMENTS: readonly string[] = Object.freeze([
+  'zz-outage-query-value',
+  'zz-outage-sql-literal',
+  '/home/dev/zz-outage-project/src/billing.ts',
+]);
+
+/**
+ * That hint. It reads like a recovery step, and no product builder registered
+ * it, so the `failed` row shows the code's own hint instead (CWE-209) and only
+ * the failure's `debug` diagnostic carries it.
+ */
+const PROVIDER_OUTAGE_HINT =
+  'Retry after https://provider.test/v1/status?account=zz-outage-query-value answers, ' +
+  "once SELECT plan FROM billing WHERE owner = 'zz-outage-sql-literal' succeeds " +
+  'in /home/dev/zz-outage-project/src/billing.ts.';
+
+/** The diagnostic reference at the end of a `failed` row's detail. */
+const FAILED_ROW_REF_PATTERN = /\(error code: [A-Z][A-Z_]+, ref: ([A-Za-z0-9][A-Za-z0-9_-]*)\)$/u;
 
 /**
  * A node type outside the catalog: the one state a parsed authoring payload can
  * never hold, injected past the authoring schema to simulate a normaliser defect.
  */
 const UNCATALOGUED_NODE_TYPE = 'uncatalogued-node-type';
+
+/**
+ * A private marker standing in for developer source or personal data a model
+ * echoed into its panel prose (CWE-532): planted in a schema-valid answer's
+ * title and summary, and in what a defective normaliser throws, then required
+ * to appear in no log record at any level.
+ *
+ * Assembled from fragments, lower-case and hyphenated, so
+ * `scripts/check-secrets.mjs` — which scans this tracked file — cannot read it
+ * as credential material and the service logger's content scrub has no pattern
+ * to redact it by: its absence is evidence of the sink being closed, never of a
+ * scrub having masked it. It also has the shape of a node type name, so the
+ * real `normalizePanel` quotes it verbatim in the error it throws for an
+ * uncatalogued node — which is how the thrown message comes to carry it.
+ */
+const PRIVATE_SENTINEL = ['zzq', 'unlogged', 'panel', 'marker'].join('-');
 
 /**
  * The service's log messages this suite reads its evidence from. None is
@@ -210,7 +270,11 @@ const LOG = Object.freeze({
   semanticPassed: 'A generated panel passed semantic validation.',
   /** `model-provider/structured.ts` — the repair budget spent on an authoring-schema failure. */
   budgetSpent: 'Structured output failed validation and the repair budget is spent',
-  /** `model-provider/structured.ts` — a normaliser throw, logged with the parsed input. */
+  /**
+   * `model-provider/structured.ts` — a normaliser throw, logged with closed
+   * fields only: provenance, counts, the thrown error's code and class, never
+   * the parsed input or the thrown message.
+   */
   normaliserThrew: 'The structured output normaliser threw; rejecting without a repair',
 });
 
@@ -420,15 +484,21 @@ function boundedSummary(summary: CaptureSummary): CaptureSummary {
  * catalog — a state `panelSpecInputSchema` can never produce. Handing it to the
  * real normaliser is how the suite reproduces a normaliser defect through the
  * `StructuredOptions.normalize` seam without any fake normaliser logic.
+ *
+ * @param input The parsed authoring payload; copied, never mutated.
+ * @param type The uncatalogued type the first node is given.
  */
-function withUncataloguedFirstNode(input: PanelSpecInput): PanelSpecInput {
+function withUncataloguedFirstNode(
+  input: PanelSpecInput,
+  type: string = UNCATALOGUED_NODE_TYPE,
+): PanelSpecInput {
   const corrupted: unknown = JSON.parse(JSON.stringify(input));
   const layout = isRecord(corrupted) ? corrupted['layout'] : undefined;
   const first: unknown = Array.isArray(layout) ? (layout as readonly unknown[])[0] : undefined;
   if (!isRecord(first)) {
     throw new Error('The authoring payload has no first layout node to corrupt.');
   }
-  Object.assign(first, { type: UNCATALOGUED_NODE_TYPE });
+  Object.assign(first, { type });
   // The one deliberate lie in this suite: the value no longer satisfies the
   // type it claims, which is precisely the product defect being simulated.
   return corrupted as PanelSpecInput;
@@ -784,21 +854,53 @@ interface DefectRun {
   readonly scripted: ScriptedProvider;
   /** How many times the structured-output loop invoked the normaliser. */
   readonly normaliserCalls: number;
+  /** Every value the defective normaliser threw, in order, exactly as thrown. */
+  readonly thrown: readonly unknown[];
   /** The validated analysis the generation was handed. */
   readonly analysis: AnalysisResult;
+}
+
+/** How one defective generation is provoked. */
+interface NormaliserDefect {
+  /** The panel stage's one scripted answer: a schema-valid authoring payload. */
+  readonly answer: ScriptedStep;
+  /**
+   * The defective normaliser. It is handed the parsed answer and the
+   * validator's real normalise-then-validate callback, and must throw.
+   */
+  readonly normalize: (input: PanelSpecInput, real: PanelStructuredNormalizer) => PanelSpec;
+}
+
+/**
+ * The default defect: the valid authored payload, whose first node the real
+ * normaliser is then handed under a type the catalog does not know.
+ */
+function uncataloguedDefect(): NormaliserDefect {
+  return {
+    answer: scriptedFixtureStep(PANEL_PROMPT_STAGE, VALID_PANEL),
+    normalize: (input, real) => real(withUncataloguedFirstNode(input)),
+  };
 }
 
 /**
  * Generates one panel for a scenario's stored capture through the panel
  * subsystem composed exactly as `startService` composes it — the same store,
  * evidence resolvers, capture summaries, validator, fallback builder and
- * prompts — except that the validator's normaliser callback hands the real
- * `normalizePanel` an input whose first node the catalog does not know. The
- * normaliser then throws its own exhaustiveness error on input the authoring
- * schema had accepted: the product defect AAP §0.5.3 says is logged with the
- * input and never retried against the model.
+ * prompts — except that the validator's normaliser callback is replaced by
+ * `defect.normalize`. By default that hands the real `normalizePanel` an input
+ * whose first node the catalog does not know, and the normaliser throws its own
+ * exhaustiveness error on input the authoring schema had accepted: the product
+ * defect AAP §0.5.3 says is logged and never retried against the model. The
+ * record it is logged with carries closed fields only — never the parsed input,
+ * whose prose can echo developer source (CWE-532).
+ *
+ * @param run The scenario whose stored capture and validated analysis the panel answers for.
+ * @param defect The answer and the defect; {@link uncataloguedDefect} when omitted.
  */
-async function runNormaliserDefect(run: ScenarioRun): Promise<DefectRun> {
+async function runNormaliserDefect(
+  run: ScenarioRun,
+  defect: NormaliserDefect = uncataloguedDefect(),
+): Promise<DefectRun> {
   const logger = harness.logger.root;
   const facts = createAnalysisFacts({
     evidence: harness.repos.telemetry,
@@ -814,18 +916,26 @@ async function runNormaliserDefect(run: ScenarioRun): Promise<DefectRun> {
   const validator = createPanelValidator({ evidence: facts, captures: summarizer, logger });
 
   let normaliserCalls = 0;
+  const thrown: unknown[] = [];
   const defective: PanelValidator = {
     ...validator,
     buildStructuredOptionsNormalizer: (analysis, context) => {
-      const normalize = validator.buildStructuredOptionsNormalizer(analysis, context);
+      const real = validator.buildStructuredOptionsNormalizer(analysis, context);
       return (input: PanelSpecInput): PanelSpec => {
         normaliserCalls += 1;
-        return normalize(withUncataloguedFirstNode(input));
+        try {
+          return defect.normalize(input, real);
+        } catch (failure) {
+          // Recorded, then rethrown unchanged: the structured-output loop must
+          // see exactly what the defect threw.
+          thrown.push(failure);
+          throw failure;
+        }
       };
     },
   };
 
-  const scripted = createScriptedProvider([scriptedFixtureStep(PANEL_PROMPT_STAGE, VALID_PANEL)]);
+  const scripted = createScriptedProvider([defect.answer]);
   const generator = createPanelGenerator({
     provider: scripted.provider,
     prompts: createPromptLoader({ promptsDir: PROMPTS_DIR, env: {}, logger }),
@@ -843,7 +953,7 @@ async function runNormaliserDefect(run: ScenarioRun): Promise<DefectRun> {
     question: QUESTION,
     analysis,
   });
-  return Object.freeze({ result, scripted, normaliserCalls, analysis });
+  return Object.freeze({ result, scripted, normaliserCalls, thrown, analysis });
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -866,6 +976,51 @@ function parsedValidPanel(): PanelSpecInput {
     throw new Error(`${VALID_PANEL} no longer parses through the authoring schema.`);
   }
   return parsed.data;
+}
+
+/**
+ * The valid payload with {@link PRIVATE_SENTINEL} written into its free prose —
+ * the panel title, a string summary and every node title — and parsed again,
+ * so the answer is one the authoring schema accepts and the normaliser is
+ * handed: the model echoing private text into a panel it otherwise got right.
+ */
+function privateAnswer(): PanelSpecInput {
+  const withSentinel = (value: unknown): unknown => {
+    if (Array.isArray(value)) {
+      return (value as readonly unknown[]).map(withSentinel);
+    }
+    if (!isRecord(value)) {
+      return value;
+    }
+    return Object.fromEntries(
+      Object.entries(value).map(([key, element]) => [
+        key,
+        key === 'title' && typeof element === 'string'
+          ? `${element} (${PRIVATE_SENTINEL})`
+          : withSentinel(element),
+      ]),
+    );
+  };
+  const authored = withSentinel({
+    ...parsedValidPanel(),
+    summary: `Most of the interaction time is spent reading ${PRIVATE_SENTINEL}.`,
+  });
+  const parsed = panelSpecInputSchema.safeParse(authored);
+  if (!parsed.success) {
+    throw new Error('The private answer no longer parses through the authoring schema.');
+  }
+  return parsed.data;
+}
+
+/** The messages along a thrown value's `cause` chain, outermost first. */
+function causeMessages(thrown: unknown): readonly string[] {
+  const messages: string[] = [];
+  let current: unknown = thrown;
+  for (let depth = 0; depth < 8 && current instanceof Error; depth += 1) {
+    messages.push(current.message);
+    current = current.cause;
+  }
+  return messages;
 }
 
 /** The statements an authored summary writes in its fact and cause lists. */
@@ -957,6 +1112,7 @@ interface ProgressLine {
   readonly stage: string;
   readonly status: string;
   readonly message: string;
+  readonly detail?: unknown;
 }
 
 /**
@@ -1474,12 +1630,57 @@ describe('the three authored panel payloads, each answered for a real capture', 
  * A terminal rejection, a normaliser defect, and the edges of the state machine
  * ---------------------------------------------------------------------------------------------- */
 
-/** A provider outage at the panel stage: the one rejection with no panel to show (AAP §0.5.5). */
+/**
+ * A provider outage at the panel stage: the one rejection with no panel to show
+ * (AAP §0.5.5). It carries a private hint of its own, which no surface may show.
+ */
 function providerOutage(): ScriptedStep {
   return {
     stage: PANEL_PROMPT_STAGE,
-    failure: new DebuggenError('MODEL_UNAVAILABLE', PROVIDER_OUTAGE_MESSAGE),
+    failure: new DebuggenError('MODEL_UNAVAILABLE', PROVIDER_OUTAGE_MESSAGE, {
+      hint: PROVIDER_OUTAGE_HINT,
+    }),
   };
+}
+
+/**
+ * The private answer, whose first node the real normaliser is then handed
+ * under the sentinel as its type: `normalizePanel` quotes a type-shaped name
+ * verbatim, so the error it throws — which the validator keeps as the cause of
+ * its own `DebuggenError` — carries the sentinel.
+ */
+function quotingDefect(): NormaliserDefect {
+  return {
+    answer: { stage: PANEL_PROMPT_STAGE, raw: privateAnswer() },
+    normalize: (input, real) => real(withUncataloguedFirstNode(input, PRIVATE_SENTINEL)),
+  };
+}
+
+/**
+ * The private answer, and a normaliser whose defect echoes the model's own
+ * title into the message of the native error it throws.
+ */
+function echoingDefect(): NormaliserDefect {
+  return {
+    answer: { stage: PANEL_PROMPT_STAGE, raw: privateAnswer() },
+    normalize: (input) => {
+      throw new Error(`The panel normaliser could not place "${input.title}".`);
+    },
+  };
+}
+
+/** A record's fields without its error field: the part no serializer rewrites. */
+function outsideErrorField(fields: Readonly<Record<string, unknown>>): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(fields).filter(([key]) => key !== LOG_ERROR_FIELD_KEY));
+}
+
+/** The error field of a captured record, as the service's serializer wrote it. */
+function errorFieldOf(record: CapturedLogRecord): Readonly<Record<string, unknown>> {
+  const value = record.fields[LOG_ERROR_FIELD_KEY];
+  if (!isRecord(value)) {
+    throw new Error(`The "${record.message}" record has no error field.`);
+  }
+  return value;
 }
 
 describe('a terminal rejection and a normaliser defect', () => {
@@ -1488,6 +1689,10 @@ describe('a terminal rejection and a normaliser defect', () => {
   let outagePanels: readonly PanelSpec[];
   let defective: ScenarioRun;
   let defect: DefectRun;
+  /** A third outage session, answered by the two defects that carry the private sentinel. */
+  let privately: ScenarioRun;
+  let quoted: DefectRun;
+  let echoed: DefectRun;
 
   beforeAll(async () => {
     outage = await runScenario({
@@ -1507,7 +1712,18 @@ describe('a terminal rejection and a normaliser defect', () => {
       script: [providerOutage()],
     });
     defect = await runNormaliserDefect(defective);
-  }, 2 * SCENARIO_TIMEOUT_MS);
+
+    // A third, so the private defects' panels never share a session with the
+    // assertions above that expect exactly one.
+    privately = await runScenario({
+      label: 'private',
+      tabId: 16,
+      eventTag: 'pp',
+      script: [providerOutage()],
+    });
+    quoted = await runNormaliserDefect(privately, quotingDefect());
+    echoed = await runNormaliserDefect(privately, echoingDefect());
+  }, 3 * SCENARIO_TIMEOUT_MS);
 
   it('leaves the session failed at generate-panel, with no panel and never generated', () => {
     expect(outage.final.status).toBe('failed');
@@ -1528,19 +1744,95 @@ describe('a terminal rejection and a normaliser defect', () => {
     expect(bannerRows(outage)).toHaveLength(0);
 
     // The failure names its stage: stored once, and pushed to both surfaces.
+    // Its row is the public copy of its stage and code, never the provider's
+    // own text, and its detail names the code and a diagnostic reference that
+    // the one local log record of the failure carries too.
     const isPanelFailure = isLine(GENERATE_PANEL_STAGE, 'failed');
     const failedRow = single(
       storedProgress(outage.sessionId).filter(isPanelFailure),
       'failed generate-panel progress row',
     );
-    expect(failedRow.message).toContain(PROVIDER_OUTAGE_MESSAGE);
+    expect(failedRow.message).toBe(
+      publicFailureCopy(GENERATE_PANEL_STAGE, 'MODEL_UNAVAILABLE').message,
+    );
+    expect(failedRow.message).not.toContain(PROVIDER_OUTAGE_MESSAGE);
+    const detail = typeof failedRow.detail === 'string' ? failedRow.detail : '';
+    expect(detail).not.toContain(PROVIDER_OUTAGE_MESSAGE);
+    expect(detail).toContain('error code: MODEL_UNAVAILABLE');
+    const ref = FAILED_ROW_REF_PATTERN.exec(detail)?.[1];
+    expect(ref, detail).toBeDefined();
+    // The provider's own hint is unproven, so the row's next step is the code's copy.
+    expect(detail).toBe(
+      `${FAILURE_COPY_BY_CODE.MODEL_UNAVAILABLE.hint} (error code: MODEL_UNAVAILABLE, ref: ${String(ref)})`,
+    );
+    const failureLog = logFor(outage.sessionId, STAGE_FAILURE_LOG_MESSAGE);
+    expect(failureLog.level).toBe('warn');
+    expect(failureLog.fields['ref']).toBe(ref);
+    expect(failureLog.fields['code']).toBe('MODEL_UNAVAILABLE');
+    expect(failureLog.fields['stage']).toBe(GENERATE_PANEL_STAGE);
+    expect(failureLog.fields['hintSource']).toBe('code');
     for (const client of [outage.editor, outage.devtools]) {
       expect(
         progressRows(client, outage.sessionId).some(
-          (row) => isPanelFailure(row) && row.message === failedRow.message,
+          (row) =>
+            isPanelFailure(row) && row.message === failedRow.message && row.detail === detail,
         ),
       ).toBe(true);
     }
+  });
+
+  it("keeps the provider's private hint off both surfaces and the default-level log, under a debug diagnostic", () => {
+    // Every surface: the persisted rows and record, and every frame the editor
+    // and the DevTools panel received for the session.
+    const presented = haystackOf(...presentedArtifacts(outage));
+    const updates = haystackOf(
+      ...[outage.editor, outage.devtools].flatMap((client) =>
+        sessionUpdates(client, outage.sessionId).map(({ message }) => message.payload),
+      ),
+    );
+    for (const fragment of [PROVIDER_OUTAGE_HINT, ...PROVIDER_OUTAGE_HINT_FRAGMENTS]) {
+      expect(presented, `a presented artifact carries ${fragment}`).not.toContain(fragment);
+      expect(updates, `a session.updated frame carries ${fragment}`).not.toContain(fragment);
+    }
+    expect(
+      progressRows(outage.devtools, outage.sessionId).some(isLine(GENERATE_PANEL_STAGE, 'failed')),
+    ).toBe(true);
+
+    // The warn record is written at the default level: neither its fields nor
+    // its error carry the hint, and its line quotes none of it.
+    const failureLog = logFor(outage.sessionId, STAGE_FAILURE_LOG_MESSAGE);
+    expect(errorFieldOf(failureLog)['hint']).toBeUndefined();
+    for (const fragment of PROVIDER_OUTAGE_HINT_FRAGMENTS) {
+      expect(failureLog.line).not.toContain(fragment);
+    }
+
+    // No record of the session, at any level, carries the hint outside its error field.
+    const sessionRecords = harness.logger.records.filter(
+      (record) => record.fields['sessionId'] === outage.sessionId,
+    );
+    expect(sessionRecords.length).toBeGreaterThan(0);
+    for (const record of sessionRecords) {
+      const outside = JSON.stringify(outsideErrorField(record.fields));
+      for (const fragment of PROVIDER_OUTAGE_HINT_FRAGMENTS) {
+        expect(outside, `the "${record.message}" record carries ${fragment}`).not.toContain(
+          fragment,
+        );
+      }
+    }
+
+    // The reference the row shows leads to the debug diagnostic, which holds
+    // the failure's own message and hint as the serializer emits them there.
+    const twin = logFor(outage.sessionId, STAGE_FAILURE_DIAGNOSTIC_MESSAGE);
+    expect(twin.level).toBe('debug');
+    expect(twin.fields).toMatchObject({
+      ref: failureLog.fields['ref'],
+      code: 'MODEL_UNAVAILABLE',
+      stage: GENERATE_PANEL_STAGE,
+    });
+    const diagnostic = errorFieldOf(twin);
+    expect(diagnostic).toMatchObject({ type: 'DebuggenError', code: 'MODEL_UNAVAILABLE' });
+    expect(String(diagnostic['message'])).toContain('scripted panel provider is unavailable');
+    expect(typeof diagnostic['hint']).toBe('string');
   });
 
   it('refuses every path to generated that lacks a validated panel', () => {
@@ -1565,7 +1857,7 @@ describe('a terminal rejection and a normaliser defect', () => {
     }
   });
 
-  it('rejects a normaliser defect without a re-prompt, logs its input and falls back', () => {
+  it('rejects a normaliser defect without a re-prompt, logs closed fields and never its input, and falls back', () => {
     const generated = unwrap(defect.result, 'the defective generation');
 
     expect(generated.fallback).toBe(true);
@@ -1581,8 +1873,13 @@ describe('a terminal rejection and a normaliser defect', () => {
     const threw = logFor(defective.sessionId, LOG.normaliserThrew);
     expect(threw.level).toBe('error');
     expect(threw.fields).toMatchObject({ reason: 'normalize', attempts: 1, repairs: 0 });
-    // Logged with the input: the authoring payload the schema had accepted.
-    expect(threw.fields['input']).toEqual(parsedValidPanel());
+    // Closed fields only: the thrown error's own code and the class the
+    // validator recorded on it. Never the authoring payload the schema had
+    // accepted, whose prose can echo developer source (CWE-532), and never the
+    // thrown message.
+    expect(threw.fields).toMatchObject({ code: 'INTERNAL', failureClass: 'normalize' });
+    expect(Object.hasOwn(threw.fields, 'input')).toBe(false);
+    expect(Object.hasOwn(threw.fields, 'error')).toBe(false);
     expect(logFor(defective.sessionId, LOG.productDefect).fields).toMatchObject({
       failureClass: 'normalize',
       productBug: true,
@@ -1594,6 +1891,64 @@ describe('a terminal rejection and a normaliser defect', () => {
     expectFallbackPanel(panel, defect.analysis);
     const drawnTypes: readonly string[] = nodesOf(panel).map(({ node }) => node.type);
     expect(drawnTypes).not.toContain(UNCATALOGUED_NODE_TYPE);
+  });
+
+  it('keeps a private sentinel in the panel answer and the thrown message out of every log record, and still falls back', () => {
+    // Not vacuous: each defect was handed the schema-valid private answer after
+    // one provider call, and threw the sentinel — the quoting defect on the
+    // cause chain of the validator's error, the echoing one in its own message.
+    for (const run of [quoted, echoed]) {
+      expect(panelCalls(run.scripted)).toHaveLength(1);
+      expect(run.scripted.remaining()).toBe(0);
+      expect(run.normaliserCalls).toBe(1);
+      expect(run.thrown).toHaveLength(1);
+      expect(causeMessages(run.thrown[0]).some((line) => line.includes(PRIVATE_SENTINEL))).toBe(
+        true,
+      );
+    }
+    expect(DebuggenError.is(quoted.thrown[0])).toBe(true);
+    expect(causeMessages(echoed.thrown[0])[0]).toContain(PRIVATE_SENTINEL);
+
+    // Every record the service wrote, at every level it emits (the harness runs
+    // it at `debug`, its lowest), searched as the exact line pino wrote.
+    expect(harness.logger.records.length).toBeGreaterThan(0);
+    const leaking = harness.logger.records
+      .filter((record) => record.line.includes(PRIVATE_SENTINEL))
+      .map((record) => `${record.level}: ${record.message}`);
+    expect(leaking).toEqual([]);
+
+    // The two normaliser records are still written, at error, closed: the
+    // validator's `DebuggenError` by its code and class, the native error as
+    // `INTERNAL` with no class.
+    const threw = logsFor(privately.sessionId, LOG.normaliserThrew);
+    expect(threw.map((record) => record.level)).toEqual(['error', 'error']);
+    for (const record of threw) {
+      expect(record.fields).toMatchObject({ reason: 'normalize', attempts: 1, repairs: 0 });
+      expect(record.fields['code']).toBe('INTERNAL');
+      expect(Object.hasOwn(record.fields, 'input')).toBe(false);
+      expect(Object.hasOwn(record.fields, 'error')).toBe(false);
+    }
+    expect(threw.map((record) => record.fields['failureClass'])).toEqual(['normalize', undefined]);
+    expect(logsFor(privately.sessionId, LOG.productDefect)).toHaveLength(2);
+
+    // What the developer sees is unchanged: the visible, validated fallback,
+    // stored once per generation and free of the sentinel.
+    const panels = storedPanels(privately.sessionId);
+    expect(panels).toEqual([
+      unwrap(quoted.result, 'the quoting defect').panel,
+      unwrap(echoed.result, 'the echoing defect').panel,
+    ]);
+    for (const run of [quoted, echoed]) {
+      const generated = unwrap(run.result, `the ${run === quoted ? 'quoting' : 'echoing'} defect`);
+      expect(generated.fallback).toBe(true);
+      expect(generated.fallbackReason).toBe('normalize');
+      expect(generated.attempts).toBe(1);
+      expect(generated.repairs).toBe(0);
+    }
+    for (const panel of panels) {
+      expectFallbackPanel(panel, quoted.analysis);
+      expect(haystackOf(panel)).not.toContain(PRIVATE_SENTINEL);
+    }
   });
 
   it('admits the fallback of a normaliser defect through the generated guard', () => {

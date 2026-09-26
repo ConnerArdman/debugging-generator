@@ -1,7 +1,9 @@
 /**
- * The byte-size formatters of `utils/format`: the split form a metric tile
- * renders as a figure and a unit, and the joined form every other surface
- * shows.
+ * `utils/format`: the byte-size formatters, and the label fitting every SVG
+ * view places its labels with.
+ *
+ * The byte-size formatters are the split form a metric tile renders as a
+ * figure and a unit, and the joined form every other surface shows.
  *
  * Two properties are pinned. The split form answers with the same
  * discriminated shape as the duration split, so a caller styles the unit on
@@ -12,7 +14,21 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { NOT_AVAILABLE_LABEL, formatBytes, formatBytesParts, formatMetric } from './format';
+import {
+  DEFAULT_LABEL_FONT_SIZE,
+  ELLIPSIS,
+  ESTIMATE_NARROW_ADVANCE_EM,
+  ESTIMATE_WIDE_ADVANCE_EM,
+  NOT_AVAILABLE_LABEL,
+  createEstimateMeasure,
+  estimateTextWidth,
+  fitTextToWidth,
+  formatBytes,
+  formatBytesParts,
+  formatMetric,
+  splitGraphemes,
+} from './format';
+import type { TextMeasure } from './format';
 
 /** One kilobyte on the decimal (SI) scale the formatter uses. */
 const KB = 1000;
@@ -122,5 +138,111 @@ describe('formatBytes', () => {
     expect(measured.available).toBe(true);
     expect(unmeasured.text).toBe(NOT_AVAILABLE_LABEL);
     expect(unmeasured.available).toBe(false);
+  });
+});
+
+/*
+ * Label fitting in logical units: the deterministic advance estimate every SVG
+ * view fits its labels with, and the grapheme-safe fit itself. The fitting
+ * cases use an exact, hand-written measure — ten units per grapheme — so every
+ * expected string is derivable by hand.
+ */
+
+/** Ten units per grapheme: every fit below is arithmetic. */
+const tenPerGrapheme: TextMeasure = (text) => splitGraphemes(text).length * 10;
+
+describe('splitGraphemes', () => {
+  it('keeps an emoji, a flag and an accented letter whole', () => {
+    expect(splitGraphemes('a\u{1F680}b')).toEqual(['a', '\u{1F680}', 'b']);
+    expect(splitGraphemes('\u{1F1EF}\u{1F1F5}x')).toEqual(['\u{1F1EF}\u{1F1F5}', 'x']);
+    expect(splitGraphemes('e\u0301z')).toEqual(['e\u0301', 'z']);
+  });
+
+  it('answers the same graphemes on every call', () => {
+    expect(splitGraphemes('ab\u{1F680}')).toEqual(splitGraphemes('ab\u{1F680}'));
+    expect(splitGraphemes('')).toEqual([]);
+  });
+});
+
+describe('estimateTextWidth', () => {
+  it('advances 0.6 em per narrow grapheme and 1.25 em per wide one', () => {
+    expect(estimateTextWidth('abcd', 10)).toBeCloseTo(4 * ESTIMATE_NARROW_ADVANCE_EM * 10);
+    expect(estimateTextWidth('a\u{1F680}', 10)).toBeCloseTo(
+      (ESTIMATE_NARROW_ADVANCE_EM + ESTIMATE_WIDE_ADVANCE_EM) * 10,
+    );
+    expect(estimateTextWidth('\u6f22\u5b57', 10)).toBeCloseTo(2 * ESTIMATE_WIDE_ADVANCE_EM * 10);
+  });
+
+  it('assumes the default label size for an unusable font size', () => {
+    expect(estimateTextWidth('ab', Number.NaN)).toBeCloseTo(
+      2 * ESTIMATE_NARROW_ADVANCE_EM * DEFAULT_LABEL_FONT_SIZE,
+    );
+    expect(createEstimateMeasure(-1)('ab')).toBeCloseTo(
+      2 * ESTIMATE_NARROW_ADVANCE_EM * DEFAULT_LABEL_FONT_SIZE,
+    );
+    expect(createEstimateMeasure()('ab')).toBeCloseTo(
+      2 * ESTIMATE_NARROW_ADVANCE_EM * DEFAULT_LABEL_FONT_SIZE,
+    );
+  });
+});
+
+describe('fitTextToWidth', () => {
+  it('returns the whole text when it fits', () => {
+    expect(fitTextToWidth('query', 50, tenPerGrapheme)).toEqual({
+      text: 'query',
+      width: 50,
+      truncated: false,
+    });
+  });
+
+  it('keeps the longest prefix that fits with its ellipsis', () => {
+    expect(fitTextToWidth('abcdefghij', 55, tenPerGrapheme)).toEqual({
+      text: `abcd${ELLIPSIS}`,
+      width: 50,
+      truncated: true,
+    });
+  });
+
+  it('never splits an emoji and never exceeds the width, even for a long hostile name', () => {
+    const hostile = `${'span name '.repeat(24)}\u{1F680} tail`;
+    const fit = fitTextToWidth(hostile, 916, tenPerGrapheme);
+
+    expect(fit?.truncated).toBe(true);
+    expect(fit?.text.endsWith(ELLIPSIS)).toBe(true);
+    expect(fit?.width).toBeLessThanOrEqual(916);
+    expect(tenPerGrapheme(fit?.text ?? '')).toBe(fit?.width);
+    expect(splitGraphemes(fit?.text ?? '').every((g) => g !== '\uD83D')).toBe(true);
+  });
+
+  it('trims whitespace before the ellipsis', () => {
+    expect(fitTextToWidth('ab   cdefgh', 60, tenPerGrapheme)?.text).toBe(`ab${ELLIPSIS}`);
+  });
+
+  it('draws nothing when not even the shortest acceptable prefix fits', () => {
+    expect(fitTextToWidth('abcdef', 15, tenPerGrapheme)).toBeUndefined();
+    expect(fitTextToWidth('abcdef', 30, tenPerGrapheme, { minGraphemes: 3 })).toBeUndefined();
+    expect(fitTextToWidth('abcdef', 40, tenPerGrapheme, { minGraphemes: 3 })?.text).toBe(
+      `abc${ELLIPSIS}`,
+    );
+  });
+
+  it('draws nothing for empty text or an unusable width', () => {
+    expect(fitTextToWidth('', 100, tenPerGrapheme)).toBeUndefined();
+    expect(fitTextToWidth('abc', 0, tenPerGrapheme)).toBeUndefined();
+    expect(fitTextToWidth('abc', Number.NaN, tenPerGrapheme)).toBeUndefined();
+  });
+
+  it('treats a measure that answers NaN as never fitting', () => {
+    expect(fitTextToWidth('abc', 100, () => Number.NaN)).toBeUndefined();
+  });
+
+  it('fits with the estimate identically on every call, so a chart is a pure function of its data', () => {
+    const measure = createEstimateMeasure(DEFAULT_LABEL_FONT_SIZE);
+    const room = estimateTextWidth('abcdef', DEFAULT_LABEL_FONT_SIZE);
+
+    expect(fitTextToWidth('abcdefghijkl', room, measure)).toEqual(
+      fitTextToWidth('abcdefghijkl', room, measure),
+    );
+    expect(fitTextToWidth('abcdef', room, measure)?.truncated).toBe(false);
   });
 });

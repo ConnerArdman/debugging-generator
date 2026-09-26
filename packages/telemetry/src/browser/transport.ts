@@ -5,41 +5,99 @@
  * Every other module in this folder observes one thing — an interaction, a
  * React commit, a request, a performance entry, an error, a state
  * transition — builds an {@link EventDraft} for it and hands that draft to
- * {@link emit}. Nothing else in the agent touches `window.postMessage`, an
- * event id, the producer id, the `tier` field or the per-producer sequence
- * number. That concentration is the point: a producer cannot get the stamping
- * contract wrong if it never performs it, and a sibling module that assigns
- * `producerId`, `seq`, `tier` or an id of its own is a bug to be removed
- * rather than a style choice.
+ * {@link emit}. Nothing else in the agent touches the page channel, an event
+ * id, the producer id, the `tier` field, the per-producer sequence number or
+ * the clock offset. That concentration is the point: a producer cannot get the
+ * stamping contract wrong if it never performs it, and a sibling module that
+ * assigns `producerId`, `seq`, `tier`, `clockOffsetMs` or an id of its own is
+ * a bug to be removed rather than a style choice.
  *
  * ## The page↔bridge channel (this module defines it)
  *
  * The agent runs in the **MAIN world** of the inspected page and has no
  * extension APIs at all: no `chrome.runtime`, no socket, no storage. Its only
  * neighbour is the isolated-world content script
- * (`apps/chrome-extension/src/content/bridge.ts`), which shares the page's
- * `window` and therefore its `message` event loop, and which does hold a
- * `chrome.runtime` port to the service worker. Both sides of that channel are
- * defined here, in one frame shape and two closed type vocabularies, because
- * the bridge and the service worker are written against this file.
+ * (`apps/chrome-extension/src/content/bridge.ts`), which shares the page's DOM
+ * — but not its JavaScript realm — and which does hold a `chrome.runtime` port
+ * to the service worker. Both sides of the channel are defined here, in one
+ * frame shape and two closed type vocabularies, because the bridge
+ * (`apps/chrome-extension/src/shared/messages.ts` mirrors every literal below)
+ * and the service worker are written against this file.
+ *
+ * ### Version 3: a detached node, never the window
+ *
+ * The channel is **one DOM element** this module creates per document — with
+ * the `Document.prototype.createElement` it captured when it was evaluated —
+ * and never inserts into the document, never stores on a global and never
+ * publishes on `__DEBUGGEN__`. Every frame is a `CustomEvent` dispatched **on
+ * that node**. A node with no parent has no propagation path: an event
+ * dispatched on it reaches the listeners registered on that very node and
+ * nothing else — not `window`, not `document`, not a capture-phase listener a
+ * page installed anywhere. So a script can observe a frame, or inject one,
+ * only by holding a reference to the node, and exactly one reference is ever
+ * handed out.
  *
  * ```text
- * page agent  --window.postMessage({source:'debuggen-agent',version:2,...},'/')-->  bridge
- * page agent  <--window.postMessage({source:'debuggen-bridge',version:2,token,...},'/')-- bridge
- *                                                                                     |
- *                                             chrome.runtime port (the bridge's job)  v
- *                                                                          service worker
- *                                                          (wraps batches into protocol
- *                                                           envelopes and adds tabId)
+ * document_start, MAIN world                    document_start, ISOLATED world
+ * ──────────────────────────                    ──────────────────────────────
+ * agent.iife.js evaluated: Reflect.apply, the
+ *   EventTarget methods, CustomEvent,
+ *   MouseEvent, the detail getter,
+ *   preventDefault, JSON and createElement
+ *   are captured
+ * subscribe(): node = createElement('div')
+ *   (detached; never inserted)
+ *   node   listens for 'debuggen-bridge-frame'
+ *   window listens for 'debuggen-bridge-handshake'
+ *                                               bridge.ts evaluated
+ *                                                 window listens for
+ *                                                   'debuggen-agent-handshake'
+ *                                        <────    window.dispatchEvent(new CustomEvent(
+ *                                                   'debuggen-bridge-handshake'))
+ * the FIRST request, and only that one:
+ *   latch set, request listener removed,
+ *   then window.dispatchEvent(new MouseEvent(
+ *     'debuggen-agent-handshake',
+ *     { relatedTarget: node }))          ────>    node = event.relatedTarget
+ *                                                 node listens for 'debuggen-agent-frame'
+ *
+ * node.dispatchEvent(new CustomEvent('debuggen-agent-frame',
+ *   { detail: '{"source":"debuggen-agent","version":3,…}', cancelable: true }))  ──> bridge
+ * agent  <──  node.dispatchEvent(new CustomEvent('debuggen-bridge-frame',
+ *   { detail: '{"source":"debuggen-bridge","version":3,…}', cancelable: true }))
  * ```
  *
- * **Outbound**, the agent posts `{ source, version, type, payload }` — where
- * `source` is {@link AGENT_SOURCE_TAG} and `version` is
- * {@link CHANNEL_VERSION} — with a `targetOrigin` of `'/'`, meaning "this
- * window's own origin", which is correct even for an opaque origin, where
- * `location.origin` reads `"null"` and would not match. `'*'` is never used:
- * it would broadcast the developer's telemetry to any listener a page chose to
- * install.
+ * **The wire, in full** — the bridge is written against exactly this:
+ *
+ * - **Handshake.** The bridge dispatches one {@link HANDSHAKE_REQUEST_EVENT}
+ *   (a `CustomEvent` with no `detail`) on `window`, with its
+ *   {@link HANDSHAKE_OFFER_EVENT} listener already registered, because the
+ *   answer is dispatched synchronously inside the request. The answer is a
+ *   `MouseEvent` on `window` whose `relatedTarget` is the node: `relatedTarget`
+ *   is the one standard event field that carries a node, and a DOM node is the
+ *   one kind of value both worlds see as the same object (each world wraps the
+ *   one underlying node). **Only the first request is ever answered**, and
+ *   there is no unsolicited offer: the manifest declares this agent before the
+ *   bridge, both at `document_start`, so the agent's listener always exists
+ *   when the bridge asks.
+ * - **Frames.** Agent → bridge frames are {@link AGENT_FRAME_EVENT}, bridge →
+ *   agent frames are {@link BRIDGE_FRAME_EVENT}; each is a `CustomEvent` with
+ *   `bubbles: false` and `cancelable: true` whose `detail` is the **string**
+ *   JSON text of `{ source, version, type, payload }`. A string, because a
+ *   primitive is the one `detail` shape that crosses the world boundary
+ *   unchanged, and because JSON is the measure the size cap is written in.
+ *   This module renders that text with {@link serializeFrameJson}: exactly
+ *   what `JSON.stringify` returns for the JSON-shaped data a frame is made
+ *   of, produced without consulting any `toJSON` or running any getter (see
+ *   "Frame serialization").
+ * - **Size.** `detail.length` — code units of that one string, the string
+ *   actually dispatched — is at most {@link MAX_MESSAGE_BYTES}, in both
+ *   directions.
+ * - **Acknowledgement.** A receiver that accepts a frame calls
+ *   `preventDefault()` on it; the sender reads `dispatchEvent`'s return value,
+ *   and `false` means "claimed". Dispatch is synchronous, so the answer exists
+ *   before `dispatchEvent` returns, which is what lets a batch stay in this
+ *   module's custody until the bridge has actually taken it (see **Custody**).
  *
  * The four outbound types ({@link AgentOutboundType}):
  *
@@ -61,14 +119,14 @@
  *
  * The five inbound types ({@link BridgeInboundType}):
  *
- * - `bridge.ready` — the bridge's listener is installed and its port is live.
- *   The bridge author sends this at `document_start` **and again after every
- *   service-worker reconnect**: a Manifest V3 worker suspends after roughly
- *   30 seconds of idleness, and until the bridge says it is back this module
- *   buffers rather than posts. It is also the cue for `./agent.ts` to re-post
- *   `agent.ready`, because a control message posted before the bridge's
- *   listener existed is simply lost — this module deliberately does not queue
- *   control messages, so that a dormant agent holds nothing.
+ * - `bridge.ready` — the bridge holds the node, its listener is installed and
+ *   its runtime port is live. The bridge sends this once it has the node
+ *   **and again after every service-worker reconnect**: a Manifest V3 worker
+ *   suspends after roughly 30 seconds of idleness, and until the bridge says it
+ *   is back this module buffers rather than dispatches. It is also the cue for
+ *   `./agent.ts` to re-send `agent.ready`, because a control frame is a
+ *   statement about a moment and this module deliberately does not queue one,
+ *   so that a dormant agent holds nothing.
  * - `bridge.gone` — the bridge's runtime port disconnected. Buffering resumes.
  * - `agent.config` — the service's hook configuration for this tab, relayed.
  *   `./agent.ts` reads it and calls {@link configureTransport}.
@@ -76,140 +134,173 @@
  *   tree).
  * - `target.request` — the panel entered element-picker mode.
  *
- * **Inbound is a security boundary.** Any script the page loads can post a
- * message to `window`, so {@link subscribe}'s listener accepts a frame only
- * when *all* of `event.source === window`, the origin is this document's own
- * (or the empty/`"null"` origin an opaque-origin document reports),
- * `event.data` is a non-null object, `data.source` is exactly
- * {@link BRIDGE_SOURCE_TAG}, `data.version` is exactly
- * {@link CHANNEL_VERSION}, `data.type` is a member of the closed inbound
- * vocabulary, **and `data.token` is this document's handshake token** — the
- * one condition a page script cannot satisfy, described in the next section.
- * Everything else is dropped in silence — no logging, which would itself be a
- * channel — and no field of an accepted frame is ever called, evaluated or
- * trusted as a function.
+ * ### Inbound acceptance
  *
- * ## The handshake, and why a tag and a version are not authentication
+ * The node's listener accepts a frame only when its `detail` — read through
+ * the captured `CustomEvent.prototype.detail` getter, so a page that redefined
+ * the accessor reads nothing into it — is a string no longer than
+ * {@link MAX_MESSAGE_BYTES} that the captured `JSON.parse` turns into a plain
+ * object carrying exactly {@link BRIDGE_SOURCE_TAG}, exactly
+ * {@link CHANNEL_VERSION} and a member of the closed inbound vocabulary. An
+ * accepted frame is acknowledged with the captured `preventDefault`; anything
+ * else is dropped in silence and left unacknowledged — no logging, which would
+ * itself be a channel. The parsed tree is revived into **null-prototype**
+ * objects, so a field the bridge did not send reads as absent even on a page
+ * that has since added that name to `Object.prototype`, and no field of an
+ * accepted frame is ever called, evaluated or trusted as a function.
  *
- * Every condition in the paragraph above except the token is satisfiable by
- * the page itself. Its own window is `event.source`, its own origin is
- * `event.origin`, and the tag, the version and the frame types are published
- * constants in a file that ships — minified, but perfectly readable — inside a
- * public extension. A page script that posted
- * `{source:'debuggen-bridge', version:…, type:'agent.config', payload:{…}}` to
- * its own window was therefore indistinguishable from the bridge, and an
- * `agent.config` arms hooks, patches `fetch` and `XMLHttpRequest`, names the
- * session and capture of the attacker's choosing, and — with no capture id —
- * tears a live capture down. The origin checks were correct about *where* a
- * frame came from and silent about *who* sent it.
+ * ### What the channel protects against, and what it does not
  *
- * What the two sides lack is a shared secret, and there is no channel that
- * could hand them one which the page could not also read: the bridge and the
- * agent share one window and one `message` loop, and a value posted over it is
- * a value the page can observe. The secret is therefore **minted by the agent,
- * in the page's own realm, and disclosed inside a window the page has no
- * script running in.** The agent is declared with
- * `run_at: "document_start"`, so its evaluation precedes every script the
- * document loads; both disclosures below happen during that evaluation or
- * during the bridge's, which is the same window.
- *
- * ```text
- * document_start, MAIN world                 document_start, ISOLATED world
- * ──────────────────────────                 ──────────────────────────────
- * agent.iife.js evaluated                    (bridge.ts not evaluated yet)
- *   subscribe() -> mint 32 CSPRNG bytes
- *                  as 64 lowercase hex
- *   dispatchEvent(new CustomEvent(
- *     'debuggen-agent-handshake',
- *     { detail: '‹token›' }))         ────>  nothing is listening: offer lost
- *                                            bridge.ts evaluated
- *                                              addEventListener(
- *                                                'debuggen-agent-handshake')
- *                                     <────    dispatchEvent(new CustomEvent(
- *                                                'debuggen-bridge-handshake'))
- *   the FIRST request, and only ever
- *   that one, is answered:
- *   dispatchEvent(new CustomEvent(
- *     'debuggen-agent-handshake',
- *     { detail: '‹token›' }))         ────>  token kept for the life of the
- *   request listener removed,                 document
- *   answered-flag latched
- *                                     <────  every frame it posts carries
- *                                              { source, version, type,
- *                                                token: '‹token›', payload }
- * ```
- *
- * **What the bridge author must do**, in this order and once per document:
- *
- * 1. Register a listener for {@link HANDSHAKE_OFFER_EVENT} on `window` *before*
- *    dispatching anything, because the answer is dispatched synchronously
- *    inside the request and a listener registered afterwards has already
- *    missed it. `event.detail` is the token as a **bare string** — not an
- *    object, because a string is the only `detail` shape whose structured
- *    clone across Chrome's isolated/main world boundary cannot vary.
- * 2. Dispatch one `new CustomEvent(HANDSHAKE_REQUEST_EVENT)` on `window`. It
- *    carries no `detail`; the request is the whole message.
- * 3. Keep the token in the content script's own closure for the life of the
- *    document, and put it on the `token` field of **every** frame it posts to
- *    the page — `bridge.ready` included, since that frame is what starts a
- *    drain.
- * 4. Ask once, and never again. Only the first request is answered, by design —
- *    a page script that has spotted the exchange must not be able to replay
- *    it — so a bridge that discards the token has no way to recover it and must
- *    wait for the document to reload. A bridge injected *before* the agent
- *    already holds the token from the unsolicited offer, and should send its
- *    one request anyway — neither side can observe the relative injection
- *    order, and the answer it receives is the same token again, which its
- *    listener can ignore or store idempotently.
- *
- * **Why the token is not minted by the service worker**, which is the obvious
- * alternative and the one the extension's other credentials use: the agent is
- * the side that has to *verify* it, and a token the worker minted would have
- * to travel worker → bridge → agent. The only path from the bridge to the
- * agent is this channel, whose inbound direction is exactly what the token
- * exists to authenticate; disclosing it over an unauthenticated `postMessage`
- * would put it in front of the page and make the whole exchange decorative. A
- * `CustomEvent` is different in kind: the agent is the *source* of the value,
- * so it needs no delivery it must then trust, and the disclosure is bounded to
- * the two dispatches above rather than repeated on every frame.
- *
- * **The residual, stated honestly.** On a page carrying this bundle with no
- * extension bridge present, page script is the only party that can ask, so it
- * can consume the single request-answer and forge frames from then on. What it
- * gains is an armed agent with no bridge to deliver to, no session and no
- * capture to interfere with, and an `agent.error` or `telemetry.batch` posted
- * into a window nobody is listening on — the agent performs no network egress
- * of its own in any configuration. With the extension present, the bridge's
- * `document_start` request is necessarily the first, because
+ * It is built against **page scripts that run after `document_start`** —
+ * which is every script the document loads, because
  * `apps/chrome-extension/manifest.config.ts` declares both content scripts at
- * `document_start` and Chrome injects them in declaration order (the MAIN-world
- * agent first, the ISOLATED-world bridge second), and both precede every page
- * script. The exchange is therefore complete and latched before the page's
- * first statement runs.
+ * `document_start` and Chrome injects them, in declaration order (this agent,
+ * then the bridge), before the page's first statement. Such a script:
+ *
+ * - **observes no frame.** None is dispatched anywhere it can listen; the only
+ *   events this module ever dispatches on `window` are the one handshake
+ *   answer, dispatched before that script existed, and nothing after it.
+ * - **injects no frame.** It holds no reference to the node, and an event
+ *   dispatched on `window` — a `message`, a forged {@link BRIDGE_FRAME_EVENT},
+ *   anything — never reaches the node's listener.
+ * - **cannot obtain the node.** The bridge's request was the first and is the
+ *   only one ever answered; the listener is removed before the answer is
+ *   dispatched, and neither a transport reset nor a re-subscribe re-opens it.
+ * - **cannot subvert the machinery.** `EventTarget.prototype.addEventListener`,
+ *   `removeEventListener` and `dispatchEvent` (and the same three as `window`
+ *   resolves them), the event constructors, the `detail` getter,
+ *   `preventDefault`, `JSON.parse`, `createElement` and the object helpers the
+ *   reviver uses were captured before it ran and are called through the
+ *   captured `Reflect.apply`, so replacing any of them afterwards changes
+ *   nothing here. The event init dictionaries are null-prototype records, so
+ *   a getter the page defines on `Object.prototype` for a dictionary member
+ *   (`composed`, say) is never consulted and never sees a frame's `detail`.
+ * - **cannot obtain a handler that applies a configuration, nor change what a
+ *   delivered one asks for.** The control path — frame receipt, subscriber
+ *   delivery, configuration parsing and the arm/disarm decisions in
+ *   `./agent.ts` — runs only on language intrinsics captured at evaluation,
+ *   null-prototype storage and operators (see "Core intrinsics and page-proof
+ *   primitives"). No built-in the page can replace — `Array.from`, a `Set` or
+ *   `Map` method, an iterator, `Array.prototype.some`, `Array.isArray`,
+ *   `Function.prototype.call`, `JSON.parse` — is ever handed the subscriber
+ *   registry, a handler, the parsed frame or its payload, or asked a question
+ *   whose answer decides whether the agent arms, which capture it stamps or
+ *   which hooks it attaches. The payload is revived null-prototype all the
+ *   way down, so a key the bridge did not send reads as absent. Nothing
+ *   published on `globalThis.__DEBUGGEN__` (`span`, `version`,
+ *   `describeTarget` and a diagnostic copy of the configuration that nothing
+ *   reads back) leads to a handler, and the bundle is an IIFE that exposes no
+ *   module export on any global.
+ * - **cannot read or rewrite an outbound frame as the agent builds it.**
+ *   Frames and events are composed by defining own properties
+ *   ({@link defineOwnValue}, {@link appendValue}) rather than assigning them,
+ *   so a setter or index accessor on `Object.prototype` or `Array.prototype`
+ *   is never handed a value, and they are rendered by
+ *   {@link serializeFrameJson}, which never consults an own or inherited
+ *   `toJSON`. The bytes the bridge receives are the bytes this module
+ *   composed.
+ *
+ * It does **not** protect against, and no in-page design can:
+ *
+ * - **code that ran before this agent** — another extension's MAIN-world
+ *   `document_start` script, an automation tool's init script (Playwright's
+ *   `addInitScript`), a modified browser. Such code can replace the primitives
+ *   before they are captured, or listen on `window` for the handshake answer
+ *   and take the node. It is as privileged in the page as this agent is.
+ * - **a page with no bridge.** If the bridge never asks, a page script can ask
+ *   first and hold the node. What it then drives is an agent with no bridge
+ *   behind it: no session, no capture, no service, and no network egress of
+ *   the agent's own in any configuration.
+ * - **the page's own behaviour.** A page script can still call
+ *   `__DEBUGGEN__.span` and can cause real clicks, renders, requests and
+ *   errors, and every one of them is recorded faithfully. Telemetry from the
+ *   MAIN world is therefore **evidence about what the page did, never a
+ *   tamper-proof measurement**, and the service treats every field of it as
+ *   untrusted input (ingest validation, bounds and redaction). An object a
+ *   page hands `__DEBUGGEN__.span` as attributes is read once, own getters
+ *   included, as the page's own data.
+ * - **the signal producers' in-page hooks.** The producers
+ *   (`./interaction.ts`, `./react.ts`, `./fetch.ts`, `./perf.ts`,
+ *   `./errors.ts`, `./state.ts` and the helpers they arm, `./continuation.ts`
+ *   and `./dom-target.ts`) install their listeners, observers and patches
+ *   through the page's own built-ins when they are armed, reset their
+ *   counters through them, and build their drafts with them. A page that
+ *   rewrites those built-ins can keep a signal from attaching, or stop or
+ *   distort what it records. That costs the signal, never the decision: a
+ *   producer failure is contained and reported as that producer's failure
+ *   (its type name reduced to a closed vocabulary), and the capture stays
+ *   armed or disarmed as the extension asked.
+ * - **the page's clock and scheduler.** Timestamps come from the page's
+ *   `performance.now()` and `performance.timeOrigin` (`Date.now()` as the
+ *   fallback) through `Math.round`, so a page can skew the times its events
+ *   carry. The coalescing timer, the drain task and the drain microtask use
+ *   the page's `setTimeout`, `clearTimeout`, `MessageChannel` and
+ *   `queueMicrotask`, so a page can delay, hasten or suppress a scheduled
+ *   delivery, and the callback it is handed does one thing: drain the queue
+ *   onto the private node. The terminal drains — `pagehide`, capture stop
+ *   and capture change — are synchronous and scheduled by nothing.
+ *
+ * **Why there is no token any more.** Version 2 authenticated inbound frames
+ * with a per-document secret handed to the bridge over a `CustomEvent` and
+ * then carried on *every* bridge frame posted to `window` — so every frame
+ * disclosed the secret to any page listener, and a replayed `agent.config`
+ * (an all-false one disarms a live capture) was indistinguishable from the
+ * bridge's. Version 3 carries no secret at all: authority is possession of a
+ * node that never leaves the two content scripts.
+ *
+ * ### Custody
+ *
+ * A telemetry batch is taken out of the queue to be dispatched and is
+ * **returned to the front of the queue, in order, unless the bridge claims
+ * it**. The bridge claims a batch only once its runtime port has accepted it,
+ * so a port that died between `bridge.ready` and the batch costs a retry, not
+ * the events: the batch is requeued, the bridge is marked away, and the next
+ * `bridge.ready` delivers it with the `batchSeq` it would have carried and no
+ * duplicate. See {@link postFrame} for the five outcomes and {@link deliver}
+ * for what each one does. Before the handshake has been answered no bridge
+ * can exist, so nothing is dispatched and nothing is counted as lost: the
+ * `agent.ready` that `./agent.ts` announces at `document_start` is simply
+ * re-announced on the bridge's `bridge.ready`.
+ *
+ * Every step is re-entrant. The bridge's listener runs synchronously inside
+ * this module's dispatch, and this module's `bridge.ready` handling — a drain,
+ * and `./agent.ts`'s re-announcement — runs synchronously inside the bridge's.
+ * One drain is ever in progress (a nested request is left to the drain that
+ * is already running, which reschedules what is left), and a batch whose
+ * capture ended or whose transport was reset while it was in the bridge's
+ * hands is never requeued into the next one: a capture change settles it into
+ * the cumulative totals, and a reset — which has just zeroed them — into
+ * nothing.
  *
  * ## Invariants
  *
- * **1. No side effects at import time.** No listener, no timer, no
- * `postMessage` and no `dispatchEvent` at module scope. The `message` listener
- * is installed by the first {@link subscribe} and removed by the last
- * unsubscribe, and so is the handshake request listener; the token is minted —
- * and the one unsolicited offer dispatched — by that same first
- * {@link subscribe} and never before it; the flush timer starts on the first
- * enqueue, the queue allocates its first slots with the first event and the
- * drain channel is created with the first scheduled drain.
- * `./agent.ts` is the one module in this folder allowed to act when it is
- * evaluated.
+ * **1. No side effects at import time.** No listener, no timer, no node and no
+ * `dispatchEvent` at module scope; what module evaluation does is *read* the
+ * platform intrinsics the channel and the control path use (see
+ * {@link CHANNEL_INTRINSICS}, {@link CORE_INTRINSICS} and {@link NODE_TEST})
+ * and build a few frozen lookup tables and pre-made errors from them, which
+ * observes nothing and changes nothing. The node is created, and its listener
+ * and the handshake request listener installed, by the first
+ * {@link subscribe}; the last unsubscribe removes both listeners. The flush
+ * timer starts on the first enqueue, the queue allocates its first slots with
+ * the first event and the drain channel is created with the first scheduled
+ * drain. `./agent.ts` is the one module in this folder allowed to act when it
+ * is evaluated.
  *
  * **2. Nothing throws into the page.** Every exported function wraps its body:
  * the agent runs inside the developer's own click handlers and React commits,
  * where an exception escaping would break the application it is observing. A
  * failure is counted in {@link TransportStats} and swallowed.
  *
- * **3. Nothing leaves that cannot be structure-cloned.** `postMessage`
- * structure-clones its payload, so one function, symbol, DOM node, `Proxy` or
- * cyclic object in an attribute bag throws `DataCloneError` and would cost the
- * whole batch. Attributes are therefore rebuilt through a bounded sanitizer
- * before an event is buffered (see {@link emit}).
+ * **3. Nothing leaves that JSON cannot render faithfully.** A frame's `detail`
+ * is its JSON rendering, so one function, symbol, bigint, DOM node, `Proxy` or
+ * cyclic object in an attribute bag would either throw (and cost the whole
+ * batch) or silently change shape. Attributes are therefore rebuilt through a
+ * bounded sanitizer before an event is buffered (see {@link emit}), into
+ * plain data the renderer, {@link serializeFrameJson}, reproduces exactly as
+ * `JSON.stringify` would — except that it never calls a `toJSON` or a getter,
+ * and refuses a cycle, a bigint or excessive nesting with a throw that
+ * {@link postFrame} counts as an unserializable frame.
  *
  * **4. Only the producer fields are stamped.** `sessionId`, `captureId` and
  * `ingestSeq` are assigned by the service and rejected by the strict ingress
@@ -231,9 +322,9 @@
  *   `MessageChannel` message, the cheapest true task source a page has)
  *   instead of serialising a frame inside the click handler or React commit
  *   that produced the last event.
- * - **Every drain posts at most {@link MAX_BATCHES_PER_DRAIN} batches** and
- *   reschedules the remainder, so emptying a full queue is several short tasks
- *   rather than one long one. That applies to all three non-terminal
+ * - **Every drain dispatches at most {@link MAX_BATCHES_PER_DRAIN} batches**
+ *   and reschedules the remainder, so emptying a full queue is several short
+ *   tasks rather than one long one. That applies to all three non-terminal
  *   routes — the batch threshold, the {@link FLUSH_INTERVAL_MS} timer and the
  *   bridge announcing itself after an absence — because each of them can find
  *   a queue of any depth, and a full one is twenty-five batches.
@@ -244,15 +335,39 @@
  *   document is going away, or the queued events are about to stop being
  *   attributable to the capture they were recorded under.
  *
- * **6. Every frame is measured before it is posted.** {@link MAX_MESSAGE_BYTES}
- * is enforced in {@link postFrame}, which is the only function that calls
- * `postMessage` — so it bounds control frames (an `agent.ready` carrying a
- * page-controlled URL, a `target.described` descriptor) exactly as it bounds a
- * telemetry batch. A batch over the cap is split; a control frame over it is
- * refused and replaced by one fixed-size diagnostic that cannot itself be
- * oversize and cannot trigger another.
+ * **6. Every frame is measured before it is dispatched.**
+ * {@link MAX_MESSAGE_BYTES} is enforced in {@link postFrame}, the only function
+ * that dispatches a frame, on the very string it dispatches — so it bounds
+ * control frames (an `agent.ready` carrying a page-controlled URL, a
+ * `target.described` descriptor) exactly as it bounds a telemetry batch. A
+ * batch over the cap is split; a control frame over it is refused and replaced
+ * by one fixed-size diagnostic that cannot itself be oversize and cannot
+ * trigger another.
  *
- * ## Imports: four modules, and why not a fifth
+ * ## The clock offset (AAP 0.2.3)
+ *
+ * AAP 0.2.3 applies no clock alignment to event times "beyond a recorded
+ * per-producer `clockOffsetMs` (server `Date` header versus local clock,
+ * informational)". This document is the producer, so this module holds its one
+ * estimator ({@link clockOffset}) and is the only place the value is written
+ * onto an event:
+ *
+ * - **Measured** by `./fetch.ts`, which hands {@link observeServerClock} the
+ *   `Date` header of each same-origin response its hook observes — the dev
+ *   server's clock — with the request's start and settle instants read from
+ *   {@link nowEpochMs}, the clock every `startTime` in this folder comes from.
+ * - **Stamped once**, in {@link completeDraft}, when the event is created and
+ *   only once an estimate exists. A queued or re-delivered event is never
+ *   restamped: the store compares a replay against the event it already holds,
+ *   so a replay whose offset had moved would read as an id conflict.
+ * - **Never applied.** `startTime` and `duration` are exactly what they would
+ *   be with no sample at all; the offset is a statement *about* them.
+ * - **Document-scoped**, like the producer id and the channel node: it
+ *   describes this document's clock, not a capture, so neither a capture change
+ *   nor {@link resetTransport} discards it. {@link getClockOffsetStats} reports
+ *   it for diagnostics without widening {@link TransportStats}.
+ *
+ * ## Imports: five modules, and why not a sixth
  *
  * `packages/telemetry/esbuild.agent.mjs` bundles this folder into the static
  * content script the Chrome extension copies verbatim, and it hard-fails on
@@ -260,9 +375,14 @@
  * `@debuggen/shared/node` or `zod`. So: `./ids.js` (import-free by
  * construction), `../schema/attributes.js` (imports only `../schema/kinds.js`,
  * both vocabulary-only), `../redaction/rules.js` (import-free by contract, for
- * the one code-point-safe {@link truncate} every bound in this repository goes
- * through — `./fiber-diff.ts` takes its previews from the same function, so a
- * value bounded here reads the same as one bounded there), and
+ * the {@link TRUNCATION_SUFFIX} its code-point-safe `truncate` marks a cut
+ * with — {@link boundControlText} reproduces that function's output exactly,
+ * on this module's page-proof primitives rather than on the `Array.from`,
+ * `slice` and `join` it calls, so a value bounded here still reads the same
+ * as one `./fiber-diff.ts` bounded there),
+ * `../schema/clock-offset.js` (import-free by contract, for the
+ * `ClockOffsetEstimator` the Node preload runs too, so both tiers measure the
+ * offset by one definition and one bound), and
  * `../schema/event.js` **for a type alone** — that
  * module value-imports `zod` and `@debuggen/shared`, and `import type` is
  * erased before esbuild ever sees the file, which is what lets the one
@@ -274,8 +394,9 @@
  * @module packages/telemetry/src/browser/transport
  */
 
-import { truncate } from '../redaction/rules.js';
+import { TRUNCATION_SUFFIX } from '../redaction/rules.js';
 import { MAX_TRACKED_KEYS, type AttributeValueType } from '../schema/attributes.js';
+import { ClockOffsetEstimator, type ClockOffsetSnapshot } from '../schema/clock-offset.js';
 import type { TelemetryEventIngress } from '../schema/event.js';
 import type { TelemetryTier } from '../schema/kinds.js';
 import { getDocumentId, getProducerId, newEventId } from './ids.js';
@@ -290,77 +411,99 @@ import { getDocumentId, getProducerId, newEventId } from './ids.js';
  */
 
 /**
- * The `source` tag on every frame the page agent posts.
+ * The `source` tag inside every frame the page agent dispatches.
  *
  * The bridge filters on it, and so does this module's own inbound guard in the
- * opposite direction: without a tag, the agent would read its own outbound
- * frames back (a window receives what it posts to itself) and a page's
- * unrelated `postMessage` traffic would reach the agent's subscribers.
+ * opposite direction: the two directions travel on distinct event types
+ * already, and the tag inside the JSON is what keeps a frame that reached the
+ * wrong listener — a stale bridge from an earlier build, a mistaken dispatch —
+ * from being read as the other side's.
  */
 export const AGENT_SOURCE_TAG = 'debuggen-agent';
 
 /**
- * The `source` tag the isolated-world bridge must put on every frame it posts
- * to the page.
+ * The `source` tag the isolated-world bridge must put inside every frame it
+ * dispatches to the agent.
  *
  * Deliberately different from {@link AGENT_SOURCE_TAG}: one shared tag would
- * make the two directions indistinguishable on a channel where both sides
- * receive everything.
+ * make the two directions indistinguishable to a reader of the JSON alone.
  */
 export const BRIDGE_SOURCE_TAG = 'debuggen-bridge';
 
 /**
  * The DOM event the isolated-world bridge dispatches on `window` to ask this
- * module for the document's handshake token.
+ * module for the document's channel node.
  *
- * A `CustomEvent` rather than a frame on the `message` channel, and that is the
- * whole point: this is the one exchange that cannot travel over the channel it
- * authenticates. It carries no `detail` — the request *is* the message — and
- * exactly one of them is ever answered (see {@link subscribe} and the module
- * overview's handshake section).
- *
- * Published like the source tags: the bridge dispatches this name literally,
- * so it is part of the channel rather than an implementation detail.
+ * A `CustomEvent` with no `detail` — the request *is* the message. Exactly one
+ * is ever answered, the first, with a {@link HANDSHAKE_OFFER_EVENT}
+ * (see {@link subscribe} and the module overview). Published like the source
+ * tags: the bridge dispatches this name literally, so it is part of the
+ * channel rather than an implementation detail.
  */
 export const HANDSHAKE_REQUEST_EVENT = 'debuggen-bridge-handshake';
 
 /**
- * The DOM event this module dispatches on `window` to disclose the document's
- * handshake token.
+ * The DOM event this module dispatches on `window`, exactly once per document,
+ * to hand the channel node to the bridge.
  *
- * `event.detail` is the token as a **bare string**, deliberately not wrapped in
- * an object: `CustomEvent.detail` is structure-cloned when it crosses Chrome's
- * isolated/main world boundary, and a primitive string is the one shape whose
- * clone cannot acquire or lose a property on the way. The bridge must have its
- * listener registered before it asks, because the answer is dispatched
- * synchronously inside the request.
+ * A **`MouseEvent` whose `relatedTarget` is the node**, carrying no `detail`
+ * and nothing else. `relatedTarget` is the standard event field that holds a
+ * node, and a DOM node is the one value Chrome's isolated and main worlds see
+ * as the same object — so the bridge receives the node itself, not a copy. The
+ * bridge must have its listener registered before it asks, because the answer
+ * is dispatched synchronously inside the request.
  *
- * Dispatched at most twice per document: once unsolicited, immediately after
- * the token is minted, for a bridge that was evaluated before this agent; and
- * once in answer to the first {@link HANDSHAKE_REQUEST_EVENT}.
+ * Never dispatched unsolicited: the agent is declared (and so injected) before
+ * the bridge, so the bridge's request always finds the listener, and an offer
+ * nobody asked for would only be one more chance for a listener that should
+ * not have it to catch the node.
  */
 export const HANDSHAKE_OFFER_EVENT = 'debuggen-agent-handshake';
 
 /**
- * The channel version, carried on every frame in both directions and checked
- * exactly.
+ * The DOM event every agent → bridge frame is dispatched as, **on the channel
+ * node** and never on `window`.
+ *
+ * A `CustomEvent` with `bubbles: false`, `cancelable: true` and a `detail` that
+ * is the frame's JSON string. The bridge acknowledges a frame it has taken
+ * custody of by calling `preventDefault()`, which this module reads as
+ * `dispatchEvent` returning `false` (see {@link postFrame}).
+ */
+export const AGENT_FRAME_EVENT = 'debuggen-agent-frame';
+
+/**
+ * The DOM event every bridge → agent frame must be dispatched as, on the
+ * channel node.
+ *
+ * The same shape as {@link AGENT_FRAME_EVENT} in the other direction: a
+ * cancelable, non-bubbling `CustomEvent` whose `detail` is the frame's JSON
+ * string. This module calls `preventDefault()` on every frame it accepts, so
+ * the bridge can tell a frame the agent took from one nobody was listening
+ * for.
+ */
+export const BRIDGE_FRAME_EVENT = 'debuggen-bridge-frame';
+
+/**
+ * The channel version, carried inside every frame in both directions and
+ * checked exactly.
  *
  * The agent is a static content script copied out of this package's build and
  * the bridge is compiled into the extension, so the two can be shipped at
  * different moments (a reloaded extension against a page that was not
  * reloaded). An exact match is what makes that mismatch silent and harmless
  * instead of a stream of half-understood frames: a change to any payload shape
- * in this file is a version bump, and both sides then simply ignore each
- * other until the page reloads.
+ * or to the transport itself is a version bump, and both sides then simply
+ * ignore each other until the page reloads.
  *
- * **Version 2 is that rule being applied.** Inbound frames gained a required
- * field — `token`, the handshake secret described in the module overview — and
- * an un-hardened bridge's version-1 frames are consequently *legible enough to
- * ignore* rather than half-processed: they fail the version check before the
- * token check, which is the difference between a mismatched pair that sits
- * quiet until the page reloads and one that arms hooks nobody authenticated.
+ * **Version 3 is that rule being applied.** The transport moved off `window`
+ * and onto the private channel node, the handshake now hands over the node
+ * rather than a token, frames travel as JSON strings, and a frame is
+ * acknowledged by `preventDefault()`. A version-2 bridge dispatches nothing
+ * this module listens for and a version-3 frame reaching a stale listener
+ * fails its version check, so a mismatched pair sits quiet until the page
+ * reloads.
  */
-export const CHANNEL_VERSION = 2;
+export const CHANNEL_VERSION = 3;
 
 /**
  * The most completed events held in memory while the bridge is away.
@@ -379,8 +522,8 @@ export const MAX_BUFFERED_EVENTS = 5000;
  * Also the drain trigger: reaching it schedules a drain on the next task
  * instead of waiting out the timer, so a burst travels while it is happening
  * rather than in one large frame at the end. 200 keeps a batch well inside
- * {@link MAX_MESSAGE_BYTES} for ordinary events and keeps each structured
- * clone short enough not to show up as a long task of its own.
+ * {@link MAX_MESSAGE_BYTES} for ordinary events and keeps each JSON rendering
+ * short enough not to show up as a long task of its own.
  *
  * Reaching it deliberately does **not** post inline. The event that fills a
  * batch arrives on a stack the agent is measuring — a click handler, a React
@@ -411,16 +554,19 @@ export const MAX_EVENTS_PER_BATCH = 200;
 export const MAX_BATCHES_PER_DRAIN = 8;
 
 /**
- * The largest frame this module will post, as measured by the length of its
- * JSON rendering.
+ * The largest frame the channel carries, in either direction, as measured by
+ * the `length` of the frame's `detail` — the JSON string that is dispatched.
  *
- * A code-unit count is an estimate of a byte count, not a byte count — one
- * non-ASCII character is one unit and several bytes — and it is deliberately
- * the cheap measure: it is taken on the page's own thread for every batch, and
- * the number it feeds is a safety valve rather than a quota. Chrome imposes no
- * documented `postMessage` size limit, but a multi-megabyte structured clone
- * is a long task in the page and a memory spike in the extension, so a batch
- * over this size is split instead (see {@link flush}).
+ * The measure is taken on the very string that travels: {@link postFrame}
+ * renders a frame once, compares that string's length with this cap and
+ * dispatches that same string, and the inbound guard applies the same cap to
+ * the `detail` it reads before parsing anything. A code-unit count is an
+ * estimate of a byte count, not a byte count — one non-ASCII character is one
+ * unit and several bytes — and it is deliberately the cheap measure: it is
+ * taken on the page's own thread for every batch, and the number it feeds is a
+ * safety valve rather than a quota. A multi-megabyte frame is a long task in
+ * the page and a memory spike in the extension, so a batch over this size is
+ * split instead (see {@link deliver}).
  */
 export const MAX_MESSAGE_BYTES = 512 * 1024;
 
@@ -437,9 +583,10 @@ export const MAX_MESSAGE_BYTES = 512 * 1024;
  * 2 048 is several times the longest URL any server accepts in practice, so an
  * ordinary URL, selector or symbol crosses untouched and the field the service
  * reads is the field the page reported (AAP 0.5.2 needs the raw URL to resolve
- * a route and to redact its query values). Past it, the value is truncated by
- * the repository's one code-point-safe {@link truncate}, which marks what it
- * removed with a single ellipsis.
+ * a route and to redact its query values). Past it, the value is truncated
+ * exactly as the repository's one code-point-safe `truncate` would truncate it
+ * (see {@link boundControlText}), which marks what it removed with a single
+ * ellipsis.
  *
  * This is a bound on a *field*, not the frame's guarantee: a sanitized payload
  * may still hold up to {@link MAX_TRACKED_KEYS} keys of bounded strings, so
@@ -524,8 +671,8 @@ const MAX_FAILURE_FIELD_CHARS = 64;
  * The members are the names standardised by the platform, which is what makes
  * the list closed and finite: the ECMAScript error constructors, and the
  * `DOMException` names that a page API failure actually reports — a structured
- * clone that refused a value (`DataCloneError`, the failure mode
- * {@link postFrame} exists to survive), a cross-origin or policy refusal
+ * clone that refused a value (`DataCloneError`, which a producer handing page
+ * values to a platform API can meet), a cross-origin or policy refusal
  * (`SecurityError`, `NotAllowedError`), an observer or an object used out of
  * order (`InvalidStateError`, `NotSupportedError`), storage and IndexedDB
  * conditions, and the DOM tree errors a descriptor walk can provoke. Together
@@ -583,6 +730,26 @@ const REPORTABLE_ERROR_NAMES: ReadonlySet<string> = Object.freeze(
   ]),
 );
 
+/**
+ * {@link REPORTABLE_ERROR_NAMES} as a null-prototype membership record, which
+ * is what {@link reportableErrorName} consults.
+ *
+ * Derived here, while the module is evaluated and the set's iterator is still
+ * the platform's. Asking the set later would call `Set.prototype.has`, which a
+ * page can replace to admit any `name` it chose. `name in` this record is an
+ * operator over own keys, so it cannot be answered that way, and a `name` of
+ * `__proto__` or `constructor` is simply not a member.
+ */
+const REPORTABLE_ERROR_NAME_MEMBERSHIP: Readonly<Record<string, true>> = ((): Readonly<
+  Record<string, true>
+> => {
+  const membership = createNullRecord<Record<string, true>>();
+  for (const name of REPORTABLE_ERROR_NAMES) {
+    membership[name] = true;
+  }
+  return Object.freeze(membership);
+})();
+
 /*
  * ---------------------------------------------------------------------------
  * Public types
@@ -590,16 +757,17 @@ const REPORTABLE_ERROR_NAMES: ReadonlySet<string> = Object.freeze(
  */
 
 /**
- * What a producer builds: a telemetry event minus the four fields this module
+ * What a producer builds: a telemetry event minus the five fields this module
  * stamps.
  *
  * `id` stays available as an optional override for the one producer that needs
  * to know an event's id before it emits it — a fetch wrapper that has to
  * reference the request span it is about to report. Omitting it is the norm.
  *
- * `producerId`, `seq` and `tier` are absent on purpose and cannot be supplied:
- * a document has exactly one producer id, one sequence and one tier, and all
- * three are this module's to assign (see {@link emit}).
+ * `producerId`, `seq`, `tier` and `clockOffsetMs` are absent on purpose and
+ * cannot be supplied: a document has exactly one producer id, one sequence,
+ * one tier and one clock, and all four are this module's to assign (see
+ * {@link emit} and {@link clockOffset}).
  *
  * The optional members are declared to accept an explicit `undefined` as well
  * as absence, because the repository compiles with
@@ -607,7 +775,10 @@ const REPORTABLE_ERROR_NAMES: ReadonlySet<string> = Object.freeze(
  * conditionally would otherwise have to build its draft with a conditional
  * spread.
  */
-export type EventDraft = Omit<TelemetryEventIngress, 'id' | 'producerId' | 'seq' | 'tier'> & {
+export type EventDraft = Omit<
+  TelemetryEventIngress,
+  'id' | 'producerId' | 'seq' | 'tier' | 'clockOffsetMs'
+> & {
   /** Pre-minted event id; omit it and {@link emit} mints one. */
   id?: string | undefined;
 };
@@ -643,13 +814,15 @@ export interface TransportStats {
   buffered: number;
   /**
    * Events discarded and never delivered, cumulative: queue overflow, a
-   * capture change the bridge was not present for, a frame the page refused to
-   * clone, and events too large to post at all.
+   * capture change the bridge was not present for, a frame the channel refused
+   * to carry, and events too large to dispatch at all. A batch the bridge did
+   * not claim is **not** counted here — it goes back to the front of the queue
+   * (see {@link deliver}).
    */
   dropped: number;
-  /** Events successfully posted, cumulative. */
+  /** Events the bridge claimed, cumulative: only a claimed batch counts. */
   sent: number;
-  /** `telemetry.batch` frames successfully posted, cumulative. */
+  /** `telemetry.batch` frames the bridge claimed, cumulative. */
   batches: number;
   /**
    * The sequence number the next stamped event will carry — equivalently, how
@@ -659,17 +832,21 @@ export interface TransportStats {
   /** Whether the bridge has announced itself and not gone away since. */
   bridgeReady: boolean;
   /**
-   * Events that could not be rendered or posted at all, cumulative: a value
+   * Events that could not be rendered or dispatched at all, cumulative: a value
    * JSON refused, or a single event larger than {@link MAX_MESSAGE_BYTES}.
    * Also counted in {@link dropped}; this field says *why*.
    */
   serializationFailures: number;
 
   /**
-   * Control frames refused before they were posted, cumulative: an
-   * `agent.ready`, `target.described` or `agent.error` whose sanitized and
-   * bounded payload still measured over {@link MAX_MESSAGE_BYTES}, or that the
-   * page refused to clone.
+   * Control frames the channel did not deliver, cumulative: an `agent.ready`,
+   * `target.described` or `agent.error` whose sanitized and bounded payload
+   * still measured over {@link MAX_MESSAGE_BYTES}, that could not be rendered
+   * or dispatched, or that the bridge did not claim. A control frame is never
+   * retried, so an unclaimed one is lost and counted here — and only here: it
+   * is not reported on the channel that just failed to carry it. Frames never
+   * dispatched because no handshake had been answered yet are not counted,
+   * since no bridge existed to lose them.
    *
    * Kept apart from {@link dropped} and {@link serializationFailures}, which
    * count *events*: a control frame carries no telemetry, so folding it into
@@ -704,15 +881,19 @@ export interface ProducerFailureStats {
   suppressed: number;
 }
 
-/** The closed set of frame types the page agent posts. */
+/** The closed set of frame types the page agent dispatches. */
 export type AgentOutboundType =
   'agent.ready' | 'telemetry.batch' | 'target.described' | 'agent.error';
 
-/** The closed set of frame types the isolated-world bridge posts. */
+/** The closed set of frame types the isolated-world bridge dispatches. */
 export type BridgeInboundType =
   'bridge.ready' | 'bridge.gone' | 'agent.config' | 'agent.snapshot' | 'target.request';
 
-/** A frame as the page agent posts it. */
+/**
+ * A frame as the page agent builds it; its JSON rendering, by
+ * {@link serializeFrameJson}, is the `detail` of the {@link AGENT_FRAME_EVENT}
+ * that carries it.
+ */
 export interface AgentOutboundMessage {
   /** Always {@link AGENT_SOURCE_TAG}. */
   source: typeof AGENT_SOURCE_TAG;
@@ -720,21 +901,23 @@ export interface AgentOutboundMessage {
   version: typeof CHANNEL_VERSION;
   /** Which frame this is. */
   type: AgentOutboundType;
-  /** The frame's body, already sanitized for structured cloning. */
+  /** The frame's body, already sanitized so JSON renders it faithfully. */
   payload: Record<string, unknown>;
 }
 
 /**
- * A frame as the bridge posts it, after this module's guard has accepted it.
+ * A frame from the bridge, after this module's guard has parsed and accepted
+ * the `detail` of a {@link BRIDGE_FRAME_EVENT}.
  *
  * `version` is typed as a plain `number` because the field arrives from
  * outside; the guard admits only {@link CHANNEL_VERSION}, so a handler reading
  * an accepted message is reading that value.
  *
- * The `token` the bridge puts on every frame it posts is deliberately **not** a
- * member: {@link acceptFrame} verifies it and drops it, so the document's
- * secret never reaches a subscriber or anything a subscriber builds from a
- * frame.
+ * `payload` is a tree of **null-prototype** objects (arrays stay arrays): the
+ * guard revives the parsed JSON that way so a key the bridge did not send
+ * reads as absent — `in` included — even on a page that has added that name
+ * to `Object.prototype`. Handlers read it with `typeof`, `in` and index
+ * access, never through an inherited method.
  */
 export interface BridgeInboundMessage {
   /** Always {@link BRIDGE_SOURCE_TAG} on an accepted frame. */
@@ -809,8 +992,39 @@ let ringHead = 0;
 /** How many slots from {@link ringHead} hold events. Never above the cap. */
 let ringCount = 0;
 
-/** Subscribers registered through {@link subscribe}. */
-const subscribers = new Set<(message: BridgeInboundMessage) => void>();
+/*
+ * The subscriber registry: a linked list of null-prototype links, and why not
+ * a `Set`.
+ *
+ * The registry holds the one function in this bundle that applies an
+ * `agent.config` — `./agent.ts`'s frame handler — and it is walked on every
+ * accepted frame, long after the page's own scripts have run. A `Set` is
+ * driven through `Set.prototype.add`/`delete`/`clear` and walked through its
+ * iterator or `Array.from`, every one of which a page can replace; a
+ * replacement is handed the set (and with it the handler) or the handler
+ * itself, and can then call it with a forged all-false configuration. The
+ * links below are created by {@link createNullRecord}, which is a literal and
+ * calls nothing, have no prototype to intercept a write, and are walked with a
+ * plain `for` over `next` — so neither registering, unregistering nor
+ * delivering a frame reaches any function the page can reach.
+ */
+
+/** One registered subscriber: its handler and the link after it. */
+interface SubscriberLink {
+  /** The handler {@link subscribe} was given. */
+  handler: (message: BridgeInboundMessage) => void;
+  /** The next link, in registration order, or `undefined` at the tail. */
+  next: SubscriberLink | undefined;
+}
+
+/** The oldest registered subscriber, or `undefined` when there is none. */
+let subscriberHead: SubscriberLink | undefined;
+
+/** The newest registered subscriber, where the next registration is linked. */
+let subscriberTail: SubscriberLink | undefined;
+
+/** How many subscribers are registered; kept as a number, never measured. */
+let subscriberCount = 0;
 
 /** The session id to stamp on batch payloads, when the service named one. */
 let currentSessionId: string | undefined;
@@ -827,16 +1041,16 @@ let seqCounter = 0;
 /** The next `batchSeq` to hand out; restarts at 0 on every capture change. */
 let batchSeqCounter = 0;
 
-/** Events dropped since the last successfully posted batch reported a count. */
+/** Events dropped since the last claimed batch reported a count. */
 let pendingDropped = 0;
 
 /** Every event this document has dropped, for {@link TransportStats}. */
 let droppedTotal = 0;
 
-/** Every event this document has posted, for {@link TransportStats}. */
+/** Every event the bridge has claimed, for {@link TransportStats}. */
 let sentTotal = 0;
 
-/** Every batch this document has posted, for {@link TransportStats}. */
+/** Every batch the bridge has claimed, for {@link TransportStats}. */
 let batchesTotal = 0;
 
 /** Events lost to a serialization or clone failure, for {@link TransportStats}. */
@@ -851,8 +1065,13 @@ let controlFramesDroppedTotal = 0;
  * Scoped to the capture, like `seq`: cleared on every capture change and on
  * {@link resetTransport}, so the bound in {@link MAX_PRODUCER_FAILURE_REPORTS}
  * is spent per capture rather than once per document.
+ *
+ * A null-prototype record, replaced rather than cleared: a capture change runs
+ * inside {@link configureTransport}, on the path an `agent.config` takes, and a
+ * `Map` cleared through the page-replaceable `Map.prototype.clear` would let a
+ * page that made it throw keep every configuration from being applied.
  */
-const producerFailureCounts = new Map<ProducerFailureSource, number>();
+let producerFailureCounts: Partial<Record<ProducerFailureSource, number>> = createNullRecord();
 
 /** Failure frames posted, cumulative, for {@link getProducerFailureStats}. */
 let producerFailuresReported = 0;
@@ -893,62 +1112,940 @@ let drainChannel: MessageChannel | undefined;
  */
 let reportingControlLoss = false;
 
-/** The single installed `message` listener, or `undefined` when none is. */
-let messageListener: ((event: MessageEvent<unknown>) => void) | undefined;
+/**
+ * Whether a drain is dispatching batches right now.
+ *
+ * The one-drain-at-a-time latch, and the reason this module is re-entrant.
+ * The bridge's listener runs synchronously inside every dispatch, and anything
+ * it dispatches back — a `bridge.gone`, a `bridge.ready` — is handled inside
+ * that same stack, where `./agent.ts` answers `bridge.ready` with a flush. A
+ * second drain started there would take the batches queued *behind* the one
+ * still in the bridge's hands and dispatch them first, under the same
+ * `batchSeq`. So a nested drain request returns at once, and the running drain
+ * reschedules whatever is left when it finishes (see {@link drainBatches}).
+ */
+let delivering = false;
 
 /**
- * The secret every inbound frame must carry, or `undefined` when none could be
- * minted (no CSPRNG in the realm — see {@link mintHandshakeToken}).
+ * Incremented on every capture change and every {@link resetTransport}.
+ *
+ * A batch reads it before it is dispatched and again afterwards. A different
+ * value means the capture the batch belongs to ended — or the whole transport
+ * was reset — while the bridge was handling the frame, and whatever the
+ * outcome, the events are accounted to that ended capture: never requeued into
+ * the next one, and never allowed to move its `batchSeq` or `droppedCount`.
+ */
+let captureEpoch = 0;
+
+/**
+ * Incremented on every {@link resetTransport}.
+ *
+ * Read around a dispatch alongside {@link captureEpoch}, to tell the two ways a
+ * capture can end under a batch apart. After a capture change the cumulative
+ * totals carry on, so the batch is settled into them; after a reset they have
+ * just been zeroed — the transport is back to the state it had before anything
+ * was configured — and a batch from before the reset is settled into nothing,
+ * or a freshly reset transport would report traffic it never carried.
+ */
+let resetGeneration = 0;
+
+/**
+ * Incremented on every accepted `bridge.ready`.
+ *
+ * Read around a dispatch for the same reason as {@link captureEpoch}: a
+ * `bridge.ready` handled while a batch was in the bridge's hands means the
+ * bridge came back during that very dispatch, so the batch it did not claim
+ * was refused by the bridge's *previous* port. That batch is requeued as usual
+ * but the bridge is not marked away — marking it away would wait for a second
+ * `bridge.ready` that is never coming — and the running drain reschedules the
+ * retry for the next task.
+ */
+let bridgeReadyGeneration = 0;
+
+/**
+ * The channel node: a detached element created by the first {@link subscribe}
+ * and handed to the bridge by the one handshake answer.
  *
  * **Document-scoped, and deliberately untouched by {@link resetTransport}.**
- * That is the one lifetime decision in this module that would break production
- * silently if it were the other way round. `./agent.ts`'s `disarm()` calls
- * `resetTransport()` at the end of *every* capture and immediately
- * re-subscribes, so a token cleared there would leave the bridge holding a
- * value this module no longer recognises and the agent permanently deaf to the
- * next `agent.config` — no second capture on that document, ever, and no error
- * anywhere to say why. A token is a property of the document, like the producer
- * id in `./ids.js`, not of a capture.
- *
- * Re-minting on a re-subscribe would be just as wrong in the opposite
- * direction: a fresh token has to be disclosed, and a disclosure at disarm time
- * happens long after `document_start`, in a document whose scripts are all
- * running — which is precisely the window the exchange is designed to stay
- * inside.
+ * `./agent.ts`'s `disarm()` calls `resetTransport()` at the end of *every*
+ * capture and immediately re-subscribes; a node replaced there would leave the
+ * bridge holding one this module no longer listens on, with no second
+ * handshake coming, and the document could never be armed again. The node is
+ * a property of the document, like the producer id in `./ids.js`, not of a
+ * capture. It is held only in this module-private binding: never inserted into
+ * the document, never assigned to a global, never exposed on `__DEBUGGEN__`.
  */
-let handshakeToken: string | undefined;
-
-/**
- * Whether a mint has been attempted for this document.
- *
- * Separate from {@link handshakeToken} being set, because a realm with no
- * CSPRNG leaves the token `undefined` and must not be retried: the retry would
- * fail identically and would re-report a failure the service has already been
- * told about. Never cleared, for the reasons on {@link handshakeToken}.
- */
-let handshakeMintAttempted = false;
+let channelNode: EventTarget | undefined;
 
 /**
  * Whether the one answerable {@link HANDSHAKE_REQUEST_EVENT} has been answered.
  *
- * The latch that bounds disclosure. Set before the answer is dispatched, so a
- * listener that synchronously dispatches a second request from inside the
- * offer — a page script's most natural move — finds the exchange already
- * closed. Never cleared: not by {@link resetTransport}, not by a re-subscribe,
- * not by anything, because "the first asker" is a fact about the document.
+ * The latch that bounds disclosure of the node. Set — and the request listener
+ * removed — before the answer is dispatched, so a listener that synchronously
+ * dispatches a second request from inside the answer finds the exchange
+ * already closed. Never cleared: not by {@link resetTransport}, not by a
+ * re-subscribe, not by anything, because "the first asker" is a fact about the
+ * document. It is also the channel's "open" flag: until it is set no bridge
+ * can hold the node, so nothing is dispatched on it (see {@link postControl}).
  */
-let handshakeRequestAnswered = false;
+let handshakeAnswered = false;
 
 /**
- * The installed {@link HANDSHAKE_REQUEST_EVENT} listener, or `undefined`.
+ * The installed {@link HANDSHAKE_REQUEST_EVENT} listener on `window`, or
+ * `undefined`.
  *
- * Follows the `message` listener's lifetime rather than the token's: installed
- * by the first {@link subscribe}, removed by the last unsubscribe and by
- * {@link resetTransport}, so the "a fully detached agent leaves no listener on
- * the page's window" invariant keeps holding. It is also removed the moment the
- * request is answered, since a latched exchange has nothing left to listen for.
+ * Installed by the first {@link subscribe} while the handshake is still
+ * unanswered, removed by the last unsubscribe and by {@link resetTransport},
+ * and removed the moment the request is answered, since a latched exchange has
+ * nothing left to listen for — so an agent past its handshake keeps no
+ * listener on the page's window at all.
  */
-let handshakeRequestListener: (() => void) | undefined;
+let handshakeRequestListener: EventListener | undefined;
+
+/**
+ * The installed {@link BRIDGE_FRAME_EVENT} listener on the channel node, or
+ * `undefined`.
+ *
+ * Follows the subscriber lifecycle: installed by the first {@link subscribe},
+ * removed by the last unsubscribe and by {@link resetTransport}, re-installed
+ * by the next subscribe — on the same node, so the bridge's reference stays
+ * good across every disarm and re-arm.
+ */
+let bridgeFrameListener: EventListener | undefined;
+
+/*
+ * ---------------------------------------------------------------------------
+ * Channel intrinsics
+ *
+ * Every platform function the channel calls, read once while this module is
+ * evaluated — which, in the bundle, is at `document_start`, before any script
+ * the page loads — and called only through the captured `Reflect.apply`.
+ *
+ * A page script that later replaces `EventTarget.prototype.dispatchEvent`,
+ * wraps `addEventListener`, shadows `CustomEvent`, redefines the `detail`
+ * accessor or swaps `JSON.parse` is the attack this closes: each of those is
+ * a way to watch frames go by, or to put words into one, without holding the
+ * node. Reading them now and never again makes the channel's behaviour a fact
+ * about the document as it was at `document_start`.
+ *
+ * The node's listener and dispatch methods are read off
+ * `EventTarget.prototype`; the three the handshake calls on `window` are read
+ * off `window` itself, the way `window` resolves them at that moment. In a
+ * browser those are the very same functions — nothing has run before the
+ * agent to make them differ — so the two reads carry one guarantee. Reading
+ * them from the receiver they are applied to is what keeps the handshake
+ * working in a host whose global object is not itself an `EventTarget` and
+ * forwards these methods to one, as the DOM emulation this package's suites
+ * run on does; the prototype's methods refuse such a receiver.
+ *
+ * Reading a global is not a side effect in the sense of invariant 1 — nothing
+ * is listened to, dispatched, allocated on the page or changed — and every
+ * read is `typeof`-guarded, so a host with no DOM (the Node program that also
+ * type-checks this file, a worker) captures nothing and the channel simply
+ * never opens.
+ * ---------------------------------------------------------------------------
+ */
+
+/** `EventTarget.prototype.addEventListener` / `removeEventListener`. */
+type ListenerMethod = (this: EventTarget, type: string, listener: EventListener) => void;
+
+/** `EventTarget.prototype.dispatchEvent`. */
+type DispatchMethod = (this: EventTarget, event: Event) => boolean;
+
+/** The `CustomEvent.prototype.detail` getter. */
+type EventAccessor = (this: Event) => unknown;
+
+/** `Event.prototype.preventDefault`. */
+type EventMethod = (this: Event) => void;
+
+/** `Document.prototype.createElement`, for the one tag this module creates. */
+type CreateElementMethod = (this: Document, tagName: string) => Element;
+
+/** `JSON.stringify`, in the one-argument form this module uses. */
+type StringifyFunction = (this: unknown, value: unknown) => string | undefined;
+
+/** A `JSON.parse` reviver. */
+type JsonReviver = (this: unknown, key: string, value: unknown) => unknown;
+
+/** `JSON.parse`, always called with {@link reviveNullPrototype}'s reviver. */
+type ParseFunction = (this: unknown, text: string, reviver: JsonReviver) => unknown;
+
+/** `Object.create`, only ever called with `null`. */
+type CreateObjectFunction = (this: unknown, prototype: null) => Record<string, unknown>;
+
+/** `Object.keys`. */
+type KeysFunction = (this: unknown, value: object) => string[];
+
+/** `Array.isArray`. */
+type IsArrayFunction = (this: unknown, value: unknown) => boolean;
+
+/** The captured platform functions the channel runs on. */
+interface ChannelIntrinsics {
+  /** `Reflect.apply`: the only way anything below is ever called. */
+  readonly apply: typeof Reflect.apply;
+  /** `EventTarget.prototype.addEventListener`. */
+  readonly addEventListener: ListenerMethod;
+  /** `EventTarget.prototype.removeEventListener`. */
+  readonly removeEventListener: ListenerMethod;
+  /** `EventTarget.prototype.dispatchEvent`. */
+  readonly dispatchEvent: DispatchMethod;
+  /** `window.addEventListener`, as `window` resolved it: the request listener. */
+  readonly windowAddEventListener: ListenerMethod;
+  /** `window.removeEventListener`, as `window` resolved it. */
+  readonly windowRemoveEventListener: ListenerMethod;
+  /** `window.dispatchEvent`, as `window` resolved it: the handshake answer. */
+  readonly windowDispatchEvent: DispatchMethod;
+  /** The `CustomEvent` constructor, for frames. */
+  readonly CustomEvent: typeof CustomEvent;
+  /** The `MouseEvent` constructor, for the handshake answer. */
+  readonly MouseEvent: typeof MouseEvent;
+  /** The `CustomEvent.prototype.detail` getter. */
+  readonly readDetail: EventAccessor;
+  /** `Event.prototype.preventDefault`: the acknowledgement. */
+  readonly preventDefault: EventMethod;
+  /** `JSON.parse`: reads an inbound frame. */
+  readonly parse: ParseFunction;
+  /** `Document.prototype.createElement`: makes the channel node. */
+  readonly createElement: CreateElementMethod;
+  /** `Object.create`: the null-prototype records inbound frames revive into. */
+  readonly createObject: CreateObjectFunction;
+  /** `Object.keys`: copies a parsed record's own keys. */
+  readonly ownKeys: KeysFunction;
+  /** `Array.isArray`: tells a parsed array from a parsed record. */
+  readonly isArray: IsArrayFunction;
+}
+
+/**
+ * How far up a prototype chain {@link accessorOf} looks for an accessor.
+ *
+ * `detail` is an own accessor of `CustomEvent.prototype` in every engine this
+ * product supports; the walk exists for a DOM implementation that defines it
+ * one level up, and the bound keeps a hostile or cyclic-looking chain from
+ * costing more than a few reads.
+ */
+const MAX_PROTOTYPE_WALK = 4;
+
+/**
+ * Read a function-valued property, or `undefined` when it is not a function.
+ *
+ * Read through `Reflect.get` rather than as `owner.key`, which would bind
+ * nothing and is exactly what the type-aware lint's `unbound-method` rule
+ * warns about: these are deliberately unbound, to be called later with an
+ * explicit receiver through `Reflect.apply`.
+ *
+ * @param owner The object that holds the function.
+ * @param key The property name.
+ * @returns The function, typed as the caller's signature, or `undefined`.
+ */
+function functionOf<T>(owner: object, key: string): T | undefined {
+  const value: unknown = Reflect.get(owner, key);
+  return typeof value === 'function' ? (value as T) : undefined;
+}
+
+/**
+ * Find the getter of an accessor property on a prototype or its ancestors.
+ *
+ * @param prototype The prototype to start from.
+ * @param key The accessor's name.
+ * @returns The getter, or `undefined` when there is no such accessor.
+ */
+function accessorOf(prototype: object, key: string): EventAccessor | undefined {
+  let owner: object | null = prototype;
+  for (let depth = 0; depth < MAX_PROTOTYPE_WALK && owner !== null; depth += 1) {
+    const descriptor = Reflect.getOwnPropertyDescriptor(owner, key);
+    if (descriptor !== undefined) {
+      const getter: unknown = descriptor.get;
+      return typeof getter === 'function' ? (getter as EventAccessor) : undefined;
+    }
+    owner = Reflect.getPrototypeOf(owner);
+  }
+  return undefined;
+}
+
+/**
+ * Capture the channel's intrinsics, or report that this host cannot have a
+ * channel at all.
+ *
+ * All or nothing: a channel missing one of these could not be both private
+ * and acknowledged, so a host lacking any of them gets `undefined` and the
+ * agent stays deaf and silent rather than half-working.
+ *
+ * @returns The captured intrinsics, frozen, or `undefined`.
+ */
+function captureChannelIntrinsics(): ChannelIntrinsics | undefined {
+  try {
+    if (
+      typeof Reflect === 'undefined' ||
+      typeof JSON === 'undefined' ||
+      typeof EventTarget === 'undefined' ||
+      typeof Event === 'undefined' ||
+      typeof CustomEvent !== 'function' ||
+      typeof MouseEvent !== 'function' ||
+      typeof Document === 'undefined' ||
+      typeof window === 'undefined'
+    ) {
+      return undefined;
+    }
+
+    const apply = functionOf<typeof Reflect.apply>(Reflect, 'apply');
+    const addEventListener = functionOf<ListenerMethod>(EventTarget.prototype, 'addEventListener');
+    const removeEventListener = functionOf<ListenerMethod>(
+      EventTarget.prototype,
+      'removeEventListener',
+    );
+    const dispatchEvent = functionOf<DispatchMethod>(EventTarget.prototype, 'dispatchEvent');
+    const windowAddEventListener = functionOf<ListenerMethod>(window, 'addEventListener');
+    const windowRemoveEventListener = functionOf<ListenerMethod>(window, 'removeEventListener');
+    const windowDispatchEvent = functionOf<DispatchMethod>(window, 'dispatchEvent');
+    const readDetail = accessorOf(CustomEvent.prototype, 'detail');
+    const preventDefault = functionOf<EventMethod>(Event.prototype, 'preventDefault');
+    const parse = functionOf<ParseFunction>(JSON, 'parse');
+    const createElement = functionOf<CreateElementMethod>(Document.prototype, 'createElement');
+    const createObject = functionOf<CreateObjectFunction>(Object, 'create');
+    const ownKeys = functionOf<KeysFunction>(Object, 'keys');
+    const isArray = functionOf<IsArrayFunction>(Array, 'isArray');
+
+    if (
+      apply === undefined ||
+      addEventListener === undefined ||
+      removeEventListener === undefined ||
+      dispatchEvent === undefined ||
+      windowAddEventListener === undefined ||
+      windowRemoveEventListener === undefined ||
+      windowDispatchEvent === undefined ||
+      readDetail === undefined ||
+      preventDefault === undefined ||
+      parse === undefined ||
+      createElement === undefined ||
+      createObject === undefined ||
+      ownKeys === undefined ||
+      isArray === undefined
+    ) {
+      return undefined;
+    }
+
+    return Object.freeze({
+      apply,
+      addEventListener,
+      removeEventListener,
+      dispatchEvent,
+      windowAddEventListener,
+      windowRemoveEventListener,
+      windowDispatchEvent,
+      CustomEvent,
+      MouseEvent,
+      readDetail,
+      preventDefault,
+      parse,
+      createElement,
+      createObject,
+      ownKeys,
+      isArray,
+    });
+  } catch {
+    // A host whose globals throw on read has no channel; the agent stays
+    // dormant and deaf rather than throwing out of its own evaluation.
+    return undefined;
+  }
+}
+
+/**
+ * The channel's intrinsics, captured once, at module evaluation.
+ *
+ * Declared after every constant and helper {@link captureChannelIntrinsics}
+ * reads, because a module-scope `const` read before its declaration has run
+ * throws — and that throw would be swallowed into a silently absent channel.
+ */
+const CHANNEL_INTRINSICS: ChannelIntrinsics | undefined = captureChannelIntrinsics();
+
+/*
+ * ---------------------------------------------------------------------------
+ * Core intrinsics and page-proof primitives
+ *
+ * The channel above is private, which settles who can put a frame on it. What
+ * it does not settle is what the agent's *own code* hands to the page while it
+ * handles one. This bundle shares the page's realm, so every built-in it calls
+ * after `document_start` — `Array.from`, `Set.prototype.add`, an array's
+ * iterator, `Array.prototype.some`, `Function.prototype.call`, `Array.isArray`,
+ * `Object.keys`, `JSON.stringify` — is whatever the page has since put there,
+ * and a replacement receives the arguments. Handed a subscriber registry it
+ * obtains the handler that applies an `agent.config` and can call it with a
+ * forged one; asked whether a hook was requested it can answer "no" to every
+ * genuine configuration; asked to serialise a frame it can substitute the
+ * text through an inherited `toJSON`. Writes are no safer: assigning a key a
+ * fresh object does not already own walks its prototype chain, so a setter a
+ * page defined on `Object.prototype` (or an index accessor on
+ * `Array.prototype`) is handed the value and decides whether it lands.
+ *
+ * So the control path — frame receipt, subscriber delivery, configuration
+ * parsing and the arm/disarm decisions in `./agent.ts` — and the composition
+ * and rendering of every outbound frame run on three things only:
+ *
+ * 1. **Language intrinsics captured here, at evaluation** (`document_start`,
+ *    before any page script), always called through the captured
+ *    `Reflect.apply`. Captured separately from {@link CHANNEL_INTRINSICS}
+ *    because none of them needs a DOM: `./agent.ts` parses a configuration with
+ *    them whichever way the call arrived.
+ * 2. **Null-prototype storage** made by {@link createNullRecord}, a literal
+ *    that calls nothing: a read of a missing key is absent and a write
+ *    creates an own property, whatever the page added to `Object.prototype`.
+ *    Arrays this module builds are filled through {@link appendValue}, which
+ *    defines the element instead of assigning it.
+ * 3. **Operators and indexed loops** — `typeof`, `===`, `in` on a
+ *    null-prototype record, `for (let i = 0; i < list.length; i += 1)` over an
+ *    array whose elements are its own — which no page can redefine.
+ *
+ * What these three cannot settle is the *values* the page is the source of,
+ * and the module header names each one: a clock reading and its rounding
+ * through `Math.round` (a number, which can skew a timestamp), the type name
+ * of a thrown value (read with `instanceof` and reduced to a closed
+ * vocabulary), a producer's draft and a page-supplied attribute object (data,
+ * read once as own properties), and the page's scheduler, which is handed a
+ * drain callback and nothing else. Each decides what a field says or when a
+ * batch leaves; none is handed a control function, the configuration or a
+ * frame, and none decides whether the agent arms, which capture it stamps or
+ * which bytes the bridge receives for the data it was given. Tables derived
+ * while this bundle evaluates (before any page script) may use ordinary
+ * built-ins: they are frozen, and read afterwards by index or `in` only.
+ *
+ * Exported for `./agent.ts`, which must not import anything the bundle
+ * forbids and has no other module in this folder to take them from.
+ * ---------------------------------------------------------------------------
+ */
+
+/** `Reflect.getOwnPropertyDescriptor`. */
+type OwnDescriptorFunction = (
+  this: unknown,
+  target: object,
+  key: PropertyKey,
+) => PropertyDescriptor | undefined;
+
+/** `Reflect.defineProperty`. */
+type DefineOwnFunction = (
+  this: unknown,
+  target: object,
+  key: PropertyKey,
+  attributes: PropertyDescriptor,
+) => boolean;
+
+/** `Object.hasOwn`. */
+type HasOwnFunction = (this: unknown, target: object, key: PropertyKey) => boolean;
+
+/** `Reflect.getPrototypeOf`. */
+type PrototypeOfFunction = (this: unknown, target: object) => object | null;
+
+/** The captured language intrinsics the page-proof primitives run on. */
+interface CoreIntrinsics {
+  /** `Reflect.apply`: the only way anything below is ever called. */
+  readonly apply: typeof Reflect.apply;
+  /** `Object.keys`: own enumerable string keys, in property order. */
+  readonly ownKeys: KeysFunction;
+  /** `Array.isArray`. */
+  readonly isArray: IsArrayFunction;
+  /** `Reflect.getOwnPropertyDescriptor`: reads a value without running a getter. */
+  readonly ownDescriptor: OwnDescriptorFunction;
+  /** `Reflect.defineProperty`: writes a value without running a setter. */
+  readonly defineOwn: DefineOwnFunction;
+  /** `Object.hasOwn`: tells a data descriptor from an accessor one. */
+  readonly hasOwn: HasOwnFunction;
+  /** `Reflect.getPrototypeOf`. */
+  readonly prototypeOf: PrototypeOfFunction;
+  /**
+   * `JSON.stringify`, only ever applied to a string or a number: for a
+   * primitive the algorithm consults no `toJSON` and calls nothing, so the
+   * captured function quotes and formats exactly as the specification says.
+   */
+  readonly stringify: StringifyFunction;
+  /** `Object.prototype` as it was at evaluation, for the plain-object test. */
+  readonly objectPrototype: object;
+}
+
+/**
+ * Capture the core intrinsics, or report that this host lacks one of them.
+ *
+ * All or nothing, like {@link captureChannelIntrinsics}. Every one of them is
+ * standard in any engine that can parse this bundle's syntax (the build
+ * targets Chrome 111), so `undefined` describes a host whose globals were
+ * removed before the agent ran — code this module does not claim to defend
+ * against. There the primitives below throw, every caller contains the throw,
+ * and the agent neither arms, disarms nor dispatches anything.
+ *
+ * @returns The captured intrinsics, frozen, or `undefined`.
+ */
+function captureCoreIntrinsics(): CoreIntrinsics | undefined {
+  try {
+    if (typeof Reflect === 'undefined' || typeof JSON === 'undefined') {
+      return undefined;
+    }
+
+    const apply = functionOf<typeof Reflect.apply>(Reflect, 'apply');
+    const ownKeys = functionOf<KeysFunction>(Object, 'keys');
+    const isArray = functionOf<IsArrayFunction>(Array, 'isArray');
+    const ownDescriptor = functionOf<OwnDescriptorFunction>(Reflect, 'getOwnPropertyDescriptor');
+    const defineOwn = functionOf<DefineOwnFunction>(Reflect, 'defineProperty');
+    const hasOwn = functionOf<HasOwnFunction>(Object, 'hasOwn');
+    const prototypeOf = functionOf<PrototypeOfFunction>(Reflect, 'getPrototypeOf');
+    const stringify = functionOf<StringifyFunction>(JSON, 'stringify');
+    const objectPrototype: unknown = Reflect.get(Object, 'prototype');
+
+    if (
+      apply === undefined ||
+      ownKeys === undefined ||
+      isArray === undefined ||
+      ownDescriptor === undefined ||
+      defineOwn === undefined ||
+      hasOwn === undefined ||
+      prototypeOf === undefined ||
+      stringify === undefined ||
+      typeof objectPrototype !== 'object' ||
+      objectPrototype === null
+    ) {
+      return undefined;
+    }
+
+    return Object.freeze({
+      apply,
+      ownKeys,
+      isArray,
+      ownDescriptor,
+      defineOwn,
+      hasOwn,
+      prototypeOf,
+      stringify,
+      objectPrototype,
+    });
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The core intrinsics, captured once, at module evaluation — after
+ * {@link functionOf}'s declaration has run, for the reason given at
+ * {@link CHANNEL_INTRINSICS}.
+ */
+const CORE_INTRINSICS: CoreIntrinsics | undefined = captureCoreIntrinsics();
+
+/*
+ * The failures the primitives below can report, built while the module is
+ * evaluated. Throwing one constructs nothing, so a page that has replaced the
+ * `TypeError` or `RangeError` globals runs no code of its own when the agent
+ * refuses a value. Callers never inspect them beyond "it threw": every call
+ * site maps a throw to its own documented outcome.
+ */
+
+/** A core intrinsic is missing (see {@link captureCoreIntrinsics}). */
+const CORE_UNAVAILABLE = new TypeError('the page agent could not capture its core intrinsics');
+
+/** {@link appendValue} or {@link defineOwnValue} met a target that refused the value. */
+const DEFINE_REFUSED = new TypeError('the page agent could not define a value it built');
+
+/** {@link serializeFrameJson} met a value that contains itself. */
+const JSON_CYCLE = new TypeError('the value contains itself and has no JSON rendering');
+
+/** {@link serializeFrameJson} met containers nested deeper than {@link MAX_SERIALIZED_DEPTH}. */
+const JSON_TOO_DEEP = new RangeError('the value nests deeper than a frame may');
+
+/** {@link serializeFrameJson} met a bigint, which JSON cannot spell. */
+const JSON_BIGINT = new TypeError('a bigint has no JSON rendering');
+
+/** {@link serializeFrameJson} was given a value with no rendering at all. */
+const JSON_NO_RENDERING = new TypeError('the value has no JSON rendering');
+
+/**
+ * What {@link readOwnData} answers for a key with no own data property: absent,
+ * or an accessor whose getter this module will not run.
+ *
+ * A symbol, so no value a holder can store is mistaken for it.
+ */
+const NOT_OWN_DATA = Symbol('debuggen.not-own-data');
+
+/**
+ * The core intrinsics, or the {@link CORE_UNAVAILABLE} throw.
+ *
+ * @returns The captured intrinsics.
+ */
+function coreIntrinsics(): CoreIntrinsics {
+  const core = CORE_INTRINSICS;
+  if (core === undefined) {
+    throw CORE_UNAVAILABLE;
+  }
+  return core;
+}
+
+/**
+ * A fresh, empty object with no prototype, typed as the caller's record.
+ *
+ * `{ __proto__: null }` is object-literal syntax, not an assignment: the
+ * literal is created with a null prototype and calls nothing, so there is no
+ * `Object.create` a page could have replaced and no `__proto__` setter to
+ * intercept. On the result a missing key reads as absent, `in` sees only own
+ * keys, and an assignment creates an own property — which is what makes it
+ * the storage for everything the control path keeps and every record an
+ * outbound frame is built from.
+ *
+ * The cast is the one place a record is typed before its members exist; each
+ * caller assigns them immediately.
+ *
+ * @example
+ * const hooks = createNullRecord<Record<HookFlag, boolean>>();
+ * hooks.fetch = true; // an own property, whatever `Object.prototype` defines
+ *
+ * @returns An empty null-prototype object.
+ */
+export function createNullRecord<T extends object = Record<string, unknown>>(): T {
+  const record: object = { __proto__: null };
+  return record as T;
+}
+
+/**
+ * `Array.isArray` as it was at evaluation.
+ *
+ * @param value Anything.
+ * @returns Whether the value is an array (a `Proxy` of one included).
+ * @throws {TypeError} Only in a host with no core intrinsics.
+ */
+export function isArrayValue(value: unknown): value is readonly unknown[] {
+  const core = coreIntrinsics();
+  return core.apply(core.isArray, undefined, [value]);
+}
+
+/**
+ * A null-prototype data descriptor for `value`: writable, enumerable and
+ * configurable, exactly like the property an assignment would create.
+ *
+ * Null-prototype because `Reflect.defineProperty` reads a descriptor's six
+ * fields through the prototype chain: an ordinary object here would let a page
+ * that defined `Object.prototype.get` turn the definition into an accessor.
+ */
+function dataDescriptor(value: unknown): PropertyDescriptor {
+  const descriptor = createNullRecord<PropertyDescriptor>();
+  descriptor.value = value;
+  descriptor.writable = true;
+  descriptor.enumerable = true;
+  descriptor.configurable = true;
+  return descriptor;
+}
+
+/**
+ * Give `target` an own data property `key`, without an assignment.
+ *
+ * For the fields of an ordinary object this module (or `./agent.ts`) builds
+ * with a literal and then extends conditionally — an optional `parentSpanId`,
+ * a `captureId` present only inside a capture. The result is what the
+ * assignment would have produced when nothing intercepts it, and what it
+ * produces here whatever the page defined along the prototype chain.
+ *
+ * @param target The object to extend.
+ * @param key The property to define.
+ * @param value Its value.
+ * @throws {TypeError} When the target refuses the definition (a frozen
+ * object), or in a host with no core intrinsics.
+ */
+export function defineOwnValue<T extends object, K extends keyof T>(
+  target: T,
+  key: K,
+  value: T[K],
+): void {
+  const core = coreIntrinsics();
+  if (!core.apply(core.defineOwn, undefined, [target, key, dataDescriptor(value)])) {
+    throw DEFINE_REFUSED;
+  }
+}
+
+/**
+ * Append `value` to `list`, as `push` would, without calling `push`.
+ *
+ * `Array.prototype.push` is the page's once its scripts have run, and even the
+ * original assigns the new element — so an index accessor a page put on
+ * `Array.prototype` would receive it. Defining the element at `list.length`
+ * creates it as an own property and advances `length`, which is the whole of
+ * what `push` does for an ordinary array.
+ *
+ * @example
+ * const released: HookName[] = [];
+ * appendValue(released, 'fetch');
+ *
+ * @param list An array this module or `./agent.ts` created.
+ * @param value The element to append.
+ * @throws {TypeError} When the array refuses the element (a frozen array), or
+ * in a host with no core intrinsics.
+ */
+export function appendValue<T>(list: T[], value: T): void {
+  const core = coreIntrinsics();
+  if (!core.apply(core.defineOwn, undefined, [list, list.length, dataDescriptor(value)])) {
+    throw DEFINE_REFUSED;
+  }
+}
+
+/**
+ * Read an own data property without running anything.
+ *
+ * The captured `Reflect.getOwnPropertyDescriptor` reports the property without
+ * invoking a getter, and the captured `Object.hasOwn` on the returned
+ * descriptor is what tells a data property from an accessor: the descriptor
+ * is an ordinary object, so reading `descriptor.value` of an *accessor* would
+ * fall through to whatever a page defined as `Object.prototype.value`.
+ *
+ * @param core The captured intrinsics.
+ * @param holder The object to read.
+ * @param key The property.
+ * @returns The value, or {@link NOT_OWN_DATA} for an absent key or an accessor.
+ */
+function readOwnData(core: CoreIntrinsics, holder: object, key: PropertyKey): unknown {
+  const descriptor = core.apply(core.ownDescriptor, undefined, [holder, key]);
+  if (descriptor === undefined || !core.apply(core.hasOwn, undefined, [descriptor, 'value'])) {
+    return NOT_OWN_DATA;
+  }
+  const value: unknown = descriptor.value;
+  return value;
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * Frame serialization
+ *
+ * Every frame's `detail` is JSON text, and the native `JSON.stringify` — even
+ * the one captured at evaluation — looks up `toJSON` on every object it
+ * visits, inherited ones included, and reads every property through its
+ * getter. A late `Object.prototype.toJSON` would therefore be called with the
+ * frame itself, could read every identifier on it, and would decide what text
+ * the agent dispatches on its own private node. {@link serializeFrameJson}
+ * renders JSON-shaped data to exactly the text `JSON.stringify` produces for
+ * it, without consulting `toJSON` (own or inherited) and without running any
+ * getter.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * The deepest container nesting {@link serializeFrameJson} renders.
+ *
+ * Every frame this module builds nests at most eight containers (frame,
+ * payload, events, event, attributes and the three levels the sanitizer
+ * keeps); the bound exists for the one field that is carried as given — an
+ * event's `source` — and makes a pathologically deep value a refused frame
+ * rather than a stack overflow in the page.
+ */
+const MAX_SERIALIZED_DEPTH = 64;
+
+/** One container on the path from the root to the value being rendered. */
+interface AncestorLink {
+  /** The container. */
+  value: object;
+  /** The container that holds it, or `undefined` at the root. */
+  parent: AncestorLink | undefined;
+}
+
+/**
+ * Render a value to the JSON text `JSON.stringify(value)` produces for it,
+ * without ever calling `toJSON` or a getter.
+ *
+ * The rules, and where each one matches the native algorithm:
+ *
+ * - **Strings and numbers** go through the captured `JSON.stringify` applied to
+ *   the primitive itself — the one input for which it consults nothing — so
+ *   quoting (quotes, backslashes, control characters, lone surrogates) and
+ *   number formatting (`-0` as `0`, `1e21` as `1e+21`, `NaN` and both
+ *   infinities as `null`) are the platform's own.
+ * - **Booleans and `null`** render as their literals.
+ * - **`undefined`, functions and symbols** have no rendering: a property
+ *   holding one is omitted, an array element holding one renders `null`, and
+ *   at the top level the call throws (native `JSON.stringify` returns
+ *   `undefined`, which the caller would have to treat as a failure anyway).
+ * - **Arrays** (by the captured `Array.isArray`) render `length` elements in
+ *   order, each read as an own data property; a hole — which natively reads
+ *   `undefined` — renders `null`.
+ * - **Other objects** render their own enumerable string keys in property
+ *   order (the captured `Object.keys`, the order `JSON.stringify` uses),
+ *   each value read as an own data property.
+ * - **Never consulted:** `toJSON` in any form, getters (an accessor property
+ *   is omitted from an object and renders `null` in an array), `valueOf` and
+ *   `toString` (a boxed primitive or a `Date` is rendered as the object it is,
+ *   by its own enumerable data properties). None of these reach a frame this
+ *   module builds; the rule is what keeps a page from making them.
+ * - **Refused**, with a throw: a bigint, a value that contains itself, and
+ *   nesting deeper than {@link MAX_SERIALIZED_DEPTH}. The native function
+ *   throws for the first two as well.
+ *
+ * Exported for `./agent.ts`, whose component-tree snapshot travels as JSON
+ * text inside an attribute and must be rendered by the same rules.
+ *
+ * @example
+ * serializeFrameJson({ a: 'x"y', b: [undefined, -0], c: undefined });
+ * // '{"a":"x\\"y","b":[null,0]}' — the same text JSON.stringify produces
+ *
+ * @param value The value to render.
+ * @returns The JSON text.
+ * @throws {TypeError | RangeError} For a value with no faithful rendering, as
+ * listed above, or in a host with no core intrinsics.
+ */
+export function serializeFrameJson(value: unknown): string {
+  const core = coreIntrinsics();
+  const rendered = renderJsonValue(core, value, undefined, 0);
+  if (rendered === undefined) {
+    throw JSON_NO_RENDERING;
+  }
+  return rendered;
+}
+
+/**
+ * Quote a string or format a number through the captured `JSON.stringify`.
+ *
+ * @param core The captured intrinsics.
+ * @param value The primitive.
+ * @returns Its JSON text.
+ */
+function renderJsonPrimitive(core: CoreIntrinsics, value: string | number): string {
+  const rendered = core.apply(core.stringify, undefined, [value]);
+  if (typeof rendered !== 'string') {
+    throw JSON_NO_RENDERING;
+  }
+  return rendered;
+}
+
+/**
+ * Render one value; see {@link serializeFrameJson} for the rules.
+ *
+ * @param core The captured intrinsics.
+ * @param value The value.
+ * @param ancestors The containers above it, innermost first.
+ * @param depth How many containers enclose it.
+ * @returns The JSON text, or `undefined` for a value with no rendering.
+ */
+function renderJsonValue(
+  core: CoreIntrinsics,
+  value: unknown,
+  ancestors: AncestorLink | undefined,
+  depth: number,
+): string | undefined {
+  switch (typeof value) {
+    case 'string':
+    case 'number':
+      return renderJsonPrimitive(core, value);
+    case 'boolean':
+      return value ? 'true' : 'false';
+    case 'bigint':
+      throw JSON_BIGINT;
+    case 'object':
+      break;
+    default:
+      // `undefined`, a function or a symbol.
+      return undefined;
+  }
+
+  if (value === null) {
+    return 'null';
+  }
+
+  const container: object = value;
+  for (let link = ancestors; link !== undefined; link = link.parent) {
+    if (link.value === container) {
+      throw JSON_CYCLE;
+    }
+  }
+  if (depth >= MAX_SERIALIZED_DEPTH) {
+    throw JSON_TOO_DEEP;
+  }
+
+  // The path is a linked list of null-prototype links, not an array: nothing
+  // about rendering a frame may call a method a page can replace.
+  const path = createNullRecord<AncestorLink>();
+  path.value = container;
+  path.parent = ancestors;
+
+  return core.apply(core.isArray, undefined, [container])
+    ? renderJsonArray(core, container, path, depth + 1)
+    : renderJsonRecord(core, container, path, depth + 1);
+}
+
+/**
+ * Render an array's elements, in order.
+ *
+ * @param core The captured intrinsics.
+ * @param array The array.
+ * @param path The containers down to and including this one.
+ * @param depth The nesting of its elements.
+ * @returns The JSON text.
+ */
+function renderJsonArray(
+  core: CoreIntrinsics,
+  array: object,
+  path: AncestorLink,
+  depth: number,
+): string {
+  const length = readOwnData(core, array, 'length');
+  const count = typeof length === 'number' ? length : 0;
+
+  let rendered = '[';
+  for (let index = 0; index < count; index += 1) {
+    if (index > 0) {
+      rendered += ',';
+    }
+    const element = readOwnData(core, array, index);
+    const text = element === NOT_OWN_DATA ? undefined : renderJsonValue(core, element, path, depth);
+    rendered += text ?? 'null';
+  }
+  return `${rendered}]`;
+}
+
+/**
+ * Render a record's own enumerable string-keyed data properties, in order.
+ *
+ * @param core The captured intrinsics.
+ * @param record The record.
+ * @param path The containers down to and including this one.
+ * @param depth The nesting of its values.
+ * @returns The JSON text.
+ */
+function renderJsonRecord(
+  core: CoreIntrinsics,
+  record: object,
+  path: AncestorLink,
+  depth: number,
+): string {
+  const keys = core.apply(core.ownKeys, undefined, [record]);
+
+  let rendered = '{';
+  let members = 0;
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys[index];
+    if (key === undefined) {
+      continue;
+    }
+    const member = readOwnData(core, record, key);
+    if (member === NOT_OWN_DATA) {
+      continue;
+    }
+    const text = renderJsonValue(core, member, path, depth);
+    if (text === undefined) {
+      continue;
+    }
+    rendered += `${members === 0 ? '' : ','}${renderJsonPrimitive(core, key)}:${text}`;
+    members += 1;
+  }
+  return `${rendered}}`;
+}
+
+/**
+ * This document's clock-offset estimate: the dev server's clock minus this
+ * document's event clock, from the `Date` headers `./fetch.ts` feeds through
+ * {@link observeServerClock} (AAP 0.2.3; the estimator is defined in
+ * `../schema/clock-offset.ts`).
+ *
+ * **Document-scoped, and deliberately untouched by {@link configureTransport}
+ * and {@link resetTransport}**, for the reason the producer id and
+ * {@link channelNode} are: it describes this document's clock, and that
+ * clock does not change when a capture does. `./agent.ts`'s `disarm()` resets
+ * the transport at the end of every capture, so an estimate cleared there would
+ * leave every capture after the first starting blind, with no sample until the
+ * page next made a same-origin request — and the samples already taken remain
+ * exactly as valid a statement about the clock as they were.
+ *
+ * `const`, and constructed at evaluation: the instance holds four numbers and
+ * three counters, reads no clock and touches nothing on the page, so creating
+ * it is no more a side effect than the zeroes above.
+ */
+const clockOffset = new ClockOffsetEstimator();
 
 /*
  * ---------------------------------------------------------------------------
@@ -968,7 +2065,10 @@ let handshakeRequestListener: (() => void) | undefined;
  *
  * The two exports below are therefore the single definition *inside the
  * bundle*: `./interaction.ts`, `./react.ts`, `./fetch.ts`, `./perf.ts` and
- * `./state.ts` convert through them and never re-derive the arithmetic. The
+ * `./state.ts` convert through them and never re-derive the arithmetic, and
+ * the clock-offset samples `./fetch.ts` takes are read from the same
+ * {@link nowEpochMs}, so the offset describes the clock event times are
+ * stamped with rather than a second one. The
  * semantics are the shared package's, deliberately: prefer
  * `performance.timeOrigin`, fall back to `Date.now() - performance.now()` when
  * a host exposes the clock but not the origin, and fall back to `Date.now()`
@@ -981,6 +2081,22 @@ const TIME_DECIMALS = 3;
 
 /** The rounding multiplier, derived so the two constants cannot disagree. */
 const TIME_ROUNDING_FACTOR = 10 ** TIME_DECIMALS;
+
+/**
+ * `Number.isFinite`, spelled with operators.
+ *
+ * `value - value` is `0` for every finite number and `NaN` for `NaN` and both
+ * infinities, so the answer is exactly the built-in's. The built-in is the
+ * page's to replace, and here it decides whether an event is stamped and
+ * whether a number reaches the wire: one that answered `false` would make the
+ * transport drop every event it is given.
+ *
+ * @param value Anything.
+ * @returns Whether the value is a finite number.
+ */
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && value - value === 0;
+}
 
 /**
  * A reading of the host's high-resolution clock, or `undefined` when there
@@ -1007,19 +2123,24 @@ function probeClock(): ClockReading | undefined {
   }
 
   const clock: { now?: unknown; timeOrigin?: unknown } = performance;
-  if (typeof clock.now !== 'function') {
+  const core = CORE_INTRINSICS;
+  if (typeof clock.now !== 'function' || core === undefined) {
     return undefined;
   }
 
-  const relativeMs: unknown = (clock.now as () => unknown).call(performance);
-  if (typeof relativeMs !== 'number' || !Number.isFinite(relativeMs)) {
+  // Called through the captured `Reflect.apply`, not `.call`: the page's
+  // `Function.prototype.call` would run on every timestamp the agent takes.
+  // The clock itself is the page's, which is the residual stated in the
+  // module header: a page can skew the times it is measured with.
+  const relativeMs: unknown = core.apply(clock.now as () => unknown, performance, []);
+  if (!isFiniteNumber(relativeMs)) {
     return undefined;
   }
 
   const origin = clock.timeOrigin;
   return {
     relativeMs,
-    timeOrigin: typeof origin === 'number' && Number.isFinite(origin) ? origin : undefined,
+    timeOrigin: isFiniteNumber(origin) ? origin : undefined,
   };
 }
 
@@ -1047,7 +2168,7 @@ function round3(value: number): number {
  * event with no start time is not an event.
  */
 function roundEpochMs(value: number): number {
-  if (!Number.isFinite(value)) {
+  if (!isFiniteNumber(value)) {
     return Date.now();
   }
   return round3(value);
@@ -1099,7 +2220,7 @@ export function nowEpochMs(): number {
  */
 export function toEpochMs(relativeMs: number): number {
   try {
-    if (!Number.isFinite(relativeMs)) {
+    if (!isFiniteNumber(relativeMs)) {
       return nowEpochMs();
     }
 
@@ -1130,16 +2251,26 @@ export function toEpochMs(relativeMs: number): number {
  * application value near this module, and `./dom-target.ts` returns a
  * descriptor of strings. What is left for this layer is the mistake those two
  * cannot prevent: a producer that puts a live callback, a DOM node, an `Error`
- * or a cyclic object straight onto an attribute bag. That single value would
- * make `postMessage` throw `DataCloneError` and cost the whole batch — and the
- * ingress schema refuses functions and symbols as well — so every bag is
- * rebuilt here out of values that are certain to clone and certain to survive
- * a JSON round trip.
+ * or a cyclic object straight onto an attribute bag. A cycle or a bigint makes
+ * the frame's serialization throw and would cost the whole batch, a function
+ * or a DOM node would silently change shape on the way — and the ingress schema
+ * refuses functions and symbols as well — so every bag is rebuilt here out of
+ * values that are certain to survive a JSON round trip unchanged.
  *
  * Rebuilding rather than checking has a second effect worth stating: the
- * object that leaves is a fresh plain object with no getters, no prototype
- * chain and no `Proxy` traps, so nothing the page can define runs while the
- * frame is being cloned.
+ * object that leaves is a fresh plain object with no getters and no `Proxy`
+ * traps, so nothing the page defined on the value itself runs while the frame
+ * is being rendered.
+ *
+ * The walk follows the rules of "Core intrinsics and page-proof primitives":
+ * keys come from the captured `Object.keys`, arrays and plain objects are
+ * recognised with the captured `Array.isArray` and `Reflect.getPrototypeOf`,
+ * a DOM node with the captured `instanceof` algorithm, and the rebuilt bag is
+ * filled with {@link defineOwnValue} and {@link appendValue}. So no built-in
+ * a page replaced, and no accessor it put on a prototype, is handed a bag a
+ * producer built or the bag being rebuilt. An own getter on a value the *page*
+ * supplied still runs here, once, as it always has: that getter belongs to the
+ * object it is defined on, and its result is what gets copied.
  * ---------------------------------------------------------------------------
  */
 
@@ -1196,14 +2327,77 @@ function typeTag(type: AttributeValueType): string {
   return `[${type}]`;
 }
 
-/** Whether a value is, or convincingly claims to be, a DOM node. */
-function isDomNode(value: object): boolean {
-  if (typeof Node !== 'undefined' && value instanceof Node) {
+/** `Function.prototype[Symbol.hasInstance]`: the ordinary `instanceof` algorithm. */
+type HasInstanceFunction = (this: unknown, value: unknown) => boolean;
+
+/** `value instanceof Node`, as the platform answered it at evaluation. */
+interface NodeTest {
+  /** The ordinary `instanceof` algorithm, called with {@link node} as `this`. */
+  readonly hasInstance: HasInstanceFunction;
+  /** The `Node` interface object. */
+  readonly node: object;
+}
+
+/**
+ * Capture what `value instanceof Node` needs, or report that this host has no
+ * DOM.
+ *
+ * `instanceof Node` written out looks up the global `Node` binding and then
+ * its `Symbol.hasInstance` when it runs. A page can replace either one, and
+ * the replacement receives the value being tested, which here is a container
+ * a producer built. The interface object and the ordinary algorithm on
+ * `Function.prototype` are captured instead, and called through the captured
+ * `Reflect.apply`. The algorithm reads `Node.prototype`, which WebIDL makes
+ * non-writable and non-configurable, and walks the value's prototype chain.
+ *
+ * @returns The captured pair, frozen, or `undefined` where there is no `Node`.
+ */
+function captureNodeTest(): NodeTest | undefined {
+  try {
+    if (typeof Node === 'undefined' || typeof Symbol === 'undefined') {
+      return undefined;
+    }
+    const node: unknown = Node;
+    const hasInstance: unknown = Reflect.get(Function.prototype, Symbol.hasInstance);
+    if (typeof node !== 'function' || typeof hasInstance !== 'function') {
+      return undefined;
+    }
+    return Object.freeze({ node, hasInstance: hasInstance as HasInstanceFunction });
+  } catch {
+    return undefined;
+  }
+}
+
+/** The `instanceof Node` test, captured once, at module evaluation. */
+const NODE_TEST: NodeTest | undefined = captureNodeTest();
+
+/**
+ * Whether a value is, or convincingly claims to be, a DOM node.
+ *
+ * A node from another realm (an iframe's document) fails `instanceof`, and a
+ * node is exactly the value that must not be serialised, so a duck test
+ * follows. For an array or a plain object it reads only *own data*
+ * properties. Such a container is one a producer built, or page data copied
+ * into a literal, and reading a key it lacks would walk to `Object.prototype`,
+ * where a page accessor would receive the container. Any other object is the
+ * page's own, a class instance or a node from another realm, and is asked as
+ * it always was.
+ *
+ * @param core The captured intrinsics.
+ * @param value The object to test.
+ * @param container Whether `value` is an array or a plain object.
+ */
+function isDomNode(core: CoreIntrinsics, value: object, container: boolean): boolean {
+  const test = NODE_TEST;
+  if (test !== undefined && core.apply(test.hasInstance, test.node, [value])) {
     return true;
   }
-  // A node from another realm (an iframe's document) fails `instanceof`, and
-  // a node is exactly the value that must not be serialised, so the duck test
-  // is worth having.
+  if (container) {
+    return (
+      typeof readOwnData(core, value, 'nodeType') === 'number' &&
+      typeof readOwnData(core, value, 'nodeName') === 'string'
+    );
+  }
   const candidate = value as { nodeType?: unknown; nodeName?: unknown };
   return typeof candidate.nodeType === 'number' && typeof candidate.nodeName === 'string';
 }
@@ -1214,23 +2408,34 @@ function isDomNode(value: object): boolean {
  *
  * Only plain objects are walked. Everything else is tagged, because its
  * meaning lives in its prototype and a JSON rendering of it would be either
- * empty (`Error`, `Map`) or a lie.
+ * empty (`Error`, `Map`) or a lie. Asked with the captured
+ * `Reflect.getPrototypeOf` against `Object.prototype` as it was at
+ * evaluation, so a page's `Object.getPrototypeOf` never receives the value.
+ *
+ * @param core The captured intrinsics.
+ * @param value The object to test.
  */
-function isPlainObject(value: object): boolean {
-  const prototype: unknown = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
+function isPlainObject(core: CoreIntrinsics, value: object): boolean {
+  const prototype = core.apply(core.prototypeOf, undefined, [value]);
+  return prototype === core.objectPrototype || prototype === null;
 }
 
 /**
  * Sanitize one value, recursing into plain arrays and objects within the
  * depth and node budgets.
  *
+ * @param core The captured intrinsics.
  * @param value The value as the producer left it.
  * @param depth Container level of this value; 0 for a top-level attribute.
  * @param budget Shared node allowance for the whole bag.
- * @returns A clone-safe value, or {@link OMITTED}.
+ * @returns A JSON-safe value, or {@link OMITTED}.
  */
-function sanitizeValue(value: unknown, depth: number, budget: SanitizeBudget): unknown {
+function sanitizeValue(
+  core: CoreIntrinsics,
+  value: unknown,
+  depth: number,
+  budget: SanitizeBudget,
+): unknown {
   budget.remaining -= 1;
 
   switch (typeof value) {
@@ -1238,14 +2443,14 @@ function sanitizeValue(value: unknown, depth: number, budget: SanitizeBudget): u
     case 'boolean':
       return value;
     case 'number':
-      // `NaN` and `Infinity` survive a structured clone but become `null` in
+      // `NaN` and `Infinity` are numbers to the schema but become `null` in
       // JSON, and the event schema bounds the numeric fields that matter, so
       // the honest rendering of a non-finite number is its absence.
-      return Number.isFinite(value) ? value : OMITTED;
+      return isFiniteNumber(value) ? value : OMITTED;
     case 'undefined':
       return OMITTED;
     case 'bigint':
-      // `JSON.stringify` throws on a bigint, which would cost the batch.
+      // The frame's serialization throws on a bigint, which would cost the batch.
       return typeTag('bigint');
     case 'symbol':
       return typeTag('symbol');
@@ -1267,18 +2472,24 @@ function sanitizeValue(value: unknown, depth: number, budget: SanitizeBudget): u
   }
 
   const container: object = value;
-  if (isDomNode(container)) {
+  // Classified once, with the captured intrinsics, before anything is read
+  // from the container: the DOM test below needs to know whether it may ask
+  // an arbitrary object or only a container's own data.
+  const array = core.apply(core.isArray, undefined, [container]);
+  const plain = !array && isPlainObject(core, container);
+
+  if (isDomNode(core, container, array || plain)) {
     return typeTag('dom');
   }
 
-  if (Array.isArray(value)) {
+  if (array) {
     if (depth > MAX_ATTRIBUTE_DEPTH || budget.remaining <= 0) {
       return typeTag('array');
     }
-    return sanitizeArray(value, depth + 1, budget);
+    return sanitizeArray(core, container as readonly unknown[], depth + 1, budget);
   }
 
-  if (!isPlainObject(container)) {
+  if (!plain) {
     return typeTag('object');
   }
 
@@ -1286,7 +2497,7 @@ function sanitizeValue(value: unknown, depth: number, budget: SanitizeBudget): u
     return typeTag('object');
   }
 
-  return sanitizeRecord(container as Record<string, unknown>, depth + 1, budget);
+  return sanitizeRecord(core, container as Record<string, unknown>, depth + 1, budget);
 }
 
 /**
@@ -1294,23 +2505,33 @@ function sanitizeValue(value: unknown, depth: number, budget: SanitizeBudget): u
  *
  * An entry that must not appear becomes `null` rather than vanishing: an array
  * is positional, and dropping an element would silently renumber the rest.
+ *
+ * A hole reads as the `undefined` it is, and so becomes `null`, as before. It
+ * is tested with the captured `Object.hasOwn` rather than read, because
+ * reading an index the array does not own walks to `Array.prototype`, where a
+ * page's index accessor would receive the array.
  */
 function sanitizeArray(
+  core: CoreIntrinsics,
   value: readonly unknown[],
   depth: number,
   budget: SanitizeBudget,
 ): unknown[] {
-  const limit = Math.min(value.length, MAX_TRACKED_KEYS);
+  const length = value.length;
+  const limit = length < MAX_TRACKED_KEYS ? length : MAX_TRACKED_KEYS;
   const out: unknown[] = [];
   for (let index = 0; index < limit; index += 1) {
     let sanitized: unknown;
     try {
-      sanitized = sanitizeValue(value[index], depth, budget);
+      const element: unknown = core.apply(core.hasOwn, undefined, [value, index])
+        ? value[index]
+        : undefined;
+      sanitized = sanitizeValue(core, element, depth, budget);
     } catch {
       // An exotic array with a throwing index getter costs one element.
       sanitized = typeTag('unknown');
     }
-    out.push(sanitized === OMITTED ? null : sanitized);
+    appendValue(out, sanitized === OMITTED ? null : sanitized);
   }
   return out;
 }
@@ -1326,10 +2547,18 @@ function sanitizeArray(
  * `undefined` are different things, and only the first survives transport.
  *
  * Symbol-keyed properties are not visited at all: `Object.keys` does not
- * report them, the event schema's attribute bag is keyed by strings, and a
- * symbol key cannot be cloned.
+ * report them, the event schema's attribute bag is keyed by strings, and
+ * JSON drops a symbol key without a trace.
+ *
+ * Keys come from the captured `Object.keys`, so each one is the value's own and
+ * reading it never reaches a prototype. Each member of the result is defined
+ * rather than assigned, so a setter a page put on `Object.prototype` is never
+ * handed the bag being built. A key named `__proto__` is skipped. Assigning it
+ * never produced an own key either: it replaced the result's prototype, and the
+ * frame never carried it.
  */
 function sanitizeRecord(
+  core: CoreIntrinsics,
   value: Record<string, unknown>,
   depth: number,
   budget: SanitizeBudget,
@@ -1338,7 +2567,7 @@ function sanitizeRecord(
 
   let keys: string[];
   try {
-    keys = Object.keys(value);
+    keys = core.apply(core.ownKeys, undefined, [value]);
   } catch {
     // A `Proxy` with a throwing `ownKeys` trap yields an empty bag, not a
     // thrown event.
@@ -1346,14 +2575,19 @@ function sanitizeRecord(
   }
 
   let kept = 0;
-  for (const key of keys) {
+  for (let index = 0; index < keys.length; index += 1) {
     if (kept >= MAX_TRACKED_KEYS) {
       break;
     }
 
+    const key = keys[index];
+    if (key === undefined || key === '__proto__') {
+      continue;
+    }
+
     let sanitized: unknown;
     try {
-      sanitized = sanitizeValue(value[key], depth, budget);
+      sanitized = sanitizeValue(core, value[key], depth, budget);
     } catch {
       // A throwing getter costs one key.
       sanitized = typeTag('unknown');
@@ -1363,7 +2597,7 @@ function sanitizeRecord(
       continue;
     }
 
-    out[key] = sanitized;
+    defineOwnValue(out, key, sanitized);
     kept += 1;
   }
 
@@ -1371,21 +2605,24 @@ function sanitizeRecord(
 }
 
 /**
- * Turn a producer's attribute bag into one that is certain to clone and
- * certain to survive JSON.
+ * Turn a producer's attribute bag into one that is certain to survive a JSON
+ * round trip unchanged.
  *
  * A bag that is not an object at all — `undefined` from a producer that forgot
  * the field, or an array — becomes `{}`, because the schema requires an object
  * and an empty bag is a well-formed event while a malformed one is not.
  *
  * @param value The bag as the producer left it.
- * @returns A fresh plain object of clone-safe values.
+ * @returns A fresh plain object of JSON-safe values.
+ * @throws {TypeError} Only in a host with no core intrinsics; every caller
+ * contains it.
  */
 function sanitizeAttributes(value: unknown): Record<string, unknown> {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+  const core = coreIntrinsics();
+  if (typeof value !== 'object' || value === null || core.apply(core.isArray, undefined, [value])) {
     return {};
   }
-  return sanitizeRecord(value as Record<string, unknown>, 0, {
+  return sanitizeRecord(core, value as Record<string, unknown>, 0, {
     remaining: MAX_SANITIZED_NODES,
   });
 }
@@ -1400,19 +2637,78 @@ function sanitizeAttributes(value: unknown): Record<string, unknown> {
  * in a payload anyway, so calling this is belt and braces — deliberately, since
  * the second guarantee is the one a reviewer can see at the field.
  *
+ * The text is exactly what `../redaction/rules.ts`'s
+ * `truncate(value, MAX_CONTROL_TEXT_LENGTH)` returns: the value itself when it
+ * has at most that many code points, otherwise its first
+ * `MAX_CONTROL_TEXT_LENGTH - 1` code points and {@link TRUNCATION_SUFFIX}. A
+ * code point is a surrogate pair or any other single code unit, as the string
+ * iterator counts them. It is computed here with indexed reads of the
+ * primitive and string comparisons rather than by calling `truncate`, which
+ * runs `Number.isFinite`, `Math.floor`, `Array.from`, `slice` and `join`. All
+ * of those are the page's to replace, and a page that made `Number.isFinite`
+ * answer `false` would switch the bound off for every control frame, the
+ * `agent.ready` announcement included.
+ *
  * @param value The text as its producer read it.
  * @returns The text, at most {@link MAX_CONTROL_TEXT_LENGTH} code points, with
  * an ellipsis in place of whatever was removed.
  */
 export function boundControlText(value: string): string {
   try {
-    return truncate(value, MAX_CONTROL_TEXT_LENGTH);
+    const limit = MAX_CONTROL_TEXT_LENGTH;
+    if (value.length <= limit) {
+      return value;
+    }
+
+    // Units covered by the first `limit - 1` code points: what is kept when
+    // the text turns out to be longer than `limit` code points.
+    let kept = 0;
+    let points = 0;
+    let index = 0;
+    while (index < value.length) {
+      index += isSurrogatePairAt(value, index) ? 2 : 1;
+      points += 1;
+      if (points === limit - 1) {
+        kept = index;
+      }
+      if (points > limit) {
+        let text = '';
+        for (let unit = 0; unit < kept; unit += 1) {
+          text += value[unit] ?? '';
+        }
+        return text + TRUNCATION_SUFFIX;
+      }
+    }
+    return value;
   } catch {
-    // `truncate` is a pure function over a primitive and cannot throw; the
-    // guard is here because this is called from a page stack and the module's
-    // second invariant admits no exceptions.
+    // Indexed reads of a primitive cannot throw; the guard is here because this
+    // is called from a page stack and the module's second invariant admits no
+    // exceptions.
     return '';
   }
+}
+
+/**
+ * Whether a high surrogate at `index` is followed by a low surrogate, so the
+ * two code units are one code point.
+ *
+ * String comparison of one-unit strings compares their code units, which is
+ * what makes this operator-only.
+ *
+ * @param value The text.
+ * @param index A code-unit index into it.
+ */
+function isSurrogatePairAt(value: string, index: number): boolean {
+  const high = value[index];
+  const low = value[index + 1];
+  return (
+    high !== undefined &&
+    low !== undefined &&
+    high >= '\uD800' &&
+    high <= '\uDBFF' &&
+    low >= '\uDC00' &&
+    low <= '\uDFFF'
+  );
 }
 
 /**
@@ -1424,33 +2720,55 @@ export function boundControlText(value: string): string {
  * containers deep with at most {@link MAX_TRACKED_KEYS} members per container
  * and {@link MAX_SANITIZED_NODES} nodes overall: the walk below is therefore
  * bounded by construction, has no getters to trigger and no cycles to find.
+ * It is the sanitizer's own output, so it is walked the same way: captured
+ * `Array.isArray` and `Object.keys`, indexed loops, and every member of the
+ * copy defined rather than assigned.
  *
+ * @param core The captured intrinsics.
  * @param value A sanitized value.
  * @returns The same shape with its strings bounded.
  */
-function boundControlValue(value: unknown): unknown {
+function boundControlValue(core: CoreIntrinsics, value: unknown): unknown {
   if (typeof value === 'string') {
     return boundControlText(value);
   }
 
-  if (Array.isArray(value)) {
+  if (typeof value !== 'object' || value === null) {
+    return value;
+  }
+
+  if (core.apply(core.isArray, undefined, [value])) {
+    const list = value as readonly unknown[];
     const out: unknown[] = [];
-    for (const entry of value) {
-      out.push(boundControlValue(entry));
+    for (let index = 0; index < list.length; index += 1) {
+      appendValue(out, boundControlValue(core, list[index]));
     }
     return out;
   }
 
-  if (typeof value === 'object' && value !== null) {
-    const record = value as Record<string, unknown>;
-    const out: Record<string, unknown> = {};
-    for (const key of Object.keys(record)) {
-      out[key] = boundControlValue(record[key]);
-    }
-    return out;
-  }
+  return boundControlRecord(core, value as Record<string, unknown>);
+}
 
-  return value;
+/**
+ * The record case of {@link boundControlValue}.
+ *
+ * @param core The captured intrinsics.
+ * @param record A sanitized record.
+ * @returns A copy with every string bounded.
+ */
+function boundControlRecord(
+  core: CoreIntrinsics,
+  record: Record<string, unknown>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  const keys = core.apply(core.ownKeys, undefined, [record]);
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys[index];
+    if (key !== undefined) {
+      defineOwnValue(out, key, boundControlValue(core, record[key]));
+    }
+  }
+  return out;
 }
 
 /**
@@ -1458,13 +2776,11 @@ function boundControlValue(value: unknown): unknown {
  *
  * @param payload A sanitized control payload.
  * @returns The payload with every string bounded.
+ * @throws {TypeError} Only in a host with no core intrinsics; the caller
+ * contains it.
  */
 function boundControlPayload(payload: Record<string, unknown>): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  for (const key of Object.keys(payload)) {
-    out[key] = boundControlValue(payload[key]);
-  }
-  return out;
+  return boundControlRecord(coreIntrinsics(), payload);
 }
 
 /*
@@ -1485,17 +2801,6 @@ function boundControlPayload(payload: Record<string, unknown>): Record<string, u
  * kind/tier agreement check in `../schema/event.ts` explains the consequence).
  */
 const BROWSER_TIER = 'browser' satisfies TelemetryTier;
-
-/**
- * The `targetOrigin` every outbound frame uses: this window's own origin.
- *
- * `'/'` is the literal the specification defines for "the same origin as the
- * calling window", and it is correct where `location.origin` is not — a
- * sandboxed iframe or a `data:` document has an opaque origin whose
- * `location.origin` reads `"null"`, which matches nothing and would silently
- * discard every frame.
- */
-const SAME_ORIGIN_TARGET = '/';
 
 /**
  * Hand out the next sequence number for the current capture.
@@ -1539,17 +2844,45 @@ function nextSeq(): number {
  * - **No unknown key can escape either**, for the same reason: strictness at
  *   the service means one stray property costs the event.
  *
+ * The three optional members — `id`, `parentSpanId`, `source` — are read as
+ * the draft's *own data* only. A producer that leaves one out builds a literal
+ * without that key, and reading a missing key walks to `Object.prototype`,
+ * where a page's accessor would be handed the draft and could rewrite it
+ * before the rest is copied. The required members are always the literal's
+ * own. The three optional members that are written onto the event —
+ * `parentSpanId`, `source` and `clockOffsetMs` — are defined rather than
+ * assigned, for the same reason in the other direction: the event is the
+ * object the batch is serialised from.
+ *
+ * It is also where `clockOffsetMs` is stamped, and the only place: the
+ * document's current estimate ({@link clockOffset}), read once as the event is
+ * created and carried by the event object from then on. Every later path —
+ * the queue, a batch split, a delivery after the bridge returns — posts that
+ * same object, so an event is never restamped, and its `startTime` and
+ * `duration` are computed without reference to the offset at all.
+ *
  * @returns The completed event, or `undefined` when the draft cannot become
  * one — which today means only a non-finite `startTime` or `duration`, since
  * JSON has no spelling for those and the event would be rejected at ingest.
+ * @throws {TypeError} Only in a host with no core intrinsics; the caller
+ * contains it.
  */
 function completeDraft(draft: EventDraft): TelemetryEventIngress | undefined {
-  if (!Number.isFinite(draft.startTime) || !Number.isFinite(draft.duration)) {
+  const core = coreIntrinsics();
+  if (!isFiniteNumber(draft.startTime) || !isFiniteNumber(draft.duration)) {
     return undefined;
   }
 
+  const draftId = readOptionalMember(core, draft, 'id') as EventDraft['id'] | null;
+  const parentSpanId = readOptionalMember(
+    core,
+    draft,
+    'parentSpanId',
+  ) as EventDraft['parentSpanId'];
+  const source = readOptionalMember(core, draft, 'source') as EventDraft['source'];
+
   const event: TelemetryEventIngress = {
-    id: draft.id ?? newEventId(),
+    id: draftId ?? newEventId(),
     traceId: draft.traceId,
     spanId: draft.spanId,
     kind: draft.kind,
@@ -1566,17 +2899,38 @@ function completeDraft(draft: EventDraft): TelemetryEventIngress | undefined {
     seq: nextSeq(),
   };
 
-  // Both optional: assigned only when the producer resolved one, because under
+  // Both optional: defined only when the producer resolved one, because under
   // `exactOptionalPropertyTypes` an absent field and a field set to
   // `undefined` are different things, and JSON keeps only the first.
-  if (draft.parentSpanId !== undefined) {
-    event.parentSpanId = draft.parentSpanId;
+  if (parentSpanId !== undefined) {
+    defineOwnValue(event, 'parentSpanId', parentSpanId);
   }
-  if (draft.source !== undefined) {
-    event.source = draft.source;
+  if (source !== undefined) {
+    defineOwnValue(event, 'source', source);
+  }
+  // Absent until the document's first usable sample, for the same
+  // `exactOptionalPropertyTypes` reason: "no estimate yet" is an absent field,
+  // never an explicit `undefined`.
+  const clockOffsetMs = clockOffset.estimate();
+  if (clockOffsetMs !== undefined) {
+    defineOwnValue(event, 'clockOffsetMs', clockOffsetMs);
   }
 
   return event;
+}
+
+/**
+ * An optional member of a producer-built object, read as its own data.
+ *
+ * @param core The captured intrinsics.
+ * @param holder The object.
+ * @param key The member.
+ * @returns The value, or `undefined` when the object has no own data property
+ * by that name. Neither case reaches the prototype chain.
+ */
+function readOptionalMember(core: CoreIntrinsics, holder: object, key: string): unknown {
+  const value = readOwnData(core, holder, key);
+  return value === NOT_OWN_DATA ? undefined : value;
 }
 
 /**
@@ -1640,16 +2994,21 @@ function growBuffer(): boolean {
     return false;
   }
 
-  const nextCapacity = Math.min(
-    MAX_BUFFERED_EVENTS,
-    capacity === 0 ? INITIAL_BUFFER_CAPACITY : capacity * 2,
-  );
-  const grown: (TelemetryEventIngress | undefined)[] = new Array<TelemetryEventIngress | undefined>(
-    nextCapacity,
-  );
-  for (let index = 0; index < ringCount; index += 1) {
+  const doubled = capacity === 0 ? INITIAL_BUFFER_CAPACITY : capacity * 2;
+  const nextCapacity = doubled < MAX_BUFFERED_EVENTS ? doubled : MAX_BUFFERED_EVENTS;
+
+  // Every slot is defined, the free ones as `undefined`, so the ring has no
+  // holes: each later write lands on an own element instead of walking to
+  // `Array.prototype`, where a page's index accessor would receive the event.
+  // For the same reason the ring is a literal filled by `appendValue()`,
+  // never `new Array(n)`: `Array` is a page global like any other.
+  const grown: (TelemetryEventIngress | undefined)[] = [];
+  for (let index = 0; index < nextCapacity; index += 1) {
     const slot = ringHead + index;
-    grown[index] = ring[slot >= capacity ? slot - capacity : slot];
+    appendValue(
+      grown,
+      index < ringCount ? ring[slot >= capacity ? slot - capacity : slot] : undefined,
+    );
   }
 
   ring = grown;
@@ -1700,7 +3059,7 @@ function pushBuffered(event: TelemetryEventIngress): void {
  * @returns The events, oldest first.
  */
 function takeBatch(limit: number): TelemetryEventIngress[] {
-  const take = Math.min(limit, ringCount);
+  const take = limit < ringCount ? limit : ringCount;
   if (take <= 0) {
     return [];
   }
@@ -1713,7 +3072,8 @@ function takeBatch(limit: number): TelemetryEventIngress[] {
     const event = ring[slot];
     ring[slot] = undefined;
     if (event !== undefined) {
-      batch.push(event);
+      // Defined, not pushed: `Array.prototype.push` would be handed the event.
+      appendValue(batch, event);
     }
   }
 
@@ -1721,6 +3081,60 @@ function takeBatch(limit: number): TelemetryEventIngress[] {
   ringHead = head >= capacity ? head - capacity : head;
   ringCount -= take;
   return batch;
+}
+
+/**
+ * Put events the bridge did not claim back at the front of the queue, in the
+ * order given.
+ *
+ * The inverse of {@link takeBatch}, and the whole of the custody rule: a batch
+ * leaves the queue to be dispatched and comes straight back unless the bridge
+ * took it. Everything requeued here was taken from the head, so it is older
+ * than everything still queued, and prepending it restores the stamping order
+ * exactly — which is what lets the next drain deliver it with the `batchSeq`
+ * it would have carried, before anything recorded after it.
+ *
+ * The queue's bound still holds. Events requeued into a queue that filled
+ * while they were out are subject to the same oldest-first eviction as
+ * {@link pushBuffered}: the oldest of them — the oldest events there are — are
+ * the ones dropped, counted in {@link recordDropped} and reported on the next
+ * batch's `droppedCount`, and the rest keep their place.
+ *
+ * @param events The unclaimed events, oldest first.
+ */
+function requeueFront(events: readonly TelemetryEventIngress[]): void {
+  const room = MAX_BUFFERED_EVENTS - ringCount;
+  const excess = events.length - room;
+  const first = excess > 0 ? excess : 0;
+  if (first > 0) {
+    recordDropped(first);
+  }
+
+  const keep = events.length - first;
+  if (keep <= 0) {
+    return;
+  }
+
+  while (ring.length - ringCount < keep) {
+    if (!growBuffer()) {
+      // Unreachable while `room` is honoured above — the ring grows to the cap
+      // and `keep` never exceeds the room below it — and a stop rather than a
+      // spin if that arithmetic is ever broken.
+      return;
+    }
+  }
+
+  // Written backwards from the event just ahead of the head, so the first
+  // event given ends up at the new head.
+  for (let index = events.length - 1; index >= first; index -= 1) {
+    const event = events[index];
+    if (event === undefined) {
+      continue;
+    }
+    ringHead = ringHead === 0 ? ring.length - 1 : ringHead - 1;
+    ring[ringHead] = event;
+    ringCount += 1;
+  }
 }
 
 /** Discard every queued event, keeping the ring's slots for reuse. */
@@ -1943,30 +3357,53 @@ function scheduleDrain(): void {
 }
 
 /**
- * Post queued events in batches of at most {@link MAX_EVENTS_PER_BATCH}, if
- * the bridge is there to receive them.
+ * Dispatch queued events in batches of at most {@link MAX_EVENTS_PER_BATCH},
+ * if the bridge is there to receive them.
  *
- * @param maxBatches How many batches this turn may post.
- * `Number.POSITIVE_INFINITY` empties the queue, which is what the three
- * synchronous callers want; a finite bound leaves the remainder to a
- * rescheduled drain.
+ * The drain stops at the first batch the bridge does not claim: that batch —
+ * and, for a batch that had to be halved, every half after the unclaimed one —
+ * goes back to the front of the queue in order (see {@link deliver} and
+ * {@link requeueFront}), and dispatching the batches behind it would only
+ * deliver them out of order or not at all.
+ *
+ * **One drain at a time.** A drain requested while another is dispatching —
+ * which happens only from inside the bridge's listener, when it hands back a
+ * `bridge.ready` and `./agent.ts` answers with a flush — returns at once. The
+ * running drain owns the queue's head until it finishes, and then reschedules
+ * whatever is still queued if the bridge is still there, so the nested request
+ * is honoured on the next task rather than lost.
+ *
+ * @param maxBatches How many batches this turn may dispatch.
+ * `Number.POSITIVE_INFINITY` empties the queue, which is what the synchronous
+ * callers want; a finite bound leaves the remainder to a rescheduled drain.
  */
 function drainBatches(maxBatches: number): void {
   clearFlushTimer();
 
-  if (!bridgeAvailable) {
+  if (!bridgeAvailable || delivering) {
     return;
   }
 
-  let batches = 0;
-  while (ringCount > 0 && batches < maxBatches) {
-    deliver(takeBatch(MAX_EVENTS_PER_BATCH));
-    batches += 1;
+  delivering = true;
+  try {
+    let batches = 0;
+    while (ringCount > 0 && batches < maxBatches && bridgeAvailable) {
+      const unclaimed = deliver(takeBatch(MAX_EVENTS_PER_BATCH));
+      batches += 1;
+      if (unclaimed.length > 0) {
+        requeueFront(unclaimed);
+        break;
+      }
+    }
+  } finally {
+    delivering = false;
   }
 
   if (ringCount > 0) {
-    // The bound was reached with events still queued: the rest travels on the
-    // next turn instead of extending this one.
+    // The bound was reached with events still queued, a nested request was
+    // deferred to this drain, or a batch was refused by a port the bridge has
+    // since replaced: the rest travels on the next turn instead of extending
+    // this one. `scheduleDrain` does nothing while the bridge is away.
     scheduleDrain();
   }
 }
@@ -2004,8 +3441,9 @@ function flushNow(): void {
  * byte-for-byte copy of this package's build artifact.
  *
  * `droppedCount` carries the loss accumulated since the last batch reported
- * one; {@link deliver} zeroes it only after a post succeeds, so the count is
- * reported exactly once and never lost to a failed frame.
+ * one; {@link deliver} clears what a batch reported only once the bridge has
+ * claimed that batch, so the count is reported exactly once and never lost to
+ * a frame nobody took.
  */
 function buildBatchPayload(events: readonly TelemetryEventIngress[]): Record<string, unknown> {
   const payload: Record<string, unknown> = {
@@ -2018,51 +3456,77 @@ function buildBatchPayload(events: readonly TelemetryEventIngress[]): Record<str
 
   // Both omitted rather than sent as `undefined` when the service has not
   // named them: the frame is JSON-shaped, where an absent key is the only way
-  // to say "no value".
+  // to say "no value". Defined rather than assigned: the literal does not own
+  // either key yet, so an assignment would walk to `Object.prototype`, where a
+  // page's setter would be handed the payload and could replace its events.
   if (currentCaptureId !== undefined) {
-    payload.captureId = currentCaptureId;
+    defineOwnValue(payload, 'captureId', currentCaptureId);
   }
   if (currentSessionId !== undefined) {
-    payload.sessionId = currentSessionId;
+    defineOwnValue(payload, 'sessionId', currentSessionId);
   }
 
   return payload;
 }
 
 /**
- * What became of one attempt to post a frame.
+ * What became of one attempt to dispatch a frame.
  *
- * Four outcomes rather than a boolean, because the three failures call for
- * three different answers: an `oversize` batch can be split into halves that
- * fit, an `unserializable` one has a single bad event in it to isolate, and a
- * `refused` frame was rendered and then rejected by the page's own
- * `postMessage` — splitting it would fail the same way, so it is dropped.
+ * Five outcomes rather than a boolean, because each failure calls for a
+ * different answer:
+ *
+ * - `sent` — the bridge claimed the frame: `dispatchEvent` returned `false`
+ *   because its listener called `preventDefault()`. The only outcome after
+ *   which a batch's events are counted as delivered and leave custody.
+ * - `unclaimed` — the frame was dispatched and nobody claimed it:
+ *   `dispatchEvent` returned `true`. The bridge's runtime port was gone, its
+ *   listener was not installed, or it refused the frame. A batch is requeued in
+ *   order and delivered after the next `bridge.ready`; a control frame, which
+ *   is never retried, is counted as lost.
+ * - `oversize` — the rendered frame is longer than {@link MAX_MESSAGE_BYTES}.
+ *   A batch is split into halves that fit.
+ * - `unserializable` — {@link serializeFrameJson} threw: the frame held a
+ *   cycle, a bigint or nesting deeper than a frame may. A batch has a single
+ *   bad event in it to isolate, so it is split too.
+ * - `refused` — the frame was rendered but the event could not be constructed
+ *   or dispatched at all. Splitting it would fail the same way, so a batch is
+ *   dropped and counted.
  */
-type FrameOutcome = 'sent' | 'oversize' | 'unserializable' | 'refused';
+type FrameOutcome = 'sent' | 'unclaimed' | 'oversize' | 'unserializable' | 'refused';
 
 /**
- * Estimate a frame's transported size as the length of its JSON rendering.
+ * Render a frame to the exact string that will travel as its `detail`.
  *
- * The whole frame is measured, not just its payload: `source`, `version` and
- * `type` are what the bridge filters on and they travel with every one.
+ * The whole frame is rendered, not just its payload: `source`, `version` and
+ * `type` are what the bridge filters on and they travel with every one. The
+ * string is produced once and both measured and dispatched, so the size the
+ * cap was checked against is the size that crossed.
  *
- * @returns The length in code units, or `undefined` when the frame cannot be
- * rendered at all — which after sanitizing should be impossible, and is
- * reported rather than thrown.
+ * Rendered by {@link serializeFrameJson}, never by `JSON.stringify`: the text
+ * is the one `JSON.stringify` would produce for the frame, but no `toJSON` a
+ * page installed afterwards — on `Object.prototype`, `Array.prototype` or
+ * anywhere else — is ever called with the frame or any part of it, and no
+ * getter runs, so the page can neither read the frame while it is rendered nor
+ * choose the text the agent dispatches.
+ *
+ * @param frame The frame to render.
+ * @returns The JSON string, or `undefined` when the frame cannot be rendered
+ * at all — which after sanitizing should be impossible, and is reported rather
+ * than thrown.
  */
-function measureFrame(frame: AgentOutboundMessage): number | undefined {
+function renderFrame(frame: AgentOutboundMessage): string | undefined {
   try {
-    const rendered: string | undefined = JSON.stringify(frame);
-    return typeof rendered === 'string' ? rendered.length : undefined;
+    return serializeFrameJson(frame);
   } catch {
     return undefined;
   }
 }
 
 /**
- * Measure one frame and, if it fits, post it to the bridge.
+ * Render one frame, measure it and, if it fits, dispatch it on the channel
+ * node for the bridge to claim.
  *
- * **The size cap lives here**, in the one function that calls `postMessage`,
+ * **The size cap lives here**, in the one function that dispatches a frame,
  * rather than in the telemetry path that used to own it. That is what makes it
  * apply to control frames too: an `agent.ready` carries the document's URL and
  * a `target.described` carries a selector and a text preview, all of them page
@@ -2070,17 +3534,27 @@ function measureFrame(frame: AgentOutboundMessage): number | undefined {
  * frame whose size the page chooses (AAP 0.5.5's availability rule — the agent
  * must not be the reason the extension or the page falls over).
  *
- * Never throws. A `DataCloneError` is reported as `refused` and swallowed: the
- * agent runs inside the page's own call stack, where an exception would surface
- * as an error in the developer's application.
+ * The event is a {@link AGENT_FRAME_EVENT} `CustomEvent` built with the
+ * captured constructor — `bubbles: false`, `cancelable: true`, the rendered
+ * string as `detail` — and dispatched on the node through the captured
+ * `dispatchEvent`. The bridge's listener runs synchronously inside that call,
+ * which is why its `preventDefault()` is already reflected in the return value
+ * when this function reads it.
+ *
+ * Never throws: the agent runs inside the page's own call stack, where an
+ * exception would surface as an error in the developer's application.
  *
  * @param type The frame type, from the closed outbound vocabulary.
  * @param payload The frame's body, already sanitized by the caller.
- * @returns What became of the attempt.
+ * @returns What became of the attempt. `unclaimed` when the channel is not
+ * open, since no bridge can hold the node before the handshake; callers that
+ * must not count such a frame check {@link isChannelOpen} first.
  */
 function postFrame(type: AgentOutboundType, payload: Record<string, unknown>): FrameOutcome {
-  if (typeof window === 'undefined') {
-    return 'refused';
+  const intrinsics = CHANNEL_INTRINSICS;
+  const node = channelNode;
+  if (intrinsics === undefined || node === undefined || !handshakeAnswered) {
+    return 'unclaimed';
   }
 
   const frame: AgentOutboundMessage = {
@@ -2090,20 +3564,32 @@ function postFrame(type: AgentOutboundType, payload: Record<string, unknown>): F
     payload,
   };
 
-  const size = measureFrame(frame);
-  if (size === undefined) {
+  const detail = renderFrame(frame);
+  if (detail === undefined) {
     return 'unserializable';
   }
-  if (size > MAX_MESSAGE_BYTES) {
+  if (detail.length > MAX_MESSAGE_BYTES) {
     return 'oversize';
   }
 
+  let uncancelled: boolean;
   try {
-    window.postMessage(frame, SAME_ORIGIN_TARGET);
-    return 'sent';
+    // The init dictionary is a null-prototype record. The constructor reads
+    // every member the dictionary type declares, `composed` among them, and on
+    // an ordinary object a member it lacks is looked up on `Object.prototype`.
+    // A getter a page put there would run with the dictionary as `this` and
+    // could read `detail`, the frame's whole text.
+    const init = createNullRecord<CustomEventInit<string>>();
+    init.detail = detail;
+    init.bubbles = false;
+    init.cancelable = true;
+    const event = new intrinsics.CustomEvent<string>(AGENT_FRAME_EVENT, init);
+    uncancelled = intrinsics.apply(intrinsics.dispatchEvent, node, [event]);
   } catch {
     return 'refused';
   }
+
+  return uncancelled ? 'unclaimed' : 'sent';
 }
 
 /**
@@ -2128,16 +3614,17 @@ function dropUnpostableEvent(event: TelemetryEventIngress, reason: string): void
  * The reason each refusal is reported under, as a closed vocabulary.
  *
  * Fixed strings, so the diagnostic frame's size is known in advance and cannot
- * be influenced by whatever made the original frame too large.
+ * be influenced by whatever made the original frame too large. `unclaimed` has
+ * no entry because it is never reported: see {@link noteControlFrameLoss}.
  */
 const CONTROL_LOSS_REASONS = {
   oversize: 'control-frame-too-large',
   unserializable: 'control-frame-unserializable',
   refused: 'control-frame-refused',
-} as const satisfies Record<Exclude<FrameOutcome, 'sent'>, string>;
+} as const satisfies Record<Exclude<FrameOutcome, 'sent' | 'unclaimed'>, string>;
 
 /**
- * Account for a control frame the channel would not take, and say so where it
+ * Account for a control frame the channel did not deliver, and say so where it
  * can be said cheaply.
  *
  * The diagnostic is deliberately minimal: a reason from
@@ -2146,17 +3633,19 @@ const CONTROL_LOSS_REASONS = {
  * payload is the very thing that was too large, and a diagnostic that carried
  * a piece of it would be a second, smaller copy of the problem.
  *
- * Two properties make this safe to call from the post path itself:
+ * Two properties make this safe to call from the dispatch path itself:
  *
  * - **Non-recursive.** {@link reportingControlLoss} is set while the
- *   diagnostic is being posted, so a diagnostic that is itself refused reports
- *   nothing further; it is counted and that is all.
+ *   diagnostic is being dispatched, so a diagnostic that is itself refused
+ *   reports nothing further; it is counted and that is all.
  * - **Reported only when reporting can work.** A frame refused for its *size*
- *   leaves a working channel, and a small frame will cross it. A frame the page
- *   refused to clone means the channel itself rejected a rendered frame, so a
- *   second frame would be rejected the same way and none is attempted.
+ *   or its *rendering* leaves a working channel, and a small frame will cross
+ *   it. A frame the channel `refused` means the platform rejected a rendered
+ *   frame, and one nobody claimed (`unclaimed`) means there is no bridge on the
+ *   other end right now: a second frame would meet the same fate, so none is
+ *   attempted.
  *
- * @param type The frame that could not be posted.
+ * @param type The frame that could not be delivered.
  * @param outcome Why it could not.
  */
 function noteControlFrameLoss(
@@ -2165,7 +3654,7 @@ function noteControlFrameLoss(
 ): void {
   controlFramesDroppedTotal += 1;
 
-  if (reportingControlLoss || outcome === 'refused') {
+  if (reportingControlLoss || outcome === 'refused' || outcome === 'unclaimed') {
     return;
   }
 
@@ -2178,9 +3667,9 @@ function noteControlFrameLoss(
     });
     if (reported !== 'sent') {
       // The diagnostic is a control frame too, and one the channel dropped:
-      // counted, so the number means "frames the channel would not take"
-      // exactly. Nothing further is posted — the flag above is still set, and
-      // this is the recursion it exists to stop.
+      // counted, so the number means "frames the channel did not deliver"
+      // exactly. Nothing further is dispatched — the flag above is still set,
+      // and this is the recursion it exists to stop.
       controlFramesDroppedTotal += 1;
     }
   } finally {
@@ -2188,39 +3677,168 @@ function noteControlFrameLoss(
   }
 }
 
+/** The empty result of a {@link deliver} that left nothing to requeue. */
+const NOTHING_UNCLAIMED: readonly TelemetryEventIngress[] = Object.freeze([]);
+
 /**
- * Post one batch, splitting it when it is too large to travel.
+ * A fresh array of `prefix` followed by `source[start]` up to (excluding)
+ * `source[end]`.
  *
- * Halving is what keeps one pathological event from costing its neighbours: a
- * batch over {@link MAX_MESSAGE_BYTES} is split and each half retried, down to
- * a single event, and only that event is dropped. Recursion depth is bounded
- * by `log2(MAX_EVENTS_PER_BATCH)`, eight levels.
+ * What `[...prefix, ...source.slice(start, end)]` would build, by index and
+ * with every element defined: the events of a batch are never handed to the
+ * page's `slice`, to an array iterator, or to an index accessor on
+ * `Array.prototype`.
  *
- * A `postMessage` that throws is different in kind: the frame was rendered, so
- * the page refused to clone it, and splitting cannot help. That batch is
- * dropped and counted.
+ * @param source The events to copy from; this module's own dense array.
+ * @param start The first index copied.
+ * @param end One past the last index copied.
+ * @param prefix Events placed before the copied ones; also this module's own.
+ * @returns The new array.
  */
-function deliver(events: readonly TelemetryEventIngress[]): void {
-  if (events.length === 0) {
+function copyEvents(
+  source: readonly TelemetryEventIngress[],
+  start: number,
+  end: number,
+  prefix: readonly TelemetryEventIngress[],
+): TelemetryEventIngress[] {
+  const copy: TelemetryEventIngress[] = [];
+  for (let index = 0; index < prefix.length; index += 1) {
+    const event = prefix[index];
+    if (event !== undefined) {
+      appendValue(copy, event);
+    }
+  }
+  for (let index = start; index < end; index += 1) {
+    const event = source[index];
+    if (event !== undefined) {
+      appendValue(copy, event);
+    }
+  }
+  return copy;
+}
+
+/**
+ * Settle a batch whose capture ended while the bridge was handling it.
+ *
+ * The events belong to a capture that is over, so none of the current
+ * capture's counters may move — not its `batchSeq`, not its `droppedCount` —
+ * and nothing is requeued into it. A claimed batch was delivered, under the
+ * identity it was built with, and is counted as sent; any other outcome loses
+ * the events for good, which the cumulative totals record. Not called when the
+ * transport was *reset* under the batch (see {@link resetGeneration}): those
+ * totals have just been zeroed, and the batch predates them.
+ *
+ * @param count How many events the batch held.
+ * @param outcome What became of it.
+ */
+function settleAcrossCaptureChange(count: number, outcome: FrameOutcome): void {
+  if (outcome === 'sent') {
+    sentTotal += count;
+    batchesTotal += 1;
     return;
   }
+  if (outcome === 'refused' || outcome === 'unserializable') {
+    serializationFailureTotal += count;
+  }
+  droppedTotal += count;
+}
 
+/**
+ * Account for a batch the bridge did not claim.
+ *
+ * The bridge is marked away and the flush timer cleared, so nothing more is
+ * dispatched into a channel with nobody at the other end until the next
+ * `bridge.ready` — **unless** that `bridge.ready` already arrived during this
+ * very dispatch (see {@link bridgeReadyGeneration}), in which case the refusal
+ * came from the port the bridge has since replaced and the bridge stays marked
+ * present for the retry.
+ *
+ * @param generation {@link bridgeReadyGeneration} as it was when the frame was
+ * dispatched.
+ */
+function noteUnclaimedBatch(generation: number): void {
+  if (bridgeReadyGeneration !== generation) {
+    return;
+  }
+  bridgeAvailable = false;
+  clearFlushTimer();
+}
+
+/**
+ * Dispatch one batch, splitting it when it is too large to travel, and hand
+ * back whatever the bridge did not take.
+ *
+ * **Custody.** The events are counted as sent — and `batchSeq` advances, and
+ * the reported part of `droppedCount` is cleared — only when the bridge claims
+ * the frame. An `unclaimed` frame changes none of those: its events are
+ * returned to the caller, which puts them back at the front of the queue, so
+ * the next delivery carries the same `batchSeq`, the same drop count and no
+ * duplicate. Halving keeps that order: when one half is unclaimed, it is
+ * returned together with every half after it, earlier events first.
+ *
+ * Halving is also what keeps one pathological event from costing its
+ * neighbours: a batch over {@link MAX_MESSAGE_BYTES} is split and each half
+ * retried, down to a single event, and only that event is dropped. Recursion
+ * depth is bounded by `log2(MAX_EVENTS_PER_BATCH)`, eight levels.
+ *
+ * A frame the platform `refused` is different in kind: it was rendered, and
+ * splitting cannot help. That batch is dropped and counted.
+ *
+ * Re-entrant: the bridge's listener runs inside the dispatch and may hand back
+ * frames of its own. A capture change or reset in that window is detected by
+ * {@link captureEpoch}: a capture change is settled by
+ * {@link settleAcrossCaptureChange}, a reset (see {@link resetGeneration}) into
+ * nothing. A `bridge.gone` there stops the remaining halves from being
+ * dispatched into a channel that has just closed, and an unclaimed frame marks
+ * the bridge away whichever capture it belonged to.
+ *
+ * @param events The batch, oldest first.
+ * @returns The events to requeue, oldest first; empty when every event was
+ * delivered or accounted for.
+ */
+function deliver(events: readonly TelemetryEventIngress[]): readonly TelemetryEventIngress[] {
+  if (events.length === 0) {
+    return NOTHING_UNCLAIMED;
+  }
+
+  const epoch = captureEpoch;
+  const resets = resetGeneration;
+  const generation = bridgeReadyGeneration;
+  const reportedDropped = pendingDropped;
   const outcome = postFrame('telemetry.batch', buildBatchPayload(events));
+
+  if (captureEpoch !== epoch) {
+    if (resetGeneration === resets) {
+      settleAcrossCaptureChange(events.length, outcome);
+    }
+    if (outcome === 'unclaimed') {
+      // The events are accounted to their ended capture, but the fact the
+      // refusal states — nobody is taking frames — is about the channel.
+      noteUnclaimedBatch(generation);
+    }
+    return NOTHING_UNCLAIMED;
+  }
 
   if (outcome === 'sent') {
     batchSeqCounter += 1;
     sentTotal += events.length;
     batchesTotal += 1;
-    // Reported: the next batch starts a fresh count.
-    pendingDropped = 0;
-    return;
+    // Only what this batch reported is cleared: a loss recorded while the
+    // bridge held the frame rides out on the next batch instead of vanishing.
+    pendingDropped = pendingDropped > reportedDropped ? pendingDropped - reportedDropped : 0;
+    return NOTHING_UNCLAIMED;
+  }
+
+  if (outcome === 'unclaimed') {
+    noteUnclaimedBatch(generation);
+    return events;
   }
 
   if (outcome === 'refused') {
-    // The frame was rendered and the page still refused to clone it. Halving
-    // would produce two frames that fail the same way.
+    // The frame was rendered and the platform still refused to carry it.
+    // Halving would produce two frames that fail the same way.
     recordUnpostable(events.length);
-    return;
+    return NOTHING_UNCLAIMED;
   }
 
   const only = events.length === 1 ? events[0] : undefined;
@@ -2229,12 +3847,34 @@ function deliver(events: readonly TelemetryEventIngress[]): void {
       only,
       outcome === 'unserializable' ? 'event-unserializable' : 'event-too-large',
     );
-    return;
+    return NOTHING_UNCLAIMED;
   }
 
-  const middle = Math.ceil(events.length / 2);
-  deliver(events.slice(0, middle));
-  deliver(events.slice(middle));
+  // `Math.ceil`, `slice` and spread are the page's: each would be handed the
+  // batch, or decide how it is split. The halves are copied by index instead,
+  // and `middle` is `ceil(length / 2)` for the integer length.
+  const middle = (events.length + (events.length % 2)) / 2;
+  const later = copyEvents(events, middle, events.length, NOTHING_UNCLAIMED);
+  const unclaimed = deliver(copyEvents(events, 0, middle, NOTHING_UNCLAIMED));
+  if (unclaimed.length > 0) {
+    // The earlier half was not taken, so the later one is not attempted: both
+    // go back, earlier first, and the next delivery starts where this stopped.
+    return copyEvents(later, 0, later.length, unclaimed);
+  }
+  if (captureEpoch !== epoch) {
+    // The capture ended while the earlier half was in the bridge's hands; the
+    // later half belongs to it and can no longer be labelled correctly. It is
+    // counted as lost unless the transport was reset, which zeroed the totals.
+    if (resetGeneration === resets) {
+      droppedTotal += later.length;
+    }
+    return NOTHING_UNCLAIMED;
+  }
+  if (!bridgeAvailable) {
+    // The bridge said it was gone while it held the earlier half.
+    return later;
+  }
+  return deliver(later);
 }
 
 /*
@@ -2260,445 +3900,217 @@ const BRIDGE_INBOUND_TYPES: readonly BridgeInboundType[] = [
   'target.request',
 ];
 
-/** Whether a value is one of the five frame types the bridge may send. */
+/**
+ * Whether a value is one of the five frame types the bridge may send.
+ *
+ * An indexed loop of strict comparisons rather than `Array.prototype.includes`:
+ * the guard runs long after the page's scripts have, and a page that replaced
+ * `includes` could otherwise widen the vocabulary this module admits.
+ */
 function isBridgeInboundType(value: unknown): value is BridgeInboundType {
-  return typeof value === 'string' && (BRIDGE_INBOUND_TYPES as readonly string[]).includes(value);
-}
-
-/**
- * Whether an incoming frame's origin is this document's own.
- *
- * The bridge shares the page's window, so a legitimate frame always carries
- * this document's origin — or the empty string, or the literal `"null"`, which
- * is what a document with an opaque origin (a sandboxed iframe, a `data:` or
- * `blob:` document) reports for a message it posted to itself.
- */
-function isOwnOrigin(origin: string): boolean {
-  if (origin === '' || origin === 'null') {
-    return true;
-  }
-  if (typeof location === 'undefined') {
+  if (typeof value !== 'string') {
     return false;
   }
-  return origin === location.origin;
-}
-
-/*
- * ---------------------------------------------------------------------------
- * The handshake
- *
- * Everything below implements the exchange documented in the module
- * overview's handshake section, which is where a bridge author reads it. Four
- * properties are what make it worth having, and each one is a decision taken
- * here rather than a consequence of the mechanism:
- *
- * 1. The token comes from a **CSPRNG or from nowhere at all**.
- * 2. It is disclosed **at most twice**, both times inside the `document_start`
- *    window, and never again for the life of the document.
- * 3. It is compared with **fixed work**, so the comparison itself says nothing
- *    about how close a guess was.
- * 4. It is **stripped** from everything handed onward, so no subscriber and no
- *    page-visible diagnostic can leak it.
- * ---------------------------------------------------------------------------
- */
-
-/**
- * Bytes of entropy in a handshake token: 32, the same width as the local
- * service's credentials (AAP 0.5.6).
- *
- * The value is not a tuning knob — a guess has to be right in one attempt,
- * since a wrong token is dropped in silence and there is no oracle to iterate
- * against — so the width is chosen to be uninteresting rather than marginal.
- */
-const HANDSHAKE_TOKEN_BYTES = 32;
-
-/** Hex characters per byte, which is the `padStart` width {@link mintHandshakeToken} uses. */
-const HEX_DIGITS_PER_BYTE = 2;
-
-/** The exact length of a well-formed token: 64 lowercase hex characters. */
-const HANDSHAKE_TOKEN_CHARS = HANDSHAKE_TOKEN_BYTES * HEX_DIGITS_PER_BYTE;
-
-/**
- * The parts of a random source this module reads, structurally.
- *
- * Read through a structural view rather than the `Crypto` type because this
- * code runs in the page's own realm: `globalThis.crypto` may be absent, `null`,
- * an application's own object, or a getter that throws. Nothing here assumes
- * more than "a `getRandomValues` function is reachable", and the call is made
- * with `.call(source, …)` so the method keeps its receiver — a detached
- * reference raises an illegal-invocation `TypeError` in Chromium.
- */
-interface HandshakeRandomSource {
-  /** `Crypto.prototype.getRandomValues`, when the realm has one. */
-  getRandomValues?: unknown;
+  for (let index = 0; index < BRIDGE_INBOUND_TYPES.length; index += 1) {
+    if (BRIDGE_INBOUND_TYPES[index] === value) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /**
- * Mint the document's handshake token: 32 CSPRNG bytes as 64 lowercase hex
- * characters, or `undefined` when no CSPRNG is reachable.
+ * A fresh record with no prototype at all.
  *
- * **`./ids.js`'s `randomHex` is deliberately not reused**, even though it
- * renders exactly this shape. That function degrades to `Math.random` when the
- * realm has no Web Crypto, which is the right trade for a trace id — ids are
- * correlation keys, they authorise nothing, and refusing to capture would cost
- * a real capability for no security benefit — and the wrong trade to the point
- * of being worthless here. `Math.random`'s generator state belongs to the
- * page's own realm, is advanced by the page's own calls, and is recoverable
- * from a short run of observed output; a token drawn from it is a secret the
- * page can compute. So this path does not degrade: **no CSPRNG means no
- * token**, which means no inbound frame is ever accepted, which the caller
- * reports once through {@link reportProducerFailure} (AAP 0.5.5 — a signal that
- * cannot be enabled is reported, never silently dropped).
- *
- * An all-zero result is refused for the same reason. A realm whose
- * `getRandomValues` is a stub that leaves the array untouched — a naive
- * polyfill, or a page that replaced the global — returns success and no
- * entropy, and 64 zeroes is a token anyone can type. Treating it as "no
- * CSPRNG" is the honest reading.
- *
- * Every global access is `typeof`-guarded and the whole body is wrapped:
- * nothing here may throw into the page, and this runs during the agent's
- * opening sequence where an exception would cost the entire bundle.
- *
- * @returns The token, or `undefined` when one cannot be minted safely.
+ * @param intrinsics The captured intrinsics.
+ * @returns An empty null-prototype record.
  */
-function mintHandshakeToken(): string | undefined {
-  if (typeof globalThis === 'undefined') {
+function nullPrototypeRecord(intrinsics: ChannelIntrinsics): Record<string, unknown> {
+  return intrinsics.apply(intrinsics.createObject, undefined, [null]);
+}
+
+/**
+ * Whether a parsed JSON value is a record — an object that is not an array.
+ *
+ * `JSON.parse` produces only plain objects, arrays and primitives, so a
+ * non-null, non-array object here is a plain record by construction.
+ *
+ * @param intrinsics The captured intrinsics.
+ * @param value The parsed value.
+ */
+function isParsedRecord(intrinsics: ChannelIntrinsics, value: unknown): value is object {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    !intrinsics.apply(intrinsics.isArray, undefined, [value])
+  );
+}
+
+/**
+ * Rebuild one parsed record as a null-prototype record with the same own keys.
+ *
+ * The `JSON.parse` reviver of the inbound guard, so it runs bottom-up over
+ * every object in a frame: nested records are rebuilt before their holder
+ * copies them. The point is what a *missing* key reads as. A plain object
+ * inherits from `Object.prototype`, which a page can extend after
+ * `document_start`; `'captureId' in payload` or `payload.hooks.fetch` would
+ * then read the page's value wherever the bridge sent none. On a
+ * null-prototype record a missing key is simply absent. Arrays and primitives
+ * are returned as they are.
+ *
+ * Keys are copied with an indexed loop over the captured `Object.keys`, never
+ * with an iterator or `for…in`, both of which a page can influence. A key
+ * named `__proto__` in the JSON becomes an ordinary own key here, because a
+ * null-prototype record has no `__proto__` setter to invoke.
+ *
+ * @param intrinsics The captured intrinsics.
+ * @param value The value `JSON.parse` has just produced.
+ * @returns The value, with a record rebuilt on a null prototype.
+ */
+function reviveNullPrototype(intrinsics: ChannelIntrinsics, value: unknown): unknown {
+  if (!isParsedRecord(intrinsics, value)) {
+    return value;
+  }
+
+  const source = value as Record<string, unknown>;
+  const revived = nullPrototypeRecord(intrinsics);
+  const keys = intrinsics.apply(intrinsics.ownKeys, undefined, [source]);
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys[index];
+    if (key !== undefined) {
+      revived[key] = source[key];
+    }
+  }
+  return revived;
+}
+
+/**
+ * Decide whether a {@link BRIDGE_FRAME_EVENT} carries a frame from the bridge,
+ * and normalise it if it does.
+ *
+ * Reached only through the listener on the channel node, which only the bridge
+ * can dispatch on — possession of the node is the authentication, and the
+ * checks below are about *well-formedness*: a bridge from another build, a
+ * frame from the wrong direction, a truncated or hostile string. So a frame is
+ * accepted only when its `detail`, read through the captured getter, is a
+ * string of at most {@link MAX_MESSAGE_BYTES} code units that the captured
+ * `JSON.parse` turns into a record carrying exactly {@link BRIDGE_SOURCE_TAG},
+ * exactly {@link CHANNEL_VERSION} and a member of the closed inbound
+ * vocabulary. The size is checked before anything is parsed, so an oversize
+ * string costs one comparison.
+ *
+ * The result is built field by field: nothing but `source`, `version`, `type`
+ * and `payload` is carried, and a payload that is not a record becomes an
+ * empty null-prototype record, so a handler reading `payload.something` can
+ * neither throw on `undefined` nor read an inherited value. Nothing in an
+ * accepted frame is ever called or evaluated.
+ *
+ * @param intrinsics The captured intrinsics.
+ * @param event The dispatched event, whatever its constructor.
+ * @returns The accepted frame, or `undefined` to drop it in silence.
+ */
+function acceptFrame(
+  intrinsics: ChannelIntrinsics,
+  event: Event,
+): BridgeInboundMessage | undefined {
+  // The captured getter throws for an event that is not a `CustomEvent`, and
+  // the caller treats a throw as a drop.
+  const detail: unknown = intrinsics.apply(intrinsics.readDetail, event, []);
+  if (typeof detail !== 'string' || detail.length > MAX_MESSAGE_BYTES) {
     return undefined;
   }
 
+  let parsed: unknown;
   try {
-    const scope = globalThis as unknown as { crypto?: HandshakeRandomSource | null };
-    const source = scope.crypto;
-    if (source === undefined || source === null) {
-      return undefined;
-    }
-
-    const getRandomValues = source.getRandomValues;
-    if (typeof getRandomValues !== 'function') {
-      return undefined;
-    }
-
-    const bytes = new Uint8Array(HANDSHAKE_TOKEN_BYTES);
-    (getRandomValues as (array: Uint8Array) => unknown).call(source, bytes);
-
-    let allZero = true;
-    let token = '';
-    for (const byte of bytes) {
-      if (byte !== 0) {
-        allZero = false;
-      }
-      // Rendered inline rather than through a 256-entry lookup table: this runs
-      // once per document, so the table `./ids.js` maintains for its per-event
-      // hex would be an allocation with nothing to amortise it over.
-      token += byte.toString(16).padStart(HEX_DIGITS_PER_BYTE, '0');
-    }
-
-    if (allZero || token.length !== HANDSHAKE_TOKEN_CHARS) {
-      return undefined;
-    }
-    return token;
+    parsed = intrinsics.apply(intrinsics.parse, undefined, [
+      detail,
+      (_key: string, value: unknown): unknown => reviveNullPrototype(intrinsics, value),
+    ]);
   } catch {
-    // A realm that refuses the read, or a `getRandomValues` that throws, is a
-    // realm with no CSPRNG as far as this module is concerned.
     return undefined;
   }
-}
-
-/**
- * Disclose the token in one {@link HANDSHAKE_OFFER_EVENT} on `window`.
- *
- * The `detail` is the bare string, for the structured-clone reason documented
- * on that constant. Guarded end to end: a realm without `window` or without
- * `CustomEvent` simply makes no offer, and a page that has replaced
- * `dispatchEvent` with something that throws costs this disclosure and nothing
- * else.
- *
- * @param token The token to disclose.
- */
-function offerHandshakeToken(token: string): void {
-  if (typeof window === 'undefined' || typeof CustomEvent === 'undefined') {
-    return;
-  }
-
-  try {
-    window.dispatchEvent(new CustomEvent<string>(HANDSHAKE_OFFER_EVENT, { detail: token }));
-  } catch {
-    // A refused dispatch leaves the bridge to ask (or, if it already asked, to
-    // reload the page); it must never surface in the developer's application.
-  }
-}
-
-/**
- * Answer the first — and only the first — handshake request.
- *
- * The order of the three statements is the security property: the latch is set
- * and the listener removed *before* the offer is dispatched, so a handler that
- * dispatches a second request from inside the first answer finds the exchange
- * already closed. Doing it afterwards would make the bound "one request per
- * synchronous turn" instead of "one request per document".
- */
-function answerHandshakeRequest(): void {
-  const token = handshakeToken;
-  if (handshakeRequestAnswered || token === undefined) {
-    return;
-  }
-
-  handshakeRequestAnswered = true;
-  removeHandshakeRequestListener();
-  offerHandshakeToken(token);
-}
-
-/**
- * Install the request listener, if this document still has an answer to give.
- *
- * Nothing is installed once the exchange is latched or when no token was
- * minted: a listener that could only ignore what it hears is a listener on the
- * developer's `window` for no reason, and this module's contract is that a
- * detached agent leaves none.
- */
-function installHandshakeRequestListener(): void {
-  if (
-    handshakeRequestListener !== undefined ||
-    handshakeRequestAnswered ||
-    handshakeToken === undefined ||
-    typeof window === 'undefined'
-  ) {
-    return;
-  }
-
-  const listener = (): void => {
-    answerHandshakeRequest();
-  };
-  window.addEventListener(HANDSHAKE_REQUEST_EVENT, listener);
-  handshakeRequestListener = listener;
-}
-
-/**
- * Remove the request listener, if one is installed.
- *
- * The reference is cleared only after the removal returns, exactly as
- * {@link removeMessageListener} does it: a listener the page refused to remove
- * is still known, and the next call tries again.
- */
-function removeHandshakeRequestListener(): void {
-  if (handshakeRequestListener === undefined) {
-    return;
-  }
-
-  if (typeof window !== 'undefined') {
-    window.removeEventListener(HANDSHAKE_REQUEST_EVENT, handshakeRequestListener);
-  }
-  handshakeRequestListener = undefined;
-}
-
-/**
- * Open the authenticated half of the inbound channel: mint once, disclose
- * once, then listen for the one request that will be answered.
- *
- * Called from {@link installMessageListener}, which is the module's "the
- * inbound channel is now open" moment — the first {@link subscribe}, which
- * `./agent.ts`'s bootstrap performs at `document_start`. Everything past the
- * first call is idempotent: the token and the latch are document-scoped and
- * never re-minted, so a re-subscribe after `resetTransport()` re-installs the
- * listener (when there is still an answer to give) and discloses nothing.
- *
- * A realm with no CSPRNG is reported once, as an `agent.error` frame with
- * `source: 'transport'`. That frame may well be lost — at `document_start` the
- * bridge's own listener may not exist yet, and this module deliberately queues
- * no control frames — which is why the outcome is also visible in
- * {@link getProducerFailureStats} and, for the developer, in the agent being
- * demonstrably unconfigurable. Saying it once is the AAP 0.5.5 requirement;
- * saying it repeatedly would turn a diagnostic into a channel.
- */
-function openHandshake(): void {
-  if (!handshakeMintAttempted) {
-    handshakeMintAttempted = true;
-
-    const token = mintHandshakeToken();
-    if (token === undefined) {
-      reportProducerFailure('transport', 'handshake-token-mint', undefined, {
-        reason: 'no-csprng',
-        // Stated so the frame is self-explanatory: this is not a degraded mode.
-        inboundAccepted: false,
-      });
-      return;
-    }
-
-    handshakeToken = token;
-    // The unsolicited half: a bridge evaluated before this agent is already
-    // listening, and a bridge evaluated after it hears nothing and asks.
-    offerHandshakeToken(token);
-  }
-
-  installHandshakeRequestListener();
-}
-
-/**
- * Whether a frame's `token` field is this document's issued token.
- *
- * Fixed work by construction: the length is compared first (two strings of
- * different lengths cannot be equal, and the length of a token is not a
- * secret — it is 64 characters, stated in this file), and the character
- * comparison then accumulates a difference over **every** code unit instead of
- * returning at the first mismatch. A short-circuiting `===` on two strings is
- * not a timing oracle worth much across a `postMessage` boundary, but "not
- * worth much" is a measurement, not a guarantee, and this loop costs 64
- * XOR-and-or operations once per inbound frame.
- *
- * `false` when no token was ever issued, which is the whole of the
- * no-CSPRNG behaviour: a realm that could not mint one accepts nothing, rather
- * than accepting anything.
- *
- * @param candidate The frame's `token` field, typed `unknown` because it comes
- * from outside.
- * @returns `true` only when `candidate` is the issued token.
- */
-function isIssuedToken(candidate: unknown): boolean {
-  const issued = handshakeToken;
-  if (issued === undefined || typeof candidate !== 'string') {
-    return false;
-  }
-  if (candidate.length !== issued.length) {
-    return false;
-  }
-
-  let difference = 0;
-  for (let index = 0; index < issued.length; index += 1) {
-    difference |= issued.charCodeAt(index) ^ candidate.charCodeAt(index);
-  }
-  return difference === 0;
-}
-
-/**
- * Decide whether a `message` event is a frame from the bridge, and normalise
- * it if it is.
- *
- * This is the agent's security boundary, and every condition earns its place.
- * Any script the page loads — including one an attacker got onto the page —
- * can post a message to `window`, and a subscriber acts on what it is handed:
- * `agent.config` arms hooks, `target.request` starts describing elements. So a
- * frame is accepted only when it came from this window, on this window's
- * origin, tagged as the bridge's and at exactly this channel version, carrying
- * a known frame type, **and carrying this document's handshake token**. A frame
- * that fails any condition is dropped in silence — reporting it would hand a
- * probing page a signal to iterate against.
- *
- * Every condition before the token establishes *where* a frame came from, and
- * a page script satisfies all of them about its own window; the token is what
- * establishes *who* sent it (see {@link isIssuedToken} and the module
- * overview). A frame with no token, with a wrong token, or with any token at
- * all in a realm where none could be minted is dropped in exactly the same
- * silence as a frame with the wrong source tag.
- *
- * The token is **not** carried onto the {@link BridgeInboundMessage} this
- * returns. The message is built field by field, so the secret reaches no
- * subscriber, no `agent.error` payload assembled from a frame and no
- * diagnostic a page can read back: the only code that ever compares it is
- * {@link isIssuedToken}.
- *
- * Nothing in an accepted frame is ever called or evaluated. `payload` is
- * passed through as data, and a non-object payload becomes `{}` so that a
- * handler reading `payload.something` cannot throw on `undefined`.
- */
-function acceptFrame(event: MessageEvent<unknown>): BridgeInboundMessage | undefined {
-  if (typeof window === 'undefined' || event.source !== window) {
+  if (!isParsedRecord(intrinsics, parsed)) {
     return undefined;
   }
 
-  if (!isOwnOrigin(event.origin)) {
+  const frame = parsed as Record<string, unknown>;
+  if (frame['source'] !== BRIDGE_SOURCE_TAG || frame['version'] !== CHANNEL_VERSION) {
     return undefined;
   }
 
-  const data: unknown = event.data;
-  if (typeof data !== 'object' || data === null) {
-    return undefined;
-  }
-
-  const frame = data as {
-    source?: unknown;
-    version?: unknown;
-    type?: unknown;
-    token?: unknown;
-    payload?: unknown;
-  };
-  if (frame.source !== BRIDGE_SOURCE_TAG || frame.version !== CHANNEL_VERSION) {
-    return undefined;
-  }
-
-  const { type } = frame;
+  const type = frame['type'];
   if (!isBridgeInboundType(type)) {
     return undefined;
   }
 
-  // Last of the guards, deliberately: the cheap structural checks have already
-  // discarded the page's unrelated `postMessage` traffic, so the only frames
-  // that reach the comparison are ones claiming to be the bridge's.
-  if (!isIssuedToken(frame.token)) {
-    return undefined;
-  }
-
-  const payload: unknown = frame.payload;
-  const normalisedPayload =
-    typeof payload === 'object' && payload !== null && !Array.isArray(payload)
-      ? (payload as Record<string, unknown>)
-      : {};
-
+  const payload = frame['payload'];
   return {
     source: BRIDGE_SOURCE_TAG,
     version: CHANNEL_VERSION,
     type,
-    payload: normalisedPayload,
+    payload: isParsedRecord(intrinsics, payload)
+      ? (payload as Record<string, unknown>)
+      : nullPrototypeRecord(intrinsics),
   };
 }
 
 /**
  * Handle one accepted frame: update bridge presence, then dispatch.
  *
- * The order is deliberate. Presence and the flush it triggers come first, so
+ * The order is deliberate. Presence and the drain it triggers come first, so
  * that events buffered under the outgoing configuration leave before a handler
  * can reconfigure the transport — an `agent.config` for a new capture would
  * otherwise renumber the sequence out from under events still queued from the
  * previous one.
  *
+ * Runs synchronously inside the bridge's own `dispatchEvent`, so the drain it
+ * starts dispatches batches back to the bridge from inside the bridge's
+ * dispatch; and when this frame itself arrived from inside one of *this*
+ * module's dispatches, the drain is deferred to the one already running (see
+ * {@link drainBatches}). Every accepted `bridge.ready` advances
+ * {@link bridgeReadyGeneration}, including one that finds the bridge already
+ * marked present — a reconnect the agent never saw a `bridge.gone` for.
+ *
  * Subscribers are dispatched from a snapshot, so a handler that unsubscribes
  * (or subscribes) while being called does not disturb the iteration, and each
  * one is called inside its own guard: a subscriber that throws costs itself
- * and not the frame.
+ * and not the frame. The snapshot is a linked list of null-prototype links
+ * (see {@link snapshotSubscribers}) and each handler is called directly — no
+ * `Array.from`, no iterator, no `Function.prototype.call` — so nothing the page
+ * can replace is ever handed a subscriber, which is what keeps the handler
+ * that applies an `agent.config` out of a page script's reach.
+ *
+ * @param message The accepted frame.
  */
-function handleInbound(event: MessageEvent<unknown>): void {
-  let message: BridgeInboundMessage | undefined;
-  try {
-    message = acceptFrame(event);
-  } catch {
-    // A page that replaced `MessageEvent`'s accessors cannot make this throw
-    // into its own `message` dispatch.
-    return;
-  }
-
-  if (message === undefined) {
-    return;
-  }
-
+function handleInbound(message: BridgeInboundMessage): void {
   if (message.type === 'bridge.gone') {
     bridgeAvailable = false;
     clearFlushTimer();
-  } else if (!bridgeAvailable) {
-    bridgeAvailable = true;
-    try {
-      // Bounded, and for the same reason the threshold path is: a queue that
-      // waited out a service-worker suspension holds up to
-      // {@link MAX_BUFFERED_EVENTS} events, and posting all twenty-five
-      // batches of them in this one `message` handler would be a long task on
-      // the page's main thread. The first batches still travel here — recovery
-      // stays immediate — and the remainder is rescheduled turn by turn.
-      drainBatches(MAX_BATCHES_PER_DRAIN);
-    } catch {
-      // The queue survives a failed flush and the next one retries.
+  } else {
+    if (message.type === 'bridge.ready') {
+      bridgeReadyGeneration += 1;
+    }
+    if (!bridgeAvailable) {
+      bridgeAvailable = true;
+      try {
+        // Bounded, and for the same reason the threshold path is: a queue that
+        // waited out a service-worker suspension holds up to
+        // {@link MAX_BUFFERED_EVENTS} events, and dispatching all twenty-five
+        // batches of them inside the bridge's one dispatch would be a long task
+        // on the page's main thread. The first batches still travel here —
+        // recovery stays immediate — and the remainder is rescheduled turn by
+        // turn.
+        drainBatches(MAX_BATCHES_PER_DRAIN);
+      } catch {
+        // The queue survives a failed drain and the next one retries.
+      }
     }
   }
 
-  for (const handler of Array.from(subscribers)) {
+  for (let link = snapshotSubscribers(); link !== undefined; link = link.next) {
+    // Read into a local and called as a plain function: `link.handler(…)`
+    // would run the handler with the snapshot link as `this`.
+    const handler = link.handler;
     try {
       handler(message);
     } catch {
@@ -2709,39 +4121,369 @@ function handleInbound(event: MessageEvent<unknown>): void {
 }
 
 /**
- * Install the one `message` listener, if it is not installed already, and open
- * the handshake that authenticates what arrives on it.
+ * The link holding `handler`, with the link before it.
  *
- * The two are one operation on purpose: a listener installed without a token
- * accepts nothing at all (see {@link isIssuedToken}), and a token disclosed
- * with no listener behind it has nobody to answer. {@link openHandshake} is
- * idempotent, so the re-subscribe `./agent.ts` performs after every disarm
- * re-installs the request listener and mints nothing.
+ * A linear walk: the registry holds `./agent.ts`'s one handler in production
+ * and a handful in the suites, and identity is the membership test a `Set`
+ * applied, so registering one handler twice is still one registration.
+ *
+ * @param handler The handler to find.
+ * @returns The link and its predecessor, or `undefined` when not registered.
  */
-function installMessageListener(): void {
-  if (messageListener !== undefined || typeof window === 'undefined') {
-    return;
+function findSubscriber(
+  handler: (message: BridgeInboundMessage) => void,
+): { link: SubscriberLink; previous: SubscriberLink | undefined } | undefined {
+  let previous: SubscriberLink | undefined;
+  for (let link = subscriberHead; link !== undefined; link = link.next) {
+    if (link.handler === handler) {
+      return { link, previous };
+    }
+    previous = link;
   }
-
-  const listener = (event: MessageEvent<unknown>): void => {
-    handleInbound(event);
-  };
-  window.addEventListener('message', listener);
-  messageListener = listener;
-
-  openHandshake();
+  return undefined;
 }
 
-/** Remove the `message` listener, if one is installed. */
-function removeMessageListener(): void {
-  if (messageListener === undefined) {
+/**
+ * Register a handler at the tail, unless it is already registered.
+ *
+ * @param handler The handler.
+ */
+function addSubscriber(handler: (message: BridgeInboundMessage) => void): void {
+  if (findSubscriber(handler) !== undefined) {
     return;
   }
 
-  if (typeof window !== 'undefined') {
-    window.removeEventListener('message', messageListener);
+  const link = createNullRecord<SubscriberLink>();
+  link.handler = handler;
+  link.next = undefined;
+
+  if (subscriberTail === undefined) {
+    subscriberHead = link;
+  } else {
+    subscriberTail.next = link;
   }
-  messageListener = undefined;
+  subscriberTail = link;
+  subscriberCount += 1;
+}
+
+/**
+ * Unregister a handler, if it is registered.
+ *
+ * The unlinked link keeps its own `next`, so a fan-out walking a snapshot is
+ * unaffected — it never walks the registry's links in the first place.
+ *
+ * @param handler The handler.
+ */
+function removeSubscriber(handler: (message: BridgeInboundMessage) => void): void {
+  const found = findSubscriber(handler);
+  if (found === undefined) {
+    return;
+  }
+
+  const { link, previous } = found;
+  if (previous === undefined) {
+    subscriberHead = link.next;
+  } else {
+    previous.next = link.next;
+  }
+  if (subscriberTail === link) {
+    subscriberTail = previous;
+  }
+  subscriberCount -= 1;
+}
+
+/** Unregister every handler. */
+function clearSubscribers(): void {
+  subscriberHead = undefined;
+  subscriberTail = undefined;
+  subscriberCount = 0;
+}
+
+/**
+ * Copy the registry into a fresh chain of null-prototype links.
+ *
+ * The same snapshot semantics `Array.from(set)` gave the fan-out: a handler
+ * registered while a frame is being delivered first hears the next frame, and
+ * one unregistered during delivery still hears this one. The copy is taken
+ * with a `for` over `next` and one literal per link — no array, no iterator
+ * and no call the page could have replaced.
+ *
+ * @returns The first link of the copy, or `undefined` when nothing is registered.
+ */
+function snapshotSubscribers(): SubscriberLink | undefined {
+  let head: SubscriberLink | undefined;
+  let tail: SubscriberLink | undefined;
+  for (let link = subscriberHead; link !== undefined; link = link.next) {
+    const copy = createNullRecord<SubscriberLink>();
+    copy.handler = link.handler;
+    copy.next = undefined;
+    if (tail === undefined) {
+      head = copy;
+    } else {
+      tail.next = copy;
+    }
+    tail = copy;
+  }
+  return head;
+}
+
+/**
+ * The channel node's {@link BRIDGE_FRAME_EVENT} listener: accept, acknowledge,
+ * handle.
+ *
+ * The acknowledgement — the captured `preventDefault()` — is given as soon as
+ * the frame is accepted and before it is handled, because it means "the agent
+ * took this frame", not "every subscriber succeeded"; a frame that fails the
+ * guard is left unacknowledged, so the bridge can tell it was not taken.
+ * Nothing here can throw into the bridge's dispatch.
+ *
+ * @param event The dispatched event.
+ */
+function receiveBridgeFrame(event: Event): void {
+  const intrinsics = CHANNEL_INTRINSICS;
+  if (intrinsics === undefined) {
+    return;
+  }
+
+  let message: BridgeInboundMessage | undefined;
+  try {
+    message = acceptFrame(intrinsics, event);
+  } catch {
+    // An event that is not a `CustomEvent`, or a reviver that met something
+    // it could not copy, is a frame that was never sent.
+    return;
+  }
+  if (message === undefined) {
+    return;
+  }
+
+  try {
+    intrinsics.apply(intrinsics.preventDefault, event, []);
+  } catch {
+    // An event that cannot be cancelled is still a frame the agent accepted.
+  }
+
+  try {
+    handleInbound(message);
+  } catch {
+    // `handleInbound` guards its own steps; this is the structural backstop
+    // for "nothing throws into the bridge's dispatch".
+  }
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * The channel node and the handshake
+ *
+ * Everything below implements the exchange documented in the module
+ * overview, which is where a bridge author reads it. Three properties are what
+ * make it worth having, and each one is a decision taken here rather than a
+ * consequence of the mechanism:
+ *
+ * 1. The node is **document-scoped and private**: created once, never
+ *    inserted, never published, surviving every reset.
+ * 2. It is disclosed **at most once**, in answer to the first request, with
+ *    the latch set and the request listener removed before the answer is
+ *    dispatched.
+ * 3. Every listener is installed and removed with the **captured** methods,
+ *    so a page wrapper sees none of them and cannot refuse their removal.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * The tag of the channel node.
+ *
+ * An ordinary `div`: creating one runs no page code (unlike a custom-element
+ * name the page may have defined), it has no behaviour of its own, and a
+ * detached one is never rendered, observed by a `MutationObserver` or reached
+ * by a selector.
+ */
+const CHANNEL_NODE_TAG = 'div';
+
+/**
+ * Whether the channel is open: a node exists and the handshake has handed it
+ * to the bridge.
+ *
+ * Until it is, no bridge can hold the node, so a frame dispatched on it could
+ * reach nobody — which is why {@link postControl} dispatches nothing and
+ * counts nothing before this is true.
+ */
+function isChannelOpen(): boolean {
+  return CHANNEL_INTRINSICS !== undefined && channelNode !== undefined && handshakeAnswered;
+}
+
+/**
+ * The document's channel node, created on first use with the captured
+ * `createElement`.
+ *
+ * @param intrinsics The captured intrinsics.
+ * @returns The node, or `undefined` in a host with no document.
+ */
+function ensureChannelNode(intrinsics: ChannelIntrinsics): EventTarget | undefined {
+  if (channelNode !== undefined) {
+    return channelNode;
+  }
+  if (typeof document === 'undefined') {
+    return undefined;
+  }
+
+  const node: EventTarget = intrinsics.apply(intrinsics.createElement, document, [
+    CHANNEL_NODE_TAG,
+  ]);
+  channelNode = node;
+  return node;
+}
+
+/**
+ * Answer the first — and only the first — handshake request.
+ *
+ * The order of the three statements is the security property: the latch is
+ * set and the listener removed *before* the answer is dispatched, so a handler
+ * that dispatches a second request from inside the first answer finds the
+ * exchange already closed. Doing it afterwards would make the bound "one
+ * request per synchronous turn" instead of "one request per document".
+ *
+ * The answer is a `MouseEvent` built with the captured constructor, whose
+ * `relatedTarget` is the node, dispatched on `window` with the captured
+ * `dispatchEvent`. It is neither bubbling nor cancelable and carries nothing
+ * else.
+ */
+function answerHandshakeRequest(): void {
+  const intrinsics = CHANNEL_INTRINSICS;
+  const node = channelNode;
+  if (
+    handshakeAnswered ||
+    intrinsics === undefined ||
+    node === undefined ||
+    typeof window === 'undefined'
+  ) {
+    return;
+  }
+
+  handshakeAnswered = true;
+  try {
+    removeHandshakeRequestListener();
+  } catch {
+    // The latch is already set, so a listener that somehow survived answers
+    // nothing: `answerHandshakeRequest` returns at its first check.
+  }
+
+  try {
+    // A null-prototype init dictionary, for the reason given in
+    // {@link postFrame}: the constructor reads members the record lacks, and
+    // on an ordinary object those reads reach `Object.prototype`, where a
+    // getter would be handed the dictionary and with it the node.
+    const init = createNullRecord<MouseEventInit>();
+    init.relatedTarget = node;
+    init.bubbles = false;
+    init.cancelable = false;
+    const answer = new intrinsics.MouseEvent(HANDSHAKE_OFFER_EVENT, init);
+    intrinsics.apply(intrinsics.windowDispatchEvent, window, [answer]);
+  } catch {
+    // A refused dispatch leaves this document without a bridge until it
+    // reloads; it must never surface in the developer's application.
+  }
+}
+
+/**
+ * Install the request listener, if this document still has an answer to give.
+ *
+ * Nothing is installed once the exchange is latched: a listener that could
+ * only ignore what it hears is a listener on the developer's `window` for no
+ * reason, and this module's contract is that it leaves none it does not need.
+ *
+ * @param intrinsics The captured intrinsics.
+ */
+function installHandshakeRequestListener(intrinsics: ChannelIntrinsics): void {
+  if (
+    handshakeRequestListener !== undefined ||
+    handshakeAnswered ||
+    channelNode === undefined ||
+    typeof window === 'undefined'
+  ) {
+    return;
+  }
+
+  const listener: EventListener = (): void => {
+    answerHandshakeRequest();
+  };
+  intrinsics.apply(intrinsics.windowAddEventListener, window, [HANDSHAKE_REQUEST_EVENT, listener]);
+  handshakeRequestListener = listener;
+}
+
+/**
+ * Remove the request listener, if one is installed.
+ *
+ * The reference is cleared only after the removal returns, so a removal that
+ * failed is still known and the next call tries again.
+ */
+function removeHandshakeRequestListener(): void {
+  const listener = handshakeRequestListener;
+  const intrinsics = CHANNEL_INTRINSICS;
+  if (listener === undefined) {
+    return;
+  }
+
+  if (intrinsics !== undefined && typeof window !== 'undefined') {
+    intrinsics.apply(intrinsics.windowRemoveEventListener, window, [
+      HANDSHAKE_REQUEST_EVENT,
+      listener,
+    ]);
+  }
+  handshakeRequestListener = undefined;
+}
+
+/**
+ * Open the channel for the current subscribers: create the node on first use,
+ * listen on it for bridge frames, and — while the handshake is unanswered —
+ * listen on `window` for the one request that will be answered.
+ *
+ * Called by every {@link subscribe} and idempotent past the first: the node
+ * and the latch are document-scoped, so the re-subscribe `./agent.ts` performs
+ * after every disarm re-installs the frame listener on the same node and never
+ * re-opens the handshake.
+ */
+function installChannelListeners(): void {
+  const intrinsics = CHANNEL_INTRINSICS;
+  if (intrinsics === undefined) {
+    return;
+  }
+
+  const node = ensureChannelNode(intrinsics);
+  if (node === undefined) {
+    return;
+  }
+
+  if (bridgeFrameListener === undefined) {
+    const listener: EventListener = (event: Event): void => {
+      receiveBridgeFrame(event);
+    };
+    intrinsics.apply(intrinsics.addEventListener, node, [BRIDGE_FRAME_EVENT, listener]);
+    bridgeFrameListener = listener;
+  }
+
+  installHandshakeRequestListener(intrinsics);
+}
+
+/**
+ * Remove the node's frame listener, if one is installed.
+ *
+ * The node itself is kept (see {@link channelNode}); without a listener on it
+ * a bridge frame is simply unacknowledged, which is how the bridge learns that
+ * nothing on this side is subscribed.
+ */
+function removeBridgeFrameListener(): void {
+  const listener = bridgeFrameListener;
+  const intrinsics = CHANNEL_INTRINSICS;
+  const node = channelNode;
+  if (listener === undefined) {
+    return;
+  }
+
+  if (intrinsics !== undefined && node !== undefined) {
+    intrinsics.apply(intrinsics.removeEventListener, node, [BRIDGE_FRAME_EVENT, listener]);
+  }
+  bridgeFrameListener = undefined;
 }
 
 /*
@@ -2769,6 +4511,15 @@ function removeMessageListener(): void {
  *
  * Trimmed, truncated and stripped of control characters, because the value
  * ends up in a frame the panel renders as text.
+ *
+ * Built from indexed reads of the primitive and string comparisons only, so
+ * the page's string iterator, `codePointAt` and `trim` are never asked what
+ * the field says. The text is the one the iterator-and-`trim` formulation
+ * produced: code points are walked in order (a surrogate pair is one), each
+ * control character (U+0000–U+001F, U+007F) becomes a space, the walk stops
+ * once {@link MAX_FAILURE_FIELD_CHARS} code units are written, and leading and
+ * trailing white space is removed exactly as `String.prototype.trim` removes
+ * it (see {@link isTrimmedSpace}).
  */
 function boundFailureField(value: string): string {
   let cleaned = '';
@@ -2777,15 +4528,66 @@ function boundFailureField(value: string): string {
   // remove are the control range, and a control-character class is exactly
   // what `no-control-regex` exists to reject. Stopping at the bound also means
   // an absurdly long input is never scanned in full.
-  for (const character of value) {
-    const code = character.codePointAt(0) ?? 0;
-    cleaned += code < 0x20 || code === 0x7f ? ' ' : character;
+  let index = 0;
+  while (index < value.length) {
+    const width = isSurrogatePairAt(value, index) ? 2 : 1;
+    const unit = value[index] ?? '';
+    // A one-unit string below U+0020 is a C0 control. A pair starts with a
+    // high surrogate, which is never below it and never U+007F.
+    if (width === 1 && (unit < ' ' || unit === '\u007f')) {
+      cleaned += ' ';
+    } else {
+      cleaned += width === 2 ? unit + (value[index + 1] ?? '') : unit;
+    }
+    index += width;
     if (cleaned.length >= MAX_FAILURE_FIELD_CHARS) {
       break;
     }
   }
 
-  return cleaned.trim();
+  let first = 0;
+  while (first < cleaned.length && isTrimmedSpace(cleaned[first] ?? '')) {
+    first += 1;
+  }
+  let last = cleaned.length;
+  while (last > first && isTrimmedSpace(cleaned[last - 1] ?? '')) {
+    last -= 1;
+  }
+
+  let trimmed = '';
+  for (let unit = first; unit < last; unit += 1) {
+    trimmed += cleaned[unit] ?? '';
+  }
+  return trimmed;
+}
+
+/**
+ * Whether one code unit is white space `String.prototype.trim` removes, once
+ * the control characters are spaces.
+ *
+ * `trim` removes the ECMAScript WhiteSpace and LineTerminator code points.
+ * The C0 ones among them (TAB, LF, VT, FF, CR) cannot survive
+ * {@link boundFailureField}'s first pass, so what remains is U+0020, U+00A0,
+ * U+1680, U+2000–U+200A, U+2028, U+2029, U+202F, U+205F, U+3000 and U+FEFF:
+ * the space separators of the Unicode `Zs` category, the two line and
+ * paragraph separators, and the byte-order mark. Every one is a single code
+ * unit, so a surrogate is never removed.
+ *
+ * @param unit One code unit, as a one-unit string.
+ */
+function isTrimmedSpace(unit: string): boolean {
+  return (
+    unit === ' ' ||
+    unit === '\u00a0' ||
+    unit === '\u1680' ||
+    (unit >= '\u2000' && unit <= '\u200a') ||
+    unit === '\u2028' ||
+    unit === '\u2029' ||
+    unit === '\u202f' ||
+    unit === '\u205f' ||
+    unit === '\u3000' ||
+    unit === '\ufeff'
+  );
 }
 
 /**
@@ -2881,7 +4683,9 @@ function failureTypeName(error: unknown): string {
  * @returns The matching vocabulary member, or `'Error'`.
  */
 function reportableErrorName(name: unknown): string {
-  return typeof name === 'string' && REPORTABLE_ERROR_NAMES.has(name) ? name : 'Error';
+  // `in` over the null-prototype membership record, never `Set.prototype.has`:
+  // the page's replacement could admit any string it chose.
+  return typeof name === 'string' && name in REPORTABLE_ERROR_NAME_MEMBERSHIP ? name : 'Error';
 }
 
 /**
@@ -2953,14 +4757,14 @@ export function reportProducerFailure(
   detail?: Record<string, unknown>,
 ): void {
   try {
-    const alreadyReported = producerFailureCounts.get(source) ?? 0;
+    const alreadyReported = producerFailureCounts[source] ?? 0;
     if (alreadyReported >= MAX_PRODUCER_FAILURE_REPORTS) {
       producerFailuresSuppressed += 1;
       return;
     }
 
     const occurrence = alreadyReported + 1;
-    producerFailureCounts.set(source, occurrence);
+    producerFailureCounts[source] = occurrence;
     producerFailuresReported += 1;
 
     const boundedStage = boundFailureField(stage);
@@ -2992,9 +4796,10 @@ export function reportProducerFailure(
  *
  * The one entry point for every signal this folder produces. It completes the
  * draft into a `TelemetryEventIngress` — `id` (the draft's own, or a fresh
- * `evt_…`), `producerId` (this document's), `tier` (`browser`) and `seq` (the
- * next in this capture) — sanitizes its attributes so the batch is certain to
- * clone, and queues it.
+ * `evt_…`), `producerId` (this document's), `tier` (`browser`), `seq` (the
+ * next in this capture) and, once the document has an estimate,
+ * `clockOffsetMs` — sanitizes its attributes so the batch is certain to clone,
+ * and queues it.
  *
  * **Outside a capture, nothing is kept.** With `enabled` false or no
  * `captureId`, this returns immediately without buffering, so a dormant agent
@@ -3039,33 +4844,51 @@ export function emitMany(drafts: readonly EventDraft[]): void {
     if (!acceptingEvents || currentCaptureId === undefined) {
       return;
     }
-    for (const draft of drafts) {
+    // By index, never through the array iterator: the page's would be handed
+    // the producer's drafts, and could rewrite them before they are stamped.
+    // A hole is tested with the captured `Object.hasOwn` rather than read, so
+    // no index accessor on `Array.prototype` is handed the array either; like
+    // an `undefined` entry, it is a draft that cannot be stamped.
+    const core = coreIntrinsics();
+    for (let index = 0; index < drafts.length; index += 1) {
+      const draft = core.apply(core.hasOwn, undefined, [drafts, index]) ? drafts[index] : undefined;
+      if (draft === undefined) {
+        recordUnpostable(1);
+        continue;
+      }
       acceptDraft(draft);
     }
   } catch {
-    // An exotic iterable from the page cannot break the commit it came from.
+    // An exotic array from the page cannot break the commit it came from.
     recordUnpostable(1);
   }
 }
 
 /**
- * Post a control frame to the bridge immediately, capture or no capture.
+ * Dispatch a control frame to the bridge immediately, capture or no capture.
  *
  * Control frames are how the agent says things about itself rather than about
  * the application: `agent.ready` when it initialises (and again whenever the
- * bridge announces itself, since a frame posted before the bridge's listener
- * existed is lost), `target.described` with an element descriptor the panel
- * asked for, and `agent.error` when something could not be done.
+ * bridge announces itself), `target.described` with an element descriptor the
+ * panel asked for, and `agent.error` when something could not be done.
+ *
+ * **Nothing is dispatched before the handshake.** Until the bridge has asked
+ * for the node no bridge can hold it, so a frame could reach nobody; it is
+ * neither dispatched nor counted as lost. That is the fate of the
+ * `agent.ready` `./agent.ts` announces at `document_start`, and it is by
+ * design: the bridge's `bridge.ready` is the cue to re-announce, and that
+ * announcement finds the channel open.
  *
  * The payload is sanitized on the way out, exactly as an event's attributes
- * are: a control frame is structure-cloned like any other, and a descriptor
- * assembled from page data must not be the thing that throws `DataCloneError`.
- * It is then **bounded** — every string to {@link MAX_CONTROL_TEXT_LENGTH},
- * every frame to {@link MAX_MESSAGE_BYTES} — because a control frame's fields
- * are page data (a URL, a selector, an element's text) whose length no page has
- * to justify. A frame the cap refuses is replaced by one fixed-size diagnostic
- * (see {@link noteControlFrameLoss}), never posted unmeasured and never
- * silently dropped.
+ * are: a control frame is rendered to JSON like any other, and a descriptor
+ * assembled from page data must not be the thing that fails to render. It is
+ * then **bounded** — every string to {@link MAX_CONTROL_TEXT_LENGTH}, every
+ * frame to {@link MAX_MESSAGE_BYTES} — because a control frame's fields are
+ * page data (a URL, a selector, an element's text) whose length no page has to
+ * justify. A frame the cap refuses is replaced by one fixed-size diagnostic
+ * (see {@link noteControlFrameLoss}), never dispatched unmeasured and never
+ * silently dropped; a frame the bridge does not claim is counted in
+ * {@link TransportStats}'s `controlFramesDropped`.
  *
  * Nothing is queued and nothing is retried. A control frame is a statement
  * about a moment, and the bridge's own `bridge.ready` is the cue to restate
@@ -3073,6 +4896,9 @@ export function emitMany(drafts: readonly EventDraft[]): void {
  */
 export function postControl(type: AgentOutboundType, payload: Record<string, unknown>): void {
   try {
+    if (!isChannelOpen()) {
+      return;
+    }
     const bounded = boundControlPayload(sanitizeAttributes(payload));
     const outcome = postFrame(type, bounded);
     if (outcome !== 'sent') {
@@ -3087,16 +4913,18 @@ export function postControl(type: AgentOutboundType, payload: Record<string, unk
 /**
  * Subscribe to frames from the bridge.
  *
- * The first call installs the module's single `message` listener and opens the
- * handshake that authenticates it (mint the token, disclose it once, listen for
- * the one request that will be answered); the last unsubscribe removes both
- * listeners, so a fully detached agent leaves no listener on the page's window.
- * The returned function is idempotent and safe to call after
- * {@link resetTransport}.
+ * The first call opens the channel: it creates the document's detached
+ * channel node, listens on it for {@link BRIDGE_FRAME_EVENT} and — while the
+ * handshake is still unanswered — listens on `window` for the one
+ * {@link HANDSHAKE_REQUEST_EVENT} that will be answered. The last unsubscribe
+ * removes both listeners, so a fully detached agent leaves no listener on the
+ * page's window and none on the node; a later subscribe re-installs the node
+ * listener and never answers another request. The returned function is
+ * idempotent and safe to call after {@link resetTransport}.
  *
- * The token itself is **not** a subscription: it belongs to the document and
- * survives every reset, so the bridge's copy stays valid across the disarm and
- * re-arm of a second capture (see {@link handshakeToken}).
+ * The node itself is **not** a subscription: it belongs to the document and
+ * survives every reset, so the bridge's reference stays valid across the
+ * disarm and re-arm of a second capture (see {@link channelNode}).
  *
  * @param handler Called with each accepted frame. It must not throw — one that
  * does is contained, but it forfeits its own notification.
@@ -3104,19 +4932,19 @@ export function postControl(type: AgentOutboundType, payload: Record<string, unk
  */
 export function subscribe(handler: (message: BridgeInboundMessage) => void): () => void {
   try {
-    subscribers.add(handler);
-    installMessageListener();
+    addSubscriber(handler);
+    installChannelListeners();
   } catch {
-    // A page that has broken `addEventListener` leaves the agent deaf rather
-    // than broken; `getTransportStats().bridgeReady` stays false and
+    // A host that refuses the node or the listener leaves the agent deaf
+    // rather than broken; `getTransportStats().bridgeReady` stays false and
     // `./agent.ts` reports it.
   }
 
   return function unsubscribe(): void {
     try {
-      subscribers.delete(handler);
-      if (subscribers.size === 0) {
-        removeMessageListener();
+      removeSubscriber(handler);
+      if (subscriberCount === 0) {
+        removeBridgeFrameListener();
         removeHandshakeRequestListener();
       }
     } catch {
@@ -3136,19 +4964,39 @@ export function subscribe(handler: (message: BridgeInboundMessage) => void): () 
  *    capture change, or a transition to disabled, flushes first — so a batch
  *    is never labelled with the capture that replaced the one it belongs to.
  * 2. **Events the bridge never took at a capture change are discarded**, not
- *    relabelled. They are counted in {@link TransportStats}'s cumulative
- *    `dropped`, while the per-capture `droppedCount` restarts with the new
- *    capture, because that number describes a capture.
+ *    relabelled — including a batch the flush dispatched and the bridge did
+ *    not claim, which custody has just put back in the queue. They are counted
+ *    in {@link TransportStats}'s cumulative `dropped`, while the per-capture
+ *    `droppedCount` restarts with the new capture, because that number
+ *    describes a capture. A batch still in the bridge's hands when this runs —
+ *    a configuration relayed from inside one of this module's own dispatches —
+ *    is settled against the capture it was built for (see
+ *    {@link captureEpoch}).
  * 3. **The sequence restarts.** `seq` and `batchSeq` are scoped to the
  *    capture (see {@link nextSeq}), so a new `captureId` restarts both at
  *    zero. An identical `captureId` — the same configuration re-sent after a
  *    reconnect, which the bridge is expected to do — changes nothing, which is
  *    what makes re-configuration idempotent.
+ *
+ * This is the last step of an arm or a disarm, so it runs on the control
+ * path's rules (see "Core intrinsics and page-proof primitives"): the three
+ * fields are read as **own data properties** — a field the caller left out
+ * reads as absent even when a page has defined an accessor of that name on
+ * `Object.prototype` — and nothing here calls a method the page can replace.
+ * A `captureId` that is not a string is no capture, and `enabled` is on only
+ * when it is exactly `true`.
+ *
+ * The clock-offset estimate is not touched on any of these paths: it belongs to
+ * the document, not to the capture (see {@link clockOffset}).
  */
 export function configureTransport(config: TransportConfig): void {
   try {
-    const nextCaptureId = config.captureId;
-    const nextEnabled = config.enabled;
+    const core = coreIntrinsics();
+    const requestedCaptureId = readOwnData(core, config, 'captureId');
+    const requestedSessionId = readOwnData(core, config, 'sessionId');
+    const nextCaptureId = typeof requestedCaptureId === 'string' ? requestedCaptureId : undefined;
+    const nextSessionId = typeof requestedSessionId === 'string' ? requestedSessionId : undefined;
+    const nextEnabled = readOwnData(core, config, 'enabled') === true;
     const captureChanged = nextCaptureId !== currentCaptureId;
 
     if (captureChanged || (acceptingEvents && !nextEnabled)) {
@@ -3165,13 +5013,14 @@ export function configureTransport(config: TransportConfig): void {
       seqCounter = 0;
       batchSeqCounter = 0;
       pendingDropped = 0;
+      captureEpoch += 1;
       // Failure reports are bounded per capture for the same reason the
       // sequence is scoped to one: a new capture is a new statement about what
       // could and could not be collected (see MAX_PRODUCER_FAILURE_REPORTS).
-      producerFailureCounts.clear();
+      producerFailureCounts = createNullRecord();
     }
 
-    currentSessionId = config.sessionId;
+    currentSessionId = nextSessionId;
     currentCaptureId = nextCaptureId;
     acceptingEvents = nextEnabled;
 
@@ -3187,14 +5036,15 @@ export function configureTransport(config: TransportConfig): void {
 }
 
 /**
- * Post everything queued right now, without waiting for the flush timer.
+ * Dispatch everything queued right now, without waiting for the flush timer.
  *
  * `./agent.ts` calls this on `pagehide` — the last moment a document can hand
  * anything to the bridge — and when a capture stops, so the analysis runs on
  * the whole capture and not on the whole capture minus its final 250 ms.
  *
  * A no-op while the bridge is away: the queue is kept and the arrival of
- * `bridge.ready` starts draining it.
+ * `bridge.ready` starts draining it. A flush that meets a batch the bridge
+ * does not claim stops there, with that batch back at the front of the queue.
  */
 export function flush(): void {
   try {
@@ -3210,40 +5060,45 @@ export function flush(): void {
  * Called by `./agent.ts` on full detach, which is what an `agent.config` with
  * every hook false amounts to (AAP 0.5.1: "agent.config with all hooks false
  * returns the browser agent to dormant"). Afterwards the module holds no
- * events, no subscribers, no timer and no listener on the page's window, and
- * {@link emit} accepts nothing until it is configured again.
+ * events, no subscribers, no timer and no listener — none on the page's window
+ * and none on the channel node — and {@link emit} accepts nothing until it is
+ * configured again.
  *
  * The producer and document ids are **not** reset, and `./ids.ts` offers no
  * way to reset them: they identify the document, not the capture, and a second
  * producer id inside one document would split one sequence into two
  * incomparable halves.
  *
- * Neither is the handshake token, nor the latch that records that the one
- * request was answered — and for a sharper reason, because this function runs
- * at the end of *every* capture (`./agent.ts`'s `disarm()` calls it and then
- * immediately re-subscribes). Clearing the token here would leave the bridge
- * holding a value this module no longer recognises, with no way to be told and
- * no second disclosure coming, so the next `agent.config` would never be
- * accepted and the document would be finished after one capture. See
- * {@link handshakeToken}. What *is* released is the request listener, because
- * that follows the `message` listener: afterwards the module holds no listener
- * on the page's window, and the next {@link subscribe} re-installs both.
+ * Neither is the channel node, nor the latch that records that the one
+ * handshake request was answered — and for a sharper reason, because this
+ * function runs at the end of *every* capture (`./agent.ts`'s `disarm()` calls
+ * it and then immediately re-subscribes). Replacing the node here would leave
+ * the bridge holding one this module no longer listens on, with no second
+ * handshake coming, so the next `agent.config` would never arrive and the
+ * document would be finished after one capture. See {@link channelNode}. What
+ * *is* released are the listeners: the next {@link subscribe} re-installs the
+ * node's, and the request listener only while the handshake is unanswered.
  *
- * Every step stands in its own guard (see {@link teardownStep}). The three
- * that touch the page — clearing the timer and removing the listener — are the
- * ones that can fail, because `clearTimeout` and `removeEventListener` belong
- * to the document and a page is free to replace them; the rest cannot, and are
- * guarded anyway so that the ordering carries no assumption. Without the
- * per-step guard a single hostile or broken page API would leave
+ * Nor is the clock-offset estimate, for the producer id's reason: it describes
+ * this document's clock, which a capture ending does not change, and the
+ * samples behind it stay valid for the next capture. Clearing it would only
+ * leave that capture's first events without an offset until the page made
+ * another same-origin request. See {@link clockOffset}.
+ *
+ * Every step stands in its own guard (see {@link teardownStep}). The listener
+ * removals go through the captured methods, so a page cannot refuse them the
+ * way it can refuse its own; `clearTimeout` still belongs to the page. Without
+ * the per-step guard a single hostile or broken page API would leave
  * `acceptingEvents` true and `currentCaptureId` set — a "dormant" agent still
  * accepting events into a capture that has ended, which is precisely what AAP
  * 0.5.1's "disabled, not merely idled" forbids.
  *
  * What a failed step leaves behind is retained rather than forgotten:
- * {@link removeMessageListener} clears its reference only after the removal
- * returns, so a listener that could not be removed is still known and the next
- * call tries again. The failure itself is reported as an `agent.error` frame
- * with `source: 'transport'`.
+ * {@link removeBridgeFrameListener} and {@link removeHandshakeRequestListener}
+ * clear their references only after the removal returns, so a listener that
+ * could not be removed is still known and the next call tries again. The
+ * failure itself is reported as an `agent.error` frame with
+ * `source: 'transport'`.
  */
 export function resetTransport(): void {
   // Deliberately not wrapped as a whole: a failure in any one of these must
@@ -3256,17 +5111,17 @@ export function resetTransport(): void {
     // empty queue and an absent bridge and does nothing.
     closeDrainChannel();
   });
-  teardownStep('message-listener-remove', () => {
-    removeMessageListener();
+  teardownStep('channel-listener-remove', () => {
+    removeBridgeFrameListener();
   });
   // Its own step rather than a second statement in the one above: the two
-  // removals are independent, and a `removeEventListener` the page refuses for
-  // one event type must not leave the other listener on the window.
+  // removals are independent, and one that fails must not leave the other
+  // listener installed.
   teardownStep('handshake-listener-remove', () => {
     removeHandshakeRequestListener();
   });
   teardownStep('subscribers-clear', () => {
-    subscribers.clear();
+    clearSubscribers();
   });
   teardownStep('buffer-clear', () => {
     releaseBuffer();
@@ -3278,6 +5133,11 @@ export function resetTransport(): void {
     acceptingEvents = false;
     bridgeAvailable = false;
     reportingControlLoss = false;
+    // A batch still in the bridge's hands — a reset reached from inside one of
+    // this module's own dispatches — belongs to the capture this ends, and is
+    // settled into none of the counters the next step zeroes.
+    captureEpoch += 1;
+    resetGeneration += 1;
   });
 
   teardownStep('counter-reset', () => {
@@ -3297,8 +5157,53 @@ export function resetTransport(): void {
   // teardown, and a reset that erased the reports it had just provoked would
   // leave a document that failed to detach looking like one that never tried.
   teardownStep('failure-allowance-reset', () => {
-    producerFailureCounts.clear();
+    producerFailureCounts = createNullRecord();
   });
+}
+
+/**
+ * Fold one server response's `Date` header into this document's clock-offset
+ * estimate (AAP 0.2.3: "server `Date` header versus local clock").
+ *
+ * `./fetch.ts` calls it where a same-origin request settles with a response the
+ * dev server produced just then — a response carrying `Age` came from a cache
+ * and states the clock of its original generation, so it is not offered. The
+ * header is the server's clock at some instant between this document's two
+ * readings, which is exactly what the estimator needs: an interval that
+ * contains the offset (`../schema/clock-offset.ts`).
+ *
+ * Both instants must be readings of {@link nowEpochMs}, the clock this module's
+ * events are stamped with. Reading `sentAt` earlier than the send, or
+ * `receivedAt` later than the arrival, only widens the interval; it never makes
+ * it exclude the true offset.
+ *
+ * Nothing is posted and no event is created or changed. The estimate only
+ * decides what {@link completeDraft} stamps on events created from now on, and
+ * it is taken with or without a capture, because the clock is the document's.
+ *
+ * Never throws into the page.
+ *
+ * @param dateHeader The response's raw `Date` value, or `null`/`undefined` when
+ *   it carried none — which is no sample, and changes nothing. A value that is
+ *   present but not a canonical IMF-fixdate is counted as a rejected sample.
+ * @param sentAt This document's clock immediately before the request was sent.
+ * @param receivedAt This document's clock when the response arrived.
+ */
+export function observeServerClock(
+  dateHeader: string | null | undefined,
+  sentAt: number,
+  receivedAt: number,
+): void {
+  try {
+    clockOffset.observeHttpDate(dateHeader, sentAt, receivedAt);
+  } catch (error: unknown) {
+    // The estimator performs no I/O and throws for no input, so this is not
+    // expected to run. It is guarded anyway because this runs inside the
+    // application's own promise chain and XHR listeners, where an escaping
+    // exception would be the page's; the lost sample costs only precision and
+    // is reported like every contained producer failure.
+    reportProducerFailure('transport', 'clock-sample', error);
+  }
 }
 
 /**
@@ -3336,4 +5241,20 @@ export function getProducerFailureStats(): ProducerFailureStats {
     reported: producerFailuresReported,
     suppressed: producerFailuresSuppressed,
   };
+}
+
+/**
+ * A snapshot of this document's clock-offset estimate: the value the next
+ * event will be stamped with (`offsetMs`), the interval it is the midpoint of,
+ * and how many samples were accepted, restarted the estimate or were rejected.
+ *
+ * Its own function rather than members of {@link TransportStats}, whose numbers
+ * describe the queue and the channel: this one describes the document's clock,
+ * survives {@link resetTransport} and a capture change alike, and is shaped by
+ * `../schema/clock-offset.ts` so both producers report it identically.
+ *
+ * @returns A fresh, frozen snapshot.
+ */
+export function getClockOffsetStats(): ClockOffsetSnapshot {
+  return clockOffset.snapshot();
 }

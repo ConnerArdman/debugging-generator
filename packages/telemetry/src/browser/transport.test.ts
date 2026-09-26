@@ -2,89 +2,103 @@
 /**
  * Colocated tests for `./transport.ts` — the bounds the page agent promises the
  * developer's page, each one exercised at the value itself, one short of it and
- * one over.
+ * one over; the private page channel those bounds travel on; and the custody
+ * rule that decides when an event has actually left the page.
  *
  * **What this suite owns.** Every number that decides when telemetry travels,
  * how much of it is held and what happens when there is too much:
  *
- * - {@link MAX_EVENTS_PER_BATCH} (200) — the size of a posted batch *and* the
- *   drain trigger. The event that reaches it must not pay for the batch: the
- *   drain goes to a later turn, which the cases below assert by observing that
- *   nothing has been posted when the emitting loop returns.
+ * - {@link MAX_EVENTS_PER_BATCH} (200) — the size of a dispatched batch *and*
+ *   the drain trigger. The event that reaches it must not pay for the batch:
+ *   the drain goes to a later turn, which the cases below assert by observing
+ *   that nothing has been dispatched when the emitting loop returns.
  * - {@link MAX_BUFFERED_EVENTS} (5 000) — AAP §0.5.5's "the agent buffers up to
  *   5 000 events in memory until the bridge returns". At the cap exactly one
  *   oldest event is evicted per new event, order survives the ring's
  *   wrap-around, `seq` is **not** renumbered (the gap is how a reader learns
- *   events were lost) and the loss rides out on the next batch's
+ *   events were lost) and the loss rides out on the next claimed batch's
  *   `droppedCount`, once.
- * - {@link MAX_BATCHES_PER_DRAIN} (8) — what one drain posts before it yields
- *   the task back to the page, with the remainder rescheduled. Asserted on
- *   both non-terminal routes that can meet a deep queue: the scheduled drain
+ * - {@link MAX_BATCHES_PER_DRAIN} (8) — what one drain dispatches before it
+ *   yields the task back to the page, with the remainder rescheduled. Asserted
+ *   on both non-terminal routes that can meet a deep queue: the scheduled drain
  *   the batch threshold starts, and the recovery drain the bridge's return
  *   starts after an absence. {@link flush} is the deliberate exception — a
  *   terminal moment with no later turn — and is asserted to be unbounded.
- * - {@link MAX_MESSAGE_BYTES} (512 KiB) — measured on every frame. An oversize
- *   batch is halved until it fits, a single event that cannot fit is dropped
- *   alone with a diagnostic naming only its id and kind, and a control frame
- *   over the cap is refused and replaced by one fixed-size diagnostic that
- *   cannot trigger another.
+ * - {@link MAX_MESSAGE_BYTES} (512 KiB) — the length of every frame's `detail`,
+ *   in both directions. An oversize batch is halved until it fits, a single
+ *   event that cannot fit is dropped alone with a diagnostic naming only its id
+ *   and kind, a control frame over the cap is refused and replaced by one
+ *   fixed-size diagnostic that cannot trigger another, and an inbound frame one
+ *   code unit over the cap is dropped while one exactly at it is accepted.
  * - {@link MAX_CONTROL_TEXT_LENGTH} (2 048) — the per-field bound on the
  *   page-controlled text a control frame carries.
  *
- * **And the inbound channel's authentication**, which is the other thing this
- * module owns alone: the page↔bridge handshake. `describe('the bridge
- * handshake')` covers the five properties the guard rests on — a frame with no
- * `token` is not accepted, nor is one whose token is the right length and the
- * wrong value, nor one at the previous {@link CHANNEL_VERSION}; the token the
- * module discloses *is* accepted, and still is after a
- * {@link resetTransport} and a fresh {@link subscribe} (the disarm→re-arm path
- * of a second capture on one document); exactly one
- * {@link HANDSHAKE_REQUEST_EVENT} is ever answered; a module instance whose
- * disclosure nobody joined accepts nothing a caller can construct; and the
- * token never reaches a subscriber. Without those cases a page script could
- * arm, reconfigure or silently tear down a capture by posting a frame to its
- * own window, which is what the five structural checks alone allowed.
+ * **The channel, version 3.** Frames travel as `CustomEvent`s on a detached
+ * node the agent hands to the bridge exactly once, never on `window`, and a
+ * frame counts as delivered only when the receiver acknowledges it with
+ * `preventDefault()`. The cases assert the properties that design exists for:
+ *
+ * - *what a page script can see* — nothing: a listener on `window` or
+ *   `document`, for `message` or for the frame events, observes no frame, and
+ *   `window.postMessage` is never called;
+ * - *what a page script can send* — nothing the agent accepts: a v2-style frame
+ *   posted to the window, token or not, and a {@link BRIDGE_FRAME_EVENT}
+ *   dispatched anywhere but the node are ignored, unacknowledged;
+ * - *how the node is disclosed* — once, to the first request, never
+ *   unsolicited, never again (not from inside the answer, not after a reset);
+ * - *what an accepted frame is* — a `detail` string within the cap that parses
+ *   to a record with the bridge's tag, version 3 and an inbound type; anything
+ *   else is dropped unacknowledged, and the payload a subscriber receives is a
+ *   null-prototype record a polluted `Object.prototype` cannot reach into;
+ * - *custody* — a claimed batch leaves the queue and advances `batchSeq`; an
+ *   unclaimed one goes back to the front, in order, marks the bridge away and
+ *   is delivered after the next `bridge.ready` with the same `batchSeq`, the
+ *   same `droppedCount` and no duplicate — halves included;
+ * - *re-entrancy* — a `bridge.gone`, a `bridge.ready`, a flush, a capture change
+ *   or a reset handed back from inside the agent's own dispatch;
+ * - *the captured primitives* — replacing `dispatchEvent`, `addEventListener`,
+ *   the `detail` getter, `preventDefault`, `JSON` or `CustomEvent` after the
+ *   module loaded neither breaks the channel nor lets the page watch it.
  *
  * No other suite in the repository reaches any of them: the sibling browser
  * suites drive producers (`./continuation.test.ts`, `./dom-target.test.ts`,
  * `./react.test.tsx`) and `../node/control.test.ts` drives the capture gate, so
  * a regression in the backpressure rules — a queue that shifts its whole array
- * per event, an inline drain on a click handler, a frame posted unmeasured — or
- * in the handshake would otherwise reach a developer's page before it reached a
- * test.
+ * per event, an inline drain on a click handler, a frame dispatched unmeasured,
+ * a batch forgotten when the bridge's port died — or in the channel would
+ * otherwise reach a developer's page before it reached a test.
  *
  * ## Techniques, and why each one is the way it is
  *
- * **Outbound frames are observed by spying on `window.postMessage`.** The
- * module posts with a `targetOrigin` of `'/'` on purpose (it is the only
- * spelling that works in a document with an opaque origin), and happy-dom
- * refuses that value with a `SecurityError`. Un-spied, every frame this module
- * posts would therefore be *refused* rather than delivered, and the suite would
- * be asserting against a host limitation instead of against the product. The
- * spy records each frame and counts each attempt, so "did not split the batch"
- * is an attempt count rather than an inference.
+ * **Both directions go through a fake bridge that does exactly what the real
+ * one does** (`./__tests__/page-channel.ts`). This file connects it once, at
+ * module scope: it dispatches the one {@link HANDSHAKE_REQUEST_EVENT} this
+ * module instance will ever answer, holds the node the answer carries, records
+ * every {@link AGENT_FRAME_EVENT} dispatched on it and acknowledges each one its
+ * claim policy says to take. So "the bridge's runtime port was gone" is a claim
+ * policy of `false`, "the bridge handed back a `bridge.gone` from inside the
+ * dispatch" is a policy that sends one, and every assertion reads the frames
+ * off the wire rather than out of the module's internals. The node and the
+ * handshake latch are document-scoped and survive the {@link resetTransport}
+ * each case runs, which is the same lifetime a second capture on one document
+ * depends on.
  *
- * **Inbound frames are dispatched as constructed `MessageEvent`s.** The
- * module's guard requires `event.source === window`, which happy-dom's own
- * `window.postMessage` does not set. `bridge.ready` and `bridge.gone` are
- * therefore delivered by `window.dispatchEvent(new MessageEvent('message',
- * { …, source: window }))` — through the same listener the real bridge reaches,
- * with the same guard applied. The listener exists only while something is
- * subscribed, so every case subscribes first and unsubscribes in teardown.
+ * **Cases that need an unspent handshake take a fresh module instance**
+ * (`vi.resetModules()` and a dynamic `import()`, which this module supports
+ * because it has no import-time side effects). The file's own instance has
+ * already answered its request and listens for no other, so a request
+ * dispatched in such a case reaches exactly the fresh one. Every fresh
+ * instance is reset in a `finally`, which removes its request listener too, so
+ * no case leaves an answerable listener behind for the next.
  *
- * **The handshake token is captured once, at module scope.** Every inbound
- * frame now has to carry it (see {@link announceBridge}), and the module
- * discloses it at most twice per document: unsolicited, the instant the first
- * {@link subscribe} mints it, and once in answer to the first request. This
- * file takes the first of those, by registering a {@link HANDSHAKE_OFFER_EVENT}
- * listener at module scope — before any `subscribe()` runs, which is the
- * bridge-injected-first order — and latching what it hears. One capture serves
- * the whole file, because the token is document-scoped and survives the
- * {@link resetTransport} each case runs; the two cases that need a *fresh*
- * handshake take a fresh module instance instead (`vi.resetModules()` and a
- * dynamic `import()`, which this module supports because it has no import-time
- * side effects), so neither of them consumes the single request-answer the
- * rest of the file's token came from.
+ * **A `refused` dispatch is produced where the product meets it**: by a
+ * `CustomEvent` constructor that throws. The stub is installed only while a
+ * fresh instance is evaluated — which is when the module captures its
+ * constructors — and removed straight after, so it is that one instance's
+ * constructor and nobody else's. It subclasses the real one, so the captured
+ * `detail` getter is still found on its prototype chain. The fake bridge
+ * dispatches with the constructor it captured at its own evaluation and is
+ * unaffected.
  *
  * **The scheduled drain is waited for, never assumed.** The module hands a
  * scheduled drain to a `MessageChannel` message, and in this host that is
@@ -105,8 +119,8 @@
  * state at the end of one turn.
  *
  * **State is module-global**, being one document's transport, so
- * {@link resetTransport} runs before and after every case, and no case depends
- * on another's counters.
+ * {@link resetTransport} runs before and after every case, the fake bridge's
+ * record is cleared with it, and no case depends on another's counters.
  *
  * **Deterministic by construction.** No fake timers, no wall-clock sleep beyond
  * a zero-delay yield, no network, and no Node built-in anywhere: `eslint.config.js`
@@ -120,10 +134,18 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { MAX_TRACKED_KEYS } from '../schema/attributes.js';
+import {
+  bridgeFrameDetail,
+  connectFakeBridge,
+  requestChannelNode,
+} from './__tests__/page-channel.js';
+import type { FakeBridge, HandshakeResult, RecordedAgentFrame } from './__tests__/page-channel.js';
 import { getProducerId } from './ids.js';
 import {
+  AGENT_FRAME_EVENT,
   AGENT_SOURCE_TAG,
   boundControlText,
+  BRIDGE_FRAME_EVENT,
   BRIDGE_SOURCE_TAG,
   CHANNEL_VERSION,
   configureTransport,
@@ -142,12 +164,7 @@ import {
   resetTransport,
   subscribe,
 } from './transport.js';
-import type {
-  AgentOutboundMessage,
-  AgentOutboundType,
-  BridgeInboundMessage,
-  EventDraft,
-} from './transport.js';
+import type { BridgeInboundMessage, EventDraft } from './transport.js';
 
 /*
  * ---------------------------------------------------------------------------
@@ -166,7 +183,7 @@ const SESSION_ID = `ses_${'1'.repeat(16)}`;
 /** The capture every case runs under. */
 const CAPTURE_A = `cap_${'a'.repeat(16)}`;
 
-/** A second capture, for the transition case. */
+/** A second capture, for the transition cases. */
 const CAPTURE_B = `cap_${'b'.repeat(16)}`;
 
 /** The trace every emitted draft belongs to: 32 lowercase hex characters. */
@@ -186,6 +203,15 @@ const FILLER_ATTRIBUTE = 'debuggen.filler';
 
 /** A small, round epoch-millisecond base; the module only ever rounds it. */
 const T0 = 1_700_000_000_000;
+
+/** A page URL for control frames; `.invalid` is reserved and resolves nowhere. */
+const PAGE_URL = 'https://example.invalid/page';
+
+/**
+ * A property name a case adds to `Object.prototype`, the way a page script can,
+ * and removes again before it returns.
+ */
+const POLLUTED_KEY = 'debuggenPolluted';
 
 /**
  * Macrotask yields {@link drainToCompletion} will spend before it gives up.
@@ -215,8 +241,8 @@ const OVERSIZE_BATCH_EVENTS = 8;
  *
  * Sized so the whole batch measures just over {@link MAX_MESSAGE_BYTES} — the
  * filler alone reaches the cap exactly and the events' own fields carry it
- * past — while either half is comfortably inside it. That is the split the case
- * asserts: one halving, no more.
+ * past — while either half is comfortably inside it. That is the split the
+ * cases assert: one halving, no more.
  */
 const OVERSIZE_BATCH_FILLER = MAX_MESSAGE_BYTES / OVERSIZE_BATCH_EVENTS;
 
@@ -272,7 +298,7 @@ function renderDraft(index: number, options: DraftOptions = {}): EventDraft {
  *
  * Synchronous and unbroken on purpose: it is the shape of the burst the bounds
  * exist for — a render storm inside one commit — and it is what makes "nothing
- * was posted while the producer was on the stack" an assertion about the
+ * was dispatched while the producer was on the stack" an assertion about the
  * module rather than about the scheduler.
  *
  * @param count How many drafts to emit.
@@ -281,6 +307,20 @@ function renderDraft(index: number, options: DraftOptions = {}): EventDraft {
 function emitRange(count: number, startIndex = 0): void {
   for (let offset = 0; offset < count; offset += 1) {
     emit(renderDraft(startIndex + offset));
+  }
+}
+
+/**
+ * Emit the oversize-batch fixture: {@link OVERSIZE_BATCH_EVENTS} drafts whose
+ * filler takes the batch just over {@link MAX_MESSAGE_BYTES}.
+ *
+ * @param emitDraft The module instance's `emit`.
+ * @param startIndex The first emission index.
+ */
+function emitOversizeRun(emitDraft: (draft: EventDraft) => void, startIndex = 0): void {
+  const filler = 'x'.repeat(OVERSIZE_BATCH_FILLER);
+  for (let offset = 0; offset < OVERSIZE_BATCH_EVENTS; offset += 1) {
+    emitDraft(renderDraft(startIndex + offset, { attributes: { [FILLER_ATTRIBUTE]: filler } }));
   }
 }
 
@@ -301,168 +341,15 @@ function indexRange(start: number, count: number): number[] {
 
 /*
  * ---------------------------------------------------------------------------
- * Outbound observation
+ * The bridge
  *
- * One spy, two behaviours: record a frame, or refuse to clone it. Nothing else
- * in this file calls `window.postMessage`.
+ * Connected once, here, before any case runs: this module instance answers one
+ * handshake request in its life, and this is it. See the file overview.
  * ---------------------------------------------------------------------------
  */
 
-/** Every frame the module posted in the current case, in order. */
-let frames: AgentOutboundMessage[] = [];
-
-/** How many times the module called `window.postMessage`, delivered or not. */
-let postAttempts = 0;
-
-/**
- * Record every frame the module posts.
- *
- * The recorded object is the frame itself rather than a clone, which is what a
- * real `postMessage` would deliver a structured copy of. That is deliberate:
- * these cases assert on the frame the module built, and a clone step here could
- * only lose information (and would throw on exactly the values the module's
- * sanitizer exists to prevent).
- */
-function interceptFrames(): void {
-  vi.spyOn(window, 'postMessage').mockImplementation((message: unknown): void => {
-    postAttempts += 1;
-    frames.push(message as AgentOutboundMessage);
-  });
-}
-
-/**
- * Refuse every frame, as a page whose structured clone fails would.
- *
- * A thrown `postMessage` is the module's `refused` outcome: the frame was
- * rendered and measured, and the host still would not take it. A plain `Error`
- * is thrown rather than a `DOMException`, because the module catches whatever
- * comes out and the distinction would only pin this case to a host detail.
- */
-function refuseFrames(): void {
-  vi.spyOn(window, 'postMessage').mockImplementation((): void => {
-    postAttempts += 1;
-    throw new Error('the page refused to clone the frame');
-  });
-}
-
-/*
- * ---------------------------------------------------------------------------
- * Inbound bridge frames
- * ---------------------------------------------------------------------------
- */
-
-/**
- * The token the module disclosed for this document, or `undefined` before the
- * first {@link subscribe} has minted one.
- *
- * Latched rather than overwritten: two cases create a fresh module instance,
- * whose own offer must not replace the token the rest of the file posts with.
- */
-let offeredToken: string | undefined;
-
-/**
- * The token a {@link HANDSHAKE_OFFER_EVENT} carries, or `undefined` when the
- * event's `detail` is not the bare non-empty string the channel specifies.
- *
- * Read through `unknown` on purpose: `detail` is typed by whoever constructed
- * the event, and a case that asserted on it without narrowing could not tell a
- * missing disclosure from a malformed one.
- *
- * @param event The dispatched offer.
- * @returns The token, or `undefined`.
- */
-function offerDetail(event: Event): string | undefined {
-  const detail: unknown = (event as CustomEvent<unknown>).detail;
-  return typeof detail === 'string' && detail.length > 0 ? detail : undefined;
-}
-
-/*
- * The one module-scope side effect in this file, and it is required rather than
- * convenient: the module's unsolicited offer is dispatched inside the first
- * `subscribe()`, which `beforeEach` performs, so a listener registered any
- * later would have missed it. Registering here is also the order the real
- * extension produces — the bridge's listener exists before it asks — which is
- * what makes this file's token the one a bridge would hold.
- */
-window.addEventListener(HANDSHAKE_OFFER_EVENT, (event: Event) => {
-  offeredToken ??= offerDetail(event);
-});
-
-/**
- * The token every inbound frame must carry, failing loudly when there is none.
- *
- * A missing token is not something a case should be able to pass around as
- * `undefined`: the frame would then be rejected for the very reason the case is
- * trying to assert about, and the failure would read as a guard bug rather than
- * as a handshake that never happened.
- *
- * @returns The disclosed token.
- */
-function issuedToken(): string {
-  if (offeredToken === undefined) {
-    throw new Error('the transport disclosed no handshake token');
-  }
-  return offeredToken;
-}
-
-/**
- * A token of exactly the issued token's length and a different value.
- *
- * The first character is flipped between two hex digits, so the result is the
- * same width, the same alphabet and never equal — which is what makes the
- * rejection attributable to the comparison rather than to the length check
- * that precedes it.
- *
- * @param token The issued token.
- * @returns A wrong token of the same length.
- */
-function alteredToken(token: string): string {
-  return `${token.startsWith('0') ? '1' : '0'}${token.slice(1)}`;
-}
-
-/**
- * Deliver one constructed `message` event to the module's listener.
- *
- * `source: window` is the load-bearing part: the guard drops any frame that did
- * not come from this window, and happy-dom's `window.postMessage` does not set
- * the field at all, so a constructed event is the only way to reach the
- * listener in this host.
- *
- * The frame is passed as a whole record rather than assembled here, so the
- * handshake cases can deliver one with a wrong `token`, with none at all, or at
- * the wrong version — every shape a page script can post.
- *
- * @param data The frame, exactly as it will arrive.
- */
-function deliverFrame(data: Record<string, unknown>): void {
-  window.dispatchEvent(
-    new MessageEvent('message', {
-      data,
-      origin: window.location.origin,
-      source: window,
-    }),
-  );
-}
-
-/**
- * Deliver one well-formed frame from the bridge, through the module's own
- * guard.
- *
- * Carries the handshake token, because that is what the bridge does: a frame
- * without it is dropped, and the cases in this file that are about the queue
- * and the bounds are entitled to a channel that works.
- *
- * @param type The inbound frame type.
- */
-function announceBridge(type: 'bridge.ready' | 'bridge.gone'): void {
-  deliverFrame({
-    source: BRIDGE_SOURCE_TAG,
-    version: CHANNEL_VERSION,
-    type,
-    token: issuedToken(),
-    payload: {},
-  });
-}
+/** The fake bridge, holding this module instance's channel node. */
+const bridge: FakeBridge = connectFakeBridge({ subscribe });
 
 /*
  * ---------------------------------------------------------------------------
@@ -526,23 +413,15 @@ function at<T>(list: readonly T[], index: number, what: string): T {
   return value;
 }
 
-/** Frames of one outbound type, in the order they were posted. */
-function framesOfType(type: AgentOutboundType): AgentOutboundMessage[] {
-  return frames.filter((frame) => frame.type === type);
-}
-
-/** The `telemetry.batch` frames, in order. */
-function batchFrames(): AgentOutboundMessage[] {
-  return framesOfType('telemetry.batch');
-}
-
 /** One batch payload, with the members these cases read. */
 interface BatchView {
+  /** Whether the bridge claimed the frame that carried it. */
+  readonly claimed: boolean;
   /** The payload's own keys, sorted, so an extra one is visible. */
   readonly keys: readonly string[];
   /** The events, each as a record. */
   readonly events: readonly Readonly<Record<string, unknown>>[];
-  /** The count of events lost since the last batch reported one. */
+  /** The count of events lost since the last claimed batch reported one. */
   readonly droppedCount: unknown;
   /** The batch's own sequence number. */
   readonly batchSeq: unknown;
@@ -562,10 +441,11 @@ interface BatchView {
  * @param frame The recorded frame.
  * @returns The payload, narrowed to what the cases read.
  */
-function batchView(frame: AgentOutboundMessage): BatchView {
+function batchView(frame: RecordedAgentFrame): BatchView {
   const payload = asRecord(frame.payload, 'a telemetry.batch payload');
   const events = asList(payload.events, "a telemetry.batch payload's events");
   return {
+    claimed: frame.claimed,
     keys: Object.keys(payload).sort(),
     events: events.map((event, index) => asRecord(event, `event ${String(index)} of a batch`)),
     droppedCount: payload.droppedCount,
@@ -577,14 +457,30 @@ function batchView(frame: AgentOutboundMessage): BatchView {
   };
 }
 
-/** Every batch's view, in posting order. */
-function batchViews(): BatchView[] {
-  return batchFrames().map((frame) => batchView(frame));
+/**
+ * Every **claimed** batch's view, in dispatch order: what was delivered.
+ *
+ * @param source The fake bridge to read; this file's own by default.
+ * @returns The views.
+ */
+function batchViews(source: FakeBridge = bridge): BatchView[] {
+  return source.claimedOfType('telemetry.batch').map((frame) => batchView(frame));
 }
 
-/** Every delivered event, across every batch, in posting order. */
-function deliveredEvents(): Readonly<Record<string, unknown>>[] {
-  return batchViews().flatMap((batch) => [...batch.events]);
+/**
+ * Every **dispatched** batch's view, claimed or not, in dispatch order: what
+ * was attempted.
+ *
+ * @param source The fake bridge to read; this file's own by default.
+ * @returns The views.
+ */
+function dispatchedBatchViews(source: FakeBridge = bridge): BatchView[] {
+  return source.framesOfType('telemetry.batch').map((frame) => batchView(frame));
+}
+
+/** Every delivered event, across every claimed batch, in dispatch order. */
+function deliveredEvents(source: FakeBridge = bridge): Readonly<Record<string, unknown>>[] {
+  return batchViews(source).flatMap((batch) => [...batch.events]);
 }
 
 /**
@@ -606,9 +502,14 @@ function orderOf(event: Readonly<Record<string, unknown>>): number {
   return order;
 }
 
+/** The emission indices of one batch's events, in order. */
+function batchOrder(batch: BatchView): number[] {
+  return batch.events.map((event) => orderOf(event));
+}
+
 /** The emission indices of every delivered event, in delivery order. */
-function deliveredOrder(): number[] {
-  return deliveredEvents().map((event) => orderOf(event));
+function deliveredOrder(source: FakeBridge = bridge): number[] {
+  return deliveredEvents(source).map((event) => orderOf(event));
 }
 
 /**
@@ -626,8 +527,8 @@ function seqOf(event: Readonly<Record<string, unknown>>): number {
 }
 
 /** The sequence numbers of every delivered event, in delivery order. */
-function deliveredSeqs(): number[] {
-  return deliveredEvents().map((event) => seqOf(event));
+function deliveredSeqs(source: FakeBridge = bridge): number[] {
+  return deliveredEvents(source).map((event) => seqOf(event));
 }
 
 /** The shape of a run of numbers, as the ordering cases assert on it. */
@@ -651,6 +552,9 @@ interface RunShape {
  * `gaps` is what makes the sequence cases legible: the module deliberately does
  * not renumber `seq` when the ring evicts an event, so the numbers that are
  * *absent* are the assertion, and naming them beats asserting a literal list.
+ * `increasing` is what makes the custody cases legible: a requeued batch that
+ * was delivered twice, or behind the events queued after it, is a run that
+ * stops increasing.
  *
  * @param values The run, in delivery order.
  * @returns Its shape.
@@ -691,9 +595,15 @@ function contiguousRun(first: number, count: number): RunShape {
   };
 }
 
-/** The length of a frame's JSON rendering, the measure the module's cap uses. */
-function measuredLength(frame: AgentOutboundMessage): number {
-  return JSON.stringify(frame).length;
+/**
+ * The top-level keys of a dispatched frame's `detail`, sorted.
+ *
+ * @param frame The recorded frame.
+ * @returns The keys the JSON carried.
+ */
+function detailKeys(frame: RecordedAgentFrame): string[] {
+  const parsed: unknown = JSON.parse(frame.detail);
+  return Object.keys(asRecord(parsed, 'a dispatched detail')).sort();
 }
 
 /*
@@ -717,16 +627,115 @@ async function nextTurn(): Promise<void> {
  * "one turn" is not a number a case may assume. The bound is what keeps a drain
  * that never arrives a failed assertion rather than a hung suite.
  *
+ * @param stats The module instance's stats reader.
  * @returns How many turns were spent.
  */
-async function drainToCompletion(): Promise<number> {
+async function drainToCompletion(
+  stats: () => { readonly buffered: number } = getTransportStats,
+): Promise<number> {
   for (let turn = 1; turn <= MAX_WAITED_TURNS; turn += 1) {
     await nextTurn();
-    if (getTransportStats().buffered === 0) {
+    if (stats().buffered === 0) {
       return turn;
     }
   }
   return MAX_WAITED_TURNS;
+}
+
+/**
+ * Yield macrotasks until a page listener has seen `expected` messages, or the
+ * patience runs out.
+ *
+ * `window.postMessage` delivers on a later task, so a case asserting that a
+ * posted forgery was *ignored* first has to know it *arrived*; otherwise the
+ * assertion would pass on a message that was still in flight.
+ *
+ * @param seen How many messages the page listener has seen so far.
+ * @param expected How many the case posted.
+ * @returns How many had arrived when the wait ended.
+ */
+async function waitForPageMessages(seen: () => number, expected: number): Promise<number> {
+  for (let turn = 0; turn < MAX_WAITED_TURNS && seen() < expected; turn += 1) {
+    await nextTurn();
+  }
+  return seen();
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * Fresh module instances
+ * ---------------------------------------------------------------------------
+ */
+
+/** A module namespace of the transport, from whichever evaluation. */
+type TransportModule = typeof import('./transport.js');
+
+/**
+ * A fresh evaluation of the module under test, with an unspent handshake.
+ *
+ * The node and the answered-a-request latch are document-scoped and cleared by
+ * nothing — that is the lifetime a second capture on one document depends
+ * on — so a case that needs an *unspent* handshake cannot get one by
+ * resetting. A fresh instance is the only way, and this module supports it
+ * because it has no import-time side effects: the new evaluation installs
+ * nothing until it is subscribed to. The caller resets it in a `finally`.
+ *
+ * @returns The fresh module namespace.
+ */
+async function freshTransport(): Promise<TransportModule> {
+  vi.resetModules();
+  return import('./transport.js');
+}
+
+/** A fresh module instance whose frame constructor the page broke. */
+interface RefusingChannel {
+  /** The instance. */
+  readonly transport: TransportModule;
+  /** A fake bridge connected to it. */
+  readonly bridge: FakeBridge;
+  /** How many agent frames it tried to construct. */
+  readonly attempts: () => number;
+}
+
+/**
+ * A fresh module instance evaluated while `CustomEvent` refused to construct an
+ * agent frame, connected to a fake bridge of its own.
+ *
+ * The product's `refused` outcome: the frame was rendered and measured, and
+ * the platform would still not carry it. The stub is global only for the
+ * instant the fresh instance captures its constructors, and a subclass of the
+ * real constructor so the captured `detail` getter is still found; every other
+ * event type, and every event after the import, is built as usual.
+ *
+ * @returns The instance, its bridge and its attempt count.
+ */
+async function refusingChannel(): Promise<RefusingChannel> {
+  const NativeCustomEvent = CustomEvent;
+  let attempts = 0;
+
+  class RefusingCustomEvent<T> extends NativeCustomEvent<T> {
+    constructor(type: string, init?: CustomEventInit<T>) {
+      if (type === AGENT_FRAME_EVENT) {
+        attempts += 1;
+        throw new Error('the page refused to construct the frame');
+      }
+      super(type, init);
+    }
+  }
+
+  vi.stubGlobal('CustomEvent', RefusingCustomEvent);
+  let transport: TransportModule;
+  try {
+    transport = await freshTransport();
+  } finally {
+    vi.unstubAllGlobals();
+  }
+
+  return {
+    transport,
+    bridge: connectFakeBridge(transport),
+    attempts: () => attempts,
+  };
 }
 
 /*
@@ -740,10 +749,9 @@ let unsubscribe: (() => void) | undefined;
 
 beforeEach(() => {
   resetTransport();
-  frames = [];
-  postAttempts = 0;
-  // The `message` listener exists only while something is subscribed, and every
-  // case delivers at least the bridge's own frames through it.
+  bridge.clear();
+  // The node's frame listener exists only while something is subscribed, and
+  // every case sends at least the bridge's own frames through it.
   unsubscribe = subscribe(() => undefined);
   configureTransport({ sessionId: SESSION_ID, captureId: CAPTURE_A, enabled: true });
 });
@@ -754,6 +762,7 @@ afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
   resetTransport();
+  bridge.clear();
 });
 
 /*
@@ -764,15 +773,13 @@ afterEach(() => {
 
 describe('MAX_EVENTS_PER_BATCH', () => {
   beforeEach(() => {
-    interceptFrames();
-    announceBridge('bridge.ready');
+    bridge.send('bridge.ready');
   });
 
   it('holds a burst one event short of the threshold', () => {
     emitRange(MAX_EVENTS_PER_BATCH - 1);
 
-    expect(frames).toHaveLength(0);
-    expect(postAttempts).toBe(0);
+    expect(bridge.frames).toHaveLength(0);
     expect(getTransportStats()).toMatchObject({
       buffered: MAX_EVENTS_PER_BATCH - 1,
       sent: 0,
@@ -782,21 +789,20 @@ describe('MAX_EVENTS_PER_BATCH', () => {
     });
   });
 
-  it('schedules the batch that reaches the threshold instead of posting it inline', async () => {
+  it('schedules the batch that reaches the threshold instead of dispatching it inline', async () => {
     emitRange(MAX_EVENTS_PER_BATCH);
 
     // The producer's stack is the thing being protected: the event that filled
     // the batch must not have paid for serialising it.
-    expect(frames).toHaveLength(0);
-    expect(postAttempts).toBe(0);
+    expect(bridge.frames).toHaveLength(0);
     expect(getTransportStats().buffered).toBe(MAX_EVENTS_PER_BATCH);
 
     await drainToCompletion();
 
     const batches = batchViews();
     expect(batches).toHaveLength(1);
-    expect(at(batches, 0, 'the posted batches').events).toHaveLength(MAX_EVENTS_PER_BATCH);
-    expect(postAttempts).toBe(1);
+    expect(at(batches, 0, 'the claimed batches').events).toHaveLength(MAX_EVENTS_PER_BATCH);
+    expect(bridge.frames).toHaveLength(1);
     expect(deliveredOrder()).toEqual(indexRange(0, MAX_EVENTS_PER_BATCH));
     expect(getTransportStats()).toMatchObject({
       buffered: 0,
@@ -806,11 +812,11 @@ describe('MAX_EVENTS_PER_BATCH', () => {
     });
   });
 
-  it('posts one full batch and the remainder, in emission order, one event over', async () => {
+  it('dispatches one full batch and the remainder, in emission order, one event over', async () => {
     const total = MAX_EVENTS_PER_BATCH + 1;
     emitRange(total);
 
-    expect(frames).toHaveLength(0);
+    expect(bridge.frames).toHaveLength(0);
     expect(getTransportStats().buffered).toBe(total);
 
     await drainToCompletion();
@@ -837,16 +843,12 @@ describe('MAX_EVENTS_PER_BATCH', () => {
  * The buffer cap
  *
  * Every case here runs with the bridge away, which is the state AAP §0.5.5
- * describes: nothing is posted, nothing is scheduled, and the ring is the only
- * thing between a render storm and the page's memory.
+ * describes: nothing is dispatched, nothing is scheduled, and the ring is the
+ * only thing between a render storm and the page's memory.
  * ---------------------------------------------------------------------------
  */
 
 describe('MAX_BUFFERED_EVENTS with the bridge away', () => {
-  beforeEach(() => {
-    interceptFrames();
-  });
-
   it('buffers a burst one event short of the cap without dropping anything', () => {
     emitRange(MAX_BUFFERED_EVENTS - 1);
 
@@ -856,7 +858,7 @@ describe('MAX_BUFFERED_EVENTS with the bridge away', () => {
       sent: 0,
       bridgeReady: false,
     });
-    expect(frames).toHaveLength(0);
+    expect(bridge.frames).toHaveLength(0);
   });
 
   it('buffers exactly the cap without dropping anything', () => {
@@ -867,7 +869,7 @@ describe('MAX_BUFFERED_EVENTS with the bridge away', () => {
       dropped: 0,
       sent: 0,
     });
-    expect(frames).toHaveLength(0);
+    expect(bridge.frames).toHaveLength(0);
   });
 
   it('evicts exactly the oldest event for the one that goes over the cap', async () => {
@@ -875,12 +877,13 @@ describe('MAX_BUFFERED_EVENTS with the bridge away', () => {
 
     expect(getTransportStats()).toMatchObject({ buffered: MAX_BUFFERED_EVENTS, dropped: 1 });
 
-    announceBridge('bridge.ready');
+    expect(bridge.send('bridge.ready')).toBe(true);
 
     // Recovery starts in the handler and is bounded there like every other
-    // non-terminal drain: a full queue is twenty-five batches, and posting all
-    // of them in one `message` handler would be the long task the scheduled
-    // drain exists to avoid. The rest arrives on the turns that follow.
+    // non-terminal drain: a full queue is twenty-five batches, and dispatching
+    // all of them inside the bridge's one dispatch would be the long task the
+    // scheduled drain exists to avoid. The rest arrives on the turns that
+    // follow.
     expect(batchViews()).toHaveLength(MAX_BATCHES_PER_DRAIN);
     expect(getTransportStats().buffered).toBe(
       MAX_BUFFERED_EVENTS - MAX_BATCHES_PER_DRAIN * MAX_EVENTS_PER_BATCH,
@@ -906,7 +909,7 @@ describe('MAX_BUFFERED_EVENTS with the bridge away', () => {
       dropped: overflow,
     });
 
-    announceBridge('bridge.ready');
+    bridge.send('bridge.ready');
     await drainToCompletion();
 
     expect(runShapeOf(deliveredOrder())).toEqual(contiguousRun(overflow, MAX_BUFFERED_EVENTS));
@@ -916,7 +919,7 @@ describe('MAX_BUFFERED_EVENTS with the bridge away', () => {
   it('reports the accumulated loss on exactly one batch and then starts a fresh count', async () => {
     const overflow = 137;
     emitRange(MAX_BUFFERED_EVENTS + overflow);
-    announceBridge('bridge.ready');
+    bridge.send('bridge.ready');
     await drainToCompletion();
 
     const reported = batchViews().map((batch) => batch.droppedCount);
@@ -930,7 +933,7 @@ describe('MAX_BUFFERED_EVENTS with the bridge away', () => {
     // nothing was lost, because nothing was lost since the last one.
     expect(getTransportStats().dropped).toBe(overflow);
 
-    frames = [];
+    bridge.clear();
     emitRange(1, MAX_BUFFERED_EVENTS + overflow);
     flush();
 
@@ -948,22 +951,18 @@ describe('MAX_BUFFERED_EVENTS with the bridge away', () => {
  */
 
 describe('stable order and stamping', () => {
-  beforeEach(() => {
-    interceptFrames();
-  });
-
   it('leaves a gap in seq exactly where the ring dropped events', async () => {
-    announceBridge('bridge.ready');
+    bridge.send('bridge.ready');
     emitRange(MAX_EVENTS_PER_BATCH);
     flush();
 
     // The bridge goes away with the sequence part-used, so the events the ring
     // evicts are in the middle of the run rather than at its start.
-    announceBridge('bridge.gone');
+    bridge.send('bridge.gone');
     emitRange(MAX_BUFFERED_EVENTS + 1, MAX_EVENTS_PER_BATCH);
     expect(getTransportStats().dropped).toBe(1);
 
-    announceBridge('bridge.ready');
+    bridge.send('bridge.ready');
     await drainToCompletion();
 
     const seqs = deliveredSeqs();
@@ -980,7 +979,7 @@ describe('stable order and stamping', () => {
   });
 
   it('stamps every event with the browser tier and this document\u2019s producer id', async () => {
-    announceBridge('bridge.ready');
+    bridge.send('bridge.ready');
     emitRange(MAX_EVENTS_PER_BATCH + 1);
     await drainToCompletion();
 
@@ -1007,7 +1006,7 @@ describe('stable order and stamping', () => {
   });
 
   it('keeps a whole commit\u2019s drafts together and in order', () => {
-    announceBridge('bridge.ready');
+    bridge.send('bridge.ready');
     emitMany(indexRange(0, MAX_EVENTS_PER_BATCH).map((index) => renderDraft(index)));
     flush();
 
@@ -1023,14 +1022,13 @@ describe('stable order and stamping', () => {
  */
 
 describe('MAX_BATCHES_PER_DRAIN', () => {
-  it('posts at most the bound in one scheduled turn and reschedules the rest', async () => {
+  it('dispatches at most the bound in one scheduled turn and reschedules the rest', async () => {
     // The microtask fallback runs the same drain body as the channel route and
     // is the only route whose turn boundary a probe can sit on. `beforeEach`
     // has already closed any cached channel, so stubbing it away here is enough
     // to take that route for the whole case.
     vi.stubGlobal('MessageChannel', undefined);
-    interceptFrames();
-    announceBridge('bridge.ready');
+    bridge.send('bridge.ready');
 
     const extraBatches = 2;
     const total = MAX_EVENTS_PER_BATCH * (MAX_BATCHES_PER_DRAIN + extraBatches);
@@ -1042,11 +1040,11 @@ describe('MAX_BATCHES_PER_DRAIN', () => {
     // continuation that drain will schedule for itself, because microtasks run
     // in the order they were queued.
     queueMicrotask(() => {
-      batchesAfterOneTurn = batchFrames().length;
+      batchesAfterOneTurn = batchViews().length;
       bufferedAfterOneTurn = getTransportStats().buffered;
     });
 
-    expect(frames).toHaveLength(0);
+    expect(bridge.frames).toHaveLength(0);
 
     await nextTurn();
 
@@ -1055,51 +1053,48 @@ describe('MAX_BATCHES_PER_DRAIN', () => {
 
     await drainToCompletion();
 
-    expect(batchFrames()).toHaveLength(MAX_BATCHES_PER_DRAIN + extraBatches);
+    expect(batchViews()).toHaveLength(MAX_BATCHES_PER_DRAIN + extraBatches);
     expect(deliveredOrder()).toEqual(indexRange(0, total));
     expect(getTransportStats()).toMatchObject({ buffered: 0, sent: total });
   });
 
   it('bounds the drain that recovers a queue the bridge was away for', async () => {
-    interceptFrames();
-
     // The Manifest V3 case: the service worker suspended, the bridge said it
     // was gone, and the queue filled while it was. Recovery is not a terminal
     // moment — the page is still there and there will be more turns — so it
     // gets the same per-turn bound as the threshold path, and the assertion
     // below needs no probe: the bound is observable at the synchronous return
-    // of the `message` handler that delivered `bridge.ready`.
+    // of the bridge's dispatch of `bridge.ready`.
     const extraBatches = 3;
     const total = MAX_EVENTS_PER_BATCH * (MAX_BATCHES_PER_DRAIN + extraBatches);
     emitRange(total);
     expect(getTransportStats()).toMatchObject({ buffered: total, bridgeReady: false });
-    expect(frames).toHaveLength(0);
+    expect(bridge.frames).toHaveLength(0);
 
-    announceBridge('bridge.ready');
+    bridge.send('bridge.ready');
 
-    expect(batchFrames()).toHaveLength(MAX_BATCHES_PER_DRAIN);
+    expect(batchViews()).toHaveLength(MAX_BATCHES_PER_DRAIN);
     expect(getTransportStats().buffered).toBe(MAX_EVENTS_PER_BATCH * extraBatches);
 
     await drainToCompletion();
 
-    expect(batchFrames()).toHaveLength(MAX_BATCHES_PER_DRAIN + extraBatches);
+    expect(batchViews()).toHaveLength(MAX_BATCHES_PER_DRAIN + extraBatches);
     expect(deliveredOrder()).toEqual(indexRange(0, total));
     expect(getTransportStats()).toMatchObject({ buffered: 0, sent: total, dropped: 0 });
   });
 
   it('empties a queue deeper than the bound in one synchronous flush', () => {
-    interceptFrames();
-    announceBridge('bridge.ready');
+    bridge.send('bridge.ready');
 
     const total = MAX_EVENTS_PER_BATCH * (MAX_BATCHES_PER_DRAIN + 2);
     emitRange(total);
-    expect(frames).toHaveLength(0);
+    expect(bridge.frames).toHaveLength(0);
 
     flush();
 
     // `pagehide` has no later turn to rely on, so `flush` is unbounded by
-    // design: everything is on the wire when it returns.
-    expect(batchFrames()).toHaveLength(MAX_BATCHES_PER_DRAIN + 2);
+    // design: everything is in the bridge's custody when it returns.
+    expect(batchViews()).toHaveLength(MAX_BATCHES_PER_DRAIN + 2);
     expect(getTransportStats()).toMatchObject({ buffered: 0, sent: total });
     expect(deliveredOrder()).toEqual(indexRange(0, total));
   });
@@ -1112,41 +1107,54 @@ describe('MAX_BATCHES_PER_DRAIN', () => {
  */
 
 describe('failing and partial sends', () => {
-  it('drops a refused batch whole, counts it, and does not split it', () => {
-    refuseFrames();
-    announceBridge('bridge.ready');
-    emitRange(MAX_EVENTS_PER_BATCH);
+  it('drops a refused batch whole, counts it, and does not split it', async () => {
+    const refusing = await refusingChannel();
+    const { transport } = refusing;
+    const stop = transport.subscribe(() => undefined);
 
-    flush();
+    try {
+      transport.configureTransport({ sessionId: SESSION_ID, captureId: CAPTURE_A, enabled: true });
+      expect(refusing.bridge.send('bridge.ready')).toBe(true);
+      for (let index = 0; index < MAX_EVENTS_PER_BATCH; index += 1) {
+        transport.emit(renderDraft(index));
+      }
 
-    // One attempt, not nine: a frame the page refused to clone would fail the
-    // same way in halves, so halving it would only multiply the cost.
-    expect(postAttempts).toBe(1);
-    expect(getTransportStats()).toMatchObject({
-      buffered: 0,
-      sent: 0,
-      batches: 0,
-      dropped: MAX_EVENTS_PER_BATCH,
-      serializationFailures: MAX_EVENTS_PER_BATCH,
-    });
+      transport.flush();
+
+      // One attempt, not nine: a frame the platform refused to construct would
+      // fail the same way in halves, so halving it would only multiply the
+      // cost. And it is dropped, not requeued: a refusal is not a bridge that
+      // might come back.
+      expect(refusing.attempts()).toBe(1);
+      expect(refusing.bridge.frames).toHaveLength(0);
+      expect(transport.getTransportStats()).toMatchObject({
+        buffered: 0,
+        sent: 0,
+        batches: 0,
+        dropped: MAX_EVENTS_PER_BATCH,
+        serializationFailures: MAX_EVENTS_PER_BATCH,
+        bridgeReady: true,
+      });
+    } finally {
+      stop();
+      transport.resetTransport();
+    }
   });
 
   it('halves an oversize batch until it fits', () => {
-    interceptFrames();
-    announceBridge('bridge.ready');
-
-    const filler = 'x'.repeat(OVERSIZE_BATCH_FILLER);
-    for (let index = 0; index < OVERSIZE_BATCH_EVENTS; index += 1) {
-      emit(renderDraft(index, { attributes: { [FILLER_ATTRIBUTE]: filler } }));
-    }
+    bridge.send('bridge.ready');
+    emitOversizeRun(emit);
 
     flush();
 
     const sizes = batchViews().map((batch) => batch.events.length);
     expect(sizes).toEqual([OVERSIZE_BATCH_EVENTS / 2, OVERSIZE_BATCH_EVENTS / 2]);
     expect(deliveredOrder()).toEqual(indexRange(0, OVERSIZE_BATCH_EVENTS));
-    for (const frame of frames) {
-      expect(measuredLength(frame)).toBeLessThanOrEqual(MAX_MESSAGE_BYTES);
+    // Only the halves were dispatched: the whole batch was measured and never
+    // left the page.
+    expect(bridge.frames).toHaveLength(2);
+    for (const frame of bridge.frames) {
+      expect(frame.detail.length).toBeLessThanOrEqual(MAX_MESSAGE_BYTES);
     }
     expect(getTransportStats()).toMatchObject({
       sent: OVERSIZE_BATCH_EVENTS,
@@ -1156,8 +1164,7 @@ describe('failing and partial sends', () => {
   });
 
   it('drops a single unpostable event alone and still delivers its neighbours', () => {
-    interceptFrames();
-    announceBridge('bridge.ready');
+    bridge.send('bridge.ready');
 
     const tooLarge = 'x'.repeat(MAX_MESSAGE_BYTES + 1);
     emit(renderDraft(0));
@@ -1174,12 +1181,9 @@ describe('failing and partial sends', () => {
       buffered: 0,
     });
 
-    const diagnostics = framesOfType('agent.error');
+    const diagnostics = bridge.framesOfType('agent.error');
     expect(diagnostics).toHaveLength(1);
-    const diagnostic = asRecord(
-      at(diagnostics, 0, 'the posted diagnostics').payload,
-      'the diagnostic payload',
-    );
+    const diagnostic = at(diagnostics, 0, 'the dispatched diagnostics').payload;
     // The event's identity and nothing of its content: the attributes are what
     // made it too large, so quoting any of them would be a second copy of the
     // problem.
@@ -1188,6 +1192,33 @@ describe('failing and partial sends', () => {
     expect(diagnostic.kind).toBe(EVENT_KIND);
     expect(diagnostic.limitBytes).toBe(MAX_MESSAGE_BYTES);
     expect(typeof diagnostic.eventId).toBe('string');
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The wire
+ * ---------------------------------------------------------------------------
+ */
+
+describe('the frames the agent dispatches', () => {
+  it('dispatches every frame on the node as a cancelable, non-bubbling JSON string', () => {
+    bridge.send('bridge.ready');
+    emitRange(2);
+    flush();
+    postControl('agent.ready', { url: PAGE_URL });
+
+    const types = bridge.frames.map((frame) => frame.type);
+    expect(types).toEqual(['telemetry.batch', 'agent.ready']);
+    for (const frame of bridge.frames) {
+      expect(frame.cancelable).toBe(true);
+      expect(frame.bubbles).toBe(false);
+      expect(frame.source).toBe(AGENT_SOURCE_TAG);
+      expect(frame.version).toBe(CHANNEL_VERSION);
+      // Exactly the four fields: no token, no origin, nothing a v2 frame had.
+      expect(detailKeys(frame)).toEqual(['payload', 'source', 'type', 'version']);
+      expect(frame.detail.length).toBeLessThanOrEqual(MAX_MESSAGE_BYTES);
+    }
   });
 });
 
@@ -1221,7 +1252,6 @@ function oversizeControlPayload(): Record<string, unknown> {
 
 describe('control frames', () => {
   it('refuses an oversize control frame and reports it with one fixed-size frame', () => {
-    interceptFrames();
     const payload = oversizeControlPayload();
     // A self-checking fixture: the case is meaningless if the payload is not
     // actually over the cap.
@@ -1229,12 +1259,13 @@ describe('control frames', () => {
 
     postControl('agent.ready', payload);
 
-    expect(frames).toHaveLength(1);
-    const frame = at(frames, 0, 'the posted frames');
+    expect(bridge.frames).toHaveLength(1);
+    const frame = at(bridge.frames, 0, 'the dispatched frames');
     expect(frame.type).toBe('agent.error');
     expect(frame.source).toBe(AGENT_SOURCE_TAG);
-    expect(measuredLength(frame)).toBeLessThanOrEqual(MAX_MESSAGE_BYTES);
-    expect(asRecord(frame.payload, 'the diagnostic payload')).toEqual({
+    expect(frame.claimed).toBe(true);
+    expect(frame.detail.length).toBeLessThanOrEqual(MAX_MESSAGE_BYTES);
+    expect(frame.payload).toEqual({
       reason: 'control-frame-too-large',
       frame: 'agent.ready',
       limitBytes: MAX_MESSAGE_BYTES,
@@ -1246,30 +1277,70 @@ describe('control frames', () => {
     });
   });
 
-  it('does not recurse when the channel refuses the diagnostic as well', () => {
-    refuseFrames();
+  it('counts an unclaimed control frame and reports nothing about it', () => {
+    bridge.claim = false;
+
+    postControl('agent.ready', { url: PAGE_URL });
+
+    // Dispatched once and not taken — the bridge's port was gone. A control
+    // frame is a statement about a moment and is never retried; reporting its
+    // loss on the channel that just failed to carry it would only lose a
+    // second frame.
+    expect(bridge.frames.map((frame) => [frame.type, frame.claimed])).toEqual([
+      ['agent.ready', false],
+    ]);
+    expect(bridge.framesOfType('agent.error')).toHaveLength(0);
+    expect(getTransportStats()).toMatchObject({ controlFramesDropped: 1, dropped: 0 });
+  });
+
+  it('counts an oversize control frame whose diagnostic nobody claims, and stops there', () => {
+    bridge.claim = false;
 
     postControl('agent.ready', oversizeControlPayload());
 
-    // Exactly one attempt: the refused frame was never posted (it was measured
-    // and rejected first), and the diagnostic that replaced it is not reported
-    // again when it fails — it is only counted. Two frames the channel would
-    // not take, one attempt, no recursion.
-    expect(postAttempts).toBe(1);
+    // The oversize frame is never dispatched; the diagnostic is, once, and its
+    // loss is counted rather than reported again.
+    expect(bridge.frames.map((frame) => [frame.type, frame.claimed])).toEqual([
+      ['agent.error', false],
+    ]);
     expect(getTransportStats().controlFramesDropped).toBe(2);
   });
 
-  it('reports a refused control frame once and attempts nothing further', () => {
-    refuseFrames();
+  it('does not recurse when the channel refuses the diagnostic as well', async () => {
+    const refusing = await refusingChannel();
+    const { transport } = refusing;
 
-    postControl('agent.ready', { url: 'https://example.invalid/page' });
+    try {
+      transport.postControl('agent.ready', oversizeControlPayload());
 
-    expect(postAttempts).toBe(1);
-    expect(getTransportStats().controlFramesDropped).toBe(1);
+      // Exactly one attempt: the oversize frame was measured and rejected
+      // before construction, and the diagnostic that replaced it is not
+      // reported again when it fails — it is only counted. Two frames the
+      // channel would not take, one attempt, no recursion.
+      expect(refusing.attempts()).toBe(1);
+      expect(refusing.bridge.frames).toHaveLength(0);
+      expect(transport.getTransportStats().controlFramesDropped).toBe(2);
+    } finally {
+      transport.resetTransport();
+    }
+  });
+
+  it('reports a refused control frame once and attempts nothing further', async () => {
+    const refusing = await refusingChannel();
+    const { transport } = refusing;
+
+    try {
+      transport.postControl('agent.ready', { url: PAGE_URL });
+
+      expect(refusing.attempts()).toBe(1);
+      expect(refusing.bridge.frames).toHaveLength(0);
+      expect(transport.getTransportStats().controlFramesDropped).toBe(1);
+    } finally {
+      transport.resetTransport();
+    }
   });
 
   it('bounds control text at the limit and truncates one character over it', () => {
-    interceptFrames();
     const atLimit = 'u'.repeat(MAX_CONTROL_TEXT_LENGTH);
     const overLimit = 'u'.repeat(MAX_CONTROL_TEXT_LENGTH + 1);
 
@@ -1278,16 +1349,442 @@ describe('control frames', () => {
 
     postControl('agent.ready', { url: overLimit });
 
-    const payload = asRecord(
-      at(frames, 0, 'the posted frames').payload,
-      'the control frame payload',
-    );
-    const url = payload.url;
+    const url = at(bridge.frames, 0, 'the dispatched frames').payload.url;
     if (typeof url !== 'string') {
       throw new Error('the control frame carried no url string');
     }
     expect(url).toHaveLength(MAX_CONTROL_TEXT_LENGTH);
     expect(getTransportStats().controlFramesDropped).toBe(0);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Custody
+ *
+ * A batch leaves the page only when the bridge claims it. Every case below
+ * varies one thing — whether, and which, frame the bridge takes — and asserts
+ * the four quantities custody keeps honest: what is still queued, what was
+ * counted as sent, the `batchSeq` the next claimed batch carries, and the
+ * `droppedCount` it reports.
+ * ---------------------------------------------------------------------------
+ */
+
+describe('custody of a batch', () => {
+  it('lets a claimed batch leave the queue and advances the batch sequence', () => {
+    bridge.send('bridge.ready');
+    emitRange(3);
+    flush();
+    emitRange(2, 3);
+    flush();
+
+    expect(dispatchedBatchViews().map((batch) => [batch.batchSeq, batch.claimed])).toEqual([
+      [0, true],
+      [1, true],
+    ]);
+    expect(deliveredOrder()).toEqual(indexRange(0, 5));
+    expect(getTransportStats()).toMatchObject({ buffered: 0, sent: 5, batches: 2, dropped: 0 });
+  });
+
+  it('requeues an unclaimed batch in order, marks the bridge away and moves no counter', () => {
+    bridge.send('bridge.ready');
+    emitRange(5);
+    bridge.claim = false;
+
+    flush();
+
+    const attempted = dispatchedBatchViews();
+    expect(attempted).toHaveLength(1);
+    const unclaimed = at(attempted, 0, 'the dispatched batches');
+    expect(unclaimed).toMatchObject({ claimed: false, batchSeq: 0, droppedCount: 0 });
+    expect(batchOrder(unclaimed)).toEqual(indexRange(0, 5));
+    expect(getTransportStats()).toMatchObject({
+      buffered: 5,
+      sent: 0,
+      batches: 0,
+      dropped: 0,
+      bridgeReady: false,
+    });
+
+    // The bridge is away now, so nothing more is dispatched into a channel
+    // with nobody at the other end: a flush keeps the queue.
+    emitRange(2, 5);
+    flush();
+    expect(bridge.frames).toHaveLength(1);
+    expect(getTransportStats().buffered).toBe(7);
+  });
+
+  it('delivers a requeued batch after the next bridge.ready, once, under the same batchSeq', () => {
+    bridge.send('bridge.ready');
+    emitRange(5);
+    bridge.claim = false;
+    flush();
+    emitRange(2, 5);
+
+    bridge.claim = true;
+    expect(bridge.send('bridge.ready')).toBe(true);
+
+    // The retry is the batch the bridge missed plus what was queued behind it,
+    // under the `batchSeq` the missed one carried: the service sees no gap in
+    // the batch sequence and no event twice.
+    const delivered = batchViews();
+    expect(delivered).toHaveLength(1);
+    expect(at(delivered, 0, 'the claimed batches')).toMatchObject({
+      batchSeq: 0,
+      droppedCount: 0,
+    });
+    expect(deliveredOrder()).toEqual(indexRange(0, 7));
+    expect(runShapeOf(deliveredSeqs())).toEqual(contiguousRun(0, 7));
+    expect(new Set(deliveredEvents().map((event) => event.id)).size).toBe(7);
+    expect(getTransportStats()).toMatchObject({
+      buffered: 0,
+      sent: 7,
+      batches: 1,
+      dropped: 0,
+      bridgeReady: true,
+    });
+  });
+
+  it('carries a pending drop count until a batch reporting it is claimed', async () => {
+    const overflow = 3;
+    emitRange(MAX_BUFFERED_EVENTS + overflow);
+    bridge.claim = false;
+
+    bridge.send('bridge.ready');
+
+    // The recovery drain's first batch reported the loss and nobody took it,
+    // so the loss is still pending: it is not cleared by a frame the bridge
+    // never held.
+    const missed = dispatchedBatchViews();
+    expect(missed).toHaveLength(1);
+    expect(at(missed, 0, 'the dispatched batches')).toMatchObject({
+      claimed: false,
+      droppedCount: overflow,
+      batchSeq: 0,
+    });
+    expect(getTransportStats()).toMatchObject({
+      buffered: MAX_BUFFERED_EVENTS,
+      dropped: overflow,
+      bridgeReady: false,
+    });
+
+    bridge.claim = true;
+    bridge.send('bridge.ready');
+    await drainToCompletion();
+
+    const delivered = batchViews();
+    expect(delivered).toHaveLength(MAX_BUFFERED_EVENTS / MAX_EVENTS_PER_BATCH);
+    expect(delivered.map((batch) => batch.batchSeq)).toEqual(
+      indexRange(0, MAX_BUFFERED_EVENTS / MAX_EVENTS_PER_BATCH),
+    );
+    expect(at(delivered, 0, 'the claimed batches').droppedCount).toBe(overflow);
+    expect(delivered.slice(1).every((batch) => batch.droppedCount === 0)).toBe(true);
+    expect(runShapeOf(deliveredOrder())).toEqual(contiguousRun(overflow, MAX_BUFFERED_EVENTS));
+    expect(getTransportStats()).toMatchObject({ dropped: overflow, sent: MAX_BUFFERED_EVENTS });
+  });
+
+  it('keeps the queue bound when a requeue meets a queue that filled meanwhile', async () => {
+    bridge.send('bridge.ready');
+    emitRange(MAX_EVENTS_PER_BATCH);
+
+    // While the bridge holds the first batch, the page keeps producing — enough
+    // to leave room for only part of that batch when it comes back unclaimed.
+    const room = 50;
+    const produced = MAX_BUFFERED_EVENTS - room;
+    bridge.claim = (frame) => {
+      if (frame.type === 'telemetry.batch' && bridge.framesOfType('telemetry.batch').length === 1) {
+        emitRange(produced, MAX_EVENTS_PER_BATCH);
+      }
+      return false;
+    };
+
+    flush();
+
+    // The oldest events there are — the head of the requeued batch — are the
+    // ones evicted, counted, and reported on the next claimed batch; the rest
+    // keep their place at the front.
+    const evicted = MAX_EVENTS_PER_BATCH - room;
+    expect(getTransportStats()).toMatchObject({
+      buffered: MAX_BUFFERED_EVENTS,
+      dropped: evicted,
+      sent: 0,
+      bridgeReady: false,
+    });
+
+    bridge.claim = true;
+    bridge.send('bridge.ready');
+    await drainToCompletion();
+
+    expect(runShapeOf(deliveredOrder())).toEqual(contiguousRun(evicted, MAX_BUFFERED_EVENTS));
+    const delivered = batchViews();
+    expect(at(delivered, 0, 'the claimed batches')).toMatchObject({
+      batchSeq: 0,
+      droppedCount: evicted,
+    });
+  });
+
+  it('requeues an unclaimed first half together with the half it never dispatched', () => {
+    bridge.send('bridge.ready');
+    emitOversizeRun(emit);
+    bridge.claim = false;
+
+    flush();
+
+    // Halving meets the unclaimed first half and stops: the second half is not
+    // dispatched into a channel that just refused one, and both go back.
+    const attempted = dispatchedBatchViews();
+    expect(attempted.map((batch) => batchOrder(batch))).toEqual([
+      indexRange(0, OVERSIZE_BATCH_EVENTS / 2),
+    ]);
+    expect(getTransportStats()).toMatchObject({
+      buffered: OVERSIZE_BATCH_EVENTS,
+      sent: 0,
+      bridgeReady: false,
+    });
+
+    bridge.claim = true;
+    bridge.send('bridge.ready');
+
+    expect(batchViews().map((batch) => [batch.batchSeq, batchOrder(batch)])).toEqual([
+      [0, indexRange(0, OVERSIZE_BATCH_EVENTS / 2)],
+      [1, indexRange(OVERSIZE_BATCH_EVENTS / 2, OVERSIZE_BATCH_EVENTS / 2)],
+    ]);
+    expect(getTransportStats()).toMatchObject({ buffered: 0, sent: OVERSIZE_BATCH_EVENTS });
+  });
+
+  it('stops a drain at an unclaimed half and puts every later half behind it', () => {
+    bridge.send('bridge.ready');
+    // An oversize run at the head of the queue, then enough small events to
+    // make a second batch: the first batch is halved several times over, and
+    // the queue holds a batch the drain must not reach.
+    emitOversizeRun(emit);
+    const total = MAX_EVENTS_PER_BATCH + OVERSIZE_BATCH_EVENTS;
+    emitRange(total - OVERSIZE_BATCH_EVENTS, OVERSIZE_BATCH_EVENTS);
+
+    // The bridge takes the first frame and its port dies on the second.
+    bridge.claim = () => bridge.frames.length === 1;
+
+    flush();
+
+    const attempted = dispatchedBatchViews();
+    expect(attempted.map((batch) => batch.claimed)).toEqual([true, false]);
+    const first = batchOrder(at(attempted, 0, 'the dispatched batches'));
+    const second = batchOrder(at(attempted, 1, 'the dispatched batches'));
+    expect(first).toEqual(indexRange(0, first.length));
+    expect(second).toEqual(indexRange(first.length, second.length));
+    for (const frame of bridge.frames) {
+      expect(frame.detail.length).toBeLessThanOrEqual(MAX_MESSAGE_BYTES);
+    }
+    expect(getTransportStats()).toMatchObject({
+      buffered: total - first.length,
+      sent: first.length,
+      batches: 1,
+      bridgeReady: false,
+    });
+
+    bridge.claim = true;
+    bridge.send('bridge.ready');
+
+    // Everything after the claimed half arrives, in order, after it: the
+    // unclaimed half first, then the halves it held back, then the batch the
+    // drain never reached — and the sequence carries on from the claimed one.
+    expect(runShapeOf(deliveredOrder())).toEqual(contiguousRun(0, total));
+    const batchSeqs = batchViews().map((batch) => batch.batchSeq);
+    expect(batchSeqs).toEqual(indexRange(0, batchSeqs.length));
+    expect(getTransportStats()).toMatchObject({ buffered: 0, sent: total, dropped: 0 });
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Re-entrancy
+ *
+ * The bridge's listener runs inside the agent's dispatch, and whatever it hands
+ * back is handled inside that same stack. Each case hands back one thing from
+ * inside the first batch's dispatch, through the fake bridge's claim policy.
+ * ---------------------------------------------------------------------------
+ */
+
+describe('frames handed back from inside a dispatch', () => {
+  /**
+   * A claim policy that runs `inside` during the first `telemetry.batch`
+   * dispatch and answers `claimFirst` for it, and claims every later frame.
+   *
+   * @param inside What the bridge does from inside its listener.
+   * @param claimFirst Whether it takes that first batch.
+   * @returns The policy.
+   */
+  function onFirstBatch(inside: () => void, claimFirst: boolean): FakeBridge['claim'] {
+    let done = false;
+    return (frame) => {
+      if (done || frame.type !== 'telemetry.batch') {
+        return true;
+      }
+      done = true;
+      inside();
+      return claimFirst;
+    };
+  }
+
+  it('stops the drain at a bridge.gone and resumes it at the next bridge.ready', () => {
+    bridge.send('bridge.ready');
+    emitRange(MAX_EVENTS_PER_BATCH * 3);
+    bridge.claim = onFirstBatch(() => {
+      bridge.send('bridge.gone');
+    }, true);
+
+    flush();
+
+    // The batch in the bridge's hands was taken; nothing after it was
+    // dispatched into the channel the bridge just said was closed.
+    expect(dispatchedBatchViews()).toHaveLength(1);
+    expect(getTransportStats()).toMatchObject({
+      sent: MAX_EVENTS_PER_BATCH,
+      buffered: MAX_EVENTS_PER_BATCH * 2,
+      bridgeReady: false,
+    });
+
+    bridge.send('bridge.ready');
+
+    expect(batchViews().map((batch) => batch.batchSeq)).toEqual([0, 1, 2]);
+    expect(deliveredOrder()).toEqual(indexRange(0, MAX_EVENTS_PER_BATCH * 3));
+  });
+
+  it('keeps the bridge present when bridge.ready arrives during an unclaimed dispatch', async () => {
+    bridge.send('bridge.ready');
+    emitRange(3);
+    // The bridge's old port refused the batch and its new one announced itself
+    // in the same listener call: a reconnect inside the dispatch.
+    bridge.claim = onFirstBatch(() => {
+      bridge.send('bridge.ready');
+    }, false);
+
+    flush();
+
+    // Not marked away — that would wait for a second `bridge.ready` nobody is
+    // going to send — and the batch is back at the front for the retry the
+    // drain scheduled.
+    expect(getTransportStats()).toMatchObject({ buffered: 3, sent: 0, bridgeReady: true });
+
+    await drainToCompletion();
+
+    expect(dispatchedBatchViews().map((batch) => [batch.batchSeq, batch.claimed])).toEqual([
+      [0, false],
+      [0, true],
+    ]);
+    expect(deliveredOrder()).toEqual([0, 1, 2]);
+    expect(getTransportStats()).toMatchObject({ buffered: 0, sent: 3, batches: 1 });
+  });
+
+  it('leaves a flush requested inside a dispatch to the drain already running', () => {
+    bridge.send('bridge.ready');
+    emitRange(MAX_EVENTS_PER_BATCH * 2);
+    // What `./agent.ts` does on `bridge.ready`: re-announce and flush. A second
+    // drain started here would dispatch the batch queued behind the one still
+    // in the bridge's hands, under the same `batchSeq`.
+    bridge.claim = onFirstBatch(() => {
+      bridge.send('bridge.ready');
+      flush();
+    }, true);
+
+    flush();
+
+    expect(batchViews().map((batch) => batch.batchSeq)).toEqual([0, 1]);
+    expect(deliveredOrder()).toEqual(indexRange(0, MAX_EVENTS_PER_BATCH * 2));
+    expect(getTransportStats()).toMatchObject({ buffered: 0, sent: MAX_EVENTS_PER_BATCH * 2 });
+  });
+
+  it('settles a claimed batch to its own capture when the capture changes under it', () => {
+    bridge.send('bridge.ready');
+    const behind = 5;
+    emitRange(MAX_EVENTS_PER_BATCH + behind);
+    bridge.claim = onFirstBatch(() => {
+      configureTransport({ sessionId: SESSION_ID, captureId: CAPTURE_B, enabled: true });
+    }, true);
+
+    flush();
+
+    // The batch was built for, and claimed under, the capture that ended; the
+    // events queued behind it can no longer be labelled and are counted as
+    // lost, never relabelled.
+    const first = at(batchViews(), 0, 'the claimed batches');
+    expect(first).toMatchObject({ captureId: CAPTURE_A, batchSeq: 0 });
+    expect(getTransportStats()).toMatchObject({
+      sent: MAX_EVENTS_PER_BATCH,
+      batches: 1,
+      dropped: behind,
+      buffered: 0,
+      seq: 0,
+    });
+
+    bridge.clear();
+    emitRange(2);
+    flush();
+
+    const next = at(batchViews(), 0, 'the claimed batches');
+    expect(next).toMatchObject({ captureId: CAPTURE_B, batchSeq: 0, droppedCount: 0 });
+    expect(deliveredSeqs()).toEqual([0, 1]);
+  });
+
+  it('counts an unclaimed batch lost when the capture changes under it', () => {
+    bridge.send('bridge.ready');
+    emitRange(4);
+    bridge.claim = onFirstBatch(() => {
+      configureTransport({ sessionId: SESSION_ID, captureId: CAPTURE_B, enabled: true });
+    }, false);
+
+    flush();
+
+    // Never requeued into the capture that replaced its own, and the channel
+    // fact the refusal stated — nobody is taking frames — still holds.
+    expect(getTransportStats()).toMatchObject({
+      sent: 0,
+      dropped: 4,
+      buffered: 0,
+      bridgeReady: false,
+    });
+
+    bridge.clear();
+    emitRange(2);
+    bridge.send('bridge.ready');
+
+    const next = at(batchViews(), 0, 'the claimed batches');
+    expect(next).toMatchObject({ captureId: CAPTURE_B, batchSeq: 0, droppedCount: 0 });
+    expect(deliveredOrder()).toEqual([0, 1]);
+  });
+
+  it('settles a batch into nothing when the transport is reset under it', () => {
+    bridge.send('bridge.ready');
+    emitRange(3);
+    bridge.claim = onFirstBatch(() => {
+      resetTransport();
+    }, true);
+
+    flush();
+
+    // A reset returns the transport to the state it had before anything was
+    // configured; a batch that predates it must not reappear in the zeroed
+    // counters.
+    expect(bridge.frames).toHaveLength(1);
+    expect(getTransportStats()).toEqual({
+      buffered: 0,
+      dropped: 0,
+      sent: 0,
+      batches: 0,
+      seq: 0,
+      bridgeReady: false,
+      serializationFailures: 0,
+      controlFramesDropped: 0,
+    });
+
+    // And the document's channel survives it: the same node carries the next
+    // capture.
+    unsubscribe = subscribe(() => undefined);
+    configureTransport({ sessionId: SESSION_ID, captureId: CAPTURE_B, enabled: true });
+    expect(bridge.send('bridge.ready')).toBe(true);
+    emitRange(1);
+    flush();
+    expect(at(batchViews(), 1, 'the claimed batches').captureId).toBe(CAPTURE_B);
   });
 });
 
@@ -1299,7 +1796,6 @@ describe('control frames', () => {
 
 describe('a capture change', () => {
   it('discards what the bridge never took, counts it, and restarts the sequence', () => {
-    interceptFrames();
     const abandoned = 5;
     emitRange(abandoned);
     expect(getTransportStats()).toMatchObject({
@@ -1313,87 +1809,129 @@ describe('a capture change', () => {
     // Undeliverable and no longer attributable: counted in the cumulative
     // total, never relabelled onto the capture that replaced theirs.
     expect(getTransportStats()).toMatchObject({ buffered: 0, dropped: abandoned, seq: 0 });
-    expect(frames).toHaveLength(0);
+    expect(bridge.frames).toHaveLength(0);
 
-    announceBridge('bridge.ready');
+    bridge.send('bridge.ready');
     emitRange(2);
     flush();
 
     const batches = batchViews();
     expect(batches).toHaveLength(1);
-    const batch = at(batches, 0, 'the posted batches');
+    const batch = at(batches, 0, 'the claimed batches');
     expect(batch.captureId).toBe(CAPTURE_B);
     expect(batch.batchSeq).toBe(0);
     expect(batch.droppedCount).toBe(0);
     expect(deliveredSeqs()).toEqual([0, 1]);
     expect(getTransportStats().dropped).toBe(abandoned);
   });
+
+  it('discards a batch its own flush dispatched and the bridge did not claim', () => {
+    bridge.send('bridge.ready');
+    const abandoned = 5;
+    emitRange(abandoned);
+    bridge.claim = false;
+
+    configureTransport({ sessionId: SESSION_ID, captureId: CAPTURE_B, enabled: true });
+
+    // The change flushed first, custody put the unclaimed batch back, and the
+    // change then found it still queued: discarded like anything else the
+    // bridge never took.
+    expect(dispatchedBatchViews().map((view) => [view.captureId, view.claimed])).toEqual([
+      [CAPTURE_A, false],
+    ]);
+    expect(getTransportStats()).toMatchObject({
+      buffered: 0,
+      dropped: abandoned,
+      sent: 0,
+      seq: 0,
+      bridgeReady: false,
+    });
+  });
 });
 
 /*
  * ---------------------------------------------------------------------------
- * The handshake
+ * The inbound guard
  *
- * The inbound channel's authentication. Every case below posts a frame the way
- * a page script would — to its own window, on its own origin, with the
- * published source tag and a known frame type — and the only thing that
- * separates an accepted frame from a dropped one is the token.
+ * Every case dispatches on the real channel node — the only place the agent
+ * listens — so what separates an accepted frame from a dropped one is the
+ * frame's own shape, and "dropped" means three observable things: the bridge's
+ * dispatch was not acknowledged, no subscriber was called, and the bridge is
+ * still considered absent with the queued event still queued.
  * ---------------------------------------------------------------------------
  */
 
-/** Every {@link HANDSHAKE_OFFER_EVENT} dispatched while a collector is live. */
-interface OfferCollector {
-  /** The tokens disclosed so far, in dispatch order. */
-  readonly tokens: readonly string[];
-  /** Stop collecting. Idempotent, and called from a `finally`. */
-  readonly stop: () => void;
-}
-
 /**
- * Collect the offers dispatched from now until {@link OfferCollector.stop}.
+ * The `detail` of a well-formed `bridge.ready` padded to an exact length.
  *
- * Separate from the module-scope latch, which keeps only the first offer: a
- * case that drives a fresh module instance needs that instance's disclosures,
- * and needs them counted rather than latched.
- *
- * @returns The collector.
+ * @param length The length the detail must have.
+ * @returns The detail.
  */
-function collectOffers(): OfferCollector {
-  const tokens: string[] = [];
-  const listener = (event: Event): void => {
-    const token = offerDetail(event);
-    if (token !== undefined) {
-      tokens.push(token);
-    }
-  };
-
-  window.addEventListener(HANDSHAKE_OFFER_EVENT, listener);
-  return {
-    tokens,
-    stop: (): void => {
-      window.removeEventListener(HANDSHAKE_OFFER_EVENT, listener);
-    },
-  };
+function paddedReadyDetail(length: number): string {
+  const unpadded = bridgeFrameDetail('bridge.ready', { pad: '' });
+  const padding = length - unpadded.length;
+  if (padding < 0) {
+    throw new Error(`a bridge.ready detail cannot be as short as ${String(length)}`);
+  }
+  return bridgeFrameDetail('bridge.ready', { pad: 'p'.repeat(padding) });
 }
 
-/**
- * A fresh evaluation of the module under test, with a handshake of its own.
- *
- * The token and the answered-a-request latch are document-scoped and cleared by
- * nothing — that is the lifetime a second capture on one document depends
- * on — so a case that needs an *unspent* handshake cannot get one by resetting.
- * A fresh instance is the only way, and this module supports it because it has
- * no import-time side effects: the new evaluation installs nothing until it is
- * subscribed to.
- *
- * @returns The fresh module namespace.
- */
-async function freshTransport(): Promise<typeof import('./transport.js')> {
-  vi.resetModules();
-  return import('./transport.js');
+/** One malformed inbound frame and what makes it so. */
+interface MalformedFrame {
+  /** What is wrong with it, for the case name. */
+  readonly label: string;
+  /** The `detail` the bridge frame carries. */
+  readonly detail: unknown;
 }
 
-describe('the bridge handshake', () => {
+/** Every shape of bridge frame the guard must drop. */
+const MALFORMED_FRAMES: readonly MalformedFrame[] = [
+  { label: 'a frame with no detail', detail: undefined },
+  {
+    label: 'a detail that is an object rather than a string',
+    detail: { source: BRIDGE_SOURCE_TAG, version: CHANNEL_VERSION, type: 'bridge.ready' },
+  },
+  {
+    label: 'a detail one code unit over the cap',
+    detail: paddedReadyDetail(MAX_MESSAGE_BYTES + 1),
+  },
+  { label: 'a detail that is not JSON', detail: '{"source":"debuggen-bridge",' },
+  { label: 'a JSON array', detail: JSON.stringify([BRIDGE_SOURCE_TAG, CHANNEL_VERSION]) },
+  { label: 'a JSON string', detail: JSON.stringify('bridge.ready') },
+  { label: 'JSON null', detail: 'null' },
+  {
+    label: 'the agent\u2019s own source tag',
+    detail: JSON.stringify({
+      source: AGENT_SOURCE_TAG,
+      version: CHANNEL_VERSION,
+      type: 'bridge.ready',
+    }),
+  },
+  {
+    label: 'no source tag',
+    detail: JSON.stringify({ version: CHANNEL_VERSION, type: 'bridge.ready' }),
+  },
+  {
+    label: 'the previous channel version',
+    detail: JSON.stringify({
+      source: BRIDGE_SOURCE_TAG,
+      version: CHANNEL_VERSION - 1,
+      type: 'bridge.ready',
+    }),
+  },
+  {
+    label: 'the version as a string',
+    detail: JSON.stringify({
+      source: BRIDGE_SOURCE_TAG,
+      version: String(CHANNEL_VERSION),
+      type: 'bridge.ready',
+    }),
+  },
+  { label: 'an outbound frame type', detail: bridgeFrameDetail('telemetry.batch') },
+  { label: 'an unknown frame type', detail: bridgeFrameDetail('bridge.unknown') },
+];
+
+describe('the inbound guard', () => {
   /** Frames the module accepted in the current case, in order. */
   let accepted: BridgeInboundMessage[] = [];
 
@@ -1412,214 +1950,512 @@ describe('the bridge handshake', () => {
     stopRecording = undefined;
   });
 
-  it('drops a frame that carries no token', () => {
-    interceptFrames();
-    emitRange(1);
-
-    deliverFrame({
-      source: BRIDGE_SOURCE_TAG,
-      version: CHANNEL_VERSION,
-      type: 'bridge.ready',
-      payload: {},
-    });
-
-    // Dropped in the same silence as any other malformed frame: no subscriber
-    // notified, the bridge still considered absent, and the queued event still
-    // queued — a page script cannot even make the agent flush.
-    expect(accepted).toEqual([]);
-    expect(frames).toEqual([]);
-    expect(getTransportStats()).toMatchObject({ buffered: 1, sent: 0, bridgeReady: false });
-  });
-
-  it('drops a frame whose token is the right length and the wrong value', () => {
-    interceptFrames();
-    const wrong = alteredToken(issuedToken());
-    // Self-checking fixture: a wrong token of a different length would be
-    // rejected by the length check, which is not the comparison under test.
-    expect(wrong).toHaveLength(issuedToken().length);
-    expect(wrong).not.toBe(issuedToken());
-
-    emitRange(1);
-    deliverFrame({
-      source: BRIDGE_SOURCE_TAG,
-      version: CHANNEL_VERSION,
-      type: 'bridge.ready',
-      token: wrong,
-      payload: {},
-    });
-
-    expect(accepted).toEqual([]);
-    expect(getTransportStats()).toMatchObject({ buffered: 1, sent: 0, bridgeReady: false });
-  });
-
-  it('drops a frame at the previous channel version even with the right token', () => {
-    interceptFrames();
-    emitRange(1);
-
-    deliverFrame({
-      source: BRIDGE_SOURCE_TAG,
-      version: CHANNEL_VERSION - 1,
-      type: 'bridge.ready',
-      token: issuedToken(),
-      payload: {},
-    });
-
-    // The version bump is what makes an un-hardened bridge legible enough to
-    // ignore: its frames are refused before the token is even considered.
-    expect(accepted).toEqual([]);
-    expect(getTransportStats()).toMatchObject({ buffered: 1, bridgeReady: false });
-  });
-
-  it('accepts a frame carrying the disclosed token and drains what was queued', () => {
-    interceptFrames();
+  it('accepts a well-formed frame, acknowledges it and drains what was queued', () => {
     emitRange(1);
     expect(getTransportStats()).toMatchObject({ buffered: 1, bridgeReady: false });
 
-    announceBridge('bridge.ready');
+    expect(bridge.send('bridge.ready')).toBe(true);
 
     expect(accepted.map((message) => message.type)).toEqual(['bridge.ready']);
     expect(getTransportStats()).toMatchObject({ buffered: 0, sent: 1, bridgeReady: true });
     expect(deliveredOrder()).toEqual([0]);
   });
 
-  it('hands subscribers a frame with no token on it', () => {
-    interceptFrames();
+  it.each(MALFORMED_FRAMES)('drops $label, unacknowledged', ({ detail }) => {
+    emitRange(1);
 
-    announceBridge('bridge.ready');
+    expect(bridge.sendDetail(detail)).toBe(false);
 
-    const message = at(accepted, 0, 'the accepted frames');
-    // The secret is verified and dropped: a subscriber that echoed its whole
-    // frame into a diagnostic would otherwise publish it to the page.
-    expect(Object.keys(message).sort()).toEqual(['payload', 'source', 'type', 'version']);
-    expect(JSON.stringify(message)).not.toContain(issuedToken());
+    expect(accepted).toEqual([]);
+    expect(bridge.frames).toEqual([]);
+    expect(getTransportStats()).toMatchObject({ buffered: 1, sent: 0, bridgeReady: false });
   });
 
-  it('still accepts the same token after a reset and a fresh subscribe', () => {
-    interceptFrames();
+  it('accepts a detail exactly at the cap', () => {
+    const detail = paddedReadyDetail(MAX_MESSAGE_BYTES);
+    // Self-checking fixture: the boundary case is only one if it is on it.
+    expect(detail).toHaveLength(MAX_MESSAGE_BYTES);
+
+    expect(bridge.sendDetail(detail)).toBe(true);
+    expect(accepted.map((message) => message.type)).toEqual(['bridge.ready']);
+  });
+
+  it('drops a plain Event of the frame type, unacknowledged', () => {
+    const unclaimed = bridge.node.dispatchEvent(
+      new Event(BRIDGE_FRAME_EVENT, { cancelable: true }),
+    );
+
+    expect(unclaimed).toBe(true);
+    expect(accepted).toEqual([]);
+    expect(getTransportStats().bridgeReady).toBe(false);
+  });
+
+  it('hands subscribers only the source, version, type and payload', () => {
+    const detail = JSON.stringify({
+      source: BRIDGE_SOURCE_TAG,
+      version: CHANNEL_VERSION,
+      type: 'bridge.ready',
+      payload: {},
+      token: 'f'.repeat(64),
+      extra: true,
+    });
+
+    expect(bridge.sendDetail(detail)).toBe(true);
+
+    const message = at(accepted, 0, 'the accepted frames');
+    expect(Object.keys(message).sort()).toEqual(['payload', 'source', 'type', 'version']);
+    expect(message).toMatchObject({ source: BRIDGE_SOURCE_TAG, version: CHANNEL_VERSION });
+  });
+
+  it('turns a payload that is not a record into an empty null-prototype record', () => {
+    const payloads: readonly unknown[] = [[1, 2], 'text', 7, null];
+    for (const payload of payloads) {
+      expect(bridge.send('agent.snapshot', payload)).toBe(true);
+    }
+
+    expect(accepted).toHaveLength(payloads.length);
+    for (const message of accepted) {
+      expect(Object.getPrototypeOf(message.payload)).toBeNull();
+      expect(Object.keys(message.payload)).toEqual([]);
+    }
+  });
+
+  it('reads a key the bridge did not send as absent, even on a polluted Object.prototype', () => {
+    Object.defineProperty(Object.prototype, POLLUTED_KEY, {
+      value: 'page',
+      configurable: true,
+      writable: true,
+      enumerable: false,
+    });
+
+    try {
+      expect(bridge.send('agent.config', { hooks: { fetch: true } })).toBe(true);
+
+      const payload = at(accepted, 0, 'the accepted frames').payload;
+      const hooks = asRecord(payload.hooks, 'the accepted hooks');
+      // Every record in the frame is rebuilt on a null prototype, nested ones
+      // included, so the page's key is invisible to `in` and to a read.
+      expect(Object.getPrototypeOf(payload)).toBeNull();
+      expect(Object.getPrototypeOf(hooks)).toBeNull();
+      expect(POLLUTED_KEY in payload).toBe(false);
+      expect(POLLUTED_KEY in hooks).toBe(false);
+      expect(payload[POLLUTED_KEY]).toBeUndefined();
+      expect(hooks.fetch).toBe(true);
+    } finally {
+      Reflect.deleteProperty(Object.prototype, POLLUTED_KEY);
+    }
+  });
+
+  it('keeps a __proto__ key an ordinary key and pollutes nothing', () => {
+    const detail = `{"source":"${BRIDGE_SOURCE_TAG}","version":${String(CHANNEL_VERSION)},"type":"agent.config","payload":{"__proto__":{"${POLLUTED_KEY}":true}}}`;
+
+    expect(bridge.sendDetail(detail)).toBe(true);
+
+    const payload = at(accepted, 0, 'the accepted frames').payload;
+    expect(Object.getPrototypeOf(payload)).toBeNull();
+    expect(Object.keys(payload)).toEqual(['__proto__']);
+    expect(POLLUTED_KEY in payload).toBe(false);
+    expect(POLLUTED_KEY in {}).toBe(false);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * What a page script can see and send
+ *
+ * Every case plays a page script that runs after the agent: it can listen
+ * anywhere on the page, post anything to its own window and dispatch any
+ * event it likes — everywhere except on a node it cannot reach.
+ * ---------------------------------------------------------------------------
+ */
+
+describe('what a page script can see and send', () => {
+  /** Frames the module accepted in the current case, in order. */
+  let accepted: BridgeInboundMessage[] = [];
+
+  /** The case's recording subscription. */
+  let stopRecording: (() => void) | undefined;
+
+  beforeEach(() => {
+    accepted = [];
+    stopRecording = subscribe((message) => {
+      accepted.push(message);
+    });
+  });
+
+  afterEach(() => {
+    stopRecording?.();
+    stopRecording = undefined;
+  });
+
+  it('shows a page listener on window or document none of the frames', () => {
+    const observed: string[] = [];
+    const record = (event: Event): void => {
+      observed.push(event.type);
+    };
+    const pageEvents = [
+      'message',
+      AGENT_FRAME_EVENT,
+      BRIDGE_FRAME_EVENT,
+      HANDSHAKE_OFFER_EVENT,
+      HANDSHAKE_REQUEST_EVENT,
+    ];
+    for (const type of pageEvents) {
+      window.addEventListener(type, record);
+      window.addEventListener(type, record, true);
+      document.addEventListener(type, record, true);
+    }
+    const posted = vi.spyOn(window, 'postMessage');
+
+    try {
+      bridge.send('bridge.ready');
+      emitRange(3);
+      flush();
+      postControl('agent.ready', { url: PAGE_URL });
+      bridge.send('agent.config', { captureId: CAPTURE_A });
+
+      // Self-check: the channel was busy in both directions while the page
+      // listened.
+      expect(bridge.claimedOfType('telemetry.batch')).toHaveLength(1);
+      expect(bridge.claimedOfType('agent.ready')).toHaveLength(1);
+      expect(accepted.map((message) => message.type)).toEqual(['bridge.ready', 'agent.config']);
+
+      expect(observed).toEqual([]);
+      expect(posted).not.toHaveBeenCalled();
+    } finally {
+      for (const type of pageEvents) {
+        window.removeEventListener(type, record);
+        window.removeEventListener(type, record, true);
+        document.removeEventListener(type, record, true);
+      }
+    }
+  });
+
+  it('ignores an all-false agent.config posted to the window, token or not', async () => {
+    const disarm = {
+      captureId: CAPTURE_B,
+      hooks: { react: false, fetch: false, errors: false, interactions: false, state: false },
+    };
+    const forgeries: readonly unknown[] = [
+      // Version 2's shape, with a token of the length it used.
+      {
+        source: BRIDGE_SOURCE_TAG,
+        version: CHANNEL_VERSION - 1,
+        type: 'agent.config',
+        token: 'f'.repeat(64),
+        payload: disarm,
+      },
+      // Version 3's fields, posted instead of dispatched on the node.
+      {
+        source: BRIDGE_SOURCE_TAG,
+        version: CHANNEL_VERSION,
+        type: 'agent.config',
+        payload: disarm,
+      },
+      // A version 3 detail string, as the data of a message.
+      bridgeFrameDetail('agent.config', disarm),
+    ];
+
+    let arrived = 0;
+    const onMessage = (): void => {
+      arrived += 1;
+    };
+    window.addEventListener('message', onMessage);
+
+    try {
+      emitRange(1);
+      const before = getTransportStats();
+
+      for (const forgery of forgeries) {
+        window.postMessage(forgery, '*');
+        // And delivered synchronously, with the `source` a v2 guard checked.
+        window.dispatchEvent(
+          new MessageEvent('message', {
+            data: forgery,
+            origin: window.location.origin,
+            source: window,
+          }),
+        );
+      }
+
+      // Self-check: every forgery reached the page's window.
+      expect(await waitForPageMessages(() => arrived, forgeries.length * 2)).toBe(
+        forgeries.length * 2,
+      );
+
+      expect(accepted).toEqual([]);
+      expect(getTransportStats()).toEqual(before);
+      // Still armed for the capture it was configured with: the forged
+      // configuration changed nothing, so an event is still stamped.
+      emitRange(1, 1);
+      expect(getTransportStats()).toMatchObject({ seq: before.seq + 1, buffered: 2 });
+    } finally {
+      window.removeEventListener('message', onMessage);
+    }
+  });
+
+  it('ignores a bridge frame dispatched anywhere but the node, unacknowledged', () => {
+    const pageDiv = document.createElement('div');
+    const targets: readonly EventTarget[] = [window, document, document.documentElement, pageDiv];
+    emitRange(1);
+
+    for (const target of targets) {
+      const unclaimed = target.dispatchEvent(
+        new CustomEvent(BRIDGE_FRAME_EVENT, {
+          detail: bridgeFrameDetail('agent.config', { captureId: CAPTURE_B }),
+          cancelable: true,
+        }),
+      );
+      expect(unclaimed).toBe(true);
+    }
+
+    expect(accepted).toEqual([]);
+    expect(getTransportStats()).toMatchObject({ buffered: 1, bridgeReady: false });
+  });
+
+  it('keeps working, unobserved, after a page replaces the platform methods', () => {
+    // Every primitive the channel runs on, replaced after the module loaded —
+    // by spies, which call through, so the page's own events keep working and
+    // every call is on the record.
+    const dispatchSpy = vi.spyOn(EventTarget.prototype, 'dispatchEvent');
+    const addSpy = vi.spyOn(EventTarget.prototype, 'addEventListener');
+    const removeSpy = vi.spyOn(EventTarget.prototype, 'removeEventListener');
+    const detailSpy = vi.spyOn(CustomEvent.prototype, 'detail', 'get');
+    const preventSpy = vi.spyOn(Event.prototype, 'preventDefault');
+    const parseSpy = vi.spyOn(JSON, 'parse');
+    const stringifySpy = vi.spyOn(JSON, 'stringify');
+    // And a `CustomEvent` that refuses to build anything at all.
+    vi.stubGlobal(
+      'CustomEvent',
+      class {
+        constructor() {
+          throw new Error('the page replaced CustomEvent');
+        }
+      },
+    );
+
+    // A re-subscribe, so the node's listener is removed and installed again
+    // under the replaced methods.
+    unsubscribe?.();
+    unsubscribe = subscribe(() => undefined);
+
+    expect(bridge.send('bridge.ready')).toBe(true);
+    emitRange(2);
+    flush();
+    postControl('agent.ready', { url: PAGE_URL });
+
+    // The channel still works in both directions.
+    expect(accepted.map((message) => message.type)).toEqual(['bridge.ready']);
+    expect(bridge.frames.map((frame) => [frame.type, frame.claimed])).toEqual([
+      ['telemetry.batch', true],
+      ['agent.ready', true],
+    ]);
+
+    const typeOf = (value: unknown): unknown => (value instanceof Event ? value.type : undefined);
+    const isAgentFrameObject = (value: unknown): boolean =>
+      typeof value === 'object' &&
+      value !== null &&
+      (value as Record<string, unknown>).source === AGENT_SOURCE_TAG;
+
+    // Self-checks: the spies were live — the fake bridge, which uses the
+    // page's methods like any other script, went through every one of them.
+    expect(detailSpy.mock.contexts.map(typeOf)).toContain(AGENT_FRAME_EVENT);
+    expect(preventSpy.mock.contexts.map(typeOf)).toContain(AGENT_FRAME_EVENT);
+    expect(parseSpy).toHaveBeenCalled();
+
+    // And the agent went through none of them.
+    expect(dispatchSpy.mock.calls.map(([event]) => event.type)).not.toContain(AGENT_FRAME_EVENT);
+    expect(addSpy.mock.calls.map(([type]) => type)).not.toContain(BRIDGE_FRAME_EVENT);
+    expect(removeSpy.mock.calls.map(([type]) => type)).not.toContain(BRIDGE_FRAME_EVENT);
+    expect(detailSpy.mock.contexts.map(typeOf)).not.toContain(BRIDGE_FRAME_EVENT);
+    expect(preventSpy.mock.contexts.map(typeOf)).not.toContain(BRIDGE_FRAME_EVENT);
+    expect(
+      parseSpy.mock.calls.some(
+        ([text]) => typeof text === 'string' && text.includes(`"source":"${BRIDGE_SOURCE_TAG}"`),
+      ),
+    ).toBe(false);
+    expect(stringifySpy.mock.calls.some(([value]) => isAgentFrameObject(value))).toBe(false);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The handshake
+ * ---------------------------------------------------------------------------
+ */
+
+describe('the handshake', () => {
+  it('answers no request after the one it answered, not even after a reset', () => {
+    expect(requestChannelNode().offers).toEqual([]);
 
     // The disarm path, exactly as `./agent.ts` runs it at the end of every
     // capture: configureTransport({enabled:false}), resetTransport(), then a
-    // new subscription. A token cleared there would leave the bridge holding a
-    // stale value and this document unable to start a second capture.
+    // new subscription. The exchange stays closed through all of it.
+    configureTransport({ enabled: false });
+    resetTransport();
+    unsubscribe = subscribe(() => undefined);
+
+    expect(requestChannelNode().offers).toEqual([]);
+  });
+
+  it('keeps the same node through a reset and a fresh subscribe', () => {
     configureTransport({ enabled: false });
     resetTransport();
 
     const afterReset: BridgeInboundMessage[] = [];
-    const stop = subscribe((message) => {
+    unsubscribe = subscribe((message) => {
       afterReset.push(message);
     });
+    configureTransport({ sessionId: SESSION_ID, captureId: CAPTURE_B, enabled: true });
 
-    try {
-      configureTransport({ sessionId: SESSION_ID, captureId: CAPTURE_B, enabled: true });
-      announceBridge('bridge.ready');
+    // The node the bridge was handed at the start of the document still
+    // carries the second capture: replacing it here would leave the bridge
+    // holding one nobody listens on, with no second handshake coming.
+    expect(bridge.send('bridge.ready')).toBe(true);
+    expect(afterReset.map((message) => message.type)).toEqual(['bridge.ready']);
 
-      expect(afterReset.map((message) => message.type)).toEqual(['bridge.ready']);
-      expect(getTransportStats().bridgeReady).toBe(true);
+    emitRange(1);
+    flush();
 
-      emitRange(1);
-      flush();
-
-      expect(deliveredOrder()).toEqual([0]);
-      expect(at(batchViews(), 0, 'the posted batches').captureId).toBe(CAPTURE_B);
-    } finally {
-      stop();
-    }
+    expect(deliveredOrder()).toEqual([0]);
+    expect(at(batchViews(), 0, 'the claimed batches').captureId).toBe(CAPTURE_B);
   });
 
-  it('answers exactly one handshake request, whatever asks afterwards', async () => {
-    // This file's own instance is detached first, so the requests dispatched
-    // below reach exactly one listener. Its token is already captured and
-    // survives the reset — every later case still posts with it — and leaving
-    // it subscribed would only make the offer count ambiguous, because two
-    // live instances answer one request twice.
-    resetTransport();
+  it('follows the subscriber lifecycle on the node', () => {
+    // The last unsubscribe removes the node's listener: a bridge frame then
+    // finds nobody, and the bridge can tell.
+    unsubscribe?.();
+    unsubscribe = undefined;
 
-    const offers = collectOffers();
+    expect(bridge.send('bridge.ready')).toBe(false);
+    expect(getTransportStats().bridgeReady).toBe(false);
 
-    try {
-      const fresh = await freshTransport();
-      const seen: BridgeInboundMessage[] = [];
-      const stop = fresh.subscribe((message) => {
-        seen.push(message);
-      });
-
-      try {
-        // One disclosure so far: the unsolicited offer the mint dispatches, for
-        // a bridge that was evaluated before this agent.
-        expect(offers.tokens).toHaveLength(1);
-
-        window.dispatchEvent(new CustomEvent(HANDSHAKE_REQUEST_EVENT));
-
-        expect(offers.tokens).toHaveLength(2);
-        expect(at(offers.tokens, 1, 'the disclosed tokens')).toBe(
-          at(offers.tokens, 0, 'the disclosed tokens'),
-        );
-
-        // Every later ask is unanswered for the life of the document — a bridge
-        // that discarded the token must wait for a reload, and a page script
-        // that spotted the exchange cannot replay it.
-        window.dispatchEvent(new CustomEvent(HANDSHAKE_REQUEST_EVENT));
-        window.dispatchEvent(new CustomEvent(HANDSHAKE_REQUEST_EVENT));
-
-        expect(offers.tokens).toHaveLength(2);
-
-        // And what the answer carried is what that instance accepts.
-        deliverFrame({
-          source: BRIDGE_SOURCE_TAG,
-          version: CHANNEL_VERSION,
-          type: 'bridge.ready',
-          token: at(offers.tokens, 1, 'the disclosed tokens'),
-          payload: {},
-        });
-
-        expect(seen.map((message) => message.type)).toEqual(['bridge.ready']);
-      } finally {
-        stop();
-        fresh.resetTransport();
-      }
-    } finally {
-      offers.stop();
-    }
-  });
-
-  it('accepts nothing on an instance whose disclosure nobody joined', async () => {
-    const fresh = await freshTransport();
+    // A later subscribe listens again, on the same node, with no new handshake.
     const seen: BridgeInboundMessage[] = [];
-    const stop = fresh.subscribe((message) => {
+    unsubscribe = subscribe((message) => {
       seen.push(message);
     });
 
+    expect(bridge.send('bridge.ready')).toBe(true);
+    expect(seen.map((message) => message.type)).toEqual(['bridge.ready']);
+    expect(requestChannelNode().offers).toEqual([]);
+  });
+
+  it('keeps the node detached from the document', () => {
+    const node = bridge.node;
+    if (!(node instanceof Node)) {
+      throw new Error('the channel node is not a DOM node');
+    }
+
+    expect(node.isConnected).toBe(false);
+    expect(node.parentNode).toBeNull();
+    expect(Array.from(document.querySelectorAll('*'))).not.toContain(node);
+  });
+
+  it('offers nothing unsolicited and answers only the first request of a document', async () => {
+    const fresh = await freshTransport();
+    const unsolicited: EventTarget[] = [];
+    const onOffer = (event: Event): void => {
+      const related = (event as MouseEvent).relatedTarget;
+      if (related !== null) {
+        unsolicited.push(related);
+      }
+    };
+    window.addEventListener(HANDSHAKE_OFFER_EVENT, onOffer);
+    const stop = fresh.subscribe(() => undefined);
+
     try {
-      // Nothing here listened for that instance's offer and nothing asked it
-      // for one, which is the position a page script is in when the bridge got
-      // there first. An all-zero token is a value no instance can have issued:
-      // the mint refuses one, precisely so that a `getRandomValues` stub which
-      // fills nothing cannot pass for a secret.
-      const unissued = '0'.repeat(issuedToken().length);
+      // Subscribing opens the channel and dispatches nothing.
+      expect(unsolicited).toEqual([]);
 
-      deliverFrame({
-        source: BRIDGE_SOURCE_TAG,
-        version: CHANNEL_VERSION,
-        type: 'bridge.ready',
-        payload: {},
-      });
-      deliverFrame({
-        source: BRIDGE_SOURCE_TAG,
-        version: CHANNEL_VERSION,
-        type: 'bridge.ready',
-        token: unissued,
-        payload: {},
-      });
-      deliverFrame({
-        source: BRIDGE_SOURCE_TAG,
-        version: CHANNEL_VERSION,
-        type: 'agent.config',
-        token: unissued,
-        payload: { sessionId: SESSION_ID, captureId: CAPTURE_B },
+      // A second request dispatched from inside the answer — the tightest race
+      // a page script could arrange — finds the exchange already closed.
+      window.removeEventListener(HANDSHAKE_OFFER_EVENT, onOffer);
+      const nested: HandshakeResult[] = [];
+      const askAgain = (): void => {
+        if (nested.length === 0) {
+          nested.push(requestChannelNode());
+        }
+      };
+      window.addEventListener(HANDSHAKE_OFFER_EVENT, askAgain);
+      let first: HandshakeResult;
+      try {
+        first = requestChannelNode();
+      } finally {
+        window.removeEventListener(HANDSHAKE_OFFER_EVENT, askAgain);
+      }
+
+      expect(first.offers).toHaveLength(1);
+      expect(first.node).toBeInstanceOf(Node);
+      expect(nested.map((result) => result.offers)).toEqual([[]]);
+
+      // Every later request goes unanswered for the life of the document,
+      // resets included.
+      expect(requestChannelNode().offers).toEqual([]);
+      fresh.resetTransport();
+      const again = fresh.subscribe(() => undefined);
+      try {
+        expect(requestChannelNode().offers).toEqual([]);
+      } finally {
+        again();
+      }
+    } finally {
+      window.removeEventListener(HANDSHAKE_OFFER_EVENT, onOffer);
+      stop();
+      fresh.resetTransport();
+    }
+  });
+
+  it('hands the node to whoever asks first, so a bridge that asks second gets none', async () => {
+    const fresh = await freshTransport();
+    const stop = fresh.subscribe(() => undefined);
+
+    try {
+      // The documented limit of any in-page channel: on a page with no bridge
+      // — or before it — a page script can ask first. What it gains is an agent
+      // with no bridge behind it, and the bridge learns it was pre-empted.
+      expect(requestChannelNode().offers).toHaveLength(1);
+      expect(() => connectFakeBridge(fresh)).toThrow(/answered 0 times/u);
+    } finally {
+      stop();
+      fresh.resetTransport();
+    }
+  });
+
+  it('dispatches nothing and counts nothing before the handshake', async () => {
+    const fresh = await freshTransport();
+    const stop = fresh.subscribe(() => undefined);
+
+    try {
+      fresh.configureTransport({ sessionId: SESSION_ID, captureId: CAPTURE_A, enabled: true });
+      // What `./agent.ts` does at `document_start`, before any bridge exists.
+      fresh.postControl('agent.ready', { url: PAGE_URL });
+      fresh.emit(renderDraft(0));
+      fresh.flush();
+
+      // No bridge could hold the node, so nothing was lost: not counted as a
+      // dropped control frame, and the event is still queued.
+      expect(fresh.getTransportStats()).toMatchObject({
+        controlFramesDropped: 0,
+        buffered: 1,
+        sent: 0,
+        bridgeReady: false,
       });
 
-      expect(seen).toEqual([]);
-      expect(fresh.getTransportStats().bridgeReady).toBe(false);
+      const late = connectFakeBridge(fresh);
+      expect(late.frames).toEqual([]);
+
+      // The bridge's `bridge.ready` is the cue: the queue drains, and the
+      // re-announcement finds the channel open.
+      expect(late.send('bridge.ready')).toBe(true);
+      fresh.postControl('agent.ready', { url: PAGE_URL });
+
+      expect(late.frames.map((frame) => [frame.type, frame.claimed])).toEqual([
+        ['telemetry.batch', true],
+        ['agent.ready', true],
+      ]);
+      expect(deliveredOrder(late)).toEqual([0]);
+      expect(fresh.getTransportStats()).toMatchObject({ sent: 1, controlFramesDropped: 0 });
     } finally {
       stop();
       fresh.resetTransport();

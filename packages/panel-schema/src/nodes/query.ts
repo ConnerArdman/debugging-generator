@@ -153,8 +153,13 @@ import { describeIssues } from '../summary.js';
  */
 export const DATA_QUERY_SOURCES = Object.freeze([
   /**
-   * One correlated interaction as an ordered tree, spanning every tier. Needs a
-   * `traceId` filter to name which one, since a capture holds many.
+   * One correlated interaction as an ordered tree, spanning every tier. A
+   * `traceId` filter names which one, since a capture holds many; without it
+   * the capture's primary trace is read, else its earliest. The other filter
+   * fields narrow that tree to the nodes they match **plus every ancestor of a
+   * match**, so a matched span keeps the path that caused it, and no match
+   * answers `null`. An answer holds at most {@link DATA_QUERY_MAX_LIMIT} nodes
+   * in canonical pre-order and sets the tree's `truncated` flag when cut.
    */
   'trace',
   /**

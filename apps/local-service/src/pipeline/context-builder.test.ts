@@ -20,6 +20,11 @@
  * 3. **The outbound guard.** A denied pattern that survived ingest refuses the
  *    build with a typed `Err`, returns no request and leaks nothing into the
  *    error or the log; the compliant output of the first checkpoint builds.
+ *    The page-derived sections — the selected element and the current URL —
+ *    are redacted by the builder before they are capped, so an ordinary
+ *    queried page, secret-shaped element text and an element string carrying
+ *    a queried URL build instead of being refused, while the same values
+ *    handed to the guard raw still are (or, as prose, would have been sent).
  * 4. **The `{{outputSchema}}` documents.** Each is rendered from (or delegates
  *    to) its upstream owner, accepts what the upstream schema accepts, rejects
  *    what it rejects, is byte-stable and names no application.
@@ -84,6 +89,7 @@ import {
   type Logger,
   type Result,
 } from '@debuggen/shared';
+import { MAX_QUERY_PAIRS, redactTextUrls } from '@debuggen/telemetry';
 
 import { ANALYSIS_INPUT_LIMITS, type AnalysisStageInput } from '../analysis/summarize.js';
 import {
@@ -104,6 +110,8 @@ import {
   createPipelineStageContext,
   estimatePayloadBytes,
   outputSchemaFor,
+  redactAndCapText,
+  redactAndCapUrl,
   resolveContextLimits,
   toBoundedJson,
   toPromptJson,
@@ -479,6 +487,73 @@ const PROJECT_NAME = 'atlas-console';
 const DEV_SERVER_URL = 'http://127.0.0.1:4310';
 const CURRENT_URL = `${DEV_SERVER_URL}/reports?view=${URL_QUERY_MASK}`;
 const FIXED_EPOCH_MS = 1_767_225_600_000;
+
+/**
+ * An ordinary queried page address exactly as a browser reports it, and the
+ * only form of it a request may carry: every query value and the fragment
+ * masked, the route and the parameter names kept.
+ */
+const QUERIED_URL = 'http://127.0.0.1:3000/products?sort=price&page=2#details';
+const QUERIED_URL_REDACTED = 'http://127.0.0.1:3000/products?sort=?&page=?#?';
+
+/**
+ * Query values planted in the strings of a selected element — deliberately not
+ * secret-shaped, so no content rule of `scrub` recognises them and only the
+ * URL rule can keep them from being sent.
+ */
+const PLANTED_VALUE = 'samplevalue';
+const PLANTED_TOKEN = 'QQZZ7';
+
+/**
+ * A link whose visible text is its own queried address, and the only form of
+ * it a request may carry.
+ */
+const LINK_URL = `http://127.0.0.1:3000/reset?coupon=${PLANTED_VALUE}`;
+const LINK_URL_REDACTED = `http://127.0.0.1:3000/reset?coupon=${URL_QUERY_MASK}`;
+
+/**
+ * Secret-shaped page content for the page-derived redaction cases, every value
+ * assembled at runtime. Each `body` is the part that identifies its secret —
+ * no ten-character window of it may survive into a request.
+ */
+function pageSecrets(): {
+  readonly jwt: string;
+  readonly jwtBody: string;
+  readonly textKey: string;
+  readonly textKeyBody: string;
+  readonly selectorKey: string;
+  readonly selectorKeyBody: string;
+  readonly forgeToken: string;
+  readonly forgeTokenBody: string;
+} {
+  const jwtBody = assemble(cycle(ALNUM, 20), '.', cycle(URLSAFE, 16), '.', cycle(ALNUM, 24));
+  const textKeyBody = cycle(URLSAFE, 40);
+  const selectorKeyBody = cycle([...URLSAFE].reverse().join(''), 40);
+  const forgeTokenBody = cycle(ALNUM.slice(26), 36);
+  return {
+    jwt: assemble('ey', 'J', jwtBody),
+    jwtBody,
+    textKey: assemble('s', 'k-', 'ant-', textKeyBody),
+    textKeyBody,
+    selectorKey: assemble('s', 'k-', 'ant-', selectorKeyBody),
+    selectorKeyBody,
+    forgeToken: assemble('gh', 'p_', forgeTokenBody),
+    forgeTokenBody,
+  };
+}
+
+/**
+ * Placeholder values for a hand-assembled understand request: the absent
+ * marker for every context placeholder and the real schema document. Values
+ * that carry nothing, so a guard verdict on such a request is a verdict on its
+ * structured input alone.
+ */
+function understandProbeValues(): Record<string, string> {
+  return {
+    ...Object.fromEntries(STAGE_PLACEHOLDERS.understand.map((key) => [key, ABSENT_VALUE])),
+    outputSchema: outputSchemaFor('understand'),
+  };
+}
 
 /** A token planted in every question; it may reach a prompt and never a structured input. */
 const QUESTION_SENTINEL = 'zephyrquokkasentinel';
@@ -1636,6 +1711,23 @@ describe('caps: the limits themselves', () => {
   });
 });
 
+/**
+ * The outbound guard's verdict on `text` as a selected element's visible text:
+ * a hand-assembled understand request whose structured input carries nothing
+ * else, so the verdict is on that one string.
+ */
+function guardTargetText(
+  builder: ContextBuilder,
+  text: string,
+): Result<StageRequestBuild, DebuggenError> {
+  return builder.buildStageRequest({
+    stage: 'understand',
+    values: understandProbeValues(),
+    input: { target: { text } },
+    sessionId: SESSION_ID,
+  });
+}
+
 describe('caps: pure helpers', () => {
   it('capText keeps short text, cuts long text to the cap including the marker', () => {
     expect(capText('short', 10)).toEqual({ text: 'short', truncated: false });
@@ -1653,6 +1745,229 @@ describe('caps: pure helpers', () => {
       text: 'anything',
       truncated: false,
     });
+  });
+
+  it('redactAndCapText scrubs before it cuts, so a credential across the cap never leaves its head', () => {
+    const { jwt, jwtBody } = pageSecrets();
+    const raw = assemble('x'.repeat(90), ' Bearer ', jwt);
+    // Cutting first would keep the start of the token, where no pattern can recognise it any more.
+    expect(leakProbes(raw, jwtBody).some((probe) => capText(raw, 120).text.includes(probe))).toBe(
+      true,
+    );
+    const redacted = redactAndCapText(raw, 120);
+    expect(redacted).toEqual({
+      text: `${'x'.repeat(90)} Bearer ${REDACTION_MARKER}`,
+      truncated: false,
+    });
+    for (const probe of leakProbes(jwt, jwtBody)) {
+      expect(redacted.text).not.toContain(probe);
+    }
+  });
+
+  it('redactAndCapText is capText on text with nothing to redact', () => {
+    for (const [value, max] of [
+      ['Export report', 6],
+      ['Export report', 120],
+      [TARGET.selector, 8],
+      ['', 4],
+    ] as const) {
+      expect({ value, max, capped: redactAndCapText(value, max) }).toEqual({
+        value,
+        max,
+        capped: capText(value, max),
+      });
+    }
+  });
+
+  it('redactAndCapText masks every URL embedded in element text, keeping the text around it', () => {
+    const { builder } = builderFixture(committedLibrary());
+    const cases: readonly (readonly [raw: string, expected: string])[] = [
+      // A link whose visible text is its own address: route and parameter names kept.
+      [LINK_URL, LINK_URL_REDACTED],
+      // A path quoted in prose, a query in an attribute selector, a query in a component label.
+      [`Visit /reset?coupon=${PLANTED_VALUE}`, `Visit /reset?coupon=${URL_QUERY_MASK}`],
+      [`a[href="/p?id=${PLANTED_TOKEN}"]`, `a[href="/p?id=${URL_QUERY_MASK}"]`],
+      [`ToolbarRow?x=${PLANTED_TOKEN}`, `ToolbarRow?x=${URL_QUERY_MASK}`],
+    ];
+    for (const [raw, expected] of cases) {
+      const redacted = redactAndCapText(raw, CONTEXT_LIMITS.maxTargetTextChars);
+      expect({ raw, redacted }).toEqual({ raw, redacted: { text: expected, truncated: false } });
+      for (const planted of [PLANTED_VALUE, PLANTED_TOKEN]) {
+        expect(redacted.text).not.toContain(planted);
+      }
+      // A fixed point, and a string the guard lets through.
+      expect(redactAndCapText(redacted.text, CONTEXT_LIMITS.maxTargetTextChars)).toEqual(redacted);
+      expect({ raw, ok: guardTargetText(builder, redacted.text).ok }).toEqual({ raw, ok: true });
+    }
+  });
+
+  it("redactAndCapText holds a single token to the URL parser's reading of it", () => {
+    const { builder } = builderFixture(committedLibrary());
+    const cases: readonly (readonly [raw: string, expected: string])[] = [
+      // Sentence punctuation after a link is part of its last value to the URL parser.
+      [`${LINK_URL}.`, LINK_URL_REDACTED],
+      // So are the quote and bracket that close an origin-relative reference in a path selector.
+      [
+        `/html/body/a[@href="/p?id=${PLANTED_TOKEN}"]`,
+        `/html/body/a[@href="/p?id=${URL_QUERY_MASK}`,
+      ],
+      // Whitespace around a token is ignored by the guard, and kept here.
+      [`  ${LINK_URL}`, `  ${LINK_URL_REDACTED}`],
+    ];
+    for (const [raw, expected] of cases) {
+      const redacted = redactAndCapText(raw, CONTEXT_LIMITS.maxStringChars);
+      expect({ raw, redacted }).toEqual({ raw, redacted: { text: expected, truncated: false } });
+      expect({ raw, ok: guardTargetText(builder, redacted.text).ok }).toEqual({ raw, ok: true });
+    }
+    // The embedded-URL pass alone leaves the first two to be refused.
+    for (const [raw] of cases.slice(0, 2)) {
+      const refused = guardTargetText(builder, redactTextUrls(raw));
+      expect({ raw, ruleIds: expectErr(refused).details?.['ruleIds'] }).toEqual({
+        raw,
+        ruleIds: ['url-query-value'],
+      });
+    }
+  });
+
+  it('redactAndCapText never leaves a cut single-token query value the outbound guard would refuse', () => {
+    const raw = `${LINK_URL}&step=${PLANTED_TOKEN}#${PLANTED_TOKEN}`;
+    const full = `${LINK_URL_REDACTED}&step=${URL_QUERY_MASK}#${URL_QUERY_MASK}`;
+    expect(redactAndCapText(raw, full.length)).toEqual({ text: full, truncated: false });
+    const { builder } = builderFixture(committedLibrary());
+    const reset = LINK_URL_REDACTED.slice(0, LINK_URL_REDACTED.indexOf('?') + 1);
+    const pinned: readonly (readonly [max: number, expected: string])[] = [
+      // Just after a value's mask, or inside the value: the split pair is dropped to its `&`.
+      [full.length - 1, `${LINK_URL_REDACTED}&${TRUNCATION_MARKER}`],
+      [full.length - 2, `${LINK_URL_REDACTED}&${TRUNCATION_MARKER}`],
+      // Inside a parameter name, or on a pair boundary: no value is left, so the plain cut stands.
+      [LINK_URL_REDACTED.length + 4, `${LINK_URL_REDACTED}&st${TRUNCATION_MARKER}`],
+      [LINK_URL_REDACTED.length + 2, `${LINK_URL_REDACTED}&${TRUNCATION_MARKER}`],
+      // Inside the first pair's value: only the query delimiter and the marker survive.
+      [LINK_URL_REDACTED.length + 1, `${reset}${TRUNCATION_MARKER}`],
+      [LINK_URL_REDACTED.length, `${reset}${TRUNCATION_MARKER}`],
+    ];
+    for (const [max, expected] of pinned) {
+      expect({ max, capped: redactAndCapText(raw, max) }).toEqual({
+        max,
+        capped: { text: expected, truncated: true },
+      });
+    }
+    // The cut a plain capText makes inside a value is exactly what the guard refuses.
+    for (const max of [
+      full.length - 1,
+      full.length - 2,
+      LINK_URL_REDACTED.length + 1,
+      LINK_URL_REDACTED.length,
+    ]) {
+      const refused = guardTargetText(builder, capText(full, max).text);
+      expect({ max, ruleIds: expectErr(refused).details?.['ruleIds'] }).toEqual({
+        max,
+        ruleIds: ['url-query-value'],
+      });
+    }
+    // Every cap, exhaustively: bounded, marked, masked and let through.
+    for (let max = 1; max < full.length; max += 1) {
+      const capped = redactAndCapText(raw, max);
+      expect({ max, truncated: capped.truncated }).toEqual({ max, truncated: true });
+      expect(capped.text.length).toBeLessThanOrEqual(max);
+      expect(capped.text.endsWith(TRUNCATION_MARKER)).toBe(true);
+      for (const planted of [PLANTED_VALUE, PLANTED_TOKEN]) {
+        expect(capped.text).not.toContain(planted);
+      }
+      expect({ max, ok: guardTargetText(builder, capped.text).ok }).toEqual({ max, ok: true });
+    }
+  });
+
+  it('redactAndCapText re-caps a token whose query outgrows the cap once re-masked', () => {
+    // Bare flags carry no value, so nothing masks them before the cut; past
+    // MAX_QUERY_PAIRS the re-mask bounds them with a trailing marker segment.
+    const token = `/p?${Array.from({ length: MAX_QUERY_PAIRS + 1 }, () => 'k').join('&')}`;
+    const capped = redactAndCapText(token, token.length);
+    expect(capped.truncated).toBe(true);
+    expect(capped.text.length).toBeLessThanOrEqual(token.length);
+    expect(capped.text.endsWith(TRUNCATION_MARKER)).toBe(true);
+    const { builder } = builderFixture(committedLibrary());
+    expect(guardTargetText(builder, capped.text).ok).toBe(true);
+  });
+
+  it('redactAndCapUrl masks query values, the fragment and userinfo, keeping route and names', () => {
+    expect(redactAndCapUrl(QUERIED_URL, CONTEXT_LIMITS.maxUrlChars)).toEqual({
+      text: QUERIED_URL_REDACTED,
+      truncated: false,
+    });
+    const password = cycle(ALNUM, 14);
+    const credentialed = assemble(
+      'http',
+      '://',
+      'svc_reader',
+      ':',
+      password,
+      '@',
+      '127.0.0.1:3000',
+    );
+    expect(redactAndCapUrl(`${credentialed}/ledger?cursor=42`, 2_048).text).toBe(
+      `http://${REDACTION_MARKER}@127.0.0.1:3000/ledger?cursor=${URL_QUERY_MASK}`,
+    );
+    const { jwt, jwtBody } = pageSecrets();
+    const reset = redactAndCapUrl(`${DEV_SERVER_URL}/reset/${jwt}`, 2_048).text;
+    expect(reset).toBe(`${DEV_SERVER_URL}/reset/${REDACTION_MARKER}`);
+    expect(leakProbes(jwt, jwtBody).some((probe) => reset.includes(probe))).toBe(false);
+  });
+
+  it('redactAndCapUrl is the identity on an address that was already masked', () => {
+    for (const url of [CURRENT_URL, QUERIED_URL_REDACTED, `${DEV_SERVER_URL}/ledger`]) {
+      expect(redactAndCapUrl(url, CONTEXT_LIMITS.maxUrlChars)).toEqual({
+        text: url,
+        truncated: false,
+      });
+    }
+  });
+
+  it('redactAndCapUrl never leaves a cut query value the outbound guard would refuse', () => {
+    const origin = 'http://127.0.0.1:3000/products';
+    const cases: readonly (readonly [max: number, expected: string])[] = [
+      [QUERIED_URL_REDACTED.length, QUERIED_URL_REDACTED],
+      // Just after a value's mask, or inside the value: the split pair is dropped to its `&`.
+      [45, `${origin}?sort=?&${TRUNCATION_MARKER}`],
+      [44, `${origin}?sort=?&${TRUNCATION_MARKER}`],
+      // Inside a parameter name, or on a pair boundary: no value is left, so the plain cut stands.
+      [43, `${origin}?sort=?&page${TRUNCATION_MARKER}`],
+      [41, `${origin}?sort=?&pa${TRUNCATION_MARKER}`],
+      [39, `${origin}?sort=?&${TRUNCATION_MARKER}`],
+      // Inside the first pair's value: only the query delimiter and the marker survive.
+      [38, `${origin}?${TRUNCATION_MARKER}`],
+      [37, `${origin}?${TRUNCATION_MARKER}`],
+      // On the query delimiter, in the path and in the authority: the plain cut of capText.
+      [32, `${origin}?${TRUNCATION_MARKER}`],
+      [31, `${origin}${TRUNCATION_MARKER}`],
+      [20, capText(QUERIED_URL_REDACTED, 20).text],
+    ];
+    const { builder } = builderFixture(committedLibrary());
+    for (const [max, expected] of cases) {
+      const capped = redactAndCapUrl(QUERIED_URL, max);
+      expect({ max, capped }).toEqual({
+        max,
+        capped: { text: expected, truncated: max < QUERIED_URL_REDACTED.length },
+      });
+      expect(capped.text.length).toBeLessThanOrEqual(max);
+      const guarded = builder.buildStageRequest({
+        stage: 'understand',
+        values: understandProbeValues(),
+        input: { currentUrl: capped.text },
+        sessionId: SESSION_ID,
+      });
+      expect({ max, ok: guarded.ok }).toEqual({ max, ok: true });
+    }
+    // The cut a plain capText makes inside a value is exactly what the guard refuses.
+    for (const max of [45, 44, 38, 37]) {
+      const refused = builder.buildStageRequest({
+        stage: 'understand',
+        values: understandProbeValues(),
+        input: { currentUrl: capText(QUERIED_URL_REDACTED, max).text },
+        sessionId: SESSION_ID,
+      });
+      expect(expectErr(refused).details?.['ruleIds']).toEqual(['url-query-value']);
+    }
   });
 
   it('capList keeps the head in a new array and reports the original total', () => {
@@ -1796,6 +2111,19 @@ describe('caps: enforced by every stage builder', () => {
     const build = expectOk(builder.buildUnderstandRequest({ context: stageContext().context }));
     expect(build.request.input['currentUrl']).toBe(capText(CURRENT_URL, 20).text);
     expect(probeValues(build.request.prompt)['currentUrl']).toBe(capText(CURRENT_URL, 20).text);
+    expect(build.truncated).toEqual(['currentUrl']);
+  });
+
+  it('maxUrlChars caps the redacted address, never cutting a query value into view', () => {
+    const { builder } = builderFixture(probeLibrary(), { limits: { maxUrlChars: 44 } });
+    const build = expectOk(
+      builder.buildUnderstandRequest({
+        context: stageContext({ currentUrl: QUERIED_URL }).context,
+      }),
+    );
+    const expected = `http://127.0.0.1:3000/products?sort=?&${TRUNCATION_MARKER}`;
+    expect(build.request.input['currentUrl']).toBe(expected);
+    expect(probeValues(build.request.prompt)['currentUrl']).toBe(expected);
     expect(build.truncated).toEqual(['currentUrl']);
   });
 
@@ -2793,6 +3121,241 @@ describe('outbound guard', () => {
       }
     },
   );
+});
+
+/** A selected element whose every free-text field carries a secret-shaped value. */
+function secretTarget(secrets: ReturnType<typeof pageSecrets>): SelectedTarget {
+  return {
+    ...TARGET,
+    selector: `button[data-grant="${secrets.selectorKey}"]`,
+    text: `Retry with Bearer ${secrets.jwt} or ${secrets.textKey}`,
+    componentChain: ['ExportControl', secrets.forgeToken],
+  };
+}
+
+/** Every value and ten-character body window of {@link pageSecrets} that must never be sent. */
+function pageSecretProbes(secrets: ReturnType<typeof pageSecrets>): string[] {
+  return [
+    ...leakProbes(secrets.jwt, secrets.jwtBody),
+    ...leakProbes(secrets.textKey, secrets.textKeyBody),
+    ...leakProbes(secrets.selectorKey, secrets.selectorKeyBody),
+    ...leakProbes(secrets.forgeToken, secrets.forgeTokenBody),
+  ];
+}
+
+describe('page-derived redaction', () => {
+  it('builds an understand request for an ordinary queried page, sending only the masked address', () => {
+    const { builder } = builderFixture(probeLibrary());
+    const build = expectOk(
+      builder.buildUnderstandRequest({
+        context: stageContext({ currentUrl: QUERIED_URL }).context,
+      }),
+    );
+    expect(build.request.input['currentUrl']).toBe(QUERIED_URL_REDACTED);
+    expect(probeValues(build.request.prompt)['currentUrl']).toBe(QUERIED_URL_REDACTED);
+    expect(build.truncated).toEqual([]);
+    for (const needle of ['sort=price', 'page=2', '#details']) {
+      expect(JSON.stringify(build.request.input)).not.toContain(needle);
+      expect(build.request.prompt).not.toContain(needle);
+    }
+  });
+
+  it('builds the queried page against the committed prompt, which carries the masked address', () => {
+    const { builder } = builderFixture(committedLibrary());
+    const fixture = stageContext({ currentUrl: QUERIED_URL });
+    const build = expectOk(builder.buildUnderstandRequest({ context: fixture.context }));
+    expect(build.request.prompt).toContain(QUERIED_URL_REDACTED);
+    expect(build.request.prompt).not.toContain(QUERIED_URL);
+    expect(build.request.input['currentUrl']).toBe(QUERIED_URL_REDACTED);
+    // The context keeps the address as recorded; only what is sent is redacted.
+    expect(fixture.context.currentUrl).toBe(QUERIED_URL);
+    expect(fixture.log.records.filter((record) => record.level === 'warn')).toEqual([]);
+  });
+
+  it('the raw queried address, handed to the guard unredacted, is still refused', () => {
+    const { builder } = builderFixture(committedLibrary());
+    const error = expectErr(
+      builder.buildStageRequest({
+        stage: 'understand',
+        values: understandProbeValues(),
+        input: { currentUrl: QUERIED_URL },
+        sessionId: SESSION_ID,
+      }),
+    );
+    expect(error.details?.['ruleIds']).toEqual(['url-query-value']);
+    expect(error.details?.['paths']).toEqual(['input.currentUrl?sort']);
+  });
+
+  it('builds an understand request for an element whose strings carry secrets, sending the marker', () => {
+    const secrets = pageSecrets();
+    const target = secretTarget(secrets);
+    expect(target.text?.length).toBeGreaterThan(CONTEXT_LIMITS.maxTargetTextChars);
+    const { builder } = builderFixture(committedLibrary());
+    const fixture = stageContext({ target });
+    const build = expectOk(builder.buildUnderstandRequest({ context: fixture.context }));
+
+    const inputTarget = build.request.input['target'];
+    expect(inputTarget).toEqual({
+      tagName: 'BUTTON',
+      selector: `button[data-grant="${REDACTION_MARKER}"]`,
+      text: `Retry with Bearer ${REDACTION_MARKER} or ${REDACTION_MARKER}`,
+      componentChain: ['ExportControl', REDACTION_MARKER],
+    });
+    // Redacted before it was capped: the whole text fits once its secrets are gone.
+    expect(build.truncated).toEqual([]);
+    expect(build.request.prompt).toContain(toPromptJson(inputTarget));
+    const sent = [build.request.prompt, JSON.stringify(build.request.input)];
+    for (const probe of pageSecretProbes(secrets)) {
+      for (const text of sent) {
+        expect(text).not.toContain(probe);
+      }
+    }
+    expect(fixture.context.target).toEqual(target);
+
+    // Deterministic: a second build of the same context sends byte-identical payloads.
+    const again = expectOk(builder.buildUnderstandRequest({ context: fixture.context }));
+    expect(again.request.prompt).toBe(build.request.prompt);
+    expect(again.request.input).toEqual(build.request.input);
+  });
+
+  it('the same element strings, handed to the guard unredacted, are still refused', () => {
+    const secrets = pageSecrets();
+    const target = secretTarget(secrets);
+    const { builder, log } = builderFixture(committedLibrary());
+    const error = expectErr(
+      builder.buildStageRequest({
+        stage: 'understand',
+        values: understandProbeValues(),
+        input: {
+          target: {
+            tagName: target.tagName,
+            selector: target.selector,
+            text: target.text ?? '',
+            componentChain: [...target.componentChain],
+          },
+        },
+        sessionId: SESSION_ID,
+      }),
+    );
+    expect(error.details?.['ruleIds']).toEqual(
+      expect.arrayContaining(['provider-key', 'bearer-token', 'jwt']),
+    );
+    expect(error.details?.['paths']).toEqual(
+      expect.arrayContaining([
+        'input.target.selector',
+        'input.target.text',
+        'input.target.componentChain[1]',
+      ]),
+    );
+    for (const probe of pageSecretProbes(secrets)) {
+      expect(errorText(error)).not.toContain(probe);
+      expect(JSON.stringify(log.records)).not.toContain(probe);
+    }
+  });
+
+  it('builds an understand request for a selected link whose text is its own queried address', () => {
+    const target: SelectedTarget = { ...TARGET, tagName: 'A', text: LINK_URL };
+    const { builder } = builderFixture(committedLibrary());
+    const fixture = stageContext({ target });
+    const build = expectOk(builder.buildUnderstandRequest({ context: fixture.context }));
+
+    const inputTarget = build.request.input['target'];
+    expect(inputTarget).toEqual({
+      tagName: 'A',
+      selector: TARGET.selector,
+      text: LINK_URL_REDACTED,
+      componentChain: [...TARGET.componentChain],
+    });
+    expect(build.truncated).toEqual([]);
+    expect(build.request.prompt).toContain(toPromptJson(inputTarget));
+    expect(build.request.prompt).toContain(`coupon=${URL_QUERY_MASK}`);
+    for (const sent of [build.request.prompt, JSON.stringify(build.request.input)]) {
+      expect(sent).not.toContain(PLANTED_VALUE);
+    }
+    // The context keeps the element as recorded; only what is sent is redacted.
+    expect(fixture.context.target).toEqual(target);
+    expect(fixture.log.records.filter((record) => record.level === 'warn')).toEqual([]);
+
+    // The raw link, handed to the guard unredacted, is what refused Stage 1.
+    const refused = expectErr(guardTargetText(builder, LINK_URL));
+    expect(refused.details?.['ruleIds']).toEqual(['url-query-value']);
+    expect(refused.details?.['paths']).toEqual(['input.target.text?coupon']);
+  });
+
+  it('masks queries in element prose, a selector and a component name, which the guard alone lets through', () => {
+    const target: SelectedTarget = {
+      ...TARGET,
+      tagName: 'A',
+      selector: `a[href="/p?id=${PLANTED_TOKEN}"]`,
+      text: `Visit /reset?coupon=${PLANTED_VALUE}`,
+      componentChain: ['ExportControl', `ToolbarRow?x=${PLANTED_TOKEN}`],
+    };
+    const { builder } = builderFixture(probeLibrary());
+    const build = expectOk(
+      builder.buildUnderstandRequest({ context: stageContext({ target }).context }),
+    );
+
+    const inputTarget = build.request.input['target'];
+    expect(inputTarget).toEqual({
+      tagName: 'A',
+      selector: `a[href="/p?id=${URL_QUERY_MASK}"]`,
+      text: `Visit /reset?coupon=${URL_QUERY_MASK}`,
+      componentChain: ['ExportControl', `ToolbarRow?x=${URL_QUERY_MASK}`],
+    });
+    expect(build.truncated).toEqual([]);
+    expect(probeValues(build.request.prompt)['target']).toBe(toPromptJson(inputTarget));
+    for (const sent of [build.request.prompt, JSON.stringify(build.request.input)]) {
+      for (const planted of [PLANTED_VALUE, PLANTED_TOKEN]) {
+        expect(sent).not.toContain(planted);
+      }
+    }
+
+    // None of these strings is a URL to the guard: unredacted, their values would have been sent.
+    const unredacted = builder.buildStageRequest({
+      stage: 'understand',
+      values: understandProbeValues(),
+      input: {
+        target: {
+          tagName: target.tagName,
+          selector: target.selector,
+          text: target.text ?? '',
+          componentChain: [...target.componentChain],
+        },
+      },
+      sessionId: SESSION_ID,
+    });
+    expect(unredacted.ok).toBe(true);
+  });
+
+  it('builds a selected link longer than the text cap whose cut falls inside a query value', () => {
+    // A parameter name sized so the cap's cut lands just after its `=`, with one more pair behind it.
+    const name = 'q'.repeat(CONTEXT_LIMITS.maxTargetTextChars - 1 - LINK_URL_REDACTED.length - 2);
+    const text = `${LINK_URL}&${name}=${PLANTED_TOKEN}&step=${PLANTED_TOKEN}`;
+    const masked = `${LINK_URL_REDACTED}&${name}=${URL_QUERY_MASK}&step=${URL_QUERY_MASK}`;
+    expect(masked.length).toBeGreaterThan(CONTEXT_LIMITS.maxTargetTextChars);
+    const { builder } = builderFixture(committedLibrary());
+
+    // A plain cut of the masked link leaves `name=…`, which the guard refuses.
+    const plain = capText(masked, CONTEXT_LIMITS.maxTargetTextChars).text;
+    expect(plain).toBe(`${LINK_URL_REDACTED}&${name}=${TRUNCATION_MARKER}`);
+    expect(expectErr(guardTargetText(builder, plain)).details?.['ruleIds']).toEqual([
+      'url-query-value',
+    ]);
+
+    const build = expectOk(
+      builder.buildUnderstandRequest({
+        context: stageContext({ target: { ...TARGET, tagName: 'A', text } }).context,
+      }),
+    );
+    expect(build.request.input['target']).toMatchObject({
+      text: `${LINK_URL_REDACTED}&${TRUNCATION_MARKER}`,
+    });
+    expect(build.truncated).toEqual(['target']);
+    for (const sent of [build.request.prompt, JSON.stringify(build.request.input)]) {
+      expect(sent).not.toContain(PLANTED_VALUE);
+      expect(sent).not.toContain(PLANTED_TOKEN);
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -56,13 +56,29 @@
  *
  * `base.css` records the structural forms that encode no design decision and
  * are therefore permitted, and this file uses exactly those: percentages
- * (`100%`, `50%`), grid and flex ratios (`1fr`, `minmax(0, 1fr)`,
- * `flex: 1 1 auto`), `aspect-ratio: 1`, intrinsic sizes (`max-content`),
- * unitless SVG geometry (`stroke-width`, `stroke-dasharray`), and the
- * border-width keywords `thin` and `medium` — which is how every hairline and
- * every emphasis edge below is expressed, never as a length.
+ * (`100%`, `50%`), flex ratios (`flex: 1 1 auto`), `aspect-ratio: 1`,
+ * intrinsic sizes (`max-content`) and unitless SVG geometry (`stroke-width`,
+ * `stroke-dasharray`). Three kinds of value that once appeared here as
+ * keywords or units are tokens instead, so no rule below writes them:
  *
- * Two derived forms appear, each annotated where it occurs:
+ * - An edge's weight is its ROLE: `--dg-border-width-hairline` for every
+ *   divider, table rule, outline and control or card border, and
+ *   `--dg-border-width-marker` for every emphasis edge — the inline-start
+ *   marker of an active or selected row, a callout's accent edge, the spinner
+ *   ring. No `thin`, `medium` or `thick` keyword appears in a border or
+ *   outline declaration.
+ * - A measured number takes its unit from `--dg-pixel-unit` (see the next
+ *   list); no `1px` is written here.
+ * - A share of a grid's spare width is a `--dg-column-share-*` token — the
+ *   single track that fills its grid is
+ *   `minmax(0, var(--dg-column-share-default))` — the same shares
+ *   `src/primitives/DataTable.tsx` builds its column tracks from. The one
+ *   ratio left in a rule is the waterfall row's name-to-bar split
+ *   (`minmax(0, 2fr) minmax(0, 5fr)`), which proportions a time axis against
+ *   its labels — chart geometry of `components/Waterfall.tsx`, not a column
+ *   share.
+ *
+ * Three derived forms appear, each annotated where it occurs:
  *
  * - `calc(<space token> * n)` for the few silhouette and container sizes the
  *   token table has no value for (a loading placeholder's height, a scroll
@@ -71,10 +87,17 @@
  *   thing this file adds. A size composed from two tokens is written as their
  *   sum (`calc(<token> + <token>)`) for the same reason — the `md` icon-only
  *   control's side and the dropdown's chevron room are each one such sum.
- * - `calc(var(--dgc-…, 0) * 1px)` where a component hands CSS a UNITLESS
- *   number (a virtualizer offset). The number is the value; `1px` is only the
- *   unit it is given, and this consumption form is fixed by the contract
- *   `src/primitives/DataTable.tsx` declares.
+ * - `calc(var(--dgc-…, 0) * var(--dg-pixel-unit))` where a component hands CSS
+ *   a UNITLESS number it measured in CSS pixels (a virtualizer offset, a
+ *   tooltip coordinate). The number is the value and `--dg-pixel-unit` is only
+ *   the unit it is given; this consumption form is fixed by the contracts
+ *   `src/primitives/DataTable.tsx` and `src/primitives/Tooltip.tsx` declare,
+ *   and `src/tokens/tokens.test.ts` fails on any other multiplier for those
+ *   measured properties.
+ * - `calc(var(--dgc-…, 0) * <space token>)` where a component hands CSS a
+ *   COUNT rather than a measurement (a tree depth). The count says how many
+ *   steps and the token is the step, so the indentation stays on the design
+ *   scale.
  *
  * No `@media` rule appears here at all. `base.css` owns the only one in the
  * package (`prefers-reduced-motion`), and responsiveness is intrinsic —
@@ -90,9 +113,9 @@
  * `src/layout/PanelShell.tsx` from `src/tokens/theme.ts`. The token blocks
  * carry every difference, including the high-contrast theme's thicker focus
  * ring, its opaque borders and its absent shadows — which is why every
- * elevated surface here pairs `--dg-shadow-*` with a `thin` or `medium`
- * border, so a surface stays delineated in a theme where the shadow resolves
- * to `none`.
+ * elevated surface here pairs `--dg-shadow-*` with a hairline or marker border
+ * (`--dg-border-width-*`), so a surface stays delineated in a theme where the
+ * shadow resolves to `none`.
  *
  * There is one deliberate exception, and only one. The high-contrast theme
  * raises both border tones to the same colour, so a hover that only moves an
@@ -242,7 +265,7 @@
 .dg-metric-cards__card,
 .dg-summary-header {
   background: var(--dg-surface-elevated);
-  border: thin solid var(--dg-border-subtle);
+  border: var(--dg-border-width-hairline) solid var(--dg-border-subtle);
   border-radius: var(--dg-radius-md);
 }
 
@@ -276,7 +299,7 @@
   overflow: clip;
   padding-block: var(--dg-space-0);
   padding-inline: var(--dg-space-2);
-  border: thin solid transparent;
+  border: var(--dg-border-width-hairline) solid transparent;
   border-radius: var(--dg-radius-sm);
   font: var(--dg-text-xs);
   white-space: nowrap;
@@ -312,7 +335,8 @@
 .dg-virtual-viewport,
 .dg-flame__viewport,
 .dg-timeline__viewport,
-.dg-dependency-graph__viewport {
+.dg-dependency-graph__viewport,
+.dg-waterfall__viewport {
   overflow: auto;
   overscroll-behavior: contain;
   scrollbar-width: thin;
@@ -322,14 +346,15 @@
 /* ==========================================================================
  * Virtualization
  *
- * `@tanstack/react-virtual` drives `primitives/DataTable` (and through it
- * `components/EventLog`) and the frame tree of `components/FlameChart`. The
- * contract, declared by DataTable.tsx and honoured on both sides:
+ * `@tanstack/react-virtual` drives `primitives/DataTable` and, through it,
+ * every view that lists its records in a table (`components/EventLog` among
+ * them). The contract, declared by DataTable.tsx and honoured on both sides:
  *
  *   - the component supplies the total canvas size as the UNITLESS
  *     `--dgc-virtual-total` and each row's offset as the unitless
- *     `--dgc-virtual-start`;
- *   - CSS supplies positioning and the unit, and nothing else.
+ *     `--dgc-virtual-start`, both measured in CSS pixels;
+ *   - CSS supplies positioning, and gives each number its unit through the
+ *     `--dg-pixel-unit` token, and nothing else.
  *
  * The canvas takes `min-block-size` rather than `block-size` deliberately.
  * Every consumer falls back to rendering rows unvirtualized, in normal flow,
@@ -350,7 +375,7 @@
 .dg-virtual-canvas {
   position: relative;
   inline-size: 100%;
-  min-block-size: calc(var(--dgc-virtual-total, 0) * 1px);
+  min-block-size: calc(var(--dgc-virtual-total, 0) * var(--dg-pixel-unit));
 }
 
 /* The row is placed by its block-start INSET rather than by a transform. A
@@ -360,7 +385,7 @@
  * bubble exists to escape. */
 .dg-virtual-row {
   position: absolute;
-  inset-block-start: calc(var(--dgc-virtual-start, 0) * 1px);
+  inset-block-start: calc(var(--dgc-virtual-start, 0) * var(--dg-pixel-unit));
   inset-inline-start: 0;
   inline-size: 100%;
 }
@@ -398,7 +423,7 @@
   padding-block: var(--dg-space-1);
   padding-inline: var(--dg-space-3);
   background: var(--dg-surface-elevated);
-  border: thin solid var(--dg-border-subtle);
+  border: var(--dg-border-width-hairline) solid var(--dg-border-subtle);
   border-radius: var(--dg-radius-sm);
   color: var(--dg-text-primary);
   font: var(--dg-text-md);
@@ -660,7 +685,7 @@
   min-inline-size: 0;
   padding-inline: var(--dg-space-2);
   background: var(--dg-surface-elevated);
-  border: thin solid var(--dg-border-subtle);
+  border: var(--dg-border-width-hairline) solid var(--dg-border-subtle);
   border-radius: var(--dg-radius-sm);
   transition-property: border-color;
   transition-duration: var(--dg-motion-duration);
@@ -1031,8 +1056,9 @@
  * against the content of the row it is in, so a column declared that way gives
  * the header one width, the first row another and the third row a third, and
  * the header ends up over the wrong column — confirmed in the browser, not
- * theorised. Columns take a RATIO (`minmax(0, 1fr)`, `2fr`) or a length built
- * from the tokens; `subgrid` is not an escape, because an absolutely
+ * theorised. Columns take a semantic role that DataTable.tsx resolves to a
+ * `minmax(<--dg-column-min-*>, <--dg-column-share-*>)` track built from the
+ * tokens alone; `subgrid` is not an escape, because an absolutely
  * positioned virtualized row cannot be a subgrid of the grid it belongs to.
  *
  * The sorted column is reported by the CELL's `aria-sort` attribute and by
@@ -1066,13 +1092,14 @@
  * squeezing. primitives/DataTable.tsx publishes the sum of its columns'
  * minimum tracks as `--dgc-min-inline` and their number as
  * `--dgc-column-count`; the floor adds the gaps between the tracks and the
- * row's inline-start edge (the `medium` border below, which `--dg-space-1`
- * covers). Wider than its viewport, the grid overflows it and the viewport —
- * `overflow: auto` — scrolls horizontally with every column still at its
- * readable minimum. The floor is a sum of MINIMUMS rather than `max-content`:
- * each row is its own grid container, so a content-sized grid would change
- * width with whichever rows the window currently renders. With no stated
- * minimum the fallback leaves the grid exactly as wide as its viewport. */
+ * row's inline-start edge (the `--dg-border-width-marker` border below, which
+ * `--dg-space-1` covers). Wider than its viewport, the grid overflows it and
+ * the viewport — `overflow: auto` — scrolls horizontally with every column
+ * still at its readable minimum. The floor is a sum of MINIMUMS rather than
+ * `max-content`: each row is its own grid container, so a content-sized grid
+ * would change width with whichever rows the window currently renders. With
+ * no stated minimum the fallback leaves the grid exactly as wide as its
+ * viewport. */
 .dg-data-table [role='grid'] {
   display: block;
   min-inline-size: max(
@@ -1092,7 +1119,7 @@
   inset-block-start: 0;
   z-index: var(--dg-z-overlay);
   background: var(--dg-surface-elevated);
-  border-block-end: thin solid var(--dg-border-subtle);
+  border-block-end: var(--dg-border-width-hairline) solid var(--dg-border-subtle);
   /* The low elevation separates the pinned header from the rows travelling
    * under it. The high-contrast theme resolves it to `none`, where the
    * hairline above is what keeps the separation. */
@@ -1102,7 +1129,7 @@
 .dg-data-table__head [role='row'],
 .dg-data-table__row {
   display: grid;
-  grid-template-columns: var(--dgc-columns, minmax(0, 1fr));
+  grid-template-columns: var(--dgc-columns, minmax(0, var(--dg-column-share-default)));
   align-items: center;
   gap: var(--dg-space-2);
 }
@@ -1113,7 +1140,7 @@
  * header's tracks started one border-width earlier and each flexible track
  * resolved wider than the column beneath it. */
 .dg-data-table__head [role='row'] {
-  border-inline-start: medium solid transparent;
+  border-inline-start: var(--dg-border-width-marker) solid transparent;
 }
 
 /* `--dgc-align` arrives as a CSS alignment keyword, never a physical
@@ -1198,8 +1225,8 @@
  * border that appeared with the state would resize the row's grid box and
  * shift every cell in it. */
 .dg-data-table__row {
-  border-block-end: thin solid var(--dg-border-subtle);
-  border-inline-start: medium solid transparent;
+  border-block-end: var(--dg-border-width-hairline) solid var(--dg-border-subtle);
+  border-inline-start: var(--dg-border-width-marker) solid transparent;
   transition-property: background-color, border-color;
   transition-duration: var(--dg-motion-duration);
   transition-timing-function: var(--dg-motion-easing);
@@ -1301,11 +1328,11 @@
  * column, so it takes a single full-width track rather than the grid's. */
 .dg-data-table__expanded {
   display: grid;
-  grid-template-columns: minmax(0, 1fr);
+  grid-template-columns: minmax(0, var(--dg-column-share-default));
   padding-block: var(--dg-space-2);
   padding-inline: var(--dg-space-4);
   background: var(--dg-surface-elevated);
-  border-block-end: thin solid var(--dg-border-subtle);
+  border-block-end: var(--dg-border-width-hairline) solid var(--dg-border-subtle);
 }
 
 /* Totals and paging counts, below the viewport rather than inside the grid, so
@@ -1326,7 +1353,7 @@
   gap: var(--dg-space-2);
   padding-block: var(--dg-space-1);
   padding-inline: var(--dg-space-2);
-  border-block-start: thin solid var(--dg-border-subtle);
+  border-block-start: var(--dg-border-width-hairline) solid var(--dg-border-subtle);
   color: var(--dg-text-muted);
   font: var(--dg-text-xs);
 }
@@ -1451,7 +1478,7 @@
   padding-block: 0;
   padding-inline: var(--dg-space-0);
   background: var(--dg-surface-elevated);
-  border: thin solid var(--dg-border-subtle);
+  border: var(--dg-border-width-hairline) solid var(--dg-border-subtle);
   border-radius: var(--dg-radius-sm);
   color: var(--dg-text-primary);
   font: var(--dg-mono-md);
@@ -1499,7 +1526,7 @@
   padding-block: 0;
   padding-inline: var(--dg-space-1);
   background: var(--dg-surface-elevated);
-  border: thin solid var(--dg-border-strong);
+  border: var(--dg-border-width-hairline) solid var(--dg-border-strong);
   border-radius: var(--dg-radius-sm);
   color: var(--dg-text-primary);
   font: var(--dg-mono-sm);
@@ -1605,20 +1632,23 @@
   pointer-events: none;
 }
 
-/* Gap: no size token exists for a maximum width. Ten units of the largest
+/* The open bubble sits at the two UNITLESS viewport coordinates Tooltip.tsx
+ * measured in CSS pixels, each given its unit by `--dg-pixel-unit`.
+ *
+ * Gap: no size token exists for a maximum width. Ten units of the largest
  * space token is about a short sentence at the `--dg-text-sm` role, which is
  * what a tooltip carries. */
 .dg-tooltip__bubble.dg-is-open {
   position: fixed;
-  inset-block-start: calc(var(--dgc-tooltip-block, 0) * 1px);
-  inset-inline-start: calc(var(--dgc-tooltip-inline, 0) * 1px);
+  inset-block-start: calc(var(--dgc-tooltip-block, 0) * var(--dg-pixel-unit));
+  inset-inline-start: calc(var(--dgc-tooltip-inline, 0) * var(--dg-pixel-unit));
   inline-size: max-content;
   max-inline-size: calc(var(--dg-space-7) * 10);
   padding-block: var(--dg-space-1);
   padding-inline: var(--dg-space-2);
   /* The hairline is what delineates the bubble in the high-contrast theme,
    * where every shadow token resolves to `none`. */
-  border: thin solid var(--dg-border-strong);
+  border: var(--dg-border-width-hairline) solid var(--dg-border-strong);
   white-space: normal;
   /* A long unbroken value — a URL, a SQL identifier — wraps inside the
    * maximum width instead of running out of the bubble. */
@@ -1820,10 +1850,10 @@
  * primitive renders it: it is published for the host surfaces, and
  * `scripts/check-css-classes.mjs` lists it as such. Its square is
  * `--dg-spinner-size`, the glyph square it stands in for, so it scales with
- * the type role beside it. The ring is a `medium` border with one
- * accent-coloured side; `100%` makes it round. Gap: no rotation-duration token
- * exists, so the shared motion constant is multiplied to a speed that reads as
- * continuous rather than frantic.
+ * the type role beside it. The ring is a `--dg-border-width-marker` border
+ * with one accent-coloured side; `100%` makes it round. Gap: no
+ * rotation-duration token exists, so the shared motion constant is multiplied
+ * to a speed that reads as continuous rather than frantic.
  *
  * Geometry a host needs to know, measured in the browser rather than reasoned
  * about: rotating a square grows its axis-aligned bounding box by up to a
@@ -1845,7 +1875,7 @@
   flex: none;
   inline-size: var(--dg-spinner-size);
   block-size: var(--dg-spinner-size);
-  border: medium solid var(--dg-border-subtle);
+  border: var(--dg-border-width-marker) solid var(--dg-border-subtle);
   border-block-start-color: var(--dg-accent);
   border-radius: 100%;
   animation-name: dg-spin;
@@ -1870,8 +1900,8 @@
   min-block-size: calc(var(--dg-space-7) * 4);
   padding: var(--dg-space-4);
   background: var(--dg-surface-elevated);
-  border: thin solid var(--dg-border-subtle);
-  border-inline-start: medium solid var(--dg-danger);
+  border: var(--dg-border-width-hairline) solid var(--dg-border-subtle);
+  border-inline-start: var(--dg-border-width-marker) solid var(--dg-danger);
   border-radius: var(--dg-radius-md);
 }
 
@@ -2024,7 +2054,7 @@
 .dg-section--card > .dg-section__header {
   padding-block: var(--dg-space-3);
   padding-inline: var(--dg-space-4);
-  border-block-end: thin solid var(--dg-border-subtle);
+  border-block-end: var(--dg-border-width-hairline) solid var(--dg-border-subtle);
 }
 
 .dg-section--card > .dg-section__body {
@@ -2405,7 +2435,7 @@
   padding-block: var(--dg-space-1);
   padding-inline: var(--dg-space-2);
   background: var(--dg-surface-elevated);
-  border-block-end: thin solid var(--dg-border-subtle);
+  border-block-end: var(--dg-border-width-hairline) solid var(--dg-border-subtle);
   /* Same reason as the table header: a pinned row needs to read as being above
    * the content scrolling beneath it. */
   box-shadow: var(--dg-shadow-1);
@@ -2584,7 +2614,7 @@
 /* Measured facts: a neutral edge, because the region makes no claim beyond what
  * the capture holds. */
 .dg-summary-header__region--observed .dg-summary-header__facts {
-  border-inline-start: medium solid var(--dg-border-strong);
+  border-inline-start: var(--dg-border-width-marker) solid var(--dg-border-strong);
 }
 
 /* The observed register with nothing in it: one muted sentence where the list
@@ -2594,7 +2624,7 @@
 .dg-summary-header__none {
   min-inline-size: 0;
   padding-inline-start: var(--dg-space-3);
-  border-inline-start: medium solid var(--dg-border-strong);
+  border-inline-start: var(--dg-border-width-marker) solid var(--dg-border-strong);
   color: var(--dg-text-muted);
   font: var(--dg-text-md);
 }
@@ -2602,7 +2632,7 @@
 /* Inference: a warning-toned edge, and every item carries a confidence badge
  * whose text names the level, so the distinction is never colour alone. */
 .dg-summary-header__region--causes .dg-summary-header__facts {
-  border-inline-start: medium solid var(--dg-warning);
+  border-inline-start: var(--dg-border-width-marker) solid var(--dg-warning);
 }
 
 .dg-summary-header__fact {
@@ -2826,7 +2856,7 @@
  * context and the rows after it paint over it. The timeline row that is hovered
  * or holds focus is raised to the tooltip layer, so the description its
  * Operation cell reveals overlays the rows beneath instead of hiding under
- * them — the flame chart's tree does the same for its rows. */
+ * them. */
 .dg-timeline__equivalent .dg-virtual-row:hover,
 .dg-timeline__equivalent .dg-virtual-row:focus-within {
   z-index: var(--dg-z-tooltip);
@@ -2851,17 +2881,13 @@
 }
 
 /* Every SVG canvas in the package. `display: block` removes the inline
- * baseline gap under it; the `width`/`height` attributes are the component's.
+ * baseline gap under it.
  *
- * A measured canvas is drawn in CSS pixels — one user unit per pixel, so its
- * text renders at the typography token's size at every panel width — and is
- * never narrower than the chart's minimum, so on a narrow panel it is wider
- * than its viewport and the viewport scrolls. `max-inline-size: none` is what
- * lets it: base.css caps every `svg` at its container's width, which would
- * scale a wide canvas down, shrinking its labels below legibility and leaving
- * its declared height standing as a blank band beneath the drawing. An
- * unmeasured canvas (no layout, see `utils/measure.ts`) declares a width of
- * `100%` itself, so it still fits its container. */
+ * No canvas is measured: each is drawn in a fixed logical coordinate space
+ * (`utils/scale.ts`, "Canvas width"), so its drawing is a pure function of the
+ * data. `max-inline-size: none` lifts base.css's cap on every `svg`, which
+ * would otherwise scale a canvas down to its container past the minimum each
+ * one sets below. */
 .dg-timeline__canvas,
 .dg-flame__canvas,
 .dg-dependency-graph__canvas {
@@ -2870,9 +2896,32 @@
   max-inline-size: none;
 }
 
-/* The scroll viewport each canvas is measured from. Inline-size containment
- * makes the viewport's width its container's alone: without it, a canvas drawn
- * at the measured width would become the viewport's min-content width, hold a
+/* The two time charts declare a viewBox `CHART_VIEWBOX_WIDTH` units wide with
+ * `width="100%"` and `preserveAspectRatio="xMinYMin meet"`, so CSS scales the
+ * drawing uniformly to its section. `inline-size: 100%` makes the element as
+ * wide as its viewport and `block-size: auto` lets its height follow the
+ * viewBox's aspect ratio, so the drawing fills the element with no blank band
+ * beneath or beside it; the `height` attribute is only the intrinsic fallback.
+ * The labels inside are set in a type role and scale with the drawing, so the
+ * minimum is what keeps them legible on a narrow panel: below it the canvas
+ * stops shrinking and its viewport scrolls horizontally instead. Gap: no size
+ * token exists for a chart's legible minimum; thirty-two units of the largest
+ * space token keeps an 11-unit label above eight pixels.
+ *
+ * The dependency graph is not in this rule: it declares its own deterministic
+ * logical size as its `width` and `height`, one unit to a CSS pixel, so its
+ * labels render at their token size and a graph wider than the panel scrolls
+ * in its viewport. */
+.dg-timeline__canvas,
+.dg-flame__canvas {
+  inline-size: 100%;
+  block-size: auto;
+  min-inline-size: calc(var(--dg-space-7) * 32);
+}
+
+/* The scroll viewport each canvas scrolls in. Inline-size containment makes
+ * the viewport's width its container's alone: without it, a canvas's minimum
+ * or declared width would become the viewport's min-content width, hold a
  * shrink-to-fit ancestor (a flex pane, a grid track sized by its content) at
  * that width, and the chart could never narrow when the panel does. */
 .dg-timeline__viewport,
@@ -2921,7 +2970,8 @@
  * edge from a parent span to each child.
  *
  * `--dgc-bar-color` carries the span's kind colour, `--dgc-lane-color` the
- * lane's tier accent. A bar's LABEL is measured by the component and drawn
+ * lane's tier accent. A bar's LABEL is fitted by the component in logical
+ * units (a deterministic advance estimate, `utils/format.ts`) and drawn
  * where it fits: beside the bar (after it, else before it) in a text tone on
  * the lane surface, and only where neither side has room, inside a bar wide
  * enough to hold it, in the base surface on the kind fill (`__bar-label--inside`).
@@ -3164,18 +3214,49 @@
  *
  * Request and dependency timing as HTML rows rather than one SVG canvas: each
  * row's bar is positioned inline by the component inside a track that spans
- * the row's time column, which keeps the labels selectable text.
+ * the row's time column, which keeps the labels selectable text. The axis and
+ * the rows scroll together in `__viewport`; the footer sits below it.
  * ========================================================================== */
 
+/* The scroll viewport the axis and the tree of rows share. The footer is
+ * outside it, so the counts and the paging controls never scroll out of reach.
+ *
+ * The row rule below floors the time track, so every row has a minimum inline
+ * size; a panel narrower than that scrolls here, horizontally, rather than
+ * squeezing the axis labels into each other or spilling tracks past the rows
+ * that hold them. One grid column holds both children: never narrower than the
+ * widest row's minimum (`min-content`), otherwise the viewport's whole width
+ * (`1fr`). So the axis row and the top-level rows always share one inline
+ * size — scrolling changes nothing about how the strip lines up with their
+ * tracks — and each row's background, state edge and focus ring span its
+ * tracks rather than stopping short of an overflowing one. A row pulls its
+ * focus ring inward, so the scroll edge never clips it, and an open
+ * description bubble is fixed to the browser viewport (primitives/Tooltip), so
+ * the scroll container does not clip it either. `min-inline-size: 0` lets the
+ * viewport itself narrow with the panel. */
+.dg-waterfall__viewport {
+  display: grid;
+  grid-template-columns: minmax(min-content, 1fr);
+  min-inline-size: 0;
+}
+
+/* The time track is floored at the design strip Waterfall.tsx fits its tick
+ * labels to (`AXIS_DESIGN_WIDTH_EM`, fourteen ems of the `xs` role: 154 px at
+ * its 11 px), so the tick set fitted to that strip is never drawn on a
+ * narrower one, where its labels would collide. The axis row uses this same
+ * grid, so its strip takes the same floor as the bars' tracks. Gap: no size
+ * token exists for the axis's legible minimum; seven units of the largest
+ * space token (168 px) clear the strip, and Waterfall.test.tsx holds the two
+ * together in every theme. */
 .dg-waterfall__row {
   display: grid;
-  grid-template-columns: minmax(0, 2fr) minmax(0, 5fr) max-content;
+  grid-template-columns: minmax(0, 2fr) minmax(calc(var(--dg-space-7) * 7), 5fr) max-content;
   align-items: center;
   gap: var(--dg-space-2);
   padding-block: var(--dg-space-0);
   padding-inline: var(--dg-space-2);
-  border-block-end: thin solid var(--dg-border-subtle);
-  border-inline-start: medium solid transparent;
+  border-block-end: var(--dg-border-width-hairline) solid var(--dg-border-subtle);
+  border-inline-start: var(--dg-border-width-marker) solid transparent;
   transition-property: background-color, border-color;
   transition-duration: var(--dg-motion-duration);
   transition-timing-function: var(--dg-motion-easing);
@@ -3301,7 +3382,9 @@
   background: transparent;
 }
 
-/* The axis strip occupies the track column; it shrinks with it. */
+/* The axis strip fills the track column, which the row rule floors at the
+ * design strip. Its own minimum is zero so the graphic inside it, whose width
+ * is the strip's, never sizes the column. */
 .dg-waterfall__axis-strip {
   min-inline-size: 0;
 }
@@ -3385,7 +3468,10 @@
   /* Gap: `auto-fit` needs a definite minimum to decide a track count, and the
    * token table has no size family, so the minimum is six units of the largest
    * space token — about the width of a label and a formatted value. */
-  grid-template-columns: repeat(auto-fit, minmax(calc(var(--dg-space-7) * 6), 1fr));
+  grid-template-columns: repeat(
+    auto-fit,
+    minmax(calc(var(--dg-space-7) * 6), var(--dg-column-share-default))
+  );
   gap: var(--dg-space-3);
   min-inline-size: 0;
 }
@@ -3530,10 +3616,13 @@
 
 /* The chart's text equivalent. The canvas is `role="img"` and cannot be entered
  * with a keyboard, so the same frames are listed beneath it as a tree, one row
- * each, in the order the icicle draws them. The tree is virtualized through the
- * shared `dg-virtual-*` helpers, so its viewport is capped: the cap is what
- * gives the virtualizer a window to render into, and without it every row
- * would be laid out at once. */
+ * each, in the order the icicle draws them. The component mounts one page of
+ * the tree at a time — at most sixty rows, the page holding its tab stop, with
+ * a Previous/Next row pager laid out by `Stack` beneath it; nothing is
+ * measured — in the shared scroll viewport, whose block size is capped so a
+ * long page scrolls rather than pushing the rest of the panel down. Its rows
+ * are in normal flow, so no row is a stacking context of its own and a row's
+ * detail bubble overlays the rows beneath without being raised. */
 .dg-flame__equivalent {
   min-inline-size: 0;
 }
@@ -3541,15 +3630,6 @@
 .dg-flame__equivalent .dg-virtual-viewport {
   /* Gap: no size token exists for a list's scroll cap. */
   max-block-size: calc(var(--dg-space-7) * 14);
-}
-
-/* A positioned row is its own stacking context, and the rows after it paint
- * over it, so the row being hovered or read is raised to the tooltip layer:
- * its detail bubble then overlays the rows beneath instead of hiding under
- * them. */
-.dg-flame__equivalent .dg-virtual-row:hover,
-.dg-flame__equivalent .dg-virtual-row:focus-within {
-  z-index: var(--dg-z-tooltip);
 }
 
 /* One frame's row. `--dgc-depth` is the frame's depth as a unitless integer and
@@ -3566,7 +3646,7 @@
   padding-block: var(--dg-space-0);
   padding-inline-end: var(--dg-space-2);
   padding-inline-start: calc(var(--dgc-depth, 0) * var(--dg-space-4));
-  border-inline-start: medium solid transparent;
+  border-inline-start: var(--dg-border-width-marker) solid transparent;
 }
 
 /* The row whose frame the pointer rests on in the icicle above: the author's
@@ -3725,7 +3805,7 @@
  * as on a grid row, and the transition is the grid row's. */
 .dg-render-table__occurrence {
   min-inline-size: 0;
-  border-inline-start: medium solid transparent;
+  border-inline-start: var(--dg-border-width-marker) solid transparent;
   transition-property: background-color, border-color;
   transition-duration: var(--dg-motion-duration);
   transition-timing-function: var(--dg-motion-easing);
@@ -3764,7 +3844,7 @@
   padding-block: var(--dg-space-0);
   padding-inline-end: var(--dg-space-2);
   padding-inline-start: calc(var(--dgc-depth, 0) * var(--dg-space-4));
-  border-inline-start: medium solid transparent;
+  border-inline-start: var(--dg-border-width-marker) solid transparent;
   cursor: pointer;
   /* The same easing a grid row's hover and selection take, so a tree beside a
    * table answers the pointer at the same pace. base.css's reduced-motion
@@ -3921,7 +4001,9 @@
  * occurrences) spans every track. */
 .dg-request-table__occurrences > .dg-stack__items {
   display: grid;
-  grid-template-columns: max-content max-content max-content minmax(0, 1fr);
+  grid-template-columns:
+    max-content max-content max-content
+    minmax(0, var(--dg-column-share-default));
   align-items: center;
   column-gap: var(--dg-space-3);
 }
@@ -3945,7 +4027,7 @@
   padding-block: var(--dg-space-0);
   padding-inline-start: var(--dg-space-4);
   background: var(--dg-surface-elevated);
-  border-inline-start: medium solid transparent;
+  border-inline-start: var(--dg-border-width-marker) solid transparent;
   font: var(--dg-mono-sm);
   transition-property: background-color, border-color;
   transition-duration: var(--dg-motion-duration);
@@ -4067,7 +4149,7 @@
   padding-inline: var(--dg-space-1);
   border-radius: var(--dg-radius-sm);
   background: var(--dg-surface-elevated);
-  border-inline-start: medium solid transparent;
+  border-inline-start: var(--dg-border-width-marker) solid transparent;
 }
 
 /* The execution that is the panel's selected event, drawn as every selected
@@ -4190,7 +4272,7 @@
  * component's tooltip explains the bound. There is no fuller value to offer —
  * the summary it received is the most the capture was permitted to hold. */
 .dg-state-transitions__value.dg-is-truncated {
-  border-block-end: thin dotted var(--dg-border-strong);
+  border-block-end: var(--dg-border-width-hairline) dotted var(--dg-border-strong);
   cursor: help;
 }
 
@@ -4605,7 +4687,7 @@
   padding-block: var(--dg-space-2);
   padding-inline: var(--dg-space-4);
   background: var(--dg-surface-overlay);
-  border: thin solid var(--dg-border-strong);
+  border: var(--dg-border-width-hairline) solid var(--dg-border-strong);
   border-radius: var(--dg-radius-sm);
   color: var(--dg-text-primary);
   font: var(--dg-text-sm);
@@ -4615,7 +4697,7 @@
  * from the capture because the generated specification did not validate. */
 .dg-panel__banner--fallback {
   border-color: var(--dg-warning);
-  border-inline-start: medium solid var(--dg-warning);
+  border-inline-start: var(--dg-border-width-marker) solid var(--dg-warning);
 }
 
 .dg-panel__banner--fallback .dg-icon {

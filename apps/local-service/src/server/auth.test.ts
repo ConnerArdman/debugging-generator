@@ -19,11 +19,15 @@
  *    SQL, precisely so that the "stored only as a hash" rule is checked against
  *    what is actually on disk rather than against what a repository reports.
  * 2. **Injected seams, never patched globals.** The clock, the randomness
- *    source, the revoker and the logger are the module's own `createAuthService`
- *    dependencies. The clock is a manual counter; the randomness is a
- *    counter-seeded SHA-256 stream, which makes every token and pairing code
- *    reproducible and also lets one test step *inside* a redemption to stage a
- *    genuine double-redemption race. Two tests keep the real CSPRNG.
+ *    source, the revoker, the logger and the credential-file port are the
+ *    module's own `createAuthService` dependencies. The clock is a manual
+ *    counter; the randomness is a counter-seeded SHA-256 stream, which makes
+ *    every token and pairing code reproducible and also lets one test step
+ *    *inside* a redemption to stage a genuine double-redemption race. Two tests
+ *    keep the real CSPRNG. The credential-file port wraps the real safe-fs
+ *    writer and fails exactly the step of a replacement a test names, and a
+ *    per-connection `TEMP` trigger fails a store commit, which is how the
+ *    two-resource rotation is interrupted at every point without a mock.
  * 3. **Protocol is imported, never restated.** The exempt operations, the
  *    close code, the hello deadline, the protocol version and the hello schema
  *    come from `@debuggen/protocol`; the failure table, the pairing constants
@@ -43,22 +47,28 @@ import { createHash, randomBytes as cryptoRandomBytes } from 'node:crypto';
 import {
   chmodSync,
   existsSync,
+  lstatSync,
   mkdtempSync,
   readFileSync,
   rmSync,
   statSync,
+  symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import { Hono } from 'hono';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
+  ACTING_TAB_HEADER,
   AUTHORIZATION_HEADER,
   AUTH_EXEMPT_OPERATIONS,
   CLIENT_HELLO_TIMEOUT_MS,
   HTTP_OPERATIONS,
+  HTTP_ROUTES,
   PROTOCOL_VERSION,
   WS_CLOSE_UNAUTHORIZED,
   clientHelloPayloadSchema,
@@ -77,7 +87,7 @@ import {
   unwrap,
 } from '@debuggen/shared';
 import type { Logger, Result } from '@debuggen/shared';
-import { sha256Hex } from '@debuggen/shared/node';
+import { sha256Hex, writeSecureFileAtomic } from '@debuggen/shared/node';
 
 import { loadServiceConfig } from '../config.js';
 import type { ServiceConfig } from '../config.js';
@@ -85,8 +95,10 @@ import { openStore } from '../store/db.js';
 import type { Store } from '../store/db.js';
 import {
   AUTH_FAILURE_REASONS,
+  AUTH_FILE_STAGE_SUFFIX,
   CREDENTIAL_ROLES,
   CREDENTIAL_TOKEN_BYTES,
+  MAX_WORKSPACE_ANNOUNCEMENT_LEASE_MS,
   OPERATION_ROLES,
   PAIRING_CODE_ALPHABET,
   PAIRING_CODE_LENGTH,
@@ -100,12 +112,14 @@ import {
   authFailureStatus,
   authFileSchema,
   classifyOrigin,
+  createAuthMiddleware,
   createAuthService,
   isAllowedOrigin,
   requireBoundSession,
   requireProjectScope,
   requireRole,
   requireSessionAccess,
+  resolveActingTab,
   roleForClientKind,
 } from './auth.js';
 import type {
@@ -114,13 +128,16 @@ import type {
   AuthService,
   AuthenticatedOperation,
   ConnectionRevoker,
+  CredentialFileSystem,
   DevtoolsPrincipal,
+  EditorCredentialState,
   EditorPrincipal,
   HeaderSource,
   IssuedCredential,
   Principal,
   PrincipalRole,
   ServerAgentPrincipal,
+  ServerEnv,
   TabBinding,
 } from './auth.js';
 
@@ -436,6 +453,8 @@ interface ServiceOptions {
   /** A scripted source, or `'csprng'` to leave the module's default in place. */
   readonly random?: ScriptedRandom | 'csprng';
   readonly revoker?: ConnectionRevoker;
+  /** A credential-file port; absent to leave the module's real safe-fs writer in place. */
+  readonly fileSystem?: CredentialFileSystem;
 }
 
 /** How many services have been built without an explicit source, so each gets its own stream. */
@@ -454,6 +473,7 @@ function createService(options: ServiceOptions): AuthService {
       revoker: options.revoker,
       now: clock.read,
       randomBytes: random === 'csprng' ? undefined : random.source,
+      fileSystem: options.fileSystem,
     }),
   );
   cleanups.push(() => {
@@ -510,13 +530,21 @@ afterAll(() => {
  * Credential, request and row helpers
  * ---------------------------------------------------------------------------------------------- */
 
-/** Reads `auth.json` through the module's own schema, remembering its body and token. */
-function readAuthFile(config: Pick<ServiceConfig, 'authFilePath'>): AuthFileRecord {
-  const text = remember(readFileSync(config.authFilePath, 'utf8'));
+/**
+ * Reads an editor credential record — `auth.json` or its journal — through the
+ * module's own schema, remembering its body and token.
+ */
+function readRecordAt(path: string): AuthFileRecord {
+  const text = remember(readFileSync(path, 'utf8'));
   const json: unknown = JSON.parse(text);
   const record = authFileSchema.parse(json);
   remember(record.token);
   return record;
+}
+
+/** Reads `auth.json` through the module's own schema, remembering its body and token. */
+function readAuthFile(config: Pick<ServiceConfig, 'authFilePath'>): AuthFileRecord {
+  return readRecordAt(config.authFilePath);
 }
 
 /** The permission bits of a file. */
@@ -1085,6 +1113,43 @@ describe('the origin policy', () => {
       ]);
     }
   });
+
+  // Chrome sends no `Origin` on a `GET` the extension's service worker makes to a
+  // host it holds a permission for, so the extension's reads arrive without one;
+  // every state-changing request, and the hello, still name the extension.
+  it('accepts a DevTools credential from no origin on its GET routes only', () => {
+    const devtools = pairDevtools();
+    const devtoolsOperations = (
+      Object.keys(OPERATION_ROLES) as (keyof typeof OPERATION_ROLES)[]
+    ).filter((operation) => (OPERATION_ROLES[operation] as readonly string[]).includes('devtools'));
+    const reads = devtoolsOperations.filter((operation) => HTTP_ROUTES[operation].method === 'GET');
+    const writes = devtoolsOperations.filter(
+      (operation) => HTTP_ROUTES[operation].method !== 'GET',
+    );
+    expect(reads).toEqual(['session.get', 'panel.get', 'panel.getById', 'modifications.list']);
+    expect(writes).toEqual(['capture.start', 'capture.stop', 'panel.data']);
+
+    for (const operation of reads) {
+      asDevtools(expectOk(authorize(operation, devtools)));
+      for (const origin of [WEBVIEW_ORIGIN, extensionOrigin(OTHER_EXTENSION_ID)]) {
+        expectRefusal(authorize(operation, devtools, origin), 'origin-not-permitted-for-role', [
+          devtools,
+        ]);
+      }
+    }
+    for (const operation of writes) {
+      asDevtools(expectOk(authorize(operation, devtools, extensionOrigin(EXTENSION_ID))));
+      expectRefusal(authorize(operation, devtools), 'origin-not-permitted-for-role', [devtools]);
+    }
+    expectRefusal(
+      harness.auth.authorizeHello({
+        payload: helloPayload('devtools', devtools, { tabId: 5 }),
+        origin: undefined,
+      }),
+      'origin-not-permitted-for-role',
+      [devtools],
+    );
+  });
 });
 
 /* =================================================================================================
@@ -1617,37 +1682,276 @@ describe('role and scope authorization', () => {
       boundBy: secondPrincipal.tokenHash,
     };
 
-    expectOk(requireBoundSession(firstPrincipal, ownSession.id, ownBinding));
-    expectOk(requireSessionAccess(firstPrincipal, ownSession, ownBinding));
+    expectOk(requireBoundSession(firstPrincipal, ownSession.id, ownBinding, ownBinding.tabId));
+    expectOk(requireSessionAccess(firstPrincipal, ownSession, ownBinding, ownBinding.tabId));
 
     // A session bound to another tab, by another credential.
     expectRefusal(
-      requireBoundSession(firstPrincipal, otherSession.id, otherBinding),
+      requireBoundSession(firstPrincipal, otherSession.id, otherBinding, otherBinding.tabId),
       'session-not-bound',
     );
     expectRefusal(
-      requireSessionAccess(firstPrincipal, otherSession, otherBinding),
+      requireSessionAccess(firstPrincipal, otherSession, otherBinding, otherBinding.tabId),
       'session-not-bound',
     );
     // Its own binding presented for a session it is not bound to.
     expectRefusal(
-      requireBoundSession(firstPrincipal, otherSession.id, ownBinding),
+      requireBoundSession(firstPrincipal, otherSession.id, ownBinding, ownBinding.tabId),
       'session-not-bound',
     );
     // A binding to the right session that another credential made.
     expectRefusal(
-      requireBoundSession(firstPrincipal, ownSession.id, {
-        ...ownBinding,
-        boundBy: secondPrincipal.tokenHash,
-      }),
+      requireBoundSession(
+        firstPrincipal,
+        ownSession.id,
+        { ...ownBinding, boundBy: secondPrincipal.tokenHash },
+        ownBinding.tabId,
+      ),
       'session-not-bound',
     );
     // No binding at all.
     expectRefusal(
-      requireBoundSession(firstPrincipal, ownSession.id, undefined),
+      requireBoundSession(firstPrincipal, ownSession.id, undefined, ownBinding.tabId),
       'session-not-bound',
     );
-    expectRefusal(requireSessionAccess(firstPrincipal, ownSession), 'session-not-bound');
+    expectRefusal(
+      requireSessionAccess(firstPrincipal, ownSession, undefined, ownBinding.tabId),
+      'session-not-bound',
+    );
+    // Neither guard accepts a DevTools action that names no tab, even with a binding.
+    expectRefusal(requireSessionAccess(firstPrincipal, ownSession), 'acting-tab-required');
+  });
+
+  it('tells two tabs of one credential apart by the acting tab, never by the credential', () => {
+    const shared = pairDevtools();
+    const origin = extensionOrigin(EXTENSION_ID);
+    const principal = asDevtools(expectOk(authorize('panel.data', shared, origin)));
+    const sessionOfA = { id: newSessionId(), projectRoot: projectPath('alpha') };
+    const sessionOfB = { id: newSessionId(), projectRoot: projectPath('beta') };
+    const tabA = 31;
+    const tabB = 32;
+    // One credential bound both tabs, each to its own session.
+    const bindingOfA: TabBinding = {
+      tabId: tabA,
+      sessionId: sessionOfA.id,
+      boundBy: principal.tokenHash,
+    };
+    const bindingOfB: TabBinding = {
+      tabId: tabB,
+      sessionId: sessionOfB.id,
+      boundBy: principal.tokenHash,
+    };
+
+    // Each tab acts on its own session.
+    expectOk(requireBoundSession(principal, sessionOfA.id, bindingOfA, tabA));
+    expectOk(requireBoundSession(principal, sessionOfB.id, bindingOfB, tabB));
+    expectOk(requireSessionAccess(principal, sessionOfA, bindingOfA, tabA));
+
+    // Tab B, presenting the very same credential, cannot reach tab A's session …
+    expectRefusal(
+      requireBoundSession(principal, sessionOfA.id, bindingOfA, tabB),
+      'session-not-bound',
+    );
+    expectRefusal(
+      requireSessionAccess(principal, sessionOfA, bindingOfA, tabB),
+      'session-not-bound',
+    );
+    // … nor can a tab no binding names at all.
+    expectRefusal(
+      requireBoundSession(principal, sessionOfA.id, bindingOfA, 33),
+      'session-not-bound',
+    );
+    // A request that names no tab is refused rather than attributed to either tab.
+    expectRefusal(
+      requireBoundSession(principal, sessionOfA.id, bindingOfA, undefined),
+      'acting-tab-required',
+    );
+    expectRefusal(
+      requireSessionAccess(principal, sessionOfA, bindingOfA, undefined),
+      'acting-tab-required',
+    );
+
+    // Once tab B takes over session A (a second bind replaces the first), the
+    // displaced tab A loses it and tab B gains it.
+    const replaced: TabBinding = { ...bindingOfA, tabId: tabB };
+    expectRefusal(
+      requireBoundSession(principal, sessionOfA.id, replaced, tabA),
+      'session-not-bound',
+    );
+    expectOk(requireBoundSession(principal, sessionOfA.id, replaced, tabB));
+
+    // The acting tab never widens the role rule: an editor is still refused.
+    const editor = asEditor(expectOk(authorize('panel.data', editorToken())));
+    expectRefusal(
+      requireBoundSession(editor, sessionOfA.id, bindingOfA, tabA),
+      'role-not-permitted',
+    );
+  });
+
+  it('accepts the acting-tab header only from a DevTools credential, and only as one tab id', () => {
+    const devtools = pairDevtools();
+    const origin = extensionOrigin(EXTENSION_ID);
+    const editor = editorToken();
+    const agent = serverAgentToken(projectPath('alpha'));
+    const withTab = (token: string | undefined, value: string): Headers => {
+      const headers = token === undefined ? new Headers() : bearerHeaders(token);
+      headers.set(ACTING_TAB_HEADER, value);
+      return headers;
+    };
+    const principal = asDevtools(expectOk(authorize('panel.data', devtools, origin)));
+
+    // The pure rule the middleware extracts the value with.
+    expect(expectOk(resolveActingTab(principal, '42'))).toBe(42);
+    expect(expectOk(resolveActingTab(principal, '0'))).toBe(0);
+    expect(expectOk(resolveActingTab(principal, undefined))).toBeUndefined();
+    expect(expectOk(resolveActingTab(null, undefined))).toBeUndefined();
+    for (const malformed of ['', '-1', '01', '4.2', '1, 2', ' 42']) {
+      // Too short to search a stack trace for without false positives.
+      expectRefusal(resolveActingTab(principal, malformed), 'acting-tab-invalid');
+    }
+    for (const distinctive of ['forty-two-tabs', '99999999999999999']) {
+      expectRefusal(resolveActingTab(principal, distinctive), 'acting-tab-invalid', [distinctive]);
+    }
+    const editorPrincipal = asEditor(expectOk(authorize('panel.data', editor)));
+    const agentPrincipal = asServerAgent(expectOk(authorize('telemetry.event', agent)));
+    expectRefusal(resolveActingTab(editorPrincipal, '42'), 'acting-tab-not-permitted');
+    expectRefusal(resolveActingTab(agentPrincipal, '42'), 'acting-tab-not-permitted');
+    expectRefusal(resolveActingTab(null, '42'), 'acting-tab-not-permitted');
+    // A malformed value from a caller that may send none is refused for sending one at all.
+    expectRefusal(resolveActingTab(editorPrincipal, 'forty-two'), 'acting-tab-not-permitted');
+
+    // The access boundary enforces the same rule on every request, after the
+    // credential and the role table.
+    asDevtools(
+      expectOk(
+        harness.auth.authorizeHttpRequest({
+          headers: withTab(devtools, '42'),
+          origin,
+          operation: 'panel.data',
+        }),
+      ),
+    );
+    expectRefusal(
+      harness.auth.authorizeHttpRequest({
+        headers: withTab(devtools, 'not-a-tab'),
+        origin,
+        operation: 'panel.data',
+      }),
+      'acting-tab-invalid',
+      [devtools],
+    );
+    expectRefusal(
+      harness.auth.authorizeHttpRequest({
+        headers: {
+          [AUTHORIZATION_HEADER]: formatBearer(devtools),
+          [ACTING_TAB_HEADER]: ['1', '2'],
+        },
+        origin,
+        operation: 'panel.data',
+      }),
+      'acting-tab-invalid',
+      [devtools],
+    );
+    expectRefusal(
+      harness.auth.authorizeHttpRequest({
+        headers: withTab(editor, '42'),
+        origin: undefined,
+        operation: 'session.get',
+      }),
+      'acting-tab-not-permitted',
+      [editor],
+    );
+    expectRefusal(
+      harness.auth.authorizeHttpRequest({
+        headers: withTab(agent, '42'),
+        origin: undefined,
+        operation: 'telemetry.event',
+      }),
+      'acting-tab-not-permitted',
+      [agent],
+    );
+    for (const operation of AUTH_EXEMPT_OPERATIONS) {
+      expectRefusal(
+        harness.auth.authorizeHttpRequest({
+          headers: withTab(undefined, '42'),
+          origin: undefined,
+          operation,
+        }),
+        'acting-tab-not-permitted',
+      );
+    }
+    // The credential and role checks still come first: an unknown credential
+    // carrying a tab is refused as unknown, never judged by its tab.
+    const forged = remember(cryptoRandomBytes(CREDENTIAL_TOKEN_BYTES).toString('base64url'));
+    expectRefusal(
+      harness.auth.authorizeHttpRequest({
+        headers: withTab(forged, '42'),
+        origin,
+        operation: 'panel.data',
+      }),
+      'unknown-credential',
+      [forged],
+    );
+  });
+
+  it('hands routes the verified acting tab through the middleware, and refuses a bad header before them', async () => {
+    const devtools = pairDevtools();
+    const origin = extensionOrigin(EXTENSION_ID);
+    const editor = editorToken();
+    const seen: (number | undefined)[] = [];
+    const app = new Hono<ServerEnv>();
+    const authFor = createAuthMiddleware(harness.auth);
+    app.get('/probe', authFor('session.get'), (c) => {
+      seen.push(c.get('actingTabId'));
+      return c.json({ ok: true }, 200);
+    });
+    app.get('/health-probe', authFor('health'), (c) => {
+      seen.push(c.get('actingTabId'));
+      return c.json({ ok: true }, 200);
+    });
+    const call = async (
+      path: string,
+      headers: Record<string, string>,
+    ): Promise<{ readonly status: number; readonly code: unknown }> => {
+      const response = await app.request(path, { headers });
+      const body: unknown = await response.json();
+      const code =
+        typeof body === 'object' && body !== null && 'code' in body ? body.code : undefined;
+      return { status: response.status, code };
+    };
+    const devtoolsHeaders = (tab?: string): Record<string, string> => ({
+      [AUTHORIZATION_HEADER]: formatBearer(devtools),
+      origin,
+      ...(tab === undefined ? {} : { [ACTING_TAB_HEADER]: tab }),
+    });
+
+    expect(await call('/probe', devtoolsHeaders('7'))).toEqual({ status: 200, code: undefined });
+    expect(await call('/probe', devtoolsHeaders())).toEqual({ status: 200, code: undefined });
+    expect(await call('/probe', { [AUTHORIZATION_HEADER]: formatBearer(editor) })).toEqual({
+      status: 200,
+      code: undefined,
+    });
+    expect(await call('/health-probe', {})).toEqual({ status: 200, code: undefined });
+    expect(seen).toEqual([7, undefined, undefined, undefined]);
+
+    const invalid = AUTH_FAILURE_REASONS['acting-tab-invalid'];
+    const notPermitted = AUTH_FAILURE_REASONS['acting-tab-not-permitted'];
+    expect(await call('/probe', devtoolsHeaders('07'))).toEqual({
+      status: invalid.status,
+      code: invalid.code,
+    });
+    expect(
+      await call('/probe', {
+        [AUTHORIZATION_HEADER]: formatBearer(editor),
+        [ACTING_TAB_HEADER]: '7',
+      }),
+    ).toEqual({ status: notPermitted.status, code: notPermitted.code });
+    expect(await call('/health-probe', { [ACTING_TAB_HEADER]: '7' })).toEqual({
+      status: notPermitted.status,
+      code: notPermitted.code,
+    });
+    // No refused request reached a handler.
+    expect(seen).toHaveLength(4);
   });
 
   it('never lets a DevTools client create or steer a session, or claim a project', () => {
@@ -1658,6 +1962,12 @@ describe('role and scope authorization', () => {
       'session.list',
       'session.question',
       'session.end',
+      // A panel enters picker mode on its own; only the editor asks the bound tab to.
+      'target.request',
+      // The administrative operations: purging history, minting a credential, rotating all.
+      'session.purge',
+      'devServer.credential',
+      'credentials.rotate',
     ] as const) {
       expectRefusal(authorize(operation, devtools, origin), 'role-not-permitted', [devtools]);
     }
@@ -1707,6 +2017,10 @@ describe('role and scope authorization', () => {
       'session.get',
       'panel.data',
       'pair.start',
+      // A server agent can neither mint another credential nor purge or rotate anything.
+      'devServer.credential',
+      'session.purge',
+      'credentials.rotate',
     ] as const) {
       expectRefusal(authorize(operation, agent), 'role-not-permitted', [agent]);
     }
@@ -1765,9 +2079,10 @@ describe('role and scope authorization', () => {
       );
     }
 
-    // The announcement lives exactly as long as the connection that made it.
+    // Released without a lease, the announcement ends with the connection.
     announcement.release();
     announcement.release();
+    announcement.releaseAfter(MAX_WORKSPACE_ANNOUNCEMENT_LEASE_MS);
     const released = asEditor(expectOk(authorize('session.create', editor)));
     expect(released.scope.workspaceFolders).toEqual([]);
     expectRefusal(requireProjectScope(released, workspace), 'project-out-of-scope');
@@ -1794,6 +2109,131 @@ describe('role and scope authorization', () => {
     expect(asEditor(expectOk(authorize('session.create', editor))).scope.workspaceFolders).toEqual(
       [],
     );
+  });
+
+  describe('the workspace lease of a dropped editor connection', () => {
+    /**
+     * One editor credential's announcing hello principal, and readers of the
+     * principal (and its folders) an HTTP request presenting it resolves to.
+     */
+    function announcingEditor(workspace: string): {
+      readonly hello: EditorPrincipal;
+      readonly principal: () => EditorPrincipal;
+      readonly folders: () => readonly string[];
+    } {
+      const editor = editorToken();
+      const hello = asEditor(
+        expectOk(
+          harness.auth.authorizeHello({
+            payload: helloPayload('vscode', editor, { projectRoot: workspace }),
+            origin: undefined,
+          }),
+        ),
+      );
+      const principal = (): EditorPrincipal => asEditor(expectOk(authorize('session.end', editor)));
+      return { hello, principal, folders: () => principal().scope.workspaceFolders };
+    }
+
+    it('keeps the folders in scope until the injected clock passes the lease, then drops them', () => {
+      const workspace = projectPath('workspace', 'leased');
+      const { hello, principal, folders } = announcingEditor(workspace);
+      const lease = 60_000;
+
+      const announcement = expectOk(harness.auth.announceWorkspace(hello));
+      announcement.releaseAfter(lease);
+      expect(folders(), 'within the lease').toEqual([workspace]);
+      // What VS Code's deactivate() needs after its socket closed: its own
+      // project's session may still be ended.
+      expectOk(requireSessionAccess(principal(), { id: newSessionId(), projectRoot: workspace }));
+
+      harness.clock.advance(lease - 1);
+      expect(folders(), 'one millisecond before it ends').toEqual([workspace]);
+      harness.clock.advance(1);
+      expect(folders(), 'once it has ended').toEqual([]);
+      expectRefusal(
+        requireSessionAccess(principal(), { id: newSessionId(), projectRoot: workspace }),
+        'project-out-of-scope',
+      );
+      // Settled for good: neither method brings the folders back.
+      announcement.releaseAfter(lease);
+      announcement.release();
+      expect(folders()).toEqual([]);
+    });
+
+    it('caps a lease at MAX_WORKSPACE_ANNOUNCEMENT_LEASE_MS and treats a non-finite or negative one as none', () => {
+      const workspace = projectPath('workspace', 'capped');
+      const { hello, folders } = announcingEditor(workspace);
+
+      expectOk(harness.auth.announceWorkspace(hello)).releaseAfter(
+        MAX_WORKSPACE_ANNOUNCEMENT_LEASE_MS * 10,
+      );
+      harness.clock.advance(MAX_WORKSPACE_ANNOUNCEMENT_LEASE_MS - 1);
+      expect(folders(), 'inside the cap').toEqual([workspace]);
+      harness.clock.advance(1);
+      expect(folders(), 'the cap, not the request, ended it').toEqual([]);
+
+      for (const leaseMs of [Number.NaN, Number.POSITIVE_INFINITY, -1, 0]) {
+        expectOk(harness.auth.announceWorkspace(hello)).releaseAfter(leaseMs);
+        expect(folders(), `a lease of ${String(leaseMs)}`).toEqual([]);
+      }
+    });
+
+    it('lets a new announcement take a leased folder over, and keeps the lease floor it had', () => {
+      const workspace = projectPath('workspace', 'returning');
+      const { hello, folders } = announcingEditor(workspace);
+      const lease = 30_000;
+
+      expectOk(harness.auth.announceWorkspace(hello)).releaseAfter(lease);
+      // The editor reconnects inside the lease, then drops without one.
+      const reconnected = expectOk(harness.auth.announceWorkspace(hello));
+      harness.clock.advance(lease);
+      expect(folders(), 'a live announcement outlasts the lease').toEqual([workspace]);
+      reconnected.release();
+      expect(folders(), 'no live announcement and no lease left').toEqual([]);
+
+      // An immediate release does not cut short another announcement's lease.
+      expectOk(harness.auth.announceWorkspace(hello)).releaseAfter(lease);
+      expectOk(harness.auth.announceWorkspace(hello)).release();
+      expect(folders(), 'the earlier lease still stands').toEqual([workspace]);
+      harness.clock.advance(lease);
+      expect(folders()).toEqual([]);
+    });
+
+    it('ends every lease on rotation, and a lease granted after it is a no-op', () => {
+      const workspace = projectPath('workspace', 'rotated');
+      const { hello } = announcingEditor(workspace);
+      const leased = expectOk(harness.auth.announceWorkspace(hello));
+      leased.releaseAfter(MAX_WORKSPACE_ANNOUNCEMENT_LEASE_MS);
+      // The socket the revoker closes settles its announcement after the clear.
+      const closedByRotation = expectOk(harness.auth.announceWorkspace(hello));
+
+      expectOk(harness.auth.rotateAll());
+      closedByRotation.releaseAfter(MAX_WORKSPACE_ANNOUNCEMENT_LEASE_MS);
+      const rotated = readAuthFile(harness.config).token;
+      remember(rotated);
+      const scopeOfRotated = (): readonly string[] =>
+        asEditor(expectOk(authorize('session.create', rotated))).scope.workspaceFolders;
+      expect(scopeOfRotated(), 'the new credential inherits no lease').toEqual([]);
+
+      // The new credential's own announcement is untouched by the old ones settling.
+      const fresh = expectOk(
+        harness.auth.announceWorkspace(
+          asEditor(
+            expectOk(
+              harness.auth.authorizeHello({
+                payload: helloPayload('vscode', rotated, { projectRoot: workspace }),
+                origin: undefined,
+              }),
+            ),
+          ),
+        ),
+      );
+      leased.release();
+      closedByRotation.release();
+      expect(scopeOfRotated()).toEqual([workspace]);
+      fresh.release();
+      expect(scopeOfRotated()).toEqual([]);
+    });
   });
 
   it('revokes the server-agent credentials of one project when its dev server exits', () => {
@@ -2206,6 +2646,588 @@ describe('rotation', () => {
 });
 
 /* =================================================================================================
+ * The revocation fence
+ * ============================================================================================== */
+
+/** The three principals a running service holds, one per role. */
+interface LivePrincipals {
+  readonly editor: EditorPrincipal;
+  readonly devtools: DevtoolsPrincipal;
+  readonly serverAgent: ServerAgentPrincipal;
+}
+
+describe('the revocation fence', () => {
+  const origin = extensionOrigin(EXTENSION_ID);
+
+  /**
+   * One principal per role, each resolved exactly as the HTTP middleware
+   * resolves it — the snapshot a handler holds while it reads its body.
+   */
+  function livePrincipals(projectRoot: string = projectPath('alpha')): LivePrincipals {
+    return {
+      editor: asEditor(expectOk(authorize('session.list', editorToken()))),
+      devtools: asDevtools(expectOk(authorize('panel.data', pairDevtools(), origin))),
+      serverAgent: asServerAgent(
+        expectOk(authorize('telemetry.event', serverAgentToken(projectRoot))),
+      ),
+    };
+  }
+
+  /** The principals of a {@link LivePrincipals}, in role order. */
+  function each(principals: LivePrincipals): readonly Principal[] {
+    return [principals.editor, principals.devtools, principals.serverAgent];
+  }
+
+  it('accepts the principal of every credential that is still live, and retires nothing itself', () => {
+    const principals = livePrincipals();
+    const rowsBefore = credentialRows();
+    for (const principal of each(principals)) {
+      expectOk(harness.auth.requireLiveCredential(principal));
+      // The fence only reads: it passes again, and the store is unchanged.
+      expectOk(harness.auth.requireLiveCredential(principal));
+    }
+    expect(credentialRows()).toEqual(rowsBefore);
+  });
+
+  it('refuses every principal a rotation retired, and accepts the new editor principal', () => {
+    const retired = livePrincipals();
+    expectOk(harness.auth.rotateAll());
+
+    for (const principal of each(retired)) {
+      expectRefusal(harness.auth.requireLiveCredential(principal), 'unknown-credential');
+    }
+    const rotated = readAuthFile(harness.config).token;
+    const current = asEditor(expectOk(authorize('session.list', rotated)));
+    expect(current.tokenHash).not.toBe(retired.editor.tokenHash);
+    expectOk(harness.auth.requireLiveCredential(current));
+  });
+
+  it('refuses a principal from the instant its credential expires', () => {
+    const expiresAt = harness.clock.now + 1_000;
+    const principal = asServerAgent(
+      expectOk(authorize('telemetry.event', serverAgentToken(projectPath('alpha'), expiresAt))),
+    );
+
+    harness.clock.advance(999);
+    expectOk(harness.auth.requireLiveCredential(principal));
+    harness.clock.advance(1);
+    expectRefusal(harness.auth.requireLiveCredential(principal), 'expired-credential');
+  });
+
+  it("refuses the server-agent principals of a project whose credentials were revoked, and only that project's", () => {
+    const alpha = livePrincipals(projectPath('alpha'));
+    const beta = asServerAgent(
+      expectOk(authorize('telemetry.event', serverAgentToken(projectPath('beta')))),
+    );
+
+    expect(expectOk(harness.auth.revokeServerAgentCredentials(projectPath('alpha')))).toBe(1);
+    expectRefusal(harness.auth.requireLiveCredential(alpha.serverAgent), 'unknown-credential');
+    expectOk(harness.auth.requireLiveCredential(beta));
+    expectOk(harness.auth.requireLiveCredential(alpha.editor));
+    expectOk(harness.auth.requireLiveCredential(alpha.devtools));
+  });
+
+  it('refuses a principal whose stored row now holds another role or no longer validates', () => {
+    const token = pairDevtools();
+    const principal = asDevtools(expectOk(authorize('panel.data', token, origin)));
+    const rerole = harness.store.db.prepare('UPDATE credentials SET role = ? WHERE token_hash = ?');
+
+    rerole.run('server-agent', principal.tokenHash);
+    expectRefusal(harness.auth.requireLiveCredential(principal), 'unknown-credential', [token]);
+    rerole.run('administrator', principal.tokenHash);
+    expectRefusal(harness.auth.requireLiveCredential(principal), 'corrupt-credential', [token]);
+    rerole.run('devtools', principal.tokenHash);
+    expectOk(harness.auth.requireLiveCredential(principal));
+  });
+
+  it('reports a store it cannot read as a failure, never as a live credential', () => {
+    const principal = asEditor(expectOk(authorize('session.list', editorToken())));
+    harness.store.close();
+
+    expectFailure(harness.auth.requireLiveCredential(principal), 'STORE_ERROR');
+  });
+
+  it('keeps the digest it looks up out of every refusal and every log record', () => {
+    const firstLine = capturedLogLines.length;
+    const retired = livePrincipals();
+    const digests = each(retired).map((principal) => principal.tokenHash);
+    expectOk(harness.auth.rotateAll());
+    readAuthFile(harness.config);
+
+    for (const principal of each(retired)) {
+      expectRefusal(harness.auth.requireLiveCredential(principal), 'unknown-credential', digests);
+    }
+    const lines = capturedLogLines.slice(firstLine);
+    const refusalLines = lines.filter((line) =>
+      line.includes('refused a request whose credential was retired after it was authenticated'),
+    );
+    expect(refusalLines).toHaveLength(digests.length);
+    expectNoLeak(lines, digests);
+  });
+});
+
+/* =================================================================================================
+ * Rotation across auth.json and the store
+ * ============================================================================================== */
+
+/** The editor credential's journal: `auth.json` plus the module's stage suffix. */
+function stagePath(config: Pick<ServiceConfig, 'authFilePath'> = harness.config): string {
+  return `${config.authFilePath}${AUTH_FILE_STAGE_SUFFIX}`;
+}
+
+/** Which operation of the credential-file port a fault or a recorded call concerns. */
+type FileOperation = 'write' | 'remove';
+
+/** One call a service made on its credential-file port, with what was true at that instant. */
+interface FileCall {
+  readonly operation: FileOperation;
+  readonly path: string;
+  /** Whether a transaction was open on the harness store's connection. */
+  readonly inTransaction: boolean;
+  /** Every credential digest the harness store held, sorted. */
+  readonly credentialHashes: readonly string[];
+  /** How many times the harness revoker had been called. */
+  readonly revocations: number;
+}
+
+/**
+ * A `CredentialFileSystem` over the real safe-fs writer and `unlinkSync` that
+ * records every call and throws an `EIO` failure for the calls a test scripted
+ * — the only way to fail one step of a replacement for a suite running as root,
+ * where no permission bit refuses a write.
+ */
+class ScriptedFileSystem implements CredentialFileSystem {
+  readonly calls: FileCall[] = [];
+
+  /** Remaining scripted failures per `operation:path`. */
+  readonly #faults = new Map<string, number>();
+
+  /** Makes the next `times` calls of `operation` on `path` fail; `Infinity` for every call. */
+  fail(operation: FileOperation, path: string, times = 1): void {
+    this.#faults.set(`${operation}:${path}`, times);
+  }
+
+  /** How many calls of `operation` were made on `path`, failed or not. */
+  count(operation: FileOperation, path: string): number {
+    return this.calls.filter((call) => call.operation === operation && call.path === path).length;
+  }
+
+  writeSecureFile(path: string, data: string, upTo: string): void {
+    this.#enter('write', path);
+    writeSecureFileAtomic(path, data, { upTo });
+  }
+
+  removeFile(path: string): void {
+    this.#enter('remove', path);
+    unlinkSync(path);
+  }
+
+  /** Records the call with the store and revoker state at this instant, then applies any fault. */
+  #enter(operation: FileOperation, path: string): void {
+    this.calls.push({
+      operation,
+      path,
+      inTransaction: harness.store.db.isTransaction,
+      credentialHashes: credentialRows()
+        .map((row) => String(row['token_hash']))
+        .sort(),
+      revocations: harness.revoker.calls.length,
+    });
+    const key = `${operation}:${path}`;
+    const remaining = this.#faults.get(key) ?? 0;
+    if (remaining > 0) {
+      this.#faults.set(key, remaining - 1);
+      throw Object.assign(new Error(`injected ${operation} failure`), { code: 'EIO' });
+    }
+  }
+}
+
+/** A service over the harness store, clock and revoker whose credential files go through `files`. */
+function serviceWithFiles(files: ScriptedFileSystem): AuthService {
+  return createService({
+    store: harness.store,
+    config: harness.config,
+    clock: harness.clock,
+    revoker: harness.revoker,
+    fileSystem: files,
+  });
+}
+
+/** A `TEMP` trigger — this connection only — that aborts every insert of an editor credential. */
+function refuseEditorInserts(store: Store = harness.store): () => void {
+  store.db.exec(
+    "CREATE TEMP TRIGGER refuse_editor_insert BEFORE INSERT ON main.credentials WHEN NEW.role = 'vscode' BEGIN SELECT RAISE(ABORT, 'injected commit failure'); END;",
+  );
+  return () => {
+    store.db.exec('DROP TRIGGER temp.refuse_editor_insert');
+  };
+}
+
+/** One credential of every kind and an outstanding pairing code, issued through the real flows. */
+interface IssuedSet {
+  readonly editor: string;
+  readonly devtools: string;
+  readonly agent: string;
+  readonly pending: string;
+}
+
+/** Issues one credential of every kind and starts one pairing code. */
+function issueEveryCredential(): IssuedSet {
+  return {
+    editor: editorToken(),
+    devtools: pairDevtools(),
+    agent: serverAgentToken(projectPath('alpha')),
+    pending: startCode(),
+  };
+}
+
+/** Asserts `auth` still accepts every credential of `set`: what a rotation that never committed leaves. */
+function expectStillValid(set: IssuedSet, auth: AuthService): void {
+  asEditor(expectOk(authorize('session.list', set.editor, undefined, auth)));
+  asDevtools(expectOk(authorize('panel.data', set.devtools, extensionOrigin(EXTENSION_ID), auth)));
+  asServerAgent(expectOk(authorize('telemetry.event', set.agent, undefined, auth)));
+}
+
+/** Asserts `auth` refuses every credential of `set` and its pairing code: what a committed rotation leaves. */
+function expectRetired(set: IssuedSet, auth: AuthService): void {
+  const origin = extensionOrigin(EXTENSION_ID);
+  expectRefusal(authorize('session.list', set.editor, undefined, auth), 'unknown-credential', [
+    set.editor,
+  ]);
+  expectRefusal(authorize('panel.data', set.devtools, origin, auth), 'unknown-credential', [
+    set.devtools,
+  ]);
+  expectRefusal(authorize('telemetry.event', set.agent, undefined, auth), 'unknown-credential', [
+    set.agent,
+  ]);
+  expectRefusal(auth.completePairing({ code: set.pending, origin }), 'pairing-invalid', [
+    set.pending,
+  ]);
+}
+
+/** What a restarted process has: a new connection to the same database, and a started service. */
+interface Restarted {
+  readonly store: Store;
+  readonly auth: AuthService;
+  readonly state: EditorCredentialState;
+}
+
+/**
+ * Starts the service again over the same state root, as a new process would: a
+ * new connection to the same database file, a new service with the real
+ * credential-file port, and its start-up call.
+ */
+function restartService(): Restarted {
+  const store = openTrackedStore({
+    databasePath: harness.config.databasePath,
+    logger: captureLogger(),
+  });
+  const auth = createService({ store, config: harness.config, clock: harness.clock });
+  const state = expectOk(auth.ensureEditorCredential());
+  return { store, auth, state };
+}
+
+/**
+ * Asserts what every start must leave, whatever it recovered from: no journal,
+ * a private `auth.json` whose credential is the one editor row the store holds
+ * and the principal the start reported, accepted from the editor's origin.
+ *
+ * @returns The editor credential `auth.json` holds.
+ */
+function expectConsistent(restarted: Restarted): string {
+  expect(existsSync(stagePath())).toBe(false);
+  expect(modeOf(harness.config.authFilePath)).toBe(0o600);
+  const { token } = readAuthFile(harness.config);
+  const editors = credentialRows(restarted.store).filter((row) => row['role'] === 'vscode');
+  expect(editors).toHaveLength(1);
+  expect(editors[0]?.['token_hash']).toBe(sha256Hex(token));
+  expect(restarted.state.principal.tokenHash).toBe(sha256Hex(token));
+  asEditor(expectOk(authorize('session.list', token, undefined, restarted.auth)));
+  return token;
+}
+
+/** Asserts that none of the log records emitted since `firstLine` carries a secret the suite has seen. */
+function expectQuietLogsSince(firstLine: number): readonly string[] {
+  const lines = capturedLogLines.slice(firstLine);
+  expect(lines.length).toBeGreaterThan(0);
+  expectNoLeak(lines);
+  return lines;
+}
+
+describe('rotation across auth.json and the store', () => {
+  // Every test here also proves that nothing it logged — failures and
+  // recoveries included — carries a plaintext credential, a credential file's
+  // body or a pairing code.
+  let firstLine = 0;
+  beforeEach(() => {
+    firstLine = capturedLogLines.length;
+  });
+  afterEach(() => {
+    expectQuietLogsSince(firstLine);
+  });
+
+  it('stages the new credential before the transaction, publishes it after the commit, and closes sockets last', () => {
+    const issued = issueEveryCredential();
+    const hashesBefore = credentialRows()
+      .map((row) => String(row['token_hash']))
+      .sort();
+    const files = new ScriptedFileSystem();
+
+    expectOk(serviceWithFiles(files).rotateAll());
+    const rotated = sha256Hex(readAuthFile(harness.config).token);
+
+    expect(files.calls.map(({ operation, path }) => [operation, path])).toEqual([
+      ['write', stagePath()],
+      ['write', harness.config.authFilePath],
+      ['remove', stagePath()],
+    ]);
+    const [stage, publish, unstage] = files.calls;
+    // No file is touched inside the store transaction.
+    expect(files.calls.map((call) => call.inTransaction)).toEqual([false, false, false]);
+    // Staged while every old credential still existed; published only once the
+    // commit had replaced them all; sockets closed only after both.
+    expect(stage?.credentialHashes).toEqual(hashesBefore);
+    expect(publish?.credentialHashes).toEqual([rotated]);
+    expect([stage?.revocations, publish?.revocations, unstage?.revocations]).toEqual([0, 0, 0]);
+    expect(harness.revoker.calls).toHaveLength(1);
+    expect(existsSync(stagePath())).toBe(false);
+    expectRetired(issued, harness.auth);
+  });
+
+  it('rotates nothing when the journal cannot be written, and leaves no journal behind', () => {
+    const issued = issueEveryCredential();
+    const fileBefore = readFileSync(harness.config.authFilePath);
+    const files = new ScriptedFileSystem();
+    files.fail('write', stagePath());
+
+    const error = expectFailure(serviceWithFiles(files).rotateAll(), 'INTERNAL');
+    expect(error.message).toMatch(/not rotated/);
+    expect(error.details?.['rotated']).toBe(false);
+    expect(files.count('write', harness.config.authFilePath)).toBe(0);
+    expect(readFileSync(harness.config.authFilePath)).toEqual(fileBefore);
+    expect(existsSync(stagePath())).toBe(false);
+    expect(harness.revoker.calls).toHaveLength(0);
+    expectStillValid(issued, harness.auth);
+
+    const restarted = restartService();
+    expect(restarted.state.created).toBe(false);
+    expect(expectConsistent(restarted)).toBe(issued.editor);
+    expectStillValid(issued, restarted.auth);
+  });
+
+  it('returns STORE_ERROR and rotates nothing when the store cannot commit, leaving auth.json byte-identical', () => {
+    const issued = issueEveryCredential();
+    const fileBefore = readFileSync(harness.config.authFilePath);
+    const inodeBefore = statSync(harness.config.authFilePath).ino;
+    const rowsBefore = credentialRows();
+    const codesBefore = pairingRows();
+    const allowEditorInserts = refuseEditorInserts();
+
+    const refused = expectFailure(harness.auth.rotateAll(), 'STORE_ERROR');
+    expect(refused.message).toMatch(/not rotated/);
+    expect(readFileSync(harness.config.authFilePath)).toEqual(fileBefore);
+    expect(statSync(harness.config.authFilePath).ino).toBe(inodeBefore);
+    expect(existsSync(stagePath())).toBe(false);
+    expect(harness.revoker.calls).toHaveLength(0);
+    expect(credentialRows()).toEqual(rowsBefore);
+    expect(pairingRows()).toEqual(codesBefore);
+    expectStillValid(issued, harness.auth);
+    allowEditorInserts();
+
+    // A store that is closed under the service fails the same way.
+    harness.store.close();
+    expectFailure(harness.auth.rotateAll(), 'STORE_ERROR');
+    expect(readFileSync(harness.config.authFilePath)).toEqual(fileBefore);
+    expect(statSync(harness.config.authFilePath).ino).toBe(inodeBefore);
+    expect(existsSync(stagePath())).toBe(false);
+
+    const restarted = restartService();
+    expect(restarted.state.created).toBe(false);
+    expect(expectConsistent(restarted)).toBe(issued.editor);
+    expect(readFileSync(harness.config.authFilePath)).toEqual(fileBefore);
+    expectStillValid(issued, restarted.auth);
+  });
+
+  it('discards, at the next start, a journal whose rotation never committed, and every credential stays valid', () => {
+    const issued = issueEveryCredential();
+    const fileBefore = readFileSync(harness.config.authFilePath);
+    // The commit fails and the journal cannot be removed afterwards: the state a
+    // process killed between staging and committing leaves.
+    const files = new ScriptedFileSystem();
+    files.fail('remove', stagePath(), Number.POSITIVE_INFINITY);
+    const allowEditorInserts = refuseEditorInserts();
+    expectFailure(serviceWithFiles(files).rotateAll(), 'STORE_ERROR');
+    allowEditorInserts();
+    const staged = readRecordAt(stagePath());
+    expect(staged.token).not.toBe(issued.editor);
+    expect(credentialRows().map((row) => row['token_hash'])).not.toContain(sha256Hex(staged.token));
+
+    const restarted = restartService();
+    expect(restarted.state.created).toBe(false);
+    expect(expectConsistent(restarted)).toBe(issued.editor);
+    expect(readFileSync(harness.config.authFilePath)).toEqual(fileBefore);
+    expectStillValid(issued, restarted.auth);
+    expectRefusal(
+      authorize('session.list', staged.token, undefined, restarted.auth),
+      'unknown-credential',
+      [staged.token],
+    );
+    const lines = expectQuietLogsSince(firstLine);
+    expect(lines.some((line) => line.includes('discarded an uncommitted'))).toBe(true);
+  });
+
+  it('keeps a committed rotation when auth.json cannot be updated, closes every socket, and the next start publishes it', () => {
+    const issued = issueEveryCredential();
+    const fileBefore = readFileSync(harness.config.authFilePath);
+    const files = new ScriptedFileSystem();
+    files.fail('write', harness.config.authFilePath, Number.POSITIVE_INFINITY);
+
+    const error = expectFailure(serviceWithFiles(files).rotateAll(), 'INTERNAL');
+    expect(error.message).toMatch(/rotated, but auth\.json could not be updated/);
+    expect(error.hint).toMatch(/Restart/);
+    expect(error.details?.['rotated']).toBe(true);
+    // The first write and one retry.
+    expect(files.count('write', harness.config.authFilePath)).toBe(2);
+    expect(files.count('remove', stagePath())).toBe(0);
+
+    // The rotation is durable although the file is behind it: every old
+    // credential is refused and every socket was closed.
+    expect(readFileSync(harness.config.authFilePath)).toEqual(fileBefore);
+    expect(modeOf(stagePath())).toBe(0o600);
+    const staged = readRecordAt(stagePath());
+    const rows = credentialRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.['token_hash']).toBe(sha256Hex(staged.token));
+    expect(pairingRows()).toHaveLength(0);
+    expect(harness.revoker.calls).toHaveLength(1);
+    expect(harness.revoker.calls[0]?.code).toBe(WS_CLOSE_UNAUTHORIZED);
+    expectRetired(issued, harness.auth);
+
+    const restarted = restartService();
+    expect(restarted.state.created).toBe(false);
+    expect(expectConsistent(restarted)).toBe(staged.token);
+    expectRetired(issued, restarted.auth);
+    const lines = expectQuietLogsSince(firstLine);
+    expect(lines.some((line) => line.includes('completed an interrupted'))).toBe(true);
+  });
+
+  it('retries a failed publish once, so a transient failure still completes the rotation', () => {
+    const issued = issueEveryCredential();
+    const files = new ScriptedFileSystem();
+    files.fail('write', harness.config.authFilePath, 1);
+
+    const outcome = expectOk(serviceWithFiles(files).rotateAll());
+    expect(outcome.credentialsDeleted).toBe(CREDENTIAL_ROLES.length);
+    expect(files.count('write', harness.config.authFilePath)).toBe(2);
+    expect(existsSync(stagePath())).toBe(false);
+    const { token } = readAuthFile(harness.config);
+    expect(credentialRows().map((row) => row['token_hash'])).toEqual([sha256Hex(token)]);
+    expectRetired(issued, harness.auth);
+  });
+
+  it('completes a rotation whose journal cannot be removed after auth.json was updated, and the next start clears it', () => {
+    const issued = issueEveryCredential();
+    const files = new ScriptedFileSystem();
+    files.fail('remove', stagePath(), Number.POSITIVE_INFINITY);
+
+    const outcome = expectOk(serviceWithFiles(files).rotateAll());
+    expect(outcome.socketsClosed).toBe(OPEN_SOCKETS);
+    const published = readAuthFile(harness.config);
+    expect(readRecordAt(stagePath())).toEqual(published);
+    const fileAfterRotation = readFileSync(harness.config.authFilePath);
+    expectRetired(issued, harness.auth);
+
+    const restarted = restartService();
+    expect(restarted.state.created).toBe(false);
+    expect(expectConsistent(restarted)).toBe(published.token);
+    expect(readFileSync(harness.config.authFilePath)).toEqual(fileAfterRotation);
+    expectRetired(issued, restarted.auth);
+  });
+
+  it('mints a new credential rather than reviving one a committed rotation retired, when the journal was lost', () => {
+    const issued = issueEveryCredential();
+    const files = new ScriptedFileSystem();
+    files.fail('write', harness.config.authFilePath, Number.POSITIVE_INFINITY);
+    expectFailure(serviceWithFiles(files).rotateAll(), 'INTERNAL');
+    const staged = readRecordAt(stagePath());
+    // The journal is lost: auth.json still names the retired editor credential,
+    // and the store holds only the one it was replaced by.
+    unlinkSync(stagePath());
+
+    const restarted = restartService();
+    expect(restarted.state.created).toBe(true);
+    const token = expectConsistent(restarted);
+    expect(token).not.toBe(issued.editor);
+    expect(token).not.toBe(staged.token);
+    expectRetired(issued, restarted.auth);
+    expectRefusal(
+      authorize('session.list', staged.token, undefined, restarted.auth),
+      'unknown-credential',
+      [staged.token],
+    );
+  });
+
+  it('discards a journal another account could read and issues a new editor credential', () => {
+    const issued = issueEveryCredential();
+    const files = new ScriptedFileSystem();
+    files.fail('remove', stagePath(), Number.POSITIVE_INFINITY);
+    expectOk(serviceWithFiles(files).rotateAll());
+    const exposed = readRecordAt(stagePath()).token;
+    expect(readAuthFile(harness.config).token).toBe(exposed);
+    chmodSync(stagePath(), 0o640);
+
+    const restarted = restartService();
+    expect(restarted.state.created).toBe(true);
+    const token = expectConsistent(restarted);
+    expect(token).not.toBe(exposed);
+    expectRefusal(
+      authorize('session.list', exposed, undefined, restarted.auth),
+      'unknown-credential',
+      [exposed],
+    );
+    expectRetired(issued, restarted.auth);
+  });
+
+  it('discards a journal that is not a record this service wrote, and adopts auth.json as it stands', () => {
+    const editor = editorToken();
+    writeFileSync(stagePath(), '{ "version": "not-a-record" ', { mode: 0o600 });
+
+    const restarted = restartService();
+    expect(restarted.state.created).toBe(false);
+    expect(expectConsistent(restarted)).toBe(editor);
+  });
+
+  it('refuses a journal that is a symbolic link, at start and before a rotation, and follows it nowhere', () => {
+    const issued = issueEveryCredential();
+    const decoy = join(harness.sandbox, 'decoy.json');
+    writeFileSync(decoy, 'decoy', { mode: 0o600 });
+    symlinkSync(decoy, stagePath());
+
+    expectFailure(harness.auth.ensureEditorCredential(), 'FS_UNSAFE_PATH');
+    const refused = expectFailure(harness.auth.rotateAll(), 'FS_UNSAFE_PATH');
+    expect(refused.message).toMatch(/not rotated/);
+    expect(lstatSync(stagePath()).isSymbolicLink()).toBe(true);
+    expect(readFileSync(decoy, 'utf8')).toBe('decoy');
+    expect(harness.revoker.calls).toHaveLength(0);
+    expectStillValid(issued, harness.auth);
+  });
+
+  it('finishes at the next start a first-start credential whose auth.json could not be written', () => {
+    const files = new ScriptedFileSystem();
+    files.fail('write', harness.config.authFilePath, Number.POSITIVE_INFINITY);
+
+    expectFailure(serviceWithFiles(files).ensureEditorCredential(), 'INTERNAL');
+    expect(existsSync(harness.config.authFilePath)).toBe(false);
+    const staged = readRecordAt(stagePath());
+    expect(credentialRows().map((row) => row['token_hash'])).toEqual([sha256Hex(staged.token)]);
+
+    const restarted = restartService();
+    expect(restarted.state.created).toBe(false);
+    expect(expectConsistent(restarted)).toBe(staged.token);
+  });
+});
+
+/* =================================================================================================
  * What the boundary keeps to itself
  * ============================================================================================== */
 
@@ -2234,13 +3256,20 @@ describe('what the boundary keeps to itself', () => {
     );
   });
 
-  it('draws every refusal code from the closed error-code set, answered with 401, 403 or 429', () => {
+  it('draws every refusal code from the closed error-code set, answered with 400, 401, 403 or 429', () => {
     const reasons = Object.keys(AUTH_FAILURE_REASONS);
     expect(reasons.length).toBeGreaterThan(0);
     for (const descriptor of Object.values(AUTH_FAILURE_REASONS)) {
       expect(DEBUGGEN_ERROR_CODES).toContain(descriptor.code);
-      expect([401, 403, 429]).toContain(descriptor.status);
+      expect([400, 401, 403, 429]).toContain(descriptor.status);
     }
+    // 400 is the malformed acting-tab header alone: every credential, origin
+    // and scope refusal keeps its 401/403/429.
+    expect(
+      Object.entries(AUTH_FAILURE_REASONS)
+        .filter(([, descriptor]) => descriptor.status === 400)
+        .map(([reason]) => reason),
+    ).toEqual(['acting-tab-invalid']);
   });
 
   it('answers any failure that is not a refusal with a fixed 500 body that echoes nothing', () => {

@@ -11,12 +11,28 @@
  * | --- | --- | --- |
  * | `session-end` | `POST /sessions/:id/end` → `SessionManager.end` | {@link SessionCleanup.run} |
  * | `deactivate` | VS Code `deactivate()` → the same `POST /sessions/:id/end` | {@link SessionCleanup.run} |
- * | `service-start` | `src/main.ts`, before the first client is served | {@link reconcileModificationsOnStartup} |
+ * | `service-start` | `src/main.ts`, before the first client is served | {@link reconcileModificationsOnStartup}, then {@link settleInterruptedSessions} |
  *
  * Editor deactivation is deliberately **not** a second branch: the extension
  * ends its active session over HTTP, so it arrives here exactly as an explicit
  * end does. A second branch would be a second chance to get the order below
  * wrong.
+ *
+ * Service start has two halves, because a restart interrupts sessions as well
+ * as leaving files patched. {@link reconcileModificationsOnStartup} restores
+ * every open journal record; then, once `SessionManager.hydrate()` has rebuilt
+ * the capture-owner index, {@link settleInterruptedSessions} decides every
+ * session the previous process left `instrumenting`, `ready` or `capturing`:
+ * an install cannot survive a restart, a session whose patches the first half
+ * removed can no longer capture what its plan promised, and a capture whose
+ * plan was runtime-only would be advertised before any producer had taken its
+ * configuration, so all three are failed with a sentence saying so, and every
+ * failed capture is released so its producers are owed their dormant
+ * configuration. A session left `capturing` is recorded no better than
+ * `partial` by the first half, and stays so until its producers are confirmed
+ * dormant. Nothing is sent to a producer at start-up — none is connected yet —
+ * and a surviving producer is reconciled by the instrumentation service when
+ * it reconnects.
  *
  * ## What this module decides, and what it delegates
  *
@@ -35,11 +51,13 @@
  * run(sessionId)
  *   1. serialise per session            (an end racing a deactivation must not restore twice)
  *   2. stop the conflict watcher        (a restore write would otherwise look like a developer edit)
- *   3. disable the runtime hooks        (agent dormant, preload instrumentations disabled — by delegation)
+ *   3. disable the runtime hooks        (agent dormant, preload instrumentations disabled — by delegation,
+ *                                        judged by the service's delivery receipt)
  *   4. build the cleanup context        (journal, the session's own backup store, logger, clock, signal)
  *   5. cleanupSession(...)              (the package restores, or refuses and reports)
  *   6. verify the end state             (independently re-hash what the pass claims)
- *   7. return the outcome               (SessionManager records it and broadcasts the one completion message)
+ *   7. fold in the hooks' verdict       (unconfirmed dormancy makes the pass `partial`)
+ *   8. return the outcome               (SessionManager records it and broadcasts the one completion message)
  * ```
  *
  * ## The invariants this module is judged by
@@ -52,10 +70,18 @@
  *    re-hashes every file the pass says it restored against the recorded
  *    original and every conflicted file against what the pass promised to
  *    leave, and a failed check can only make the reported status worse.
- * 3. **Runtime hooks are disabled, not idled.** The dormant page-agent
- *    configuration and the capture-less dev-server preload configuration are
- *    built and sent by `../instrumentation/service.ts`; this module only asks
- *    for them and restates neither.
+ * 3. **Runtime hooks are disabled, not idled — and a disarm is confirmed, not
+ *    assumed.** The dormant page-agent configuration and the capture-less
+ *    dev-server preload configuration are built and sent by
+ *    `../instrumentation/service.ts`; this module only asks for them and
+ *    restates neither. What it does judge is the service's delivery receipt
+ *    ({@link CleanupDisarmOutcome.pending}): a disarm that failed, that cannot
+ *    say who received it, or that names producers which did not, leaves hooks
+ *    that may still be live, so the pass reports `partial` — its files are
+ *    restored all the same. When the only shortfall was a named producer and
+ *    the files came back clean, the runner waits for the service to confirm
+ *    that producer dormant (it replays the configuration when the producer
+ *    reconnects) and then upgrades the session's verdict to `clean`.
  * 4. **Start-up reconciliation never filters by session status.** The record set
  *    is `ModificationsRepo.listAllOpen()` — every non-`reverted` record of every
  *    session, whatever state that session was left in.
@@ -66,9 +92,12 @@
  *    writes a session's status and the only emitter of the cleanup-completed
  *    message.
  *    {@link SessionCleanup.run} therefore *returns* its outcome (the manager's
- *    `end` records it), and {@link SessionCleanup.reconcileAll} routes each
- *    affected session through the injected {@link CleanupOutcomeSink}; without
- *    one it persists only the session's `cleanup` sub-object, never its status.
+ *    `end` records it), while {@link SessionCleanup.reconcileAll} and a later
+ *    dormancy upgrade — verdicts no `end` is waiting for — route each affected
+ *    session through the injected {@link CleanupOutcomeSink}; without one they
+ *    persist only the session's `cleanup` sub-object, never its status. A
+ *    session that must be failed after a restart is failed through the
+ *    manager's `fail` ({@link settleInterruptedSessions}), never written here.
  * 7. **Conflicts and partial passes are outcomes, not errors.** `run` answers
  *    `ok` for `partial` and `conflict`; `err` is reserved for a pass that could
  *    not be attempted at all, which leaves the session un-ended so ending it
@@ -103,12 +132,18 @@ import type {
   CleanupContext,
   CleanupFailure,
   CleanupOutcome,
+  InstrumentationPlan,
   ModificationConflict,
   ModificationRecord,
   ReconcileOutcome,
 } from '@debuggen/instrumentation';
 import { CLEANUP_STATUSES } from '@debuggen/protocol';
-import type { CleanupStatus, ProgressStage, SessionRecord } from '@debuggen/protocol';
+import type {
+  CleanupStatus,
+  ProgressStage,
+  SessionRecord,
+  SessionStatus,
+} from '@debuggen/protocol';
 import {
   DebuggenError,
   err,
@@ -125,8 +160,9 @@ import type { ServiceConfig } from '../config.js';
 import { sessionLogger, subsystemLogger } from '../logging.js';
 import type { SessionCleanupOutcome, SessionCleanupRunner } from '../sessions/manager.js';
 import type { SessionProgress } from '../sessions/progress.js';
+import type { SessionFailure } from '../sessions/state-machine.js';
 import type { ModificationsRepo } from '../store/modifications-repo.js';
-import type { SessionsRepo } from '../store/sessions-repo.js';
+import type { SessionListItem, SessionListPage, SessionsRepo } from '../store/sessions-repo.js';
 
 // ---------------------------------------------------------------------------
 // Section A — vocabulary
@@ -162,6 +198,32 @@ const LOG_SUBSYSTEM = 'cleanup';
  * unbounded size.
  */
 const MAX_LOGGED_RECORD_IDS = 50;
+
+/**
+ * The most sessions a runner remembers as "restored, but not yet confirmed
+ * dormant" (see {@link SessionCleanup.run}). One entry per session ended while a
+ * producer was unreachable, so the bound is never met in practice; it exists so
+ * that a producer which never reconnects cannot grow the map for the service's
+ * lifetime. The oldest entry is forgotten first, and its session simply stays
+ * `partial` — the fail-safe answer.
+ */
+const MAX_AWAITING_DORMANCY = 1000;
+
+/**
+ * How long the first retry of a dormancy upgrade that could not be recorded
+ * waits, in milliseconds; each later retry waits twice as long.
+ */
+const UPGRADE_RETRY_BASE_MS = 500;
+
+/**
+ * How many times a dormancy upgrade that could not be recorded is retried
+ * before the session is left `partial` — the conservative verdict — and the
+ * give-up is logged.
+ */
+const MAX_UPGRADE_ATTEMPTS = 6;
+
+/** The status of a session whose capture window was open when its process ended. */
+const CAPTURING_STATUS = 'capturing' satisfies SessionStatus;
 
 /**
  * How bad each cleanup status is, for combining two verdicts about the same
@@ -272,6 +334,36 @@ export interface CleanupDisarmRequest {
 }
 
 /**
+ * What {@link InstrumentationDisabler.disarmCapture} reports back: the delivery
+ * receipt a pass judges the runtime hooks by.
+ *
+ * `sessionId` is required on purpose. A port whose members were all optional
+ * would be a "weak type" any outcome object is compared against member by
+ * member; with one required member the instrumentation service's own, richer
+ * outcome type stays assignable as it grows, and this module reads only what it
+ * names here.
+ */
+export interface CleanupDisarmOutcome {
+  /** The session the disarm addressed. */
+  readonly sessionId: string;
+
+  /**
+   * The producers the service had armed for the session that did **not**
+   * receive their dormant configuration (`page-agent`, `server-agent`, or a
+   * producer kind added later) — named by kind, never by address.
+   *
+   * Read fail-safe, because a disarm that nobody received leaves live hooks:
+   *
+   * | Value | Reading |
+   * | --- | --- |
+   * | `[]` | every armed producer received its dormant configuration: dormancy confirmed |
+   * | non-empty | those producers may still be armed: not confirmed until the service says so |
+   * | absent | the disabler cannot say who received it: not confirmed, ever, by this pass |
+   */
+  readonly pending?: readonly string[] | undefined;
+}
+
+/**
  * The runtime-hook half of cleanup, owned by `../instrumentation/service.ts`.
  *
  * Satisfied by `InstrumentationService`: `disarmCapture` sends the page agent a
@@ -279,18 +371,29 @@ export interface CleanupDisarmRequest {
  * capture, which returns the agent to dormant (listeners detached, the
  * fetch/XHR patch restored, the fiber hook unsubscribed) and makes the preload
  * disable its pg and Prisma instrumentations and remove the global tracer
- * provider, so no span is even created; `stopSession` releases the service's
- * per-session state. `isInstalling` lets a pass refuse to race an install that
- * is still writing files.
+ * provider, so no span is even created; its outcome's
+ * {@link CleanupDisarmOutcome.pending} names the armed producers that did not
+ * receive that configuration. `stopSession` releases the service's per-session
+ * state. `isInstalling` lets a pass refuse to race an install that is still
+ * writing files.
+ *
+ * `onDormancyConfirmed` is how a disarm that could not be delivered is settled
+ * later: the service keeps the undelivered configurations, replays them when
+ * the producer reconnects, and calls the listener with the session id once
+ * every one of them has been delivered. It returns the unsubscribe function.
  */
 export interface InstrumentationDisabler {
   disarmCapture(
     request: CleanupDisarmRequest,
-  ): Result<unknown, DebuggenError> | Promise<Result<unknown, DebuggenError>>;
+  ):
+    | Result<CleanupDisarmOutcome, DebuggenError>
+    | Promise<Result<CleanupDisarmOutcome, DebuggenError>>;
 
   stopSession(sessionId: string): Promise<unknown> | void;
 
   isInstalling?(sessionId: string): boolean;
+
+  onDormancyConfirmed?(listener: (sessionId: string) => void): (() => void) | void;
 }
 
 /**
@@ -536,6 +639,21 @@ export interface StartupReconciliationOptions {
   readonly signal?: AbortSignal | undefined;
 }
 
+/** What {@link SessionCleanup.holdUntilDormant} is told about a released capture. */
+export interface ReleasedCaptureVerdict {
+  /**
+   * The producers the release could not deliver a dormant configuration to, or
+   * `undefined` when the release was refused or did not say who received it.
+   */
+  readonly pending: readonly string[] | undefined;
+
+  /**
+   * The files' own verdict from the start-up reconciliation, or `undefined`
+   * when the session held no open modification record.
+   */
+  readonly files: CleanupStatus | undefined;
+}
+
 /**
  * The session cleanup runner.
  *
@@ -552,6 +670,15 @@ export interface SessionCleanup {
    * Serialised per session — a concurrent call returns the first call's
    * result — and idempotent: a second call after a clean pass finds nothing
    * open, writes nothing and answers `clean`.
+   *
+   * The runtime hooks count: a pass is `clean` only when the instrumentation
+   * service's delivery receipt confirms every producer it armed received its
+   * dormant configuration. Otherwise the files are still restored and the pass
+   * answers `partial`. When the only shortfall was a named producer that could
+   * not be reached, the runner remembers the session, and when the service
+   * later reports it dormant (after replaying the configuration on reconnect)
+   * the session's verdict is upgraded to `clean` through the outcome sink —
+   * once, as a new verdict, never as a second copy of this return value.
    *
    * @returns `ok(outcome)` for every pass that ran, `partial` and `conflict`
    * included; `err` only when cleanup could not be attempted at all, which
@@ -574,8 +701,37 @@ export interface SessionCleanup {
   ): Promise<Result<StartupReconciliationReport, DebuggenError>>;
 
   /**
+   * Keeps the cleanup verdict of a session a service restart failed at
+   * `partial` while the producers of the capture it held are not known to be
+   * dormant — the service-start path of {@link settleInterruptedSessions},
+   * which calls it with what the release of that capture reported.
+   *
+   * The start-up reconciliation already records a session left `capturing` as
+   * at best `partial`; a stored `clean` found here is recorded `partial` now.
+   * When `release.pending` names the producers the release could not reach,
+   * the session is remembered and upgraded to `clean` once the instrumentation
+   * service confirms them dormant, exactly as a pass's own `partial` is; an
+   * empty list is that confirmation already. `undefined` means the release was
+   * refused or did not say who received it, so nothing can confirm it and the
+   * `partial` stands until the session is ended again.
+   *
+   * Only a session whose files are clean is held or upgraded: a `conflict`
+   * stands, and a session that held no record and was never cleaned stays
+   * `pending`. A pass in flight for the session decides its own verdict.
+   *
+   * @returns `err` when the session could not be read or its `partial` verdict
+   * could not be recorded — the caller must not serve a `clean` it could not
+   * correct — and `ok` otherwise. Never rejects.
+   */
+  holdUntilDormant(
+    sessionId: string,
+    release: ReleasedCaptureVerdict,
+  ): Promise<Result<void, DebuggenError>>;
+
+  /**
    * Stops the runner: passes in flight stop before their next record (never
-   * inside a write) and later calls are refused. Idempotent.
+   * inside a write), later calls are refused, the dormancy subscription is
+   * released and no remembered session is upgraded any more. Idempotent.
    */
   dispose(): void;
 }
@@ -1256,14 +1412,15 @@ interface ReconcileRuntime {
 }
 
 /**
- * Records one session's reconciliation verdict — through the manager when it
- * exists, otherwise as the `cleanup` sub-object alone (never the status, which
- * only the manager writes). A verdict the session already carries is not
- * written again, which is what keeps a second start over a reconciled store
- * silent.
+ * Records one session's cleanup verdict that no `SessionManager.end` is
+ * waiting to record — a start-up reconciliation's, or a dormancy upgrade's —
+ * through the manager when it exists, otherwise as the `cleanup` sub-object
+ * alone (never the status, which only the manager writes). A verdict the
+ * session already carries is not written again, which is what keeps a second
+ * start over a reconciled store silent.
  */
-async function deliverReconciliation(
-  runtime: ReconcileRuntime,
+async function deliverVerdict(
+  deps: Pick<StartupReconciliationDeps, 'sessions' | 'outcomeSink'>,
   record: SessionRecord,
   outcome: SessionCleanupOutcome,
   logger: Logger,
@@ -1274,17 +1431,17 @@ async function deliverReconciliation(
     return undefined;
   }
 
-  const sink = runtime.deps.outcomeSink;
+  const sink = deps.outcomeSink;
   const delivered =
     sink === undefined
       ? await settle(
-          () => runtime.deps.sessions.update({ ...record, cleanup: toStoredCleanup(outcome) }),
+          () => deps.sessions.update({ ...record, cleanup: toStoredCleanup(outcome) }),
           'STORE_ERROR',
         )
       : await settle(() => sink.recordCleanupOutcome(record.id, outcome), 'STORE_ERROR');
 
   if (isErr(delivered)) {
-    logger.error('the reconciliation verdict could not be recorded on the session', {
+    logger.error('the cleanup verdict could not be recorded on the session', {
       code: delivered.error.code,
       cleanup: outcome.status,
     });
@@ -1341,9 +1498,16 @@ async function reconcileSession(
   // The watcher is not running before the service serves, so this is a no-op at
   // start-up; on a later retry it keeps restore writes from reading as edits.
   //
-  // No runtime hook is disabled here, deliberately: nothing is armed before the
-  // service serves and no client is connected to receive a configuration. A
-  // session that is still live keeps its hooks until it is ended.
+  // No runtime hook is disarmed here, and none can be: this runs before the
+  // service serves, so no page agent or dev-server preload is connected to
+  // receive a configuration, and this process has armed nothing. A producer
+  // that outlived the previous process may still hold that process's hooks. It
+  // is reconciled when it reconnects, by `../instrumentation/service.ts`: a
+  // reconnecting preload is sent the authoritative configuration for its
+  // project (armed for the capture that is open there, capture-less otherwise),
+  // and a re-bound tab's page agent is returned to dormant unless its session
+  // holds an open capture. Which sessions still hold one after a restart is
+  // settled first, by `settleInterruptedSessions`, from this pass's report.
   await stopWatching(runtime.deps.watcher, sessionId, logger);
 
   const context = await contextFor(
@@ -1402,10 +1566,19 @@ async function reconcileSession(
   const errors = outcome.failures.map((failure) =>
     toErrorEntry(sessionId, failure.error, failure.recordId),
   );
-  const delivery = await deliverReconciliation(
-    runtime,
+  // A session left `capturing` had its capture armed in producers that may
+  // have outlived the process that armed them: its files say `status`, but its
+  // runtime hooks are not known dormant, so the verdict recorded on it — in the
+  // same write as the files' own — is never better than `partial` (AAP §0.5.1:
+  // runtime hooks are disabled, not merely idled). `settleInterruptedSessions`
+  // then releases that capture, and the cleanup runner upgrades the verdict
+  // once its producers take their dormant configuration. The summary keeps the
+  // files' own verdict.
+  const recorded = session.status === CAPTURING_STATUS ? worstStatus(status, 'partial') : status;
+  const delivery = await deliverVerdict(
+    runtime.deps,
     session,
-    { status, conflicts, completedAt: outcome.completedAt },
+    { status: recorded, conflicts, completedAt: outcome.completedAt },
     logger,
   );
 
@@ -1560,6 +1733,11 @@ async function reconcileAcross(
  * as its `cleanup` sub-object alone. Idempotent: a second run over a reconciled
  * store restores nothing and writes nothing.
  *
+ * It sends nothing to any producer (none is connected before the service
+ * serves) and changes no session's status. Hand its report to
+ * {@link settleInterruptedSessions} once the session manager has hydrated:
+ * `bySession` is what says which interrupted sessions lost their patches.
+ *
  * @param deps The repositories, the state directory and the optional collaborators.
  * @param options An optional session filter and cancellation signal.
  * @returns The report, or `err` when the journal could not be read at all.
@@ -1581,6 +1759,76 @@ export function reconcileModificationsOnStartup(
 // Section J — the session cleanup runner
 // ---------------------------------------------------------------------------
 
+/**
+ * What a pass established about the session's runtime hooks.
+ *
+ * - `no-instrumentation` — no instrumentation service is wired into this
+ *   process, so nothing in it armed a producer: confirmed.
+ * - `delivered` — the disarm reported an empty `pending` list: confirmed.
+ * - `disarm-failed` — the disarm answered `err` or threw: unknown, so not
+ *   confirmed.
+ * - `delivery-unreported` — the disarm answered without a `pending` list: it
+ *   cannot say who received the dormant configuration, so not confirmed.
+ * - `delivery-pending` — named producers did not receive it: not confirmed
+ *   until the service reports them dormant.
+ */
+interface DormancyVerdict {
+  readonly confirmed: boolean;
+  readonly reason:
+    | 'no-instrumentation'
+    | 'delivered'
+    | 'disarm-failed'
+    | 'delivery-unreported'
+    | 'delivery-pending';
+
+  /** The producer kinds known not to have received it, deduplicated and sorted; empty otherwise. */
+  readonly pending: readonly string[];
+}
+
+/**
+ * A session whose files a pass restored cleanly but whose runtime hooks were
+ * not confirmed dormant, so it was reported `partial`. Kept until the service
+ * confirms dormancy, when the verdict is upgraded to `clean`.
+ */
+interface AwaitingDormancy {
+  /** The file-level verdict of the pass: always `clean`, or the session would not be remembered. */
+  readonly fileStatus: CleanupStatus;
+
+  /** The conflicts the pass reported, carried into the upgraded verdict unchanged. */
+  readonly conflicts: readonly ModificationConflict[];
+
+  /** The producers that had not received their dormant configuration, for the log. */
+  readonly pending: readonly string[];
+
+  /** Which trigger ran the pass, bound on the upgrade's log records. */
+  readonly trigger: CleanupTrigger;
+}
+
+/**
+ * The producers a disarm's answer names as not having received their dormant
+ * configuration — deduplicated and sorted, a member that is not a non-blank
+ * string counted as `unnamed-producer` — or `undefined` when the answer does
+ * not say who received it.
+ *
+ * Read fail-safe, because the value crossed a module boundary: anything but an
+ * array is "cannot say", and an array with any member at all — even a
+ * malformed one — is "not delivered".
+ */
+function reportedPendingProducers(outcome: unknown): readonly string[] | undefined {
+  const reported: unknown =
+    typeof outcome === 'object' && outcome !== null && 'pending' in outcome
+      ? outcome.pending
+      : undefined;
+
+  if (!Array.isArray(reported)) {
+    return undefined;
+  }
+
+  const members: readonly unknown[] = reported;
+
+  return [...new Set(members.map((kind) => (isNonBlank(kind) ? kind : 'unnamed-producer')))].sort();
+}
+
 /** The refusal every call answers once the runner is disposed or the service is stopping. */
 function stoppedError(sessionId: string): DebuggenError {
   return new DebuggenError(
@@ -1598,8 +1846,12 @@ function stoppedError(sessionId: string): DebuggenError {
  *
  * @param deps The repositories and state directory, plus whichever of the
  * watcher, instrumentation service, progress emitter and outcome sink exist.
+ * Pass the outcome sink (late-bound to `SessionManager.recordCleanupOutcome`
+ * when the manager is created after the runner) so that a dormancy upgrade is
+ * broadcast as well as persisted.
  * @returns The runner. Constructing it touches nothing: no file, no socket, no
- * timer.
+ * timer — it only subscribes to the instrumentation service's dormancy
+ * confirmations, which {@link SessionCleanup.dispose} releases.
  *
  * @example Wiring it as the manager's cleanup runner
  * ```ts
@@ -1637,6 +1889,33 @@ export function createSessionCleanup(deps: SessionCleanupDeps): SessionCleanup {
   const inFlight = new Map<string, Promise<Result<SessionCleanupOutcome, DebuggenError>>>();
   let reconciling: Promise<Result<StartupReconciliationReport, DebuggenError>> | undefined;
   let disposed = false;
+
+  // Sessions reported `partial` only because a producer had not received its
+  // dormant configuration, in the order they were remembered (see
+  // `MAX_AWAITING_DORMANCY`). In memory on purpose: after a restart no
+  // producer has been armed by the new process, the files were verified
+  // restored, and a surviving producer is reconciled by the instrumentation
+  // service when it reconnects — the stored `partial` then stays the truthful
+  // record of what this process could establish.
+  const awaitingDormancy = new Map<string, AwaitingDormancy>();
+
+  // Sessions the service confirmed dormant while a pass of theirs was in
+  // flight. A producer can reconnect, and its outstanding configuration be
+  // replayed, while the pass is still restoring files after its disarm; the
+  // pass counts that confirmation instead of waiting for one already given.
+  // Cleared when a pass disarms (an earlier confirmation is about an earlier
+  // disarm) and when it settles.
+  const confirmedWhileRunning = new Set<string>();
+
+  // Sessions whose verdict `holdUntilDormant` is recording right now, and those
+  // of them the service confirmed dormant meanwhile: the hold then records the
+  // upgrade itself instead of remembering a session already confirmed.
+  const holding = new Set<string>();
+  const confirmedWhileHolding = new Set<string>();
+
+  // The scheduled retry of each confirmed upgrade that could not be recorded.
+  const upgradeRetries = new Map<string, ReturnType<typeof setTimeout>>();
+  let unsubscribeDormancy: (() => void) | undefined;
 
   /** The `cleanup` stage's rows, through the emitter that owns their labels. */
   function progressRow(sessionId: string, kind: 'started' | 'completed', logger: Logger): void {
@@ -1696,20 +1975,26 @@ export function createSessionCleanup(deps: SessionCleanupDeps): SessionCleanup {
    * preload configuration, and this module never builds either. Done before
    * any file is restored — which is safe because a patched wrapper branches on
    * the span helper's *availability*, so with the helper gone the original body
-   * still runs exactly once. A socket that cannot be reached is logged, never a
-   * reason to leave the files patched.
+   * still runs exactly once. A producer that cannot be reached is never a
+   * reason to leave the files patched — but neither is it a disarm: the
+   * returned verdict is confirmed only by the service's delivery receipt, and a
+   * pass whose hooks are not confirmed dormant reports `partial` (AAP §0.5.1:
+   * runtime hooks are disabled, not merely idled).
+   *
+   * @returns Whether every producer armed for the session is known to have
+   * received its dormant configuration, and which ones are known not to have.
    */
   async function disableRuntimeHooks(
     sessionId: string,
     projectRoot: string | undefined,
     logger: Logger,
-  ): Promise<void> {
+  ): Promise<DormancyVerdict> {
     const instrumentation = deps.instrumentation;
 
     if (instrumentation === undefined) {
       logger.debug('no instrumentation service is wired, so no runtime hook is armed to disable');
 
-      return;
+      return { confirmed: true, reason: 'no-instrumentation', pending: [] };
     }
 
     const request: CleanupDisarmRequest =
@@ -1718,11 +2003,31 @@ export function createSessionCleanup(deps: SessionCleanupDeps): SessionCleanup {
       () => instrumentation.disarmCapture(request),
       'TRANSPORT_DISCONNECTED',
     );
+    let verdict: DormancyVerdict;
 
     if (isErr(disarmed)) {
       logger.warn('the runtime hooks could not be disarmed; file restoration continues', {
         code: disarmed.error.code,
       });
+      verdict = { confirmed: false, reason: 'disarm-failed', pending: [] };
+    } else {
+      const pending = reportedPendingProducers(disarmed.value);
+
+      if (pending === undefined) {
+        logger.warn(
+          'the disarm did not report which producers received the dormant configuration; cleanup is reported partial',
+        );
+        verdict = { confirmed: false, reason: 'delivery-unreported', pending: [] };
+      } else if (pending.length > 0) {
+        logger.warn(
+          'some producers did not receive the dormant configuration; cleanup is reported partial until the service confirms them dormant',
+          { pendingProducers: pending.slice(0, MAX_LOGGED_RECORD_IDS), count: pending.length },
+        );
+        verdict = { confirmed: false, reason: 'delivery-pending', pending };
+      } else {
+        logger.debug('every armed producer received the dormant configuration');
+        verdict = { confirmed: true, reason: 'delivered', pending: [] };
+      }
     }
 
     try {
@@ -1732,6 +2037,324 @@ export function createSessionCleanup(deps: SessionCleanupDeps): SessionCleanup {
         code: DebuggenError.from(thrown, 'INTERNAL').code,
       });
     }
+
+    return verdict;
+  }
+
+  /** Remembers a session awaiting its dormancy confirmation, forgetting the oldest past the bound. */
+  function awaitDormancy(sessionId: string, entry: AwaitingDormancy, logger: Logger): void {
+    cancelUpgradeRetry(sessionId);
+    awaitingDormancy.delete(sessionId);
+    awaitingDormancy.set(sessionId, entry);
+
+    while (awaitingDormancy.size > MAX_AWAITING_DORMANCY) {
+      const [oldest] = awaitingDormancy.keys();
+
+      if (oldest === undefined) {
+        break;
+      }
+
+      awaitingDormancy.delete(oldest);
+      logger.warn('too many sessions await a dormancy confirmation; the oldest stays partial', {
+        forgottenSessionId: oldest,
+        limit: MAX_AWAITING_DORMANCY,
+      });
+    }
+  }
+
+  /**
+   * Upgrades a remembered session's `partial` verdict to `clean` once the
+   * service has delivered every dormant configuration it was missing.
+   *
+   * Recorded like a start-up verdict (see {@link deliverVerdict}): through the
+   * outcome sink — `SessionManager.recordCleanupOutcome`, the single emitter of
+   * the cleanup-completed message — or, without one, as the `cleanup`
+   * sub-object alone. `SessionManager.end` has always recorded the pass's own
+   * `partial` by now: it records synchronously after `run` settles, while a
+   * confirmation arrives with a later producer message. A verdict worse than
+   * `partial` found on the session belongs to a later pass and is left alone.
+   *
+   * @returns `true` when nothing is left to do — the upgrade was recorded, or
+   * there is no verdict to upgrade — and `false` when the session could not be
+   * read or the verdict could not be recorded, so the upgrade is worth
+   * retrying.
+   */
+  async function upgradeToClean(sessionId: string, entry: AwaitingDormancy): Promise<boolean> {
+    const logger = sessionLogger(log, sessionId).child({ trigger: entry.trigger });
+    const loaded = await settle(() => deps.sessions.get(sessionId), 'STORE_ERROR');
+
+    if (isErr(loaded)) {
+      logger.error('the session could not be read, so its cleanup stays partial for now', {
+        code: loaded.error.code,
+      });
+
+      return false;
+    }
+
+    const record = loaded.value;
+
+    if (record === undefined) {
+      logger.debug('the session no longer exists, so there is no cleanup verdict to upgrade');
+
+      return true;
+    }
+
+    if (STATUS_SEVERITY[record.cleanup.status] > STATUS_SEVERITY.partial) {
+      logger.info('the session carries a later, worse cleanup verdict; it is left as it is', {
+        cleanup: record.cleanup.status,
+      });
+
+      return true;
+    }
+
+    // With the hooks confirmed dormant, the verdict is what the files alone
+    // said — `clean`, or the session would not have been remembered.
+    const failure = await deliverVerdict(
+      deps,
+      record,
+      { status: entry.fileStatus, conflicts: entry.conflicts, completedAt: now() },
+      logger,
+    );
+
+    if (failure !== undefined) {
+      return false;
+    }
+
+    logger.info('the runtime hooks were confirmed dormant; the cleanup verdict is upgraded', {
+      cleanup: entry.fileStatus,
+      confirmedProducers: entry.pending.slice(0, MAX_LOGGED_RECORD_IDS),
+    });
+
+    return true;
+  }
+
+  /** Cancels a scheduled retry of a session's dormancy upgrade: a newer verdict decides. */
+  function cancelUpgradeRetry(sessionId: string): void {
+    const timer = upgradeRetries.get(sessionId);
+
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      upgradeRetries.delete(sessionId);
+    }
+  }
+
+  /**
+   * Records a confirmed dormancy upgrade, retrying with exponential backoff —
+   * {@link UPGRADE_RETRY_BASE_MS}, doubling, at most
+   * {@link MAX_UPGRADE_ATTEMPTS} attempts — while the session cannot be read or
+   * the verdict cannot be recorded: no second confirmation will come for a
+   * disarm already delivered. A pass or a hold for the session cancels the
+   * retry, because its own verdict supersedes this one; so does `dispose`. The
+   * last failure leaves the session `partial`, the conservative verdict.
+   */
+  function recordUpgrade(sessionId: string, entry: AwaitingDormancy, attempt: number): void {
+    cancelUpgradeRetry(sessionId);
+
+    const retryOrGiveUp = (): void => {
+      if (disposed || lifetime.signal.aborted) {
+        return;
+      }
+
+      const logger = sessionLogger(log, sessionId).child({ trigger: entry.trigger });
+
+      if (attempt + 1 >= MAX_UPGRADE_ATTEMPTS) {
+        logger.error(
+          'the confirmed dormancy could not be recorded after every retry; the cleanup verdict stays partial',
+          { attempts: attempt + 1 },
+        );
+
+        return;
+      }
+
+      const delayMs = UPGRADE_RETRY_BASE_MS * 2 ** attempt;
+      const timer = setTimeout(() => {
+        upgradeRetries.delete(sessionId);
+        recordUpgrade(sessionId, entry, attempt + 1);
+      }, delayMs);
+
+      // A retry never keeps the service process alive on its own.
+      timer.unref();
+      upgradeRetries.set(sessionId, timer);
+      logger.warn('the confirmed dormancy could not be recorded yet; the upgrade is retried', {
+        attempt: attempt + 1,
+        delayMs,
+      });
+    };
+
+    upgradeToClean(sessionId, entry).then(
+      (recorded) => {
+        if (!recorded) {
+          retryOrGiveUp();
+        }
+      },
+      (thrown: unknown) => {
+        sessionLogger(log, sessionId).error('the cleanup verdict could not be upgraded', {
+          code: DebuggenError.from(thrown, 'INTERNAL').code,
+        });
+        retryOrGiveUp();
+      },
+    );
+  }
+
+  /** The listener handed to {@link InstrumentationDisabler.onDormancyConfirmed}. */
+  function dormancyConfirmed(sessionId: string): void {
+    if (disposed || lifetime.signal.aborted) {
+      return;
+    }
+
+    if (inFlight.has(sessionId)) {
+      // A pass for the session is running: it decides its own verdict, and
+      // counts this confirmation if it arrived after that pass's disarm.
+      confirmedWhileRunning.add(sessionId);
+
+      return;
+    }
+
+    if (holding.has(sessionId)) {
+      // The hold is still recording `partial`; it upgrades once that is stored.
+      confirmedWhileHolding.add(sessionId);
+
+      return;
+    }
+
+    const entry = awaitingDormancy.get(sessionId);
+
+    if (entry === undefined) {
+      return;
+    }
+
+    awaitingDormancy.delete(sessionId);
+    recordUpgrade(sessionId, entry, 0);
+  }
+
+  /** The body of {@link SessionCleanup.holdUntilDormant}. */
+  async function holdVerdict(
+    sessionId: string,
+    release: ReleasedCaptureVerdict,
+  ): Promise<Result<void, DebuggenError>> {
+    const logger = sessionLogger(log, sessionId).child({
+      trigger: 'service-start' satisfies CleanupTrigger,
+    });
+
+    if (disposed || lifetime.signal.aborted) {
+      logger.debug('the runner is stopped, so the cleanup verdict is not held');
+
+      return ok(undefined);
+    }
+
+    if (inFlight.has(sessionId) || holding.has(sessionId)) {
+      // A pass (or another hold) for the session is deciding its verdict already.
+      logger.debug('the session’s cleanup verdict is being decided by a pass in flight');
+
+      return ok(undefined);
+    }
+
+    holding.add(sessionId);
+    cancelUpgradeRetry(sessionId);
+
+    try {
+      const loaded = await settle(() => deps.sessions.get(sessionId), 'STORE_ERROR');
+
+      if (isErr(loaded)) {
+        logger.error('the session could not be read, so its cleanup verdict could not be held', {
+          code: loaded.error.code,
+        });
+
+        return err(loaded.error);
+      }
+
+      const record = loaded.value;
+
+      if (record === undefined) {
+        logger.debug('the session no longer exists, so there is no cleanup verdict to hold');
+
+        return ok(undefined);
+      }
+
+      const stored = record.cleanup.status;
+      // Only a session whose files are clean can ever be clean again: the
+      // reconciliation's own verdict when it held records, else the stored one.
+      const files = release.files ?? (stored === 'clean' ? 'clean' : undefined);
+
+      if (files !== 'clean' || STATUS_SEVERITY[stored] > STATUS_SEVERITY.partial) {
+        logger.debug('the session’s cleanup verdict cannot become clean; it is left as it is', {
+          cleanup: stored,
+        });
+
+        return ok(undefined);
+      }
+
+      const { pending } = release;
+      const conflicts = record.cleanup.conflicts;
+      const entry = (confirmed: readonly string[]): AwaitingDormancy => ({
+        fileStatus: 'clean',
+        conflicts,
+        pending: confirmed,
+        trigger: 'service-start',
+      });
+
+      if (pending !== undefined && pending.length === 0) {
+        // Every producer took its dormant configuration with the release.
+        if (stored !== 'clean') {
+          recordUpgrade(sessionId, entry(pending), 0);
+        }
+
+        return ok(undefined);
+      }
+
+      if (stored === 'clean') {
+        const failure = await deliverVerdict(
+          deps,
+          record,
+          { status: 'partial', conflicts, completedAt: now() },
+          logger,
+        );
+
+        if (failure !== undefined) {
+          return err(failure);
+        }
+      }
+
+      logger.warn(
+        'the producers of the capture a restart ended may still hold it; cleanup is reported partial until they are confirmed dormant',
+        {
+          pendingProducers: (pending ?? []).slice(0, MAX_LOGGED_RECORD_IDS),
+          producersKnown: pending !== undefined,
+        },
+      );
+
+      if (pending === undefined) {
+        // Nothing names who still holds the capture, so nothing can confirm it:
+        // the stored `partial` stands until the session is ended again.
+        return ok(undefined);
+      }
+
+      if (confirmedWhileHolding.has(sessionId)) {
+        recordUpgrade(sessionId, entry(pending), 0);
+      } else if (!disposed) {
+        awaitDormancy(sessionId, entry(pending), logger);
+      }
+
+      return ok(undefined);
+    } finally {
+      holding.delete(sessionId);
+      confirmedWhileHolding.delete(sessionId);
+    }
+  }
+
+  function holdUntilDormant(
+    sessionId: string,
+    release: ReleasedCaptureVerdict,
+  ): Promise<Result<void, DebuggenError>> {
+    return holdVerdict(sessionId, release).catch((thrown: unknown) => {
+      const error = DebuggenError.from(thrown, 'INTERNAL');
+
+      sessionLogger(log, sessionId).error('the cleanup verdict could not be held at partial', {
+        code: error.code,
+      });
+
+      return err(error);
+    });
   }
 
   /** One session-scoped pass, in the order the module overview sets out. */
@@ -1783,8 +2406,12 @@ export function createSessionCleanup(deps: SessionCleanupDeps): SessionCleanup {
     // 1. Stop watching before a single byte is touched.
     await stopWatching(deps.watcher, sessionId, scoped);
 
-    // 2. Disable the runtime hooks, then restore files.
-    await disableRuntimeHooks(sessionId, session?.projectRoot, scoped);
+    // 2. Disable the runtime hooks, then restore files. This pass's disarm
+    // supersedes whatever an earlier pass of the session was still waiting for,
+    // and whatever confirmation an earlier disarm received.
+    awaitingDormancy.delete(sessionId);
+    confirmedWhileRunning.delete(sessionId);
+    const dormancy = await disableRuntimeHooks(sessionId, session?.projectRoot, scoped);
 
     if (session === undefined) {
       scoped.warn('cleanup was asked for a session that does not exist; nothing was restored');
@@ -1863,7 +2490,7 @@ export function createSessionCleanup(deps: SessionCleanupDeps): SessionCleanup {
     logFailures(scoped, outcome.failures);
     logVerification(scoped, verification);
 
-    const status = worstStatus(
+    const fileStatus = worstStatus(
       asCleanupStatus(outcome.status),
       aggregateCleanupStatus({
         restored: outcome.restored.length,
@@ -1873,9 +2500,30 @@ export function createSessionCleanup(deps: SessionCleanupDeps): SessionCleanup {
       }),
     );
 
+    // 6. Runtime hooks that are not confirmed dormant make the pass `partial`
+    // whatever the files say: a restored tree with a live page agent or preload
+    // hook is not a clean end (invariant 3). A named shortfall is settled by the
+    // service's dormancy confirmation — already, when it arrived while this
+    // pass was restoring, or later for clean files; an unknown one stays
+    // `partial`, and a worse file verdict governs itself.
+    const hooksDormant =
+      dormancy.confirmed ||
+      (dormancy.reason === 'delivery-pending' && confirmedWhileRunning.has(sessionId));
+    const status = hooksDormant ? fileStatus : worstStatus(fileStatus, 'partial');
+
+    if (!hooksDormant && dormancy.reason === 'delivery-pending' && fileStatus === 'clean') {
+      awaitDormancy(
+        sessionId,
+        { fileStatus, conflicts, pending: dormancy.pending, trigger },
+        scoped,
+      );
+    }
+
     progressRow(sessionId, 'completed', scoped);
     scoped.info('session cleanup finished', {
       cleanup: status,
+      files: fileStatus,
+      hooksDormant,
       restored: outcome.restored.length,
       conflicts: conflicts.length,
       skipped: outcome.skipped.length,
@@ -1884,7 +2532,7 @@ export function createSessionCleanup(deps: SessionCleanupDeps): SessionCleanup {
       conflictRecordIds: conflicts.slice(0, MAX_LOGGED_RECORD_IDS).map((c) => c.recordId),
     });
 
-    // 6. Returned, not broadcast: `SessionManager.end` records this outcome and
+    // 7. Returned, not broadcast: `SessionManager.end` records this outcome and
     // emits the one cleanup-completed message (see `CleanupOutcomeSink`).
     return ok({ status, conflicts, completedAt: outcome.completedAt });
   }
@@ -1900,6 +2548,9 @@ export function createSessionCleanup(deps: SessionCleanupDeps): SessionCleanup {
     }
 
     const trigger = options.trigger ?? 'session-end';
+    // This pass decides the session's verdict; an earlier upgrade still being
+    // retried would only overwrite it.
+    cancelUpgradeRetry(sessionId);
     const task = (async (): Promise<Result<SessionCleanupOutcome, DebuggenError>> => {
       // A start-up reconciliation in flight owns every open record; wait for it.
       const pending = reconciling;
@@ -1915,6 +2566,7 @@ export function createSessionCleanup(deps: SessionCleanupDeps): SessionCleanup {
       }
     })().finally(() => {
       inFlight.delete(sessionId);
+      confirmedWhileRunning.delete(sessionId);
     });
 
     inFlight.set(sessionId, task);
@@ -1960,7 +2612,689 @@ export function createSessionCleanup(deps: SessionCleanupDeps): SessionCleanup {
     disposed = true;
     deps.signal?.removeEventListener('abort', forwardAbort);
     lifetime.abort();
+
+    const unsubscribe = unsubscribeDormancy;
+    unsubscribeDormancy = undefined;
+    awaitingDormancy.clear();
+    confirmedWhileRunning.clear();
+    confirmedWhileHolding.clear();
+
+    for (const timer of upgradeRetries.values()) {
+      clearTimeout(timer);
+    }
+
+    upgradeRetries.clear();
+
+    if (unsubscribe !== undefined) {
+      try {
+        unsubscribe();
+      } catch (thrown) {
+        log.warn('the dormancy confirmations could not be unsubscribed from', {
+          code: DebuggenError.from(thrown, 'INTERNAL').code,
+        });
+      }
+    }
   }
 
-  return Object.freeze({ run, reconcileAll, dispose });
+  // Subscribed last, once every piece of state the listener reads exists. A
+  // disabler without the hook simply never upgrades a `partial` verdict.
+  if (!lifetime.signal.aborted) {
+    try {
+      const unsubscribe = deps.instrumentation?.onDormancyConfirmed?.(dormancyConfirmed);
+
+      unsubscribeDormancy = typeof unsubscribe === 'function' ? unsubscribe : undefined;
+    } catch (thrown) {
+      log.warn(
+        'the dormancy confirmations could not be subscribed to; an unconfirmed disarm stays partial',
+        { code: DebuggenError.from(thrown, 'INTERNAL').code },
+      );
+    }
+  }
+
+  return Object.freeze({ run, reconcileAll, holdUntilDormant, dispose });
+}
+
+// ---------------------------------------------------------------------------
+// Section K — settling the sessions a restart interrupted
+// ---------------------------------------------------------------------------
+
+/**
+ * The session statuses whose meaning rests on instrumentation state the
+ * previous process held: an install it was running, the patches it had
+ * installed, the capture it had armed. A session in any other status depends on
+ * none of that, so {@link settleInterruptedSessions} leaves it to its owners.
+ */
+const INTERRUPTIBLE_SESSION_STATUSES = Object.freeze([
+  'instrumenting',
+  'ready',
+  'capturing',
+] as const satisfies readonly SessionStatus[]);
+
+/**
+ * The page size {@link settleInterruptedSessions} lists sessions with — well
+ * inside the store's largest page (`MAX_SESSION_LIST_LIMIT`, 1000), so the
+ * request is never refused, and large enough that a developer's whole history
+ * is one or two reads.
+ */
+const INTERRUPTED_SESSIONS_PAGE_SIZE = 200;
+
+/** The progress-stage a restart failure is reported under, by what it interrupted. */
+const INSTRUMENT_STAGE = 'instrument' satisfies ProgressStage;
+
+/** The progress-stage an interrupted capture is failed at. */
+const CAPTURE_STAGE = 'capture' satisfies ProgressStage;
+
+/** The code every restart failure carries: the instrumentation the session needs is not there. */
+const INTERRUPTED_SESSION_CODE = 'INSTRUMENTATION_UNAVAILABLE' satisfies DebuggenErrorCode;
+
+/** The developer's next step after an interrupted session is failed. */
+const INTERRUPTED_SESSION_HINT = 'Ask your question again in a new session, or end this one.';
+
+/**
+ * Why {@link settleInterruptedSessions} failed a session.
+ *
+ * - `install-interrupted` — the session was `instrumenting`: an install cannot
+ *   survive the process that ran it.
+ * - `instrumentation-removed` — the start-up reconciliation restored the
+ *   session's patched files, so its plan's patch-mode signals are gone.
+ * - `instrumentation-unsettled` — the reconciliation held open records for the
+ *   session and could not settle all of them (a conflict, a failure or an
+ *   abort), so its patches are neither intact nor known to be gone.
+ * - `capture-interrupted` — the session was `capturing` with a plan that left
+ *   nothing in the files: its capture window is closed rather than continued,
+ *   because no producer has taken its configuration from this process, and a
+ *   capture is never advertised before one has.
+ */
+export type InterruptedSessionReason =
+  | 'install-interrupted'
+  | 'instrumentation-removed'
+  | 'instrumentation-unsettled'
+  | 'capture-interrupted';
+
+/**
+ * What {@link CaptureReleaser.releaseInterruptedCapture} is told about the
+ * capture window of a `capturing` session a restart failed.
+ */
+export interface CaptureReleaseRequest {
+  /** The session that was failed. */
+  readonly sessionId: string;
+
+  /** The capture window it held open before it was failed. */
+  readonly captureId: string;
+
+  /** The session's absolute project root, from its stored record. */
+  readonly projectRoot: string;
+
+  /** The stored plan whose version the capture was opened with, when the session holds it. */
+  readonly plan?: InstrumentationPlan | undefined;
+}
+
+/**
+ * The restart half of the instrumentation service, satisfied by
+ * `ProducerReconciler.releaseInterruptedCapture`.
+ *
+ * `releaseInterruptedCapture` disarms the capture of a session the restart
+ * failed: the producers the previous process armed may still hold it, so each
+ * is owed its dormant configuration — remembered as outstanding when no
+ * connection takes it (none is connected before the service serves), replayed
+ * when the producer reconnects, and reported `pending` by the session's next
+ * cleanup until then. Its answer names those producers in `pending`.
+ */
+export interface CaptureReleaser {
+  releaseInterruptedCapture(input: CaptureReleaseRequest): Result<unknown, DebuggenError>;
+}
+
+/**
+ * The status writer, satisfied by `SessionManager.fail`: moves the session to
+ * `failed` with the stage, code, message and hint both user interfaces render,
+ * emits that stage's `failed` progress row and closes an open capture window.
+ */
+export interface SessionFailer {
+  fail(
+    sessionId: string,
+    failure: SessionFailure,
+  ): Result<unknown, DebuggenError> | Promise<Result<unknown, DebuggenError>>;
+}
+
+/**
+ * Keeps a released capture's session from claiming a `clean` cleanup while its
+ * producers may still hold that capture. Satisfied by
+ * {@link SessionCleanup.holdUntilDormant}.
+ */
+export interface CleanupVerdictHold {
+  holdUntilDormant(
+    sessionId: string,
+    release: ReleasedCaptureVerdict,
+  ): Promise<Result<unknown, DebuggenError>>;
+}
+
+/** Everything {@link settleInterruptedSessions} is given; all of it is injected. */
+export interface InterruptedSessionDeps {
+  /** The session store: the listing of interrupted sessions, each record and its open capture. */
+  readonly sessions: Pick<SessionsRepo, 'list' | 'get' | 'getActiveCapture'>;
+
+  /** The only status writer. */
+  readonly manager: SessionFailer;
+
+  /**
+   * The instrumentation service; without it a failed capture is not released,
+   * and its producers are reconciled only when they reconnect.
+   */
+  readonly instrumentation?: CaptureReleaser | undefined;
+
+  /**
+   * The cleanup runner, told what each released capture's disarm reported so
+   * that the session's verdict stays `partial` until its producers are
+   * confirmed dormant, then becomes `clean`. Omitted, the verdict is left as
+   * the reconciliation recorded it.
+   */
+  readonly verdicts?: CleanupVerdictHold | undefined;
+
+  /** The service logger; bound to `subsystem: "cleanup"`. Defaults to `noopLogger`. */
+  readonly logger?: Logger | undefined;
+
+  /** The clock `completedAt` is read from, in epoch milliseconds. Defaults to `nowEpochMs`. */
+  readonly now?: (() => number) | undefined;
+}
+
+/** Options for {@link settleInterruptedSessions}. */
+export interface InterruptedSessionOptions {
+  /** Cancellation, honoured before the listing and between sessions, never inside one. */
+  readonly signal?: AbortSignal | undefined;
+}
+
+/** One session {@link settleInterruptedSessions} failed. */
+export interface InterruptedSessionFailure {
+  /** The session. */
+  readonly sessionId: string;
+
+  /** The status the previous process left it in. */
+  readonly status: SessionStatus;
+
+  /** Why it could not continue. */
+  readonly reason: InterruptedSessionReason;
+}
+
+/**
+ * What {@link settleInterruptedSessions} did. JSON-serialisable and
+ * deterministic: sessions are decided and listed in sorted id order, and
+ * `completedAt` comes from the injected clock.
+ */
+export interface InterruptedSessionsReport {
+  /** How many `instrumenting`, `ready` or `capturing` sessions the listing found. */
+  readonly examined: number;
+
+  /** The sessions moved to `failed`, in sorted id order. */
+  readonly failed: readonly InterruptedSessionFailure[];
+
+  /**
+   * Every session that could not be settled — its `fail` was refused, or its
+   * cleanup verdict could not be kept from claiming `clean` — in the order met.
+   * The service must not serve while any is listed.
+   */
+  readonly errors: readonly CleanupErrorEntry[];
+
+  /** Whether cancellation stopped the pass before every session was decided. */
+  readonly aborted: boolean;
+
+  /** When the pass finished, in epoch milliseconds. */
+  readonly completedAt: number;
+}
+
+/** What one session's settlement decided. */
+type InterruptedDecision =
+  | { readonly kind: 'keep' }
+  | {
+      readonly kind: 'fail';
+      readonly stage: ProgressStage;
+      readonly reason: InterruptedSessionReason;
+    };
+
+/**
+ * The failure a session is moved to `failed` with. Complete, developer-facing
+ * sentences chosen by what the restart did to the session — never by what the
+ * session asked, and naming no project, file or path.
+ */
+function interruptedFailure(
+  stage: ProgressStage,
+  reason: InterruptedSessionReason,
+): SessionFailure {
+  switch (reason) {
+    case 'install-interrupted':
+      return {
+        stage,
+        code: INTERRUPTED_SESSION_CODE,
+        message:
+          'The Debug Generator service restarted while this session’s instrumentation was being installed, so the install could not finish.',
+        hint: INTERRUPTED_SESSION_HINT,
+      };
+    case 'instrumentation-removed':
+      return {
+        stage,
+        code: INTERRUPTED_SESSION_CODE,
+        message:
+          'The Debug Generator service restarted and removed the instrumentation this session had added to your files, so it can no longer capture.',
+        hint: INTERRUPTED_SESSION_HINT,
+      };
+    case 'instrumentation-unsettled':
+      return {
+        stage,
+        code: INTERRUPTED_SESSION_CODE,
+        message:
+          'The Debug Generator service restarted and could not fully remove the instrumentation this session had added to your files, so it can no longer capture.',
+        hint: 'End this session to see which files need your attention in its cleanup report, then ask your question again in a new session.',
+      };
+    case 'capture-interrupted':
+      return {
+        stage,
+        code: INTERRUPTED_SESSION_CODE,
+        message:
+          'The Debug Generator service restarted during this session’s capture, so the capture was closed.',
+        hint: INTERRUPTED_SESSION_HINT,
+      };
+  }
+}
+
+/** Orders list items by id, so every run decides the same sessions in the same order. */
+function byItemId(left: SessionListItem, right: SessionListItem): number {
+  return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
+}
+
+/**
+ * Every interrupted session, read to the last page before anything is acted
+ * on: failing a session takes it out of the filtered set, so acting while
+ * paging would shift every later page and skip sessions.
+ */
+function collectInterrupted(
+  sessions: Pick<SessionsRepo, 'list'>,
+  logger: Logger,
+): Result<SessionListItem[], DebuggenError> {
+  const byId = new Map<string, SessionListItem>();
+  let offset = 0;
+
+  for (;;) {
+    let page: Result<SessionListPage, DebuggenError>;
+
+    try {
+      page = sessions.list({
+        statuses: INTERRUPTIBLE_SESSION_STATUSES,
+        limit: INTERRUPTED_SESSIONS_PAGE_SIZE,
+        offset,
+      });
+    } catch (thrown) {
+      page = err(DebuggenError.from(thrown, 'STORE_ERROR'));
+    }
+
+    if (isErr(page)) {
+      logger.error('the interrupted sessions could not be listed', {
+        code: page.error.code,
+        offset,
+      });
+
+      return page;
+    }
+
+    const { items, total } = page.value;
+
+    for (const item of items) {
+      byId.set(item.id, item);
+    }
+
+    offset += items.length;
+
+    // Read on until the count is reached. A page shorter than asked for is not
+    // taken as the last one — a store may serve less than the limit — but an
+    // empty page is, whatever `total` says, so a listing that disagrees with
+    // its own count cannot loop.
+    if (items.length === 0 || offset >= total) {
+      break;
+    }
+  }
+
+  return ok([...byId.values()].sort(byItemId));
+}
+
+/**
+ * The capture window a `capturing` session holds open, with the plan it was
+ * opened with — read before the session is failed, because failing it closes
+ * the window. `undefined` when there is no window or it cannot be read: a
+ * capture whose id is unknown has no dormant configuration to address.
+ */
+async function interruptedCaptureOf(
+  deps: InterruptedSessionDeps,
+  sessionId: string,
+  logger: Logger,
+): Promise<CaptureReleaseRequest | undefined> {
+  const active = await settle(() => deps.sessions.getActiveCapture(sessionId), 'STORE_ERROR');
+
+  if (isErr(active)) {
+    logger.warn('the open capture of a failing session could not be read; it cannot be released', {
+      code: active.error.code,
+    });
+
+    return undefined;
+  }
+
+  if (active.value === undefined) {
+    return undefined;
+  }
+
+  const loaded = await settle(() => deps.sessions.get(sessionId), 'STORE_ERROR');
+
+  if (isErr(loaded) || loaded.value === undefined) {
+    logger.warn('a failing session could not be read; its capture cannot be released', {
+      ...(isErr(loaded) ? { code: loaded.error.code } : {}),
+    });
+
+    return undefined;
+  }
+
+  const record = loaded.value;
+  const { id: captureId, planVersion } = active.value.capture;
+  const plan = record.plans.find((candidate) => candidate.planVersion === planVersion);
+
+  return {
+    sessionId,
+    captureId,
+    projectRoot: record.projectRoot,
+    ...(plan === undefined ? {} : { plan }),
+  };
+}
+
+/** What releasing a failed session's capture established. */
+interface InterruptedRelease {
+  /** Whether the instrumentation service accepted the release. */
+  readonly accepted: boolean;
+
+  /**
+   * The producers the release could not deliver a dormant configuration to,
+   * or `undefined` when the release was refused or did not say.
+   */
+  readonly pending: readonly string[] | undefined;
+}
+
+/**
+ * Releases the capture of a session the restart failed, through the
+ * instrumentation service. Contained: a refusal or a throw is logged, never
+ * propagated, because the session's status is already settled.
+ *
+ * @returns Whether the service accepted the release, and which producers it
+ * reported still owed their dormant configuration.
+ */
+async function releaseInterrupted(
+  releaser: CaptureReleaser,
+  request: CaptureReleaseRequest,
+  logger: Logger,
+): Promise<InterruptedRelease> {
+  const { captureId } = request;
+  const released = await settle(() => releaser.releaseInterruptedCapture(request), 'INTERNAL');
+
+  if (isErr(released)) {
+    logger.warn('the capture of a failed session could not be released', {
+      captureId,
+      code: released.error.code,
+    });
+
+    return { accepted: false, pending: undefined };
+  }
+
+  const pending = reportedPendingProducers(released.value);
+
+  logger.info('the capture of a failed session was released; its producers are owed dormancy', {
+    captureId,
+    planKnown: request.plan !== undefined,
+    pendingProducers: (pending ?? []).slice(0, MAX_LOGGED_RECORD_IDS),
+    producersKnown: pending !== undefined,
+  });
+
+  return { accepted: true, pending };
+}
+
+/**
+ * Tells the cleanup runner what a released capture's disarm reported, so the
+ * session's verdict stays `partial` until its producers are confirmed dormant.
+ *
+ * @returns The error when the verdict could not be kept from claiming `clean`
+ * — refused, or thrown by a port that should not throw — else `undefined`.
+ */
+async function holdInterruptedVerdict(
+  hold: CleanupVerdictHold,
+  sessionId: string,
+  release: ReleasedCaptureVerdict,
+  logger: Logger,
+): Promise<DebuggenError | undefined> {
+  const held = await settle(() => hold.holdUntilDormant(sessionId, release), 'INTERNAL');
+
+  if (isErr(held)) {
+    logger.error('the cleanup verdict of a failed session could not be held at partial', {
+      code: held.error.code,
+    });
+
+    return held.error;
+  }
+
+  return undefined;
+}
+
+/** The files' own verdict the start-up reconciliation reached for a session, if it held records. */
+function reconciledFilesOf(
+  reconciliation: StartupReconciliationReport,
+  sessionId: string,
+): CleanupStatus | undefined {
+  return Object.hasOwn(reconciliation.bySession, sessionId)
+    ? reconciliation.bySession[sessionId]?.status
+    : undefined;
+}
+
+/** Decides one interrupted session from its status and what the reconciliation did to it. */
+function decideInterrupted(
+  reconciliation: StartupReconciliationReport,
+  item: SessionListItem,
+  logger: Logger,
+): InterruptedDecision {
+  if (item.status === 'instrumenting') {
+    return { kind: 'fail', stage: INSTRUMENT_STAGE, reason: 'install-interrupted' };
+  }
+
+  // The journal held open records for the session, so the reconciliation
+  // removed its patches or left them in conflict: the plan it would capture
+  // with is no longer what is in the files.
+  const reconciled = Object.hasOwn(reconciliation.bySession, item.id)
+    ? reconciliation.bySession[item.id]
+    : undefined;
+
+  if (reconciled !== undefined) {
+    return {
+      kind: 'fail',
+      stage: INSTRUMENT_STAGE,
+      reason:
+        reconciled.status === 'clean' ? 'instrumentation-removed' : 'instrumentation-unsettled',
+    };
+  }
+
+  if (item.status === 'ready') {
+    // Nothing of it was in the files, and nothing is armed while no capture is
+    // open: the next capture start recomputes its arming from the stored plan.
+    logger.debug('an interrupted ready session needs nothing; its next capture arms from its plan');
+
+    return { kind: 'keep' };
+  }
+
+  // A capture whose plan left nothing in the files is not continued: no
+  // producer has taken its configuration from this process, and a capture is
+  // never advertised before one has. It is closed, and its producers owed
+  // their dormant configuration.
+  return { kind: 'fail', stage: CAPTURE_STAGE, reason: 'capture-interrupted' };
+}
+
+/**
+ * Settles every session a service restart interrupted — the second half of
+ * the service-start trigger, run by `src/main.ts` after
+ * {@link reconcileModificationsOnStartup} and `SessionManager.hydrate()`, and
+ * before the first client is served.
+ *
+ * Every `instrumenting`, `ready` and `capturing` session is first collected,
+ * to the last page of the listing; then each is decided in sorted id order:
+ *
+ * | Left in | Reconciliation held its records | Decision |
+ * | --- | --- | --- |
+ * | `instrumenting` | either | failed at `instrument`: an install cannot survive a restart |
+ * | `ready` or `capturing` | yes | failed at `instrument`: its patches were removed, or left in conflict |
+ * | `capturing` | no (runtime-only plan) | failed at `capture`: the capture window is closed rather than continued |
+ * | `ready` | no | left as it is: arming is recomputed from the stored plan when a capture starts |
+ *
+ * No capture survives a restart. Resuming one would advertise `capturing`
+ * before any producer had taken its configuration from this process, and AAP
+ * §0.4.2 has no frame a producer confirms a configuration with; a capture the
+ * developer starts again is armed afresh and judged by its delivery receipts.
+ *
+ * A session is failed through the injected manager — the only status writer,
+ * which also closes its open capture — with code `INSTRUMENTATION_UNAVAILABLE`
+ * and a sentence saying what the restart did. A failed `capturing` session's
+ * producers may still hold the capture the previous process armed, so its
+ * window is read before the failure closes it and then released through
+ * `releaseInterruptedCapture`: no producer is connected yet, so each dormant
+ * configuration it is owed stays outstanding until the instrumentation service
+ * replays it on reconnect. What the release reported is handed to the cleanup
+ * runner (`verdicts`), which keeps the session's verdict `partial` — the
+ * reconciliation already recorded it no better than that — until those
+ * producers are confirmed dormant, then records `clean`. Every other producer
+ * is reconciled on reconnect against the state this pass leaves.
+ *
+ * Failures are contained per session — logged, recorded in `errors` — and the
+ * pass moves on; cancellation is honoured before the listing and between
+ * sessions. A session in `errors` could not be failed, or could not be kept
+ * from claiming a clean cleanup, so the caller must not serve: `src/main.ts`
+ * refuses the start, and the next start settles it again.
+ *
+ * @param deps The session store, the manager, the instrumentation service and
+ * the cleanup runner when wired, the logger and the clock.
+ * @param reconciliation The report of the start-up reconciliation that ran first.
+ * @param options Cancellation.
+ * @returns The report, or `err` only when the interrupted sessions could not be
+ * listed at all.
+ *
+ * @example
+ * ```ts
+ * const hydrated = await sessionManager.hydrate();
+ * if (isErr(hydrated)) return refuse(hydrated.error);
+ * const settled = await settleInterruptedSessions(
+ *   { sessions: repos.sessions, manager: sessionManager, instrumentation, verdicts: cleanup, logger: root },
+ *   reconciled.value,
+ * );
+ * if (isErr(settled)) return refuse(settled.error);
+ * ```
+ */
+export async function settleInterruptedSessions(
+  deps: InterruptedSessionDeps,
+  reconciliation: StartupReconciliationReport,
+  options: InterruptedSessionOptions = {},
+): Promise<Result<InterruptedSessionsReport, DebuggenError>> {
+  const logger = subsystemLogger(deps.logger ?? noopLogger, LOG_SUBSYSTEM).child({
+    trigger: 'service-start' satisfies CleanupTrigger,
+  });
+  const now = deps.now ?? nowEpochMs;
+  const signal = options.signal;
+  const failed: InterruptedSessionFailure[] = [];
+  const errors: CleanupErrorEntry[] = [];
+  let examined = 0;
+  let kept = 0;
+  let released = 0;
+  let aborted = signal?.aborted === true;
+
+  if (!aborted) {
+    const collected = collectInterrupted(deps.sessions, logger);
+
+    if (isErr(collected)) {
+      return collected;
+    }
+
+    examined = collected.value.length;
+
+    for (const item of collected.value) {
+      if (signal?.aborted === true) {
+        // Stop starting new work; what was already decided stays reported.
+        aborted = true;
+        break;
+      }
+
+      const sessionId = item.id;
+      const scoped = sessionLogger(logger, sessionId);
+      const decision = decideInterrupted(reconciliation, item, scoped);
+
+      if (decision.kind === 'keep') {
+        kept += 1;
+      } else {
+        const failure = interruptedFailure(decision.stage, decision.reason);
+        const releaser = deps.instrumentation;
+        // Read before the failure closes it: the window a failed capture held
+        // is what its producers are owed a dormant configuration for.
+        const interrupted =
+          item.status === CAPTURING_STATUS && releaser !== undefined
+            ? await interruptedCaptureOf(deps, sessionId, scoped)
+            : undefined;
+        const moved = await settle(() => deps.manager.fail(sessionId, failure), 'INTERNAL');
+
+        if (isErr(moved)) {
+          scoped.error('an interrupted session could not be failed', {
+            code: moved.error.code,
+            status: item.status,
+            reason: decision.reason,
+          });
+          errors.push(toErrorEntry(sessionId, moved.error));
+        } else {
+          scoped.warn('an interrupted session was failed: it cannot continue after the restart', {
+            status: item.status,
+            reason: decision.reason,
+            stage: decision.stage,
+          });
+          failed.push({ sessionId, status: item.status, reason: decision.reason });
+
+          if (releaser !== undefined && interrupted !== undefined) {
+            const release = await releaseInterrupted(releaser, interrupted, scoped);
+
+            if (release.accepted) {
+              released += 1;
+            }
+
+            const held =
+              deps.verdicts === undefined
+                ? undefined
+                : await holdInterruptedVerdict(
+                    deps.verdicts,
+                    sessionId,
+                    {
+                      pending: release.pending,
+                      files: reconciledFilesOf(reconciliation, sessionId),
+                    },
+                    scoped,
+                  );
+
+            if (held !== undefined) {
+              errors.push(toErrorEntry(sessionId, held));
+            }
+          }
+        }
+      }
+    }
+  }
+
+  const report: InterruptedSessionsReport = {
+    examined,
+    failed,
+    errors,
+    aborted,
+    completedAt: now(),
+  };
+
+  logger.info('interrupted sessions settled', {
+    examined,
+    failed: failed.length,
+    released,
+    kept,
+    errors: errors.length,
+    aborted,
+  });
+
+  return ok(report);
 }

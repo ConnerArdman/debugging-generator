@@ -4,7 +4,11 @@
  * What this suite protects:
  *
  *   - the exact payload: `onSubmit` receives the trimmed draft, once, and the
- *     draft is cleared afterwards;
+ *     draft is KEPT until a `submission` outcome reports it accepted;
+ *   - the submission outcome: `accepted` clears the draft, `failed` keeps it
+ *     and shows a retry hint that describes the field until the next submit,
+ *     each `seq` is applied exactly once, and an outcome present at mount is
+ *     not applied;
  *   - refusal of an empty or whitespace-only draft, by the button and by the
  *     keyboard chord alike, without an error;
  *   - the three states of AAP 0.5.5 and their precedence (error > pending >
@@ -30,11 +34,25 @@ import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import type { SubmissionOutcome } from '../pending-actions';
+
 import { QuestionForm } from './QuestionForm';
 
 const FIELD_NAME = 'What do you want to debug?';
 const SUBMIT_NAME = 'Ask question';
 const UNAVAILABLE_TEXT = 'Start the local service to begin a session.';
+const RETRY_HINT_TEXT =
+  'Your question was not confirmed, so it is kept here. Press “Ask question” to try again.';
+
+/** An outcome for the submission numbered `seq`. */
+function outcome(seq: number, status: SubmissionOutcome['status']): SubmissionOutcome {
+  return { seq, status };
+}
+
+/** The retry hint, when it is on display. */
+function queryRetryHint(): HTMLElement | null {
+  return screen.queryByText(RETRY_HINT_TEXT);
+}
 
 /** The console methods a question must never reach (AAP 0.5.2). */
 const CONSOLE_METHODS = ['log', 'warn', 'error', 'info', 'debug'] as const;
@@ -148,7 +166,7 @@ describe('QuestionForm — default state', () => {
 });
 
 describe('QuestionForm — submission', () => {
-  it('hands up the trimmed draft exactly once and clears the field', () => {
+  it('hands up the trimmed draft exactly once and keeps the field until it is accepted', () => {
     const onSubmit = vi.fn<(question: string) => void>();
     render(<QuestionForm onSubmit={onSubmit} />);
 
@@ -159,8 +177,9 @@ describe('QuestionForm — submission', () => {
 
     expect(onSubmit).toHaveBeenCalledTimes(1);
     expect(onSubmit).toHaveBeenCalledWith('Why does this list take so long to appear?');
-    expect(getField().value).toBe('');
-    expect(getSubmit().disabled).toBe(true);
+    // Nothing has confirmed the question yet, so the text stays exactly as typed.
+    expect(getField().value).toBe('   Why does this list take so long to appear?  \n');
+    expect(queryRetryHint()).toBeNull();
   });
 
   it('hands up the trimmed draft when typed and clicked through user-event', async () => {
@@ -173,7 +192,7 @@ describe('QuestionForm — submission', () => {
 
     expect(onSubmit).toHaveBeenCalledTimes(1);
     expect(onSubmit).toHaveBeenCalledWith('Where does the time go after the first click?');
-    expect(getField().value).toBe('');
+    expect(getField().value).toBe('   Where does the time go after the first click?   ');
   });
 
   it('refuses an untouched field by the button and by the keyboard chord', async () => {
@@ -280,29 +299,30 @@ describe('QuestionForm — submission', () => {
 
   it('forwards two different wordings verbatim, with identical behaviour', () => {
     const onSubmit = vi.fn<(question: string) => void>();
-    const { container } = render(<QuestionForm onSubmit={onSubmit} />);
+    const { container, rerender } = render(<QuestionForm onSubmit={onSubmit} />);
 
     // The component-level counterpart of AAP 0.5.4: the text is data, so two
     // wordings of one question must meet the same controls, reach the callback
-    // untransformed and leave the same markup behind. Markup is compared
-    // between the two rounds rather than against the first render, because
-    // toggling `disabled` legitimately reorders the button's attributes.
+    // untransformed and leave the same markup behind once accepted. Markup is
+    // compared between the two rounds rather than against the first render,
+    // because toggling `disabled` legitimately reorders the button's attributes.
     const wordings = ['Why is this view slow?', 'What makes this view slow?'] as const;
     const markupAfterSubmit: string[] = [];
 
-    for (const wording of wordings) {
+    wordings.forEach((wording, index) => {
       typeDraft(`  ${wording}  `);
       expect(getSubmit().disabled).toBe(false);
       expect(screen.queryByRole('alert')).toBeNull();
       expect(screen.queryByRole('status')).toBeNull();
 
       fireEvent.click(getSubmit());
+      rerender(<QuestionForm onSubmit={onSubmit} submission={outcome(index + 1, 'accepted')} />);
 
       expect(onSubmit).toHaveBeenLastCalledWith(wording);
       expect(getField().value).toBe('');
       expect(getSubmit().disabled).toBe(true);
       markupAfterSubmit.push(container.innerHTML);
-    }
+    });
 
     expect(onSubmit.mock.calls).toEqual([[wordings[0]], [wordings[1]]]);
     expect(markupAfterSubmit[1]).toBe(markupAfterSubmit[0]);
@@ -329,6 +349,140 @@ describe('QuestionForm — submission', () => {
     } finally {
       reported.mockRestore();
     }
+  });
+});
+
+describe('QuestionForm — submission outcome', () => {
+  it('clears the draft once the submission is accepted', () => {
+    const onSubmit = vi.fn<(question: string) => void>();
+    const { rerender } = render(<QuestionForm onSubmit={onSubmit} />);
+
+    typeDraft('Why does the second step wait?');
+    fireEvent.click(getSubmit());
+    rerender(<QuestionForm onSubmit={onSubmit} pending />);
+    expect(screen.queryByRole('textbox')).toBeNull();
+
+    rerender(<QuestionForm onSubmit={onSubmit} submission={outcome(1, 'accepted')} />);
+
+    expect(getField().value).toBe('');
+    expect(getSubmit().disabled).toBe(true);
+    expect(queryRetryHint()).toBeNull();
+  });
+
+  it('keeps the draft after a failed submission and shows a retry hint describing the field', () => {
+    const onSubmit = vi.fn<(question: string) => void>();
+    const { rerender } = render(<QuestionForm onSubmit={onSubmit} />);
+
+    typeDraft('Why does the second step wait?');
+    fireEvent.click(getSubmit());
+    rerender(<QuestionForm onSubmit={onSubmit} pending />);
+    rerender(<QuestionForm onSubmit={onSubmit} submission={outcome(1, 'failed')} />);
+
+    expect(getField().value).toBe('Why does the second step wait?');
+    expect(getSubmit().disabled).toBe(false);
+    const hint = queryRetryHint();
+    expect(hint).not.toBeNull();
+    const describedBy = (getField().getAttribute('aria-describedby') ?? '').split(' ');
+    expect(describedBy).toContain(hint?.id);
+    // The hint is guidance, not a failure state: the field stays, no alert is raised.
+    expect(screen.queryByRole('alert')).toBeNull();
+
+    // Retrying hands the same question up again.
+    fireEvent.click(getSubmit());
+    expect(onSubmit.mock.calls).toEqual([
+      ['Why does the second step wait?'],
+      ['Why does the second step wait?'],
+    ]);
+  });
+
+  it('hides the retry hint on the next submit', () => {
+    const onSubmit = vi.fn<(question: string) => void>();
+    const { rerender } = render(<QuestionForm onSubmit={onSubmit} />);
+
+    typeDraft('Why does the second step wait?');
+    fireEvent.click(getSubmit());
+    rerender(<QuestionForm onSubmit={onSubmit} submission={outcome(1, 'failed')} />);
+    expect(queryRetryHint()).not.toBeNull();
+
+    fireEvent.keyDown(getField(), { key: 'Enter', ctrlKey: true });
+
+    expect(onSubmit).toHaveBeenCalledTimes(2);
+    expect(queryRetryHint()).toBeNull();
+    const describedBy = (getField().getAttribute('aria-describedby') ?? '').split(' ');
+    expect(describedBy.every((id) => document.getElementById(id) !== null)).toBe(true);
+    expect(getField().value).toBe('Why does the second step wait?');
+  });
+
+  it('applies an outcome once: the same seq passed again changes nothing', () => {
+    const onSubmit = vi.fn<(question: string) => void>();
+    const accepted = outcome(1, 'accepted');
+    const { rerender } = render(<QuestionForm onSubmit={onSubmit} />);
+
+    typeDraft('First question');
+    fireEvent.click(getSubmit());
+    rerender(<QuestionForm onSubmit={onSubmit} submission={accepted} />);
+    expect(getField().value).toBe('');
+
+    // A new draft survives re-renders carrying the already-applied outcome,
+    // whether it is the same object or an equal copy.
+    typeDraft('A draft typed afterwards');
+    rerender(<QuestionForm onSubmit={onSubmit} submission={accepted} />);
+    rerender(<QuestionForm onSubmit={onSubmit} submission={outcome(1, 'accepted')} />);
+    expect(getField().value).toBe('A draft typed afterwards');
+
+    // A failed outcome's hint, once retired by a submit, does not come back
+    // when the same outcome is passed again.
+    fireEvent.click(getSubmit());
+    rerender(<QuestionForm onSubmit={onSubmit} submission={outcome(2, 'failed')} />);
+    expect(queryRetryHint()).not.toBeNull();
+    fireEvent.click(getSubmit());
+    expect(queryRetryHint()).toBeNull();
+    rerender(<QuestionForm onSubmit={onSubmit} submission={outcome(2, 'failed')} />);
+    expect(queryRetryHint()).toBeNull();
+    expect(getField().value).toBe('A draft typed afterwards');
+  });
+
+  it('clears a kept draft and its hint when a later submission is accepted', () => {
+    const onSubmit = vi.fn<(question: string) => void>();
+    const { rerender } = render(<QuestionForm onSubmit={onSubmit} />);
+
+    typeDraft('Why does the second step wait?');
+    fireEvent.click(getSubmit());
+    rerender(<QuestionForm onSubmit={onSubmit} submission={outcome(1, 'failed')} />);
+    fireEvent.click(getSubmit());
+    rerender(<QuestionForm onSubmit={onSubmit} submission={outcome(2, 'accepted')} />);
+
+    expect(getField().value).toBe('');
+    expect(queryRetryHint()).toBeNull();
+  });
+
+  it('does not apply an outcome that was already present when the form mounted', () => {
+    const onSubmit = vi.fn<(question: string) => void>();
+    const { rerender } = render(
+      <QuestionForm onSubmit={onSubmit} submission={outcome(4, 'failed')} />,
+    );
+
+    expect(queryRetryHint()).toBeNull();
+    typeDraft('A fresh draft');
+    rerender(<QuestionForm onSubmit={onSubmit} submission={outcome(4, 'failed')} />);
+
+    expect(getField().value).toBe('A fresh draft');
+    expect(queryRetryHint()).toBeNull();
+  });
+
+  it('keeps the hint and the draft while the form is unavailable, and shows both again after', () => {
+    const onSubmit = vi.fn<(question: string) => void>();
+    const { rerender } = render(<QuestionForm onSubmit={onSubmit} />);
+
+    typeDraft('Why does the second step wait?');
+    fireEvent.click(getSubmit());
+    rerender(<QuestionForm onSubmit={onSubmit} submission={outcome(1, 'failed')} unavailable />);
+    expect(screen.queryByRole('textbox')).toBeNull();
+    expect(queryRetryHint()).toBeNull();
+
+    rerender(<QuestionForm onSubmit={onSubmit} submission={outcome(1, 'failed')} />);
+    expect(getField().value).toBe('Why does the second step wait?');
+    expect(queryRetryHint()).not.toBeNull();
   });
 });
 
@@ -468,10 +622,19 @@ describe('QuestionForm — privacy', () => {
 
     await user.type(getField(), 'Which step of this flow waits the longest?');
     await user.click(getSubmit());
+    rerender(<QuestionForm onSubmit={onSubmit} submission={outcome(1, 'accepted')} />);
     await user.type(getField(), 'And what happens right after it?');
     await user.keyboard('{Meta>}{Enter}{/Meta}');
-    rerender(<QuestionForm onSubmit={onSubmit} pending />);
-    rerender(<QuestionForm onSubmit={onSubmit} error="Stage failed." onRetry={vi.fn()} />);
+    rerender(<QuestionForm onSubmit={onSubmit} submission={outcome(1, 'accepted')} pending />);
+    rerender(<QuestionForm onSubmit={onSubmit} submission={outcome(2, 'failed')} />);
+    rerender(
+      <QuestionForm
+        onSubmit={onSubmit}
+        submission={outcome(2, 'failed')}
+        error="Stage failed."
+        onRetry={vi.fn()}
+      />,
+    );
 
     expect(onSubmit.mock.calls).toEqual([
       ['Which step of this flow waits the longest?'],

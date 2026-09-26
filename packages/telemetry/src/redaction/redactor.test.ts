@@ -891,6 +891,36 @@ describe('redactAttributes — key names', () => {
     }
   });
 
+  it('masks the search parameter values a component-tree React key embeds, and keeps every other key', () => {
+    // Next.js keys a page segment by its search parameters, serialised as JSON
+    // after a `?`: a query in all but syntax, so its values never travel.
+    const planted = 'cf53ae80c4bc5e0040c5357c';
+    const forest = [
+      {
+        name: 'Head',
+        key: `/__PAGE__?{"probe":"${planted}","page":"2"}`,
+        children: [
+          { name: 'Row', key: 'row?id=42&sort=asc' },
+          { name: 'Layout', key: 'layout' },
+          { name: 'Card', key: 48 },
+        ],
+      },
+    ];
+
+    const redacted = redactAttributes({ componentTree: JSON.stringify(forest) });
+    const text = redacted['componentTree'];
+
+    expect(typeof text).toBe('string');
+    expect(String(text)).not.toContain(planted);
+    const [head] = JSON.parse(String(text)) as [
+      { key: string; children: readonly { key?: string }[] },
+    ];
+    expect(head.key).toBe('/__PAGE__?{"probe":"?","page":"?"}');
+    expect(head.children.map((child) => child.key)).toEqual(['row?id=?&sort=?', 'layout', '48']);
+    // Idempotent: the masked document masks to itself.
+    expect(redactAttributes({ componentTree: text })['componentTree']).toBe(text);
+  });
+
   it('keeps the service-assigned request key, name and value', () => {
     const requestKey = 'a1'.repeat(32);
 

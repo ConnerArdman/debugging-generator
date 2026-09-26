@@ -288,7 +288,7 @@ export const PANEL_FAILURE_POLICY: Readonly<Record<PanelFailureClass, PanelFailu
     }),
     normalize: policyFor('normalize', {
       meaning:
-        'The deterministic normaliser threw, or produced something that is not a panel document, on input the authoring schema had accepted. A product bug: the structured-output loop logs it with the parsed input and rejects it without re-prompting.',
+        "The deterministic normaliser threw, or produced something that is not a panel document, on input the authoring schema had accepted. A product bug: the structured-output loop logs it by provenance, counts and the thrown error's closed code and class — never the parsed input or the thrown message — and rejects it without re-prompting.",
       productBug: true,
       disposition: 'fallback',
       defaultCode: 'INTERNAL',
@@ -753,14 +753,19 @@ function normalizeFailureError(failure: NormalizeFailure): DebuggenError {
  *
  * This is the one deliberate exception to this module's never-throw rule, and
  * the inversion is load-bearing. `generateStructuredWithRepair` treats a
- * `normalize` callback that **throws** as a product bug: it logs the parsed
- * input, rejects with `details.reason = 'normalize'` after exactly one provider
- * call, and **never re-prompts** — which is what AAP 0.5.3 requires of a
- * normaliser or internal-schema failure, since an identical second answer would
- * fail identically. A callback that instead *returned* a failure value would be
- * accepted as a successful normalisation. Do not "fix" this into a `Result`:
- * doing so either ships an invalid panel or, once someone adds a retry around
- * it, silently re-prompts the model for a product bug.
+ * `normalize` callback that **throws** as a product bug: it logs one error
+ * record carrying closed fields only — provenance, counts, the thrown error's
+ * code and its `details.failureClass` — never the parsed input, whose title,
+ * summary and labels are model prose that can echo developer source, and never
+ * the thrown message, which can quote it (CWE-532); it rejects with
+ * `details.reason = 'normalize'` after exactly one provider call, keeping the
+ * thrown error as the rejection's `cause`; and it **never re-prompts** — which
+ * is what AAP 0.5.3 requires of a normaliser or internal-schema failure, since
+ * an identical second answer would fail identically. A callback that instead
+ * *returned* a failure value would be accepted as a successful normalisation.
+ * Do not "fix" this into a `Result`: doing so either ships an invalid panel or,
+ * once someone adds a retry around it, silently re-prompts the model for a
+ * product bug.
  *
  * The thrown `DebuggenError` records its failure class in
  * `details.failureClass` — `normalize` when `normalizePanel` threw or produced

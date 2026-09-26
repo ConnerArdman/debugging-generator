@@ -67,8 +67,14 @@ import type { ReactElement } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { Button } from './Button';
-import { DataTable } from './DataTable';
-import type { DataTableCellMeta, DataTableColumn, DataTableSort } from './DataTable';
+import { DESIGN_TOKENS } from '../tokens/tokens';
+import { DATA_TABLE_COLUMN_TRACKS, DataTable } from './DataTable';
+import type {
+  DataTableCellMeta,
+  DataTableColumn,
+  DataTableColumnWidth,
+  DataTableSort,
+} from './DataTable';
 import { Input } from './Input';
 import { Text } from './Text';
 import { Tooltip } from './Tooltip';
@@ -1874,11 +1880,11 @@ function gridOf(container: HTMLElement): HTMLElement {
   return grid;
 }
 
-/** A single-column table's column list, with one track the test chooses. */
-function columnsWithTracks(
-  tracks: readonly (string | undefined)[],
+/** A table's column list, one column per width role the test chooses (`undefined` = no role). */
+function columnsWithWidths(
+  widths: readonly (DataTableColumnWidth | undefined)[],
 ): readonly DataTableColumn<SampleRow>[] {
-  return tracks.map((width, index) => ({
+  return widths.map((width, index) => ({
     key: `column-${String(index)}`,
     header: `Column ${String(index)}`,
     rowHeader: index === 0,
@@ -1887,66 +1893,157 @@ function columnsWithTracks(
   }));
 }
 
-describe('DataTable column tracks and the horizontal-scroll floor (Q4-B2 F15)', () => {
-  it('publishes the track template, the sum of the known minimums and the column count', () => {
-    const tracks = [
-      'minmax(22ch, 3fr)',
-      '9ch',
-      'minmax(0, 1fr)',
-      undefined,
-      'max-content',
-      'var(--dg-space-7)',
-      'minmax(max(9ch, var(--dg-space-7)), 2fr)',
-      '2fr',
-    ];
+/** Every custom property name the token table declares. */
+const TOKEN_PROPERTY_NAMES: ReadonlySet<string> = new Set(
+  Object.keys(DESIGN_TOKENS.dark).map((key) => `--dg-${kebabOf(key)}`),
+);
+
+/**
+ * A token key in the kebab form its custom property carries, computed independently of the
+ * product's `cssVarName` so a drift between the two cannot pass here.
+ *
+ * @param key A camel-case token key.
+ * @returns The key's kebab form, digit boundaries included.
+ */
+function kebabOf(key: string): string {
+  return key
+    .replace(/([A-Z])/gu, '-$1')
+    .replace(/([A-Za-z])(\d)/gu, '$1-$2')
+    .toLowerCase();
+}
+
+/**
+ * The value a `var(--dg-…)` reference resolves to in the default theme.
+ *
+ * @param reference A single `var(--dg-…)` reference.
+ * @returns The referenced token's dark value.
+ */
+function tokenValueOf(reference: string): string {
+  const property = /^var\((--dg-[a-z0-9-]+)\)$/u.exec(reference)?.[1];
+  const key = Object.keys(DESIGN_TOKENS.dark).find((name) => `--dg-${kebabOf(name)}` === property);
+  const values: Readonly<Record<string, string>> = DESIGN_TOKENS.dark;
+
+  if (key === undefined) {
+    throw new Error(`${reference} references no token the table declares`);
+  }
+
+  return values[key] ?? '';
+}
+
+describe('DataTable column width roles and the horizontal-scroll floor (FE-F46)', () => {
+  it("publishes each role's token-built track, the sum of the floors and the column count", () => {
+    const widths = ['name', 'quantity', undefined, 'ordinal', 'text', 'status'] as const;
     const { container } = render(
       <DataTable
         caption="Tracks"
         rows={makeRows(2)}
         rowKey={(row) => row.id}
-        columns={columnsWithTracks(tracks)}
+        columns={columnsWithWidths(widths)}
       />,
     );
     const grid = gridOf(container);
 
+    // Pinned literally as well as through the exported table, so the token form the rows consume is
+    // asserted and not only whatever the table currently holds.
     expect(grid.style.getPropertyValue('--dgc-columns')).toBe(
-      'minmax(22ch, 3fr) 9ch minmax(0, 1fr) minmax(10ch, 1fr) max-content var(--dg-space-7) ' +
-        'minmax(max(9ch, var(--dg-space-7)), 2fr) 2fr',
+      'minmax(var(--dg-column-min-name), var(--dg-column-share-wide)) ' +
+        'minmax(var(--dg-column-min-quantity), var(--dg-column-share-compact)) ' +
+        'minmax(var(--dg-column-min-standard), var(--dg-column-share-default)) ' +
+        'var(--dg-column-min-ordinal) ' +
+        'minmax(var(--dg-column-min-text), var(--dg-column-share-widest)) ' +
+        'minmax(var(--dg-column-min-status), var(--dg-column-share-compact))',
     );
-    // `minmax(0, …)`, `max-content` and `2fr` contribute no minimum; the unsized column contributes
-    // the default track's ten characters; a nested function's commas stay inside its argument.
+    expect(grid.style.getPropertyValue('--dgc-columns')).toBe(
+      widths.map((width) => DATA_TABLE_COLUMN_TRACKS[width ?? 'standard'].track).join(' '),
+    );
+    // Every column contributes its floor, so a dock narrower than the sum scrolls horizontally.
     expect(grid.style.getPropertyValue('--dgc-min-inline')).toBe(
-      'calc(22ch + 9ch + 10ch + var(--dg-space-7) + max(9ch, var(--dg-space-7)))',
+      'calc(var(--dg-column-min-name) + var(--dg-column-min-quantity) + ' +
+        'var(--dg-column-min-standard) + var(--dg-column-min-ordinal) + var(--dg-column-min-text) + ' +
+        'var(--dg-column-min-status))',
     );
-    expect(grid.style.getPropertyValue('--dgc-column-count')).toBe(String(tracks.length));
+    expect(grid.style.getPropertyValue('--dgc-column-count')).toBe(String(widths.length));
   });
 
-  it('gives every unsized column the non-zero default track', () => {
+  it('gives every unsized column the token-backed standard role', () => {
     const { container } = render(
       <DataTable caption="Default" rows={makeRows(1)} rowKey={(row) => row.id} columns={columns} />,
     );
     const grid = gridOf(container);
 
     expect(grid.style.getPropertyValue('--dgc-columns')).toBe(
-      'minmax(10ch, 1fr) minmax(10ch, 1fr)',
+      'minmax(var(--dg-column-min-standard), var(--dg-column-share-default)) ' +
+        'minmax(var(--dg-column-min-standard), var(--dg-column-share-default))',
     );
-    expect(grid.style.getPropertyValue('--dgc-min-inline')).toBe('calc(10ch + 10ch)');
+    expect(grid.style.getPropertyValue('--dgc-min-inline')).toBe(
+      'calc(var(--dg-column-min-standard) + var(--dg-column-min-standard))',
+    );
     expect(grid.style.getPropertyValue('--dgc-column-count')).toBe('2');
   });
 
-  it('publishes no floor when no track states a minimum', () => {
+  it('falls back to the standard role for a role an untyped caller invents', () => {
+    const [column] = columnsWithWidths(['name']);
+    if (column === undefined) {
+      throw new Error('the fixture built no column');
+    }
+    const untyped = { ...column };
+    // An untyped caller's value: neither a role nor a track, and an inherited property name besides.
+    Reflect.set(untyped, 'width', 'constructor');
+
     const { container } = render(
       <DataTable
-        caption="Flexible"
+        caption="Untyped"
         rows={makeRows(1)}
         rowKey={(row) => row.id}
-        columns={columnsWithTracks(['minmax(0, 1fr)', '2fr', 'fit-content(30ch)', '0ch'])}
+        columns={[untyped]}
       />,
     );
     const grid = gridOf(container);
 
+    expect(grid.style.getPropertyValue('--dgc-columns')).toBe(
+      DATA_TABLE_COLUMN_TRACKS.standard.track,
+    );
+    expect(grid.style.getPropertyValue('--dgc-min-inline')).toBe(
+      `calc(${DATA_TABLE_COLUMN_TRACKS.standard.minimum})`,
+    );
+  });
+
+  it('publishes no floor and no tracks for a table without columns', () => {
+    const { container } = render(
+      <DataTable caption="Bare" rows={makeRows(1)} rowKey={(row) => row.id} columns={[]} />,
+    );
+    const grid = gridOf(container);
+
     expect(grid.style.getPropertyValue('--dgc-min-inline')).toBe('');
-    expect(grid.style.getPropertyValue('--dgc-column-count')).toBe('4');
+    expect(grid.style.getPropertyValue('--dgc-column-count')).toBe('0');
+  });
+
+  for (const [role, { track, minimum }] of Object.entries(DATA_TABLE_COLUMN_TRACKS)) {
+    it(`builds the ${role} role from catalogued column tokens alone`, () => {
+      const references = [...track.matchAll(/var\((--[a-z0-9-]+)\)/gu)].map((m) => m[1] ?? '');
+
+      expect(references.length, `${role} reads no token at all`).toBeGreaterThan(0);
+      expect(references.filter((name) => !TOKEN_PROPERTY_NAMES.has(name))).toEqual([]);
+      // Nothing but token references and the minmax() frame: no number, no unit, no keyword.
+      expect(track.replace(/var\(--[a-z0-9-]+\)/gu, '')).toMatch(/^(?:minmax\(, \))?$/u);
+      expect(minimum, `${role}'s minimum must be its floor token`).toMatch(
+        /^var\(--dg-column-min-[a-z]+\)$/u,
+      );
+      expect(track.startsWith(minimum) || track.startsWith(`minmax(${minimum}, `)).toBe(true);
+    });
+
+    it(`keeps a narrow dock readable: the ${role} role has a non-zero ch floor`, () => {
+      const [, magnitude] = /^(\d+(?:\.\d+)?)ch$/u.exec(tokenValueOf(minimum)) ?? [];
+
+      expect(magnitude, `${role}'s floor must resolve to a ch length`).toBeDefined();
+      expect(Number(magnitude)).toBeGreaterThan(0);
+    });
+  }
+
+  it('offers exactly the documented roles', () => {
+    expect(Object.keys(DATA_TABLE_COLUMN_TRACKS).sort()).toEqual(
+      ['count', 'label', 'name', 'ordinal', 'quantity', 'standard', 'status', 'text'].sort(),
+    );
   });
 });
 

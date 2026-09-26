@@ -59,7 +59,9 @@
  * - **No secret material.** No shape here holds a credential, a pairing code, a
  *   request or response body or raw page data; {@link WorkerStatusSnapshot}
  *   reports only *whether* a credential exists, and {@link portErr} serializes
- *   an error's code and message only — never its `details`, `cause` or stack.
+ *   an error's code, message and `ref` only — never its `cause` or stack, and
+ *   of its `details` nothing but the schema-validated `owningSessionId` of a
+ *   capture-ownership conflict.
  *
  * Governed by AAP §0.2.5 (the chrome-extension file list), §0.7.1 Group 4
  * ("extension-internal message types"), §0.2.3 (tab/session binding and the
@@ -72,6 +74,7 @@
 import type {
   AgentReadyPayload,
   CreateEnvelopeOptions,
+  ErrorPayload,
   MessageHandler,
   MessagePayload,
   MessageType,
@@ -80,7 +83,11 @@ import type {
   TimerApi,
   Unsubscribe,
 } from '@debuggen/protocol';
-import { toErrorPayload } from '@debuggen/protocol';
+import {
+  CAPTURE_CONFLICT_ERROR_CODE,
+  captureStartConflictResponseSchema,
+  toErrorPayload,
+} from '@debuggen/protocol';
 import type {
   CaptureId,
   DebuggenErrorCode,
@@ -680,29 +687,65 @@ export function portOk<Kind extends PortRequestKind>(
 }
 
 /**
+ * The owning session of a capture-ownership conflict, as the one detail a
+ * port failure may carry: present only on a `capture.start` answer whose error
+ * code is the protocol's `CAPTURE_CONFLICT_ERROR_CODE` and whose
+ * `details.owningSessionId` passes the protocol's own `owningSessionId` schema
+ * (the field of `captureStartConflictResponseSchema`, the `409` body the
+ * protocol's `HttpClient` copies into `details` when it parses it).
+ *
+ * @param kind The kind of the request being answered.
+ * @param error Why it failed.
+ * @returns The validated owning session id, or `undefined`.
+ */
+export function captureConflictOwningSessionId(
+  kind: PortRequestKind,
+  error: DebuggenError,
+): SessionId | undefined {
+  if (kind !== 'capture.start' || error.code !== CAPTURE_CONFLICT_ERROR_CODE) {
+    return undefined;
+  }
+  const parsed = captureStartConflictResponseSchema.shape.owningSessionId.safeParse(
+    error.details?.owningSessionId,
+  );
+  return parsed.success ? parsed.data : undefined;
+}
+
+/**
  * Build the failed answer to a panel request, carrying the error as the
- * protocol's `ErrorPayload`.
+ * protocol's `ErrorPayload` — or, for a capture held by another session, as
+ * the protocol's capture-conflict body.
  *
  * The error is serialized through the protocol's `toErrorPayload`, which
  * projects the class's own `toPayload()` onto the strict wire shape
- * `{ code, message }` that `PortFailureResponse.error` declares: the `hint`
- * is not part of that shape, and `details`, `cause` and the stack never leave
- * the worker — they can carry paths and values (AAP §0.5.2). A developer-facing
- * hint reaches the panel through {@link WorkerStatusSnapshot.hint} instead.
+ * `{ code, message, ref? }`: the `hint` is not part of that shape, and
+ * `details`, `cause` and the stack never leave the worker — they can carry
+ * paths and values (AAP §0.5.2). A developer-facing hint reaches the panel
+ * through {@link WorkerStatusSnapshot.hint} instead.
+ *
+ * One detail is whitelisted, by name and by schema: the `owningSessionId` of a
+ * `capture.start` refused with `CAPTURE_ALREADY_ACTIVE`
+ * ({@link captureConflictOwningSessionId}). AAP §0.4.2 specifies that `409`
+ * as `{ owningSessionId }` precisely so a client can name the session that
+ * holds the project's capture, and the panel's `PortErrorPayload` admits it on
+ * that answer only. Nothing else from `details` is ever copied.
  *
  * An error with an empty message would produce a frame the panel's
- * `isPortResponse` refuses — leaving the panel waiting for an answer that was
- * dropped — so the error's code stands in for a missing message.
+ * `parsePortResponse` refuses — leaving the panel waiting for an answer that
+ * was dropped — so the error's code stands in for a missing message.
  *
  * @param request The request being answered, narrowed to its kind.
  * @param error Why it failed.
- * @returns A response frame that passes `isPortResponse`.
+ * @returns A response frame that passes `parsePortResponse`.
  */
 export function portErr<Kind extends PortRequestKind>(
   request: PortRequestFrame<Kind>,
   error: DebuggenError,
 ): PortFailureResponse<Kind> {
   const projected = toErrorPayload(error);
+  const payload: ErrorPayload =
+    projected.message.length > 0 ? projected : { code: projected.code, message: projected.code };
+  const owningSessionId = captureConflictOwningSessionId(request.kind, error);
   return {
     channel: EXTENSION_CHANNEL,
     version: PORT_PROTOCOL_VERSION,
@@ -710,8 +753,7 @@ export function portErr<Kind extends PortRequestKind>(
     requestId: request.requestId,
     kind: request.kind,
     ok: false,
-    error:
-      projected.message.length > 0 ? projected : { code: projected.code, message: projected.code },
+    error: owningSessionId === undefined ? payload : { ...payload, owningSessionId },
   };
 }
 
@@ -727,7 +769,9 @@ export function portErr<Kind extends PortRequestKind>(
  * @param message One sentence describing what failed. It may be shown to the
  * developer, so it must not contain a credential, a pairing code or page data.
  * @param options An optional developer hint, diagnostic `details` (logged in
- * the worker, never serialized to a panel by {@link portErr}) and `cause`.
+ * the worker, never serialized to a panel by {@link portErr} — except the
+ * whitelisted conflict owner of {@link captureConflictOwningSessionId}) and
+ * `cause`.
  * @returns The error; nothing is thrown.
  *
  * @example

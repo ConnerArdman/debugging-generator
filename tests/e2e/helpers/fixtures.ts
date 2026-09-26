@@ -1,7 +1,7 @@
 /**
  * The single import surface of the Playwright `e2e` project (AAP §0.8.3
  * "End-to-end demo"): the extended `test` and `expect` every spec under
- * `tests/e2e/**` imports, the fixtures that compose this folder's seven sibling
+ * `tests/e2e/**` imports, the fixtures that compose this folder's eight sibling
  * modules, the ordered and exception-safe teardown that owns their lifecycle,
  * the fixture-level timeout budgets, and the curated re-export of the folder's
  * public names. It is the `e2e` counterpart of `tests/browser/fixtures.ts`.
@@ -24,7 +24,10 @@
  *
  * Test-scoped — per-test handles, each released before the next test starts:
  * `serviceWorker`, `appPage`, `samplePage`, `openPanelPage`, `panel`,
- * `editorClient`, `sessions` and `resetExtension` (see {@link E2ETestFixtures}).
+ * `editorClient`, `editorHost`, `sessions` and `resetExtension` (see
+ * {@link E2ETestFixtures}). `editorHost` is a real VS Code window with the
+ * built extension (`./editor-host`), opened on the demo; it launches nothing
+ * until the spec calls its `start()`.
  *
  * ## Every fixture is lazy — `clean-clone.spec.ts` pays for nothing
  *
@@ -47,7 +50,10 @@
  *    capture or applied patch leaks into the next spec under `workers: 1`;
  * 2. `panels` — every panel opened through `openPanelPage` is closed;
  * 3. `pages` — `appPage` and `samplePage` are closed;
- * 4. `editor` — the `editorClient` socket is closed.
+ * 4. `editor` — the `editorClient` socket is closed and the `editorHost`
+ *    window is stopped. The window's extension ends its active session when it
+ *    deactivates, so it must outlive phase 1: by then every tracked session has
+ *    ended and there is nothing left for it to end.
  *
  * Every fixture registers its release with the internal `_testScope`
  * coordinator, and whichever fixture Playwright tears down first drains every
@@ -68,9 +74,10 @@
  * the editor client's message-type timeline (types, counts and first/last
  * arrival — never payloads), the last `session.progress` rows, the `endAll()`
  * cleanup report, a file-and-status summary of each session's modification
- * journal, and the service's `/health` body. Never `auth.json`, a token, a
- * pairing code, a telemetry attribute map, a diff or file contents: every
- * attached line additionally passes through a credential-shape scrubber.
+ * journal, the editor host's state, cursor positions and log tails (when a
+ * window was started), and the service's `/health` body. Never `auth.json`, a
+ * token, a pairing code, a telemetry attribute map, a diff or file contents:
+ * every attached line additionally passes through a credential-shape scrubber.
  *
  * ## Relationship to `tests/browser/fixtures.ts`
  *
@@ -160,6 +167,8 @@ import {
   withEditorAnnouncement,
 } from './demo-app';
 import type { DemoAppHandle } from './demo-app';
+import { EDITOR_HOST_TIMEOUTS, createEditorHost } from './editor-host';
+import type { EditorHostHandle } from './editor-host';
 import { repoRoot } from './repo';
 import {
   PORT_RELEASE_TIMEOUT_MS,
@@ -274,6 +283,27 @@ export type {
 // reached through the `sampleApp` handle (or by importing ./sample-app by path).
 export { SampleAppError, sourceLineContaining as sampleSourceLineContaining } from './sample-app';
 export type { SampleAppHandle, SampleAppLaunch } from './sample-app';
+
+// ./editor-host — the real VS Code window the source-open path ends in.
+export {
+  EDITOR_HOST_TIMEOUTS,
+  EDITOR_WARM_UP_POSITION,
+  EditorHostError,
+  editorWarmUpLocation,
+  isEditorWarmUpLocation,
+} from './editor-host';
+export type {
+  EditorHostErrorCode,
+  EditorHostHandle,
+  EditorHostReady,
+  EditorHostState,
+  EditorHostTimeouts,
+  EditorProbeRecord,
+  EditorSelectionRecord,
+  EditorWarmUpOptions,
+  EditorWarmUpResult,
+  WaitForSelectionOptions,
+} from './editor-host';
 
 // ./session — the workflow driver, the follow-up driver, the tracker and the session budgets.
 export {
@@ -481,6 +511,15 @@ const TEST_FIXTURE_TIMEOUT_MS = Math.max(
   E2E_TIMEOUTS.pageReady,
   E2E_TIMEOUTS.connection,
 );
+
+/**
+ * The fixture timeout of `editorHost`: whatever earlier phases its teardown
+ * drains first (the `TEST_FIXTURE_TIMEOUT_MS` slot every other test fixture
+ * has), then the window's own stop — the stop file, SIGTERM and SIGKILL for
+ * the window and its `Xvfb` — and its failure diagnostics.
+ */
+const EDITOR_HOST_FIXTURE_TIMEOUT_MS =
+  TEST_FIXTURE_TIMEOUT_MS + EDITOR_HOST_TIMEOUTS.teardown + TEARDOWN_DIAGNOSTICS_MS;
 
 // ---------------------------------------------------------------------------
 // Diagnostic bounds
@@ -1111,6 +1150,7 @@ async function closePanels(opened: readonly PanelHandle[], testInfo: TestInfo): 
 /** Phase 3 of a test's teardown for one application page: on failure attach its console tail, then close it. */
 async function closePage(
   page: Page,
+  extension: ExtensionContextHandle,
   log: BoundedLines,
   label: string,
   testInfo: TestInfo,
@@ -1131,8 +1171,83 @@ async function closePage(
         ),
     ]);
   }
-  steps.push([`close the ${label}`, () => page.close()]);
+  steps.push([`close the ${label}`, () => closePageBounded(page, extension, label)]);
   throwIfProblems(label, await runSteps(steps));
+}
+
+/** How long an application page may take to close before teardown checks its tab itself. */
+const PAGE_CLOSE_TIMEOUT_MS = 15_000;
+
+/** How long a tab the teardown removed itself may take to leave `chrome.tabs`. */
+const TAB_REMOVAL_TIMEOUT_MS = 5_000;
+
+/**
+ * Close an application page within {@link PAGE_CLOSE_TIMEOUT_MS}. Playwright's
+ * `page.close()` can stay pending forever when it races a navigation the page
+ * started itself — Next.js Fast Refresh fully reloads the page when a session's
+ * cleanup restores the files it serves, which is exactly when a test ends. On
+ * the deadline the page's tab (resolved before closing) is looked up in the
+ * extension's worker: a tab that is gone was closed; one that is still open is
+ * removed through `chrome.tabs` and must leave within
+ * {@link TAB_REMOVAL_TIMEOUT_MS}. Only a tab that survives removal, or one that
+ * could not be identified, is reported.
+ */
+async function closePageBounded(
+  page: Page,
+  extension: ExtensionContextHandle,
+  label: string,
+): Promise<void> {
+  if (page.isClosed()) {
+    return;
+  }
+  let tabId: number | undefined;
+  try {
+    tabId = await tabIdForPage(extension, page, { timeoutMs: TAB_REMOVAL_TIMEOUT_MS });
+  } catch {
+    tabId = undefined;
+  }
+  const closing = page.close();
+  try {
+    await withDeadline(closing, PAGE_CLOSE_TIMEOUT_MS, `close the ${label}`);
+    return;
+  } catch (error) {
+    if (tabId === undefined) {
+      throw error;
+    }
+  }
+  const worker = await extension.getServiceWorker();
+  const remaining = await worker.evaluate(
+    async ({ id, removalMs }) => {
+      const host = globalThis as unknown as {
+        chrome: {
+          tabs: {
+            query(queryInfo: Record<string, never>): Promise<{ id?: number }[]>;
+            remove(tabId: number): Promise<void>;
+          };
+        };
+      };
+      const isOpen = async (): Promise<boolean> =>
+        (await host.chrome.tabs.query({})).some((tab) => tab.id === id);
+      if (!(await isOpen())) {
+        return 'closed';
+      }
+      await host.chrome.tabs.remove(id).catch(() => undefined);
+      const deadline = Date.now() + removalMs;
+      while (Date.now() < deadline) {
+        if (!(await isOpen())) {
+          return 'removed';
+        }
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      return 'open';
+    },
+    { id: tabId, removalMs: TAB_REMOVAL_TIMEOUT_MS },
+  );
+  if (remaining === 'open') {
+    throw new Error(
+      `the ${label} (tab ${String(tabId)}) did not close within ${String(PAGE_CLOSE_TIMEOUT_MS)} ms, and removing its tab through chrome.tabs left it open`,
+    );
+  }
 }
 
 /** Phase 4 of a test's teardown: on failure attach the message timeline and the progress tail, then close. */
@@ -1170,6 +1285,34 @@ async function closeEditorClient(client: EditorClientHandle, testInfo: TestInfo)
     },
   ]);
   throwIfProblems('editorClient', await runSteps(steps));
+}
+
+/**
+ * Phase 4 of a test's teardown for the real editor window: on failure, when a
+ * window was started, attach its diagnostics (state, processes, cursor
+ * positions, output and log tails — no document text); then stop it and remove
+ * its throwaway profile. A handle that was never started releases nothing.
+ */
+async function closeEditorHost(host: EditorHostHandle, testInfo: TestInfo): Promise<void> {
+  const steps: TeardownStep[] = [];
+  if (testFailed(testInfo) && host.state() !== 'idle') {
+    steps.push([
+      'attach the editor host diagnostics',
+      async () =>
+        attachText(
+          testInfo,
+          'editor-host',
+          'the window state, its probe records and cursor positions (never document text), the last 200 lines of its output and the last 80 lines of the extension and extension-host logs, 500 characters per line',
+          await withDeadline(
+            host.collectDiagnostics(),
+            DIAGNOSTIC_LIMITS.screenshotTimeoutMs,
+            'collecting the editor host diagnostics',
+          ),
+        ),
+    ]);
+  }
+  steps.push(['stop the editor host', () => host.dispose()]);
+  throwIfProblems('editorHost', await runSteps(steps));
 }
 
 // ---------------------------------------------------------------------------
@@ -1281,6 +1424,16 @@ export interface E2ETestFixtures {
    */
   editorClient: EditorClientHandle;
   /**
+   * A real VS Code window (`./editor-host`) opened on the demo's project root,
+   * with the built extension loaded, configured for this service
+   * (`debuggen.serviceUrl`, its `DEBUGGEN_HOME`, no service of its own). Lazy:
+   * the fixture creates the handle only, and the spec calls `start()` — early,
+   * so the window boots while the pipeline runs — then `warmUp()` for its live
+   * session before relying on it. Stopped in the `editor` phase, after every
+   * tracked session ended.
+   */
+  editorHost: EditorHostHandle;
+  /**
    * The test's session tracker (`createSessionTracker(service)`): teardown
    * ends every session registered with it before any panel, page or socket
    * closes, and attaches the report on failure.
@@ -1316,7 +1469,9 @@ async function serveApplicationPage(
   const log = new BoundedLines(DIAGNOSTIC_LIMITS.pageConsoleLines, DIAGNOSTIC_LIMITS.lineLength);
   const page = await extension.context.newPage();
   forwardPageLog(page, log);
-  scope.onTeardown('pages', `close the ${label}`, () => closePage(page, log, label, testInfo));
+  scope.onTeardown('pages', `close the ${label}`, () =>
+    closePage(page, extension, log, label, testInfo),
+  );
   await guarded(
     label,
     testInfo,
@@ -1551,6 +1706,28 @@ export const test = base.extend<E2ETestFixtures, E2EWorkerFixtures>({
       );
     },
     { timeout: TEST_FIXTURE_TIMEOUT_MS },
+  ],
+
+  editorHost: [
+    async ({ service, demoApp, _testScope }, use, testInfo) => {
+      _testScope.noteService(service, testInfo);
+      // No I/O here: the window is launched by the spec's `start()`.
+      const host = createEditorHost({
+        serviceUrl: service.baseUrl,
+        debuggenHome: service.debuggenHome,
+        workspaceFolder: demoApp.projectRoot,
+      });
+      _testScope.onTeardown('editor', 'stop the editor host', () =>
+        closeEditorHost(host, testInfo),
+      );
+      await guarded(
+        'editorHost',
+        testInfo,
+        () => use(host),
+        () => _testScope.runThrough('editor'),
+      );
+    },
+    { timeout: EDITOR_HOST_FIXTURE_TIMEOUT_MS },
   ],
 
   sessions: [

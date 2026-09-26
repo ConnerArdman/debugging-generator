@@ -896,15 +896,50 @@ function isCancellation(cause: unknown): boolean {
 }
 
 /**
+ * The fragments of a `400` report that mean the platform refused the output
+ * format rather than the request, lower-cased.
+ *
+ * Two families, both the provider's own wording and nothing about the
+ * application under test:
+ *
+ * - **The format parameter by name** — `output_config`, `output format`,
+ *   `json_schema`, `structured output` — for a platform or model that does not
+ *   accept the parameter or the schema placed in it.
+ * - **Grammar compilation** — `compiled grammar`, `grammar compilation`,
+ *   `too complex for compilation`, `schema is too complex`, `too many optional
+ *   parameters` — for a schema the platform accepts in principle but refuses to
+ *   compile into its constrained-decoding grammar. Observed wording: "The
+ *   compiled grammar is too large, which would cause performance issues.
+ *   Simplify your tool schemas or reduce the number of strict tools.";
+ *   "Schemas contains too many optional parameters (28), which would make
+ *   grammar compilation inefficient. Reduce the number of optional parameters
+ *   in your tool schemas (limit: 24)."; and the documented "Schema is too
+ *   complex for compilation.". The forced tool route is not strict and
+ *   compiles no grammar, so it can still serve the call.
+ */
+const OUTPUT_FORMAT_REFUSAL_FRAGMENTS: readonly string[] = Object.freeze([
+  'output_config',
+  'output format',
+  'json_schema',
+  'structured output',
+  'compiled grammar',
+  'grammar compilation',
+  'too complex for compilation',
+  'schema is too complex',
+  'too many optional parameters',
+]);
+
+/**
  * Whether a refused request was refused *because of the output format*.
  *
  * This is the one string-matching heuristic in the file, and it is deliberately
- * narrow: a `400` whose report names the output-format parameter is the signal
- * that the schema-constrained route cannot serve this schema, which is exactly
- * the case AAP §0.5.3's forced-`tool_use` fallback exists for. The vocabulary
- * matched is the provider's own parameter naming and nothing about the
- * application under test; anything else — a credential, a quota, a server
- * failure — is a failure rather than a reason to try the other route.
+ * narrow: a `400` whose report names the output-format parameter, or states
+ * that the schema could not be compiled into a constrained-decoding grammar
+ * ({@link OUTPUT_FORMAT_REFUSAL_FRAGMENTS}), is the signal that the
+ * schema-constrained route cannot serve this schema, which is exactly the case
+ * AAP §0.5.3's forced-`tool_use` fallback exists for. Anything else — a
+ * credential, a quota, a server failure, any other malformed request — is a
+ * failure rather than a reason to try the other route.
  *
  * A false negative costs one honest `Err` instead of one fallback attempt, and
  * a false positive costs one extra attempt that either succeeds or reports the
@@ -918,12 +953,7 @@ function isOutputFormatRefusal(cause: unknown): boolean {
   if (report === undefined) {
     return false;
   }
-  return (
-    report.includes('output_config') ||
-    report.includes('output format') ||
-    report.includes('json_schema') ||
-    report.includes('structured output')
-  );
+  return OUTPUT_FORMAT_REFUSAL_FRAGMENTS.some((fragment) => report.includes(fragment));
 }
 
 /**
@@ -2068,7 +2098,11 @@ class AnthropicProvider implements DisposableModelProvider {
    *
    * A schema that *throws* while validating is treated the same way: it is a
    * defect in the stage's schema rather than a property of the answer, so the
-   * answer is still reported and the throw is logged for whoever fixes it.
+   * answer is still reported and the throw is logged for whoever fixes it —
+   * with the request's provenance, the route and the thrown error's closed code
+   * only. The thrown message is never logged: a schema's refinement or a
+   * value's own accessor can quote the answer it was reading, and the answer
+   * is model output (CWE-532).
    */
   #finishAttempt<T>(
     schema: ZodType<T>,
@@ -2103,7 +2137,7 @@ class AnthropicProvider implements DisposableModelProvider {
       this.#logger.error("The stage's authoring schema threw while validating an answer", {
         ...requestProvenance(request),
         route,
-        error: validated.error.message,
+        code: validated.error.code,
       });
       return { raw, ...reported };
     }

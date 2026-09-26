@@ -17,10 +17,16 @@
  *   → a runtime port to apps/chrome-extension/src/background/service-worker.ts
  *   → WebSocket `source.open { sessionId, location }` to this service
  *   → THIS MODULE: validate → look the session up → authorize → contain → forward
- *   → WebSocket `source.open` to the session's VS Code client(s)
+ *   → WebSocket `source.open` to the session's VS Code client(s), a fresh
+ *     envelope whose `id` (the "forwarded id") this module keeps
  *   → apps/vscode-extension/src/source/open-location.ts, which opens the document
  *     with `window.showTextDocument` and a selection at the location's 1-based
  *     line and column, then flashes a transient highlight
+ *   → WebSocket `source.result { ref: <forwarded id>, status }` from the editor
+ *   → THIS MODULE: {@link SourceOpenHandler.acceptEditorResult} settles the
+ *     forward's pending entry
+ *   → `src/server/ws.ts`, which relays the outcome to the original sender as
+ *     `source.result { ref: <the sender's own frame id>, status }`
  * ```
  *
  * The location arrives already resolved and stamped (`resolvedBy`,
@@ -96,20 +102,60 @@
  *
  * When no editor client is connected for the session, the handler answers
  * `ok({ delivered: false, reason: 'no-editor-client' })`. That is the honest
- * outcome the caller needs: it is what tells the DevTools side to fall back to
- * the `vscode://debuggen.debug-generator/open?file&line&col` URI, which the
- * editor's URI handler validates on its own. The fallback is produced elsewhere;
- * this module only reports that the forward reached nobody.
+ * outcome the caller needs: `src/server/ws.ts` answers the sender with
+ * `source.result { status: 'no-editor' }`, which is what tells the DevTools
+ * side to fall back to the `vscode://debuggen.debug-generator/open?file&line&col`
+ * URI, which the editor's URI handler validates on its own. The fallback is
+ * produced elsewhere; this module only reports that the forward reached nobody,
+ * and only after every containment check passed.
+ *
+ * ## Delivery is not opening: the editor's answer is correlated
+ *
+ * A frame written to an editor's socket proves nothing about the editor: the
+ * window may be frozen, the file may fail to open, the workspace may have
+ * changed. So a delivered forward carries a promise, `editorResult`, that
+ * settles exactly once — and never rejects — by these rules:
+ *
+ * - the **first `opened`** from any addressed editor settles it `opened`;
+ * - when **every** addressed editor answered `failed`, it settles with the
+ *   **first** failure, unchanged;
+ * - when nothing settled it within the editor deadline
+ *   (`SOURCE_OPEN_EDITOR_TIMEOUT_MS` of `@debuggen/protocol` by default), it
+ *   settles `failed` with `TRANSPORT_DISCONNECTED` and a constant sentence;
+ * - {@link SourceOpenHandler.close} settles every outstanding one `failed`, and
+ *   a forward attempted after it is settled that way at once.
+ *
+ * Correlation is by the forwarded envelope's `id`, which the editor echoes as
+ * the `ref` of its `source.result`. The pending entry is registered **before**
+ * the frame is handed to the client registry, so an editor that answers within
+ * the send itself cannot race the registration. The table of pending entries is
+ * bounded ({@link DEFAULT_MAX_PENDING_EDITOR_RESULTS}); past the bound the oldest
+ * entry is settled `failed`, so a flood of clicks cannot grow memory. Every
+ * deadline timer is `unref()`ed and cleared on settlement.
+ *
+ * An editor's answer is itself authorized: only a `vscode` connection may send
+ * one, it must name the session of the forward it answers, and the connection's
+ * announced workspace folders must cover that session's project root — the same
+ * rule that lets an editor open source at all. An answer for a `ref` that is not
+ * pending (never forwarded, already settled, or late after the deadline) is
+ * accepted and ignored: a late answer is normal, and refusing it would only
+ * surface a notice in the editor for a request the sender has already closed.
  *
  * ## Wiring
  *
  * - `src/main.ts` constructs the handler with {@link createSourceOpenHandler},
  *   injecting the session store, the client registry, the service logger and,
- *   by default, `node:fs/promises` `realpath`.
+ *   by default, `node:fs/promises` `realpath`, the global timers and the
+ *   protocol's editor deadline.
  * - `src/server/ws.ts` routes each inbound `source.open` frame to
  *   {@link SourceOpenHandler.handle} together with the connection's
  *   {@link SourceOpenPrincipal}, and maps an `Err` onto the protocol `error`
- *   payload with `toErrorPayload` from `@debuggen/protocol`.
+ *   payload with `toErrorPayload` from `@debuggen/protocol`. An `Ok` is answered
+ *   to the sender with `source.result` — `no-editor` at once for an undelivered
+ *   forward, and the settled `editorResult` for a delivered one — whose `ref` is
+ *   the sender's own frame `id`. Each inbound `source.result` goes to
+ *   {@link SourceOpenHandler.acceptEditorResult}, and `WsServer.close` calls
+ *   {@link SourceOpenHandler.close}, so no deadline outlives the server.
  * - `src/store/sessions-repo.ts` (`createSessionsRepo`) satisfies
  *   {@link SourceOpenSessionPort} structurally: `get` and `getBindingBySession`.
  * - `src/server/auth.ts` resolves the connection's credential into its
@@ -117,7 +163,8 @@
  *   principal's `role`, the workspace folders the connection announced and the
  *   tab its binding names.
  * - `apps/vscode-extension/src/source/open-location.ts` is the terminal
- *   consumer of the forwarded frame.
+ *   consumer of the forwarded frame, and the producer of the `source.result`
+ *   that answers it.
  *
  * ## Privacy
  *
@@ -128,7 +175,9 @@
  * lexically rejected path is not echoed at all, since it may itself be an
  * absolute path from elsewhere on the machine. Platform errors are reduced to
  * their `errno` code before they are recorded, because their messages quote the
- * absolute path they failed on.
+ * absolute path they failed on. An editor's `source.result` is logged by its
+ * status, error code and ids only — never by its message or hint, which are
+ * text from another process.
  *
  * @module
  */
@@ -136,6 +185,7 @@
 import { lstat, realpath as realpathAsync } from 'node:fs/promises';
 
 import {
+  SOURCE_OPEN_EDITOR_TIMEOUT_MS,
   clientKindSchema,
   createEnvelope,
   decodeMessage,
@@ -143,12 +193,14 @@ import {
   isPlainRecord,
   parseMessage,
   parseSourceOpenPayload,
+  parseSourceResultPayload,
 } from '@debuggen/protocol';
 import type {
   ClientKind,
   ProtocolMessage,
   SessionRecord,
   SourceOpenPayload,
+  SourceResultPayload,
 } from '@debuggen/protocol';
 import {
   DebuggenError,
@@ -269,6 +321,14 @@ export interface SourceOpenPrincipal {
    * the scope that matters for this message — and it is never logged.
    */
   readonly scope?: string | undefined;
+  /**
+   * The service's process-local id of the connection, as the client registry
+   * assigned it. Never an authority: {@link SourceOpenHandler.acceptEditorResult}
+   * reads it only so that one editor answering `failed` twice counts once
+   * towards "every addressed editor failed". Absent, each answer counts on its
+   * own.
+   */
+  readonly connectionId?: string | undefined;
 }
 
 /**
@@ -347,6 +407,55 @@ export interface SourceOpenClientPort {
  */
 export type SourceOpenRealPath = (path: string) => MaybePromise<string>;
 
+/**
+ * The timer functions the editor deadline runs on: the shape of the globals.
+ *
+ * Injectable so a test drives the deadline with a fake clock. The handle is
+ * opaque — the handler only ever hands a value its own `setTimeout` returned back
+ * to `clearTimeout` — and it is `unref()`ed whenever it offers `unref`, so a
+ * pending deadline never keeps the process alive. Declared with method syntax so
+ * the global functions, whose handle type is narrower than `unknown`, satisfy it.
+ */
+export interface SourceOpenTimers {
+  /** Schedules `callback` once, after `delayMs` milliseconds. */
+  setTimeout(callback: () => void, delayMs: number): unknown;
+  /** Cancels a callback scheduled by {@link SourceOpenTimers.setTimeout}. */
+  clearTimeout(handle: unknown): void;
+}
+
+/** Each member of a `source.result` payload union, without `sessionId` and `ref`. */
+type WithoutCorrelation<T> = T extends unknown ? Omit<T, 'sessionId' | 'ref'> : never;
+
+/**
+ * How an editor may answer a forwarded `source.open`, without the per-hop
+ * correlation fields: `{ status: 'opened' }`, or
+ * `{ status: 'failed', error: { code, message, hint? } }`.
+ *
+ * Derived from the protocol's `SourceResultPayload` rather than restated, so the
+ * two can never drift. `no-editor` is excluded: it is the service's own answer
+ * for a forward that reached nobody, never an editor's. `sessionId` and `ref` are
+ * removed because they differ on each hop — the relay re-adds the sender's own.
+ */
+export type SourceOpenEditorResult = WithoutCorrelation<
+  Exclude<SourceResultPayload, { readonly status: 'no-editor' }>
+>;
+
+/** The `failed` member of {@link SourceOpenEditorResult}. */
+export type SourceOpenEditorFailure = Extract<
+  SourceOpenEditorResult,
+  { readonly status: 'failed' }
+>;
+
+/** What {@link SourceOpenHandler.acceptEditorResult} answers with on success. */
+export interface SourceOpenResultAcceptance {
+  /**
+   * Whether this answer settled a pending forward. `false` for an answer to a
+   * `ref` that is not pending (unknown, already settled, or late), and for a
+   * `failed` answer while another addressed editor has yet to answer.
+   */
+  readonly settled: boolean;
+}
+
 /** Everything {@link createSourceOpenHandler} is given; nothing is reached for globally. */
 export interface SourceOpenDeps {
   /** The session store. See {@link SourceOpenSessionPort}. */
@@ -379,6 +488,23 @@ export interface SourceOpenDeps {
    * Defaults to the protocol's own clock inside `createEnvelope`.
    */
   readonly now?: (() => number) | undefined;
+  /**
+   * How long a delivered forward waits for an editor's `source.result` before it
+   * settles `failed`, in milliseconds. Defaults to the protocol's
+   * `SOURCE_OPEN_EDITOR_TIMEOUT_MS`, which the DevTools side's own deadline is
+   * sized to exceed; a value that is not a positive integer a timer accepts is
+   * replaced by that default (and logged).
+   */
+  readonly editorResultTimeoutMs?: number | undefined;
+  /** The timers the editor deadline runs on. Defaults to the globals. */
+  readonly timers?: SourceOpenTimers | undefined;
+  /**
+   * The most forwards that may await an editor's answer at once. Defaults to
+   * {@link DEFAULT_MAX_PENDING_EDITOR_RESULTS}; registering one more settles the
+   * oldest `failed`. A value that is not a positive safe integer is replaced by
+   * that default (and logged).
+   */
+  readonly maxPendingEditorResults?: number | undefined;
 }
 
 /** The outcome of a request the editor received. */
@@ -394,6 +520,18 @@ export interface SourceOpenDelivered {
    * through a symbolic link that stays inside the project.
    */
   readonly file: string;
+  /**
+   * The `id` of the `source.open` envelope handed to the editors: the `ref`
+   * their `source.result` answers carry.
+   */
+  readonly forwardedId: string;
+  /**
+   * The editors' answer, settled exactly once by the rules of the module header
+   * ("Delivery is not opening"). **Never rejects**: a silent editor settles it
+   * `failed` at the deadline, and {@link SourceOpenHandler.close} settles it
+   * `failed` on shutdown.
+   */
+  readonly editorResult: Promise<SourceOpenEditorResult>;
 }
 
 /**
@@ -432,14 +570,16 @@ export interface RealPathContainment {
  * The `source.open` handler.
  *
  * Constructed by `src/main.ts` through {@link createSourceOpenHandler}; called by
- * `src/server/ws.ts` for every inbound `source.open` frame.
+ * `src/server/ws.ts` for every inbound `source.open` and `source.result` frame,
+ * and closed with the WebSocket server.
  */
 export interface SourceOpenHandler {
   /**
    * Validates, authorizes, contains and forwards one `source.open` request.
    *
    * Never throws and never rejects: every failure is a typed `Err` the caller
-   * maps onto the protocol `error` payload with `toErrorPayload`.
+   * maps onto the protocol `error` payload with `toErrorPayload`. A delivered
+   * outcome carries the `editorResult` the caller relays once it settles.
    *
    * @param input The request, in any of three forms, each validated in full: a
    * parsed `source.open` envelope (`MessageByType<'source.open'>`), a raw
@@ -452,6 +592,38 @@ export interface SourceOpenHandler {
     input: unknown,
     principal: SourceOpenPrincipal,
   ): Promise<Result<SourceOpenOutcome, DebuggenError>>;
+
+  /**
+   * Accepts an editor's `source.result` for a `source.open` this handler
+   * forwarded, settling that forward's `editorResult` by the rules of the module
+   * header.
+   *
+   * Never throws and never rejects. Refusals — every one carrying its
+   * {@link SourceOpenRejection} — are: a frame that is not a well-formed
+   * `source.result`, or one answering `no-editor` (`invalid-payload`); a
+   * connection that is not an editor, an answer naming a different session than
+   * the forward it answers, or an editor whose announced workspace folders do not
+   * cover that session's project root (`not-authorized`). An answer for a `ref`
+   * that is not pending is **not** a refusal: it is `ok({ settled: false })`.
+   *
+   * @param input The answer, in any of three forms, each validated in full: a
+   * parsed `source.result` envelope, a raw frame, or the bare payload.
+   * @param principal The answering connection's resolved identity.
+   * @returns Whether the answer settled a forward, or the refusal.
+   */
+  acceptEditorResult(
+    input: unknown,
+    principal: SourceOpenPrincipal,
+  ): Promise<Result<SourceOpenResultAcceptance, DebuggenError>>;
+
+  /**
+   * Settles every forward still awaiting an editor `failed`
+   * (`TRANSPORT_DISCONNECTED`, "The Debug Generator service is shutting down.")
+   * and clears every deadline timer. Idempotent. A forward made afterwards is
+   * still sent, but its `editorResult` is settled the same way at once, because
+   * no answer can be correlated any more.
+   */
+  close(): void;
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -463,6 +635,34 @@ const SOURCE_SUBSYSTEM = 'source';
 
 /** The message this module handles and the message it forwards. */
 const SOURCE_OPEN_TYPE = 'source.open';
+
+/** The message an editor answers a forwarded `source.open` with. */
+const SOURCE_RESULT_TYPE = 'source.result';
+
+/**
+ * The default bound on forwards awaiting an editor's answer at once.
+ *
+ * The same order as the WebSocket server's per-connection frame backlog: far
+ * more clicks than a developer makes within one editor deadline, and small
+ * enough that a flooding panel costs a bounded, trivial amount of memory. Past
+ * it the oldest forward is settled `failed` rather than the new one refused,
+ * because the newest click is the one the developer is looking at.
+ */
+export const DEFAULT_MAX_PENDING_EDITOR_RESULTS = 256;
+
+/** The largest delay a Node timer accepts, in milliseconds. */
+const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
+
+/** The constant sentence of a forward no editor answered within the deadline. */
+const EDITOR_TIMEOUT_MESSAGE =
+  'VS Code did not confirm that it opened the source location in time.';
+
+/** The constant sentence of a forward settled because the service is closing. */
+const SHUTDOWN_MESSAGE = 'The Debug Generator service is shutting down.';
+
+/** The constant sentence of a forward given up on to keep the pending table bounded. */
+const OVERFLOW_MESSAGE =
+  'Too many source links were waiting for VS Code to confirm them, so the oldest one was given up on.';
 
 /** The only client kind a location is ever forwarded to. */
 const EDITOR_CLIENT: ClientKind = 'vscode';
@@ -499,6 +699,14 @@ const REASON_PATTERN = /^[a-z][a-z-]{0,63}$/;
 /** The access-boundary reasons of `src/server/auth.ts`, mirrored by name. */
 type AuthorizationReason = 'role-not-permitted' | 'project-out-of-scope' | 'session-not-bound';
 
+/**
+ * Why an editor's `source.result` was refused, beyond the shared access reasons:
+ * a non-editor answering at all, an answer naming another session than the
+ * forward it answers, and `no-editor` — the service's own status — sent by an
+ * editor.
+ */
+type ResultRefusalReason = 'role-not-permitted' | 'session-mismatch' | 'status-not-permitted';
+
 /** Why the filesystem half refused a path it could not vouch for. */
 type UnsafePathReason =
   | 'root-not-resolvable'
@@ -531,6 +739,15 @@ const HINTS = Object.freeze({
   delivery:
     'Check that VS Code is connected to the Debug Generator service, then click the source link again.',
   internal: 'The Debug Generator service log holds the reason; click the source link again.',
+  editorTimeout:
+    'Make sure the VS Code window for the project is responsive, then click the source link again.',
+  shuttingDown:
+    'Start the Debug Generator service again from VS Code, then click the source link again.',
+  overflow: 'Give VS Code a moment to catch up, then click the source link again.',
+  resultPayload:
+    'An editor answers a forwarded source.open with a source.result naming the same session, the forwarded frame id as ref, and a status of opened or failed.',
+  resultRole:
+    'A source.result is sent only by the VS Code window a source location was forwarded to.',
 } as const);
 
 /* -------------------------------------------------------------------------------------------------
@@ -578,6 +795,52 @@ function notSourceOpen(type: string): DebuggenError {
     HINTS.invalidPayload,
     { receivedType: type },
   );
+}
+
+/** A well-formed frame of another message type where an editor's answer was expected. */
+function notSourceResult(type: string): DebuggenError {
+  return refusal(
+    'PROTOCOL_INVALID_MESSAGE',
+    'invalid-payload',
+    `Expected a ${SOURCE_RESULT_TYPE} message; received a ${type} message.`,
+    HINTS.resultPayload,
+    { receivedType: type },
+  );
+}
+
+/**
+ * A refusal of an editor's `source.result` that is not the shared workspace-scope
+ * rule (which {@link notAuthorized} words): a connection that is not an editor,
+ * an answer naming another session than the forward it answers, and an editor
+ * answering with the service's own `no-editor` status.
+ */
+function resultRefused(reason: ResultRefusalReason, client: string): DebuggenError {
+  switch (reason) {
+    case 'role-not-permitted':
+      return refusal(
+        'UNAUTHORIZED',
+        'not-authorized',
+        'Only the VS Code editor a source location was forwarded to may answer it.',
+        HINTS.resultRole,
+        { reason, client },
+      );
+    case 'session-mismatch':
+      return refusal(
+        'UNAUTHORIZED',
+        'not-authorized',
+        'This source.result names a different session than the source.open it answers.',
+        HINTS.resultPayload,
+        { reason, client },
+      );
+    case 'status-not-permitted':
+      return refusal(
+        'PROTOCOL_INVALID_MESSAGE',
+        'invalid-payload',
+        'An editor answers a forwarded source.open with opened or failed; no-editor is the service’s own answer.',
+        HINTS.resultPayload,
+        { reason, client },
+      );
+  }
 }
 
 /** The named session does not exist (or was purged by retention). */
@@ -729,6 +992,38 @@ function internalFailure(message: string, cause?: unknown): DebuggenError {
     cause === undefined ? { hint: HINTS.internal } : { hint: HINTS.internal, cause },
   );
 }
+
+/**
+ * A `failed` editor result the service settles on its own: a constant sentence
+ * and hint under `code`, shaped by `DebuggenError.toPayload()` — exactly the
+ * `{ code, message, hint? }` the protocol's `source.result` carries. Frozen in
+ * depth, because one value is shared by every forward it settles.
+ */
+function serviceFailure(
+  code: DebuggenErrorCode,
+  message: string,
+  hint: string,
+): SourceOpenEditorFailure {
+  const error = Object.freeze(new DebuggenError(code, message, { hint }).toPayload());
+  return Object.freeze({ status: 'failed', error });
+}
+
+/** No addressed editor answered within the deadline. */
+const EDITOR_TIMEOUT_RESULT = serviceFailure(
+  'TRANSPORT_DISCONNECTED',
+  EDITOR_TIMEOUT_MESSAGE,
+  HINTS.editorTimeout,
+);
+
+/** The service is closing; nothing can be correlated any more. */
+const SHUTDOWN_RESULT = serviceFailure(
+  'TRANSPORT_DISCONNECTED',
+  SHUTDOWN_MESSAGE,
+  HINTS.shuttingDown,
+);
+
+/** The pending table was full, and this was the oldest entry in it. */
+const OVERFLOW_RESULT = serviceFailure('RATE_LIMITED', OVERFLOW_MESSAGE, HINTS.overflow);
 
 /**
  * Reads the {@link SourceOpenRejection} a refusal from this module carries.
@@ -1085,6 +1380,37 @@ function decodeSourceOpenInput(input: unknown): Result<SourceOpenPayload> {
   return ok({ sessionId: parsed.value.sessionId, location: location.value });
 }
 
+/**
+ * Turns any accepted form of an editor's answer into a validated
+ * `source.result` payload, exactly as {@link decodeSourceOpenInput} does for a
+ * request: a raw frame or an envelope is decoded and validated in full (the
+ * routing key included), and the payload is then validated with
+ * `parseSourceResultPayload`, whose rejection names issue paths only — never the
+ * `message` of a malformed failure, which is text from another process.
+ */
+function decodeSourceResultInput(input: unknown): Result<SourceResultPayload> {
+  let payload: unknown = input;
+
+  if (typeof input === 'string' || looksLikeEnvelope(input)) {
+    const decoded = decodeMessage(input);
+    if (!decoded.ok) {
+      return err(invalidPayload(decoded.error));
+    }
+    const message = decoded.value;
+    if (!isMessageOfType(message, SOURCE_RESULT_TYPE)) {
+      return err(notSourceResult(message.type));
+    }
+    payload = message.payload;
+  }
+
+  const parsed = parseSourceResultPayload(payload);
+  if (!parsed.ok) {
+    return err(invalidPayload(parsed.error));
+  }
+
+  return ok(parsed.value);
+}
+
 /* -------------------------------------------------------------------------------------------------
  * Step 3 — authorization from the resolved principal (AAP §0.5.6)
  * ---------------------------------------------------------------------------------------------- */
@@ -1096,6 +1422,30 @@ function clientKindOf(principal: unknown): ClientKind | undefined {
   }
   const parsed = clientKindSchema.safeParse(principal['client']);
   return parsed.success ? parsed.data : undefined;
+}
+
+/** The longest connection id read off a principal; the registry's own ids are far shorter. */
+const MAX_CONNECTION_ID_LENGTH = 128;
+
+/**
+ * The principal's connection id, when it carries a usable one; `undefined`
+ * otherwise. Read defensively, like every other principal field: it only ever
+ * de-duplicates one connection's repeated answers, so a missing or odd value
+ * degrades to counting each answer separately rather than to a refusal.
+ */
+function connectionIdOf(principal: unknown): string | undefined {
+  if (!isPlainRecord(principal)) {
+    return undefined;
+  }
+  const id = principal['connectionId'];
+  return typeof id === 'string' && id.length > 0 && id.length <= MAX_CONNECTION_ID_LENGTH
+    ? id
+    : undefined;
+}
+
+/** The workspace folders a principal announced, read defensively for {@link authorizeEditor}. */
+function projectRootsOf(principal: unknown): unknown {
+  return isPlainRecord(principal) ? principal['projectRoots'] : undefined;
 }
 
 /**
@@ -1319,6 +1669,284 @@ function isUsableSession(record: SessionRecord, sessionId: SessionId): boolean {
 }
 
 /* -------------------------------------------------------------------------------------------------
+ * Correlating the editor's answer
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The one `opened` result, shared by every forward it settles. */
+const OPENED_RESULT: SourceOpenEditorResult = Object.freeze({ status: 'opened' });
+
+/** A failed timer start: the deadline could not be armed, so the forward is not left waiting. */
+const TIMER_FAILURE_RESULT = serviceFailure(
+  'INTERNAL',
+  'The Debug Generator service could not start waiting for VS Code to confirm the source location.',
+  HINTS.internal,
+);
+
+/** The global timers, called at the moment of use so a fake clock installed later is honoured. */
+const GLOBAL_TIMERS: SourceOpenTimers = Object.freeze({
+  setTimeout: (callback: () => void, delayMs: number) => setTimeout(callback, delayMs),
+  clearTimeout: (handle: ReturnType<typeof setTimeout>) => {
+    clearTimeout(handle);
+  },
+});
+
+/**
+ * Calls `unref()` on a timer handle that offers one, so a pending deadline never
+ * keeps the process alive. A handle without it (a fake clock's number) is left
+ * alone.
+ */
+function unrefTimer(handle: unknown): void {
+  if (typeof handle !== 'object' || handle === null) {
+    return;
+  }
+  const unref: unknown = Reflect.get(handle, 'unref');
+  if (typeof unref === 'function') {
+    Reflect.apply(unref, handle, []);
+  }
+}
+
+/** One forward awaiting its editors' answer. */
+interface PendingForward {
+  /** The forwarded envelope's `id`: the `ref` an editor's answer carries. */
+  readonly forwardedId: string;
+  /** The session the forward belongs to; an answer naming another is refused. */
+  readonly sessionId: SessionId;
+  /** The stored project root an answering editor's workspace must cover. */
+  readonly projectRoot: string;
+  /** The `editorResult` handed to the caller. Never rejects. */
+  readonly promise: Promise<SourceOpenEditorResult>;
+  /** Settles {@link PendingForward.promise}. */
+  readonly resolve: (result: SourceOpenEditorResult) => void;
+  /** How many editors the frame reached; `undefined` while the send is in flight. */
+  expected: number | undefined;
+  /** The connections that answered `failed`, each counted once. */
+  readonly failedBy: Set<string>;
+  /** `failed` answers from principals that carried no connection id. */
+  anonymousFailures: number;
+  /** The first `failed` answer, which is what "every editor failed" settles with. */
+  firstFailure: SourceOpenEditorFailure | undefined;
+  /** The deadline timer's handle, until settlement. */
+  timer: unknown;
+  /** Whether {@link PendingForward.promise} has been settled (or the forward dropped). */
+  settled: boolean;
+}
+
+/** What {@link createEditorResultCorrelator} is built from. */
+interface CorrelatorOptions {
+  readonly timers: SourceOpenTimers;
+  readonly timeoutMs: number;
+  readonly maxPending: number;
+  /** Records one diagnostic; never throws. */
+  readonly emit: (level: RecordLevel, message: string, fields: LogFields) => void;
+}
+
+/** The table of forwards awaiting an editor's answer, and the rules that settle them. */
+interface EditorResultCorrelator {
+  /**
+   * Registers a forward — before its frame is sent — and arms its deadline.
+   * After {@link EditorResultCorrelator.close}, the entry is returned already
+   * settled `failed` and is not stored.
+   */
+  register(forwardedId: string, sessionId: SessionId, projectRoot: string): PendingForward;
+  /** Records how many editors the frame reached, settling at once if all of them already failed. */
+  delivered(entry: PendingForward, count: number): void;
+  /** Drops a forward whose frame reached nobody or could not be sent; its promise is never handed out. */
+  forget(entry: PendingForward): void;
+  /** The pending forward an answer's `ref` names, if any. */
+  lookup(ref: string): PendingForward | undefined;
+  /**
+   * Applies one editor's answer by the settlement rules.
+   * @returns Whether this answer settled the forward.
+   */
+  answer(entry: PendingForward, result: SourceOpenEditorResult, connectionId?: string): boolean;
+  /**
+   * Settles every pending forward `failed` for shutdown and refuses to hold new ones.
+   * @returns How many forwards were pending. Idempotent.
+   */
+  close(): number;
+}
+
+/**
+ * Builds the correlator a handler keeps between its `source.open` forwards and
+ * its editors' `source.result` answers.
+ *
+ * Map insertion order is registration order, which is what makes "the oldest
+ * forward" the first key when the bound is reached. Every settlement clears the
+ * deadline timer and removes the entry, so a settled forward holds nothing.
+ */
+function createEditorResultCorrelator(options: CorrelatorOptions): EditorResultCorrelator {
+  const { timers, timeoutMs, maxPending, emit } = options;
+  const pending = new Map<string, PendingForward>();
+  let closed = false;
+
+  /** Clears an entry's deadline, tolerating a timer implementation that throws. */
+  function disarm(entry: PendingForward): void {
+    const handle = entry.timer;
+    entry.timer = undefined;
+    if (handle !== undefined) {
+      tryCatch(() => {
+        timers.clearTimeout(handle);
+      });
+    }
+  }
+
+  /** Removes an entry from the table and marks it settled; the one exit of every entry. */
+  function retire(entry: PendingForward): boolean {
+    if (entry.settled) {
+      return false;
+    }
+    entry.settled = true;
+    disarm(entry);
+    if (pending.get(entry.forwardedId) === entry) {
+      pending.delete(entry.forwardedId);
+    }
+    return true;
+  }
+
+  /** Settles an entry with `result`, once; later calls are no-ops. */
+  function settleEntry(entry: PendingForward, result: SourceOpenEditorResult): boolean {
+    if (!retire(entry)) {
+      return false;
+    }
+    entry.resolve(result);
+    return true;
+  }
+
+  function failureCount(entry: PendingForward): number {
+    return entry.failedBy.size + entry.anonymousFailures;
+  }
+
+  /** Settles the oldest forwards until there is room for one more. */
+  function makeRoom(): void {
+    while (pending.size >= maxPending) {
+      const oldest = pending.values().next();
+      if (oldest.done === true) {
+        return;
+      }
+      settleEntry(oldest.value, OVERFLOW_RESULT);
+      emit('warn', 'Gave up on the oldest source.open awaiting an editor answer', {
+        ref: oldest.value.forwardedId,
+        [LOG_BINDING_KEYS.sessionId]: oldest.value.sessionId,
+        code: OVERFLOW_RESULT.error.code,
+        pending: pending.size,
+      });
+    }
+  }
+
+  function arm(entry: PendingForward): void {
+    const scheduled = tryCatch(() =>
+      timers.setTimeout(() => {
+        if (settleEntry(entry, EDITOR_TIMEOUT_RESULT)) {
+          emit('debug', 'No editor confirmed a forwarded source.open before the deadline', {
+            ref: entry.forwardedId,
+            [LOG_BINDING_KEYS.sessionId]: entry.sessionId,
+            code: EDITOR_TIMEOUT_RESULT.error.code,
+          });
+        }
+      }, timeoutMs),
+    );
+    if (!scheduled.ok) {
+      settleEntry(entry, TIMER_FAILURE_RESULT);
+      emit('error', 'The deadline of a forwarded source.open could not be armed', {
+        ref: entry.forwardedId,
+        [LOG_BINDING_KEYS.sessionId]: entry.sessionId,
+        code: scheduled.error.code,
+      });
+      return;
+    }
+    entry.timer = scheduled.value;
+    tryCatch(() => {
+      unrefTimer(scheduled.value);
+    });
+  }
+
+  return Object.freeze({
+    register(forwardedId: string, sessionId: SessionId, projectRoot: string): PendingForward {
+      let resolve: (result: SourceOpenEditorResult) => void = () => undefined;
+      const promise = new Promise<SourceOpenEditorResult>((settleWith) => {
+        resolve = settleWith;
+      });
+      const entry: PendingForward = {
+        forwardedId,
+        sessionId,
+        projectRoot,
+        promise,
+        resolve,
+        expected: undefined,
+        failedBy: new Set<string>(),
+        anonymousFailures: 0,
+        firstFailure: undefined,
+        timer: undefined,
+        settled: false,
+      };
+      if (closed) {
+        settleEntry(entry, SHUTDOWN_RESULT);
+        return entry;
+      }
+      makeRoom();
+      pending.set(forwardedId, entry);
+      arm(entry);
+      return entry;
+    },
+
+    delivered(entry: PendingForward, count: number): void {
+      entry.expected = count;
+      if (entry.firstFailure !== undefined && failureCount(entry) >= count) {
+        settleEntry(entry, entry.firstFailure);
+      }
+    },
+
+    forget(entry: PendingForward): void {
+      retire(entry);
+    },
+
+    lookup(ref: string): PendingForward | undefined {
+      return pending.get(ref);
+    },
+
+    answer(entry: PendingForward, result: SourceOpenEditorResult, connectionId?: string): boolean {
+      if (entry.settled) {
+        return false;
+      }
+      if (result.status === 'opened') {
+        return settleEntry(entry, OPENED_RESULT);
+      }
+      if (connectionId === undefined) {
+        entry.anonymousFailures += 1;
+      } else if (entry.failedBy.has(connectionId)) {
+        return false;
+      } else {
+        entry.failedBy.add(connectionId);
+      }
+      entry.firstFailure ??= result;
+      return entry.expected !== undefined && failureCount(entry) >= entry.expected
+        ? settleEntry(entry, entry.firstFailure)
+        : false;
+    },
+
+    close(): number {
+      closed = true;
+      const outstanding = [...pending.values()];
+      for (const entry of outstanding) {
+        settleEntry(entry, SHUTDOWN_RESULT);
+      }
+      pending.clear();
+      return outstanding.length;
+    },
+  });
+}
+
+/**
+ * Validates one optional numeric option: a safe integer in `[1, max]`.
+ * @returns the value, or `undefined` when it is absent or unusable.
+ */
+function positiveIntegerOption(value: unknown, max: number): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 1 && value <= max
+    ? value
+    : undefined;
+}
+
+/* -------------------------------------------------------------------------------------------------
  * The handler
  * ---------------------------------------------------------------------------------------------- */
 
@@ -1331,7 +1959,8 @@ function isUsableSession(record: SessionRecord, sessionId: SessionId): boolean {
  * {@link SourceOpenHandler.handle} for every inbound `source.open` frame with the
  * connection's {@link SourceOpenPrincipal}, and maps an `Err` onto the protocol
  * `error` payload with `toErrorPayload`. The forwarded frame's terminal consumer
- * is `apps/vscode-extension/src/source/open-location.ts`.
+ * is `apps/vscode-extension/src/source/open-location.ts`, whose `source.result`
+ * `ws.ts` hands to {@link SourceOpenHandler.acceptEditorResult}.
  *
  * Each request runs the fixed sequence of the module header — validate, look the
  * session up, authorize, contain lexically, contain on the filesystem, then
@@ -1340,7 +1969,8 @@ function isUsableSession(record: SessionRecord, sessionId: SessionId): boolean {
  * that changes into a link between two clicks is judged afresh on the second.
  *
  * @param deps The injected ports and options; see {@link SourceOpenDeps}.
- * @returns The handler. Frozen; stateless apart from its dependencies.
+ * @returns The handler. Frozen; its only state is the bounded table of forwards
+ * awaiting an editor's answer, emptied by {@link SourceOpenHandler.close}.
  *
  * @example
  * ```ts
@@ -1349,8 +1979,15 @@ function isUsableSession(record: SessionRecord, sessionId: SessionId): boolean {
  * if (!result.ok) {
  *   connection.send(createEnvelope('error', toErrorPayload(result.error, frame.id)));
  * } else if (!result.value.delivered) {
- *   // no editor connected: the DevTools side falls back to the vscode:// URI
+ *   // no editor connected: answer `no-editor`, the DevTools cue for the vscode:// URI
+ *   connection.send(createEnvelope('source.result', { sessionId, ref: frame.id, status: 'no-editor' }));
+ * } else {
+ *   void result.value.editorResult.then((answer) =>
+ *     connection.send(createEnvelope('source.result', { sessionId, ref: frame.id, ...answer })),
+ *   );
  * }
+ * // an editor's answer to the forwarded frame:
+ * await sourceOpen.acceptEditorResult(editorFrame, principalOf(editorConnection));
  * ```
  */
 export function createSourceOpenHandler(deps: SourceOpenDeps): SourceOpenHandler {
@@ -1382,12 +2019,59 @@ export function createSourceOpenHandler(deps: SourceOpenDeps): SourceOpenHandler
     });
   }
 
+  /** A numeric option, or its default when it is absent or unusable (the latter logged). */
+  function optionOrDefault(name: string, value: unknown, fallback: number, max: number): number {
+    if (value === undefined) {
+      return fallback;
+    }
+    const usable = positiveIntegerOption(value, max);
+    if (usable === undefined) {
+      emit('warn', 'Replaced an unusable source.open option with its default', {
+        option: name,
+        fallback,
+      });
+      return fallback;
+    }
+    return usable;
+  }
+
+  const correlator = createEditorResultCorrelator({
+    timers: deps.timers ?? GLOBAL_TIMERS,
+    timeoutMs: optionOrDefault(
+      'editorResultTimeoutMs',
+      deps.editorResultTimeoutMs,
+      SOURCE_OPEN_EDITOR_TIMEOUT_MS,
+      MAX_TIMER_DELAY_MS,
+    ),
+    maxPending: optionOrDefault(
+      'maxPendingEditorResults',
+      deps.maxPendingEditorResults,
+      DEFAULT_MAX_PENDING_EDITOR_RESULTS,
+      Number.MAX_SAFE_INTEGER,
+    ),
+    emit,
+  });
+
   /** Records a refusal or failure at its level and returns it as the `Err` it is. */
   function refuse(error: DebuggenError, context: LogFields): Result<SourceOpenOutcome> {
     const level = levelFor(sourceOpenRejectionOf(error));
     emit(
       level,
       level === 'error' ? 'A source.open request failed' : 'Refused a source.open request',
+      refusalFields(error, context),
+    );
+    return err(error);
+  }
+
+  /** {@link refuse}, for an editor's `source.result`. */
+  function refuseAnswer(
+    error: DebuggenError,
+    context: LogFields,
+  ): Result<SourceOpenResultAcceptance> {
+    const level = levelFor(sourceOpenRejectionOf(error));
+    emit(
+      level,
+      level === 'error' ? 'A source.result answer failed' : 'Refused a source.result answer',
       refusalFields(error, context),
     );
     return err(error);
@@ -1453,20 +2137,26 @@ export function createSourceOpenHandler(deps: SourceOpenDeps): SourceOpenHandler
       }
     }
 
-    // Step 6 — forward the validated location, unchanged, to the editor.
+    // Step 6 — forward the validated location, unchanged, to the editor. The
+    // answer's pending entry is registered first, keyed by the forwarded frame's
+    // id, so an editor that answers within the send itself cannot race it.
     const envelope = buildSourceOpenEnvelope({ sessionId, location }, now);
     if (!envelope.ok) {
       return refuse(envelope.error, context);
     }
+    const forwardedId = envelope.value.id;
+    const pending = correlator.register(forwardedId, sessionId, session.projectRoot);
     const delivery = await settle(
       () => clients.sendToSessionClients(sessionId, EDITOR_CLIENT, envelope.value),
       'TRANSPORT_DISCONNECTED',
     );
     if (!delivery.ok) {
+      correlator.forget(pending);
       return refuse(deliveryFailure(delivery.error), context);
     }
     const count: unknown = delivery.value;
     if (typeof count !== 'number' || !Number.isSafeInteger(count) || count < 0) {
+      correlator.forget(pending);
       return refuse(
         internalFailure('The client registry reported an invalid delivery count for source.open.'),
         context,
@@ -1483,6 +2173,7 @@ export function createSourceOpenHandler(deps: SourceOpenDeps): SourceOpenHandler
       delivered: count,
     };
     if (count === 0) {
+      correlator.forget(pending);
       emit(
         'debug',
         'No editor client is connected for this session; the caller falls back to the vscode:// URI',
@@ -1490,11 +2181,102 @@ export function createSourceOpenHandler(deps: SourceOpenDeps): SourceOpenHandler
       );
       return ok({ delivered: false, reason: 'no-editor-client', location });
     }
-    emit('debug', 'Forwarded source.open to the editor', fields);
-    return ok({ delivered: true, clients: count, location, file: contained.value.relativePath });
+    correlator.delivered(pending, count);
+    emit('debug', 'Forwarded source.open to the editor', { ...fields, ref: forwardedId });
+    return ok({
+      delivered: true,
+      clients: count,
+      location,
+      file: contained.value.relativePath,
+      forwardedId,
+      editorResult: pending.promise,
+    });
+  }
+
+  /**
+   * Validates, authorizes and applies one editor answer, in the order of
+   * {@link SourceOpenHandler.acceptEditorResult}'s contract. Records carry
+   * statuses, codes and ids only; an editor's message and hint are never logged.
+   */
+  function answer(
+    input: unknown,
+    principal: SourceOpenPrincipal,
+  ): Result<SourceOpenResultAcceptance> {
+    const client = clientKindOf(principal) ?? UNRESOLVED_CLIENT;
+    const context: LogFields = { [LOG_BINDING_KEYS.client]: client };
+
+    const decoded = decodeSourceResultInput(input);
+    if (!decoded.ok) {
+      return refuseAnswer(decoded.error, context);
+    }
+    const result = decoded.value;
+    context[LOG_BINDING_KEYS.sessionId] = result.sessionId;
+    context['ref'] = result.ref;
+    context['status'] = result.status;
+
+    if (client !== EDITOR_CLIENT) {
+      return refuseAnswer(resultRefused('role-not-permitted', client), context);
+    }
+    if (result.status === 'no-editor') {
+      return refuseAnswer(resultRefused('status-not-permitted', client), context);
+    }
+
+    const entry = correlator.lookup(result.ref);
+    if (entry === undefined) {
+      emit('debug', 'Ignored a source.result that answers no pending source.open', context);
+      return ok({ settled: false });
+    }
+    if (entry.sessionId !== result.sessionId) {
+      return refuseAnswer(resultRefused('session-mismatch', client), context);
+    }
+    const scoped = authorizeEditor(projectRootsOf(principal), entry.projectRoot);
+    if (!scoped.ok) {
+      return refuseAnswer(scoped.error, context);
+    }
+
+    const editorResult: SourceOpenEditorResult =
+      result.status === 'opened' ? OPENED_RESULT : { status: 'failed', error: result.error };
+    const settledNow = correlator.answer(entry, editorResult, connectionIdOf(principal));
+    emit(
+      'debug',
+      settledNow
+        ? 'Settled a forwarded source.open with an editor answer'
+        : 'Recorded an editor answer to a forwarded source.open',
+      result.status === 'failed'
+        ? { ...context, settled: settledNow, code: result.error.code }
+        : { ...context, settled: settledNow },
+    );
+    return ok({ settled: settledNow });
   }
 
   return Object.freeze({
+    acceptEditorResult(
+      input: unknown,
+      principal: SourceOpenPrincipal,
+    ): Promise<Result<SourceOpenResultAcceptance, DebuggenError>> {
+      try {
+        return Promise.resolve(answer(input, principal));
+      } catch (thrown) {
+        // Reached only by a defect; the thrown value is reduced to its code.
+        const failure = internalFailure('The source.result answer failed unexpectedly.');
+        const fields: LogFields = { code: failure.code };
+        if (DebuggenError.is(thrown)) {
+          fields['causeCode'] = thrown.code;
+        }
+        emit('error', 'A source.result answer failed unexpectedly', fields);
+        return Promise.resolve(err(failure));
+      }
+    },
+
+    close(): void {
+      const outstanding = correlator.close();
+      if (outstanding > 0) {
+        emit('debug', 'Settled the source.open forwards still awaiting an editor on shutdown', {
+          pending: outstanding,
+        });
+      }
+    },
+
     async handle(
       input: unknown,
       principal: SourceOpenPrincipal,

@@ -37,6 +37,21 @@
  * `.vscode-test.mjs` (asserted before it is read), nothing listens on the
  * configured port, and no process is started.
  *
+ * A second suite, `Debug Generator activation: service process supervision
+ * and shutdown`, holds the lifecycle manager and deactivation's
+ * `stopServiceForShutdown` to the ordering AAP 0.5.1 depends on, through fully
+ * fake seams — a fake child process that records every signal, a health probe
+ * that follows the configured URL the way the real client does and answers
+ * only where a fake responder listens, settings held in memory — so nothing is
+ * spawned, no socket is opened and no file is touched. It asserts that a child
+ * exiting while a stop waits is not restarted; that a changed
+ * `debuggen.serviceUrl` never stops, signals or replaces the live child and
+ * never attributes another origin's answer to it, while `restart()` still
+ * moves it; and that deactivation's stop signals the child only after the end
+ * request's bound, force-stops it only when the end concluded, keeps
+ * ownership of the child when `dispose()` follows at once, and finishes
+ * inside the extension host's shutdown window.
+ *
  * Mocha's `bdd` interface is supplied as globals by the `@vscode/test-cli`
  * runner and this workspace declares no `@types/mocha` (see the
  * `compilerOptions.types` notes in `tsconfig.json`), so the globals this suite
@@ -52,10 +67,18 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
-import { DebuggenError, err, isErr } from '@debuggen/shared';
-import type { Result } from '@debuggen/shared';
+import { DebuggenError, createConsoleLogger, err, isErr, isOk, ok } from '@debuggen/shared';
+import type { LogRecord, Logger, Result } from '@debuggen/shared';
 import * as vscode from 'vscode';
 
+import {
+  DEACTIVATE_BUDGET_MS,
+  DEACTIVATE_END_SESSION_TIMEOUT_MS,
+  DEACTIVATE_QUIESCE_TIMEOUT_MS,
+  DEACTIVATE_STOP_GRACE_MS,
+  stopServiceForShutdown,
+} from '../../src/extension';
+import type { ShutdownEndOutcome } from '../../src/extension';
 import { resolveAuthFilePath } from '../../src/service/auth';
 import {
   DEFAULT_HEALTH_PROBE_TIMEOUT_MS,
@@ -65,9 +88,11 @@ import {
   parseServiceListenAddress,
 } from '../../src/service/process';
 import type {
+  ChildProcessLike,
   ServiceCredentialPort,
   ServiceHealthProbe,
   ServiceOutputChannel,
+  ServiceProcess,
   ServiceProcessState,
   ServiceStatus,
   SpawnLike,
@@ -82,12 +107,14 @@ import {
   activateExtensionOnce,
   cleanupScratch,
   closeAllEditors,
+  createScratchDir,
   fixtureFile,
   fixtureWorkspaceRoot,
   getExtensionOrFail,
   manifestConfigurationProperties,
   readExtensionManifest,
   stopTrackedProcesses,
+  writeFixtureFile,
 } from '../helpers';
 import type { ExtensionManifest, ManifestView } from '../helpers';
 
@@ -778,5 +805,869 @@ describe('Debug Generator activation (src/extension.ts)', () => {
       [],
       'no promise may be rejected without a handler while the extension activates and runs.',
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Service process supervision and shutdown: fake seams
+// ---------------------------------------------------------------------------
+
+/**
+ * The service URL every supervised manager starts with. A plain-HTTP IPv4
+ * loopback URL whose port `parseServiceListenAddress` accepts (it is not one
+ * the Fetch standard blocks); nothing ever listens on it, because the fake
+ * spawn seam starts no process.
+ */
+const SUPERVISED_SERVICE_URL = 'http://127.0.0.1:20047';
+
+/** Where `debuggen.serviceUrl` moves to in the address-move tests. */
+const MOVED_SERVICE_URL = 'http://127.0.0.1:20048';
+
+/**
+ * How long the extension host lets deactivation run before VS Code
+ * terminates it — the window `DEACTIVATE_BUDGET_MS` must stay inside.
+ */
+const EXTENSION_HOST_SHUTDOWN_MS = 5_000;
+
+/** The supervised manager's own timings: short enough for a suite, ordered enough to be deterministic. */
+const SUPERVISION_TIMINGS = Object.freeze({
+  restartDelayMs: 50,
+  stopGraceMs: 200,
+  quiesceTimeoutMs: 500,
+  healthPollIntervalMs: 20,
+  slowStartPollIntervalMs: 50,
+  healthProbeTimeoutMs: 200,
+  startupTimeoutMs: 2_000,
+});
+
+/**
+ * How long a test keeps watching after the point where a regression would have
+ * spawned a replacement: several restart delays, so a scheduled restart has
+ * certainly fired, probed and spawned by then.
+ */
+const RESPAWN_WATCH_MS = SUPERVISION_TIMINGS.restartDelayMs * 8;
+
+/**
+ * Timer slack for lower-bound assertions: a timer never fires early, but two
+ * `Date.now()` readings on either side of it may disagree by a few
+ * milliseconds.
+ */
+const TIMER_TOLERANCE_MS = 25;
+
+/** The editor credential the fake store hands out; not secret-shaped, never persisted. */
+const FAKE_EDITOR_TOKEN = 'supervision-suite-editor-token';
+
+/** How a fake child answers `SIGTERM`: exit at once, or keep running (only `SIGKILL` ends it then). */
+type SigtermBehaviour = 'exit' | 'ignore';
+
+/** The listener shape of a child's `exit` event. */
+type ExitListener = (code: number | null, signal: NodeJS.Signals | null) => void;
+
+/** One signal a fake child received, and when. */
+interface ReceivedSignal {
+  readonly signal: NodeJS.Signals;
+  readonly atMs: number;
+}
+
+/**
+ * A child process that exists only in this suite: it "listens" on the origin
+ * it was told to bind (the probe answers there while it is alive), records
+ * every signal with its arrival time, and exits the way a real child does —
+ * asynchronously after `kill()`, or when a test ends it with
+ * {@link FakeServiceChild.emitExit}. It never fails to spawn, so its `error`
+ * listeners are accepted and never called.
+ *
+ * {@link FakeServiceChild.serveEndRequest} models the one behaviour of the
+ * real service the shutdown tests turn on: `POST /sessions/:id/end` is served
+ * to completion after its client stopped waiting (the route observes no
+ * disconnect; it waits for a cancelled install to settle, then restores), and
+ * any signal interrupts it (today's `SIGTERM` shutdown disposes the cleanup
+ * runner; `SIGKILL` ends everything).
+ */
+class FakeServiceChild implements ChildProcessLike {
+  readonly pid: number;
+  readonly origin: string;
+  readonly stdout = null;
+  readonly stderr = null;
+  readonly signals: ReceivedSignal[] = [];
+  exitCode: number | null = null;
+  signalCode: NodeJS.Signals | null = null;
+  readonly #sigterm: SigtermBehaviour;
+  readonly #exitListeners: ExitListener[] = [];
+  #exited = false;
+  #cancelEndRequest: (() => void) | undefined;
+  #endRequestInterrupted = false;
+
+  constructor(pid: number, origin: string, sigterm: SigtermBehaviour) {
+    this.pid = pid;
+    this.origin = origin;
+    this.#sigterm = sigterm;
+  }
+
+  /** Whether the process has not exited yet, i.e. still answers at its origin. */
+  get alive(): boolean {
+    return !this.#exited;
+  }
+
+  /** The names of the signals received, in order. */
+  get signalNames(): NodeJS.Signals[] {
+    return this.signals.map((received) => received.signal);
+  }
+
+  /** Whether a signal or an exit arrived while an accepted end request was still being served. */
+  get endRequestInterrupted(): boolean {
+    return this.#endRequestInterrupted;
+  }
+
+  /**
+   * Accepts an end request whose restore — `restore`, run once — completes
+   * `afterMs` from now, unless a signal or an exit interrupts it first.
+   */
+  serveEndRequest(afterMs: number, restore: () => void): void {
+    const timer = setTimeout(() => {
+      this.#cancelEndRequest = undefined;
+      restore();
+    }, afterMs);
+    this.#cancelEndRequest = () => {
+      clearTimeout(timer);
+      this.#cancelEndRequest = undefined;
+      this.#endRequestInterrupted = true;
+    };
+  }
+
+  kill(signal?: NodeJS.Signals | number): boolean {
+    const name: NodeJS.Signals = typeof signal === 'string' ? signal : 'SIGTERM';
+    this.signals.push({ signal: name, atMs: Date.now() });
+    if (this.#exited) {
+      return false;
+    }
+    this.#cancelEndRequest?.();
+    if (name === 'SIGKILL' || this.#sigterm === 'exit') {
+      setImmediate(() => {
+        this.emitExit(null, name);
+      });
+    }
+    return true;
+  }
+
+  on(event: 'exit', listener: ExitListener): this;
+  on(event: 'error', listener: (error: Error) => void): this;
+  on(event: 'exit' | 'error', listener: ExitListener | ((error: Error) => void)): this {
+    if (event === 'exit') {
+      this.#exitListeners.push(listener as ExitListener);
+    }
+    return this;
+  }
+
+  /** Ends the process — a crash, a finished shutdown — once; later calls do nothing. */
+  emitExit(code: number | null, signal: NodeJS.Signals | null): void {
+    if (this.#exited) {
+      return;
+    }
+    this.#cancelEndRequest?.();
+    this.#exited = true;
+    this.exitCode = code;
+    this.signalCode = signal;
+    for (const listener of [...this.#exitListeners]) {
+      listener(code, signal);
+    }
+  }
+}
+
+/** A manager from `src/service/process.ts` wired to fake seams, and the handles a test drives it with. */
+interface SupervisionHarness {
+  readonly serviceProcess: ServiceProcess;
+  /** Every fake child spawned, oldest first. */
+  readonly children: FakeServiceChild[];
+  /** Every record the manager (and the shutdown helper, when handed {@link logger}) logged. */
+  readonly logs: LogRecord[];
+  /** A logger writing into {@link logs}. */
+  readonly logger: Logger;
+  /** Health probes issued so far. */
+  readonly probeCount: () => number;
+  /** Moves `debuggen.serviceUrl`; the probe follows it at once, as `client.ts` does. */
+  setServiceUrl(url: string): void;
+  /** Registers a service this manager did not start, answering at `url`'s origin. */
+  addExternalResponder(url: string): void;
+  /** Makes every later probe take `ms` before it answers. */
+  setProbeDelay(ms: number): void;
+  /** The only child spawned so far; fails the test when there is not exactly one. */
+  onlyChild(): FakeServiceChild;
+  /** Disposes the manager and ends every fake child still alive, so no test leaves one behind. */
+  dispose(): void;
+}
+
+/**
+ * Builds a {@link SupervisionHarness}: auto-start on, the provider default
+ * `deterministic`, a fake bundle whose files all "exist", a configured Node
+ * runtime that "is executable", a credential store that always succeeds, and
+ * no configuration events (the manager's own handling is what is exercised).
+ */
+function createSupervisionHarness(sigterm: SigtermBehaviour = 'exit'): SupervisionHarness {
+  const children: FakeServiceChild[] = [];
+  const externalOrigins = new Set<string>();
+  const logs: LogRecord[] = [];
+  const logger = createConsoleLogger({
+    level: 'trace',
+    sink: (record) => {
+      logs.push(record);
+    },
+  });
+  let serviceUrl = SUPERVISED_SERVICE_URL;
+  let probeDelayMs = 0;
+  let probes = 0;
+  let nextPid = 7_001;
+
+  const answersAt = (origin: string): boolean =>
+    externalOrigins.has(origin) || children.some((child) => child.alive && child.origin === origin);
+
+  const probe: ServiceHealthProbe = {
+    health: async (): Promise<Result<unknown, DebuggenError>> => {
+      probes += 1;
+      // Read when the request is issued: the real client sends it to the base
+      // URL it holds at that moment.
+      const target = new URL(serviceUrl).origin;
+      if (probeDelayMs > 0) {
+        await delay(probeDelayMs);
+      }
+      return answersAt(target)
+        ? ok({ status: 'ok' })
+        : err(
+            new DebuggenError(
+              'TRANSPORT_DISCONNECTED',
+              `supervision suite: nothing answers at ${target}.`,
+            ),
+          );
+    },
+  };
+
+  const spawn: SpawnLike = (command, args, options) => {
+    const host = options.env.DEBUGGEN_HOST;
+    const port = options.env.DEBUGGEN_PORT;
+    assert.ok(
+      host !== undefined && port !== undefined,
+      `the service must be told where to listen (spawned ${command} ${args.join(' ')}).`,
+    );
+    const child = new FakeServiceChild(nextPid, new URL(`http://${host}:${port}`).origin, sigterm);
+    nextPid += 1;
+    children.push(child);
+    return child;
+  };
+
+  const credential: ServiceCredentialPort = {
+    paths: () =>
+      ok({
+        debuggenHome: '/supervision-suite/home',
+        authFilePath: '/supervision-suite/home/auth.json',
+      }),
+    ensure: () => Promise.resolve(ok(FAKE_EDITOR_TOKEN)),
+    waitForCredential: () => Promise.resolve(ok(FAKE_EDITOR_TOKEN)),
+  };
+
+  // The service output channel is not what these tests assert on (the log
+  // records are); it only has to accept writes.
+  const outputChannel: ServiceOutputChannel = {
+    append: () => undefined,
+    appendLine: () => undefined,
+    clear: () => undefined,
+    show: () => undefined,
+    dispose: () => undefined,
+  };
+
+  const serviceProcess = createServiceProcess({
+    paths: {
+      serviceMain: '/supervision-suite/extension/dist/service/main.js',
+      servicePromptsDir: '/supervision-suite/extension/dist/service/prompts',
+    },
+    probe,
+    credential,
+    nodePath: '/supervision-suite/bin/node',
+    isExecutable: () => true,
+    pathKind: (target) => (target.endsWith('prompts') ? 'directory' : 'file'),
+    env: { PATH: '/supervision-suite/bin' },
+    spawn,
+    readSettings: () => ({
+      autoStartService: true,
+      serviceUrl,
+      providerExplicit: undefined,
+      providerDefault: 'deterministic',
+    }),
+    onDidChangeConfiguration: () => ({ dispose: () => undefined }),
+    createOutputChannel: () => outputChannel,
+    logger,
+    restartPolicy: {
+      initialDelayMs: SUPERVISION_TIMINGS.restartDelayMs,
+      maxDelayMs: SUPERVISION_TIMINGS.restartDelayMs * 4,
+      factor: 2,
+      maxAttempts: 3,
+      stableAfterMs: 60_000,
+    },
+    startupTimeoutMs: SUPERVISION_TIMINGS.startupTimeoutMs,
+    healthPollIntervalMs: SUPERVISION_TIMINGS.healthPollIntervalMs,
+    slowStartPollIntervalMs: SUPERVISION_TIMINGS.slowStartPollIntervalMs,
+    healthProbeTimeoutMs: SUPERVISION_TIMINGS.healthProbeTimeoutMs,
+    stopGraceMs: SUPERVISION_TIMINGS.stopGraceMs,
+    quiesceTimeoutMs: SUPERVISION_TIMINGS.quiesceTimeoutMs,
+  });
+
+  return {
+    serviceProcess,
+    children,
+    logs,
+    logger,
+    probeCount: () => probes,
+    setServiceUrl: (url) => {
+      serviceUrl = url;
+    },
+    addExternalResponder: (url) => {
+      externalOrigins.add(new URL(url).origin);
+    },
+    setProbeDelay: (ms) => {
+      probeDelayMs = ms;
+    },
+    onlyChild: () => {
+      assert.equal(
+        children.length,
+        1,
+        `exactly one service child must have been spawned; got ${String(children.length)}.`,
+      );
+      const [child] = children;
+      assert.ok(child !== undefined);
+      return child;
+    },
+    dispose: () => {
+      serviceProcess.dispose();
+      for (const child of children) {
+        child.emitExit(0, null);
+      }
+    },
+  };
+}
+
+/** A promise and the function that resolves it. */
+interface Deferred<T> {
+  readonly promise: Promise<T>;
+  resolve(value: T): void;
+}
+
+/** A promise a test settles when it chooses — an end request still in flight, say. */
+function deferred<T>(): Deferred<T> {
+  let settle: (value: T) => void = () => undefined;
+  const promise = new Promise<T>((resolve) => {
+    settle = resolve;
+  });
+  return { promise, resolve: (value) => settle(value) };
+}
+
+/** Polls `condition` every few milliseconds until it holds, failing after `timeoutMs`. */
+async function waitUntil(condition: () => boolean, timeoutMs: number, what: string): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    assert.ok(
+      Date.now() < deadline,
+      `timed out after ${String(timeoutMs)} ms waiting for ${what}.`,
+    );
+    await delay(5);
+  }
+}
+
+/** Starts the harness's service and asserts it is this window's `running` child. */
+async function startSupervisedChild(harness: SupervisionHarness): Promise<FakeServiceChild> {
+  const started = await harness.serviceProcess.ensureRunning();
+  assert.ok(
+    isOk(started),
+    `the supervised service must start: ${isErr(started) ? started.error.message : ''}`,
+  );
+  const child = harness.onlyChild();
+  assert.equal(harness.serviceProcess.status.state, 'running');
+  assert.equal(harness.serviceProcess.status.mode, 'embedded');
+  assert.equal(harness.serviceProcess.status.pid, child.pid);
+  assert.equal(child.origin, new URL(SUPERVISED_SERVICE_URL).origin);
+  return child;
+}
+
+/** Whether any log record's message contains `fragment` at `level`. */
+function logged(logs: readonly LogRecord[], level: LogRecord['level'], fragment: string): boolean {
+  return logs.some((record) => record.level === level && record.message.includes(fragment));
+}
+
+// ---------------------------------------------------------------------------
+// Service process supervision and shutdown: the suite
+// ---------------------------------------------------------------------------
+
+describe('Debug Generator activation: service process supervision and shutdown', () => {
+  after(async function () {
+    this.timeout(ACTIVATION_TIMEOUT_MS);
+    // The slow-install test writes a real file under a scratch directory.
+    await cleanupScratch();
+  });
+
+  it('carves every deactivation step out of one budget inside the extension host shutdown window', () => {
+    assert.ok(
+      DEACTIVATE_QUIESCE_TIMEOUT_MS + DEACTIVATE_STOP_GRACE_MS <= DEACTIVATE_BUDGET_MS,
+      `the quiesce bound (${String(DEACTIVATE_QUIESCE_TIMEOUT_MS)} ms) and the stop grace (${String(DEACTIVATE_STOP_GRACE_MS)} ms) must fit the ${String(DEACTIVATE_BUDGET_MS)} ms budget.`,
+    );
+    assert.ok(
+      DEACTIVATE_BUDGET_MS < EXTENSION_HOST_SHUTDOWN_MS,
+      `the deactivation budget (${String(DEACTIVATE_BUDGET_MS)} ms) must end before VS Code terminates the extension host.`,
+    );
+    assert.ok(
+      DEACTIVATE_END_SESSION_TIMEOUT_MS < DEACTIVATE_QUIESCE_TIMEOUT_MS,
+      "the stop must wait out the end request's own bound before it acts on the child, so a timed-out end is known to be in progress.",
+    );
+    assert.ok(DEACTIVATE_STOP_GRACE_MS > 0, 'the child must get a grace window after SIGTERM.');
+  });
+
+  it('does not restart a child that exits while stop() waits for an in-flight end request', async function () {
+    this.timeout(15_000);
+    const harness = createSupervisionHarness();
+    try {
+      const child = await startSupervisedChild(harness);
+      const endRequest = deferred<undefined>();
+      const stopping = harness.serviceProcess.stop({
+        awaitInFlight: endRequest.promise,
+        quiesceTimeoutMs: 10_000,
+      });
+
+      // The service crashes while the stop is still quiescing.
+      child.emitExit(1, null);
+      await delay(RESPAWN_WATCH_MS);
+      assert.equal(
+        harness.children.length,
+        1,
+        'a child that exited during stop() must not be replaced while the stop waits.',
+      );
+      assert.equal(harness.serviceProcess.status.state, 'stopped');
+
+      endRequest.resolve(undefined);
+      await stopping;
+      await delay(RESPAWN_WATCH_MS);
+      assert.equal(
+        harness.children.length,
+        1,
+        'nothing may be spawned after stop() resolved either.',
+      );
+      assert.equal(harness.serviceProcess.status.state, 'stopped');
+      assert.equal(harness.serviceProcess.status.pid, undefined);
+      assert.deepEqual(child.signalNames, [], 'a child that already exited is never signalled.');
+      assert.ok(logged(harness.logs, 'info', 'exited while it was being stopped'));
+
+      // The stop keeps holding off automatic starts.
+      const automatic = await harness.serviceProcess.ensureRunning();
+      assert.ok(isErr(automatic), 'an automatic start must not undo a requested stop.');
+      assert.equal(failureReason(automatic.error), 'stopped');
+      assert.equal(harness.children.length, 1);
+    } finally {
+      harness.dispose();
+    }
+  });
+
+  it('abandons a scheduled restart whose probe is still running when stop() is called', async function () {
+    this.timeout(15_000);
+    const harness = createSupervisionHarness();
+    try {
+      const child = await startSupervisedChild(harness);
+      const probeDelayMs = SUPERVISION_TIMINGS.restartDelayMs * 6;
+      harness.setProbeDelay(probeDelayMs);
+      const probesBefore = harness.probeCount();
+
+      // A crash schedules a restart; its timer fires and its probe begins.
+      child.emitExit(1, null);
+      assert.equal(harness.serviceProcess.status.state, 'starting');
+      await waitUntil(
+        () => harness.probeCount() > probesBefore,
+        5_000,
+        'the scheduled restart to probe',
+      );
+
+      await harness.serviceProcess.stop();
+      assert.equal(harness.serviceProcess.status.state, 'stopped');
+
+      await delay(probeDelayMs + RESPAWN_WATCH_MS);
+      assert.equal(
+        harness.children.length,
+        1,
+        'a restart whose probe was running when stop() was called must not launch a child.',
+      );
+      assert.equal(harness.serviceProcess.status.state, 'stopped');
+      assert.ok(logged(harness.logs, 'info', 'a stop was requested before the scheduled restart'));
+    } finally {
+      harness.dispose();
+    }
+  });
+
+  it('keeps the running child when debuggen.serviceUrl moves to an address where nothing answers, until restart() moves it', async function () {
+    this.timeout(15_000);
+    const harness = createSupervisionHarness();
+    try {
+      const child = await startSupervisedChild(harness);
+      harness.setServiceUrl(MOVED_SERVICE_URL);
+
+      for (const userInitiated of [false, true]) {
+        const label = userInitiated ? 'a user-initiated' : 'an automatic';
+        const result = await harness.serviceProcess.ensureRunning({ userInitiated });
+        assert.ok(isErr(result), `${label} ensureRunning must report the move, not succeed.`);
+        assert.equal(result.error.code, 'TRANSPORT_DISCONNECTED');
+        assert.equal(failureReason(result.error), 'service-url-changed');
+        assert.ok(
+          result.error.message.includes(new URL(MOVED_SERVICE_URL).origin) &&
+            result.error.message.includes(child.origin),
+          `the failure must name both origins; it says: ${result.error.message}`,
+        );
+        const status = harness.serviceProcess.status;
+        assert.equal(status.state, 'running', `${label} call must leave the child reported.`);
+        assert.equal(status.mode, 'embedded');
+        assert.equal(status.pid, child.pid, `${label} call must not replace the child.`);
+        assert.equal(status.settingsChanged, true);
+        assert.equal(
+          harness.children.length,
+          1,
+          `${label} call must not spawn a replacement for the moved child.`,
+        );
+        assert.deepEqual(
+          child.signalNames,
+          [],
+          `${label} call must never signal the child: it may still hold a session to end.`,
+        );
+      }
+
+      // The developer's explicit restart is what moves it.
+      const restarted = await harness.serviceProcess.restart();
+      assert.ok(
+        isOk(restarted),
+        `restart() must move the service: ${isErr(restarted) ? restarted.error.message : ''}`,
+      );
+      assert.deepEqual(child.signalNames, ['SIGTERM'], 'restart() stops the old child gracefully.');
+      assert.equal(child.alive, false);
+      assert.equal(harness.children.length, 2, 'restart() spawns exactly one replacement.');
+      const replacement = harness.children[1];
+      assert.ok(replacement !== undefined);
+      assert.equal(replacement.origin, new URL(MOVED_SERVICE_URL).origin);
+      assert.equal(harness.serviceProcess.status.state, 'running');
+      assert.equal(harness.serviceProcess.status.pid, replacement.pid);
+      assert.equal(harness.serviceProcess.status.settingsChanged, false);
+    } finally {
+      harness.dispose();
+    }
+  });
+
+  it('classifies a service answering at the new debuggen.serviceUrl as external and restores the child when the URL is set back', async function () {
+    this.timeout(15_000);
+    const harness = createSupervisionHarness();
+    try {
+      const child = await startSupervisedChild(harness);
+      harness.addExternalResponder(MOVED_SERVICE_URL);
+      harness.setServiceUrl(MOVED_SERVICE_URL);
+
+      const moved = await harness.serviceProcess.ensureRunning();
+      assert.ok(isOk(moved), 'the service answering at the new URL must be usable.');
+      assert.equal(moved.value.state, 'external');
+      assert.equal(moved.value.mode, 'external');
+      assert.equal(
+        moved.value.pid,
+        undefined,
+        "another origin's answer must not be attributed to this window's child.",
+      );
+      assert.equal(moved.value.settingsChanged, true);
+      assert.deepEqual(child.signalNames, [], 'the child must be kept, not signalled.');
+      assert.equal(child.alive, true);
+      assert.equal(harness.children.length, 1);
+
+      harness.setServiceUrl(SUPERVISED_SERVICE_URL);
+      const reverted = await harness.serviceProcess.ensureRunning();
+      assert.ok(isOk(reverted), 'the kept child must answer again once the URL names it.');
+      assert.equal(reverted.value.state, 'running');
+      assert.equal(reverted.value.mode, 'embedded');
+      assert.equal(reverted.value.pid, child.pid);
+      assert.equal(reverted.value.error, undefined);
+      assert.deepEqual(child.signalNames, []);
+      assert.equal(harness.children.length, 1);
+    } finally {
+      harness.dispose();
+    }
+  });
+
+  it('lets a slow-install end finish past the shutdown budget: the child is released unsignalled and restores the file without a service start', async function () {
+    this.timeout(20_000);
+    // The real SIGTERM shutdown ends the service (and disposes its cleanup
+    // runner), so a signal here would interrupt the restore.
+    const harness = createSupervisionHarness('exit');
+    try {
+      const child = await startSupervisedChild(harness);
+      const workspace = createScratchDir('supervision-slow-install-');
+      const original = 'export function placeOrder(): string {\n  return "original";\n}\n';
+      const instrumented = `${original}// instrumented by the supervision suite\n`;
+      const file = writeFixtureFile(workspace, 'src/orders.ts', instrumented);
+
+      // The service accepted `POST /sessions/:id/end`: it waits for a
+      // cancelled install to settle, then restores the file — later than the
+      // editor's whole shutdown budget.
+      const restoreAfterMs = DEACTIVATE_BUDGET_MS + 1_000;
+      child.serveEndRequest(restoreAfterMs, () => {
+        fs.writeFileSync(file, original);
+      });
+      // What `endActiveSession` resolves to once the client's own timeout
+      // fired (`details.cancelled === 'timeout'`), registered with the manager.
+      const ending = harness.serviceProcess.keepAliveFor(
+        delay(DEACTIVATE_END_SESSION_TIMEOUT_MS).then((): ShutdownEndOutcome => 'in-progress'),
+      );
+
+      const startedAt = Date.now();
+      const stopping = stopServiceForShutdown(harness.serviceProcess, ending, harness.logger);
+      // VS Code disposes context.subscriptions right after deactivate() returned its promise.
+      harness.serviceProcess.dispose();
+      const outcome = await stopping;
+      const elapsedMs = Date.now() - startedAt;
+
+      assert.equal(outcome, 'in-progress');
+      assert.ok(
+        elapsedMs >= DEACTIVATE_END_SESSION_TIMEOUT_MS - TIMER_TOLERANCE_MS,
+        `the stop acted on the child ${String(elapsedMs)} ms in, before the end request's ${String(DEACTIVATE_END_SESSION_TIMEOUT_MS)} ms bound.`,
+      );
+      assert.ok(
+        elapsedMs < EXTENSION_HOST_SHUTDOWN_MS,
+        `the shutdown stop took ${String(elapsedMs)} ms; it must finish before VS Code terminates the host.`,
+      );
+      assert.deepEqual(child.signalNames, [], 'an end still being served must not be signalled.');
+      assert.equal(child.alive, true, 'the released child keeps running to finish the end.');
+      assert.equal(
+        fs.readFileSync(file, 'utf8'),
+        instrumented,
+        'the restore is still pending when the editor has finished shutting down.',
+      );
+      assert.equal(harness.serviceProcess.status.state, 'stopped');
+      assert.equal(harness.serviceProcess.status.pid, undefined);
+      assert.ok(logged(harness.logs, 'warn', 'left running, unsignalled'));
+      assert.ok(logged(harness.logs, 'warn', 'was still in progress at shutdown'));
+
+      // The service finishes on its own schedule, with nothing restarted.
+      await waitUntil(
+        () => fs.readFileSync(file, 'utf8') === original,
+        restoreAfterMs + 2_000,
+        'the released service to restore the instrumented file',
+      );
+      assert.equal(child.endRequestInterrupted, false, 'the end request ran to completion.');
+      assert.deepEqual(child.signalNames, [], 'nothing signalled the child while it restored.');
+      assert.equal(harness.children.length, 1, 'restoring needed no service start.');
+
+      // It then exits on its own; the released child is not supervised.
+      child.emitExit(0, null);
+      await delay(RESPAWN_WATCH_MS);
+      assert.equal(harness.children.length, 1, 'a released child that exits is not restarted.');
+    } finally {
+      harness.dispose();
+    }
+  });
+
+  it('releases a child whose end request has not settled by the quiesce bound, and keeps it released when dispose() follows', async function () {
+    this.timeout(20_000);
+    const harness = createSupervisionHarness('exit');
+    const endRequest = deferred<ShutdownEndOutcome>();
+    try {
+      const child = await startSupervisedChild(harness);
+      child.serveEndRequest(DEACTIVATE_BUDGET_MS * 3, () => undefined);
+      const ending = harness.serviceProcess.keepAliveFor(endRequest.promise);
+
+      const startedAt = Date.now();
+      const stopping = stopServiceForShutdown(harness.serviceProcess, ending, harness.logger);
+      harness.serviceProcess.dispose();
+
+      // Past the manager's own quiesce bound and grace window, which a
+      // termination started by dispose() would have used.
+      await delay(DEACTIVATE_QUIESCE_TIMEOUT_MS - 500);
+      assert.deepEqual(child.signalNames, [], 'nothing may signal the child within the bound.');
+
+      const outcome = await stopping;
+      const elapsedMs = Date.now() - startedAt;
+      assert.equal(outcome, undefined, 'the end had not settled when the stop acted.');
+      assert.ok(elapsedMs >= DEACTIVATE_QUIESCE_TIMEOUT_MS - TIMER_TOLERANCE_MS);
+      assert.ok(elapsedMs < EXTENSION_HOST_SHUTDOWN_MS);
+      assert.ok(logged(harness.logs, 'warn', 'left running, unsignalled'));
+      assert.ok(logged(harness.logs, 'warn', 'was still in progress at shutdown'));
+
+      // No late signal from the stop's grace window or from dispose().
+      await delay(DEACTIVATE_STOP_GRACE_MS + SUPERVISION_TIMINGS.stopGraceMs * 3);
+      assert.deepEqual(child.signalNames, []);
+      assert.equal(child.alive, true);
+      assert.equal(child.endRequestInterrupted, false);
+      assert.equal(harness.children.length, 1);
+    } finally {
+      endRequest.resolve('in-progress');
+      harness.dispose();
+    }
+  });
+
+  it('sends a child whose end was refused SIGTERM only, never SIGKILL', async function () {
+    this.timeout(20_000);
+    const harness = createSupervisionHarness('ignore');
+    try {
+      const child = await startSupervisedChild(harness);
+      const ending = harness.serviceProcess.keepAliveFor(
+        delay(50).then((): ShutdownEndOutcome => 'not-ended'),
+      );
+
+      const startedAt = Date.now();
+      const stopping = stopServiceForShutdown(harness.serviceProcess, ending, harness.logger);
+      harness.serviceProcess.dispose();
+      const outcome = await stopping;
+      const elapsedMs = Date.now() - startedAt;
+
+      assert.equal(outcome, 'not-ended');
+      assert.deepEqual(
+        child.signalNames,
+        ['SIGTERM'],
+        'a refused end leaves the service to run its own shutdown: SIGTERM, never SIGKILL.',
+      );
+      const [sigterm] = child.signals;
+      assert.ok(sigterm !== undefined);
+      assert.ok(
+        sigterm.atMs - startedAt < DEACTIVATE_QUIESCE_TIMEOUT_MS,
+        'a settled end must let the stop act without waiting out the quiesce bound.',
+      );
+      assert.ok(elapsedMs < EXTENSION_HOST_SHUTDOWN_MS);
+      assert.ok(logged(harness.logs, 'warn', 'leaving it to finish shutting down on its own'));
+      assert.ok(logged(harness.logs, 'warn', 'did not conclude before shutdown'));
+      assert.ok(!logged(harness.logs, 'warn', 'left running, unsignalled'));
+
+      await delay(SUPERVISION_TIMINGS.stopGraceMs * 3);
+      assert.deepEqual(child.signalNames, ['SIGTERM'], 'no late escalation either.');
+      assert.equal(harness.children.length, 1);
+    } finally {
+      harness.dispose();
+    }
+  });
+
+  it('stops rather than releases a child that debuggen.serviceUrl no longer names', async function () {
+    this.timeout(15_000);
+    const harness = createSupervisionHarness('exit');
+    try {
+      const child = await startSupervisedChild(harness);
+      // The awaited request went to the new address, so this child is not
+      // the one carrying it out.
+      harness.setServiceUrl(MOVED_SERVICE_URL);
+
+      await harness.serviceProcess.stop({
+        release: true,
+        graceMs: SUPERVISION_TIMINGS.stopGraceMs,
+      });
+
+      assert.deepEqual(child.signalNames, ['SIGTERM']);
+      assert.equal(child.alive, false);
+      assert.equal(harness.serviceProcess.status.state, 'stopped');
+      assert.ok(logged(harness.logs, 'info', 'no longer listens where the awaited request went'));
+      assert.ok(!logged(harness.logs, 'warn', 'left running, unsignalled'));
+    } finally {
+      harness.dispose();
+    }
+  });
+
+  it('treats a release decision that throws as a release', async function () {
+    this.timeout(15_000);
+    const harness = createSupervisionHarness('exit');
+    try {
+      const child = await startSupervisedChild(harness);
+      await harness.serviceProcess.stop({
+        release: () => {
+          throw new Error('supervision suite: the release decision failed.');
+        },
+      });
+      assert.deepEqual(
+        child.signalNames,
+        [],
+        'an undecidable release must not interrupt a restore.',
+      );
+      assert.equal(child.alive, true);
+      assert.equal(harness.serviceProcess.status.state, 'stopped');
+      assert.ok(logged(harness.logs, 'warn', 'deciding whether to release the service failed'));
+    } finally {
+      harness.dispose();
+    }
+  });
+
+  it('never signals a released child again: ensureRunning uses it as external, and stop(), restart() and dispose() leave it running', async function () {
+    this.timeout(15_000);
+    const harness = createSupervisionHarness('exit');
+    try {
+      const child = await startSupervisedChild(harness);
+      await harness.serviceProcess.stop({ release: true });
+      assert.deepEqual(child.signalNames, []);
+
+      const found = await harness.serviceProcess.ensureRunning();
+      assert.ok(isOk(found), 'the released service still answers and must be usable.');
+      assert.equal(found.value.state, 'external');
+      assert.equal(found.value.mode, 'external');
+      assert.equal(found.value.pid, undefined, 'a released child is no longer reported as ours.');
+
+      await harness.serviceProcess.stop({ graceMs: SUPERVISION_TIMINGS.stopGraceMs });
+      const restarted = await harness.serviceProcess.restart();
+      assert.ok(isErr(restarted), 'a released child is not restarted from this window.');
+      assert.equal(failureReason(restarted.error), 'external');
+
+      harness.serviceProcess.dispose();
+      await delay(SUPERVISION_TIMINGS.quiesceTimeoutMs + SUPERVISION_TIMINGS.stopGraceMs * 3);
+      assert.deepEqual(child.signalNames, [], 'no later stop, restart or dispose signals it.');
+      assert.equal(child.alive, true);
+      assert.equal(harness.children.length, 1, 'nothing was spawned beside it.');
+    } finally {
+      harness.dispose();
+    }
+  });
+
+  it('force-stops a child that ignores SIGTERM once the grace window passes after the end concluded', async function () {
+    this.timeout(20_000);
+    const harness = createSupervisionHarness('ignore');
+    try {
+      const child = await startSupervisedChild(harness);
+      const ending = harness.serviceProcess.keepAliveFor(
+        delay(50).then((): ShutdownEndOutcome => 'ended'),
+      );
+
+      const startedAt = Date.now();
+      const stopping = stopServiceForShutdown(harness.serviceProcess, ending, harness.logger);
+      harness.serviceProcess.dispose();
+      const outcome = await stopping;
+      const elapsedMs = Date.now() - startedAt;
+
+      assert.equal(outcome, 'ended');
+      assert.deepEqual(child.signalNames, ['SIGTERM', 'SIGKILL']);
+      assert.equal(child.alive, false);
+      const [sigterm, sigkill] = child.signals;
+      assert.ok(sigterm !== undefined && sigkill !== undefined);
+      assert.ok(
+        sigterm.atMs - startedAt < DEACTIVATE_QUIESCE_TIMEOUT_MS,
+        'a concluded end must let the stop signal the child without waiting out the quiesce bound.',
+      );
+      assert.ok(
+        sigkill.atMs - sigterm.atMs >= DEACTIVATE_STOP_GRACE_MS - TIMER_TOLERANCE_MS,
+        `SIGKILL followed SIGTERM after ${String(sigkill.atMs - sigterm.atMs)} ms, inside the ${String(DEACTIVATE_STOP_GRACE_MS)} ms grace window.`,
+      );
+      assert.ok(elapsedMs < EXTENSION_HOST_SHUTDOWN_MS);
+      assert.ok(!logged(harness.logs, 'warn', 'did not conclude before shutdown'));
+      assert.ok(!logged(harness.logs, 'warn', 'left running, unsignalled'));
+      assert.equal(harness.children.length, 1);
+    } finally {
+      harness.dispose();
+    }
+  });
+
+  it('treats an escalation decision that throws as a refusal to force-stop', async function () {
+    this.timeout(15_000);
+    const harness = createSupervisionHarness('ignore');
+    try {
+      const child = await startSupervisedChild(harness);
+      await harness.serviceProcess.stop({
+        graceMs: SUPERVISION_TIMINGS.stopGraceMs,
+        escalate: () => {
+          throw new Error('supervision suite: the escalation decision failed.');
+        },
+      });
+      assert.deepEqual(child.signalNames, ['SIGTERM']);
+      assert.equal(child.alive, true);
+      assert.equal(harness.serviceProcess.status.state, 'stopped');
+      assert.ok(logged(harness.logs, 'warn', 'it is not force-stopped'));
+      assert.ok(logged(harness.logs, 'warn', 'leaving it to finish shutting down on its own'));
+    } finally {
+      harness.dispose();
+    }
   });
 });

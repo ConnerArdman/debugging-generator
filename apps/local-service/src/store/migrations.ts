@@ -81,6 +81,7 @@ import {
   type Result,
 } from '@debuggen/shared';
 import { sha256Hex } from '@debuggen/shared/node';
+import { CLOCK_OFFSET_BOUND_MS } from '@debuggen/telemetry';
 
 import type { DatabaseSync } from 'node:sqlite';
 
@@ -101,9 +102,15 @@ import type { DatabaseSync } from 'node:sqlite';
  * {@link CHAIN_INTEGRITY_AND_PURGE_INDEXES_MIGRATION}. Version 3 adds the two
  * ordered telemetry lookup indexes, which serve a page of one span kind and the
  * occurrences of one request group in their reading order without a sort — see
- * {@link ORDERED_TELEMETRY_LOOKUP_INDEXES_MIGRATION}.
+ * {@link ORDERED_TELEMETRY_LOOKUP_INDEXES_MIGRATION}. Version 4 adds the session
+ * cleanup summary projection, which lets the session list read a row's cleanup
+ * status, completion time and conflict count without reading the session's
+ * document — see {@link SESSION_CLEANUP_SUMMARIES_MIGRATION}. Version 5 adds
+ * the `telemetry_events.clock_offset_ms` column, the informational clock
+ * offset each producer reports on its events (AAP 0.2.3) — see
+ * {@link PRODUCER_CLOCK_OFFSET_MIGRATION}.
  */
-export const STORE_SCHEMA_VERSION = 3;
+export const STORE_SCHEMA_VERSION = 5;
 
 /**
  * The `subsystem` field every log record from this module carries, so store
@@ -510,6 +517,264 @@ const ORDERED_TELEMETRY_LOOKUP_INDEXES_MIGRATION: StoreMigration = {
   },
 };
 
+/* -------------------------------------------------------------------------------------------------
+ * Version 4 — the session cleanup summary projection
+ *
+ * Self-contained on purpose: every statement and constant of this step lives in
+ * this section, so the step can be renumbered as a unit should another ladder
+ * step land first.
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * The cleanup-status vocabulary the summary table's `CHECK` admits, in the
+ * order of `@debuggen/protocol`'s `CLEANUP_STATUSES` (and so of its
+ * `cleanupStatusSchema`).
+ *
+ * Written out as SQL text rather than generated from the protocol tuple, and
+ * that is deliberate: a ladder step's DDL is frozen the moment it ships,
+ * because a database created by it keeps its `CHECK` for ever. Generating the
+ * list would let a later vocabulary change alter what this step creates for a
+ * new database while every existing one kept the old constraint — two stores
+ * of the same version disagreeing about what they accept. The store suite
+ * asserts that this list equals `CLEANUP_STATUSES`, member for member and in
+ * order, so a vocabulary change fails the build and is met with a new ladder
+ * step instead.
+ */
+const CLEANUP_STATUS_SQL_LIST = `'pending', 'clean', 'partial', 'conflict'`;
+
+/**
+ * The session cleanup summary: the three cleanup facts a session list row
+ * shows, one row per session, kept by `./sessions-repo.ts` in the same
+ * transaction as every write of the session's document.
+ *
+ * ## Why a side table rather than three added columns
+ *
+ * `ALTER TABLE sessions ADD COLUMN` would append each column **after**
+ * `record` in every stored row. SQLite reads a row's columns in declaration
+ * order, and `record` — the whole `SessionRecord` document, which grows with
+ * every plan, modification diff and analysis — spills onto overflow pages once
+ * it outgrows its page. Reading a column declared after it makes SQLite walk
+ * that document's overflow chain to reach it, which is exactly the per-row
+ * document read this projection exists to remove. A separate `WITHOUT ROWID`
+ * table keyed by the session id holds only the three facts, so the session
+ * list reads the `sessions` projections declared before `record` plus one
+ * small primary-key lookup per row, and never touches a document.
+ *
+ * ## The constraints
+ *
+ * - `session_id` references `sessions (id)` with `ON DELETE CASCADE`, so
+ *   deleting a session — the retention sweep's one statement — removes its
+ *   summary with it.
+ * - `status` is checked against {@link CLEANUP_STATUS_SQL_LIST}.
+ * - `completed_at` is whole epoch milliseconds, `NULL` while cleanup has not
+ *   completed — the column form of the record's absent `cleanup.completedAt`.
+ * - `conflict_count` is `cleanup.conflicts.length`, never negative.
+ *
+ * `STRICT`, as every table of `./schema.sql` is, so a mistyped value is refused
+ * rather than coerced.
+ */
+const CREATE_SESSION_CLEANUP_SUMMARIES_SQL = `CREATE TABLE IF NOT EXISTS session_cleanup_summaries (
+  session_id     TEXT PRIMARY KEY REFERENCES sessions (id) ON DELETE CASCADE,
+  status         TEXT NOT NULL CHECK (status IN (${CLEANUP_STATUS_SQL_LIST})),
+  completed_at   INTEGER,
+  conflict_count INTEGER NOT NULL CHECK (conflict_count >= 0)
+) STRICT, WITHOUT ROWID`;
+
+/**
+ * Derives a summary row from every stored session document that yields one —
+ * the only statement in the service that reads a session document with SQL.
+ *
+ * Every extraction is guarded by `json_valid(record)` inside a `CASE`, which
+ * SQLite evaluates lazily, because `json_extract` raises on malformed input and
+ * one unreadable document must not fail the whole step. A document yields a
+ * row only when all of these hold:
+ *
+ * - it is valid JSON;
+ * - `$.cleanup.status` is text within {@link CLEANUP_STATUS_SQL_LIST};
+ * - `$.cleanup.conflicts` is an array — `json_array_length` answers `0` for any
+ *   other value, which would pass for "no conflicts";
+ * - `$.cleanup.completedAt` is absent, JSON `null` (both stored as `NULL`), an
+ *   integer, or a real — rounded to whole milliseconds, the canonicalisation
+ *   `./sessions-repo.ts` applies to the same member on every write, so the next
+ *   write of that session stores the identical value.
+ *
+ * A document that fails any of these gets no summary row. The session list
+ * reports such a session as unreadable — left out, counted and moved past —
+ * exactly as it did while it read the document, and the session's next write
+ * creates its row.
+ *
+ * An upsert rather than a plain insert, so the step stays idempotent and the
+ * document stays authoritative: a summary row already present for a session is
+ * replaced by what that session's document says. The `WHERE` clause is also
+ * what SQLite requires of an `INSERT … SELECT` carrying an upsert clause.
+ */
+const BACKFILL_SESSION_CLEANUP_SUMMARIES_SQL = `INSERT INTO session_cleanup_summaries (session_id, status, completed_at, conflict_count)
+SELECT id, cleanup_status, cleanup_completed_at, cleanup_conflict_count
+FROM (
+  SELECT
+    id,
+    CASE WHEN json_valid(record) THEN
+      CASE json_type(record, '$.cleanup.status')
+        WHEN 'text' THEN json_extract(record, '$.cleanup.status')
+      END
+    END AS cleanup_status,
+    CASE WHEN json_valid(record) THEN
+      coalesce(json_type(record, '$.cleanup.completedAt'), 'absent')
+    END AS completed_at_type,
+    CASE WHEN json_valid(record) THEN
+      CASE json_type(record, '$.cleanup.completedAt')
+        WHEN 'integer' THEN json_extract(record, '$.cleanup.completedAt')
+        WHEN 'real' THEN CAST(round(json_extract(record, '$.cleanup.completedAt')) AS INTEGER)
+      END
+    END AS cleanup_completed_at,
+    CASE WHEN json_valid(record) THEN
+      CASE json_type(record, '$.cleanup.conflicts')
+        WHEN 'array' THEN json_array_length(record, '$.cleanup.conflicts')
+      END
+    END AS cleanup_conflict_count
+  FROM sessions
+)
+WHERE cleanup_status IN (${CLEANUP_STATUS_SQL_LIST})
+  AND completed_at_type IN ('absent', 'null', 'integer', 'real')
+  AND cleanup_conflict_count IS NOT NULL
+ON CONFLICT (session_id) DO UPDATE SET
+  status = excluded.status,
+  completed_at = excluded.completed_at,
+  conflict_count = excluded.conflict_count`;
+
+/**
+ * How many sessions are left without a summary row once the backfill ran —
+ * the sessions whose document yielded none.
+ */
+const COUNT_UNSUMMARISED_SESSIONS_SQL = `SELECT COUNT(*) AS unsummarised FROM sessions
+WHERE NOT EXISTS (
+  SELECT 1 FROM session_cleanup_summaries WHERE session_cleanup_summaries.session_id = sessions.id
+)`;
+
+/**
+ * Schema version 4: the session cleanup summary projection — see
+ * {@link CREATE_SESSION_CLEANUP_SUMMARIES_SQL} for why it is a side table and
+ * {@link BACKFILL_SESSION_CLEANUP_SUMMARIES_SQL} for which documents yield a
+ * row.
+ *
+ * Purely additive: one `IF NOT EXISTS` table and rows written into that table
+ * only. No row of any table an earlier step declared is rewritten or removed.
+ * An adopted database — stamped `0` with the schema already present — reaches
+ * this step through the ladder once adoption has stamped version 1, so it ends
+ * with the table created and backfilled like any other database below
+ * version 4.
+ *
+ * Sessions whose document yielded no row are reported at `warn` by count only —
+ * never an id, a path or a question, because the line reaches the service log.
+ */
+const SESSION_CLEANUP_SUMMARIES_MIGRATION: StoreMigration = {
+  version: 4,
+  description: 'add the session cleanup summary projection',
+  apply: (db, { logger }) => {
+    db.exec(CREATE_SESSION_CLEANUP_SUMMARIES_SQL);
+
+    const summarised = changeCount(
+      db.prepare(BACKFILL_SESSION_CLEANUP_SUMMARIES_SQL).run().changes,
+    );
+    const counted = db.prepare(COUNT_UNSUMMARISED_SESSIONS_SQL).get()?.['unsummarised'];
+    const unsummarised =
+      typeof counted === 'bigint' ? Number(counted) : typeof counted === 'number' ? counted : 0;
+
+    logger.debug('backfilled the session cleanup summaries', {
+      subsystem: SUBSYSTEM,
+      summarisedSessions: summarised,
+    });
+
+    if (unsummarised > 0) {
+      logger.warn(
+        'some stored sessions have no readable cleanup state; the session list leaves them out until they are next written',
+        { subsystem: SUBSYSTEM, unsummarisedSessions: unsummarised },
+      );
+    }
+  },
+};
+
+/* -------------------------------------------------------------------------------------------------
+ * Version 5 — the per-producer clock offset
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * The column holding the clock offset an event's producer reported when it
+ * created the event.
+ *
+ * AAP 0.2.3 applies no clock alignment between tiers "beyond a recorded
+ * per-producer `clockOffsetMs` (server `Date` header versus local clock,
+ * informational)". Each producer — a page document's browser agent, a dev
+ * server's Node preload — estimates `server clock − producer clock` in whole
+ * milliseconds with `@debuggen/telemetry`'s `ClockOffsetEstimator` and stamps
+ * its current estimate on every event it creates, as the optional
+ * `clockOffsetMs` field. The field already round-trips through the
+ * authoritative `event` JSON document; this column is its flat projection, so
+ * `./telemetry-repo.ts` can answer "what offset did each producer of this
+ * session report?" with one grouped read instead of a walk over every document.
+ *
+ * `NULL` means the event carried no offset: every row written before this
+ * step, and every event a producer created before its first usable `Date`
+ * sample. The value is informational only — nothing in the store, the
+ * correlator or the panel data layer adds it to `start_time` or `duration`.
+ */
+const CLOCK_OFFSET_COLUMN = 'clock_offset_ms';
+
+/**
+ * Whether `telemetry_events` already declares {@link CLOCK_OFFSET_COLUMN}.
+ *
+ * Probed for the reason {@link CHAIN_FORK_COLUMN_EXISTS_SQL} gives: SQLite has
+ * no `ADD COLUMN IF NOT EXISTS`, and a step must be safe to reason about as
+ * idempotent.
+ */
+const CLOCK_OFFSET_COLUMN_EXISTS_SQL = `SELECT 1 AS present FROM pragma_table_info('telemetry_events') WHERE name = ?`;
+
+/**
+ * Adds {@link CLOCK_OFFSET_COLUMN}: nullable with no default, so every existing
+ * row reads `NULL` without a rewrite, and a `CHECK` bounding a present value to
+ * `±CLOCK_OFFSET_BOUND_MS`.
+ *
+ * The bound is interpolated from `@debuggen/telemetry`'s own constant — a
+ * number, never caller input — so the column and the event schema's
+ * `clockOffsetMs` validation can never disagree about what a reportable offset
+ * is. `INTEGER` in this `STRICT` table also refuses a fractional value, which
+ * the event schema refuses first: the insert path validates every event before
+ * it binds one, so the constraint is the last line for a writer that bypassed
+ * the repository. A `NULL` satisfies the `CHECK`, as SQLite defines it.
+ */
+const ADD_CLOCK_OFFSET_COLUMN_SQL = `ALTER TABLE telemetry_events ADD COLUMN ${CLOCK_OFFSET_COLUMN} INTEGER CHECK (${CLOCK_OFFSET_COLUMN} BETWEEN -${String(CLOCK_OFFSET_BOUND_MS)} AND ${String(CLOCK_OFFSET_BOUND_MS)})`;
+
+/**
+ * Schema version 5: the per-producer clock offset column — see
+ * {@link CLOCK_OFFSET_COLUMN}.
+ *
+ * Purely additive: one nullable column and nothing else. No existing row is
+ * read or rewritten; every one of them reads `NULL`, which is the truth — the
+ * build that wrote it recorded no offset.
+ *
+ * ## Why no index
+ *
+ * Deliberately none, for the reason version 3 sets out: every index on this
+ * table is paid for on the ingest path of a running capture, on every event,
+ * while the offset is read only when someone asks for the clock diagnostic. That
+ * read — `listProducerClockOffsets` in `./telemetry-repo.ts` — is scoped to one
+ * session (and optionally one capture) and is answered from a session-leading
+ * index version 1 declared — `idx_telemetry_events_session_id_capture_id_start_time`
+ * or `idx_telemetry_events_session_id_producer_id_seq`, whose key order serves
+ * the per-producer grouping — with the offset tested on the rows it returns, so
+ * its cost is bounded by one session's rows. An index on the offset itself would
+ * serve no read at all: nothing looks an event up by its offset.
+ */
+const PRODUCER_CLOCK_OFFSET_MIGRATION: StoreMigration = {
+  version: 5,
+  description: 'record the per-producer clock offset each telemetry event reports',
+  apply: (db) => {
+    if (db.prepare(CLOCK_OFFSET_COLUMN_EXISTS_SQL).get(CLOCK_OFFSET_COLUMN) === undefined) {
+      db.exec(ADD_CLOCK_OFFSET_COLUMN_SQL);
+    }
+  },
+};
+
 /**
  * The store's schema ladder, in ascending version order.
  *
@@ -523,14 +788,17 @@ const ORDERED_TELEMETRY_LOOKUP_INDEXES_MIGRATION: StoreMigration = {
  * modification chains and adds the telemetry purge indexes
  * ({@link CHAIN_INTEGRITY_AND_PURGE_INDEXES_MIGRATION}); version 3 adds the
  * ordered telemetry lookup indexes
- * ({@link ORDERED_TELEMETRY_LOOKUP_INDEXES_MIGRATION}).
+ * ({@link ORDERED_TELEMETRY_LOOKUP_INDEXES_MIGRATION}); version 4 adds the
+ * session cleanup summary projection and backfills it from the stored
+ * documents ({@link SESSION_CLEANUP_SUMMARIES_MIGRATION}); version 5 adds the
+ * per-producer clock offset column ({@link PRODUCER_CLOCK_OFFSET_MIGRATION}).
  *
  * The shape of a future step, for the record:
  *
  * @example
  * ```ts
  * {
- *   version: 4,
+ *   version: 5,
  *   description: 'add the capture retention index',
  *   apply: (db) => {
  *     db.exec(
@@ -561,6 +829,8 @@ export const STORE_MIGRATIONS: readonly StoreMigration[] = [
   },
   CHAIN_INTEGRITY_AND_PURGE_INDEXES_MIGRATION,
   ORDERED_TELEMETRY_LOOKUP_INDEXES_MIGRATION,
+  SESSION_CLEANUP_SUMMARIES_MIGRATION,
+  PRODUCER_CLOCK_OFFSET_MIGRATION,
 ];
 
 /**

@@ -8,7 +8,12 @@
  *     while it is closed the component explains itself with a generic empty state instead of
  *     rendering a field that could not do anything (AAP 0.4.2, 0.5.5);
  *   - the exact payload: `onSubmit` receives the trimmed draft, once and alone, and the draft is
- *     cleared afterwards; blank drafts are refused by the button and by the keyboard chord;
+ *     KEPT until a `submission` outcome reports it accepted; blank drafts are refused by the button
+ *     and by the keyboard chord;
+ *   - the submission outcome: `accepted` clears the draft, `failed` keeps it and shows a retry hint
+ *     describing the field until the next submit, each `seq` is applied exactly once, an outcome
+ *     present at mount is not applied, and focus lost while the field was replaced or its submit
+ *     control disabled returns to the field — focus moved elsewhere is left alone;
  *   - the keyboard contract: `Ctrl`/`⌘`+`Enter` submits, plain `Enter` inserts a line break;
  *   - the states and their precedence (error > pending > unavailable > ready), each rendered
  *     through its design-system primitive and never as a blank area (AAP 0.5.5);
@@ -25,13 +30,20 @@
  */
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import type { ReactElement } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Mock, MockInstance } from 'vitest';
+
+import type { SubmissionOutcome } from '../pending-actions';
 
 import { FollowUp } from './FollowUp';
 
 /** The field's visible label, which `Input` renders as a real `<label htmlFor>`. */
 const FIELD_LABEL = 'Follow-up question';
+
+/** The retry hint shown under the field after a failed submission. */
+const RETRY_HINT =
+  'Your follow-up question was not confirmed, so it is kept here. Press “Ask follow-up” to try again.';
 
 /** The submit control's accessible name. */
 const SUBMIT_NAME = 'Ask follow-up';
@@ -85,6 +97,26 @@ afterEach(() => {
  */
 function submitSpy(): Mock<(question: string) => void> {
   return vi.fn<(question: string) => void>();
+}
+
+/**
+ * An outcome for the submission numbered `seq`.
+ *
+ * @param seq The submission's sequence number.
+ * @param status How it ended.
+ * @returns The outcome `App.tsx` would pass.
+ */
+function outcome(seq: number, status: SubmissionOutcome['status']): SubmissionOutcome {
+  return { seq, status };
+}
+
+/**
+ * The retry hint, when it is on display.
+ *
+ * @returns Its element, or `null`.
+ */
+function queryRetryHint(): HTMLElement | null {
+  return screen.queryByText(RETRY_HINT);
 }
 
 /**
@@ -206,7 +238,7 @@ describe('FollowUp — the gate', () => {
 });
 
 describe('FollowUp — submission', () => {
-  it('hands up the trimmed draft exactly once, alone, and clears the field', async () => {
+  it('hands up the trimmed draft exactly once, alone, and keeps the field until accepted', async () => {
     const user = userEvent.setup();
     const onSubmit = submitSpy();
     render(<FollowUp onSubmit={onSubmit} enabled />);
@@ -216,21 +248,22 @@ describe('FollowUp — submission', () => {
 
     await user.click(getSubmit());
 
-    // One call, one argument, the trimmed text.
+    // One call, one argument, the trimmed text — and the text stays until it is confirmed.
     expect(onSubmit.mock.calls).toEqual([['How often does this step run?']]);
-    expect(getField().value).toBe('');
-    expect(getSubmit().disabled).toBe(true);
+    expect(getField().value).toBe('   How often does this step run?   ');
+    expect(getSubmit().disabled).toBe(false);
+    expect(queryRetryHint()).toBeNull();
   });
 
-  it('returns focus to the field after submitting with the button', async () => {
+  it('leaves focus on the submit control, which the kept draft keeps enabled', async () => {
     const user = userEvent.setup();
     render(<FollowUp onSubmit={submitSpy()} enabled />);
 
     await user.type(getField(), 'Which step took the longest?');
     await user.click(getSubmit());
 
-    // The cleared draft disables the button, so focus must not be stranded on it.
-    expect(document.activeElement).toBe(getField());
+    expect(document.activeElement).toBe(getSubmit());
+    expect(getSubmit().disabled).toBe(false);
   });
 
   it('keeps inner line breaks and spacing, trimming only the ends', async () => {
@@ -277,7 +310,7 @@ describe('FollowUp — submission', () => {
   it('submits with Ctrl+Enter and Cmd+Enter, while plain and Shift+Enter add a line', async () => {
     const user = userEvent.setup();
     const onSubmit = submitSpy();
-    render(<FollowUp onSubmit={onSubmit} enabled />);
+    const { rerender } = render(<FollowUp onSubmit={onSubmit} enabled />);
 
     await user.click(getField());
     await user.keyboard('First line{Enter}second line{Shift>}{Enter}{/Shift}third line');
@@ -287,7 +320,12 @@ describe('FollowUp — submission', () => {
     await user.keyboard('{Control>}{Enter}{/Control}');
     expect(onSubmit).toHaveBeenLastCalledWith('First line\nsecond line\nthird line');
     // The chord submitted instead of inserting a line break.
+    expect(getField().value).toBe('First line\nsecond line\nthird line');
+
+    rerender(<FollowUp onSubmit={onSubmit} enabled submission={outcome(1, 'accepted')} />);
     expect(getField().value).toBe('');
+    // Focus never left the field, so the next question is typed straight in.
+    expect(document.activeElement).toBe(getField());
 
     await user.keyboard('Another question{Meta>}{Enter}{/Meta}');
     expect(onSubmit).toHaveBeenLastCalledWith('Another question');
@@ -307,6 +345,184 @@ describe('FollowUp — submission', () => {
 
     expect(onSubmit).not.toHaveBeenCalled();
     expect(getField().value).toBe('A composed question');
+  });
+});
+
+describe('FollowUp — submission outcome', () => {
+  it('clears the draft once the follow-up is accepted', async () => {
+    const user = userEvent.setup();
+    const onSubmit = submitSpy();
+    const { rerender } = render(<FollowUp onSubmit={onSubmit} enabled />);
+
+    await user.type(getField(), 'Which request came first?');
+    await user.click(getSubmit());
+    rerender(<FollowUp onSubmit={onSubmit} enabled pending />);
+    rerender(<FollowUp onSubmit={onSubmit} enabled submission={outcome(1, 'accepted')} />);
+
+    expect(getField().value).toBe('');
+    expect(getSubmit().disabled).toBe(true);
+    expect(queryRetryHint()).toBeNull();
+  });
+
+  it('keeps the draft after a failed follow-up and shows a retry hint describing the field', async () => {
+    const user = userEvent.setup();
+    const onSubmit = submitSpy();
+    const { rerender } = render(<FollowUp onSubmit={onSubmit} enabled />);
+
+    await user.type(getField(), 'Which request came first?');
+    await user.click(getSubmit());
+    rerender(<FollowUp onSubmit={onSubmit} enabled pending />);
+    rerender(<FollowUp onSubmit={onSubmit} enabled submission={outcome(1, 'failed')} />);
+
+    expect(getField().value).toBe('Which request came first?');
+    expect(getSubmit().disabled).toBe(false);
+    const hint = queryRetryHint();
+    expect(hint).not.toBeNull();
+    const describedBy = (getField().getAttribute('aria-describedby') ?? '').split(' ');
+    expect(describedBy).toContain(hint?.id);
+    expect(screen.queryByRole('alert')).toBeNull();
+
+    // Retrying sends the same text again.
+    await user.click(getSubmit());
+    expect(onSubmit.mock.calls).toEqual([
+      ['Which request came first?'],
+      ['Which request came first?'],
+    ]);
+  });
+
+  it('hides the retry hint on the next submit', async () => {
+    const user = userEvent.setup();
+    const onSubmit = submitSpy();
+    const { rerender } = render(<FollowUp onSubmit={onSubmit} enabled />);
+
+    await user.type(getField(), 'Which request came first?');
+    await user.click(getSubmit());
+    rerender(<FollowUp onSubmit={onSubmit} enabled submission={outcome(1, 'failed')} />);
+    expect(queryRetryHint()).not.toBeNull();
+
+    await user.click(getField());
+    await user.keyboard('{Control>}{Enter}{/Control}');
+
+    expect(onSubmit).toHaveBeenCalledTimes(2);
+    expect(queryRetryHint()).toBeNull();
+    const describedBy = (getField().getAttribute('aria-describedby') ?? '').split(' ');
+    expect(describedBy.every((id) => document.getElementById(id) !== null)).toBe(true);
+    expect(getField().value).toBe('Which request came first?');
+  });
+
+  it('applies an outcome once: the same seq passed again changes nothing', async () => {
+    const user = userEvent.setup();
+    const onSubmit = submitSpy();
+    const accepted = outcome(1, 'accepted');
+    const { rerender } = render(<FollowUp onSubmit={onSubmit} enabled />);
+
+    await user.type(getField(), 'First follow-up');
+    await user.click(getSubmit());
+    rerender(<FollowUp onSubmit={onSubmit} enabled submission={accepted} />);
+    expect(getField().value).toBe('');
+
+    await user.type(getField(), 'A draft typed afterwards');
+    rerender(<FollowUp onSubmit={onSubmit} enabled submission={accepted} />);
+    rerender(<FollowUp onSubmit={onSubmit} enabled submission={outcome(1, 'accepted')} />);
+    expect(getField().value).toBe('A draft typed afterwards');
+
+    await user.click(getSubmit());
+    rerender(<FollowUp onSubmit={onSubmit} enabled submission={outcome(2, 'failed')} />);
+    expect(queryRetryHint()).not.toBeNull();
+    await user.click(getSubmit());
+    expect(queryRetryHint()).toBeNull();
+    rerender(<FollowUp onSubmit={onSubmit} enabled submission={outcome(2, 'failed')} />);
+    expect(queryRetryHint()).toBeNull();
+    expect(getField().value).toBe('A draft typed afterwards');
+  });
+
+  it('does not apply an outcome that was already present when it mounted', async () => {
+    const user = userEvent.setup();
+    const onSubmit = submitSpy();
+    const { rerender } = render(
+      <FollowUp onSubmit={onSubmit} enabled submission={outcome(6, 'failed')} />,
+    );
+
+    expect(queryRetryHint()).toBeNull();
+    expect(document.activeElement).toBe(document.body);
+    await user.type(getField(), 'A fresh follow-up');
+    rerender(<FollowUp onSubmit={onSubmit} enabled submission={outcome(6, 'failed')} />);
+
+    expect(getField().value).toBe('A fresh follow-up');
+    expect(queryRetryHint()).toBeNull();
+  });
+
+  it('returns focus to the field when the pending state had taken it away', async () => {
+    const user = userEvent.setup();
+    const onSubmit = submitSpy();
+    const { rerender } = render(<FollowUp onSubmit={onSubmit} enabled />);
+
+    await user.type(getField(), 'Which request came first?');
+    await user.click(getSubmit());
+    rerender(<FollowUp onSubmit={onSubmit} enabled pending />);
+    rerender(<FollowUp onSubmit={onSubmit} enabled submission={outcome(1, 'failed')} />);
+
+    expect(document.activeElement).toBe(getField());
+  });
+
+  it('returns focus to the field when an accepted outcome disables the focused submit control', async () => {
+    const user = userEvent.setup();
+    const onSubmit = submitSpy();
+    const { rerender } = render(<FollowUp onSubmit={onSubmit} enabled />);
+
+    await user.type(getField(), 'Which step took the longest?');
+    await user.click(getSubmit());
+    expect(document.activeElement).toBe(getSubmit());
+
+    rerender(<FollowUp onSubmit={onSubmit} enabled submission={outcome(1, 'accepted')} />);
+
+    expect(getSubmit().disabled).toBe(true);
+    expect(document.activeElement).toBe(getField());
+  });
+
+  it('leaves focus the developer moved elsewhere where it is', async () => {
+    const user = userEvent.setup();
+    const onSubmit = submitSpy();
+    const view = (props: { pending?: boolean; submission?: SubmissionOutcome }): ReactElement => (
+      <>
+        <button type="button">Elsewhere</button>
+        <FollowUp
+          onSubmit={onSubmit}
+          enabled
+          pending={props.pending}
+          submission={props.submission}
+        />
+      </>
+    );
+    const { rerender } = render(view({}));
+
+    await user.type(getField(), 'Which request came first?');
+    await user.click(getSubmit());
+    rerender(view({ pending: true }));
+    const elsewhere = screen.getByRole('button', { name: 'Elsewhere' });
+    elsewhere.focus();
+    rerender(view({ submission: outcome(1, 'failed') }));
+
+    expect(document.activeElement).toBe(elsewhere);
+    expect(getField().value).toBe('Which request came first?');
+  });
+
+  it('does not take focus later when the outcome arrived while the field was not on screen', async () => {
+    const user = userEvent.setup();
+    const onSubmit = submitSpy();
+    const { rerender } = render(<FollowUp onSubmit={onSubmit} enabled />);
+
+    await user.type(getField(), 'Which request came first?');
+    await user.click(getSubmit());
+    rerender(<FollowUp onSubmit={onSubmit} enabled pending />);
+    // Accepted while the pipeline is still busy: the field is not on screen to receive focus.
+    rerender(<FollowUp onSubmit={onSubmit} enabled pending submission={outcome(1, 'accepted')} />);
+    expect(screen.queryByRole('textbox')).toBeNull();
+
+    // The result arrives much later; the field comes back empty and focus is not moved to it.
+    rerender(<FollowUp onSubmit={onSubmit} enabled submission={outcome(1, 'accepted')} />);
+    expect(getField().value).toBe('');
+    expect(document.activeElement).not.toBe(getField());
   });
 });
 
@@ -486,18 +702,20 @@ describe('FollowUp — the question is data', () => {
   it('forwards two different wordings verbatim after trimming, with identical output', async () => {
     const user = userEvent.setup();
     const onSubmit = submitSpy();
-    const { container } = render(<FollowUp onSubmit={onSubmit} enabled />);
+    const { container, rerender } = render(<FollowUp onSubmit={onSubmit} enabled />);
     const initialText = container.textContent;
 
     await user.type(getField(), '  Why did this step run twice?  ');
     expect(getSubmit().disabled).toBe(false);
     await user.click(getSubmit());
+    rerender(<FollowUp onSubmit={onSubmit} enabled submission={outcome(1, 'accepted')} />);
     const markupAfterFirst = container.innerHTML;
 
     // Worded to overlap the component's own state vocabulary: the text still selects nothing.
     await user.type(getField(), ' Could a retry after an error leave this step pending? ');
     expect(getSubmit().disabled).toBe(false);
     await user.click(getSubmit());
+    rerender(<FollowUp onSubmit={onSubmit} enabled submission={outcome(2, 'accepted')} />);
     const markupAfterSecond = container.innerHTML;
 
     expect(onSubmit.mock.calls).toEqual([

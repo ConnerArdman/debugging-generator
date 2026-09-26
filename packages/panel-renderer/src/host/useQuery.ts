@@ -81,6 +81,15 @@
  * from one value instead of from a store whose invalidation nothing here could
  * reason about.
  *
+ * What a provider does behind the interface is its own business, within the
+ * obligations `DataProvider` states. In particular a provider may coalesce
+ * identical requests that are *in flight at the same time* — two nodes of one
+ * panel asking for the same trace share one round trip — as long as each call
+ * still settles on its own and honours its own signal. A provider that does so
+ * decides "identical" with {@link stableQueryKey}, exported for exactly that
+ * reason, so the hook and the provider can never disagree about which two
+ * queries are the same request.
+ *
  * ## Why the query is keyed by value
  *
  * A query-backed component rebuilds its query on every render: the node's own
@@ -151,15 +160,21 @@ import type { DataProvider, DataQueryResponse, DataResultFor } from './DataProvi
  * ---------------------------------------------------------------------------
  * Stable query keys
  *
- * One module-private function and its recursive helper. Deliberately local: it
- * describes what "the same request" means for this hook and for nothing else,
- * and `src/utils/**` — which is shared, exported presentation code — has no
- * serialisation vocabulary this belongs in.
+ * One exported function and its module-private recursive helper. It is the one
+ * definition of "the same request" in the panel-data contract: this hook keys
+ * its effect on it, and a host surface's provider that coalesces identical
+ * in-flight requests keys its registry on it (the DevTools panel's
+ * `apps/chrome-extension/src/panel/data-provider.ts` does). It lives here, next
+ * to its first consumer, rather than in `src/utils/**` — which is shared
+ * presentation code with no serialisation vocabulary this belongs in — and is
+ * re-exported from the package entry beside `useQuery`.
  * ---------------------------------------------------------------------------
  */
 
 /**
- * The deterministic identity of a query's contents.
+ * The deterministic identity of a query's contents — the one definition of
+ * "the same request" shared by {@link useQuery} and by any provider that
+ * coalesces identical requests in flight.
  *
  * Two queries that would resolve to the same page produce the same key, and two
  * that would not produce different keys. Three properties make that true:
@@ -185,10 +200,21 @@ import type { DataProvider, DataQueryResponse, DataResultFor } from './DataProvi
  * concatenations per render — cheaper than the `useMemo` that would be needed to
  * avoid it, which would itself need a stable key to memoize on.
  *
+ * The key is for comparison only: it is never parsed, and no consumer may depend
+ * on its exact spelling. A consumer that coalesces requests across sessions
+ * combines it with the session itself, because the key describes the query's
+ * contents and nothing else.
+ *
+ * @example A provider coalescing identical in-flight requests:
+ * ```ts
+ * const key = `${sessionId}\n${stableQueryKey(normalizedQuery)}`;
+ * const shared = inFlight.get(key) ?? dispatch(key, sessionId, normalizedQuery);
+ * ```
+ *
  * @param query - The query whose contents identify the request.
  * @returns A string that is equal for equal query contents.
  */
-function stableQueryKey(query: DataQuery): string {
+export function stableQueryKey(query: DataQuery): string {
   return serializeStably(query);
 }
 

@@ -4,10 +4,13 @@
 // `pnpm lint` is `eslint . --max-warnings 0` (AAP 0.8.5): a blocking step of
 // `pnpm verify` where a WARNING fails the run exactly like an error. Every rule
 // enabled below therefore has to be satisfiable by the code in this repository;
-// nothing here is advisory. The script runs ESLint's bin under
-// `node --max-old-space-size=8192`: type-aware linting holds every project's
-// TypeScript program in one process and peaks near 5.6 GB, above Node's
-// default ~4 GB heap, which otherwise aborts the run with a heap OOM.
+// nothing here is advisory. The script is that plain command - no runtime flag
+// and no path into node_modules. Its 8 GiB heap ceiling comes from the
+// `nodeOptions` key of pnpm-workspace.yaml, which pnpm applies to every script
+// it runs: type-aware linting holds every project's TypeScript program in one
+// process and peaks near 5.6 GB, above Node's default ~4 GB heap, which
+// otherwise aborts the run with a heap OOM. Run it through pnpm (`pnpm lint`,
+// `pnpm exec eslint`); a bare `node_modules/.bin/eslint .` gets no ceiling.
 //
 // Three layers, in order of importance:
 //
@@ -251,53 +254,32 @@ const TOOLING_CONFIG_FILES = [
 ];
 
 /**
- * The React surfaces. Everything else in the repository is Node or plain DOM
- * code, and the React Compiler rule set has nothing to say about it.
- *
- * `.tsx` only, deliberately. A hook module written as plain `.ts`
- * (`src/host/useQuery.ts`, `apps/demo-app/src/hooks/*.ts`) is therefore checked
- * by the type-aware rules but not by the hook rules. Widening this list to
- * `.ts` means also adding the demo's two defective hook modules
- * (`src/hooks/useRecommendations.ts`, `src/hooks/useCartSummary.ts`) to
- * DEMO_SEEDED_DEFECT_FILES, because AAP 0.8.2 requires their unstable effect
- * dependencies to survive.
+ * The React surfaces of `apps/demo-app`, the product's instrumentation target.
+ * They are linted like every other React surface, with the one workspace-level
+ * exception that the 'debuggen/react-hooks-instrumentation-target' block below
+ * states and justifies.
  */
-const REACT_SURFACES = [
-  'packages/panel-renderer/src/**/*.tsx',
-  'apps/chrome-extension/src/panel/**/*.tsx',
-  'apps/vscode-extension/src/webview/**/*.tsx',
+const INSTRUMENTATION_TARGET_REACT_SURFACES = [
   'apps/demo-app/app/**/*.tsx',
   'apps/demo-app/src/**/*.tsx',
 ];
 
 /**
- * The demo application's deliberately defective React files (AAP 0.8.2, seeded
- * defects 2 and 3). Their bugs - a context value rebuilt every render, a 250 ms
- * ticker driving that context, inline callbacks defeating `memo`, and an effect
- * keyed on an inline options object - are PRODUCT REQUIREMENTS: the acceptance
- * tests (`tests/e2e/demo-excessive-renders.spec.ts`,
- * `demo-duplicate-requests.spec.ts`) exist to discover them at runtime, and
- * `scripts/check-no-hardcoding.mjs` guarantees no product file knows where they
- * live. They must never be "fixed" to satisfy a linter.
+ * The React surfaces. Everything else in the repository is Node or plain DOM
+ * code, and the React Compiler rule set has nothing to say about it.
  *
- * The rules relaxed for these files below are exactly the identity, memoization
- * and effect rules those defects embody. Everything else in the React Compiler
- * set stays on, so a genuine bug in one of these files still fails the gate; a
- * file that needs more than this relaxation carries a narrow, commented
- * `eslint-disable-next-line` naming AAP 0.8.2.
- *
- * Note the glob for the product route: `app/products/[slug]/page.tsx` cannot be
- * written literally, because `[slug]` is a character class to a glob matcher and
- * would match `app/products/s/page.tsx` instead of the directory itself.
+ * `.tsx` only, deliberately. A hook module written as plain `.ts`
+ * (`src/host/useQuery.ts`, a workspace's `src/hooks/*.ts`) is therefore checked
+ * by the type-aware rules but not by the hook rules. Widening this list to
+ * `.ts` means widening INSTRUMENTATION_TARGET_REACT_SURFACES in step, so the
+ * instrumentation target's workspace exception keeps covering every file of
+ * that workspace the hook rules reach.
  */
-const DEMO_SEEDED_DEFECT_FILES = [
-  'apps/demo-app/src/providers/CartProvider.tsx',
-  'apps/demo-app/src/providers/ShippingEtaProvider.tsx',
-  'apps/demo-app/src/components/catalog/CatalogGrid.tsx',
-  'apps/demo-app/src/components/catalog/ProductCard.tsx',
-  'apps/demo-app/src/components/product/RecommendationsRail.tsx',
-  'apps/demo-app/src/components/layout/SiteHeader.tsx',
-  'apps/demo-app/app/products/*/page.tsx',
+const REACT_SURFACES = [
+  'packages/panel-renderer/src/**/*.tsx',
+  'apps/chrome-extension/src/panel/**/*.tsx',
+  'apps/vscode-extension/src/webview/**/*.tsx',
+  ...INSTRUMENTATION_TARGET_REACT_SURFACES,
 ];
 
 /** Every test and spec file, whichever workspace owns it. */
@@ -523,8 +505,7 @@ export default tseslint.config(
     // `configs.flat`; the top-level `configs.recommended` is the eslintrc form
     // (`plugins: ['react-hooks']`), which flat config rejects. `flat.recommended`
     // carries the React Compiler rule set as well as rules-of-hooks, which is
-    // what catches the identity and purity mistakes this product's panels and
-    // the demo storefront are full of.
+    // what catches the identity and purity mistakes React code is prone to.
     name: 'debuggen/react-hooks',
     files: REACT_SURFACES,
     extends: [reactHooks.configs.flat.recommended],
@@ -537,20 +518,23 @@ export default tseslint.config(
   },
 
   {
-    // See DEMO_SEEDED_DEFECT_FILES: these defects are product requirements.
-    name: 'debuggen/react-hooks-demo-seeded-defects',
-    files: DEMO_SEEDED_DEFECT_FILES,
+    // The instrumentation target, as a workspace. `apps/demo-app` is not
+    // product code: it is the ordinary application the product instruments and
+    // explains (AAP 0.4.2, 0.5.4), and its effect dependency lists and the state
+    // its effects publish are runtime behaviour the product exists to capture,
+    // which a lint gate must never demand be rewritten (AAP 0.8.2). Exactly the
+    // two rules that judge that behaviour are off for the whole workspace, and
+    // every other rule - rules-of-hooks and the rest of the React Compiler set
+    // included - stays on there, so a genuine hook bug still fails the gate.
+    //
+    // The exception is expressed by workspace and rule only, never by file or
+    // symbol: repository tooling records nothing about where anything in the
+    // demo lives, and `scripts/check-no-hardcoding.mjs` scans this file to keep
+    // it that way.
+    name: 'debuggen/react-hooks-instrumentation-target',
+    files: INSTRUMENTATION_TARGET_REACT_SURFACES,
     rules: {
-      // Defect 3: `useRecommendations({ productId, limit })` is called with an
-      // inline options object, so the effect's dependency identity changes on
-      // every render. That unstable identity IS the bug under investigation.
       'react-hooks/exhaustive-deps': 'off',
-      // Defect 2: a context value rebuilt each render and inline `onSelect`
-      // lambdas handed to a `memo`'d card - memoization defeated on purpose.
-      'react-hooks/use-memo': 'off',
-      'react-hooks/preserve-manual-memoization': 'off',
-      // Defect 2: the shipping-ETA provider ticks state from an effect every
-      // 250 ms, which is what makes the catalog re-render while idle.
       'react-hooks/set-state-in-effect': 'off',
     },
   },
@@ -680,6 +664,31 @@ export default tseslint.config(
     ],
     'apps/local-service may import every package except @debuggen/panel-renderer: the service generates and validates panel specifications, it never renders them (AAP 0.2.2).',
   ),
+
+  {
+    // The one exception to the block above, scoped to a directory rather than
+    // to the workspace: the integration suite's live-response render oracle
+    // mounts every catalog component against a real panel-data answer (AAP
+    // 0.4.2, 0.8.3), so its helpers may import @debuggen/panel-renderer. The
+    // package is a devDependency of the service, and src/** stays renderer-free.
+    name: 'debuggen/layering-apps-local-service-test-integration-render',
+    files: ['apps/local-service/test/integration/render/**/*.ts'],
+    rules: {
+      'no-restricted-imports': layering(
+        [
+          'shared',
+          'telemetry',
+          'code-analysis',
+          'instrumentation',
+          'panel-schema',
+          'model-provider',
+          'protocol',
+          'panel-renderer',
+        ],
+        'apps/local-service/test/integration/render/** may additionally import @debuggen/panel-renderer: it is the integration suite live-response render oracle (AAP 0.4.2, 0.8.3). Everything else in apps/local-service, src/** above all, stays renderer-free (AAP 0.2.2).',
+      ),
+    },
+  },
 
   layeringBlock(
     'apps/demo-app',

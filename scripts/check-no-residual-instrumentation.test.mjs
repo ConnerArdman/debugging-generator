@@ -14,7 +14,9 @@
  *   * a clean target passes, including the lowercase word `debuggen` that required files use;
  *   * a committed marker fails, with the exact 1-based line and a sanitized, bounded excerpt;
  *   * an uncommitted target fails, and nothing outside the target can make it fail;
- *   * the tracked files the scan deliberately does not read are accounted for, never passed over;
+ *   * the tracked files the scan does not read are accounted for, never passed over: the ones it
+ *     skips by design are recorded with the reason, and one it cannot read - on any account,
+ *     root included - fails the check with `file-unreadable` (exit 2) naming it and its error code;
  *   * every condition that leaves the check without a subject exits 2, never 0 (it fails closed);
  *   * the command line - options, exit codes, the text and `--json` reports;
  *   * this repository - the gate passes over the real checkout while its demo app is clean.
@@ -37,6 +39,15 @@
  * spawn `node`: on a copy placed at `<fixture>/scripts/`, because a copy resolves the repository it
  * sits in, and through a symbolic link, because that is how a gate that skips `main` exits 0
  * without looking.
+ *
+ * WHY THE UNREADABLE FILE IS INJECTED. A tracked file the scan cannot read must fail the check,
+ * and a mode bit cannot make such a file for root, which reads a mode-000 file regardless - and the
+ * specified test host runs as root. So the fail-closed contract is asserted on every account by
+ * {@link withInjectedFs}: a freshly imported copy of the module whose `node:fs` fails one
+ * `readFileSync` or `lstatSync` with the code the kernel would report and delegates every other
+ * call to the real implementation, so the rest of the fixture is genuinely read. {@link runMain}
+ * drives that copy's `main` exactly as it drives the real one. The `chmod` case beside it is the
+ * real-permissions second opinion, and runs wherever the account is not root.
  *
  * WHY THE MARKERS ARE ASSEMBLED. Fixture source is built from the `MARKERS` export rather than
  * from restated literals, so a renamed marker changes every fixture with it. The two literals
@@ -506,14 +517,28 @@ function createRepository(files, { commit = true } = {}) {
  */
 
 /**
+ * The shape of the module's `main`, whether the statically imported one or the `main` of a copy
+ * imported by {@link withInjectedFs}.
+ *
+ * @typedef {(argv?: readonly string[]) => Promise<number>} MainFunction
+ */
+
+/**
  * Run `main` in process with both streams captured. With `repository`, every git command `main`
- * spawns operates on that fixture (see the header); `environment` adds further overrides.
+ * spawns operates on that fixture (see the header); `environment` adds further overrides. `main`
+ * selects which copy of the module runs - by default the one imported at the top of this file, or
+ * the `main` of a copy {@link withInjectedFs} built against an injected `node:fs`, which honours
+ * `repository` in exactly the same way because git is what locates the fixture.
  *
  * @param {unknown} argv Passed through untouched, so a non-array can be exercised.
- * @param {{ repository?: string, environment?: Record<string, string | undefined> }} [options]
+ * @param {{
+ *   repository?: string,
+ *   environment?: Record<string, string | undefined>,
+ *   main?: MainFunction,
+ * }} [options]
  * @returns {Promise<CliResult>}
  */
-async function runMain(argv, { repository, environment = {} } = {}) {
+async function runMain(argv, { repository, environment = {}, main: entry = main } = {}) {
   let stdout = '';
   let stderr = '';
   const outSpy = vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
@@ -529,7 +554,7 @@ async function runMain(argv, { repository, environment = {} } = {}) {
     ...environment,
   });
   try {
-    const exitCode = await main(/** @type {string[]} */ (argv));
+    const exitCode = await entry(/** @type {string[]} */ (argv));
     return { exitCode, stdout, stderr };
   } finally {
     restoreEnvironment(previous);
@@ -577,9 +602,11 @@ function runCommand(script, argv) {
  *
  * @param {() => unknown} operation
  * @param {string} code
+ * @param {typeof ResidualCheckError} [errorClass] The class the error must be an instance of: by
+ *   default the statically imported one; a copy imported by {@link withInjectedFs} has its own.
  * @returns {ResidualCheckError}
  */
-function expectResidualError(operation, code) {
+function expectResidualError(operation, code, errorClass = ResidualCheckError) {
   /** @type {unknown} */
   let caught;
   try {
@@ -587,12 +614,75 @@ function expectResidualError(operation, code) {
   } catch (error) {
     caught = error;
   }
-  expect(caught).toBeInstanceOf(ResidualCheckError);
+  expect(caught).toBeInstanceOf(errorClass);
   const error = /** @type {ResidualCheckError} */ (caught);
   expect(error.name).toBe('ResidualCheckError');
   expect(error.code).toBe(code);
   expect(error.message).not.toBe('');
   return error;
+}
+
+/**
+ * Run `use` against a freshly imported copy of the module under test whose `node:fs` has the given
+ * overrides merged over the real one.
+ *
+ * Why it exists: a tracked file the scan cannot read is a fail-closed path, and a mode bit cannot
+ * provoke it for root (see the header). Injecting the failure asserts the contract on every
+ * account. It is narrow on purpose: each override delegates to the real implementation for every
+ * input it does not fail, so the rest of the fixture is genuinely examined, read and reported on.
+ * The module registry is reset before the import so the copy is built against the injected module,
+ * and again afterwards - passed or thrown - so every later import gets the genuine module. This
+ * file's own `node:fs` bindings were resolved when it loaded and are untouched, which is what lets
+ * a case build its fixture and inspect it normally.
+ *
+ * @param {(real: typeof import('node:fs')) => Partial<typeof import('node:fs')>} overrides
+ * @param {(injected: typeof import('./check-no-residual-instrumentation.mjs')) => Promise<void>} use
+ * @returns {Promise<void>}
+ */
+async function withInjectedFs(overrides, use) {
+  vi.resetModules();
+  vi.doMock('node:fs', async () => {
+    const real = /** @type {typeof import('node:fs')} */ (await vi.importActual('node:fs'));
+    return { ...real, ...overrides(real) };
+  });
+
+  try {
+    await use(await import('./check-no-residual-instrumentation.mjs'));
+  } finally {
+    vi.doUnmock('node:fs');
+    vi.resetModules();
+  }
+}
+
+/**
+ * Wrap a path-taking `node:fs` call so it fails for the absolute paths in `failures` and delegates
+ * every other call to `genuine`. Each failure carries the errno `code`, `syscall` and `path` the
+ * real call would report - `EACCES` on an `open` is exactly what a mode-000 file reports to an
+ * unprivileged account - or, for a `null` code, no code at all, as a non-errno failure would.
+ * Every string path the wrapper is asked for is appended to `calls`, so a case can prove which
+ * files the scan went on to read after a failure.
+ *
+ * @template {(...args: any[]) => any} F
+ * @param {F} genuine The real implementation.
+ * @param {string} syscall The syscall name the real call reports, such as `open` or `lstat`.
+ * @param {ReadonlyMap<string, string | null>} failures Absolute path to errno code.
+ * @param {string[]} [calls] Receives every string path argument, in call order.
+ * @returns {F}
+ */
+function failingFsCall(genuine, syscall, failures, calls) {
+  return /** @type {F} */ (
+    (/** @type {unknown} */ target, /** @type {unknown[]} */ ...rest) => {
+      if (typeof target === 'string') {
+        calls?.push(target);
+        const code = failures.get(target);
+        if (code !== undefined) {
+          const error = new Error(`${code ?? 'failure'}: injected failure, ${syscall} '${target}'`);
+          throw code === null ? error : Object.assign(error, { code, syscall, path: target });
+        }
+      }
+      return genuine(target, ...rest);
+    }
+  );
 }
 
 /**
@@ -1103,7 +1193,7 @@ describe.skipIf(!GIT_AVAILABLE)(
  * ------------------------------------------------------------------------ */
 
 describe.skipIf(!GIT_AVAILABLE)(
-  'tracked files the scan does not read are accounted for',
+  'tracked files the scan does not read are accounted for: skipped by design, or unreadable and failing closed',
   { timeout: GIT_TEST_TIMEOUT_MS },
   () => {
     it('skips a binary file as binary even when marker bytes follow its NUL', async () => {
@@ -1176,6 +1266,28 @@ describe.skipIf(!GIT_AVAILABLE)(
       expect(stdout).toContain('residual-worktree:  D apps/demo-app/src/total.ts\n');
     });
 
+    it('records tracked files as missing when their parent directory became a file (ENOTDIR)', async () => {
+      // ENOENT and ENOTDIR are the two lstat codes that mean "not on disk"; every other lstat
+      // failure is an unreadable file (below). This is the ENOTDIR half, provoked for real.
+      const repository = createRepository(CLEAN_FILES);
+      const directory = path.join(repository, 'apps/demo-app/src');
+      rmSync(directory, { recursive: true });
+      writeFileSync(directory, 'no longer a directory\n');
+      const underDirectory = CLEAN_TARGET_FILES.filter((file) =>
+        file.startsWith('apps/demo-app/src/'),
+      );
+
+      const scan = scanResidualMarkers(repository);
+      expect(scan.skipped).toEqual(underDirectory.map((file) => ({ file, reason: 'missing' })));
+      expect(scan.filesScanned).toBe(CLEAN_TARGET_FILES.length - underDirectory.length);
+      expect(worktreeStatus(repository)).toEqual(
+        expect.arrayContaining([' D apps/demo-app/src/total.ts', '?? apps/demo-app/src']),
+      );
+
+      const { exitCode } = await runMain([], { repository });
+      expect(exitCode).toBe(EXIT_FINDINGS);
+    });
+
     it('records a tracked path replaced by a directory as not a regular file', () => {
       const repository = createRepository(CLEAN_FILES);
       const replaced = path.join(repository, 'apps/demo-app/src/total.ts');
@@ -1197,18 +1309,151 @@ describe.skipIf(!GIT_AVAILABLE)(
       expect(worktreeStatus(repository)).toEqual([' M apps/demo-app/src/total.ts']);
     });
 
-    it('records a tracked file it cannot open as unreadable', (context) => {
+    it('fails closed on a tracked file it cannot read, on every account (file-unreadable)', async () => {
+      const repository = createRepository(CLEAN_FILES);
+      const locked = path.join(repository, 'apps/demo-app/src/total.ts');
+      /** @type {string[]} */
+      const reads = [];
+
+      await withInjectedFs(
+        (real) => ({
+          readFileSync: failingFsCall(
+            real.readFileSync,
+            'open',
+            new Map([[locked, 'EACCES']]),
+            reads,
+          ),
+        }),
+        async (injected) => {
+          const error = expectResidualError(
+            () => injected.scanResidualMarkers(repository),
+            'file-unreadable',
+            injected.ResidualCheckError,
+          );
+          expect(error.message).toBe(
+            '1 tracked file under apps/demo-app could not be read, so the marker scan cannot ' +
+              'vouch for it and this check cannot be performed:\n' +
+              '  apps/demo-app/src/total.ts (EACCES)\n' +
+              'Make every listed file, and each directory above it, readable by the account ' +
+              'running this check - restore its permissions or ownership, or repair the storage ' +
+              'behind an I/O error - and re-run it.',
+          );
+          expect(error.cause).toBeInstanceOf(AggregateError);
+          expect(/** @type {AggregateError} */ (error.cause).errors).toEqual([
+            expect.objectContaining({ code: 'EACCES', syscall: 'open', path: locked }),
+          ]);
+          // The failure is raised after the loop: every tracked file was still read, once each and
+          // in `git ls-files` order, so one run names every file it could not read.
+          expect(reads).toEqual(CLEAN_TARGET_FILES.map((file) => path.join(repository, file)));
+
+          expectResidualError(
+            () => injected.findMarkers(repository),
+            'file-unreadable',
+            injected.ResidualCheckError,
+          );
+          // The worktree rule alone has its subject here; the marker rule does not, and that decides.
+          expect(injected.worktreeStatus(repository)).toEqual([]);
+
+          const text = await runMain([], { repository, main: injected.main });
+          expect(text.exitCode).toBe(EXIT_ERROR);
+          expect(text.stdout).toBe('');
+          expect(text.stderr).toBe(`residual-instrumentation: file-unreadable: ${error.message}\n`);
+
+          const json = await runMain(['--json'], { repository, main: injected.main });
+          expect(json.exitCode).toBe(EXIT_ERROR);
+          expect(JSON.parse(json.stdout)).toEqual({
+            ok: false,
+            exitCode: EXIT_ERROR,
+            error: { code: 'file-unreadable', message: error.message },
+          });
+          expect(json.stderr).toContain('residual-instrumentation: file-unreadable:');
+        },
+      );
+
+      // The genuine module, whose node:fs was never touched, reads the same file and passes it.
+      expect(findMarkers(repository)).toEqual([]);
+    });
+
+    it('names every tracked file it cannot examine or read in one report, lstat failures included', async () => {
+      const repository = createRepository(CLEAN_FILES);
+      /** @param {string} file @returns {string} */
+      const absolute = (file) => path.join(repository, file);
+
+      await withInjectedFs(
+        (real) => ({
+          // EACCES from lstat is what a file under a directory without search permission reports:
+          // the file may well exist, so it is unreadable, never `missing`.
+          lstatSync: failingFsCall(
+            real.lstatSync,
+            'lstat',
+            new Map([[absolute('apps/demo-app/src/label.tsx'), 'EACCES']]),
+          ),
+          // An I/O error, and a failure that carries no errno code at all.
+          readFileSync: failingFsCall(
+            real.readFileSync,
+            'open',
+            new Map([
+              [absolute('apps/demo-app/src/total.ts'), 'EIO'],
+              [absolute('apps/demo-app/tsconfig.json'), null],
+            ]),
+          ),
+        }),
+        async (injected) => {
+          const error = expectResidualError(
+            () => injected.scanResidualMarkers(repository),
+            'file-unreadable',
+            injected.ResidualCheckError,
+          );
+          expect(error.message).toContain(
+            '3 tracked files under apps/demo-app could not be read, so the marker scan cannot ' +
+              'vouch for them and this check cannot be performed:\n' +
+              '  apps/demo-app/src/label.tsx (EACCES)\n' +
+              '  apps/demo-app/src/total.ts (EIO)\n' +
+              '  apps/demo-app/tsconfig.json (UNKNOWN)\n' +
+              'Make every listed file',
+          );
+          expect(/** @type {AggregateError} */ (error.cause).errors).toEqual([
+            expect.objectContaining({ code: 'EACCES', syscall: 'lstat' }),
+            expect.objectContaining({ code: 'EIO', syscall: 'open' }),
+            expect.not.objectContaining({ code: expect.anything() }),
+          ]);
+          expectResidualError(
+            () => injected.findMarkers(repository),
+            'file-unreadable',
+            injected.ResidualCheckError,
+          );
+
+          const { exitCode, stdout, stderr } = await runMain(['--json'], {
+            repository,
+            main: injected.main,
+          });
+          expect(exitCode).toBe(EXIT_ERROR);
+          expect(JSON.parse(stdout).error).toEqual({
+            code: 'file-unreadable',
+            message: error.message,
+          });
+          expect(stderr).toBe(`residual-instrumentation: file-unreadable: ${error.message}\n`);
+        },
+      );
+    });
+
+    it('fails closed on a mode-000 tracked file under real permissions (file-unreadable)', async (context) => {
       context.skip(
         process.getuid?.() === 0,
-        'running as root, which can read a mode-000 file, so there is no unreadable file to make',
+        'running as root, which reads a mode-000 file regardless; the two injected-failure cases ' +
+          'above assert the same file-unreadable contract on this account',
       );
       const repository = createRepository(CLEAN_FILES);
       const locked = path.join(repository, 'apps/demo-app/src/total.ts');
       chmodSync(locked, 0o000);
       try {
-        expect(scanResidualMarkers(repository).skipped).toEqual([
-          { file: 'apps/demo-app/src/total.ts', reason: 'unreadable' },
-        ]);
+        const error = expectResidualError(() => scanResidualMarkers(repository), 'file-unreadable');
+        expect(error.message).toContain('\n  apps/demo-app/src/total.ts (EACCES)\n');
+        expectResidualError(() => findMarkers(repository), 'file-unreadable');
+
+        const { exitCode, stdout } = await runMain(['--json'], { repository });
+        expect(exitCode).toBe(EXIT_ERROR);
+        expect(JSON.parse(stdout).error.code).toBe('file-unreadable');
       } finally {
         chmodSync(locked, 0o644);
       }

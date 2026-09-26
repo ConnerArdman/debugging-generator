@@ -1,7 +1,9 @@
 /**
  * `ModificationsList` — every file the session instrumented, its journal status
  * and the exact diff that was applied (AAP 0.7.3: "file, status badge
- * applied/reverted/conflict, 'View diff' → `DiffView`").
+ * applied/reverted/conflict, 'View diff' → `DiffView`"), and, for a file edited
+ * while instrumented, AAP 0.5.5's conflict message with its "Open diff"
+ * action.
  *
  * This is the editor-side half of a product guarantee: every modification the
  * tool makes to the developer's working tree is recorded before it is written
@@ -32,7 +34,8 @@
  *
  * Which row's diff is open — a single record id, or none. It is transient
  * presentation, so it lives here rather than in the host's snapshot. "View diff"
- * toggles it through a functional update, so activating the same row twice
+ * ("Open diff" on a conflict row) toggles it through a functional update, so
+ * activating the same row twice
  * always ends collapsed and activating another row moves the disclosure there.
  * The grid's own keyboard toggle (Arrow Right / Arrow Left on a row) drives the
  * same state through `onRowToggle`.
@@ -46,13 +49,14 @@
  *       Code sm                             .dgv-modifications__file — the path, as
  *         span, span                        __directory (ellipsizes first) + __name
  *       Stack horizontal                    .dgv-modifications__meta — plan version, time
- *       Text xs                             .dgv-modifications__note — status explanation
+ *       Text xs                             .dgv-modifications__note — status explanation;
+ *         Code sm wrap (×2)                 for a conflict, its file and backup path
  *     Status                                Badge soft — tone AND text label
  *     Actions                               Stack .dgv-modifications__actions
- *       Button ghost sm                     View diff / Hide diff (disclosure)
+ *       Button ghost sm                     View diff (Open diff for a conflict) /
+ *                                           Hide diff (disclosure)
  *       Button ghost sm                     Open file (only with onOpenFile)
  *     detail row (aria-colspan)             Stack .dgv-modifications__detail
- *       Text + Code                         preserved original (conflict only)
  *       Stack horizontal                    .dgv-modifications__hashes
  *       DiffView                            the recorded unified diff, verbatim
  * ```
@@ -61,32 +65,40 @@
  * `aria-rowcount`/`aria-colcount`, `rowheader`/`gridcell`, the roving tab stop
  * and the `aria-colspan` detail row — so this component adds no role of its
  * own. It meets the primitive's two caller obligations: every control rendered
- * in a cell or in the detail row is `tabIndex={-1}` (the grid is one Tab stop,
+ * in a cell or in the detail row is `tabIndex={-1}` — the diff's region
+ * included, through `DiffView`'s `innerTabIndex` — (the grid is one Tab stop,
  * and its arrow keys reach the controls), and the disclosure button carries
  * `aria-expanded={meta.expanded}` and `aria-controls={meta.detailRowId}`,
  * because `aria-expanded` is not valid on a `grid` row. Each button's accessible
  * name starts with its visible text and ends with the record's file, so a
  * screen-reader user hears which row it acts on.
  *
- * Geometry is expressed only as relational grid tracks in the columns' `width`
- * (`ch` minimums, `fr` shares), never as a length literal; every other value
- * resolves through the `dgv-modifications` block of `../styles.css` to a
- * `--dg-*` token. `clsx` is not a dependency of this workspace, so class names
- * are joined by a local helper.
+ * Column geometry is expressed only as `DataTable` width roles in the columns'
+ * `width`, which the primitive resolves to token-built grid tracks, never as a
+ * length literal; every other value resolves through the `dgv-modifications`
+ * block of `../styles.css` to a `--dg-*` token. `clsx` is not a dependency of
+ * this workspace, so class names are joined by a local helper.
  *
  * ## Status vocabulary (AAP 0.5.1)
  *
  * The five journal statuses — `pending`, `applied`, `reverted`, `conflict`,
- * `failed` — are a closed vocabulary. Their tones sit in an exhaustive `Record`
- * and their words in a `switch` closed by `assertNever`, so a status added to
- * the schema is a compile error here rather than an unstyled, unexplained pill.
- * Colour is never the only carrier: every badge has its text label.
+ * `failed` — are a closed vocabulary. Their tones are the design system's
+ * shared `MODIFICATION_STATUS_TONE`, the same table the DevTools panel's
+ * `SessionSummary` draws from, adopted as an exhaustive `Record` over the
+ * protocol's union; their words sit in a `switch` closed by `assertNever`. A
+ * status added to the schema is therefore a compile error here rather than an
+ * unstyled, unexplained pill. Colour is never the only carrier: every badge
+ * has its text label.
  *
- * A `conflict` row says what the product did — the file changed after it was
- * instrumented, so it was left untouched and its original is preserved — and
- * never that it was reverted. That keeps each row consistent with the session's
- * cleanup outcome, which `App.tsx` shows on its own and this component does not
- * restate (AAP 0.5.1, 0.5.5).
+ * A `conflict` row says what the product did, in the row itself and in AAP
+ * 0.5.5's words: "‹file› was edited while instrumented. Debug Generator will
+ * not overwrite it. Original saved at ‹backup path›." — the file and the
+ * backup path taken from the record, never constructed. It never says the
+ * file was reverted. That keeps each row consistent with the session's cleanup
+ * outcome, which `App.tsx` shows on its own and this component does not
+ * restate (AAP 0.5.1, 0.5.5). The message's "Open diff" action is the row's
+ * disclosure, labelled for it: it opens the recorded diff in the row's detail,
+ * which is also where the editor's other "Open diff" actions lead.
  *
  * ## States (AAP 0.5.5 — never a blank area)
  *
@@ -120,6 +132,7 @@ import {
   EmptyState,
   ErrorState,
   LoadingState,
+  MODIFICATION_STATUS_TONE,
   Stack,
   Text,
 } from '@debuggen/panel-renderer';
@@ -180,20 +193,20 @@ export interface ModificationsListProps {
 type Status = ModificationRecord['status'];
 
 /**
- * The badge tone of each status. Total over the union, so a new status is a
- * compile error here as well as in {@link describeStatus}.
+ * The badge tone of each status: the design system's shared
+ * `MODIFICATION_STATUS_TONE`, so a status is drawn in the same colour here and
+ * in the DevTools panel's `SessionSummary`. The renderer keys that table by the
+ * five status literals; annotating it with the protocol's union here makes a
+ * status added upstream a compile error until the shared table covers it, as
+ * it is in {@link describeStatus}.
  *
- * `applied` is informational (instrumentation is present, as intended),
- * `reverted` is the successful end state, `pending` is neutral, and both
- * `conflict` and `failed` need the developer's attention.
+ * `pending` is neutral, `applied` is informational (instrumentation is
+ * present, as intended), `reverted` is the verified successful end state,
+ * `conflict` is a warning — the product refused to overwrite the developer's
+ * edit, which needs attention but is not a failure — and `failed` is the
+ * danger.
  */
-const STATUS_TONE: Readonly<Record<Status, BadgeTone>> = {
-  pending: 'neutral',
-  applied: 'info',
-  reverted: 'success',
-  conflict: 'danger',
-  failed: 'danger',
-};
+const STATUS_TONE: Readonly<Record<Status, BadgeTone>> = MODIFICATION_STATUS_TONE;
 
 /** The words that accompany a status: its badge label and an optional note. */
 interface StatusWords {
@@ -202,7 +215,9 @@ interface StatusWords {
 
   /**
    * One sentence explaining a status that needs it, shown under the file path.
-   * Absent for `applied` and `reverted`, whose labels say everything.
+   * Absent for `applied` and `reverted`, whose labels say everything, and for
+   * `conflict`, whose explanation names the record's own file and backup path
+   * and is therefore composed from the record by {@link ConflictNote}.
    */
   readonly note?: string | undefined;
 }
@@ -230,10 +245,7 @@ function describeStatus(status: Status): StatusWords {
     case 'reverted':
       return { label: 'Reverted' };
     case 'conflict':
-      return {
-        label: 'Conflict',
-        note: 'Edited after instrumentation, so Debug Generator left it untouched. The original is preserved.',
-      };
+      return { label: 'Conflict' };
     case 'failed':
       return {
         label: 'Failed',
@@ -275,15 +287,28 @@ const HEADER_FILE = 'File';
 const HEADER_STATUS = 'Status';
 const HEADER_ACTIONS = 'Actions';
 
-/** The disclosure control's visible text in each state. */
+/**
+ * The disclosure control's visible text in each state. A collapsed `conflict`
+ * row reads "Open diff", the recovery action AAP 0.5.5 attaches to its
+ * message; every other collapsed row reads "View diff". Expanded, every row
+ * reads "Hide diff".
+ */
 const VIEW_DIFF_LABEL = 'View diff';
+const OPEN_DIFF_LABEL = 'Open diff';
 const HIDE_DIFF_LABEL = 'Hide diff';
 
 /** The open-file control's visible text. */
 const OPEN_FILE_LABEL = 'Open file';
 
-/** Leads the backup path of a conflicting record in its detail row. */
-const PRESERVED_LABEL = 'Original preserved at';
+/**
+ * The connectives of AAP 0.5.5's conflict message — "‹file› was edited while
+ * instrumented. Debug Generator will not overwrite it. Original saved at
+ * ‹backup path›." — the only words of that sentence this file supplies. The
+ * file and the backup path come from the record.
+ */
+const CONFLICT_EDITED = ' was edited while instrumented. Debug Generator will not overwrite it.';
+const CONFLICT_SAVED_AT = ' Original saved at ';
+const CONFLICT_END = '.';
 
 /** Shown in the meta line of a record layered on an earlier record's result. */
 const LAYERED_LABEL = 'Layered on an earlier change';
@@ -301,24 +326,6 @@ const INSTRUMENTED_HASH_LABEL = 'Instrumented SHA-256';
  * the element's tooltip.
  */
 const SHORT_HASH_LENGTH = 12;
-
-/**
- * The columns' grid tracks — relational forms only (AAP 0.6.4), each with a
- * non-zero `ch` minimum so a narrow view scrolls the table horizontally rather
- * than painting one cell over the next (see `DataTableColumn.width`).
- *
- * The file column takes the larger share of spare width, since the path is the
- * row's identity, and its minimum is small because the path truncates from the
- * directory end and keeps the file name. The status column is fixed: its badge
- * labels are all of one short width, and the widest ("Reverted") fits with the
- * cell's padding to spare. The actions column shares the rest; its two buttons
- * wrap onto a second line when the track is narrower than both, so its minimum
- * is one button plus the cell's padding. The three minimums together are the
- * width below which the table scrolls horizontally instead of squeezing.
- */
-const FILE_TRACK = 'minmax(12ch, 2fr)';
-const STATUS_TRACK = '11ch';
-const ACTIONS_TRACK = 'minmax(11ch, 1fr)';
 
 /**
  * Formats a record's time for the meta line in the reader's own locale and
@@ -415,6 +422,65 @@ function splitPath(file: string): PathParts {
 }
 
 /**
+ * A conflicting record's explanation, in the row itself: AAP 0.5.5's message
+ * "‹file› was edited while instrumented. Debug Generator will not overwrite
+ * it. Original saved at ‹backup path›." — the row's text content is exactly
+ * that sentence.
+ *
+ * The file and the backup path are the record's own values, each rendered
+ * through `Code wrap`, so they are byte-faithful and break across lines in a
+ * narrow view instead of being clipped. The schema requires a non-blank backup
+ * path; should a record arrive without one anyway, only the "Original saved
+ * at …" sentence is left out — a path is never constructed or guessed. The
+ * message says what the product did and never that the file was reverted,
+ * which keeps the row consistent with the session's cleanup outcome.
+ */
+function ConflictNote(props: { readonly record: ModificationRecord }): ReactElement {
+  const { record } = props;
+
+  return (
+    <Text size="xs" tone="secondary" className="dgv-modifications__note">
+      <Code size="sm" wrap>
+        {record.file}
+      </Code>
+      {CONFLICT_EDITED}
+      {hasText(record.backupPath) ? (
+        <>
+          {CONFLICT_SAVED_AT}
+          <Code size="sm" wrap>
+            {record.backupPath}
+          </Code>
+          {CONFLICT_END}
+        </>
+      ) : null}
+    </Text>
+  );
+}
+
+/**
+ * The explanatory note under a record's path: the conflict message for a
+ * `conflict`, the status's own sentence for `pending` and `failed`, and
+ * nothing for `applied` and `reverted`, whose labels say everything.
+ */
+function RecordNote(props: { readonly record: ModificationRecord }): ReactElement | null {
+  const { record } = props;
+  if (record.status === 'conflict') {
+    return <ConflictNote record={record} />;
+  }
+
+  const { note } = describeStatus(record.status);
+  if (note === undefined) {
+    return null;
+  }
+
+  return (
+    <Text size="xs" tone="secondary" className="dgv-modifications__note">
+      {note}
+    </Text>
+  );
+}
+
+/**
  * The identity cell: the path, the meta line and — for a status that needs it —
  * the explanatory note.
  *
@@ -426,7 +492,6 @@ function splitPath(file: string): PathParts {
  */
 function RecordIdentity(props: { readonly record: ModificationRecord }): ReactElement {
   const { record } = props;
-  const { note } = describeStatus(record.status);
   const recorded = formatRecordedAt(record.appliedAt);
   const path = splitPath(record.file);
 
@@ -453,11 +518,7 @@ function RecordIdentity(props: { readonly record: ModificationRecord }): ReactEl
           </Text>
         )}
       </Stack>
-      {note === undefined ? null : (
-        <Text size="xs" tone="secondary" className="dgv-modifications__note">
-          {note}
-        </Text>
-      )}
+      <RecordNote record={record} />
     </Stack>
   );
 }
@@ -496,34 +557,31 @@ function HashItem(props: { readonly label: string; readonly hash: string }): Rea
 }
 
 /**
- * The detail row of an expanded record: where a conflicting file's original
- * is preserved, the two content hashes the journal recorded, and the diff.
+ * The detail row of an expanded record: the two content hashes the journal
+ * recorded, and the diff.
  *
- * The backup path is rendered only for a `conflict`, the one status whose
- * backup is kept for the developer to act on (a verified restore deletes it),
- * and only when the record carries one; nothing here constructs a path.
+ * A conflicting record's backup path is not repeated here: the row itself
+ * already states where the original is saved (see {@link ConflictNote}).
  *
- * The diff's scroll region is `tabIndex={-1}`, like every control inside the
- * grid: it stays focusable, and the grid's arrow keys reach it from the row.
+ * `innerTabIndex={-1}` makes every focusable element `DiffView` renders - its
+ * labelled `<pre>` region and the controls that move a long diff's window of
+ * lines - `tabIndex={-1}`, as `DataTable` requires of every control in a
+ * detail row. That is the grid's navigation model, not an exclusion from it:
+ * the grid is one Tab stop, and from the row ArrowRight expands the diff and
+ * then walks the row's controls in document order onto the window controls,
+ * when there are any, and then the region, which keeps the horizontal keys to
+ * scroll a wide line.
  */
 function RecordDetail(props: { readonly record: ModificationRecord }): ReactElement {
   const { record } = props;
 
   return (
     <Stack gap={2} className="dgv-modifications__detail">
-      {record.status === 'conflict' && hasText(record.backupPath) ? (
-        <Text as="p" size="sm" tone="secondary" className="dgv-modifications__preserved">
-          {PRESERVED_LABEL}{' '}
-          <Code size="sm" wrap>
-            {record.backupPath}
-          </Code>
-        </Text>
-      ) : null}
       <Stack direction="horizontal" gap={3} wrap className="dgv-modifications__hashes">
         <HashItem label={ORIGINAL_HASH_LABEL} hash={record.originalHash} />
         <HashItem label={INSTRUMENTED_HASH_LABEL} hash={record.instrumentedHash} />
       </Stack>
-      <DiffView diff={record.diff} fileLabel={record.file} scrollTabIndex={-1} />
+      <DiffView diff={record.diff} fileLabel={record.file} innerTabIndex={-1} />
     </Stack>
   );
 }
@@ -547,6 +605,18 @@ function recordKey(record: ModificationRecord): string {
 /**
  * Builds the three columns.
  *
+ * Each width is the `DataTable` role for the column's content, never a length
+ * (AAP 0.6.4). The file column is a `name`: the path is the row's identity, so
+ * it takes the largest share of spare width, and it truncates from the
+ * directory end to keep the file name. The status column is a `status` badge.
+ * The actions column is `status` too, the role for compact action controls:
+ * its two buttons wrap onto a second line when the track is narrower than
+ * both. Every role has a non-zero floor, so a view narrower than the three
+ * floors together scrolls the table horizontally rather than painting one
+ * cell over the next. The file and status columns take the same roles as the
+ * DevTools panel's modification grid, so the two surfaces size the same
+ * content alike.
+ *
  * @param toggle Opens or closes a record's diff by id.
  * @param onOpenFile The caller's open-file callback; the open control renders
  *   only when it is supplied.
@@ -561,21 +631,27 @@ function buildColumns(
       key: 'file',
       header: HEADER_FILE,
       rowHeader: true,
-      width: FILE_TRACK,
+      width: 'name',
       cell: (record) => <RecordIdentity record={record} />,
     },
     {
       key: 'status',
       header: HEADER_STATUS,
-      width: STATUS_TRACK,
+      width: 'status',
       cell: (record) => <RecordStatus status={record.status} />,
     },
     {
       key: 'actions',
       header: HEADER_ACTIONS,
-      width: ACTIONS_TRACK,
+      width: 'status',
       cell: (record, _rowIndex, meta) => {
-        const diffLabel = meta.expanded ? HIDE_DIFF_LABEL : VIEW_DIFF_LABEL;
+        // A conflict's disclosure is AAP 0.5.5's "Open diff" recovery action:
+        // the diff it opens is this row's own detail, the same destination the
+        // editor's other "Open diff" actions (the end-session notice and
+        // `debuggen.showModifications`) reveal. It is the same toggle as every
+        // other row's, so no host message is involved.
+        const collapsedLabel = record.status === 'conflict' ? OPEN_DIFF_LABEL : VIEW_DIFF_LABEL;
+        const diffLabel = meta.expanded ? HIDE_DIFF_LABEL : collapsedLabel;
 
         return (
           <Stack

@@ -1,5 +1,7 @@
 # The repository's only workflow (AAP 0.7.1 Group 0). Every gate runs through a root
-# package.json script, every action is pinned by commit SHA, no secret is consumed (all
+# package.json script except the dependency audit, which is pnpm's built-in
+# `pnpm audit` and deliberately not a root script (see the advisory ledger in
+# pnpm-workspace.yaml). Every action is pinned by commit SHA, no secret is consumed (all
 # tests use the deterministic provider), and no step caches, archives or uploads `.git`.
 name: CI
 
@@ -46,11 +48,22 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # Blocking: any advisory at or above `low` against the frozen lockfile fails the
+      # job until it is reconciled in pnpm-workspace.yaml's advisory ledger. Kept out of
+      # `pnpm verify`, which must stay runnable offline.
+      - name: Audit dependencies
+        run: pnpm audit --audit-level=low
+
       - name: Aggregate quality gate
         run: pnpm verify
 
+      # Pinned to the VS Code build the extension-host suites are validated against
+      # (within engines.vscode ^1.125.0), so a new stable release cannot change the
+      # editor under test between two runs of one commit.
       - name: Extension-host tests
         run: xvfb-run -a pnpm test:vscode
+        env:
+          VSCODE_TEST_VERSION: "1.139.0"
 
   e2e:
     name: End-to-end
@@ -66,12 +79,16 @@ jobs:
           POSTGRES_DB: lumen_supply
         ports: ["5432:5432"]
         options: '--health-cmd "pg_isready -U debuggen" --health-interval 5s --health-timeout 5s --health-retries 10'
-    # DEBUGGEN_HOME is set on the two Playwright steps, the only ones that start the
-    # service, because the `runner` context is not available in job-level env.
+    # DEBUGGEN_HOME is job-wide too, but the `runner` context is not available in
+    # job-level env, so the first step exports it through $GITHUB_ENV to every step
+    # after it. Nothing creates the directory: the service does, 0700, on first start.
     env:
       DATABASE_URL: postgresql://debuggen:debuggen@localhost:5432/lumen_supply
       DEBUGGEN_PROVIDER: deterministic
     steps:
+      - name: Configure DEBUGGEN_HOME
+        run: echo "DEBUGGEN_HOME=${RUNNER_TEMP:?RUNNER_TEMP is not set}/debuggen" >> "$GITHUB_ENV"
+
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -103,16 +120,14 @@ jobs:
 
       - name: Browser tests
         run: pnpm test:browser
-        env:
-          DEBUGGEN_HOME: ${{ runner.temp }}/debuggen
 
       - name: End-to-end tests
         run: pnpm test:e2e
-        env:
-          DEBUGGEN_HOME: ${{ runner.temp }}/debuggen
 
+      # always(), cancellation included: a timed-out or cancelled run's partial
+      # traces are the diagnostics most worth keeping.
       - name: Upload Playwright report
-        if: ${{ !cancelled() }}
+        if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: playwright-report

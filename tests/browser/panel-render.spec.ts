@@ -47,6 +47,10 @@
  *    `panel.generated` as a `PortProtocolPush` built by the protocol's
  *    `createEnvelope` and checked by `isPortPush` and `parseMessage`. A change
  *    to that contract therefore breaks this spec instead of passing silently.
+ *    A push the panel's port admission refuses — one carrying a specification
+ *    that bypassed validation — is never applied: the panel keeps what it
+ *    shows and announces the refusal, which the invalid-specification test
+ *    asserts in the shipped bundle.
  *
  * Only the transport is substituted: the React panel app, `PanelView`,
  * `PanelHost`, the component registry and every visualization component run
@@ -61,7 +65,9 @@
  * needs neither: it opens the panel document directly in the shared extension
  * context (`extensionContext`, `extensionId`) with a DevTools stub equivalent
  * to the fixture's — `inspectedWindow.tabId`, a refusing callback-form
- * `inspectedWindow.eval`, and `panels.themeName` — and the fake port above.
+ * `inspectedWindow.eval`, and `panels.themeName` — plus
+ * `panels.setThemeChangeHandler`, through which a test switches the DevTools
+ * theme after mount, and the fake port above.
  *
  * ## Shared-state discipline
  *
@@ -88,6 +94,7 @@ import {
   PANEL_CONNECTION_LABELS,
   PORT_PANEL,
   PORT_PROTOCOL_VERSION,
+  classifyPanelPortFrame,
   isPortPush,
   isPortRequest,
 } from '@debuggen/chrome-extension/messages';
@@ -156,6 +163,13 @@ const WORKER_BINDING_NAME = '__debuggenPanelRenderWorker';
 /** The page-global name of the fake port's control surface (pushes and counters). */
 const WORKER_CONTROL_NAME = '__debuggenPanelRenderControl';
 
+/**
+ * The page-global name of the stubbed DevTools theme-change channel: the test
+ * delivers a theme switch through the callback the panel registered with
+ * `chrome.devtools.panels.setThemeChangeHandler`.
+ */
+const DEVTOOLS_THEME_HOOK_NAME = '__debuggenPanelRenderDevtoolsTheme';
+
 /** What the stubbed `inspectedWindow.eval` reports: no page is inspected here. */
 const DEVTOOLS_EVAL_REFUSAL =
   'panel-render.spec.ts inspects no page, so chrome.devtools.inspectedWindow.eval is refused.';
@@ -193,12 +207,16 @@ const LIKELY_CAUSE_HEADING = 'Likely cause';
 const UNKNOWN_NODE_TYPE = 'uncataloguedView';
 
 /**
- * DevTools reports `'default'` for its light theme and `'dark'` for its dark
- * one; the panel maps them onto the token themes of AAP 0.6.3.
+ * The panel's mapping of `chrome.devtools.panels.themeName` onto the token
+ * themes of AAP 0.6.3 (`src/panel/theme.ts` `panelThemeFromDevToolsThemeName`).
+ * Dark mode is the product default, so DevTools' `'default'` selects `dark`
+ * even though Chrome documents it as its light theme; `'light'` is the one
+ * name that selects the light token set.
  */
 const TOKEN_THEME_FOR_DEVTOOLS_THEME = Object.freeze({
-  default: 'light',
+  default: 'dark',
   dark: 'dark',
+  light: 'light',
 } as const);
 
 /** A `chrome.devtools.panels.themeName` value. */
@@ -214,14 +232,30 @@ interface DevtoolsStubArgs {
   readonly inspectedTabId: number;
   readonly themeName: DevtoolsThemeName;
   readonly evalRefusal: string;
+  readonly themeHookName: string;
+}
+
+/** What {@link installDevtoolsStub} exposes to the test on `window[themeHookName]`. */
+interface DevtoolsThemeHook {
+  /** Whether the panel currently holds a registered theme-change callback. */
+  registered(): boolean;
+  /** Call the registered callback with `themeName`, as DevTools does on a switch. */
+  emit(themeName: string): void;
 }
 
 /**
  * Supplies exactly the `chrome.devtools` members the panel reads —
- * `inspectedWindow.tabId`, callback-form `inspectedWindow.eval` (refused) and
- * `panels.themeName` — on the top-level panel document only, mirroring
- * `tests/browser/fixtures.ts`'s emulation without announcing a tab to the real
- * worker. A panel change that needs another DevTools API fails visibly here.
+ * `inspectedWindow.tabId`, callback-form `inspectedWindow.eval` (refused),
+ * `panels.themeName` and `panels.setThemeChangeHandler` — on the top-level
+ * panel document only, mirroring `tests/browser/fixtures.ts`'s emulation
+ * without announcing a tab to the real worker. A panel change that needs
+ * another DevTools API fails visibly here.
+ *
+ * `setThemeChangeHandler` keeps the one callback the panel registers (a call
+ * without a function unsets it, as in DevTools), and {@link DevtoolsThemeHook}
+ * on `window[themeHookName]` lets the test switch the DevTools theme after the
+ * panel mounted. `themeName` itself stays the value the page opened with, as a
+ * host that never refreshes it would.
  */
 function installDevtoolsStub(args: DevtoolsStubArgs): void {
   if (window.top !== window || window.location.pathname !== args.panelPath) {
@@ -233,6 +267,19 @@ function installDevtoolsStub(args: DevtoolsStubArgs): void {
   }
   const isCallback = (value: unknown): value is (result: unknown, info: unknown) => void =>
     typeof value === 'function';
+  const isThemeCallback = (value: unknown): value is (themeName: string) => void =>
+    typeof value === 'function';
+  let themeChangeCallback: ((themeName: string) => void) | undefined;
+  const themeHook: DevtoolsThemeHook = Object.freeze({
+    registered: () => themeChangeCallback !== undefined,
+    emit(themeName: string): void {
+      if (themeChangeCallback === undefined) {
+        throw new Error('The panel registered no DevTools theme-change handler.');
+      }
+      themeChangeCallback(themeName);
+    },
+  });
+  Object.defineProperty(window, args.themeHookName, { value: themeHook, configurable: true });
   const devtools = Object.freeze({
     inspectedWindow: Object.freeze({
       tabId: args.inspectedTabId,
@@ -252,7 +299,12 @@ function installDevtoolsStub(args: DevtoolsStubArgs): void {
         }
       },
     }),
-    panels: Object.freeze({ themeName: args.themeName }),
+    panels: Object.freeze({
+      themeName: args.themeName,
+      setThemeChangeHandler(callback?: unknown): void {
+        themeChangeCallback = isThemeCallback(callback) ? callback : undefined;
+      },
+    }),
   });
   Object.defineProperty(chromeApi, 'devtools', {
     value: devtools,
@@ -399,6 +451,8 @@ interface FakeBinding {
 /** One `panelData.query` the fake worker answered, with exactly what it answered. */
 interface AnsweredQuery {
   readonly query: DataQuery;
+  /** The rendered panel the query was sent for, as the request named it. */
+  readonly panelId: string | undefined;
   readonly result: DataResult;
 }
 
@@ -565,16 +619,23 @@ class FakePanelWorker {
     };
   }
 
-  /** Serve one data query from the synthetic capture. */
+  /**
+   * Serve one data query from the synthetic capture.
+   *
+   * The request names the rendered panel beside its query (`panelId`, as the
+   * service worker forwards it to `POST /sessions/:id/panel-data`); like the
+   * service's route, the fake lifts the id off and reads the `DataQuery` alone.
+   */
   private answerDataQuery(frame: RequestOf<'panelData.query'>): PortResponse {
-    const { sessionId, query } = frame.payload;
+    const { sessionId, query: request } = frame.payload;
     if (sessionId !== this.binding.sessionId) {
       this.violations.push(`panelData.query named session ${sessionId}`);
       return failure(frame.requestId, frame.kind, 'SESSION_NOT_FOUND', 'Not the bound session.');
     }
+    const { panelId, ...query } = request;
     try {
       const result = resolvePanelDataFixture(query);
-      this.answeredQueries.push({ query, result });
+      this.answeredQueries.push({ query, panelId, result });
       return success(frame.requestId, frame.kind, result);
     } catch (error) {
       this.violations.push(`the fixture refused a ${query.source} query: ${describeError(error)}`);
@@ -631,9 +692,10 @@ function panelGeneratedPush(spec: PanelSpec): PortPush {
 
 /**
  * A `panel.generated` push carrying a document that bypassed
- * `validatePanelSpec`. The real worker's protocol client would refuse it
- * (asserted); the extension's port framing still accepts it (asserted), which is
- * exactly the path the renderer's own guard must survive.
+ * `validatePanelSpec`. The protocol refuses it (asserted), and so does the
+ * panel's port admission (asserted): `classifyPanelPortFrame` parses every
+ * relayed envelope with the protocol's own union, so this frame is classified
+ * `malformed-push` and never reaches the store or the renderer (CWE-20).
  */
 function unvalidatedPanelGeneratedPush(
   sessionId: string,
@@ -659,7 +721,11 @@ function unvalidatedPanelGeneratedPush(
     kind: 'protocol',
     message: envelope,
   };
-  expect(isPortPush(push), 'the port framing still carries it').toBe(true);
+  expect(isPortPush(push), 'the port admission refuses it').toBe(false);
+  expect(classifyPanelPortFrame(push), 'the panel classifies it as a malformed push').toEqual({
+    kind: 'malformed-push',
+    pushKind: 'protocol',
+  });
   return push;
 }
 
@@ -693,6 +759,11 @@ interface RenderedPanel {
   pushFrame(frame: unknown): Promise<void>;
   /** The fake port's counters. */
   transportStats(): Promise<ReturnType<FakeWorkerControl['stats']>>;
+  /**
+   * Switch the DevTools theme after mount: wait for the panel's theme-change
+   * callback to be registered, then deliver `themeName` through it.
+   */
+  switchDevtoolsTheme(themeName: DevtoolsThemeName): Promise<void>;
   /** The wrapper the renderer draws around the node at a document path. */
   frameOf(pathKey: string): Locator;
 }
@@ -734,6 +805,7 @@ async function openRenderedPanel(
       inspectedTabId: INSPECTED_TAB_ID,
       themeName: options.themeName ?? 'dark',
       evalRefusal: DEVTOOLS_EVAL_REFUSAL,
+      themeHookName: DEVTOOLS_THEME_HOOK_NAME,
     } satisfies DevtoolsStubArgs);
     await page.addInitScript(installFakePanelWorker, {
       panelPath: PANEL_DOCUMENT_PATH,
@@ -795,6 +867,35 @@ async function openRenderedPanel(
         }
         return control.stats();
       }, WORKER_CONTROL_NAME),
+    async switchDevtoolsTheme(themeName) {
+      await expect
+        .poll(
+          () =>
+            page.evaluate((hookName) => {
+              const hook = (window as unknown as Record<string, DevtoolsThemeHook | undefined>)[
+                hookName
+              ];
+              if (hook === undefined) {
+                throw new Error('The chrome.devtools stub is not installed in this document.');
+              }
+              return hook.registered();
+            }, DEVTOOLS_THEME_HOOK_NAME),
+          { message: 'the panel registers a DevTools theme-change handler' },
+        )
+        .toBe(true);
+      await page.evaluate(
+        ({ hookName, name }) => {
+          const hook = (window as unknown as Record<string, DevtoolsThemeHook | undefined>)[
+            hookName
+          ];
+          if (hook === undefined) {
+            throw new Error('The chrome.devtools stub is not installed in this document.');
+          }
+          hook.emit(name);
+        },
+        { hookName: DEVTOOLS_THEME_HOOK_NAME, name: themeName },
+      );
+    },
     frameOf: (pathKey) => main.locator(`[data-node-path="${pathKey}"]`),
   };
 }
@@ -1318,6 +1419,7 @@ test.describe('panel-render: a stored PanelSpec in the built panel document', ()
       if (answered === undefined) {
         throw new Error(`No answered query targets node "${entry.title}".`);
       }
+      expect(answered.panelId, `node "${entry.title}" reads its own panel's capture`).toBe(spec.id);
       const frame = panel.frameOf(entry.pathKey);
       if (resultSize(answered.result) === 0) {
         expect(EMPTY_DATA_SOURCES).toContain(entry.query.source);
@@ -1335,6 +1437,9 @@ test.describe('panel-render: a stored PanelSpec in the built panel document', ()
     // was one of its nodes' queries, for the bound session.
     for (const request of panel.worker.requestsOf('panelData.query')) {
       expect(request.payload.sessionId).toBe(spec.sessionId);
+      // Bound to the rendered panel, so the service reads the capture it was
+      // generated from rather than whichever capture is live.
+      expect(request.payload.query.panelId, 'the query names the rendered panel').toBe(spec.id);
       expect(
         queried.some((entry) => targetsSameData(request.payload.query, entry.query)),
         `the ${request.payload.query.source} query belongs to a node`,
@@ -1554,8 +1659,10 @@ test.describe('panel-render: a stored PanelSpec in the built panel document', ()
   test('follows the DevTools theme onto the token theme', async ({ openRenderedPanel }) => {
     const spec = buildCatalogPanelSpec();
     const themes = Object.keys(TOKEN_THEME_FOR_DEVTOOLS_THEME) as DevtoolsThemeName[];
-    expect(new Set(themes.map((name) => TOKEN_THEME_FOR_DEVTOOLS_THEME[name])).size).toBe(
-      themes.length,
+    // Both token themes the panel may select are reached by some DevTools name,
+    // so the loop below exercises dark and light alike.
+    expect(new Set(themes.map((name) => TOKEN_THEME_FOR_DEVTOOLS_THEME[name]))).toEqual(
+      new Set(['dark', 'light']),
     );
     for (const themeName of themes) {
       const expected = TOKEN_THEME_FOR_DEVTOOLS_THEME[themeName];
@@ -1575,7 +1682,48 @@ test.describe('panel-render: a stored PanelSpec in the built panel document', ()
     }
   });
 
-  test('an uncatalogued node type renders a visible failure, never a blank area', async ({
+  test('follows a DevTools theme switch made after the panel mounted', async ({
+    openRenderedPanel,
+  }) => {
+    const spec = buildCatalogPanelSpec();
+    const panel = await openRenderedPanel({ themeName: 'default' });
+    await panel.waitForConnected();
+    await panel.deliver(spec);
+    const documentRoot = panel.page.locator('html');
+    const generatedRoot = panel.main.locator('[data-theme]').first();
+    await expect(documentRoot, 'the theme it opened with').toHaveAttribute(
+      'data-theme',
+      TOKEN_THEME_FOR_DEVTOOLS_THEME.default,
+    );
+    await expect(generatedRoot).toHaveAttribute(
+      'data-theme',
+      TOKEN_THEME_FOR_DEVTOOLS_THEME.default,
+    );
+
+    // To light and back, through each DevTools name: the document root (the
+    // panel chrome) and the generated panel's own theme root move together.
+    const switches: readonly DevtoolsThemeName[] = ['light', 'dark', 'light', 'default'];
+    for (const themeName of switches) {
+      await panel.switchDevtoolsTheme(themeName);
+      const expected = TOKEN_THEME_FOR_DEVTOOLS_THEME[themeName];
+      await expect(documentRoot, `after switching to ${themeName}`).toHaveAttribute(
+        'data-theme',
+        expected,
+      );
+      await expect(generatedRoot, `after switching to ${themeName}`).toHaveAttribute(
+        'data-theme',
+        expected,
+      );
+    }
+    // The switches re-themed the panel in place: it is still the same panel.
+    await expect(
+      panel.main.getByRole('heading', { level: 2, name: spec.title, exact: true }),
+    ).toBeVisible();
+    await expect(panel.main.locator('[data-node-path]')).toHaveCount(placedNodes(spec).length);
+    await expectNoFailures(panel);
+  });
+
+  test('an uncatalogued node type is refused before rendering and announced, never a blank area', async ({
     openRenderedPanel,
   }) => {
     expect(isKnownPanelNodeType(UNKNOWN_NODE_TYPE)).toBe(false);
@@ -1591,32 +1739,33 @@ test.describe('panel-render: a stored PanelSpec in the built panel document', ()
     const invalid = withNodeType(spec, target.path, UNKNOWN_NODE_TYPE);
     expect(validatePanelSpec(invalid).ok, 'the product validator refuses it').toBe(false);
 
+    // A validated panel is on screen first, so "never a blank area" is observable: the refused
+    // update must leave it exactly as it was.
     const panel = await openRenderedPanel();
     await panel.waitForConnected();
+    await panel.deliver(spec);
+    await expect(panel.main.locator('[data-node-path]')).toHaveCount(placed.length);
+
     await panel.pushFrame(unvalidatedPanelGeneratedPush(spec.sessionId, spec.id, invalid));
+
+    // The refusal is announced through the panel's non-blocking failure notice, by the protocol's
+    // own code, instead of the update vanishing silently.
+    const refusal = panel.main
+      .getByRole('status')
+      .filter({ hasText: 'PROTOCOL_INVALID_MESSAGE' satisfies DebuggenErrorCode });
+    await expect(refusal, 'the refused update is announced').toBeVisible();
+
+    // The tampered document reached neither the store nor the renderer: no node failed, the
+    // unknown type appears nowhere, and the panel still shows the validated spec under its title.
     await expect(
       panel.main.getByRole('heading', { level: 2, name: spec.title, exact: true }),
     ).toBeVisible();
+    await expect(panel.main).not.toContainText(`"${UNKNOWN_NODE_TYPE}"`);
+    expect(await renderFailureTexts(panel), 'no node was rendered as a failure').toEqual([]);
 
-    const frame = panel.frameOf(target.pathKey);
-    await expect(frame, 'the node keeps its place').toBeVisible();
-    const failureNotice = frame
-      .getByRole('alert')
-      .or(frame.getByRole('status'))
-      .filter({ hasText: RENDER_FAILURE_TITLE });
-    await expect(failureNotice, 'the failure is announced').toBeVisible();
-    await expect(frame).toContainText(`"${UNKNOWN_NODE_TYPE}"`);
-    await expect(frame).toContainText(target.node.id);
-    const failures = await renderFailureTexts(panel);
-    expect(failures, 'exactly the tampered node failed').toHaveLength(1);
-    expect(failures[0]).toContain(`"${UNKNOWN_NODE_TYPE}"`);
-
-    // The rest of the panel still renders: every other node under its title.
+    // Every node, the one the tampered copy targeted included, still renders under its title.
     await expect(panel.main.locator('[data-node-path]')).toHaveCount(placed.length);
     for (const entry of placed) {
-      if (entry.pathKey === target.pathKey) {
-        continue;
-      }
       await expect(
         panel
           .frameOf(entry.pathKey)

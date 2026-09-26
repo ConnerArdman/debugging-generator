@@ -83,6 +83,7 @@ import { join } from 'node:path';
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
+import { CODE_NODE_KINDS } from '@debuggen/code-analysis';
 import {
   ACTION_ID_PATTERN,
   AGENT_HOOK_KEYS,
@@ -160,6 +161,7 @@ import type { CodeIndexPort } from '../../src/pipeline/orchestrator.js';
 import { contextBoundResolver } from '../../src/pipeline/stages/plan.js';
 import type { PlanRejectionReason } from '../../src/pipeline/stages/plan.js';
 import { tokenizeQuestion } from '../../src/pipeline/stages/understand.js';
+import { buildInvestigationRows } from '../../src/sessions/progress.js';
 import type { ProgressEntry } from '../../src/store/sessions-repo.js';
 import {
   DEFAULT_FIXTURE_PROJECT,
@@ -265,6 +267,12 @@ const RUNNING_ROW = member(PROGRESS_STATUSES, 'running');
 /** A progress row of a stage that failed. */
 const FAILED_ROW = member(PROGRESS_STATUSES, 'failed');
 
+/** A progress row reporting something a stage did or found. */
+const DONE_ROW = member(PROGRESS_STATUSES, 'done');
+
+/** The code-graph node kind of an event handler. */
+const HANDLER_NODE = member(CODE_NODE_KINDS, 'handler');
+
 /** What `session.end` reports when every modification was restored. */
 const CLEAN_CLEANUP = member(CLEANUP_STATUSES, 'clean');
 
@@ -309,6 +317,13 @@ const NORMALIZE_STEP = 'normalize';
 /** The two fixed halves of the AAP §0.5.5 degradation sentence. */
 const DEGRADATION_OPENING = 'Could not enable ';
 const DEGRADATION_CONTINUATION = ' Continuing with: ';
+
+/** The investigation's event-handler row, worded verbatim as prompt §11, Step 8 prints it. */
+const TRACED_EVENT_HANDLER_LABEL = 'Traced event handler';
+
+/** Separators of a class row's detail: `‹finding›, ‹finding› · ‹origin file›`. */
+const DETAIL_PART_SEPARATOR = ' · ';
+const DETAIL_LIST_SEPARATOR = ', ';
 
 /** The authoring payload the fixture README marks for this suite: refused by the authoring schema. */
 const INVALID_PLAN_FIXTURE = 'model-output-invalid-plan.json';
@@ -1329,6 +1344,75 @@ describe('pipeline-deterministic', () => {
       }
     });
 
+    it('words the event-handler class as one "Traced event handler" row whose detail is its evidence', async () => {
+      const { run } = subject();
+      const { graph } = run.indexed.code;
+      const corpusFiles = await listFiles(run.indexed.copy.root);
+      const handlerNodes = corpusFiles.flatMap((file) =>
+        graph.nodesByFile(file).filter((node) => node.kind === HANDLER_NODE),
+      );
+      const handlerNames = handlerNodes.map((node) => node.name);
+
+      /** A handler row's detail, `‹symbols› · ‹file›`: declared handlers, and a file declaring one. */
+      const expectHandlerEvidence = (detail: unknown): void => {
+        expect(
+          typeof detail === 'string' && isSingleLine(detail),
+          'the row carries its evidence',
+        ).toBe(true);
+        const parts = typeof detail === 'string' ? detail.split(DETAIL_PART_SEPARATOR) : [];
+        expect(parts).toHaveLength(2);
+        const [symbols = '', file = ''] = parts;
+        const named = symbols.split(DETAIL_LIST_SEPARATOR);
+        for (const symbol of named) {
+          expect(handlerNames).toContain(symbol);
+        }
+        expect(corpusFiles).toContain(file);
+        expect(
+          handlerNodes.some((node) => node.file === file && named.includes(node.name)),
+          `${file} declares a traced handler`,
+        ).toBe(true);
+      };
+
+      // The real pipeline: the class is at most one row, worded exactly as Step 8 prints it —
+      // never a handler symbol folded into the message — with its evidence in the detail.
+      const traced = run.progress.filter(
+        (entry) => entry.stage === INVESTIGATE_STAGE && entry.message.startsWith('Traced'),
+      );
+      expect(traced.length).toBeLessThanOrEqual(1);
+      for (const entry of traced) {
+        expect(entry.message).toBe(TRACED_EVENT_HANDLER_LABEL);
+        expect(entry.status).toBe(DONE_ROW);
+        expectHandlerEvidence(entry.detail);
+      }
+
+      // The corpus's own handler: the click site declares one, and the service's row builder
+      // turns it into exactly one such row, whose detail is that handler's symbol and file.
+      const clickSite = handlerNodes.filter((node) => node.file === CORPUS.clickSiteFile);
+      expect(clickSite.length, `${CORPUS.clickSiteFile} declares an event handler`).toBeGreaterThan(
+        0,
+      );
+      const rows = buildInvestigationRows({
+        eventHandlers: clickSite.map((node) => node.name),
+        relevantFiles: clickSite.map((node) =>
+          relevantFileSchema.parse({
+            file: node.file,
+            symbol: node.name,
+            reason: 'The code graph declares this event handler.',
+            score: 1,
+          }),
+        ),
+      });
+      expect(rows).toEqual([
+        {
+          stage: INVESTIGATE_STAGE,
+          status: DONE_ROW,
+          message: TRACED_EVENT_HANDLER_LABEL,
+          detail: `${clickSite.map((node) => node.name).join(DETAIL_LIST_SEPARATOR)}${DETAIL_PART_SEPARATOR}${CORPUS.clickSiteFile}`,
+        },
+      ]);
+      expectHandlerEvidence(rows[0]?.detail);
+    });
+
     it('announces the normalized plan on instrumentation.plan, parsing against protocol’s schema', async () => {
       const { run } = subject();
       const message = await waitFor(
@@ -1883,7 +1967,7 @@ describe('pipeline-deterministic', () => {
       expect(planRows.some((entry) => entry.status === FAILED_ROW)).toBe(false);
     });
 
-    it('rejects a normaliser failure without a re-prompt, logging the input as a product defect', () => {
+    it('rejects a normaliser failure without a re-prompt, logging the closed input shape as a product defect', () => {
       const run = requireRun(normalizer, 'The normaliser-failure session');
       expect(callsFor(run, PLAN_STAGE)).toHaveLength(1);
       expect(run.scripted?.remaining()).toBe(1);
@@ -1896,7 +1980,14 @@ describe('pipeline-deterministic', () => {
           record.fields['step'] === NORMALIZE_STEP,
       );
       expect(defects).toHaveLength(1);
-      expect(defects[0]?.fields['input']).toEqual(databaseOnlyInput(theFixture()));
+      // The defect is described by the authored plan's closed shape, never by the plan itself.
+      expect(Object.keys(defects[0]?.fields ?? {})).not.toContain('input');
+      expect(defects[0]?.fields).toMatchObject({
+        captureCount: databaseOnlyInput(theFixture()).capture.length,
+        targetCount: 1,
+        hypothesisCount: 0,
+        targetTypes: { [DB_QUERY_TRACKING]: 1 },
+      });
 
       const fallbacks = logsOf(
         run,

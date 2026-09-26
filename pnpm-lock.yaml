@@ -356,9 +356,27 @@ importers:
         specifier: 4.6.5
         version: 4.6.5
     devDependencies:
+      '@debuggen/panel-renderer':
+        specifier: workspace:*
+        version: link:../../packages/panel-renderer
+      '@types/react':
+        specifier: 19.3.0
+        version: 19.3.0
+      '@types/react-dom':
+        specifier: 19.3.0
+        version: 19.3.0(@types/react@19.3.0)
       '@types/ws':
         specifier: 8.18.1
         version: 8.18.1
+      happy-dom:
+        specifier: 20.14.5
+        version: 20.14.5
+      react:
+        specifier: 19.3.0
+        version: 19.3.0
+      react-dom:
+        specifier: 19.3.0
+        version: 19.3.0(react@19.3.0)
 
   apps/vscode-extension:
     dependencies:

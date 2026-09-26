@@ -77,7 +77,8 @@ const OUT_DIR = 'dist';
  * `prebuild` step from `packages/telemetry/dist/browser-agent.iife.js` - becomes
  * `dist/agent.iife.js`, the MAIN-world content script. Vite copies these bytes
  * untouched, and no transform, minifier or hashing rule in this config may
- * touch them; `assertPrebuiltFilesAreVerbatim` proves it after every build.
+ * touch them; `assertPrebuiltFilesAreVerbatim` proves it after every successful
+ * write of `dist/`.
  */
 const PUBLIC_DIR = 'public';
 
@@ -314,7 +315,8 @@ function mergeContentScripts(
  * Proves that every pre-built content script reached `dist/` byte for byte.
  *
  * Vite copies `public/` into the output directory at `renderStart`, before any
- * chunk is written, so by the time the bundle closes the copy is on disk. This
+ * chunk is written, and Rolldown calls `writeBundle` - where this runs - only
+ * once `bundle.write()` has written every file, so the copy is on disk. This
  * check is what turns "nothing is supposed to touch those bytes" into a
  * guarantee: a hashing rule, a transform or a same-named emitted asset that
  * replaced the agent bundle fails the build here instead of shipping an
@@ -371,7 +373,26 @@ function assertPrebuiltFilesAreVerbatim(
  * output file names and before `manifest.json` is serialised - so the manifest
  * is correct in a single pass and no on-disk file is rewritten afterwards, which
  * is what makes `dist/manifest.json` byte-identical between consecutive builds.
- * `closeBundle` then verifies the copied bytes.
+ * `writeBundle` then verifies the copied bytes.
+ *
+ * `writeBundle` is the one hook whose call proves the emission succeeded:
+ * Rolldown calls it only at the end of a `bundle.write()` that wrote every
+ * file, after `vite:prepare-out-dir` emptied `dist/` and copied `public/` into
+ * it at `renderStart`. `closeBundle` is the wrong stage - measured against Vite
+ * 8.3.0 and Rolldown 1.2.9, not assumed. Vite calls `bundle.close()` from a
+ * `finally` block, so `closeBundle` runs after a failed build too, and an
+ * output-stage failure - one thrown from `renderStart`, `renderChunk`,
+ * `generateBundle` or `writeBundle` - reaches neither `buildEnd` nor
+ * `closeBundle` as an error (Rolldown reports the first two to `renderError`
+ * alone). Verifying in `closeBundle` after a `renderStart` failure that preceded
+ * the `public/` copy threw "was not emitted", and that throw from the `finally`
+ * replaced the build's real error. A failed build never reaches `writeBundle`,
+ * so its own error is the one reported, and no per-build failure state has to
+ * be reset between `vite build --watch` rebuilds. `order: 'post'` runs the
+ * check after every other plugin's `writeBundle` (Rolldown runs that hook's
+ * handlers one after another), so a plugin that rewrites `dist/` from its own
+ * `writeBundle` is still caught. A `build.write: false` build neither writes
+ * nor copies anything, and is therefore not checked.
  *
  * `test/manifest.test.ts` is the test that proves both halves: it asserts the
  * two `content_scripts` entries, their worlds, `run_at`, `all_frames` and order
@@ -386,11 +407,6 @@ function assertPrebuiltFilesAreVerbatim(
 function prebuiltContentScriptsPlugin(partition: ContentScriptPartition): CrxPlugin {
   let publicDir = path.resolve(workspaceRoot, PUBLIC_DIR);
   let outDir = path.resolve(workspaceRoot, OUT_DIR);
-  // `closeBundle` also runs when bundling failed, before anything was emitted.
-  // Verifying the copy then would throw a misleading "not emitted" error that
-  // replaces the real one (an unresolved entry, say), so a failed build skips
-  // the check. Reset per build, because `vite build --watch` rebuilds.
-  let bundleFailed = false;
 
   return {
     name: 'debuggen:prebuilt-content-scripts',
@@ -400,22 +416,19 @@ function prebuiltContentScriptsPlugin(partition: ContentScriptPartition): CrxPlu
       publicDir = config.publicDir;
       outDir = path.resolve(config.root, config.build.outDir);
     },
-    buildStart() {
-      bundleFailed = false;
-    },
-    buildEnd(error) {
-      if (error !== undefined) bundleFailed = true;
-    },
     renderCrxManifest(manifest) {
       return {
         ...manifest,
         content_scripts: mergeContentScripts(partition, manifest.content_scripts ?? []),
       };
     },
-    closeBundle(error) {
-      if (error !== undefined) bundleFailed = true;
-      if (bundleFailed) return;
-      assertPrebuiltFilesAreVerbatim(partition, publicDir, outDir);
+    // Reached only by a write that succeeded, and last among the plugins'
+    // writeBundle handlers; see the JSDoc above for why this is not closeBundle.
+    writeBundle: {
+      order: 'post',
+      handler() {
+        assertPrebuiltFilesAreVerbatim(partition, publicDir, outDir);
+      },
     },
   };
 }

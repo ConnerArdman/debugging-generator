@@ -26,10 +26,20 @@
  * - **Supervision.** An unexpected exit of a healthy child is restarted with the
  *   bounded exponential policy of {@link planRestart}; after the last attempt
  *   the module settles in `failed` with an actionable message instead of
- *   looping.
+ *   looping. An exit while a stop is waiting to signal the child is never
+ *   answered with a restart.
+ * - **Address moves.** A live child is never stopped, signalled or replaced
+ *   because `debuggen.serviceUrl` changed: it may be the one process that can
+ *   still end an active session and remove its instrumentation. The injected
+ *   probe follows the setting, so a probe answer is attributed to the child
+ *   only while the configured origin is the child's own; an answer at another
+ *   origin is a service this module did not start (`external`), and no answer
+ *   there is a `service-url-changed` failure with the child still reported.
+ *   {@link ServiceProcess.restart}, which the developer chooses, is the one
+ *   way to move a live child to the new address.
  * - **Termination.** {@link ServiceProcess.stop} quiesces first (see "Ordering"
  *   below), then sends `SIGTERM`, waits a real grace window and only then
- *   escalates to `SIGKILL`.
+ *   escalates to `SIGKILL` — unless its caller declined the escalation.
  *
  * ## What it deliberately does not do
  *
@@ -53,14 +63,37 @@
  *
  * The service restores every instrumented file while it handles
  * `POST /sessions/:id/end`. `deactivate()` in `src/extension.ts` sends that
- * request for the active session **before** it calls
- * {@link ServiceProcess.stop}, and `stop()` itself refuses to race ahead of it:
+ * request for the active session and calls {@link ServiceProcess.stop} in the
+ * same synchronous step, and `stop()` refuses to race ahead of the request:
  * it first awaits every operation registered through
  * {@link ServiceProcess.keepAliveFor}, its own `awaitInFlight` promise and its
  * `beforeStop` hook — bounded, so a hung request cannot hold the editor open —
- * and only then signals the child. The grace window between `SIGTERM` and
- * `SIGKILL` is long enough for the service's own shutdown (stop launched dev
- * servers, close sockets, checkpoint the store), and an escalation is logged.
+ * and only then signals the child.
+ *
+ * - **The stop is recorded at once.** A child that exits during the quiesce is
+ *   not restarted, and a restart scheduled or probing after an earlier crash
+ *   gives up (the stop generation it was planned under has moved on).
+ * - **One stop owns the termination.** VS Code disposes `context.subscriptions`
+ *   right after `deactivate()` returned its promise; while a stop is in flight
+ *   {@link ServiceProcess.dispose} leaves the child to it instead of starting
+ *   a second quiesce and `SIGTERM` → `SIGKILL` sequence beside it.
+ * - **Accepted work is never interrupted.** The service carries on with an
+ *   end request after the client that sent it went away — it first waits for
+ *   a cancelled pipeline step (an install) to settle, then restores the files
+ *   — and a signal would cut that short. A caller whose awaited end did not
+ *   conclude within its bound releases the child with
+ *   {@link StopOptions.release}: it is left running, unsignalled and
+ *   unsupervised, so the restore completes on the service's own schedule, and
+ *   a later window uses it as the `external` service it then is. Only a child
+ *   the configured service URL still names is released, because only then did
+ *   the awaited request reach it.
+ * - **`SIGKILL` is what cuts a shutdown short.** On `SIGTERM` the service runs
+ *   its own bounded shutdown (stop launched dev servers, close sockets,
+ *   checkpoint the store). The grace window before `SIGKILL` is long enough for
+ *   that in the ordinary case and an escalation is logged; a caller that is
+ *   going away while nothing it knows of has concluded declines it with
+ *   {@link StopOptions.escalate}, and the child is left to finish on its own.
+ *
  * The service also reconciles every non-reverted modification record on its
  * next start, so a hard kill is recoverable — a safety net, not a licence.
  *
@@ -76,6 +109,20 @@
  * channel or a failure message: the editor credential's exact value, the values
  * of secret-named environment variables, bearer and key-value credentials,
  * provider-key and JWT shapes and long mixed-case base64url runs are replaced.
+ *
+ * The lifecycle records sent to the injected logger — which `src/extension.ts`
+ * prints, unredacted, into the "Debug Generator" output — are held to a
+ * stricter rule than the child's scrubbed output: they carry closed
+ * vocabularies and numbers only. A failure is logged by its error code, its
+ * `details.reason` from this module's {@link SERVICE_FAILURE_REASONS} and its
+ * exit code, signal or errno — never its message, which for an early exit is
+ * the child's own stderr report. A caught value is logged by its code, closed
+ * class and a Node error code from the finite set of known system and Node
+ * codes — never its text and never an unknown `code`. `debuggen.serviceUrl` is
+ * logged as its validated loopback origin, never as configured, because a
+ * pasted URL can carry userinfo or a query credential. An unexpected failure
+ * that is returned to a caller names a correlation reference its log record
+ * carries too, instead of the thrown text.
  *
  * ## Vocabulary
  *
@@ -98,8 +145,10 @@
 
 import { spawn as nodeSpawn } from 'node:child_process';
 import { accessSync, constants as fsConstants, statSync } from 'node:fs';
+import { constants as osConstants } from 'node:os';
 import path from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
+import { getSystemErrorMap } from 'node:util';
 
 import * as vscode from 'vscode';
 
@@ -111,6 +160,7 @@ import {
   err,
   isErr,
   isOk,
+  newMessageId,
   noopLogger,
   nowEpochMs,
   ok,
@@ -264,7 +314,12 @@ const SERVICE_URL_HINT =
 /** The prefix the service writes its start-up failure lines with (`reportStartupFailure` in its `main.ts`). */
 const STARTUP_FAILURE_PREFIX = 'debuggen: ';
 
-/** The start-up failure line that carries the developer's next step. */
+/**
+ * The start-up failure line that carries the service's recovery hint. It is
+ * only recognised so it is never mistaken for a failure line: the hint itself
+ * stays in the output channel, and a surfaced failure carries
+ * {@link SERVICE_OUTPUT_HINT} instead.
+ */
 const STARTUP_HINT_PREFIX = 'debuggen: hint: ';
 
 /** Membership over the closed error-code vocabulary, for codes read back from the child's stderr. */
@@ -285,9 +340,9 @@ const PROVIDER_SET: ReadonlySet<string> = new Set<string>(PROVIDER_IDS);
  * | `idle` | nothing attempted yet, or the service is not running and auto-start is off |
  * | `starting` | a child this module spawned has not answered `/health` yet (first start or a restart) |
  * | `running` | a child this module spawned answers `/health` and is supervised |
- * | `external` | a service this module did not spawn answers `/health`; it is never restarted or killed from here |
+ * | `external` | a service this module did not spawn answers `/health` at the configured URL; it is never restarted or killed from here (a child of this window kept on its previous address after `debuggen.serviceUrl` moved is still stopped by `stop()` and retired by `restart()`) |
  * | `failed` | the last start or the restart policy gave up; the status carries the error |
- * | `stopped` | this module stopped its child, or the module was disposed |
+ * | `stopped` | this module stopped its child, released it to finish accepted work on its own (see {@link StopOptions.release}), or the module was disposed |
  *
  * Not the WebSocket connection state — see the module overview.
  */
@@ -330,7 +385,11 @@ export interface ServiceStatus {
   /** Who owns the answering service; `undefined` while nothing answers. */
   readonly mode: ServiceMode | undefined;
 
-  /** The child's process id while this module owns a live child. */
+  /**
+   * The child's process id while the status describes a live child of this
+   * module; `undefined` in the `external` state, even when a child of this
+   * window is still kept on the address `debuggen.serviceUrl` named before.
+   */
   readonly pid: number | undefined;
 
   /** The entry the current or last child was spawned from. */
@@ -710,6 +769,57 @@ export interface StopOptions {
 
   /** The grace window between `SIGTERM` and `SIGKILL`. Defaults to the module's grace. */
   readonly graceMs?: number | undefined;
+
+  /**
+   * Whether a child that is still running when the grace window expires is
+   * sent `SIGKILL`. Defaults to `true`.
+   *
+   * `false` leaves a child that received `SIGTERM` to finish its own shutdown
+   * instead — for a caller that is going away (`deactivate()`) without knowing
+   * that the service has nothing left to do: `SIGKILL` is the one signal the
+   * service cannot finish its shutdown after. A function is read when the
+   * grace window expires, so the decision can depend on something that
+   * settles meanwhile (whether the end-of-session request concluded); a
+   * function that throws counts as `false`, and the throw is logged.
+   *
+   * @example
+   * ```ts
+   * let ended = false;
+   * void endRequest.then(() => { ended = true; });
+   * await serviceProcess.stop({ awaitInFlight: endRequest, escalate: () => ended });
+   * ```
+   */
+  readonly escalate?: boolean | (() => boolean) | undefined;
+
+  /**
+   * Whether the child is **released** instead of signalled once the quiesce
+   * ends. Defaults to `false`.
+   *
+   * A released child is left running, is no longer supervised, and is never
+   * signalled by this module again — not by this stop, a later one, or
+   * `dispose()`. It is for a caller that is going away while the service is
+   * still carrying out work it accepted and a signal would interrupt: an
+   * end-of-session request that timed out on the client is still being served
+   * — the service waits for a cancelled install to settle before it restores
+   * the files — and the service's `SIGTERM` shutdown does not wait for that.
+   * A later editor window finds the released service answering and uses it as
+   * `external`.
+   *
+   * A function is read when the quiesce ends. A function that throws counts as
+   * `true`, the answer that never interrupts a restore, and the throw is
+   * logged. Either way the child is released only while the configured
+   * service URL still names it: the awaited request went to that URL, so a
+   * child kept on a previous address cannot be carrying it out, and is
+   * stopped as usual.
+   *
+   * @example
+   * ```ts
+   * let settled = false;
+   * void endRequest.finally(() => { settled = true; });
+   * await serviceProcess.stop({ awaitInFlight: endRequest, release: () => !settled });
+   * ```
+   */
+  readonly release?: boolean | (() => boolean) | undefined;
 }
 
 /**
@@ -718,8 +828,9 @@ export interface StopOptions {
  * `src/extension.ts` constructs one per window, pushes it into
  * `context.subscriptions`, calls {@link ServiceProcess.ensureRunning} from its
  * asynchronous start-up (never awaiting it on the activation path) and, in
- * `deactivate()`, calls {@link ServiceProcess.stop} only after the active
- * session's end request settled.
+ * `deactivate()`, calls {@link ServiceProcess.stop} together with the active
+ * session's end request, awaiting that request before it acts on the child:
+ * a child whose end is still being served is released rather than signalled.
  *
  * Every asynchronous member resolves and never rejects.
  */
@@ -735,25 +846,47 @@ export interface ServiceProcess extends DisposableLike {
    * starting one is allowed — ensures the editor credential, spawns the
    * embedded service and waits for its health. Concurrent calls share one
    * attempt. Resolves `Ok` with a `running` or `external` snapshot.
+   *
+   * A live child of this window whose address `debuggen.serviceUrl` no longer
+   * names is kept, never replaced, for automatic and user-initiated calls
+   * alike: the result is then the `external` service answering at the new
+   * address, or a failure with `details.reason` `service-url-changed` while
+   * the status still describes the child. {@link ServiceProcess.restart}
+   * moves it.
    */
   ensureRunning(options?: EnsureRunningOptions): Promise<Result<ServiceStatus, DebuggenError>>;
 
   /**
    * Stops the child this module spawned: quiesce, `SIGTERM`, grace window,
-   * `SIGKILL`. Never touches a service this module did not spawn. Idempotent;
-   * safe when nothing was spawned.
+   * then `SIGKILL` unless {@link StopOptions.escalate} declines it — or, when
+   * {@link StopOptions.release} asks for it at the end of the quiesce, no
+   * signal at all: the child is released to finish accepted work on its own.
+   * Never touches a service this module did not spawn. Idempotent; safe when
+   * nothing was spawned.
+   *
+   * The stop request is recorded synchronously, when `stop()` is called, not
+   * when its quiesce ends: a child that exits while the stop waits is not
+   * restarted, a restart already scheduled after a crash is cancelled, and a
+   * scheduled restart already probing gives up instead of launching.
    *
    * A requested stop also holds off automatic starts: until a user-initiated
    * {@link ServiceProcess.ensureRunning} or {@link ServiceProcess.restart}, an
    * automatic `ensureRunning` (a dropped connection during shutdown, say)
    * reports "not running" instead of spawning the service straight back.
+   *
+   * While the returned promise is pending, the stop owns the child's
+   * termination: {@link ServiceProcess.dispose} does not start a second one.
    */
   stop(options?: StopOptions): Promise<void>;
 
   /**
    * Stops this module's child (as {@link ServiceProcess.stop}) and starts a
    * fresh one. User-initiated by nature, so it ignores `autoStartService` and
-   * resets the restart series. Refused for an `external` service.
+   * resets the restart series. Refused for an `external` service — unless
+   * this window still holds a child of its own (one kept after
+   * `debuggen.serviceUrl` moved), which it retires — and for a child a stop
+   * released ({@link StopOptions.release}), which is no longer this window's
+   * to signal. The only way a live child is moved to a new service URL.
    */
   restart(options?: StopOptions): Promise<Result<ServiceStatus, DebuggenError>>;
 
@@ -774,6 +907,12 @@ export interface ServiceProcess extends DisposableLike {
    * Terminates the child (after the registered operations settle, bounded),
    * disposes the output channel and the configuration listener. Idempotent;
    * never throws.
+   *
+   * When a {@link ServiceProcess.stop} or {@link ServiceProcess.restart} is
+   * still running — `deactivate()`'s stop, which VS Code follows with this
+   * call at once — that stop keeps ownership of the child's termination, with
+   * its own bounds and escalation decision; `dispose()` then starts no quiesce
+   * or signal of its own. A child that stop released is never signalled here.
    */
   dispose(): void;
 }
@@ -1464,24 +1603,43 @@ export class OutputLineSplitter {
   }
 }
 
-/** A start-up failure the service reported on stderr, read back into its parts. */
+/**
+ * A start-up failure the service reported on stderr, read back into the two
+ * parts a surfaced error may carry: the closed-vocabulary code and the
+ * service's own message.
+ *
+ * The service's `debuggen: hint: <hint>` line is deliberately **not** part of
+ * it. A hint read back from a child's stderr can relay output the editor must
+ * not put in a notification (CWE-532), so a surfaced failure always carries
+ * {@link SERVICE_OUTPUT_HINT}, which points at the output channel where the
+ * service's full report — its hint included — is visible.
+ */
 export interface ReportedStartupFailure {
   /** The service's error code, from the closed vocabulary. */
   readonly code: DebuggenErrorCode;
   /** The service's message. */
   readonly message: string;
-  /** The service's recovery instruction, when it printed one. */
-  readonly hint: string | undefined;
 }
 
 /**
  * Finds the start-up failure the service printed before exiting. Its
  * `main.ts` writes one `debuggen: <CODE>: <message>` line and, when it has one,
- * a `debuggen: hint: <hint>` line; the last such pair wins. Lines are expected
- * to be scrubbed already.
+ * a `debuggen: hint: <hint>` line; the last failure line wins. A hint line is
+ * skipped — never read as a failure and never returned (see
+ * {@link ReportedStartupFailure}). Lines are expected to be scrubbed already.
  *
  * @param lines The child's scrubbed stderr lines, oldest first.
- * @returns The failure, or `undefined` when the child printed none.
+ * @returns The code and message, or `undefined` when the child printed no
+ * failure line with a known code and a non-empty message.
+ *
+ * @example
+ * ```ts
+ * parseStartupFailure([
+ *   'debuggen: CONFIG_INVALID: DEBUGGEN_PORT must be an integer.',
+ *   'debuggen: hint: Set DEBUGGEN_PORT to a free port.',
+ * ]);
+ * // → { code: 'CONFIG_INVALID', message: 'DEBUGGEN_PORT must be an integer.' }
+ * ```
  */
 export function parseStartupFailure(lines: readonly string[]): ReportedStartupFailure | undefined {
   for (let index = lines.length - 1; index >= 0; index -= 1) {
@@ -1496,12 +1654,7 @@ export function parseStartupFailure(lines: readonly string[]): ReportedStartupFa
     if (!isErrorCode(code) || message === '') {
       continue;
     }
-    const next = lines[index + 1]?.trim();
-    const hint =
-      next !== undefined && next.startsWith(STARTUP_HINT_PREFIX)
-        ? next.slice(STARTUP_HINT_PREFIX.length).trim()
-        : undefined;
-    return Object.freeze({ code, message, hint: hint === '' ? undefined : hint });
+    return Object.freeze({ code, message });
   }
   return undefined;
 }
@@ -1515,11 +1668,78 @@ function isErrorCode(value: string): value is DebuggenErrorCode {
 // Default seams (read at construction or call time, never at module load)
 // ---------------------------------------------------------------------------
 
-/** The errno code of a caught value, when it carries one; never its message. */
+/**
+ * The error codes Node attaches to the child-process, stream, socket and
+ * argument errors this module can meet that are not libuv system errors, plus
+ * the DNS resolver's `ENOTFOUND`. The same finite list as `./client` keeps for
+ * its own records, restated because this module does not import `./client`
+ * (see the module overview).
+ */
+const NODE_ERROR_CODES = Object.freeze([
+  'ABORT_ERR',
+  'ENOTFOUND',
+  'ERR_CHILD_PROCESS_IPC_REQUIRED',
+  'ERR_CHILD_PROCESS_STDIO_MAXBUFFER',
+  'ERR_INVALID_ARG_TYPE',
+  'ERR_INVALID_ARG_VALUE',
+  'ERR_INVALID_STATE',
+  'ERR_INVALID_URL',
+  'ERR_IPC_CHANNEL_CLOSED',
+  'ERR_OUT_OF_RANGE',
+  'ERR_SOCKET_CLOSED',
+  'ERR_STREAM_DESTROYED',
+  'ERR_STREAM_PREMATURE_CLOSE',
+  'ERR_STREAM_WRITE_AFTER_END',
+  'ERR_UNHANDLED_ERROR',
+] as const);
+
+/** The memo of {@link knownErrorCodes}, built on first use rather than at load. */
+let knownErrorCodeSet: ReadonlySet<string> | undefined;
+
+/**
+ * Every error code this module copies from a caught value's `code` property:
+ * the names of the running platform's libuv system errors (`ENOENT`,
+ * `EACCES`, `ESRCH`, … — `util.getSystemErrorMap()`, the table Node itself
+ * names system errors from) and {@link NODE_ERROR_CODES}. Finite on purpose: a
+ * `code` property is a value its thrower chose, and a pattern would still
+ * admit an invented, credential-shaped value into a log record, a failure's
+ * details or a message. Should the platform table be unavailable, only the
+ * listed codes remain.
+ */
+function knownErrorCodes(): ReadonlySet<string> {
+  if (knownErrorCodeSet === undefined) {
+    const codes = new Set<string>(NODE_ERROR_CODES);
+    try {
+      for (const [name] of getSystemErrorMap().values()) {
+        codes.add(name);
+      }
+    } catch {
+      // No platform table: the listed codes are still a closed vocabulary.
+    }
+    knownErrorCodeSet = codes;
+  }
+  return knownErrorCodeSet;
+}
+
+/** Whether `value` is one of the {@link knownErrorCodes}. */
+function isKnownErrorCode(value: unknown): value is string {
+  return typeof value === 'string' && knownErrorCodes().has(value);
+}
+
+/**
+ * The Node error code of a caught value — its `code` property when that is
+ * one of the {@link knownErrorCodes} — or `undefined`; never its message and
+ * never an unknown code. Never throws, including for a value whose getters or
+ * proxy traps throw.
+ */
 function errnoCodeOf(value: unknown): string | undefined {
-  if (typeof value === 'object' && value !== null && 'code' in value) {
-    const code: unknown = value.code;
-    return typeof code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(code) ? code : undefined;
+  try {
+    if (typeof value === 'object' && value !== null && 'code' in value) {
+      const code: unknown = value.code;
+      return isKnownErrorCode(code) ? code : undefined;
+    }
+  } catch {
+    // A hostile getter or trap: no code is known.
   }
   return undefined;
 }
@@ -1606,6 +1826,49 @@ function readWorkspaceSettings(): ServiceProcessSettings {
 // Failures
 // ---------------------------------------------------------------------------
 
+/**
+ * Every `details.reason` a failure built by this module carries, as a closed
+ * vocabulary: the only reasons {@link describeError} copies into a log record.
+ * A reason outside it — a failure some other layer built — is left out of the
+ * record rather than trusted.
+ */
+export const SERVICE_FAILURE_REASONS = Object.freeze([
+  'node-runtime',
+  'service-url',
+  'provider',
+  'bundle-incomplete',
+  'spawn-failed',
+  'exited',
+  'crashed',
+  'restarts-exhausted',
+  'stopped',
+  'disposed',
+  'external',
+  'restart-pending',
+  'failed',
+  'auto-start-disabled',
+  'service-url-changed',
+  'slow-start',
+  'unresponsive',
+  'unexpected',
+] as const);
+
+/** One member of {@link SERVICE_FAILURE_REASONS}. */
+export type ServiceFailureReason = (typeof SERVICE_FAILURE_REASONS)[number];
+
+/** Whether `value` is one of the {@link SERVICE_FAILURE_REASONS}. */
+function isServiceFailureReason(value: unknown): value is ServiceFailureReason {
+  return SERVICE_FAILURE_REASONS.some((reason) => reason === value);
+}
+
+/**
+ * The name of the output channel `src/extension.ts` creates for the host's own
+ * log records — where the correlation reference of an unexpected failure is
+ * found. Distinct from {@link SERVICE_OUTPUT_CHANNEL_NAME}, which holds the
+ * child's output.
+ */
+const HOST_LOG_CHANNEL_NAME = 'Debug Generator';
+
 /** How a child ended, in words, for a message. */
 interface ChildExit {
   /** The exit code, when the process exited normally. */
@@ -1633,8 +1896,23 @@ function describeServiceUrl(serviceUrl: string): string {
   return isOk(address) ? address.value.origin : 'the configured debuggen.serviceUrl';
 }
 
+/**
+ * The log fields of a configured service URL: its validated loopback origin —
+ * scheme, host and port, with no userinfo, path, query or fragment — and
+ * whether it was accepted. A refused URL is logged as `serviceUrlAccepted:
+ * false` with no origin at all. The configured value itself is never logged:
+ * `readWorkspaceSettings` only trims it, so a pasted `user:password@` or
+ * `?token=` survives into it (AAP §0.5.2).
+ */
+function serviceUrlLogFields(serviceUrl: string): LogFields {
+  const address = parseLoopbackServiceUrl(serviceUrl);
+  return isOk(address)
+    ? { serviceOrigin: address.value.origin, serviceUrlAccepted: true }
+    : { serviceUrlAccepted: false };
+}
+
 /** Nothing answers and this module may not, or did not, start a service. */
-function notRunningError(serviceUrl: string, reason: string): DebuggenError {
+function notRunningError(serviceUrl: string, reason: ServiceFailureReason): DebuggenError {
   return new DebuggenError(
     'TRANSPORT_DISCONNECTED',
     `The Debug Generator service is not running at ${describeServiceUrl(serviceUrl)}.`,
@@ -1660,7 +1938,12 @@ function spawnFailedError(errno: string | undefined): DebuggenError {
   );
 }
 
-/** The child ended before it answered: its own report when it printed one, else the exit. */
+/**
+ * The child ended before it answered: its own report's code and message when
+ * it printed one, else the exit. The hint is always {@link SERVICE_OUTPUT_HINT}
+ * — never a hint read back from the child's stderr — so nothing the service
+ * relayed from its output reaches a notification.
+ */
 function exitedBeforeHealthyError(exit: ChildExit, stderrTail: readonly string[]): DebuggenError {
   if (exit.spawnError !== undefined) {
     return spawnFailedError(exit.spawnError);
@@ -1669,7 +1952,7 @@ function exitedBeforeHealthyError(exit: ChildExit, stderrTail: readonly string[]
   const reported = parseStartupFailure(stderrTail);
   if (reported !== undefined) {
     return new DebuggenError(reported.code, reported.message, {
-      hint: reported.hint ?? SERVICE_OUTPUT_HINT,
+      hint: SERVICE_OUTPUT_HINT,
       details,
     });
   }
@@ -1754,6 +2037,45 @@ function externalRestartError(serviceUrl: string): DebuggenError {
   );
 }
 
+/**
+ * `debuggen.serviceUrl` moved away from the address a live child of this
+ * window listens on. The child is kept — never stopped or replaced for it —
+ * because it may hold an active session whose instrumentation only it can
+ * remove. Both origins are loopback origins with no credentials (the parse
+ * refuses those), so naming them is safe.
+ */
+function serviceUrlMovedError(childOrigin: string, configuredOrigin: string): DebuggenError {
+  return new DebuggenError(
+    'TRANSPORT_DISCONNECTED',
+    `debuggen.serviceUrl now names ${configuredOrigin}, but the Debug Generator service this window started listens on ${childOrigin}.`,
+    {
+      hint: `It is kept running so an active session can still be ended and its instrumentation removed. Set debuggen.serviceUrl back to ${childOrigin} to keep using it, or run "Debug Generator: Start Local Service" and choose "Restart service" to move it — the restarted service restores every instrumented file when it starts.`,
+      details: { reason: 'service-url-changed', childOrigin, configuredOrigin },
+    },
+  );
+}
+
+/**
+ * An ensure attempt threw. The returned failure is surfaced to the developer
+ * (a notification), so its message is a fixed sentence naming `ref` — the
+ * correlation reference the matching log record carries — and never the
+ * thrown text, which can quote a path, a URL or a credential. The code is the
+ * thrown `DebuggenError`'s own when it is one, `INTERNAL` otherwise; the
+ * original value stays reachable as `cause` for a debugger, and neither
+ * `toPayload()` nor any log record here reads it.
+ */
+function unexpectedFailureError(cause: unknown, ref: string): DebuggenError {
+  return new DebuggenError(
+    DebuggenError.is(cause) ? cause.code : 'INTERNAL',
+    `Checking or starting the Debug Generator service failed unexpectedly (reference ${ref}).`,
+    {
+      hint: `Open the "${HOST_LOG_CHANNEL_NAME}" output and look for reference ${ref}, then run "Debug Generator: Start Local Service".`,
+      details: { reason: 'unexpected', ref },
+      cause,
+    },
+  );
+}
+
 // ---------------------------------------------------------------------------
 // The supervisor
 // ---------------------------------------------------------------------------
@@ -1797,6 +2119,11 @@ interface ManagedChild {
   exit: ChildExit | undefined;
   /** Set once this module decided to stop the child; its exit is then not a crash. */
   stopping: boolean;
+  /**
+   * Set when a stop released the child to finish accepted work on its own
+   * ({@link StopOptions.release}); it is never signalled by this module again.
+   */
+  released: boolean;
   /** When the child first answered `/health`, in epoch milliseconds. */
   healthySince: number | undefined;
   /** The shared termination, once one began. */
@@ -1810,14 +2137,22 @@ type LaunchOutcome =
   | { readonly kind: 'slow'; readonly error: DebuggenError }
   | { readonly kind: 'aborted'; readonly error: DebuggenError }
   | {
+      /** `debuggen.serviceUrl` stopped naming the child's address while it started; the child is kept. */
+      readonly kind: 'moved';
+      readonly error: DebuggenError;
+    }
+  | {
       readonly kind: 'failed';
       readonly error: DebuggenError;
       /** `true` when a child ran and exited; `false` when nothing could be spawned. */
       readonly exited: boolean;
     };
 
-/** How a health wait ended. */
-type HealthWait = 'healthy' | 'exited' | 'timeout' | 'aborted';
+/**
+ * How a health wait ended. `moved`: the configured service URL no longer
+ * names the child's address, so an answer there would not be the child's.
+ */
+type HealthWait = 'healthy' | 'exited' | 'timeout' | 'aborted' | 'moved';
 
 /** A signal that never aborts, for waits only a timer or a promise ends. */
 const NEVER_ABORTED: AbortSignal = new AbortController().signal;
@@ -1854,6 +2189,12 @@ class EmbeddedServiceProcess implements ServiceProcess {
 
   readonly #listeners = new Set<(status: ServiceStatus) => void>();
   readonly #criticalOperations = new Set<Promise<unknown>>();
+  /**
+   * Every `stop()` and `restart()` stop still running. While one is, it owns
+   * the child's termination — its quiesce bound, grace window and escalation
+   * decision — and `dispose()` does not start a second one beside it.
+   */
+  readonly #stopsInFlight = new Set<Promise<void>>();
   readonly #configSubscription: DisposableLike | undefined;
 
   #status: ServiceStatus;
@@ -1865,6 +2206,13 @@ class EmbeddedServiceProcess implements ServiceProcess {
   #restartAttempts = 0;
   #failureLatched = false;
   #stopRequested = false;
+  /**
+   * Incremented by every `stop()` and `restart()`. A restart scheduled after a
+   * crash captures it and gives up when it changed: a stop that began after
+   * the restart was planned always wins over it, even if a later explicit
+   * start cleared {@link #stopRequested} in between.
+   */
+  #stopGeneration = 0;
   #disposed = false;
   #channel: ServiceOutputChannel | undefined;
   #channelDisposed = false;
@@ -1966,22 +2314,58 @@ class EmbeddedServiceProcess implements ServiceProcess {
   }
 
   stop(options: StopOptions = {}): Promise<void> {
-    this.#stopRequested = true;
-    return this.#stopChild(options);
+    this.#recordStopRequest();
+    return this.#trackStop(this.#stopChild(options));
   }
 
   /**
-   * The body of {@link ServiceProcess.stop}, without recording a stop request —
-   * also used to replace a child whose address changed. Never rejects.
+   * Records the intent to stop — synchronously, before any quiesce begins — so
+   * a child exit observed while the stop waits is never answered with a
+   * restart, and a restart already planned or running gives up.
+   */
+  #recordStopRequest(): void {
+    this.#stopRequested = true;
+    this.#stopGeneration += 1;
+  }
+
+  /**
+   * Registers a running stop in {@link #stopsInFlight} synchronously and
+   * releases it once it settled, so `dispose()` — which VS Code calls right
+   * after `deactivate()` returned its promise — sees the stop and leaves the
+   * child's termination to it.
+   */
+  #trackStop(stopping: Promise<void>): Promise<void> {
+    this.#stopsInFlight.add(stopping);
+    const release = (): void => {
+      this.#stopsInFlight.delete(stopping);
+    };
+    void stopping.then(release, release);
+    return stopping;
+  }
+
+  /**
+   * The body of {@link ServiceProcess.stop} and of the stop half of
+   * {@link ServiceProcess.restart}; the caller records the stop request.
+   * Never rejects.
    */
   async #stopChild(options: StopOptions): Promise<void> {
     try {
       this.#cancelPendingRestart();
       this.#startAbort?.abort();
       await this.#quiesce(options);
+      // Again after the wait: the quiesce can last seconds, and anything that
+      // was planned or started meanwhile belongs to the service being stopped.
+      this.#cancelPendingRestart();
+      this.#startAbort?.abort();
       const child = this.#child;
-      if (child !== undefined) {
-        await this.#terminate(child, positiveOr(options.graceMs, this.#stopGraceMs));
+      if (child !== undefined && this.#shouldRelease(child, options.release)) {
+        this.#releaseChild(child);
+      } else if (child !== undefined) {
+        await this.#terminate(
+          child,
+          positiveOr(options.graceMs, this.#stopGraceMs),
+          options.escalate,
+        );
       }
       if (
         this.#status.state === 'starting' ||
@@ -2000,17 +2384,17 @@ class EmbeddedServiceProcess implements ServiceProcess {
       return err(disposedError());
     }
     const serviceUrl = this.#settings().serviceUrl;
-    if (
-      this.#child === undefined &&
-      this.#status.state === 'external' &&
-      (await this.#probeOnce())
-    ) {
+    // A child a stop released is no longer this window's to signal: like a
+    // service another window started, it is restarted where it runs.
+    const own = this.#child;
+    const notOurs = own === undefined ? this.#status.state === 'external' : own.released;
+    if (notOurs && (await this.#probeOnce())) {
       return err(externalRestartError(serviceUrl));
     }
     // Held while the old child stops, so no automatic attempt slips a child in
     // between; the user-initiated start below clears it.
-    this.#stopRequested = true;
-    await this.#stopChild(options);
+    this.#recordStopRequest();
+    await this.#trackStop(this.#stopChild(options));
     const pending = this.#ensureInFlight;
     if (pending !== undefined) {
       await pending;
@@ -2062,12 +2446,21 @@ class EmbeddedServiceProcess implements ServiceProcess {
     }
 
     const child = this.#child;
-    if (child !== undefined) {
+    if (child !== undefined && this.#stopsInFlight.size > 0) {
+      // A `stop()` is still running — `deactivate()`'s, which VS Code follows
+      // with this call at once. It owns the child's termination, with the
+      // bounds and the escalation decision its caller chose; a second quiesce
+      // and SIGTERM → SIGKILL sequence here would race it and could kill the
+      // service in the middle of restoring files (AAP §0.5.1).
+      this.#logger.debug('a stop is in flight; it keeps ownership of the service termination', {
+        pid: child.pid,
+      });
+    } else if (child !== undefined) {
       // `dispose()` cannot await, but it still never signals the child ahead
       // of a registered end-of-session request (AAP §0.5.1): the quiesce and
       // the termination run on, bounded, after this returns.
       void this.#quiesce({})
-        .then(() => this.#terminate(child, this.#stopGraceMs))
+        .then(() => this.#terminate(child, this.#stopGraceMs, true))
         .catch((cause: unknown) => {
           this.#logger.error('stopping the service on dispose failed', errorFields(cause));
         });
@@ -2096,7 +2489,11 @@ class EmbeddedServiceProcess implements ServiceProcess {
 
   /**
    * Runs one ensure attempt as the shared in-flight attempt. The returned
-   * promise never rejects: an unexpected throw becomes an `INTERNAL` failure.
+   * promise never rejects: an unexpected throw becomes a failure with a fixed
+   * message naming a fresh correlation reference, and the log record under
+   * that reference carries the thrown value's code, class and errno only —
+   * never its text, which the notification showing the failure would
+   * otherwise repeat too.
    */
   #track(
     attempt: () => Promise<Result<ServiceStatus, DebuggenError>>,
@@ -2106,9 +2503,12 @@ class EmbeddedServiceProcess implements ServiceProcess {
       try {
         return await attempt();
       } catch (cause) {
-        const error = DebuggenError.from(cause, 'INTERNAL');
-        this.#logger.error('ensuring the service failed unexpectedly', describeError(error));
-        return err(error);
+        const ref = newMessageId();
+        this.#logger.error('ensuring the service failed unexpectedly', {
+          ref,
+          ...errorFields(cause),
+        });
+        return err(unexpectedFailureError(cause, ref));
       }
     })();
     this.#ensureInFlight = running;
@@ -2129,10 +2529,11 @@ class EmbeddedServiceProcess implements ServiceProcess {
     this.#update({ serviceUrl: settings.serviceUrl });
 
     // 1. A child of ours is alive: it answers, it is still starting, or it was
-    //    started for an address the setting no longer names.
+    //    started for an address the setting no longer names (it is kept, and
+    //    only `restart()` moves it).
     const own = this.#child;
     if (own !== undefined && own.exit === undefined && !own.stopping) {
-      return this.#ensureOwnChild(own, settings, userInitiated);
+      return this.#ensureOwnChild(own, settings);
     }
 
     // 2. A restart is already scheduled after a crash: an automatic caller
@@ -2156,9 +2557,10 @@ class EmbeddedServiceProcess implements ServiceProcess {
         error: undefined,
         settingsChanged: false,
       });
-      this.#logger.info('a service is already answering; nothing was spawned', {
-        serviceUrl: this.#status.serviceUrl,
-      });
+      this.#logger.info(
+        'a service is already answering; nothing was spawned',
+        serviceUrlLogFields(this.#status.serviceUrl),
+      );
       return ok(this.#status);
     }
     if (this.#disposed) {
@@ -2182,9 +2584,10 @@ class EmbeddedServiceProcess implements ServiceProcess {
     if (!settings.autoStartService && !userInitiated) {
       const error = notRunningError(settings.serviceUrl, 'auto-start-disabled');
       this.#update({ state: 'idle', mode: undefined, pid: undefined, error });
-      this.#logger.info('the service is not running and auto-start is disabled', {
-        serviceUrl: this.#status.serviceUrl,
-      });
+      this.#logger.info(
+        'the service is not running and auto-start is disabled',
+        serviceUrlLogFields(this.#status.serviceUrl),
+      );
       return err(error);
     }
 
@@ -2192,39 +2595,39 @@ class EmbeddedServiceProcess implements ServiceProcess {
     return this.#resultOf(await this.#launch(settings, 'initial'));
   }
 
-  /** {@link ServiceProcess.ensureRunning} while a child of ours is alive. */
+  /**
+   * {@link ServiceProcess.ensureRunning} while a child of ours is alive.
+   *
+   * The address comes first. The injected probe follows `debuggen.serviceUrl`
+   * on its own (the client behind it moves its base URL as soon as the setting
+   * changes), so once the setting names another origin a probe answer comes
+   * from whatever listens *there*, never from this child. Such a child is
+   * retained ({@link #retainMovedChild}) — not stopped, signalled or replaced:
+   * it may be the only process that can still end an active session and
+   * remove its instrumentation, and `restart()` is the developer's explicit
+   * way to move it.
+   */
   async #ensureOwnChild(
     child: ManagedChild,
     settings: ServiceProcessSettings,
-    userInitiated: boolean,
   ): Promise<Result<ServiceStatus, DebuggenError>> {
-    if (await this.#probeOnce()) {
-      if (child.exit === undefined && !child.stopping && child.healthySince === undefined) {
-        this.#markHealthy(child);
-      }
-      return ok(this.#status);
+    if (!this.#namesChild(child, settings.serviceUrl)) {
+      return this.#retainMovedChild(child, settings.serviceUrl);
     }
 
-    // The loopback parse, not the listen-address one: a move to an unreachable
-    // (Fetch-blocked) port is still a move, and the relaunch below refuses it.
-    const wanted = parseLoopbackServiceUrl(settings.serviceUrl);
-    const moved = isOk(wanted) && wanted.value.origin !== child.plan.address.origin;
-    if (moved) {
-      // The child listens where the client no longer looks. Replacing it is a
-      // spawn like any other, so it needs the same permission.
-      if (!settings.autoStartService && !userInitiated) {
-        const error = notRunningError(settings.serviceUrl, 'service-url-changed');
-        this.#update({ error, settingsChanged: true });
-        return err(error);
+    const answered = await this.#probeOnce();
+    if (this.#disposed) {
+      return err(disposedError());
+    }
+    if (!this.#namesChild(child)) {
+      // The setting moved while the probe ran: the answer is not the child's.
+      return this.#retainMovedChild(child, this.#settings().serviceUrl);
+    }
+    if (answered) {
+      if (child.exit === undefined && !child.stopping) {
+        this.#reportAnswering(child);
       }
-      this.#logger.info('the service URL changed; restarting the service on the new address', {
-        serviceUrl: settings.serviceUrl,
-      });
-      await this.#stopChild({});
-      if (this.#disposed) {
-        return err(disposedError());
-      }
-      return this.#resultOf(await this.#launch(this.#settings(), 'initial'));
+      return ok(this.#status);
     }
 
     // Same address, no answer yet: it is starting (possibly slowly — start-up
@@ -2235,9 +2638,9 @@ class EmbeddedServiceProcess implements ServiceProcess {
     const outcome = await this.#awaitHealthy(child, abort.signal, this.#startupTimeoutMs);
     switch (outcome) {
       case 'healthy':
-        if (child.healthySince === undefined) {
-          this.#markHealthy(child);
-        }
+        // Also restores `running` for a child that answered before and was
+        // reported as moved or external until the URL was set back.
+        this.#reportAnswering(child);
         return ok(this.#status);
       case 'timeout':
         return err(
@@ -2250,7 +2653,149 @@ class EmbeddedServiceProcess implements ServiceProcess {
         return err(this.#disposed ? disposedError() : stoppedError());
       case 'exited':
         return err(this.#status.error ?? notRunningError(settings.serviceUrl, 'exited'));
+      case 'moved':
+        return this.#retainMovedChild(child, this.#settings().serviceUrl);
     }
+  }
+
+  /**
+   * {@link ServiceProcess.ensureRunning} for a live child whose address
+   * `serviceUrl` no longer names. Never stops, signals or replaces the child;
+   * it classifies what the configured URL reaches instead:
+   *
+   * - an unusable URL — the `CONFIG_INVALID` parse failure;
+   * - something answers there — a service this module did not start, used as
+   *   `external` (the child stays supervised in the background, and
+   *   `restart()` retires it);
+   * - nothing answers — {@link serviceUrlMovedError}, with the status still
+   *   describing the child (`running` or `starting`, its pid) so the developer
+   *   is offered the restart that moves it.
+   *
+   * Every branch flags `settingsChanged`.
+   */
+  async #retainMovedChild(
+    child: ManagedChild,
+    serviceUrl: string,
+  ): Promise<Result<ServiceStatus, DebuggenError>> {
+    const childOrigin = child.plan.address.origin;
+    const configured = parseLoopbackServiceUrl(serviceUrl);
+    if (isErr(configured)) {
+      this.#update({ error: configured.error, settingsChanged: true });
+      this.#logger.warn(
+        'debuggen.serviceUrl cannot name a service; the service this window started is kept running',
+        { pid: child.pid, childOrigin },
+      );
+      return err(configured.error);
+    }
+    const configuredOrigin = configured.value.origin;
+
+    const answered = await this.#probeOnce();
+    if (this.#disposed) {
+      return err(disposedError());
+    }
+    if (child.exit !== undefined || child.stopping) {
+      // The child ended (or is being stopped) while the probe ran; its exit
+      // handling owns the status now.
+      return err(
+        this.#status.error ?? notRunningError(serviceUrl, child.stopping ? 'stopped' : 'exited'),
+      );
+    }
+    const current = this.#settings();
+    if (current.serviceUrl !== serviceUrl) {
+      // The setting changed again while the probe ran, so the answer describes
+      // an address nobody asks about any more: classify the current one.
+      return this.#ensureOwnChild(child, current);
+    }
+
+    if (answered) {
+      this.#update({
+        state: 'external',
+        mode: 'external',
+        pid: undefined,
+        error: undefined,
+        settingsChanged: true,
+      });
+      this.#logger.info(
+        'another service answers at the new service URL; using it, and keeping the service this window started running',
+        { childOrigin, configuredOrigin, pid: child.pid },
+      );
+      return ok(this.#status);
+    }
+
+    const error = serviceUrlMovedError(childOrigin, configuredOrigin);
+    const healthy = child.healthySince !== undefined;
+    this.#update({
+      state: healthy ? 'running' : 'starting',
+      mode: healthy ? 'embedded' : undefined,
+      pid: child.pid,
+      origin: child.plan.entry.origin,
+      runtime: child.plan.runtime.source,
+      error,
+      settingsChanged: true,
+    });
+    this.#logger.warn(
+      'the service URL changed; nothing answers there, and the service this window started is kept running until it is restarted',
+      { childOrigin, configuredOrigin, pid: child.pid },
+    );
+    return err(error);
+  }
+
+  /**
+   * Whether `serviceUrl` (by default the current `debuggen.serviceUrl`) names
+   * the origin `child` listens on. The loopback parse, not the listen-address
+   * one: a move to an unreachable (Fetch-blocked) port is still a move.
+   */
+  #namesChild(child: ManagedChild, serviceUrl: string = this.#settings().serviceUrl): boolean {
+    const configured = parseLoopbackServiceUrl(serviceUrl);
+    return isOk(configured) && configured.value.origin === child.plan.address.origin;
+  }
+
+  /**
+   * A live child of ours answered at the configured URL: the first answer
+   * marks it healthy; a later one restores `running` when the status says
+   * otherwise — after the URL was set back to the child's address, say.
+   */
+  #reportAnswering(child: ManagedChild): void {
+    if (child.healthySince === undefined) {
+      this.#markHealthy(child);
+      return;
+    }
+    this.#update({
+      state: 'running',
+      mode: 'embedded',
+      pid: child.pid,
+      origin: child.plan.entry.origin,
+      runtime: child.plan.runtime.source,
+      error: undefined,
+    });
+  }
+
+  /**
+   * A start whose child the configured URL stopped naming is no longer
+   * watched for health: an answer at the new address would not be the child's.
+   * Its exit, should it end before it ever answered, is still accounted for —
+   * as the early exit it is — so the status never keeps describing a process
+   * that is gone.
+   */
+  #releaseMovedStart(child: ManagedChild, kind: 'initial' | 'restart'): void {
+    this.#logger.info(
+      'the service URL changed while the service was starting; it is kept running',
+      {
+        pid: child.pid,
+        childOrigin: child.plan.address.origin,
+      },
+    );
+    void child.exited
+      .then(async () => {
+        // A child that answered later exits as a crash (`#onChildExit`); a
+        // child already replaced is no longer the status's subject.
+        if (child.healthySince === undefined && this.#child === undefined) {
+          await this.#afterEarlyExit(child, kind);
+        }
+      })
+      .catch((cause: unknown) => {
+        this.#logger.error('handling the exit of a moved service failed', errorFields(cause));
+      });
   }
 
   /** Maps a launch outcome to the result {@link ServiceProcess.ensureRunning} resolves with. */
@@ -2261,6 +2806,7 @@ class EmbeddedServiceProcess implements ServiceProcess {
         return ok(this.#status);
       case 'slow':
       case 'aborted':
+      case 'moved':
       case 'failed':
         return err(outcome.error);
     }
@@ -2336,7 +2882,25 @@ class EmbeddedServiceProcess implements ServiceProcess {
       }
       case 'exited':
         return this.#afterEarlyExit(child, kind);
+      case 'moved': {
+        const error = this.#movedStartError(child);
+        this.#update({ error, settingsChanged: true });
+        this.#releaseMovedStart(child, kind);
+        return { kind: 'moved', error };
+      }
     }
+  }
+
+  /**
+   * The failure for a start whose child the configured URL stopped naming:
+   * the URL's own parse failure when it is unusable, else
+   * {@link serviceUrlMovedError}.
+   */
+  #movedStartError(child: ManagedChild): DebuggenError {
+    const configured = parseLoopbackServiceUrl(this.#settings().serviceUrl);
+    return isOk(configured)
+      ? serviceUrlMovedError(child.plan.address.origin, configured.value.origin)
+      : configured.error;
   }
 
   /** The outcome of a launch that `stop()` or `dispose()` cancelled. */
@@ -2361,9 +2925,10 @@ class EmbeddedServiceProcess implements ServiceProcess {
     if (await this.#probeOnce()) {
       this.#restartAttempts = 0;
       this.#update({ state: 'external', mode: 'external', pid: undefined, error: undefined });
-      this.#logger.info('another service answered after the spawned one exited; using it', {
-        serviceUrl: this.#status.serviceUrl,
-      });
+      this.#logger.info(
+        'another service answered after the spawned one exited; using it',
+        serviceUrlLogFields(this.#status.serviceUrl),
+      );
       return { kind: 'external' };
     }
     const error = exitedBeforeHealthyError(
@@ -2581,6 +3146,7 @@ class EmbeddedServiceProcess implements ServiceProcess {
       stderrTail: [],
       exit: undefined,
       stopping: false,
+      released: false,
       healthySince: undefined,
       termination: undefined,
     };
@@ -2757,6 +3323,16 @@ class EmbeddedServiceProcess implements ServiceProcess {
     if (this.#disposed) {
       return;
     }
+    if (this.#stopRequested) {
+      // `stop()` (or `restart()`) is waiting for its quiesce: the exit is the
+      // end that stop was about to bring, so it is never answered with a
+      // replacement the stop would not know about.
+      this.#logger.info('the service exited while it was being stopped; it is not restarted', {
+        ...describeError(error),
+      });
+      this.#update({ state: 'stopped', mode: undefined, pid: undefined });
+      return;
+    }
     if (!this.#settings().autoStartService) {
       this.#logger.warn('the service stopped and auto-start is disabled; not restarting', {
         ...describeError(error),
@@ -2795,28 +3371,45 @@ class EmbeddedServiceProcess implements ServiceProcess {
       `[Debug Generator] Restarting the service in ${String(Math.round(decision.delayMs / 100) / 10)} s (attempt ${String(decision.attempt)} of ${String(this.#policy.maxAttempts)}).`,
     );
     this.#cancelPendingRestart();
+    const generation = this.#stopGeneration;
     this.#cancelRestartTimer = this.#schedule(() => {
       this.#cancelRestartTimer = undefined;
-      if (this.#disposed || this.#ensureInFlight !== undefined) {
-        // An ensure attempt is already bringing a service up.
+      if (
+        this.#disposed ||
+        this.#stopRequested ||
+        generation !== this.#stopGeneration ||
+        this.#ensureInFlight !== undefined
+      ) {
+        // Disposed, stopped since the restart was planned, or an ensure
+        // attempt is already bringing a service up.
         return;
       }
-      void this.#track(() => this.#restartNow(), false);
+      void this.#track(() => this.#restartNow(generation), false);
     }, decision.delayMs);
   }
 
-  /** The scheduled restart: reuse a service that answers by now, else launch again. */
-  async #restartNow(): Promise<Result<ServiceStatus, DebuggenError>> {
-    if (await this.#probeOnce()) {
-      this.#restartAttempts = 0;
-      this.#update({ state: 'external', mode: 'external', pid: undefined, error: undefined });
-      this.#logger.info('a service answered before the restart; using it', {
-        serviceUrl: this.#status.serviceUrl,
-      });
-      return ok(this.#status);
-    }
+  /**
+   * The scheduled restart: reuse a service that answers by now, else launch
+   * again — unless a stop began while the probe ran (`generation` is the stop
+   * generation the restart was planned under).
+   */
+  async #restartNow(generation: number): Promise<Result<ServiceStatus, DebuggenError>> {
+    const answered = await this.#probeOnce();
     if (this.#disposed) {
       return err(disposedError());
+    }
+    if (this.#stopRequested || generation !== this.#stopGeneration) {
+      this.#logger.info('a stop was requested before the scheduled restart; not restarting');
+      return err(stoppedError());
+    }
+    if (answered) {
+      this.#restartAttempts = 0;
+      this.#update({ state: 'external', mode: 'external', pid: undefined, error: undefined });
+      this.#logger.info(
+        'a service answered before the restart; using it',
+        serviceUrlLogFields(this.#status.serviceUrl),
+      );
+      return ok(this.#status);
     }
     return this.#resultOf(await this.#launch(this.#settings(), 'restart'));
   }
@@ -2838,6 +3431,11 @@ class EmbeddedServiceProcess implements ServiceProcess {
         this.#markHealthy(child);
       } else if (outcome === 'exited') {
         await this.#afterEarlyExit(child, kind);
+      } else if (outcome === 'moved') {
+        // The watch ends: an answer at the new address would not be this
+        // child's. The child is kept, and its exit is still accounted for.
+        this.#update({ error: this.#movedStartError(child), settingsChanged: true });
+        this.#releaseMovedStart(child, kind);
       }
     })().catch((cause: unknown) => {
       this.#logger.error('watching a slow service start failed', errorFields(cause));
@@ -2864,7 +3462,10 @@ class EmbeddedServiceProcess implements ServiceProcess {
   /**
    * Polls `/health` until the child answers, exits, the deadline passes or
    * `signal` aborts. An answer while the child has already exited is reported
-   * as `exited`: the answering service is someone else's.
+   * as `exited`: the answering service is someone else's. So is an answer
+   * once `debuggen.serviceUrl` stopped naming the child's address — the probe
+   * follows the setting — which is reported as `moved`, checked before every
+   * probe and again after a positive one.
    */
   async #awaitHealthy(
     child: ManagedChild,
@@ -2880,6 +3481,9 @@ class EmbeddedServiceProcess implements ServiceProcess {
       if (child.exit !== undefined) {
         return 'exited';
       }
+      if (!this.#namesChild(child)) {
+        return 'moved';
+      }
       const healthy = await this.#probeOnce(signal);
       if (child.exit !== undefined) {
         return 'exited';
@@ -2888,7 +3492,7 @@ class EmbeddedServiceProcess implements ServiceProcess {
         return 'aborted';
       }
       if (healthy) {
-        return 'healthy';
+        return this.#namesChild(child) ? 'healthy' : 'moved';
       }
       if (this.#now() >= deadline) {
         return 'timeout';
@@ -3005,15 +3609,26 @@ class EmbeddedServiceProcess implements ServiceProcess {
 
   /**
    * Terminates one child this module spawned: `SIGTERM`, a grace window for the
-   * service's own shutdown, then `SIGKILL`. Shared by concurrent callers; a
-   * no-op for a child that already exited.
+   * service's own shutdown, then `SIGKILL` — unless `escalate` declines it, in
+   * which case the child is left to finish the shutdown `SIGTERM` started (see
+   * {@link StopOptions.escalate}). Shared by concurrent callers: the first
+   * caller's grace window and escalation decision apply. A no-op for a child
+   * that already exited, and for one a stop released
+   * ({@link StopOptions.release}): that child is never signalled again.
    *
    * On Windows `kill()` cannot deliver a catchable signal and ends the process
    * at once; the journal-backed reconciliation at the next start is what keeps
    * that platform safe.
    */
-  #terminate(child: ManagedChild, graceMs: number): Promise<void> {
+  #terminate(
+    child: ManagedChild,
+    graceMs: number,
+    escalate: StopOptions['escalate'],
+  ): Promise<void> {
     child.stopping = true;
+    if (child.released) {
+      return Promise.resolve();
+    }
     if (child.termination !== undefined) {
       return child.termination;
     }
@@ -3024,6 +3639,16 @@ class EmbeddedServiceProcess implements ServiceProcess {
       this.#logger.info('stopping the service', { pid: child.pid, graceMs });
       this.#signal(child, 'SIGTERM');
       if (await this.#waitForExit(child, graceMs)) {
+        return;
+      }
+      if (!this.#shouldEscalate(escalate)) {
+        this.#logger.warn(
+          'the service did not exit within its grace window; leaving it to finish shutting down on its own',
+          { pid: child.pid, graceMs },
+        );
+        this.#write(
+          `[Debug Generator] The service did not stop within ${String(Math.round(graceMs / 1000))} s; it was left to finish shutting down on its own.`,
+        );
         return;
       }
       this.#logger.warn('the service did not exit within its grace window; escalating to SIGKILL', {
@@ -3041,6 +3666,84 @@ class EmbeddedServiceProcess implements ServiceProcess {
       }
     })();
     return child.termination;
+  }
+
+  /**
+   * Reads a {@link StopOptions.escalate} decision when the grace window
+   * expired: absent means `true`; a function is called now, and a throw
+   * counts as `false` — the conservative answer, because declining `SIGKILL`
+   * never loses a restore, while the journal reconciliation at the next start
+   * covers whatever the service did not finish.
+   */
+  #shouldEscalate(escalate: StopOptions['escalate']): boolean {
+    if (escalate === undefined || typeof escalate === 'boolean') {
+      return escalate ?? true;
+    }
+    try {
+      return escalate();
+    } catch (cause) {
+      this.#logger.warn(
+        'deciding whether to force-stop the service failed; it is not force-stopped',
+        errorFields(cause),
+      );
+      return false;
+    }
+  }
+
+  /**
+   * Reads a {@link StopOptions.release} decision when the quiesce ended. Only
+   * a live child that no termination has signalled yet, and that the
+   * configured service URL still names, can be released: the awaited request
+   * went to that URL, so a child kept on a previous address is not carrying
+   * it out. Absent means `false`; a function that throws counts as `true` —
+   * the answer that never interrupts a restore — and the throw is logged.
+   */
+  #shouldRelease(child: ManagedChild, release: StopOptions['release']): boolean {
+    if (child.exit !== undefined || child.termination !== undefined || child.released) {
+      return false;
+    }
+    let wanted: boolean;
+    if (release === undefined || typeof release === 'boolean') {
+      wanted = release ?? false;
+    } else {
+      try {
+        wanted = release();
+      } catch (cause) {
+        this.#logger.warn(
+          'deciding whether to release the service failed; it is left running unsignalled',
+          errorFields(cause),
+        );
+        wanted = true;
+      }
+    }
+    if (!wanted) {
+      return false;
+    }
+    if (!this.#namesChild(child)) {
+      this.#logger.info(
+        'the service this window started no longer listens where the awaited request went; stopping it instead of releasing it',
+        { pid: child.pid, childOrigin: child.plan.address.origin },
+      );
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Releases a child to finish work it accepted: it is left running, never
+   * signalled by this module again, and no longer supervised — its exit is
+   * logged, never answered with a restart. See {@link StopOptions.release}.
+   */
+  #releaseChild(child: ManagedChild): void {
+    child.stopping = true;
+    child.released = true;
+    this.#logger.warn(
+      'the service is still carrying out an end-of-session request; it is left running, unsignalled, to restore the instrumented files',
+      { pid: child.pid, childOrigin: child.plan.address.origin },
+    );
+    this.#write(
+      '[Debug Generator] The service is still finishing a session end, so it was left running to restore every instrumented file; a later window uses it.',
+    );
   }
 
   /** Whether the child exited within `timeoutMs`. */
@@ -3207,19 +3910,100 @@ function positiveOr(value: number | undefined, fallback: number): number {
   return value !== undefined && Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
-/** Log fields for a caught value: its error code and errno only, never its content. */
-function errorFields(cause: unknown): LogFields {
-  const error = DebuggenError.from(cause, 'INTERNAL');
-  const errno = errnoCodeOf(cause);
-  return errno === undefined ? { errorCode: error.code } : { errorCode: error.code, errno };
+/**
+ * The error classes a caught value is logged as: the ECMAScript native error
+ * constructors, `DebuggenError`, and the two `DOMException` names an abort or
+ * a timeout raises. The same closed vocabulary as `errorClassOf` in
+ * `./client`, restated because this module does not import `./client` (see
+ * the module overview); any other class is logged as `unlisted`, because an
+ * application-defined `name` is free text.
+ */
+const LOGGED_ERROR_CLASSES = Object.freeze([
+  'Error',
+  'TypeError',
+  'RangeError',
+  'SyntaxError',
+  'ReferenceError',
+  'EvalError',
+  'URIError',
+  'AggregateError',
+  'DebuggenError',
+  'AbortError',
+  'TimeoutError',
+] as const);
+
+/**
+ * Whether `value` names one of the running platform's signals
+ * (`os.constants.signals`: `SIGTERM`, `SIGKILL`, …) — the finite vocabulary a
+ * child's exit signal is logged from.
+ */
+function isKnownSignal(value: unknown): value is string {
+  return typeof value === 'string' && Object.hasOwn(osConstants.signals, value);
 }
 
 /**
- * Log fields for an error this module built or read back from the scrubbed
- * stderr of the child: code and message, both free of credentials.
+ * A caught value's class for a log record: a name from
+ * {@link LOGGED_ERROR_CLASSES}, `unlisted` for any other `Error`, or the
+ * `typeof` of a value that is not an `Error`. Never the name verbatim, the
+ * message or the stack, and never throws — a getter or proxy trap that throws
+ * while the value is classified yields `unlisted`.
+ */
+function thrownClassOf(value: unknown): string {
+  try {
+    if (DebuggenError.is(value)) {
+      return 'DebuggenError';
+    }
+    if (!(value instanceof Error)) {
+      return typeof value;
+    }
+    const name: unknown = value.name;
+    return LOGGED_ERROR_CLASSES.find((listed) => listed === name) ?? 'unlisted';
+  } catch {
+    return 'unlisted';
+  }
+}
+
+/**
+ * Log fields for a caught value: its error code, its closed class and a known
+ * Node error code ({@link errnoCodeOf}) — never its message, its stack, an
+ * unknown `code` or any other property.
+ */
+function errorFields(cause: unknown): LogFields {
+  const error = DebuggenError.from(cause, 'INTERNAL');
+  const fields: LogFields = { errorCode: error.code, errorClass: thrownClassOf(cause) };
+  const errno = errnoCodeOf(cause);
+  return errno === undefined ? fields : { ...fields, errno };
+}
+
+/**
+ * Log fields for a failure this module built, or read back from the child's
+ * stderr: its error code, its `details.reason` when that is one of
+ * {@link SERVICE_FAILURE_REASONS}, an integer exit code, a signal known to the
+ * platform and a known Node error code. Never the message: an early exit's
+ * message is the child's own stderr report (`parseStartupFailure`), which the
+ * output channel already shows scrubbed and which can still quote a path, a
+ * URL or a value the scrubber has no pattern for.
  */
 function describeError(error: DebuggenError): LogFields {
-  return { errorCode: error.code, errorMessage: error.message };
+  const fields: LogFields = { errorCode: error.code };
+  const details = error.details;
+  if (details === undefined) {
+    return fields;
+  }
+  const { reason, exitCode, signal, errno } = details;
+  if (isServiceFailureReason(reason)) {
+    fields.reason = reason;
+  }
+  if (typeof exitCode === 'number' && Number.isInteger(exitCode)) {
+    fields.exitCode = exitCode;
+  }
+  if (isKnownSignal(signal)) {
+    fields.signal = signal;
+  }
+  if (isKnownErrorCode(errno)) {
+    fields.errno = errno;
+  }
+  return fields;
 }
 
 /** "Electron run as Node (/path/to/code)", "Node on PATH (/usr/bin/node)", … */

@@ -9,8 +9,8 @@
  *     reconnect — AAP 0.5.5's "Reconnecting…").
  *   - **A pill per session status**, total over the protocol's eleven statuses.
  *   - **The provider verbatim**, and nothing invented when it is absent.
- *   - **The retry callback**, offered only while the connection is not
- *     established, and invoked with no arguments.
+ *   - **The retry callback**, offered as an enabled control in every state but
+ *     `open`, and invoked exactly once, with no arguments, when activated.
  *   - **The three states**: empty (the connection pill still renders), loading
  *     (badge plus text, never a skeleton) and error (an `ErrorState` for a
  *     `closed` connection with no retry, outside the live region).
@@ -331,11 +331,37 @@ describe('StatusBar retry', () => {
     expect(onRetry).toHaveBeenCalledTimes(1);
   });
 
+  // Every state that is not `open` must offer a retry that actually works: an
+  // enabled control whose activation reaches the parent exactly once, with no
+  // arguments. Existence alone would pass a control that is rendered disabled
+  // or wired to nothing, so each state gets its own spy and its own click.
   it.each([['connecting'], ['reconnecting'], ['closed']] as const)(
-    'offers the retry control while the connection is %s',
-    (state) => {
-      render(<StatusBar connection={state} onRetryConnection={noop} />);
-      expect(screen.getByRole('button', { name: 'Retry connection' })).toBeDefined();
+    'offers an enabled retry control while the connection is %s, and activating it retries once',
+    async (state) => {
+      const user = userEvent.setup();
+      const onRetry = vi.fn<() => void>();
+      render(<StatusBar connection={state} onRetryConnection={onRetry} />);
+
+      // The bar's only button is the retry control.
+      const buttons = screen.getAllByRole('button');
+      expect(buttons).toHaveLength(1);
+      const retry = screen.getByRole('button', { name: 'Retry connection' });
+      expect(buttons[0]).toBe(retry);
+
+      // Enabled by every route a control can be disabled: the native
+      // attribute, the ARIA state and the design system's disabled modifier.
+      expect(retry).toBeInstanceOf(HTMLButtonElement);
+      expect((retry as HTMLButtonElement).disabled).toBe(false);
+      expect(retry.getAttribute('aria-disabled')).not.toBe('true');
+      expect(retry.classList.contains('dg-is-disabled')).toBe(false);
+
+      // Rendering alone never retries.
+      expect(onRetry).not.toHaveBeenCalled();
+
+      await user.click(retry);
+
+      expect(onRetry).toHaveBeenCalledTimes(1);
+      expect(onRetry).toHaveBeenCalledWith();
     },
   );
 

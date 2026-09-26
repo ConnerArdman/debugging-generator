@@ -2946,6 +2946,408 @@ describe('a chain of plan versions over one file', () => {
 
 /*
  * ---------------------------------------------------------------------------
+ * Journal reads along a chain
+ * ---------------------------------------------------------------------------
+ *
+ * A chained patch needs the session's journal for two things: choosing the
+ * parent — the last `applied` record for the file — and walking that parent's
+ * ancestry back to the chain root, whose backup holds the developer's text.
+ * Every listing carries each record in full, diffs included, so the walk runs
+ * over the listing the parent was chosen from instead of a second one, a parent
+ * that is itself the root needs no walk at all, and only a parent the caller
+ * supplied — which nothing has listed — costs the walk a read of its own.
+ *
+ * These cases count the listings through a delegating probe and, by rewriting
+ * what one listing returns, plant each broken ancestry the walk must still
+ * refuse — so reusing the listing is proven to have kept every check the walk
+ * made when it read its own.
+ */
+
+/** A delegating journal that counts its listings. */
+interface ListingProbe {
+  /** The journal to hand the patcher. */
+  readonly journal: ModificationJournal;
+
+  /** How many times `listBySession` has been called through this probe. */
+  listings(): number;
+}
+
+/**
+ * Wraps a journal so every `listBySession` call is counted and, optionally,
+ * what it returns is rewritten.
+ *
+ * Delegating rather than replacing, like {@link recordingFileSystem}: appends
+ * and status moves reach the real journal, so a rewrite changes only what the
+ * patcher *reads* in one attempt — which is how a case plants a broken ancestry
+ * the durable log never holds.
+ */
+function probeListings(
+  inner: ModificationJournal,
+  rewrite: (records: ModificationRecord[]) => Result<ModificationRecord[]> = (records) =>
+    ok(records),
+): ListingProbe {
+  let calls = 0;
+
+  return {
+    journal: {
+      append: (record) => inner.append(record),
+      updateStatus: (id, status, patch) => inner.updateStatus(id, status, patch),
+      listBySession: async (sessionId) => {
+        calls += 1;
+
+        const listed = await inner.listBySession(sessionId);
+
+        return isErr(listed) ? listed : rewrite(listed.value);
+      },
+      listOpen: () => inner.listOpen(),
+    },
+    listings: () => calls,
+  };
+}
+
+/** One chain case's world: a sandbox, its durable journal and its backup store. */
+interface ChainWorld {
+  /** The case's sandbox. */
+  readonly sandbox: Sandbox;
+
+  /** {@link TARGET_FILE} as the developer left it, before any patch. */
+  readonly pristine: Pristine;
+
+  /** The durable journal every plan version's records land in. */
+  readonly journal: FileJournal;
+
+  /** The session's backup store. */
+  readonly backups: BackupStore;
+
+  /**
+   * A patcher for one plan version, reaching the journal through `through` —
+   * {@link ChainWorld.journal} itself, or a probe over it.
+   */
+  patcherFor(planVersion: number, through: ModificationJournal, files?: PatchFileSystem): Patcher;
+}
+
+/** A {@link ChainWorld} over a fresh sandbox. */
+function chainWorld(): ChainWorld {
+  const sandbox = makeSandbox();
+  const backups = createBackupStore({
+    debuggenHome: sandbox.debuggenHome,
+    sessionId: sandbox.sessionId,
+  });
+
+  return {
+    sandbox,
+    pristine: pristineFile(sandbox, TARGET_FILE),
+    journal: openFileJournal(journalPathFor(sandbox)),
+    backups,
+    patcherFor: (planVersion, through, files) =>
+      createPatcher({
+        projectRoot: sandbox.projectRoot,
+        sessionId: sandbox.sessionId,
+        planVersion,
+        backups,
+        journal: through,
+        ...(files !== undefined ? { files } : {}),
+      }),
+  };
+}
+
+/** The backup files the world's session holds, sorted. */
+function sessionBackupsOf(world: ChainWorld): string[] {
+  return readdirSync(join(world.sandbox.debuggenHome, 'backups', world.sandbox.sessionId)).sort();
+}
+
+/**
+ * Asserts a patch recorded `symbol`'s position in the developer's own text —
+ * the line and column of its name in {@link ChainWorld.pristine}, which is what
+ * the root walk exists to supply — and wrote the same numbers into the file.
+ */
+function expectDeveloperPosition(world: ChainWorld, outcome: PatchOutcome, symbol: string): void {
+  const developerText = world.pristine.bytes.toString('utf8');
+  const declaration = new RegExp(`^export function ${symbol}\\(`, 'mu').exec(developerText);
+
+  expect(declaration, symbol).not.toBeNull();
+
+  const nameOffset = (declaration?.index ?? 0) + 'export function '.length;
+  const before = developerText.slice(0, nameOffset);
+  const line = before.split('\n').length;
+  const column = nameOffset - before.lastIndexOf('\n');
+
+  expect({ line: outcome.location.line, column: outcome.location.column }, symbol).toEqual({
+    line,
+    column,
+  });
+  expect(readFileSync(world.pristine.path, 'utf8'), symbol).toContain(
+    `line: ${String(line)}, column: ${String(column)}, symbol: "${symbol}"`,
+  );
+}
+
+/** The first two links of a chain over {@link TARGET_FILE}. */
+interface TwoLinks {
+  /** Plan version 1's outcome: the chain root. */
+  readonly first: PatchOutcome;
+
+  /** Plan version 2's outcome, layered on the root. */
+  readonly second: PatchOutcome;
+}
+
+/** Lays {@link TwoLinks} through the journal directly, unprobed. */
+async function layTwoLinks(world: ChainWorld): Promise<TwoLinks> {
+  const first = appliedOutcome(
+    await world
+      .patcherFor(1, world.journal)
+      .patchTarget({ file: TARGET_FILE, symbol: TARGET_SYMBOL }),
+  );
+  const second = appliedOutcome(
+    await world
+      .patcherFor(2, world.journal)
+      .patchTarget({ file: TARGET_FILE, symbol: 'findConeProfile' }),
+  );
+
+  expect(second.previousRecordId).toBe(first.record.id);
+
+  return { first, second };
+}
+
+/**
+ * Runs plan version 3 over {@link OTHER_SYMBOL} with its one listing
+ * rewritten, and asserts the root walk refused it with `cause` having written
+ * nothing: no project write, no journal row, no new backup, the file's bytes
+ * as plan version 2 left them.
+ *
+ * The refusal is pinned to the walk, not merely to the attempt. It names plan
+ * version 2's record as the parent — so the rewritten listing still chose it —
+ * and `chain-root-unreadable` is produced only once that parent's baseline was
+ * confirmed.
+ */
+async function expectRootWalkRefusal(
+  world: ChainWorld,
+  links: TwoLinks,
+  rewrite: (records: ModificationRecord[]) => ModificationRecord[],
+  cause: string,
+): Promise<DebuggenError> {
+  const beforeThird = readFileSync(world.pristine.path);
+  const backupsBefore = sessionBackupsOf(world);
+  const probe = probeListings(world.journal, (records) => ok(rewrite(records)));
+  const { files, log } = recordingFileSystem();
+
+  const error = refusalOf(
+    await world
+      .patcherFor(3, probe.journal, files)
+      .patchTarget({ file: TARGET_FILE, symbol: OTHER_SYMBOL }),
+  );
+
+  expect(error.code).toBe('INSTRUMENTATION_INSTALL_FAILED');
+  expect(error.details?.reason).toBe('chain-root-unreadable');
+  expect(error.details?.cause).toBe(cause);
+  expect(error.details?.recordId).toBe(links.second.record.id);
+  expect(typeof error.hint).toBe('string');
+  expect(probe.listings()).toBe(1);
+
+  expect(log.writes).toEqual([]);
+  expect(world.journal.rows()).toHaveLength(2);
+  expect(sessionBackupsOf(world)).toEqual(backupsBefore);
+  expectFileBytes(world.pristine.path, beforeThird);
+
+  return error;
+}
+
+describe('journal reads along a chain of plan versions', () => {
+  it('lists the journal once per patch, however many links the chain already has', async () => {
+    // The first patch has no parent, the second's parent is the root itself,
+    // and the third walks one link — over the listing its parent came from,
+    // where it used to list the session a second time.
+    const world = chainWorld();
+    const probe = probeListings(world.journal);
+    const symbols = [TARGET_SYMBOL, 'findConeProfile', OTHER_SYMBOL] as const;
+    const outcomes: PatchOutcome[] = [];
+
+    for (const [index, symbol] of symbols.entries()) {
+      const before = probe.listings();
+      const outcome = appliedOutcome(
+        await world.patcherFor(index + 1, probe.journal).patchTarget({ file: TARGET_FILE, symbol }),
+      );
+
+      expect(probe.listings() - before, symbol).toBe(1);
+      expectDeveloperPosition(world, outcome, symbol);
+      outcomes.push(outcome);
+    }
+
+    expect(world.journal.rows().map((row) => row.previousRecordId)).toEqual([
+      undefined,
+      outcomes[0]?.record.id,
+      outcomes[1]?.record.id,
+    ]);
+
+    // Reading fewer listings changed nothing about what was recorded: the chain
+    // still unwinds to the developer's file exactly.
+    const pass = await reconcileSandbox(world.sandbox, world.pristine.path);
+
+    expect(pass.outcome.status).toBe('clean');
+    expect(pass.outcome.restored).toHaveLength(3);
+    expectFileBytes(world.pristine.path, world.pristine.bytes);
+  });
+
+  it('lists nothing for a supplied parent that is the root, and once for one with ancestors', async () => {
+    const world = chainWorld();
+    const first = appliedOutcome(
+      await world
+        .patcherFor(1, world.journal)
+        .patchTarget({ file: TARGET_FILE, symbol: TARGET_SYMBOL }),
+    );
+
+    // The caller names the root: there is no parent to look up and no
+    // ancestry to walk, so the journal is not read at all.
+    const rootAsParent = probeListings(world.journal);
+    const second = appliedOutcome(
+      await world
+        .patcherFor(2, rootAsParent.journal)
+        .patchTarget(
+          { file: TARGET_FILE, symbol: 'findConeProfile' },
+          { previousRecord: first.record },
+        ),
+    );
+
+    expect(rootAsParent.listings()).toBe(0);
+    expect(second.previousRecordId).toBe(first.record.id);
+    expectDeveloperPosition(world, second, 'findConeProfile');
+
+    // The caller names a parent with an ancestor: nothing has been listed yet,
+    // so the walk lists the session itself — once.
+    const withAncestor = probeListings(world.journal);
+    const third = appliedOutcome(
+      await world
+        .patcherFor(3, withAncestor.journal)
+        .patchTarget(
+          { file: TARGET_FILE, symbol: OTHER_SYMBOL },
+          { previousRecord: second.record },
+        ),
+    );
+
+    expect(withAncestor.listings()).toBe(1);
+    expect(third.previousRecordId).toBe(second.record.id);
+    expectDeveloperPosition(world, third, OTHER_SYMBOL);
+    expect(world.journal.rows().map((row) => row.previousRecordId)).toEqual([
+      undefined,
+      first.record.id,
+      second.record.id,
+    ]);
+  });
+
+  it("returns the journal's own error when the listing a supplied parent needs fails, writing nothing", async () => {
+    const world = chainWorld();
+    const links = await layTwoLinks(world);
+    const beforeThird = readFileSync(world.pristine.path);
+    const backupsBefore = sessionBackupsOf(world);
+    const storeFailure = new DebuggenError('STORE_ERROR', 'The session could not be listed.', {
+      hint: 'The suite refused the listing on purpose.',
+      details: { reason: 'listing-refused' },
+    });
+    const probe = probeListings(world.journal, () => err(storeFailure));
+    const { files, log } = recordingFileSystem();
+
+    const error = refusalOf(
+      await world
+        .patcherFor(3, probe.journal, files)
+        .patchTarget(
+          { file: TARGET_FILE, symbol: OTHER_SYMBOL },
+          { previousRecord: links.second.record },
+        ),
+    );
+
+    expect(error).toBe(storeFailure);
+    expect(probe.listings()).toBe(1);
+    expect(log.writes).toEqual([]);
+    expect(world.journal.rows()).toHaveLength(2);
+    expect(sessionBackupsOf(world)).toEqual(backupsBefore);
+    expectFileBytes(world.pristine.path, beforeThird);
+  });
+
+  it('refuses a walk whose root is missing from the listing', async () => {
+    const world = chainWorld();
+    const links = await layTwoLinks(world);
+
+    const error = await expectRootWalkRefusal(
+      world,
+      links,
+      (records) => records.filter((row) => row.id !== links.first.record.id),
+      'chain-link-missing',
+    );
+
+    expect(error.details?.missingRecordId).toBe(links.first.record.id);
+  });
+
+  it('refuses a walk whose root links back to the parent', async () => {
+    // The root still names this file and is still `applied`, so the parent
+    // lookup passes over it to plan version 2's record exactly as before.
+    const world = chainWorld();
+    const links = await layTwoLinks(world);
+
+    const error = await expectRootWalkRefusal(
+      world,
+      links,
+      (records) =>
+        records.map((row) =>
+          row.id === links.first.record.id
+            ? { ...row, previousRecordId: links.second.record.id }
+            : row,
+        ),
+      'chain-cycle',
+    );
+
+    expect(error.details?.linkRecordId).toBe(links.second.record.id);
+  });
+
+  it('refuses a walk whose root describes another file', async () => {
+    // The parent lookup skips a record of another file, so plan version 2's
+    // record is still the parent; the walk then reaches that record by id.
+    const world = chainWorld();
+    const links = await layTwoLinks(world);
+
+    const error = await expectRootWalkRefusal(
+      world,
+      links,
+      (records) =>
+        records.map((row) =>
+          row.id === links.first.record.id ? { ...row, file: CHAIN_FILE } : row,
+        ),
+      'chain-link-other-file',
+    );
+
+    expect(error.details?.linkRecordId).toBe(links.first.record.id);
+  });
+
+  it("refuses a root backup whose bytes no longer hash to the root's original", async () => {
+    // The listing is untouched; the root's backup keeps its name and mode but
+    // holds other bytes. The parent's own backup — the one the baseline check
+    // reads — is intact, so only the walk's digest check can refuse this.
+    const world = chainWorld();
+    const links = await layTwoLinks(world);
+    const rootBackup = links.first.record.backupPath;
+    const mode = permissionsOf(rootBackup);
+
+    expect(sha256Hex(readFileSync(rootBackup))).toBe(world.pristine.hash);
+
+    writeFileSync(
+      rootBackup,
+      Buffer.from(`${world.pristine.bytes.toString('utf8')}// not the developer's text\n`, 'utf8'),
+    );
+
+    expect(permissionsOf(rootBackup)).toBe(mode);
+    expect(sha256Hex(readFileSync(rootBackup))).not.toBe(world.pristine.hash);
+
+    const error = await expectRootWalkRefusal(
+      world,
+      links,
+      (records) => records,
+      'backup-digest-mismatch',
+    );
+
+    expect(error.details?.rootRecordId).toBe(links.first.record.id);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
  * Targets and requests the sequence refuses
  * ---------------------------------------------------------------------------
  *

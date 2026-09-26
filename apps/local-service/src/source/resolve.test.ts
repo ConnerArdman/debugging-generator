@@ -20,6 +20,12 @@
  * replaced by a guard that fails the test if anything reaches it, so no case
  * can touch the network.
  *
+ * The one real collaborator is the journal's evidence: the patch route only
+ * keeps a claim whose exact `meta` literal a record's diff adds, so the diffs
+ * the patch cases corroborate against are rendered by `@debuggen/instrumentation`'s
+ * own `createPatcher` over a temporary copy of the invented modules — the bytes
+ * a live session journals, not a restatement of them.
+ *
  * Expected confidences are always read from `DEFAULT_RESOLUTION_CONFIDENCE`
  * and expected precedence from `SOURCE_RESOLVED_BY` sorted by it, so a change
  * to the shared table moves the module and this suite together; the kinds and
@@ -29,11 +35,11 @@
  * demo application.
  */
 
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Mock } from 'vitest';
 
 import {
@@ -55,19 +61,27 @@ import type {
   CodeQueries,
   CodeSymbolMatch,
   DbDriver,
+  FetchSourceMapOptions,
   RouteEntry,
   RouteMap,
   RouteQueryResult,
   SourceMapCache,
+  SourceMapLookup,
+  fetchSourceMap,
   resolveStack,
 } from '@debuggen/code-analysis';
 import {
   OPEN_MODIFICATION_STATUSES,
+  PATCH_DIFF_TRUNCATION_NOTICE,
   PATCH_META_KEYS,
+  buildSpanMetaLiteral,
+  createBackupStore,
   createModificationRecord,
+  createPatcher,
   parseSelectedTarget,
 } from '@debuggen/instrumentation';
 import type {
+  ModificationJournal,
   ModificationRecord,
   ModificationStatus,
   SelectedTarget,
@@ -101,6 +115,7 @@ import {
   INTERACTION_ATTRIBUTE_KEYS,
   KIND_ATTRIBUTE_KEYS,
   MAX_CALLER_LOOKUP_HOPS,
+  MAX_PREVIEW_LENGTH,
   QUERY_KINDS,
   RENDER_ATTRIBUTE_KEYS,
   RENDER_KINDS,
@@ -108,18 +123,26 @@ import {
   ROUTE_HANDLER_ATTRIBUTE_KEYS,
   STATE_KINDS,
   TELEMETRY_KINDS,
+  TRUNCATION_SUFFIX,
   allowedTiersFor,
   parseTelemetryEvent,
+  truncate,
 } from '@debuggen/telemetry';
 import type { TelemetryEvent, TelemetryKind, TelemetryStatus } from '@debuggen/telemetry';
 
 import {
+  CORROBORATION_CACHE_TTL_MS,
+  SOURCE_MAP_FAILURE_TTL_MS,
+  SOURCE_MAP_SCOPE_IDLE_MS,
   SOURCE_RESOLUTION_MISS_REASONS,
   SOURCE_RESOLVE_LIMITS,
   SOURCE_ROUTE_ORDER,
+  createCorroborationCache,
+  createSourceMapScopes,
   createSourceResolver,
 } from './resolve.js';
 import type {
+  ModificationCorroboration,
   ModificationCorroborationPort,
   ParentEventPort,
   ResolvableEvent,
@@ -361,12 +384,201 @@ function makeEvent(spec: EventSpec): TelemetryEvent {
   );
 }
 
-/** A modification record built by the instrumentation package's own constructor. */
+/* -------------------------------------------------------------------------------------------------
+ * The real patch — what a live session's journal holds for the invented modules
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * The invented module declaring `PROJECT.fn`. The declaration's name starts at
+ * line 21, column 23 (`export async function ` is 22 characters), which is
+ * where the patcher anchors its recorded position.
+ */
+const GAUGES_MODULE: string = [
+  '/** Readings for the orbit console gauges. Invented for this suite. */',
+  '',
+  'export interface GaugeSample {',
+  '  readonly gaugeId: string;',
+  '  readonly value: number;',
+  '}',
+  '',
+  '/** The smallest reading a gauge reports. */',
+  'export const GAUGE_FLOOR = 0;',
+  '',
+  '/** The largest reading a gauge reports. */',
+  'export const GAUGE_CEILING = 100;',
+  '',
+  '/** Clamps a raw reading into the gauge range. */',
+  'export function clampReading(value: number): number {',
+  '  return Math.min(GAUGE_CEILING, Math.max(GAUGE_FLOOR, value));',
+  '}',
+  '',
+  '// The reading every gauge panel renders.',
+  '/** Averages the samples of one gauge into a single reading. */',
+  `export async function ${PROJECT.fn.name}(samples: readonly GaugeSample[]): Promise<number> {`,
+  '  const total = samples.reduce((sum, sample) => sum + sample.value, 0);',
+  '  return clampReading(samples.length === 0 ? GAUGE_FLOOR : total / samples.length);',
+  '}',
+  '',
+].join('\n');
+
+/**
+ * A declaration whose name is longer than the span helpers' symbol bound
+ * (`MAX_PREVIEW_LENGTH`) but inside the patcher's own, so the stamp a helper
+ * sends for it carries a bounded symbol.
+ */
+const SERIES_FN: Declaration = {
+  name: 'blendGaugeReadingSeriesAcrossOrbitalWindows'.repeat(4),
+  file: 'src/lib/gauge-series.ts',
+  line: 2,
+  column: 17,
+};
+
+/** The invented module declaring {@link SERIES_FN} at line 2, column 17. */
+const SERIES_MODULE: string = [
+  '/** Series blending for the orbit console. Invented for this suite. */',
+  `export function ${SERIES_FN.name}(values: readonly number[]): number {`,
+  '  return values.reduce((sum, value) => sum + value, 0);',
+  '}',
+  '',
+].join('\n');
+
+/** What the real patcher journaled for one declaration. */
+interface RealPatch {
+  /** The record exactly as the patcher left it: `applied`, carrying the diff it rendered. */
+  readonly record: ModificationRecord;
+  /** The position the patcher recorded — the four values its `meta` literal carries. */
+  readonly location: SourceLocation;
+}
+
+/** The real patches of {@link GAUGES_MODULE} and {@link SERIES_MODULE}, set once for the file. */
+let patches: { readonly gauges: RealPatch; readonly series: RealPatch } | undefined;
+
+/** Where {@link patches} were produced; removed after the file. */
+let patchSandbox: string | undefined;
+
+/** The real patches; a case that runs before they exist is a broken suite, not a skip. */
+function realPatches(): { readonly gauges: RealPatch; readonly series: RealPatch } {
+  if (patches === undefined) {
+    throw new Error('the real patch fixtures are produced in beforeAll');
+  }
+  return patches;
+}
+
+/** The `ModificationJournal` port in memory: the service implements it over `node:sqlite`. */
+function memoryJournal(): ModificationJournal {
+  const rows: ModificationRecord[] = [];
+  return {
+    append: (record) => {
+      rows.push(record);
+      return Promise.resolve(ok(record));
+    },
+    updateStatus: (id, status, patch) => {
+      const index = rows.findIndex((row) => row.id === id);
+      const current = rows[index];
+      if (current === undefined) {
+        return Promise.resolve(
+          err(new DebuggenError('STORE_ERROR', 'No modification record has that id.')),
+        );
+      }
+      const updated: ModificationRecord = { ...current, ...patch, status };
+      rows[index] = updated;
+      return Promise.resolve(ok(updated));
+    },
+    listBySession: (sessionId) =>
+      Promise.resolve(ok(rows.filter((row) => row.sessionId === sessionId))),
+    listOpen: () => Promise.resolve(ok(rows.filter((row) => row.status !== 'reverted'))),
+  };
+}
+
+/**
+ * Patches both invented modules with `createPatcher` — the crash-safe write
+ * sequence a session's installer runs — inside a temporary project, and keeps
+ * the journaled records and recorded positions.
+ */
+async function producePatches(sandbox: string): Promise<{
+  readonly gauges: RealPatch;
+  readonly series: RealPatch;
+}> {
+  const projectRoot = join(sandbox, 'project');
+  const debuggenHome = join(sandbox, 'home');
+  mkdirSync(debuggenHome, { recursive: true, mode: 0o700 });
+  for (const [file, text] of [
+    [PROJECT.fn.file, GAUGES_MODULE],
+    [SERIES_FN.file, SERIES_MODULE],
+  ] as const) {
+    mkdirSync(dirname(join(projectRoot, file)), { recursive: true });
+    writeFileSync(join(projectRoot, file), text);
+  }
+
+  const patcher = createPatcher({
+    projectRoot,
+    sessionId: SESSION,
+    planVersion: 1,
+    backups: createBackupStore({ debuggenHome, sessionId: SESSION }),
+    journal: memoryJournal(),
+  });
+  const patch = async (declaration: Declaration): Promise<RealPatch> => {
+    const outcome = await patcher.patchTarget({
+      file: declaration.file,
+      symbol: declaration.name,
+    });
+    if (!outcome.ok) {
+      throw new Error(`the real patcher refused ${declaration.file}: ${outcome.error.code}`);
+    }
+    return { record: outcome.value.record, location: outcome.value.location };
+  };
+  return { gauges: await patch(PROJECT.fn), series: await patch(SERIES_FN) };
+}
+
+beforeAll(async () => {
+  patchSandbox = realpathSync(mkdtempSync(join(tmpdir(), 'debuggen-resolve-patch-')));
+  patches = await producePatches(patchSandbox);
+}, 60_000);
+
+afterAll(() => {
+  if (patchSandbox !== undefined) {
+    rmSync(patchSandbox, { recursive: true, force: true });
+    patchSandbox = undefined;
+  }
+});
+
+/** The `meta` literal the patcher writes for `declaration`, from its own builder. */
+function metaLiteral(declaration: Declaration): string {
+  return unwrapOk(
+    buildSpanMetaLiteral({
+      file: declaration.file,
+      line: declaration.line,
+      column: declaration.column,
+      symbol: declaration.name,
+    }),
+    'patch meta literal',
+  );
+}
+
+/** The added lines of a unified diff's hunks, without their `+` prefix. */
+function addedLines(diff: string): string[] {
+  const lines = diff.split('\n');
+  const firstHunk = lines.findIndex((line) => line.startsWith('@@'));
+  return lines
+    .slice(firstHunk < 0 ? lines.length : firstHunk)
+    .filter((line) => line.startsWith('+'))
+    .map((line) => line.slice(1));
+}
+
+/**
+ * A modification record built by the instrumentation package's own constructor.
+ *
+ * A record naming `PROJECT.fn`'s file carries, by default, the unified diff the
+ * real patcher journaled for it, so it proves that declaration's exact
+ * position the way a live session's journal does; a record naming any other
+ * file carries an empty diff and proves nothing.
+ */
 function modification(
   file: string,
   status: ModificationStatus,
   appliedAt: number = BASE_TIME - 1_000,
   sessionId: string = SESSION,
+  diff: string = file === PROJECT.fn.file ? realPatches().gauges.record.diff : '',
 ): ModificationRecord {
   const originalHash = 'a'.repeat(64);
   return unwrapOk(
@@ -378,7 +590,7 @@ function modification(
         originalHash,
         backupPath: `/tmp/debuggen-backups/${sessionId}/${originalHash}`,
         instrumentedHash: 'b'.repeat(64),
-        diff: '',
+        diff,
         status,
       },
       { now: () => appliedAt },
@@ -655,15 +867,24 @@ function fakeRouteMap(entries: readonly RouteEntry[]): {
   return { routeMap: { entries, resolve }, resolve };
 }
 
-/** The modification journal, answering synchronously like the SQLite repository does. */
+/**
+ * The modification journal, answering synchronously like the SQLite repository
+ * does: the session's records for the metadata read, and a session's records
+ * of one stored file for the patch-evidence read.
+ */
 function fakeJournal(records: readonly ModificationRecord[]): {
   readonly port: ModificationCorroborationPort;
   readonly listBySession: Mock<ModificationCorroborationPort['listBySession']>;
+  readonly listPatchEvidence: Mock<ModificationCorroborationPort['listPatchEvidence']>;
 } {
   const listBySession = vi.fn<ModificationCorroborationPort['listBySession']>((sessionId) =>
     ok(records.filter((record) => record.sessionId === sessionId)),
   );
-  return { port: { listBySession }, listBySession };
+  const listPatchEvidence = vi.fn<ModificationCorroborationPort['listPatchEvidence']>(
+    (sessionId, file) =>
+      ok(records.filter((record) => record.sessionId === sessionId && record.file === file)),
+  );
+  return { port: { listBySession, listPatchEvidence }, listBySession, listPatchEvidence };
 }
 
 /** The telemetry store's parent-span lookup, answering asynchronously. */
@@ -909,6 +1130,18 @@ async function unresolved(
   return result.value;
 }
 
+/** The well-formed outcome of a call that must succeed, resolved or not. */
+async function settled(
+  pending: Promise<Result<SourceResolution, DebuggenError>>,
+): Promise<SourceResolution> {
+  const result = await pending;
+  if (!result.ok) {
+    throw new Error(`expected Ok, got Err ${result.error.code}`);
+  }
+  expectWellFormed(result.value);
+  return result.value;
+}
+
 /** The `Err` of a call that must fail with a coded `DebuggenError`, never a throw. */
 async function failed<T>(pending: Promise<Result<T, DebuggenError>>): Promise<DebuggenError> {
   const result = await pending;
@@ -986,6 +1219,30 @@ describe('fixture vocabulary', () => {
     expect(project.graph.nodesByKind('db-call')).toHaveLength(project.dbCalls.length);
     expect(modification(PROJECT.fn.file, 'applied').file).toBe(PROJECT.fn.file);
   });
+
+  it('patches the invented modules with the real patcher, whose diff adds the exact meta literal', () => {
+    for (const [declaration, patch] of [
+      [PROJECT.fn, realPatches().gauges],
+      [SERIES_FN, realPatches().series],
+    ] as const) {
+      // The recorded position is the declaration the other fixtures place the function at…
+      expect(patch.location).toMatchObject({
+        file: declaration.file,
+        line: declaration.line,
+        column: declaration.column,
+        symbol: declaration.name,
+        resolvedBy: ROUTE.patch,
+      });
+      expect(patch.record.status).toBe('applied');
+      expect(patch.record.file).toBe(declaration.file);
+      // …and the journaled diff adds, byte for byte, the literal the patcher's own builder emits.
+      const added = addedLines(patch.record.diff).filter((line) =>
+        line.includes(metaLiteral(declaration)),
+      );
+      expect(added).toHaveLength(1);
+    }
+    expect(SERIES_FN.name.length).toBeGreaterThan(MAX_PREVIEW_LENGTH);
+  });
 });
 
 /* -------------------------------------------------------------------------------------------------
@@ -1048,12 +1305,14 @@ describe('SOURCE_RESOLUTION_MISS_REASONS', () => {
       'symbol-not-found',
       'ambiguous',
       'not-corroborated',
+      'kind-not-patchable',
       'no-initiator-stack',
       'dev-server-unknown',
       'unmapped-frame',
       'outside-project',
       'invalid-location',
       'aborted',
+      'budget-expired',
     ] as const) {
       expect(reason(value)).toBe(value);
     }
@@ -1310,6 +1569,255 @@ describe('SourceResolver.resolveEvent', () => {
       });
       expect(journal.listBySession).toHaveBeenCalledWith(SESSION);
       expect(journal.listBySession).not.toHaveBeenCalledWith(OTHER_SESSION);
+    });
+
+    /** The stamp a span helper sends for a real patch: its recorded position, no end line. */
+    const helperStamp = (patch: RealPatch): SourceLocation =>
+      stampedLocation(ROUTE.patch, patch.location, patch.location.symbol);
+
+    /**
+     * Claims naming the file the session really instrumented, each with one
+     * field the patch did not write — what a page script can hand the public
+     * span helper as `meta`.
+     */
+    const inventedClaims: readonly (readonly [field: string, claim: Declaration])[] = [
+      ['line', { ...PROJECT.fn, line: 999 }],
+      ['column', { ...PROJECT.fn, column: 1 }],
+      ['symbol', { ...PROJECT.fn, name: 'inventedGaugeReading' }],
+    ];
+
+    const notCorroborated = {
+      route: ROUTE.patch,
+      outcome: 'rejected',
+      reason: reason('not-corroborated'),
+    } as const;
+
+    it('corroborates the stamp a span helper sends against the record the real patcher journaled', async () => {
+      const { gauges } = realPatches();
+      const stamp = helperStamp(gauges);
+      const outcome = await resolved(
+        resolverFor(standardProject(), {
+          modifications: fakeJournal([gauges.record]).port,
+        }).resolveEvent(patchedFunction({ source: stamp })),
+      );
+
+      expect(stamp).toEqual(patchStamp(PROJECT.fn));
+      expect(outcome.route).toBe(ROUTE.patch);
+      expect(outcome.location).toEqual(stamp);
+      expect(outcome.attempted).toEqual([{ route: ROUTE.patch, outcome: 'hit' }]);
+    });
+
+    it('refuses a stamp on the instrumented file with an invented line, column or symbol, and falls through', async () => {
+      for (const [field, claim] of inventedClaims) {
+        const project = standardProject();
+        const outcome = await resolved(
+          resolverFor(project, {
+            modifications: fakeJournal([realPatches().gauges.record]).port,
+          }).resolveEvent(patchedFunction({ source: patchStamp(claim) })),
+        );
+
+        expect(outcome.attempted[0], field).toEqual(notCorroborated);
+        // The later route computes its own location from the index; nothing of the claim survives.
+        expect(outcome.route, field).toBe(ROUTE.codeGraph);
+        expect(outcome.location, field).toEqual(project.fnSymbol.location);
+        expect(outcome.location.confidence, field).not.toBe(DEFAULT_RESOLUTION_CONFIDENCE.patch);
+      }
+    });
+
+    it('holds forwarded meta attributes to the same exact position and symbol', async () => {
+      for (const [field, claim] of inventedClaims) {
+        const project = standardProject();
+        const outcome = await settled(
+          resolverFor(project, {
+            modifications: fakeJournal([realPatches().gauges.record]).port,
+          }).resolveEvent(
+            makeEvent({
+              kind: KIND.function,
+              name: PROJECT.fn.name,
+              attributes: {
+                [META_FILE]: claim.file,
+                [META_LINE]: claim.line,
+                [META_COLUMN]: claim.column,
+                [META_SYMBOL]: claim.name,
+              },
+            }),
+          ),
+        );
+
+        expect(outcome.attempted[0], field).toEqual(notCorroborated);
+        // An invented position still names the indexed symbol, which the code graph places
+        // itself; an invented symbol names nothing the index holds, so no location is kept.
+        if (field === 'symbol') {
+          expect(outcome.status).toBe('unresolved');
+        } else {
+          expect(outcome).toMatchObject({
+            status: 'resolved',
+            route: ROUTE.codeGraph,
+            location: project.fnSymbol.location,
+          });
+        }
+      }
+    });
+
+    it('refuses a claim checked against a diff clipped before its literal, and keeps one clipped after it', async () => {
+      const diff = realPatches().gauges.record.diff;
+      const literal = metaLiteral(PROJECT.fn);
+      const at = diff.indexOf(literal);
+      expect(at).toBeGreaterThan(0);
+      const clipped = (end: number): ModificationRecord =>
+        modification(
+          PROJECT.fn.file,
+          'applied',
+          BASE_TIME - 1_000,
+          SESSION,
+          `${diff.slice(0, end)}${PATCH_DIFF_TRUNCATION_NOTICE}`,
+        );
+
+      const project = standardProject();
+      const cutInside = await resolved(
+        resolverFor(project, {
+          modifications: fakeJournal([clipped(at + Math.floor(literal.length / 2))]).port,
+        }).resolveEvent(patchedFunction()),
+      );
+      expect(cutInside.attempted[0]).toEqual(notCorroborated);
+      expect(cutInside.route).toBe(ROUTE.codeGraph);
+      expect(cutInside.location).toEqual(project.fnSymbol.location);
+
+      const cutAfter = await resolved(
+        resolverFor(standardProject(), {
+          modifications: fakeJournal([clipped(at + literal.length)]).port,
+        }).resolveEvent(patchedFunction()),
+      );
+      expect(cutAfter.route).toBe(ROUTE.patch);
+    });
+
+    it('never reads the literal off a line the diff does not add', async () => {
+      const diff = realPatches().gauges.record.diff;
+      // The same diff with every added line turned into context: the literal is
+      // still in the text, but no longer written by the patch.
+      const asContext = diff
+        .split('\n')
+        .map((line) =>
+          line.startsWith('+') && !line.startsWith('+++') ? ` ${line.slice(1)}` : line,
+        )
+        .join('\n');
+      expect(asContext).toContain(metaLiteral(PROJECT.fn));
+
+      const outcome = await resolved(
+        resolverFor(standardProject(), {
+          modifications: fakeJournal([
+            modification(PROJECT.fn.file, 'applied', BASE_TIME - 1_000, SESSION, asContext),
+          ]).port,
+        }).resolveEvent(patchedFunction()),
+      );
+      expect(outcome.attempted[0]).toEqual(notCorroborated);
+      expect(outcome.route).toBe(ROUTE.codeGraph);
+    });
+
+    it('refuses a patch claim on a kind no patch emits, before reading the journal', async () => {
+      const journal = fakeJournal([modification(PROJECT.fn.file, 'applied')]);
+      const resolver = resolverFor(standardProject(), { modifications: journal.port });
+
+      const stampedRender = await resolved(
+        resolver.resolveEvent(
+          makeEvent({
+            kind: KIND.render,
+            attributes: { [ATTR.component]: PROJECT.component.name },
+            source: patchStamp(PROJECT.fn),
+          }),
+        ),
+      );
+      const metaOnRequest = await resolved(
+        resolver.resolveEvent(
+          makeEvent({
+            kind: KIND.httpServer,
+            attributes: {
+              [ATTR.nextRoute]: PROJECT.routePath,
+              [META_FILE]: PROJECT.fn.file,
+              [META_LINE]: PROJECT.fn.line,
+              [META_COLUMN]: PROJECT.fn.column,
+              [META_SYMBOL]: PROJECT.fn.name,
+            },
+          }),
+        ),
+      );
+
+      for (const outcome of [stampedRender, metaOnRequest]) {
+        expect(outcome.attempted[0]).toEqual({
+          route: ROUTE.patch,
+          outcome: 'rejected',
+          reason: reason('kind-not-patchable'),
+        });
+      }
+      expect(stampedRender.route).toBe(ROUTE.codeGraph);
+      expect(metaOnRequest.route).toBe(ROUTE.routeMap);
+      expect(journal.listBySession).not.toHaveBeenCalled();
+    });
+
+    it('lets a reverted record applied before the span corroborate only the exact claim', async () => {
+      const appliedAt = BASE_TIME + 10_000;
+      const journal = fakeJournal([modification(PROJECT.fn.file, 'reverted', appliedAt)]);
+      const resolver = resolverFor(standardProject(), { modifications: journal.port });
+
+      const exact = await resolved(
+        resolver.resolveEvent(patchedFunction({ startTime: appliedAt + 5 })),
+      );
+      expect(exact.route).toBe(ROUTE.patch);
+
+      for (const [field, claim] of inventedClaims) {
+        const invented = await resolved(
+          resolver.resolveEvent(
+            patchedFunction({ startTime: appliedAt + 5, source: patchStamp(claim) }),
+          ),
+        );
+        expect(invented.attempted[0], field).toEqual(notCorroborated);
+        expect(invented.route, field).toBe(ROUTE.codeGraph);
+      }
+    });
+
+    it('never keeps a claimed end line, which no patch meta carries', async () => {
+      const stamp = unwrapOk(
+        parseSourceLocation({ ...patchStamp(PROJECT.fn), endLine: PROJECT.fn.line + 40 }),
+        'stamp with an end line',
+      );
+      const outcome = await resolved(
+        resolverFor(standardProject(), {
+          modifications: fakeJournal([modification(PROJECT.fn.file, 'applied')]).port,
+        }).resolveEvent(patchedFunction({ source: stamp })),
+      );
+
+      expect(outcome.route).toBe(ROUTE.patch);
+      expect(outcome.location).toEqual(patchStamp(PROJECT.fn));
+      expect(outcome.location).not.toHaveProperty('endLine');
+    });
+
+    it('corroborates a symbol a span helper bounded by its kept prefix, and no shorter or different one', async () => {
+      const { series } = realPatches();
+      const resolver = resolverFor(standardProject(), {
+        modifications: fakeJournal([series.record]).port,
+      });
+      const claiming = (symbol: string): TelemetryEvent =>
+        makeEvent({
+          kind: KIND.function,
+          name: 'blendGaugeReadingSeries',
+          source: stampedLocation(ROUTE.patch, SERIES_FN, symbol),
+        });
+
+      // The bound both span helpers apply, from the telemetry package itself.
+      const bounded = truncate(SERIES_FN.name, MAX_PREVIEW_LENGTH);
+      expect(bounded.endsWith(TRUNCATION_SUFFIX)).toBe(true);
+      for (const symbol of [SERIES_FN.name, bounded]) {
+        const outcome = await resolved(resolver.resolveEvent(claiming(symbol)));
+        expect(outcome.route).toBe(ROUTE.patch);
+        expect(outcome.location.symbol).toBe(symbol);
+      }
+
+      const altered = `X${bounded.slice(1)}`;
+      const tooShort = `${SERIES_FN.name.slice(0, 8)}${TRUNCATION_SUFFIX}`;
+      for (const symbol of [altered, tooShort]) {
+        const outcome = await unresolved(resolver.resolveEvent(claiming(symbol)));
+        expect(outcome.attempted[0], symbol).toEqual(notCorroborated);
+      }
     });
   });
 
@@ -2274,6 +2782,7 @@ describe('faults', () => {
         modifications: {
           listBySession: () =>
             err(new DebuggenError('STORE_ERROR', 'The modification journal could not be read.')),
+          listPatchEvidence: () => ok([]),
         },
       }).resolveEvent(patched()),
     );
@@ -2285,6 +2794,7 @@ describe('faults', () => {
           listBySession: () => {
             throw new Error('journal handle closed');
           },
+          listPatchEvidence: () => ok([]),
         },
       }).resolveEvent(patched()),
     );
@@ -2682,6 +3192,7 @@ describe('SourceResolver.resolveEvents', () => {
       resolverFor(standardProject(), {
         modifications: {
           listBySession: () => err(new DebuggenError('STORE_ERROR', 'The journal is closed.')),
+          listPatchEvidence: () => ok([]),
         },
       }).resolveEvents([patched]),
     );
@@ -2698,6 +3209,900 @@ describe('SourceResolver.resolveEvents', () => {
       resolverFor(standardProject()).resolveEvents([{ ...patched, traceId: 'not-a-trace-id' }]),
     );
     expect(onlyMalformed.size).toBe(0);
+  });
+});
+
+describe('SourceResolver.resolveEvents — the worker pool and the budget', () => {
+  /** A request span whose initiator stack only the source-map route can place. */
+  const fetchEvent = (): TelemetryEvent =>
+    makeEvent({ kind: KIND.fetch, attributes: { [ATTR.initiator]: CHUNK_STACK } });
+
+  /**
+   * A stack resolver that answers `locations` a macrotask later, recording how
+   * many of its calls were outstanding at once.
+   */
+  function overlappingStack(locations: readonly SourceLocation[]) {
+    let inFlight = 0;
+    let peak = 0;
+    const impl = vi.fn<typeof resolveStack>(async () => {
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      await new Promise<void>((resolve) => {
+        setImmediate(resolve);
+      });
+      inFlight -= 1;
+      return [...locations];
+    });
+    return { impl, peak: (): number => peak };
+  }
+
+  /** A stack resolver that holds every call until the signal it was handed aborts. */
+  function heldStack() {
+    const signals: AbortSignal[] = [];
+    const impl = vi.fn<typeof resolveStack>(
+      (_stack, options) =>
+        new Promise((resolve) => {
+          const signal = options.signal;
+          if (signal === undefined) {
+            resolve([]);
+            return;
+          }
+          signals.push(signal);
+          signal.addEventListener(
+            'abort',
+            () => {
+              resolve([]);
+            },
+            { once: true },
+          );
+        }),
+    );
+    return { impl, signals };
+  }
+
+  /** The fields of the one batch summary a resolver logged. */
+  function batchSummary(entries: readonly LogEntry[]): LogFields | undefined {
+    return entries.find((entry) => entry.message === 'source resolution batch finished')?.fields;
+  }
+
+  it('keeps at most maxConcurrentEvents events in flight and still answers in input order', async () => {
+    const events = Array.from({ length: 10 }, fetchEvent);
+
+    const pooled = overlappingStack([mapped(PROJECT.component.file)]);
+    const page = await located(
+      resolverFor(standardProject(), {
+        resolveStackImpl: pooled.impl,
+        devServerOrigin: DEV_ORIGIN,
+      }).resolveEvents(events),
+    );
+    expect(pooled.impl).toHaveBeenCalledTimes(events.length);
+    expect(pooled.peak()).toBe(SOURCE_RESOLVE_LIMITS.maxConcurrentEvents);
+    expect([...page.keys()]).toEqual(events.map((event) => event.id));
+
+    const narrowed = overlappingStack([]);
+    await located(
+      resolverFor(standardProject(), {
+        resolveStackImpl: narrowed.impl,
+        devServerOrigin: DEV_ORIGIN,
+        limits: { maxConcurrentEvents: 2 },
+      }).resolveEvents(events),
+    );
+    expect(narrowed.peak()).toBe(2);
+
+    const raised = overlappingStack([]);
+    await located(
+      resolverFor(standardProject(), {
+        resolveStackImpl: raised.impl,
+        devServerOrigin: DEV_ORIGIN,
+        limits: { maxConcurrentEvents: SOURCE_RESOLVE_LIMITS.maxConcurrentEvents * 4 },
+      }).resolveEvents(events),
+    );
+    expect(raised.peak()).toBe(SOURCE_RESOLVE_LIMITS.maxConcurrentEvents);
+  });
+
+  it('shares one journal read between the concurrent events of a batch', async () => {
+    const journal = fakeJournal([modification(PROJECT.fn.file, 'applied')]);
+    const events = Array.from({ length: 6 }, () =>
+      makeEvent({ kind: KIND.function, source: patchStamp(PROJECT.fn) }),
+    );
+
+    const page = await located(
+      resolverFor(standardProject(), { modifications: journal.port }).resolveEvents(events),
+    );
+
+    expect(page.size).toBe(events.length);
+    expect(journal.listBySession).toHaveBeenCalledTimes(1);
+    expect(journal.listBySession).toHaveBeenCalledWith(SESSION);
+  });
+
+  it('stops starting events when the budget fires and answers Ok with the locations found so far', async () => {
+    const entries: LogEntry[] = [];
+    const budget = new AbortController();
+    const events = Array.from({ length: 5 }, fetchEvent);
+    let calls = 0;
+    const resolveStackImpl = vi.fn<typeof resolveStack>(() => {
+      calls += 1;
+      if (calls === 2) {
+        budget.abort();
+      }
+      return Promise.resolve([mapped(PROJECT.component.file)]);
+    });
+
+    const page = await located(
+      resolverFor(standardProject(), {
+        resolveStackImpl,
+        devServerOrigin: DEV_ORIGIN,
+        limits: { maxConcurrentEvents: 1 },
+        logger: capturingLogger(entries),
+      }).resolveEvents(events, { budget: budget.signal }),
+    );
+
+    // The second stack answered after the budget fired, and its answer is kept.
+    expect([...page.keys()]).toEqual(events.slice(0, 2).map((event) => event.id));
+    expect(resolveStackImpl).toHaveBeenCalledTimes(2);
+    expect(batchSummary(entries)).toMatchObject({
+      resolved: 2,
+      unresolved: 3,
+      budgetExpired: 3,
+    });
+  });
+
+  it('lets work in flight see the budget, and counts the events it cut short as unresolved', async () => {
+    const entries: LogEntry[] = [];
+    const budget = new AbortController();
+    const held = heldStack();
+    const events = Array.from({ length: 6 }, fetchEvent);
+
+    const pending = resolverFor(standardProject(), {
+      resolveStackImpl: held.impl,
+      devServerOrigin: DEV_ORIGIN,
+      logger: capturingLogger(entries),
+    }).resolveEvents(events, { budget: budget.signal });
+    await vi.waitFor(() => {
+      expect(held.impl).toHaveBeenCalledTimes(SOURCE_RESOLVE_LIMITS.maxConcurrentEvents);
+    });
+    budget.abort();
+
+    const page = await located(pending);
+    expect(page.size).toBe(0);
+    expect(held.impl).toHaveBeenCalledTimes(SOURCE_RESOLVE_LIMITS.maxConcurrentEvents);
+    expect(held.signals.every((signal) => signal.aborted)).toBe(true);
+    expect(batchSummary(entries)).toMatchObject({
+      resolved: 0,
+      unresolved: events.length,
+      budgetExpired: events.length,
+    });
+  });
+
+  it('still fails the batch when a cancelling signal fires, budget or not', async () => {
+    const cancel = new AbortController();
+    const budget = new AbortController();
+    const held = heldStack();
+
+    const pending = resolverFor(standardProject(), {
+      resolveStackImpl: held.impl,
+      devServerOrigin: DEV_ORIGIN,
+    }).resolveEvents([fetchEvent(), fetchEvent()], {
+      signal: cancel.signal,
+      budget: budget.signal,
+    });
+    await vi.waitFor(() => {
+      expect(held.impl).toHaveBeenCalledTimes(2);
+    });
+    cancel.abort();
+    budget.abort();
+
+    const error = await failed(pending);
+    expect(error.details).toMatchObject({ reason: reason('aborted') });
+  });
+
+  it('answers a single event whose budget already fired as budget-expired, consulting nothing', async () => {
+    const project = standardProject();
+    const journal = fakeJournal([modification(PROJECT.fn.file, 'applied')]);
+    const budget = new AbortController();
+    budget.abort();
+
+    const result = await resolverFor(project, { modifications: journal.port }).resolveEvent(
+      makeEvent({ kind: KIND.function, source: patchStamp(PROJECT.fn) }),
+      { budget: budget.signal },
+    );
+
+    expect(result).toEqual({
+      ok: true,
+      value: { status: 'unresolved', reason: reason('budget-expired'), attempted: [] },
+    });
+    expect(project.fake.totalCalls()).toBe(0);
+    expect(journal.listBySession).not.toHaveBeenCalled();
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * The metadata-only journal and the cross-batch corroboration cache
+ * ---------------------------------------------------------------------------------------------- */
+
+describe('metadata-first corroboration', () => {
+  /** The patch evidence of `facts`: each fact with the diff the real patcher wrote for its file. */
+  function evidenceOf(
+    facts: readonly ModificationCorroboration[],
+  ): Mock<ModificationCorroborationPort['listPatchEvidence']> {
+    return vi.fn<ModificationCorroborationPort['listPatchEvidence']>((_sessionId, file) =>
+      ok(
+        facts
+          .filter((fact) => fact.file === file)
+          .map((fact) => ({
+            ...fact,
+            diff: fact.file === PROJECT.fn.file ? realPatches().gauges.record.diff : '',
+          })),
+      ),
+    );
+  }
+
+  it('corroborates a patch stamp from the metadata, then reads the diff of that one file only', async () => {
+    const facts: ModificationCorroboration[] = [
+      { file: 'src/unrelated/module.ts', status: 'applied', appliedAt: BASE_TIME - 1_000 },
+      { file: PROJECT.fn.file, status: 'applied', appliedAt: BASE_TIME - 1_000 },
+    ];
+    const listBySession = vi.fn<ModificationCorroborationPort['listBySession']>(() => ok(facts));
+    const listPatchEvidence = evidenceOf(facts);
+
+    const resolution = await resolved(
+      resolverFor(standardProject(), {
+        modifications: { listBySession, listPatchEvidence },
+      }).resolveEvent(
+        makeEvent({ kind: KIND.function, name: PROJECT.fn.name, source: patchStamp(PROJECT.fn) }),
+      ),
+    );
+
+    expect(resolution.route).toBe(ROUTE.patch);
+    expect(resolution.location).toEqual(patchStamp(PROJECT.fn));
+    expect(listBySession).toHaveBeenCalledWith(SESSION);
+    expect(listPatchEvidence.mock.calls).toEqual([[SESSION, PROJECT.fn.file]]);
+  });
+
+  it('reads no diff for a stamp whose file the metadata never saw in force', async () => {
+    const facts: ModificationCorroboration[] = [
+      { file: 'src/unrelated/module.ts', status: 'applied', appliedAt: BASE_TIME - 1_000 },
+    ];
+    const listBySession = vi.fn<ModificationCorroborationPort['listBySession']>(() => ok(facts));
+    const listPatchEvidence = evidenceOf(facts);
+
+    const resolution = await resolved(
+      resolverFor(standardProject(), {
+        modifications: { listBySession, listPatchEvidence },
+      }).resolveEvent(
+        makeEvent({ kind: KIND.function, name: PROJECT.fn.name, source: patchStamp(PROJECT.fn) }),
+      ),
+    );
+
+    expect(resolution.route).not.toBe(ROUTE.patch);
+    expect(listPatchEvidence).not.toHaveBeenCalled();
+  });
+
+  it('walks a long journal once per read, however many stamped events a batch carries', async () => {
+    const appliedAt = BASE_TIME - 1_000;
+    const unrelated = Array.from({ length: 5_000 }, (_, index): ModificationCorroboration => ({
+      file: `src/unrelated/module-${String(index)}.ts`,
+      status: index % 2 === 0 ? 'applied' : 'reverted',
+      appliedAt,
+    }));
+    const facts: ModificationCorroboration[] = [
+      ...unrelated,
+      { file: PROJECT.fn.file, status: 'reverted', appliedAt: appliedAt + 500 },
+      { file: `./${PROJECT.fn.file}`, status: 'reverted', appliedAt },
+    ];
+    let elementReads = 0;
+    const counted = new Proxy(facts, {
+      get(target, property, receiver) {
+        if (typeof property === 'string' && /^\d+$/u.test(property)) {
+          elementReads += 1;
+        }
+        return Reflect.get(target, property, receiver) as unknown;
+      },
+    });
+    const listBySession = vi.fn<ModificationCorroborationPort['listBySession']>(() => ok(counted));
+    const listPatchEvidence = evidenceOf(facts);
+    const resolver = resolverFor(standardProject(), {
+      modifications: { listBySession, listPatchEvidence },
+    });
+
+    const stamped = Array.from({ length: 200 }, () =>
+      makeEvent({ kind: KIND.function, name: PROJECT.fn.name, source: patchStamp(PROJECT.fn) }),
+    );
+    const early = makeEvent({
+      kind: KIND.function,
+      name: PROJECT.fn.name,
+      source: patchStamp(PROJECT.fn),
+      startTime: appliedAt - 1,
+    });
+    const placed = await resolver.resolveEvents([...stamped, early]);
+
+    const placedBy = (id: string): string | undefined =>
+      isOk(placed) ? placed.value.get(id)?.resolvedBy : undefined;
+    expect(stamped.every((event) => placedBy(event.id) === ROUTE.patch)).toBe(true);
+    expect(placedBy(early.id), 'reverted before the span ran: not corroborated').not.toBe(
+      ROUTE.patch,
+    );
+    expect(listBySession).toHaveBeenCalledTimes(1);
+    expect(elementReads, 'one pass over the journal').toBe(facts.length);
+    // One diff read for the stamped file per batch, never one per event.
+    expect(listPatchEvidence.mock.calls).toEqual([[SESSION, PROJECT.fn.file]]);
+
+    // A second batch over the same read reuses its index.
+    await resolver.resolveEvents(stamped.slice(0, 10));
+    expect(elementReads).toBe(facts.length);
+  });
+});
+
+describe('createCorroborationCache', () => {
+  const CAPTURE_A = newCaptureId();
+  const CAPTURE_B = newCaptureId();
+  const FACTS: readonly ModificationCorroboration[] = Object.freeze([
+    { file: PROJECT.fn.file, status: 'applied', appliedAt: BASE_TIME - 1_000 },
+  ]);
+
+  /** A journal answering {@link FACTS}, or what `answer` returns instead. */
+  function countingJournal(
+    answer: () => ReturnType<ModificationCorroborationPort['listBySession']> = () => ok(FACTS),
+  ) {
+    const listBySession = vi.fn<ModificationCorroborationPort['listBySession']>(() => answer());
+    const listPatchEvidence = vi.fn<ModificationCorroborationPort['listPatchEvidence']>(() =>
+      ok([]),
+    );
+    return { journal: { listBySession, listPatchEvidence }, listBySession, listPatchEvidence };
+  }
+
+  it('shares one read between the batches of a capture, and keeps captures apart', async () => {
+    const { journal, listBySession } = countingJournal();
+    const cache = createCorroborationCache({ journal, now: () => BASE_TIME });
+
+    const first = await cache.forCapture(CAPTURE_A).listBySession(SESSION);
+    const second = await cache.forCapture(CAPTURE_A).listBySession(SESSION);
+    expect(first).toEqual(ok(FACTS));
+    expect(second).toEqual(first);
+    expect(listBySession).toHaveBeenCalledTimes(1);
+
+    await cache.forCapture(CAPTURE_B).listBySession(SESSION);
+    await cache.forCapture(CAPTURE_A).listBySession(OTHER_SESSION);
+    expect(listBySession).toHaveBeenCalledTimes(3);
+    expect(listBySession.mock.calls.map(([sessionId]) => sessionId)).toEqual([
+      SESSION,
+      SESSION,
+      OTHER_SESSION,
+    ]);
+  });
+
+  it('shares a read still in flight', async () => {
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const { journal, listBySession } = countingJournal(() => gate.then(() => ok(FACTS)));
+    const port = createCorroborationCache({ journal, now: () => BASE_TIME }).forCapture(CAPTURE_A);
+
+    const first = port.listBySession(SESSION);
+    const second = port.listBySession(SESSION);
+    release?.();
+
+    expect(await Promise.all([first, second])).toEqual([ok(FACTS), ok(FACTS)]);
+    expect(listBySession).toHaveBeenCalledTimes(1);
+  });
+
+  it('reads again once the TTL has passed, or when the clock went backwards', async () => {
+    let now = BASE_TIME;
+    const { journal, listBySession } = countingJournal();
+    const port = createCorroborationCache({ journal, now: () => now }).forCapture(CAPTURE_A);
+
+    await port.listBySession(SESSION);
+    now += CORROBORATION_CACHE_TTL_MS - 1;
+    await port.listBySession(SESSION);
+    expect(listBySession).toHaveBeenCalledTimes(1);
+
+    now += 1;
+    await port.listBySession(SESSION);
+    expect(listBySession).toHaveBeenCalledTimes(2);
+
+    now -= 5_000;
+    await port.listBySession(SESSION);
+    expect(listBySession).toHaveBeenCalledTimes(3);
+
+    const short = countingJournal();
+    let clock = BASE_TIME;
+    const shortPort = createCorroborationCache({
+      journal: short.journal,
+      ttlMs: 50,
+      now: () => clock,
+    }).forCapture(CAPTURE_A);
+    await shortPort.listBySession(SESSION);
+    clock += 50;
+    await shortPort.listBySession(SESSION);
+    expect(short.listBySession).toHaveBeenCalledTimes(2);
+  });
+
+  it('never keeps a failed or throwing read', async () => {
+    let calls = 0;
+    const { journal, listBySession } = countingJournal(() => {
+      calls += 1;
+      if (calls === 1) {
+        return err(new DebuggenError('STORE_ERROR', 'The journal is closed.'));
+      }
+      if (calls === 2) {
+        throw new Error('the journal handle was revoked');
+      }
+      return ok(FACTS);
+    });
+    const port = createCorroborationCache({ journal, now: () => BASE_TIME }).forCapture(CAPTURE_A);
+
+    const refused = await port.listBySession(SESSION);
+    expect(isErr(refused) && refused.error.code).toBe('STORE_ERROR');
+    const thrown = await port.listBySession(SESSION);
+    expect(isErr(thrown) && thrown.error.code).toBe('STORE_ERROR');
+    expect(await port.listBySession(SESSION)).toEqual(ok(FACTS));
+    expect(await port.listBySession(SESSION)).toEqual(ok(FACTS));
+    expect(listBySession).toHaveBeenCalledTimes(3);
+  });
+
+  it('holds at most maxEntries reads, dropping the oldest first', async () => {
+    const { journal, listBySession } = countingJournal();
+    const cache = createCorroborationCache({ journal, maxEntries: 1, now: () => BASE_TIME });
+
+    await cache.forCapture(CAPTURE_A).listBySession(SESSION);
+    await cache.forCapture(CAPTURE_B).listBySession(SESSION);
+    await cache.forCapture(CAPTURE_A).listBySession(SESSION);
+
+    expect(listBySession).toHaveBeenCalledTimes(3);
+  });
+
+  it('keeps reading when the clock throws or answers nonsense', async () => {
+    const { journal, listBySession } = countingJournal();
+    const cache = createCorroborationCache({
+      journal,
+      now: () => {
+        throw new Error('the clock is gone');
+      },
+    });
+
+    expect(await cache.forCapture(CAPTURE_A).listBySession(SESSION)).toEqual(ok(FACTS));
+    expect(await cache.forCapture(CAPTURE_A).listBySession(SESSION)).toEqual(ok(FACTS));
+    expect(listBySession).toHaveBeenCalledTimes(1);
+
+    const nonsense = countingJournal();
+    const second = createCorroborationCache({ journal: nonsense.journal, now: () => Number.NaN });
+    expect(await second.forCapture(CAPTURE_A).listBySession(SESSION)).toEqual(ok(FACTS));
+    expect(nonsense.listBySession).toHaveBeenCalledTimes(1);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * The cross-batch source-map scopes
+ * ---------------------------------------------------------------------------------------------- */
+
+describe('createSourceMapScopes', () => {
+  const CHUNK_ONE = `${DEV_ORIGIN}/_next/static/chunks/app/gauges/page.js`;
+  const CHUNK_TWO = `${DEV_ORIGIN}/_next/static/chunks/app/layout.js`;
+  const CHUNK_THREE = `${DEV_ORIGIN}/_next/static/chunks/webpack.js`;
+  const NO_MAP: Result<SourceMapLookup, DebuggenError> = ok({
+    kind: 'none',
+    reason: 'no-directive',
+  });
+
+  /** A lookup double answering `answer` (the chunk has no map, by default). */
+  function countingLookup(
+    answer: () => ReturnType<typeof fetchSourceMap> = () => Promise.resolve(NO_MAP),
+  ): Mock<typeof fetchSourceMap> {
+    return vi.fn<typeof fetchSourceMap>(() => answer());
+  }
+
+  /** A lookup double held until `release` is called. */
+  function heldLookup(): { readonly lookup: Mock<typeof fetchSourceMap>; release(): void } {
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    return {
+      lookup: countingLookup(() => gate.then(() => NO_MAP)),
+      release: () => release?.(),
+    };
+  }
+
+  const pinned = (extra: Partial<FetchSourceMapOptions> = {}): FetchSourceMapOptions => ({
+    devServerOrigin: DEV_ORIGIN,
+    ...extra,
+  });
+
+  /** A one-source map document naming `src/<build>.ts`. */
+  const mapFor = (build: string): string =>
+    JSON.stringify({ version: 3, sources: [`src/${build}.ts`], names: [], mappings: 'AAAA' });
+
+  /**
+   * A dev-server double: each chunk URL serves `console.log("<build>")` with a
+   * directive naming its sibling `.map`, which serves {@link mapFor} of the
+   * chunk's current build. Every request is recorded, in order.
+   */
+  function devServer(builds: Record<string, string>): {
+    readonly fetchImpl: typeof fetch;
+    readonly requested: string[];
+  } {
+    const requested: string[] = [];
+    const fetchImpl: typeof fetch = (input) => {
+      const url = input instanceof Request ? input.url : String(input);
+      requested.push(url);
+      const chunkBuild = builds[url];
+      if (chunkBuild !== undefined) {
+        const name = url.slice(url.lastIndexOf('/') + 1);
+        return Promise.resolve(
+          new Response(`console.log("${chunkBuild}");\n//# sourceMappingURL=${name}.map\n`),
+        );
+      }
+      const mapBuild = url.endsWith('.map') ? builds[url.slice(0, -'.map'.length)] : undefined;
+      if (mapBuild !== undefined) {
+        return Promise.resolve(new Response(mapFor(mapBuild)));
+      }
+      return Promise.resolve(new Response('', { status: 404 }));
+    };
+    return { fetchImpl, requested };
+  }
+
+  /** The `sources` of the map a lookup found, or the lookup itself when it found none. */
+  async function sourcesOf(found: ReturnType<typeof fetchSourceMap>): Promise<unknown> {
+    const answer = await found;
+    return answer.ok && answer.value.kind === 'found' && 'sources' in answer.value.map
+      ? answer.value.map.sources
+      : answer;
+  }
+
+  it('shares a lookup in flight, started without any caller’s signal, and reads again after', async () => {
+    const held = heldLookup();
+    const scope = createSourceMapScopes({
+      fetchSourceMapImpl: held.lookup,
+      now: () => BASE_TIME,
+    }).scopeFor('document-one');
+    const signal = new AbortController().signal;
+
+    const first = scope.lookup(CHUNK_ONE, pinned({ signal }));
+    const second = scope.lookup(CHUNK_ONE, pinned());
+    // The pin is compared by origin.
+    const third = scope.lookup(CHUNK_ONE, pinned({ devServerOrigin: `${DEV_ORIGIN}/gauges` }));
+    held.release();
+
+    expect(await Promise.all([first, second, third])).toEqual([NO_MAP, NO_MAP, NO_MAP]);
+    expect(held.lookup).toHaveBeenCalledTimes(1);
+    const [chunkUrl, request] = held.lookup.mock.calls[0] ?? [];
+    expect(chunkUrl).toBe(CHUNK_ONE);
+    expect(request).not.toHaveProperty('signal');
+    expect(typeof request?.fetchImpl).toBe('function');
+    expect(request?.cache).toBeDefined();
+
+    // A settled success is never answered from memory: the chunk may have been rebuilt.
+    await scope.lookup(CHUNK_ONE, pinned());
+    expect(held.lookup).toHaveBeenCalledTimes(2);
+    await scope.lookup(CHUNK_TWO, pinned());
+    await scope.lookup(CHUNK_ONE, pinned({ devServerOrigin: 'http://127.0.0.1:20162' }));
+    expect(held.lookup).toHaveBeenCalledTimes(4);
+  });
+
+  it('answers a failure from memory only for the failure TTL', async () => {
+    let now = BASE_TIME;
+    const refused: Result<SourceMapLookup, DebuggenError> = err(
+      new DebuggenError('DEV_SERVER_UNAVAILABLE', 'The dev server did not answer.', {
+        details: { reason: 'request-failed' },
+      }),
+    );
+    const lookup = countingLookup(() => Promise.resolve(refused));
+    const scope = createSourceMapScopes({ fetchSourceMapImpl: lookup, now: () => now }).scopeFor(
+      'document-one',
+    );
+
+    expect(await scope.lookup(CHUNK_ONE, pinned())).toBe(refused);
+    now += SOURCE_MAP_FAILURE_TTL_MS - 1;
+    expect(await scope.lookup(CHUNK_ONE, pinned())).toBe(refused);
+    expect(lookup).toHaveBeenCalledTimes(1);
+
+    now += 1;
+    await scope.lookup(CHUNK_ONE, pinned());
+    expect(lookup).toHaveBeenCalledTimes(2);
+
+    now -= 1;
+    await scope.lookup(CHUNK_ONE, pinned());
+    expect(lookup, 'a clock that stepped back ends the failure').toHaveBeenCalledTimes(3);
+  });
+
+  it('reads each chunk once per batch, and again for the next batch', async () => {
+    const lookup = countingLookup();
+    const scope = createSourceMapScopes({
+      fetchSourceMapImpl: lookup,
+      now: () => BASE_TIME,
+    }).scopeFor('document-one');
+
+    const batch = scope.forBatch();
+    expect(await batch(CHUNK_ONE, pinned())).toBe(NO_MAP);
+    await batch(CHUNK_ONE, pinned());
+    await batch(CHUNK_ONE, pinned({ devServerOrigin: `${DEV_ORIGIN}/gauges` }));
+    expect(lookup, 'one read for the batch').toHaveBeenCalledTimes(1);
+    await batch(CHUNK_TWO, pinned());
+    expect(lookup, 'another chunk is its own read').toHaveBeenCalledTimes(2);
+
+    const next = scope.forBatch();
+    await next(CHUNK_ONE, pinned());
+    expect(lookup, 'the next batch reads the chunk itself').toHaveBeenCalledTimes(3);
+  });
+
+  it('maps a chunk rebuilt under the same chunk and map URLs on the first lookup after the rebuild', async () => {
+    // The clock never moves: nothing here may depend on a window passing.
+    const builds: Record<string, string> = { [CHUNK_ONE]: 'one' };
+    const server = devServer(builds);
+    const mapUrl = `${CHUNK_ONE}.map`;
+    const scope = createSourceMapScopes({ now: () => BASE_TIME }).scopeFor('document-one');
+    const look = (): ReturnType<typeof fetchSourceMap> =>
+      scope.lookup(CHUNK_ONE, pinned({ fetchImpl: server.fetchImpl }));
+
+    expect(await sourcesOf(look())).toEqual(['src/one.ts']);
+    expect(server.requested).toEqual([CHUNK_ONE, mapUrl]);
+
+    expect(await sourcesOf(look()), 'unchanged: the kept map').toEqual(['src/one.ts']);
+    expect(server.requested, 'the map is spared').toEqual([CHUNK_ONE, mapUrl, CHUNK_ONE]);
+
+    builds[CHUNK_ONE] = 'two'; // a hot update rebuilds the chunk; both URLs are kept
+    expect(await sourcesOf(look()), 'the rebuilt map, at once').toEqual(['src/two.ts']);
+    expect(server.requested.slice(3)).toEqual([CHUNK_ONE, mapUrl]);
+
+    builds[CHUNK_ONE] = 'one'; // and back: the old map was dropped, not kept aside
+    expect(await sourcesOf(look())).toEqual(['src/one.ts']);
+    expect(server.requested.slice(5)).toEqual([CHUNK_ONE, mapUrl]);
+  });
+
+  it('maps a rebuild on the next batch, while a batch keeps the one read it made', async () => {
+    const builds: Record<string, string> = { [CHUNK_ONE]: 'one' };
+    const server = devServer(builds);
+    const scope = createSourceMapScopes({ now: () => BASE_TIME }).scopeFor('document-one');
+    const inBatch = (batch: typeof fetchSourceMap) => (): ReturnType<typeof fetchSourceMap> =>
+      batch(CHUNK_ONE, pinned({ fetchImpl: server.fetchImpl }));
+
+    const first = inBatch(scope.forBatch());
+    expect(await sourcesOf(first())).toEqual(['src/one.ts']);
+    builds[CHUNK_ONE] = 'two';
+    expect(await sourcesOf(first()), 'the batch answers from its own read').toEqual(['src/one.ts']);
+    expect(server.requested).toHaveLength(2);
+
+    const second = inBatch(scope.forBatch());
+    expect(await sourcesOf(second()), 'the next batch reads the rebuild').toEqual(['src/two.ts']);
+    expect(await sourcesOf(second())).toEqual(['src/two.ts']);
+    expect(server.requested).toHaveLength(4);
+  });
+
+  it('reuses an inline map, which fetchSourceMap keys by the chunk URL, only for its own chunk', async () => {
+    let build = 'one';
+    const requested: string[] = [];
+    const fetchImpl: typeof fetch = (input) => {
+      requested.push(input instanceof Request ? input.url : String(input));
+      const inline = Buffer.from(mapFor(build)).toString('base64');
+      return Promise.resolve(
+        new Response(
+          `console.log("${build}");\n//# sourceMappingURL=data:application/json;base64,${inline}\n`,
+        ),
+      );
+    };
+    const scope = createSourceMapScopes({ now: () => BASE_TIME }).scopeFor('document-one');
+    const look = (): ReturnType<typeof fetchSourceMap> =>
+      scope.lookup(CHUNK_ONE, pinned({ fetchImpl }));
+
+    expect(await sourcesOf(look())).toEqual(['src/one.ts']);
+    expect(await sourcesOf(look())).toEqual(['src/one.ts']);
+    build = 'two';
+    expect(await sourcesOf(look()), 'the rebuilt inline map').toEqual(['src/two.ts']);
+    expect(requested).toEqual([CHUNK_ONE, CHUNK_ONE, CHUNK_ONE]);
+  });
+
+  it('never digests a chunk it could not read whole, and leaves fetchSourceMap to refuse it', async () => {
+    const answerWith =
+      (respond: () => Response): typeof fetch =>
+      () =>
+        Promise.resolve(respond());
+    const detailsOf = async (found: ReturnType<typeof fetchSourceMap>): Promise<unknown> => {
+      const answer = await found;
+      return isErr(answer) ? answer.error.details?.['reason'] : answer;
+    };
+    const lookupOn = (fetchImpl: typeof fetch, extra: Partial<FetchSourceMapOptions> = {}) =>
+      createSourceMapScopes({ now: () => BASE_TIME })
+        .scopeFor('document-one')
+        .lookup(CHUNK_ONE, pinned({ fetchImpl, ...extra }));
+
+    const longChunk = `console.log("${'x'.repeat(64)}");\n//# sourceMappingURL=page.js.map\n`;
+    expect(
+      await detailsOf(
+        lookupOn(
+          answerWith(() => new Response(longChunk)),
+          { maxBytes: 16 },
+        ),
+      ),
+      'streamed past the bound',
+    ).toBe('too-large');
+    expect(
+      await detailsOf(
+        lookupOn(
+          answerWith(
+            () =>
+              new Response(longChunk, { headers: { 'content-length': String(longChunk.length) } }),
+          ),
+          { maxBytes: 16 },
+        ),
+      ),
+      'declared past the bound',
+    ).toBe('too-large');
+    expect(
+      await detailsOf(lookupOn(answerWith(() => new Response('', { status: 404 })))),
+      'not a success',
+    ).toBe('http-status');
+
+    const broken = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        controller.enqueue(new TextEncoder().encode('console.log("one");'));
+        controller.error(new Error('the connection was reset'));
+      },
+    });
+    expect(
+      await detailsOf(lookupOn(answerWith(() => new Response(broken)))),
+      'failed mid-stream',
+    ).toBe('request-failed');
+
+    const endless = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('console.log("one");'));
+      },
+    });
+    expect(
+      await detailsOf(
+        lookupOn(
+          answerWith(() => new Response(endless)),
+          { timeoutMs: 20 },
+        ),
+      ),
+      'ended by the request timeout',
+    ).toBe('request-failed');
+  });
+
+  it('answers a cancelled caller alone and never keeps the cancellation', async () => {
+    const held = heldLookup();
+    const scope = createSourceMapScopes({
+      fetchSourceMapImpl: held.lookup,
+      now: () => BASE_TIME,
+    }).scopeFor('document-one');
+
+    const spent = new AbortController();
+    spent.abort();
+    const refused = await scope.lookup(CHUNK_ONE, pinned({ signal: spent.signal }));
+    expect(isErr(refused) && refused.error.details?.['reason']).toBe(reason('aborted'));
+    const refusedInBatch = await scope.forBatch()(CHUNK_ONE, pinned({ signal: spent.signal }));
+    expect(isErr(refusedInBatch) && refusedInBatch.error.details?.['reason']).toBe(
+      reason('aborted'),
+    );
+    expect(held.lookup).not.toHaveBeenCalled();
+
+    const batch = scope.forBatch();
+    const budget = new AbortController();
+    const cancelled = batch(CHUNK_ONE, pinned({ signal: budget.signal }));
+    const patient = batch(CHUNK_ONE, pinned());
+    const outside = scope.lookup(CHUNK_ONE, pinned());
+    budget.abort();
+    const early = await cancelled;
+    expect(isErr(early) && early.error.code).toBe('DEV_SERVER_UNAVAILABLE');
+    expect(isErr(early) && early.error.details?.['reason']).toBe(reason('aborted'));
+
+    held.release();
+    expect(await patient).toBe(NO_MAP);
+    expect(await outside).toBe(NO_MAP);
+    expect(await batch(CHUNK_ONE, pinned()), 'the batch kept the read, not the cancellation').toBe(
+      NO_MAP,
+    );
+    expect(held.lookup).toHaveBeenCalledTimes(1);
+  });
+
+  it('never rejects, even when the lookup it delegates to throws', async () => {
+    let now = BASE_TIME;
+    const lookup = countingLookup(() => {
+      throw new Error('the chunk reader was revoked');
+    });
+    const scope = createSourceMapScopes({ fetchSourceMapImpl: lookup, now: () => now }).scopeFor(
+      'document-one',
+    );
+
+    const answer = await scope.lookup(CHUNK_ONE, pinned());
+    expect(isErr(answer) && answer.error.code).toBe('DEV_SERVER_UNAVAILABLE');
+    expect(JSON.stringify(isErr(answer) ? answer.error.toPayload() : {})).not.toContain('revoked');
+    await scope.lookup(CHUNK_ONE, pinned());
+    expect(lookup, 'kept as a failure').toHaveBeenCalledTimes(1);
+
+    now += SOURCE_MAP_FAILURE_TTL_MS;
+    await scope.lookup(CHUNK_ONE, pinned());
+    expect(lookup).toHaveBeenCalledTimes(2);
+  });
+
+  it('holds at most maxEntriesPerScope parsed maps, dropping the least recently written', async () => {
+    const server = devServer({ [CHUNK_ONE]: 'one', [CHUNK_TWO]: 'two', [CHUNK_THREE]: 'three' });
+    const scope = createSourceMapScopes({
+      maxEntriesPerScope: 2,
+      now: () => BASE_TIME,
+    }).scopeFor('document-one');
+    const mapsFetched = (): number => server.requested.filter((url) => url.endsWith('.map')).length;
+    const look = (url: string): ReturnType<typeof fetchSourceMap> =>
+      scope.lookup(url, pinned({ fetchImpl: server.fetchImpl }));
+
+    expect(await sourcesOf(look(CHUNK_ONE))).toEqual(['src/one.ts']);
+    await look(CHUNK_TWO);
+    await look(CHUNK_THREE); // evicts CHUNK_ONE's map, the least recently written
+    expect(mapsFetched()).toBe(3);
+
+    await look(CHUNK_THREE);
+    expect(mapsFetched(), 'kept').toBe(3);
+    expect(await sourcesOf(look(CHUNK_ONE))).toEqual(['src/one.ts']);
+    expect(mapsFetched(), 'dropped, so read again').toBe(4);
+  });
+
+  it('hands one scope per key while used, and retires the least recent and the idle', () => {
+    let now = BASE_TIME;
+    const scopes = createSourceMapScopes({ maxScopes: 2, now: () => now });
+
+    const one = scopes.scopeFor('document-one');
+    expect(scopes.scopeFor('document-one')).toBe(one);
+    expect(scopes.scopeFor('document-two')).not.toBe(one);
+
+    scopes.scopeFor('document-three'); // evicts document-one, the least recently used
+    expect(scopes.scopeFor('document-one')).not.toBe(one);
+
+    const three = scopes.scopeFor('document-three');
+    now += SOURCE_MAP_SCOPE_IDLE_MS - 1;
+    expect(scopes.scopeFor('document-three')).toBe(three);
+    now += SOURCE_MAP_SCOPE_IDLE_MS;
+    expect(scopes.scopeFor('document-three'), 'idle for the whole period').not.toBe(three);
+  });
+
+  it('is what the resolver hands resolveStack when injected, and nothing when not', async () => {
+    const batch = createSourceMapScopes({
+      fetchSourceMapImpl: countingLookup(),
+      now: () => BASE_TIME,
+    })
+      .scopeFor('document-one')
+      .forBatch();
+    const resolveStackImpl = stackResolver([mapped(PROJECT.component.file)]);
+    const resolver = resolverFor(standardProject(), {
+      resolveStackImpl,
+      devServerOrigin: DEV_ORIGIN,
+      sourceMapLookup: batch,
+    });
+
+    await resolver.resolveEvent(
+      makeEvent({ kind: KIND.fetch, attributes: { [ATTR.initiator]: CHUNK_STACK } }),
+    );
+
+    const [, options] = resolveStackImpl.mock.calls[0] ?? [];
+    expect(options?.fetchSourceMapImpl).toBe(batch);
+
+    const unscoped = stackResolver([]);
+    await resolverFor(standardProject(), {
+      resolveStackImpl: unscoped,
+      devServerOrigin: DEV_ORIGIN,
+    }).resolveEvent(makeEvent({ kind: KIND.fetch, attributes: { [ATTR.initiator]: CHUNK_STACK } }));
+    expect(unscoped.mock.calls[0]?.[1]).not.toHaveProperty('fetchSourceMapImpl');
+  });
+
+  it('spares the real stack resolver a second read of a chunk within one batch', async () => {
+    const lookup = countingLookup();
+    const scope = createSourceMapScopes({
+      fetchSourceMapImpl: lookup,
+      now: () => BASE_TIME,
+    }).scopeFor('document-one');
+    const initiated = (): TelemetryEvent =>
+      makeEvent({ kind: KIND.fetch, attributes: { [ATTR.initiator]: CHUNK_STACK } });
+
+    for (let batch = 0; batch < 2; batch += 1) {
+      const located = await resolverFor(standardProject(), {
+        devServerOrigin: DEV_ORIGIN,
+        sourceMapLookup: scope.forBatch(),
+      }).resolveEvents([initiated(), initiated(), initiated()]);
+      expect(located.ok).toBe(true);
+    }
+
+    expect(lookup, 'one read per batch').toHaveBeenCalledTimes(2);
+    expect(lookup.mock.calls[0]?.[0]).toBe(`${DEV_ORIGIN}/_next/static/chunks/app/gauges/page.js`);
   });
 });
 

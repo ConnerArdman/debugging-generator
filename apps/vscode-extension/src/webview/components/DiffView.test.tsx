@@ -16,6 +16,17 @@
  *     intact, nothing trimmed, nothing numbered.
  *   - **Meaning beyond colour.** The `+`, `-` or space marker is real, visible,
  *     announced text, never `aria-hidden` or visually hidden.
+ *   - **A labelled `<pre>` region.** The lines sit in one `<pre role=region>`
+ *     named after the file, as phrasing `span` rows separated by line-break
+ *     text nodes; it is a Tab stop unless `innerTabIndex` is `-1`.
+ *   - **Long diffs are bounded, never cut.** At most `DIFF_LINE_BATCH` rows are
+ *     ever mounted - pinned against a worst-case diff at the record's 2 MiB cap
+ *     - and a notice above the lines, which also describes the region, names
+ *     the window on screen. "Show previous" / "Show next" move the window one
+ *     batch, every line is reachable by paging, classification survives a
+ *     window that starts inside a hunk, and a control that reaches its end
+ *     hands focus to the region. A new diff starts at its first window, and a
+ *     re-render with the same diff keeps every mounted row.
  *   - **Styling.** Class names only; no inline `style` in any state (AAP 0.6.4).
  *   - **The three states** and their precedence, error > pending > empty > diff,
  *     so the view never renders a blank area (AAP 0.5.5).
@@ -25,10 +36,11 @@
  * inspected project's names or routes appear in it (AAP 0.5.4).
  */
 
-import { cleanup, render, screen, within } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { classifyDiffLine, DiffView } from './DiffView';
+import { classifyDiffLine, DIFF_LINE_BATCH, DiffView } from './DiffView';
 import type { DiffLineKind, DiffViewProps } from './DiffView';
 
 // `@testing-library/react` registers its automatic cleanup only on a global
@@ -393,18 +405,66 @@ describe('DiffView rendering', () => {
     ]);
   });
 
-  it('keeps every row inside one named, focusable scroll region', () => {
+  it('keeps every row inside one labelled, focusable <pre> region', () => {
     const { container } = render(<DiffView diff={SAMPLE_DIFF} />);
 
     const regions = container.querySelectorAll('.dgv-diff__scroll');
     expect(regions).toHaveLength(1);
     const region = regions.item(0);
-    expect(region.getAttribute('role')).toBe('group');
+    expect(region.tagName).toBe('PRE');
+    expect(region.getAttribute('role')).toBe('region');
     expect(region.getAttribute('aria-label')).toBe('Diff');
     expect(region.getAttribute('tabindex')).toBe('0');
-    expect(screen.getByRole('group', { name: 'Diff' })).toBe(region);
+    expect(screen.getByRole('region', { name: 'Diff' })).toBe(region);
     expect(rowsIn(region)).toHaveLength(SAMPLE_LINES.length);
     expect(rowsIn(container)).toHaveLength(SAMPLE_LINES.length);
+  });
+
+  it('takes the region out of the Tab order only when innerTabIndex is -1', () => {
+    const { rerender } = render(<DiffView diff={SAMPLE_DIFF} fileLabel={FILE_LABEL} />);
+
+    const region = screen.getByRole('region', { name: `Diff of ${FILE_LABEL}` });
+    expect(region.getAttribute('tabindex')).toBe('0');
+
+    rerender(<DiffView diff={SAMPLE_DIFF} fileLabel={FILE_LABEL} innerTabIndex={-1} />);
+    expect(
+      screen.getByRole('region', { name: `Diff of ${FILE_LABEL}` }).getAttribute('tabindex'),
+    ).toBe('-1');
+
+    rerender(<DiffView diff={SAMPLE_DIFF} fileLabel={FILE_LABEL} innerTabIndex={0} />);
+    expect(
+      screen.getByRole('region', { name: `Diff of ${FILE_LABEL}` }).getAttribute('tabindex'),
+    ).toBe('0');
+  });
+
+  it('holds phrasing rows separated by line breaks, so the region’s text is the diff’s lines', () => {
+    const { container } = render(<DiffView diff={SAMPLE_DIFF} />);
+
+    const region = container.querySelector('pre.dgv-diff__scroll');
+    if (region === null) {
+      throw new Error('expected the diff region');
+    }
+
+    // The <pre>'s text is the recorded lines joined by line breaks: an
+    // unstyled render or a copy still shows one line per row.
+    expect(region.textContent).toBe(SAMPLE_LINES.join('\n'));
+
+    // Rows are spans (phrasing content), and the separators are text nodes
+    // between them rather than part of any row, so each row's text stays the
+    // recorded line exactly.
+    const children = Array.from(region.childNodes);
+    expect(children).toHaveLength(SAMPLE_LINES.length * 2 - 1);
+    children.forEach((node, index) => {
+      if (index % 2 === 0) {
+        expect(node instanceof HTMLElement && node.tagName).toBe('SPAN');
+        expect(node instanceof HTMLElement && node.classList.contains('dgv-diff__line')).toBe(true);
+      } else {
+        expect(node.nodeType).toBe(Node.TEXT_NODE);
+        expect(node.textContent).toBe('\n');
+      }
+    });
+    expect(rowsIn(region).map((row) => row.textContent)).toEqual([...SAMPLE_LINES]);
+    expect(region.querySelector('div')).toBeNull();
   });
 
   it('renders the file label above the diff and names the scroll region after it', () => {
@@ -417,15 +477,16 @@ describe('DiffView rendering', () => {
     expect(root.firstElementChild).toBe(label);
     expect(screen.queryByText(FILE_LABEL)).not.toBeNull();
 
-    const region = screen.getByRole('group', { name: `Diff of ${FILE_LABEL}` });
+    const region = screen.getByRole('region', { name: `Diff of ${FILE_LABEL}` });
     expect(region.className).toBe('dgv-diff__scroll');
+    expect(region.tagName).toBe('PRE');
   });
 
   it('renders no file label for an absent or blank label', () => {
     const { container } = render(<DiffView diff={SAMPLE_DIFF} fileLabel="   " />);
 
     expect(container.querySelector('.dgv-diff__file')).toBeNull();
-    expect(screen.getByRole('group', { name: 'Diff' })).not.toBeNull();
+    expect(screen.getByRole('region', { name: 'Diff' })).not.toBeNull();
     cleanup();
 
     const second = render(<DiffView diff={SAMPLE_DIFF} fileLabel={undefined} />);
@@ -522,6 +583,379 @@ describe('DiffView rendering', () => {
     const { container } = render(<DiffView diff={SAMPLE_DIFF} className="extra-layout" />);
 
     expect(rootOf(container).className).toBe('dgv-diff extra-layout');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Long diffs
+// ---------------------------------------------------------------------------
+
+/**
+ * A diff of exactly `count` added lines, each unique to its position and to
+ * `tag`, terminated as the service records it.
+ *
+ * @param count How many lines the diff holds.
+ * @param tag Distinguishes two diffs of the same length.
+ * @returns The diff string.
+ */
+function longDiff(count: number, tag = 'row'): string {
+  return `${Array.from({ length: count }, (_, index) => `+${tag} ${String(index)}`).join('\n')}\n`;
+}
+
+/**
+ * The longest diff a modification record may carry: 2 MiB, the service-side
+ * cap `MAX_MODIFICATION_DIFF_LENGTH` of `@debuggen/instrumentation`, which this
+ * workspace does not depend on.
+ */
+const MAX_RECORDED_DIFF_LENGTH = 2 * 1024 * 1024;
+
+/**
+ * The worst case the view can be handed: a diff at the record's size cap made
+ * of the shortest possible content lines, so it holds as many rows as a legal
+ * record can. Each line is a one-character added line, `+` and a letter, which
+ * makes the line count - not the byte count - the pressure on the view.
+ *
+ * @returns The diff and the lines it holds, without terminators.
+ */
+function worstCaseDiff(): { readonly diff: string; readonly lines: readonly string[] } {
+  // Three code units per line: `+`, the letter and the terminator.
+  const count = Math.floor(MAX_RECORDED_DIFF_LENGTH / 3);
+  const lines = Array.from(
+    { length: count },
+    (_, index) => `+${String.fromCharCode(97 + (index % 26))}`,
+  );
+  return { diff: `${lines.join('\n')}\n`, lines };
+}
+
+/** The time budget of the worst-case case, which does real work at scale. */
+const WORST_CASE_TIMEOUT_MS = 30_000;
+
+/** The locale formatting the component itself uses for line counts. */
+const COUNT = new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 });
+
+/**
+ * The notice text for a window, e.g. "Showing lines 1,001–2,000 of 2,500." in
+ * the en-US test runtime; positions are 1-based.
+ */
+function noticeText(first: number, last: number, total: number): string {
+  return `Showing lines ${COUNT.format(first)}–${COUNT.format(last)} of ${COUNT.format(total)}.`;
+}
+
+/** The forward window control, found by its visible text. */
+function nextButton(): HTMLElement | null {
+  return screen.queryByRole('button', { name: /^Show next /u });
+}
+
+/** The backward window control, found by its visible text. */
+function previousButton(): HTMLElement | null {
+  return screen.queryByRole('button', { name: /^Show previous /u });
+}
+
+/**
+ * A control that must be present, failing the case instead of returning
+ * `null`.
+ *
+ * @param control The query result.
+ * @param name What the control is, for the failure message.
+ * @returns The control.
+ */
+function present(control: HTMLElement | null, name: string): HTMLElement {
+  if (control === null) {
+    throw new Error(`expected the ${name} control to be rendered`);
+  }
+  return control;
+}
+
+/** Every `.dgv-diff__line` in the whole document - the mounted row count. */
+function mountedRowCount(): number {
+  return document.querySelectorAll('.dgv-diff__line').length;
+}
+
+/**
+ * The recorded text of every row in a scope, in order.
+ *
+ * @param scope The element to search.
+ * @returns Each row's `marker + text`.
+ */
+function rowTexts(scope: ParentNode): string[] {
+  return rowsIn(scope).map((row) => row.textContent ?? '');
+}
+
+describe('DiffView long diffs', () => {
+  it('shows a long diff through a stated window of DIFF_LINE_BATCH rows, ahead of the region', () => {
+    const total = 2500;
+    const { container } = render(<DiffView diff={longDiff(total)} fileLabel={FILE_LABEL} />);
+
+    expect(DIFF_LINE_BATCH).toBe(1000);
+    const region = screen.getByRole('region', { name: `Diff of ${FILE_LABEL}` });
+    expect(rowsIn(region)).toHaveLength(DIFF_LINE_BATCH);
+    expect(rowAt(rowsIn(region), 0).textContent).toBe('+row 0');
+    expect(rowAt(rowsIn(region), 999).textContent).toBe('+row 999');
+
+    // The notice is visible text naming the window, and it describes the
+    // region, so assistive technology announces which lines the region holds.
+    // It is also a polite live region, so a later move of the window is
+    // announced while focus stays on the control that moved it.
+    const notice = screen.getByText(noticeText(1, 1000, total));
+    expect(notice.id).not.toBe('');
+    expect(region.getAttribute('aria-describedby')).toBe(notice.id);
+    expect(notice.getAttribute('aria-live')).toBe('polite');
+
+    // At the first window only the forward control exists.
+    expect(previousButton()).toBeNull();
+    const next = present(nextButton(), 'next');
+    expect(next.textContent).toBe(`Show next ${COUNT.format(1000)} lines`);
+    expect(next.getAttribute('tabindex')).toBe('0');
+
+    // The notice and the control precede the region in document order, so an
+    // owner's arrow keys reach the control before the scrolling region keeps
+    // them.
+    expect(notice.compareDocumentPosition(region) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+    expect(next.compareDocumentPosition(region) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+    expect(container.querySelectorAll('[style]')).toHaveLength(0);
+  });
+
+  it('moves the window one batch each way, replacing rows, and hands focus to the region at either end', async () => {
+    const user = userEvent.setup();
+    const total = 2500;
+    const { container } = render(<DiffView diff={longDiff(total)} fileLabel={FILE_LABEL} />);
+    const region = screen.getByRole('region', { name: `Diff of ${FILE_LABEL}` });
+
+    // Forward into the middle: the window is replaced, not extended, and the
+    // control the reader used keeps focus because it is still there.
+    const next = present(nextButton(), 'next');
+    await user.click(next);
+    expect(rowTexts(region)).toEqual(
+      Array.from({ length: 1000 }, (_, index) => `+row ${String(1000 + index)}`),
+    );
+    expect(mountedRowCount()).toBe(DIFF_LINE_BATCH);
+    expect(screen.getByText(noticeText(1001, 2000, total))).toBeDefined();
+    expect(present(previousButton(), 'previous').textContent).toBe(
+      `Show previous ${COUNT.format(1000)} lines`,
+    );
+    expect(nextButton()).toBe(next);
+    expect(next.textContent).toBe('Show next 500 lines');
+    expect(document.activeElement).toBe(next);
+
+    // Forward to the end: the last, shorter window; the forward control is gone
+    // and focus moves to the lines just brought into view.
+    await user.click(next);
+    expect(rowTexts(region)).toEqual(
+      Array.from({ length: 500 }, (_, index) => `+row ${String(2000 + index)}`),
+    );
+    expect(screen.getByText(noticeText(2001, 2500, total))).toBeDefined();
+    expect(nextButton()).toBeNull();
+    expect(document.activeElement).toBe(region);
+    expect(region.getAttribute('aria-describedby')).toBe(
+      screen.getByText(noticeText(2001, 2500, total)).id,
+    );
+
+    // Back into the middle: the backward control keeps focus.
+    const previous = present(previousButton(), 'previous');
+    expect(previous.textContent).toBe(`Show previous ${COUNT.format(1000)} lines`);
+    await user.click(previous);
+    expect(rowAt(rowsIn(region), 0).textContent).toBe('+row 1000');
+    expect(rowsIn(region)).toHaveLength(DIFF_LINE_BATCH);
+    expect(screen.getByText(noticeText(1001, 2000, total))).toBeDefined();
+    expect(present(nextButton(), 'next').textContent).toBe('Show next 500 lines');
+    expect(document.activeElement).toBe(previous);
+
+    // Back to the start: the backward control is gone and focus is on the
+    // region again.
+    await user.click(previous);
+    expect(rowAt(rowsIn(region), 0).textContent).toBe('+row 0');
+    expect(rowsIn(region)).toHaveLength(DIFF_LINE_BATCH);
+    expect(screen.getByText(noticeText(1, 1000, total))).toBeDefined();
+    expect(previousButton()).toBeNull();
+    expect(document.activeElement).toBe(region);
+    expect(container.querySelectorAll('[style]')).toHaveLength(0);
+  });
+
+  it('reaches every line of a multi-window diff in order, one bounded window at a time', () => {
+    const total = 4 * DIFF_LINE_BATCH + 250;
+    render(<DiffView diff={longDiff(total)} />);
+    const region = screen.getByRole('region', { name: 'Diff' });
+
+    const seen: string[] = [...rowTexts(region)];
+    let windows = 1;
+    for (let next = nextButton(); next !== null; next = nextButton()) {
+      fireEvent.click(next);
+      windows += 1;
+      expect(mountedRowCount()).toBeLessThanOrEqual(DIFF_LINE_BATCH);
+      seen.push(...rowTexts(region));
+    }
+
+    expect(windows).toBe(5);
+    expect(seen).toEqual(longDiff(total).slice(0, -1).split('\n'));
+    expect(screen.getByText(noticeText(4001, total, total))).toBeDefined();
+  });
+
+  // Parsing some 700,000 rows and paging a thousand-row window twenty times is
+  // real DOM work in the test environment, so this case gets the time the
+  // project's default per-case budget does not allow for.
+  it(
+    'keeps a worst-case 2 MiB diff to one mounted batch however far the reader pages',
+    () => {
+      const { diff, lines } = worstCaseDiff();
+      expect(diff.length).toBeLessThanOrEqual(MAX_RECORDED_DIFF_LENGTH);
+      // Hundreds of windows' worth of rows: the pressure the bound exists for.
+      expect(lines.length).toBeGreaterThan(500 * DIFF_LINE_BATCH);
+
+      render(<DiffView diff={diff} fileLabel={FILE_LABEL} />);
+      const region = screen.getByRole('region', { name: `Diff of ${FILE_LABEL}` });
+      expect(mountedRowCount()).toBe(DIFF_LINE_BATCH);
+      expect(screen.getByText(noticeText(1, 1000, lines.length))).toBeDefined();
+
+      const pages = 10;
+      for (let page = 1; page <= pages; page += 1) {
+        fireEvent.click(present(nextButton(), 'next'));
+        expect(mountedRowCount()).toBe(DIFF_LINE_BATCH);
+        const start = page * DIFF_LINE_BATCH;
+        expect(rowTexts(region)).toEqual(lines.slice(start, start + DIFF_LINE_BATCH));
+      }
+      expect(
+        screen.getByText(noticeText(pages * 1000 + 1, (pages + 1) * 1000, lines.length)),
+      ).toBeDefined();
+
+      // Paging back is bounded the same way.
+      for (let page = pages - 1; page >= 0; page -= 1) {
+        fireEvent.click(present(previousButton(), 'previous'));
+        expect(mountedRowCount()).toBe(DIFF_LINE_BATCH);
+      }
+      expect(rowTexts(region)).toEqual(lines.slice(0, DIFF_LINE_BATCH));
+      expect(previousButton()).toBeNull();
+    },
+    WORST_CASE_TIMEOUT_MS,
+  );
+
+  it('classifies a window that starts inside a hunk from the whole diff', async () => {
+    const user = userEvent.setup();
+    // One hunk longer than a window whose line past the first window is a
+    // removed `-- legacy`: on its own that line reads as a `---` file header.
+    const body = Array.from({ length: DIFF_LINE_BATCH + 10 }, (_, index) =>
+      index === DIFF_LINE_BATCH ? '--- legacy' : ` context ${String(index)}`,
+    );
+    const lines = [`@@ -1,${String(body.length)} +1,${String(body.length - 1)} @@`, ...body];
+    render(<DiffView diff={`${lines.join('\n')}\n`} />);
+
+    await user.click(present(nextButton(), 'next'));
+
+    const rows = rowsIn();
+    expect(rows).toHaveLength(lines.length - DIFF_LINE_BATCH);
+    // Row 1,001 of the diff is body line 1,000 (0-based 999) and the removed
+    // line is right after it.
+    expect(rowAt(rows, 0).textContent).toBe(' context 999');
+    expect(variantsOf(rowAt(rows, 1))).toEqual(['removed']);
+    expect(columnOf(rowAt(rows, 1), 'marker').textContent).toBe('-');
+    expect(columnOf(rowAt(rows, 1), 'text').textContent).toBe('-- legacy');
+    expect(variantsOf(rowAt(rows, 2))).toEqual(['context']);
+  });
+
+  it('says "line" for a single line beyond the first window', async () => {
+    const user = userEvent.setup();
+    const total = DIFF_LINE_BATCH + 1;
+    render(<DiffView diff={longDiff(total)} />);
+
+    expect(screen.getByText(noticeText(1, DIFF_LINE_BATCH, total))).toBeDefined();
+    expect(present(nextButton(), 'next').textContent).toBe('Show next 1 line');
+
+    await user.click(present(nextButton(), 'next'));
+    expect(rowTexts(document)).toEqual([`+row ${String(DIFF_LINE_BATCH)}`]);
+    expect(screen.getByText(noticeText(total, total, total))).toBeDefined();
+    expect(nextButton()).toBeNull();
+    expect(present(previousButton(), 'previous').textContent).toBe(
+      `Show previous ${COUNT.format(1000)} lines`,
+    );
+    expect(document.activeElement).toBe(screen.getByRole('region', { name: 'Diff' }));
+  });
+
+  it('renders no notice, no control and no description for a diff at or under the cap', () => {
+    render(<DiffView diff={SAMPLE_DIFF} />);
+    expect(nextButton()).toBeNull();
+    expect(previousButton()).toBeNull();
+    expect(screen.queryByText(/^Showing /u)).toBeNull();
+    expect(screen.getByRole('region', { name: 'Diff' }).hasAttribute('aria-describedby')).toBe(
+      false,
+    );
+    cleanup();
+
+    render(<DiffView diff={longDiff(DIFF_LINE_BATCH)} />);
+    expect(rowsIn()).toHaveLength(DIFF_LINE_BATCH);
+    expect(nextButton()).toBeNull();
+    expect(previousButton()).toBeNull();
+    expect(screen.queryByText(/^Showing /u)).toBeNull();
+  });
+
+  it('starts again at the first window when the diff changes', async () => {
+    const user = userEvent.setup();
+    const { rerender } = render(<DiffView diff={longDiff(1500, 'first')} />);
+
+    await user.click(present(nextButton(), 'next'));
+    expect(rowAt(rowsIn(), 0).textContent).toBe('+first 1000');
+    expect(rowsIn()).toHaveLength(500);
+    expect(nextButton()).toBeNull();
+
+    rerender(<DiffView diff={longDiff(1500, 'second')} />);
+
+    const rows = rowsIn();
+    expect(rows).toHaveLength(1000);
+    expect(rowAt(rows, 0).textContent).toBe('+second 0');
+    expect(screen.getByText(noticeText(1, 1000, 1500))).toBeDefined();
+    expect(previousButton()).toBeNull();
+    expect(present(nextButton(), 'next').textContent).toBe('Show next 500 lines');
+  });
+
+  it('keeps both window controls out of the Tab order with the region when innerTabIndex is -1', async () => {
+    const user = userEvent.setup();
+    render(<DiffView diff={longDiff(2500)} fileLabel={FILE_LABEL} innerTabIndex={-1} />);
+
+    const region = screen.getByRole('region', { name: `Diff of ${FILE_LABEL}` });
+    expect(present(nextButton(), 'next').getAttribute('tabindex')).toBe('-1');
+    expect(region.getAttribute('tabindex')).toBe('-1');
+
+    await user.click(present(nextButton(), 'next'));
+    expect(present(previousButton(), 'previous').getAttribute('tabindex')).toBe('-1');
+    expect(present(nextButton(), 'next').getAttribute('tabindex')).toBe('-1');
+
+    // Reaching the end still hands focus to the region: `tabIndex={-1}` leaves
+    // it focusable.
+    await user.click(present(nextButton(), 'next'));
+    expect(nextButton()).toBeNull();
+    expect(document.activeElement).toBe(region);
+  });
+
+  it('keeps every mounted row element across a re-render with the same diff', () => {
+    const { container, rerender } = render(<DiffView diff={SAMPLE_DIFF} fileLabel={FILE_LABEL} />);
+
+    const before = rowsIn(container);
+    const columnsBefore = before.map((row) => columnOf(row, 'text'));
+    rerender(<DiffView diff={SAMPLE_DIFF} fileLabel={FILE_LABEL} className="extra-layout" />);
+
+    const after = rowsIn(container);
+    expect(after).toHaveLength(before.length);
+    after.forEach((row, index) => {
+      expect(row).toBe(before[index]);
+      expect(columnOf(row, 'text')).toBe(columnsBefore[index]);
+    });
+    expectRows(after, SAMPLE_ROWS);
+  });
+
+  it('keeps the rows of a long diff’s window across a re-render with the same diff', async () => {
+    const user = userEvent.setup();
+    const diff = longDiff(2500);
+    const { rerender } = render(<DiffView diff={diff} fileLabel={FILE_LABEL} />);
+    await user.click(present(nextButton(), 'next'));
+
+    const before = rowsIn();
+    rerender(<DiffView diff={diff} fileLabel={FILE_LABEL} className="extra-layout" />);
+
+    // The window stays where the reader put it, and no row is remounted.
+    const after = rowsIn();
+    expect(after).toHaveLength(before.length);
+    after.forEach((row, index) => {
+      expect(row).toBe(before[index]);
+    });
+    expect(screen.getByText(noticeText(1001, 2000, 2500))).toBeDefined();
   });
 });
 

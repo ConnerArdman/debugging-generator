@@ -19,13 +19,13 @@
  *   - no force simulation and no layout library of any kind — the layered
  *     geometry is `../utils/scale`'s, which is arithmetic over a column index
  *     and a row index and nothing more;
- *   - one measurement, and only one: the inner width of the canvas's scroll
- *     viewport, observed by `useChartCanvas` (`../utils/measure`), which sets
- *     the space between columns and nothing else. It is responsive sizing, not
- *     an interaction: no box, label, column or reading order depends on it, and
- *     where there is no layout to measure (happy-dom, where every measurement
- *     answers zero) the component draws the unmeasured rhythm, identically on
- *     every render. See "The canvas is drawn in CSS pixels" below.
+ *   - no measurement of any kind: nothing here reads a size from the DOM, a
+ *     font or a layout. The canvas is a fixed logical drawing whose `viewBox`
+ *     is the layout's own size, and the stylesheet sizes it relationally
+ *     inside a scroll viewport. Every coordinate is a pure function of the
+ *     payload, so one payload draws the same picture in a browser, under a
+ *     layout-free test DOM and on every render. See "The canvas is a fixed
+ *     logical drawing" below.
  *
  * The limitation is stated on screen rather than left for a reader to discover
  * by trying to drag the picture — see {@link STATIC_LAYOUT_NOTE}.
@@ -177,10 +177,12 @@
  * badge, how many of the most significant participants are drawn, and the
  * route to the rest — narrowing the query to one trace or interaction.
  *
- * ## THE KNOWN BOUNDS OF A STATIC PICTURE, MEASURED IN THE BROWSER
+ * ## THE KNOWN BOUNDS OF A STATIC PICTURE
  *
- * Verified in Chrome against a fixture of eight participants across six layers,
- * and recorded here so the next reader does not have to rediscover any of it:
+ * Recorded here so the next reader does not have to rediscover any of it. The
+ * first and the last were verified in Chrome against a fixture of eight
+ * participants across six layers; the second follows from the geometry below
+ * and holds for every payload by construction:
  *
  *   - **Direction is carried by the layout and by the grid, not by arrowheads.**
  *     The stylesheet declares no marker for this block and the geometry helper
@@ -190,29 +192,21 @@
  *     screen-reader user has. A relationship that runs backwards — what a cyclic
  *     dependency produces — is anchored correctly by the helper and stays
  *     legible in the grid.
- *   - **The canvas is drawn in CSS pixels, and a graph too wide to fit scrolls.**
- *     A fixed logical `viewBox` fitted to the panel was the alternative, and it
- *     shrank every label with the panel — to about a quarter of its type size
- *     in a docked DevTools panel — while leaving a blank band beneath the
- *     drawing. Instead the canvas's `width` and `height` equal its `viewBox`
- *     size, one user unit to one pixel (`components.css` lifts `base.css`'s
- *     `max-width` cap from this canvas so nothing rescales it), so text renders
- *     at its token size at every width and the canvas is exactly as tall as
- *     its participants. The boxes keep their size — their labels are budgeted
- *     for it — and the column gap is what follows the viewport: fitted by
- *     `fitGraphColumnGap` so a graph that fits spreads its columns across the
- *     viewport (up to `MAX_GRAPH_COLUMN_GAP`, past which it stops short of the
- *     right edge rather than scattering related participants), and one that
- *     cannot fit even at the narrowest gap is drawn at that gap and scrolls
- *     horizontally inside its viewport at full size. The narrowest gap still
- *     holds every relationship count drawn in it, measured in its own font
- *     (see {@link fittedColumnGap}). Measured on the eight-participant fixture
- *     from 375 to 1920 px: one unit per pixel and 11 px text at every width;
- *     a 1256 px viewport holds all six columns at a 49 unit gap with no
- *     scrollbar, a 1896 px one stops at the widest gap 86 px short of the
- *     edge, and a 351 px one scrolls the drawing laid out at the 32 unit gap,
- *     with no band beneath it in any of them. A tall graph scrolls
- *     in the block axis inside the viewport's own `max-block-size`. The
+ *   - **The canvas is a fixed logical drawing, and a graph too big to fit
+ *     scrolls.** Its `viewBox` is the layout's own size — every box, gap and
+ *     curve in SVG user units, plus the outline inset on each side — and its
+ *     `width` and `height` attributes carry those same two numbers, so at rest
+ *     one user unit is one CSS pixel: text renders at its token size and the
+ *     canvas is exactly as tall as its participants, with no band beneath it.
+ *     Nothing sizes the drawing from its container. The stylesheet, not this
+ *     component, decides how the element sits in its scroll viewport, and that
+ *     viewport scrolls a graph wider than the panel in the inline axis and a
+ *     tall one in the block axis. A `viewBox` scaled to fit the panel was the
+ *     alternative, and it shrank every label with the panel — to about a
+ *     quarter of its type size in a docked DevTools panel. The boxes, the row
+ *     gap and the column gap are the scale module's rhythm; the column gap
+ *     widens beyond it only as far as the data requires, to hold the widest
+ *     relationship count drawn inside a gap (see {@link columnGapOf}). The
  *     participants grid is the complete reading of a graph too large to take
  *     in at a glance, which is the other reason it is never virtualized.
  *   - **The relationship curves carry no information of their own.** The
@@ -277,8 +271,9 @@
  *
  * The caller's `className` is composed last.
  *
- * @see ../utils/scale for the layered geometry, the edge paths and the fitted column gap.
- * @see ../utils/measure for the viewport width and the label measure.
+ * @see ../utils/scale for the layered geometry, the edge paths and the column rhythm.
+ * @see ../utils/format for the deterministic text-width estimate the column gap
+ * holds its count labels with.
  * @see ../utils/color for the participant colour rule: span kinds first, then
  * the participant-class scale.
  * @see ../host/DataProvider for the data seam and the `graph` result shape.
@@ -322,8 +317,10 @@ import {
   dependencyParticipantTokenKey,
 } from '../utils/color';
 import {
+  DEFAULT_LABEL_FONT_SIZE,
   NOT_AVAILABLE_LABEL,
   countedNoun,
+  createEstimateMeasure,
   formatCount,
   formatCountOf,
   formatDurationCompact,
@@ -332,15 +329,11 @@ import {
   pluralize,
   truncate,
 } from '../utils/format';
-import { useChartCanvas } from '../utils/measure';
-import type { TextMeasure } from '../utils/measure';
-import type { CountedNoun } from '../utils/format';
+import type { CountedNoun, TextMeasure } from '../utils/format';
 import {
-  MIN_GRAPH_COLUMN_GAP,
+  DEFAULT_GRAPH_COLUMN_GAP,
   edgePathData,
-  fitGraphColumnGap,
   interpolate,
-  isMeasuredWidth,
   layoutDependencyGraph,
   resolveGraphLayering,
 } from '../utils/scale';
@@ -448,11 +441,13 @@ const KIND_LEGEND_ORDER: readonly DependencyGraphNode['kind'][] = Object.freeze(
  * Geometry
  *
  * Every coordinate below is either a value `../utils/scale` returned or plain
- * arithmetic over one, in SVG user units that the canvas draws one to a CSS
- * pixel. Nothing here is a CSS length. Two inputs are measured, both through
- * `useChartCanvas`: the viewport's inner width, and the advance of the
- * relationship count labels in their font. Together they choose the column
- * gap ({@link fittedColumnGap}); nothing else is derived from a measurement.
+ * arithmetic over one, in SVG user units that the canvas declares one to a CSS
+ * pixel. Nothing here is a CSS length, and nothing is measured: no element's
+ * size, no font metric, no layout. The one input beyond the scale module's
+ * rhythm is the payload itself — the relationship count labels a column gap
+ * must hold, whose advance is `../utils/format`'s deterministic estimate — so
+ * the column gap ({@link columnGapOf}), and with it the whole drawing, is a
+ * pure function of the data.
  * ---------------------------------------------------------------------------
  */
 
@@ -478,9 +473,9 @@ const BOX_TEXT_BANDS = 3;
  * Approximate SVG user units one label character occupies at the label's type
  * role (`--dg-text-sm`).
  *
- * An estimate: a box is the same width at every panel width — only the gaps
- * between columns follow the viewport — so its budget is a constant of the
- * rhythm rather than a measurement. It is used only to choose a truncation
+ * An estimate: a box is the scale module's fixed width for every payload and at
+ * every panel width, so its budget is a constant of the rhythm rather than a
+ * measurement. It is used only to choose a truncation
  * budget — the stylesheet, not this number, decides how the text is drawn — so
  * an approximation that errs toward a shorter label is the safe direction.
  */
@@ -493,12 +488,18 @@ const MIN_LABEL_CHARACTERS = 6;
 const EDGE_LABEL_POSITION = 0.5;
 
 /**
- * The typography token a relationship's count label is set in: `monoSm`, the
- * `font` `components.css` gives `dg-dependency-graph__edge-label`. The viewport
- * measure resolves it, so {@link fittedColumnGap} measures those labels in the
- * face they are drawn in.
+ * The advance of a relationship's count label, as {@link columnGapOf} sizes a
+ * column gap for it: `../utils/format`'s deterministic estimate at
+ * `DEFAULT_LABEL_FONT_SIZE`, the 11-unit size of the `monoSm` role that
+ * `components.css` sets `dg-dependency-graph__edge-label` in. The canvas
+ * declares one user unit per CSS pixel, so that is the size the label is drawn
+ * at; and the estimate's 0.6 em per narrow grapheme is the advance of the
+ * monospace faces that role names, so a label sized by it fits the gap drawn.
+ *
+ * A module constant, created once: it reads no font, no element and no layout,
+ * so the same labels always ask for the same gap.
  */
-const EDGE_LABEL_FONT = 'monoSm';
+const EDGE_LABEL_MEASURE: TextMeasure = createEstimateMeasure(DEFAULT_LABEL_FONT_SIZE);
 
 /**
  * The space kept clear between a count label's ink and the outline of the box
@@ -528,13 +529,16 @@ function edgeCountText(count: number): string {
 }
 
 /**
- * The canvas box: the layout's own size, inset so no outline is clipped.
+ * The canvas box: the layout's own logical size, inset so no outline is
+ * clipped.
  *
- * It is also the canvas's size in CSS pixels. The `width` and `height`
+ * It is also the size the canvas declares. The `width` and `height`
  * attributes and the `viewBox` ({@link canvasViewBox}) are the same two
- * numbers, so one user unit is one pixel: nothing rescales the drawing, its
- * text renders at its token size, and the element is exactly as tall as its
- * content, with no band beneath it.
+ * numbers, so at rest one user unit is one CSS pixel: its text renders at its
+ * token size, and the element is exactly as tall as its content, with no band
+ * beneath it. Both are pure functions of the layout — nothing is read from the
+ * element or its container — and the scroll viewport around the canvas is what
+ * lets a drawing larger than the panel be reached.
  */
 function canvasSize(layout: DependencyGraphLayout): { width: number; height: number } {
   return {
@@ -543,28 +547,10 @@ function canvasSize(layout: DependencyGraphLayout): { width: number; height: num
   };
 }
 
-/** The `viewBox` of the canvas: its pixel size, with the outline inset applied. */
+/** The `viewBox` of the canvas: its logical size, with the outline inset applied. */
 function canvasViewBox(layout: DependencyGraphLayout): string {
   const { width, height } = canvasSize(layout);
   return `${String(-OUTLINE_INSET)} ${String(-OUTLINE_INSET)} ${String(width)} ${String(height)}`;
-}
-
-/**
- * How many columns a layout built from `layering` uses: one past the highest
- * column any participant was given, and `0` for an empty graph.
- *
- * `layoutDependencyGraph` reports the same count as its `layerCount`, by the
- * same rule — a column index that is not a whole number of zero or more is
- * read as `0`. It is read here from the layering because the column gap the
- * layout is built with depends on it, which keeps the layout to one call per
- * gap rather than a trial layout followed by the real one.
- */
-function columnCountOf(layering: GraphLayering): number {
-  let highest = -1;
-  for (const layer of layering.layers.values()) {
-    highest = Math.max(highest, Number.isInteger(layer) && layer >= 0 ? layer : 0);
-  }
-  return highest + 1;
 }
 
 /**
@@ -573,8 +559,8 @@ function columnCountOf(layering: GraphLayering): number {
  * A repeated relationship's count sits at the midpoint of its anchors
  * ({@link EDGE_LABEL_POSITION}). For a relationship from one column to the
  * next, that midpoint is the centre of the gap between the two columns, so
- * the gap is all the room its label has; those are the labels the narrowest
- * gap is sized for. A relationship that skips columns, runs backwards or stays
+ * the gap is all the room its label has; those are the labels the column gap
+ * is widened for. A relationship that skips columns, runs backwards or stays
  * in one column labels a point outside any single gap, and one naming a
  * participant the graph does not contain is not drawn, so neither constrains
  * the gap.
@@ -601,15 +587,17 @@ function gapCountLabelsOf(
 
 /**
  * The narrowest column gap that holds every label in `labels`: the widest
- * one's advance in its font, plus {@link EDGE_LABEL_CLEARANCE} and the half
- * outline ({@link OUTLINE_INSET}) that each neighbouring box's stroke reaches
- * into the gap, on both sides. Never less than `MIN_GRAPH_COLUMN_GAP`, the
- * narrowest gap at which a curve still reads as a connector.
+ * one's advance, plus {@link EDGE_LABEL_CLEARANCE} and the half outline
+ * ({@link OUTLINE_INSET}) that each neighbouring box's stroke reaches into the
+ * gap, on both sides. `0` when there is no label to hold, so the label
+ * requirement alone never sets a floor; {@link columnGapOf} supplies that.
  *
- * A measure that answers a non-finite advance is ignored rather than trusted.
+ * A measure that answers a non-finite or non-positive advance is ignored
+ * rather than trusted, so it can never shrink or poison the gap.
  *
  * @param labels The count labels drawn inside a column gap.
- * @param measure Measures a string in the labels' font.
+ * @param measure Estimates a string's advance in the labels' type role.
+ * @returns A finite, non-negative width in SVG user units.
  */
 function minimumColumnGap(labels: readonly string[], measure: TextMeasure): number {
   let widest = 0;
@@ -620,48 +608,35 @@ function minimumColumnGap(labels: readonly string[], measure: TextMeasure): numb
     }
   }
   if (widest === 0) {
-    return MIN_GRAPH_COLUMN_GAP;
+    return 0;
   }
-  return Math.max(
-    MIN_GRAPH_COLUMN_GAP,
-    Math.ceil(widest) + 2 * (EDGE_LABEL_CLEARANCE + OUTLINE_INSET),
-  );
+  return Math.ceil(widest) + 2 * (EDGE_LABEL_CLEARANCE + OUTLINE_INSET);
 }
 
 /**
- * The column gap to lay the graph out with, given the viewport it is drawn in.
+ * The column gap to lay the graph out with: the scale module's rhythm,
+ * `DEFAULT_GRAPH_COLUMN_GAP`, widened only as far as the data requires so the
+ * widest repeated-relationship count drawn inside a gap still fits it
+ * ({@link minimumColumnGap}, estimated by {@link EDGE_LABEL_MEASURE}).
  *
- * - **Measured.** `fitGraphColumnGap` over the viewport's inner width less the
- *   canvas inset, so the whole canvas, outlines included, fits the viewport
- *   whenever the graph can. Its columns spread to fill the width up to
- *   `MAX_GRAPH_COLUMN_GAP` and tighten down to {@link minimumColumnGap}; a
- *   graph that does not fit at that gap is drawn at it, wider than its
- *   viewport, which then scrolls horizontally with the drawing at full size.
- * - **Unmeasured** — `width` is `undefined` before the first measurement and
- *   wherever there is no layout — `fitGraphColumnGap` answers
- *   `DEFAULT_GRAPH_COLUMN_GAP`, the rhythm the layout-free suites assert.
+ * A pure function of the payload's labels. No element, font or container is
+ * read, so identical data yields an identical gap — and so an identical
+ * drawing — in a browser, under a layout-free test DOM and on every render.
+ * A graph that is wider than its panel at this gap is not squeezed to fit:
+ * the canvas keeps its logical size and its scroll viewport scrolls.
  *
- * A viewport narrower than the inset itself is still a measurement: it asks
- * for the narrowest gap rather than falling back to the unmeasured rhythm.
+ * @example A chain whose one repeated relationship ran twice keeps the rhythm,
+ * because `×2` needs far less room than the default gap already gives:
+ * ```ts
+ * columnGapOf(['×2']); // DEFAULT_GRAPH_COLUMN_GAP
+ * ```
  *
- * @param columnCount How many columns the layout uses.
- * @param gapLabels The count labels drawn inside a column gap.
- * @param width The viewport's inner width in CSS pixels, if measured.
- * @param measure Measures a string in the count labels' font.
- * @returns A finite, non-negative gap in SVG user units.
+ * @param gapLabels The count labels drawn inside a column gap; see
+ *   {@link gapCountLabelsOf}.
+ * @returns A finite gap in SVG user units, never below the default rhythm.
  */
-function fittedColumnGap(
-  columnCount: number,
-  gapLabels: readonly string[],
-  width: number | undefined,
-  measure: TextMeasure,
-): number {
-  if (!isMeasuredWidth(width)) {
-    return fitGraphColumnGap(undefined, columnCount);
-  }
-  return fitGraphColumnGap(Math.max(1, width - OUTLINE_INSET * 2), columnCount, {
-    minGap: minimumColumnGap(gapLabels, measure),
-  });
+function columnGapOf(gapLabels: readonly string[]): number {
+  return Math.max(DEFAULT_GRAPH_COLUMN_GAP, minimumColumnGap(gapLabels, EDGE_LABEL_MEASURE));
 }
 
 /**
@@ -781,33 +756,31 @@ function canonicalGraph(
   };
 }
 
-/** A payload prepared for layout: everything about it that no viewport width changes. */
+/** A payload prepared for layout: every input `layoutDependencyGraph` is given. */
 interface GraphArrangement {
   /** The payload with its participants in canonical order. */
   readonly graph: DependencyGraphData;
   /** The layering resolved for it, which both the order and the geometry use. */
   readonly layering: GraphLayering;
-  /** How many columns its layout uses; see {@link columnCountOf}. */
-  readonly columnCount: number;
-  /** Its count labels that sit inside a column gap; see {@link gapCountLabelsOf}. */
-  readonly gapLabels: readonly string[];
+  /** The column gap its count labels require; see {@link columnGapOf}. */
+  readonly columnGap: number;
 }
 
 /**
- * Everything about a payload's layout that the viewport width does not
- * change: one layering, the canonical order built from that same object, the
- * column count and the count labels the column gap must hold.
+ * Everything a payload's layout is built from: one layering, the canonical
+ * order built from that same object, and the column gap its count labels
+ * require.
  *
- * Computed once per payload. A resize then rebuilds only the geometry, from
- * this same layering, so the layering never runs twice for one payload.
+ * A pure function of the payload, computed once per payload, so the layering
+ * never runs twice for one payload and the geometry built from this
+ * arrangement is the same for identical data wherever it is drawn.
  */
 function arrangeGraph(data: DependencyGraphData): GraphArrangement {
   const layering = resolveGraphLayering(data.nodes, data.edges);
   return {
     graph: canonicalGraph(data, layering.layers),
     layering,
-    columnCount: columnCountOf(layering),
-    gapLabels: gapCountLabelsOf(data.edges, layering.layers),
+    columnGap: columnGapOf(gapCountLabelsOf(data.edges, layering.layers)),
   };
 }
 
@@ -1552,24 +1525,37 @@ function SourceCell({ row }: { readonly row: ParticipantRow }): ReactElement {
  *
  * A module constant because every cell is a function of its row alone.
  *
- * The participant column takes twice the share of the others: it is the one
- * that carries a full label and a detail line, both wrapped rather than
- * truncated, so the extra share is spent where the text is. The track is a
- * ratio, so it resolves identically in the header and in every row, with a
- * floor in `ch` like every other column (the unsized ones take `DataTable`'s
- * default `minmax(10ch, 1fr)`): `DataTable` sums the floors into the grid's
- * minimum width, so a panel narrower than their sum scrolls the table
+ * Every column declares its width ROLE, never a size (`DataTableColumnWidth`
+ * in `../primitives/DataTable`, AAP 0.6.4): `DataTable` resolves each role to
+ * a track built from the design system's column floor and share tokens, the
+ * same track every other table gives content of that kind, so no number here
+ * decides how wide a column is. The roles follow the content:
+ *
+ * - **Layer** and **Total time** are figures — a short layer number and a
+ *   formatted duration — so they take `status` and `quantity`, the compact
+ *   roles that leave the spare width to the text columns.
+ * - **Class** is a short categorical chip ("UI event", "Database"): `label`.
+ * - **Participant** is `name`, the identifier role's wide share: it carries a
+ *   full label and a detail line, both wrapped rather than truncated, so the
+ *   extra share is spent where the text is.
+ * - **Relationships** is `name` too, for the same reason: its chips name their
+ *   full target and wrap rather than truncate, so a floor narrower than an
+ *   identifier would break a typical `GET /api/… ×4` chip into fragments of a
+ *   few characters and make its row several hundred pixels tall.
+ * - **Source** is `name`, the role of a source-location chip.
+ *
+ * Every role track is a floor and a ratio, so it resolves identically in the
+ * header and in every row, and `DataTable` sums the floors into the grid's
+ * minimum width: a panel narrower than their sum scrolls the table
  * horizontally instead of squeezing the participant label a few characters
- * per line. The relationships column gets the same share and a floor of its
- * own, because its chips name their full target and wrap rather than
- * truncate: at the default floor a typical `GET /api/… ×4` chip broke into
- * fragments of a few characters and made its row several hundred pixels tall.
+ * per line.
  */
 const PARTICIPANT_COLUMNS: readonly DataTableColumn<ParticipantRow>[] = Object.freeze([
   {
     key: 'layer',
     header: 'Layer',
     align: 'end',
+    width: 'status',
     cell: (row: ParticipantRow) => (
       <Text size="xs" tone="muted" numeric>
         {formatCount(row.box.layer + 1)}
@@ -1580,29 +1566,32 @@ const PARTICIPANT_COLUMNS: readonly DataTableColumn<ParticipantRow>[] = Object.f
     key: 'participant',
     header: 'Participant',
     rowHeader: true,
-    width: 'minmax(24ch, 2fr)',
+    width: 'name',
     cell: (row: ParticipantRow) => <ParticipantCell row={row} />,
   },
   {
     key: 'class',
     header: 'Class',
+    width: 'label',
     cell: (row: ParticipantRow) => <ClassCell row={row} />,
   },
   {
     key: 'total-time',
     header: 'Total time',
     align: 'end',
+    width: 'quantity',
     cell: (row: ParticipantRow) => <DurationCell ms={row.node.totalDurationMs} size="sm" />,
   },
   {
     key: 'relationships',
     header: 'Relationships',
-    width: 'minmax(22ch, 2fr)',
+    width: 'name',
     cell: (row: ParticipantRow) => <RelationshipsCell row={row} />,
   },
   {
     key: 'source',
     header: 'Source',
+    width: 'name',
     cell: (row: ParticipantRow) => <SourceCell row={row} />,
   },
 ]);
@@ -1659,42 +1648,22 @@ export function DependencyGraph(props: DependencyGraphProps): ReactElement {
 
   const { status, data, error, announcement, retry } = useQuery(query);
 
-  // The canvas's scroll viewport, observed: its inner width chooses the column
-  // gap, and the measure (in the count labels' font) sizes the narrowest gap.
-  // Without layout the width stays `undefined` and the measure is a
-  // deterministic estimate, so the unmeasured drawing is reproducible.
-  const {
-    ref: viewportRef,
-    width: viewportWidth,
-    measureText,
-  } = useChartCanvas<HTMLDivElement>({ font: EDGE_LABEL_FONT });
-
-  // The layout in three memos, split by what each depends on. The arrangement
-  // (one layering, and the canonical ordering built from that same object) is
-  // a pure function of the payload, so the layering is resolved exactly once
-  // per payload. The column gap follows the viewport. The geometry is rebuilt
-  // from the arrangement only when the gap changes, so a resize that leaves
-  // the gap where it was redraws nothing, and one payload at one width always
-  // draws the same picture.
+  // The layout, as a pure function of the payload and nothing else: no element
+  // is observed and no size is read, so one payload always draws the same
+  // picture. The arrangement (one layering, the canonical ordering built from
+  // that same object, and the column gap its count labels require) is
+  // resolved exactly once per payload, and the geometry is built from it.
   const arrangement = useMemo(() => (data === undefined ? undefined : arrangeGraph(data)), [data]);
-  const columnGap = useMemo(
-    () =>
-      arrangement === undefined
-        ? undefined
-        : fittedColumnGap(
-            arrangement.columnCount,
-            arrangement.gapLabels,
-            viewportWidth,
-            measureText,
-          ),
-    [arrangement, viewportWidth, measureText],
-  );
   const layout = useMemo(
     () =>
       arrangement === undefined
         ? undefined
-        : layoutDependencyGraph(arrangement.graph, { columnGap }, arrangement.layering),
-    [arrangement, columnGap],
+        : layoutDependencyGraph(
+            arrangement.graph,
+            { columnGap: arrangement.columnGap },
+            arrangement.layering,
+          ),
+    [arrangement],
   );
   const rows = useMemo(() => (layout === undefined ? NO_ROWS : buildRows(layout)), [layout]);
   const colourKey = useMemo(() => spanColourKey(rows), [rows]);
@@ -1903,11 +1872,11 @@ export function DependencyGraph(props: DependencyGraphProps): ReactElement {
       ) : null}
 
       {/*
-       * The measured element: the canvas is drawn at a size derived from this
-       * viewport's inner width, one user unit to a pixel, and scrolls inside it
-       * when the graph cannot fit even at the narrowest column gap.
+       * The scroll viewport. Nothing reads its size: the canvas inside declares
+       * the layout's own logical size, one user unit to a pixel at rest, and
+       * the viewport scrolls a drawing larger than the panel.
        */}
-      <div className="dg-dependency-graph__viewport" ref={viewportRef}>
+      <div className="dg-dependency-graph__viewport">
         <svg
           className="dg-dependency-graph__canvas"
           role="img"

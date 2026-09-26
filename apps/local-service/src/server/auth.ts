@@ -13,22 +13,27 @@
  * {@link ConnectionRevoker} structurally, and the route modules call
  * {@link requireRole}, {@link requireProjectScope}, {@link requireBoundSession}
  * and {@link requireSessionAccess} so that no rule is re-derived per route.
+ * A route that awaits its request body before acting also calls
+ * {@link AuthService.requireLiveCredential} between the read and the act, so
+ * a credential retired while the body was in flight authorizes nothing.
  *
  * ## The three credentials
  *
  * Every credential is a 32-byte CSPRNG token, rendered base64url, and stored
  * **only** as its SHA-256 digest in the `credentials` table together with its
  * role, its scope and its lifetime. The plaintext exists in exactly three
- * places in the whole system: `$DEBUGGEN_HOME/auth.json` (mode `0600`), the
- * one-time response body of `POST /pair/complete`, and the environment of a
- * dev-server process the launcher started. Nothing in this module logs,
- * persists, throws or returns a plaintext token anywhere else.
+ * places in the whole system: `$DEBUGGEN_HOME/auth.json` (mode `0600`) — with,
+ * while the editor credential is being replaced, its journal
+ * `auth.json.pending` ({@link AUTH_FILE_STAGE_SUFFIX}) beside it at the same
+ * mode — the one-time response body of `POST /pair/complete`, and the
+ * environment of a dev-server process the launcher started. Nothing in this
+ * module logs, persists, throws or returns a plaintext token anywhere else.
  *
  * | Role | Scope | Issued by | Lifetime |
  * | --- | --- | --- | --- |
  * | `vscode` (editor) | the machine user; acts on projects under the workspace folders its live connections announced in `client.hello` | {@link AuthService.ensureEditorCredential}, written to `auth.json` | until rotation |
  * | `devtools` | the Chrome extension id that redeemed a pairing code | {@link AuthService.completePairing} | until rotation |
- * | `server-agent` | exactly one `projectRoot` | {@link AuthService.issueServerAgentCredential}, called by the dev-server launcher | until the launched process exits ({@link AuthService.revokeServerAgentCredentials}) or an explicit expiry |
+ * | `server-agent` | exactly one `projectRoot` | {@link AuthService.issueServerAgentCredential}, called by the dev-server launcher | until the launched process exits or is stopped ({@link AuthService.revokeServerAgentCredential}, that one credential only), and never past its expiry: a launched child's credential is a lease the launcher renews ({@link AuthService.renewServerAgentCredential}) only while the child runs |
  *
  * The page agent (`client: 'agent'` in protocol's `CLIENT_KINDS`) holds no
  * credential and no socket of its own: the Chrome service worker relays its
@@ -48,10 +53,21 @@
  *
  * On top of that, each role may only be presented from the origins its client
  * can actually have: an editor credential from no origin or a VS Code webview,
- * a DevTools credential only from `chrome-extension://<the id it was issued
- * to>`, and a server-agent credential only from no origin. A credential that
- * surfaces anywhere else is refused, which is what makes a stolen DevTools
- * token useless outside the extension that paired.
+ * a DevTools credential from `chrome-extension://<the id it was issued to>`,
+ * and a server-agent credential only from no origin. A credential that
+ * surfaces anywhere else is refused, which is what keeps a stolen DevTools
+ * token out of every other extension, webview and web page.
+ *
+ * One DevTools case carries no `Origin` at all: Chrome sends the header on an
+ * extension's `POST` and on its WebSocket upgrade, but not on a `GET` its
+ * service worker makes to a host the extension holds a host permission for
+ * (`http://127.0.0.1/*`). A DevTools credential is therefore also accepted
+ * from no origin on a `GET` route — the read-only ones: `session.get`,
+ * `panel.get`, `panel.getById` and `modifications.list` — and nowhere else:
+ * every state-changing request and the `client.hello` still need the issuing
+ * extension's origin. This admits nothing a web page can use: a page's own
+ * cross-origin request names its origin (refused above), and the no-origin
+ * requests a page can provoke cannot carry an `Authorization` header.
  *
  * No `Access-Control-Allow-Origin` header is ever set by this module or by the
  * middleware it builds. Its absence is load-bearing: it is why a browser page
@@ -64,37 +80,97 @@
  * role and scope decide; where a claim contradicts the credential, the
  * credential wins and the connection is refused. The one claim that *narrows*
  * authority rather than asserting it is the editor's announced `projectRoot`:
- * an editor credential may act only under folders its connections announced,
- * and an announcement lives exactly as long as the connection that made it
- * ({@link AuthService.announceWorkspace}).
+ * an editor credential may act only under folders its connections announced
+ * ({@link AuthService.announceWorkspace}). An announcement lives as long as the
+ * connection that made it plus, when that connection merely dropped, a bounded
+ * **lease** ({@link WorkspaceAnnouncement.releaseAfter}, at most
+ * {@link MAX_WORKSPACE_ANNOUNCEMENT_LEASE_MS}): disconnects are routine — VS
+ * Code's `deactivate()` ends its sessions over HTTP after its socket is gone,
+ * and a reconnect takes a moment — so the editor keeps its folders for the
+ * same offline grace a suspended client keeps its registration. Rotation and
+ * shutdown end every announcement and every lease at once.
+ *
+ * ## A DevTools credential is not a tab identity
+ *
+ * One paired Chrome extension holds one `devtools` credential, and its MV3
+ * service worker carries **every** inspected tab over one WebSocket and one
+ * HTTP client. The credential therefore proves *which extension* is asking,
+ * never *which tab* it is asking for: tab B and tab A present the same digest.
+ * AAP §0.5.6 lets a DevTools client act only on the session bound to its own
+ * tab, so every DevTools action names its **acting tab** — the
+ * {@link ACTING_TAB_HEADER} on HTTP (resolved by {@link resolveActingTab} and
+ * exposed to routes as `c.get('actingTabId')`), the envelope's `tabId` (or a
+ * single-tab connection's hello `tabId`) on WebSocket — and
+ * {@link requireBoundSession} admits the action only when the service's own
+ * live binding table says that tab is bound to that session by that
+ * credential. The acting tab is a claim the extension makes from Chrome's own
+ * port metadata; what makes it safe is that it is checked against the binding
+ * table, never trusted as authority on its own, and that an action naming no
+ * tab is refused rather than attributed to a guessed one.
  *
  * ## Failure reporting
  *
  * Every fallible operation returns a `Result`; nothing here throws. Every
  * refusal is a `DebuggenError` whose code comes from the closed
  * `DEBUGGEN_ERROR_CODES` set and whose `details.reason` names one entry of
- * {@link AUTH_FAILURE_REASONS}, which fixes its HTTP status (401, 403 or 429).
+ * {@link AUTH_FAILURE_REASONS}, which fixes its HTTP status (400, 401, 403 or
+ * 429).
  * Messages are constant sentences about the rule that was applied; no presented
  * value — token, code, header, payload — is ever interpolated into one.
  *
  * ## State and lifetime
  *
  * Durable state is the two tables `credentials` and `pairing_codes`, reached
- * through the injected {@link Store}'s statement cache. The only in-memory state
- * is the pairing lockout ledger and the workspace announcements, both bounded,
- * both dropped by {@link AuthService.close}. This module starts no timer and
- * opens no socket: lockouts expire lazily against the injected clock.
+ * through the injected {@link Store}'s statement cache, and `auth.json`. The
+ * only in-memory state is the pairing lockout ledger and the workspace
+ * announcements, both bounded, both dropped by {@link AuthService.close}. This
+ * module starts no timer and opens no socket: lockouts and workspace leases
+ * expire lazily against the injected clock, and an expired lease is pruned by
+ * the scope read that finds it expired.
+ *
+ * ## Replacing the editor credential across two resources
+ *
+ * A new editor credential — minted on first start or by
+ * {@link AuthService.rotateAll} — changes two resources that share no
+ * transaction: a row in the store and the plaintext in `auth.json`. Renaming
+ * the file inside the store transaction, as a single "atomic" step, is not
+ * atomic: a failure after the rename rolls the rows back but not the file.
+ * Every replacement therefore runs as a journaled sequence, and no file is
+ * touched inside a store transaction:
+ *
+ * 1. **Stage** — the new record is written to the journal,
+ *    `auth.json.pending` ({@link AUTH_FILE_STAGE_SUFFIX}), atomically at `0600`.
+ * 2. **Commit** — one store transaction deletes what the replacement retires
+ *    and inserts the new editor row.
+ * 3. **Publish** — the journal's record is written to `auth.json`.
+ * 4. **Unstage** — the journal is removed.
+ *
+ * The journal's own editor row is the commit marker: it is inserted in the same
+ * transaction as every deletion, so a live row for the journal's credential
+ * means the whole change committed and its absence means none of it did.
+ * {@link AuthService.ensureEditorCredential} — every start — and
+ * {@link AuthService.rotateAll} — every rotation — first recover a journal an
+ * earlier call left: a committed one is published, an uncommitted one is
+ * discarded. `auth.json` is therefore only ever published after the store
+ * change it belongs to is durable, and a file that has fallen behind the store
+ * is caught up to it — the store is never rolled back to the file. A file whose
+ * credential has no row while another editor credential is registered is, for
+ * the same reason, never registered again: a new credential is minted instead,
+ * so no credential a committed rotation retired can come back.
  */
 
 import { randomBytes as cryptoRandomBytes, timingSafeEqual } from 'node:crypto';
+import { unlinkSync } from 'node:fs';
 import { dirname } from 'node:path';
 
 import type { MiddlewareHandler } from 'hono';
 import { z } from 'zod';
 
 import {
+  ACTING_TAB_HEADER,
   AUTHORIZATION_HEADER,
   CLIENT_KINDS,
+  HTTP_ROUTES,
   PROTOCOL_VERSION,
   WS_CLOSE_UNAUTHORIZED,
   clientHelloPayloadSchema,
@@ -102,6 +178,7 @@ import {
   formatBearer,
   isAuthExemptOperation,
   isCompatibleProtocolVersion,
+  parseActingTabHeader,
   toErrorPayload,
 } from '@debuggen/protocol';
 import type {
@@ -170,6 +247,21 @@ export const CREDENTIAL_TOKEN_BYTES = 32;
 /** The `version` field of the `auth.json` record this module writes. */
 export const AUTH_FILE_VERSION = 1;
 
+/**
+ * The suffix that names the editor credential's journal: the file
+ * `<authFilePath>` + this suffix, beside `auth.json` in the same private
+ * directory.
+ *
+ * The journal holds the record a replacement of the editor credential is about
+ * to publish, in exactly `auth.json`'s format and at its mode, from before the
+ * replacement's store transaction until `auth.json` holds it (see "Replacing
+ * the editor credential across two resources" in the module documentation). A
+ * journal that outlives the call that wrote it is finished or discarded by the
+ * next {@link AuthService.ensureEditorCredential} or
+ * {@link AuthService.rotateAll}; nothing else reads it.
+ */
+export const AUTH_FILE_STAGE_SUFFIX = '.pending';
+
 /** How many characters a pairing code has (AAP §0.5.6). */
 export const PAIRING_CODE_LENGTH = 8;
 
@@ -227,10 +319,28 @@ const MAX_TRACKED_PAIRING_ORIGINS = 1024;
 const MAX_GENERATION_ATTEMPTS = 4;
 
 /**
+ * How many times a committed editor credential is written to `auth.json` before
+ * the replacement reports the file as not updated: the first write and one
+ * retry. A committed credential is already the only editor credential the
+ * store accepts, so one more attempt is cheap insurance against a transient
+ * failure; a failure that persists leaves the journal for the next start.
+ */
+const PUBLISH_ATTEMPTS = 2;
+
+/** How the editor credential file is named in failure messages. */
+const AUTH_FILE_SUBJECT = 'editor credential file';
+
+/** How the editor credential's journal is named in failure messages. */
+const AUTH_STAGE_SUBJECT = 'editor credential journal';
+
+/**
  * The reason text a rotation hands to the revoker for every socket it closes.
  * WebSocket close reasons are limited to 123 bytes, so it is short.
  */
 const ROTATION_CLOSE_REASON = 'credentials rotated';
+
+/** The close reason of a connection whose credential was revoked on its own. */
+const REVOCATION_CLOSE_REASON = 'credential revoked';
 
 /** The request header that carries a browser client's origin, lower-case like hono's lookups. */
 const ORIGIN_HEADER = 'origin';
@@ -416,11 +526,20 @@ export interface IssuedCredential {
  * `principal` is set for every operation that requires a credential and never
  * for the two auth-exempt ones (`health`, `pair.complete`), whose handlers
  * must not read it.
+ *
+ * `actingTabId` is the inspected tab a DevTools request names in the
+ * {@link ACTING_TAB_HEADER}, as {@link resolveActingTab} verified its shape:
+ * `undefined` for every editor and server-agent request (which may not send the
+ * header at all) and for a DevTools request that named none. It is a claim to
+ * be checked, never authority: a route hands it to {@link requireBoundSession}
+ * (directly or through {@link requireSessionAccess}), which refuses a DevTools
+ * request whose acting tab is absent or is not the session's live bound tab.
  */
 export type ServerEnv = {
   Variables: {
     principal: Principal;
     operation: HttpOperationId;
+    actingTabId: number | undefined;
   };
 };
 
@@ -431,6 +550,11 @@ export type ServerEnv = {
  * bound the tab: AAP §0.5.6 records a binding "against the connection's
  * principal", which is what stops one DevTools credential from acting on a
  * session another credential's tab is bound to.
+ *
+ * `boundBy` names a **credential, not a tab**. Every tab one paired extension
+ * inspects shares that credential, so `boundBy` alone would let tab B act on
+ * the session tab A is bound to; `tabId` is what {@link requireBoundSession}
+ * compares the request's acting tab against to tell them apart.
  */
 export interface TabBinding {
   readonly tabId: number;
@@ -461,6 +585,57 @@ export interface ConnectionRevoker {
    * @returns How many sockets were closed.
    */
   revokeAll(code: number, reason?: string): number;
+
+  /**
+   * Closes the open connections authenticated with one credential — what
+   * {@link AuthService.revokeServerAgentCredential} calls once that credential
+   * is deleted, so a revoked dev server's socket stops receiving configuration
+   * at once rather than at its next expiry check. Every other connection,
+   * including another credential of the same project, is left open.
+   *
+   * Optional: without it a revoked credential's socket is closed by the client
+   * registry's expiry sweep, which sees a revoked server-agent principal as
+   * expired (see {@link AuthService.authorizeHello}).
+   *
+   * @param tokenHash The revoked credential's SHA-256 digest.
+   * @param code The close code — protocol's `WS_CLOSE_UNAUTHORIZED`.
+   * @param reason A short close reason.
+   * @returns How many sockets were closed.
+   */
+  closeCredential?(tokenHash: string, code: number, reason?: string): number;
+}
+
+/**
+ * The two filesystem writes a replacement of the editor credential makes, as a
+ * port: the atomic write that stages and publishes a record, and the removal
+ * of the journal.
+ *
+ * Production never supplies one: {@link createAuthService} defaults to
+ * `writeSecureFileAtomic` from `@debuggen/shared/node` and `node:fs`'s
+ * `unlinkSync`. It is a **test seam**, the same kind as the injected clock and
+ * randomness source: it lets the unit suite fail exactly one step of a
+ * replacement — staging, publishing, removing the journal — and prove what a
+ * restart makes of the state that step left behind, which no arrangement of
+ * the filesystem can do for a suite that runs as root. Reads are never routed
+ * through it, and every write is still verified afterwards with
+ * `inspectPrivateFileNoFollow`, so a port cannot make an unsafe file pass.
+ */
+export interface CredentialFileSystem {
+  /**
+   * Atomically creates or replaces `path` at `0600`, after verifying its parent
+   * chain up to and including `upTo` is private.
+   *
+   * @throws Any failure; nothing may be left at `path` but the old or the new
+   * content.
+   */
+  writeSecureFile(path: string, data: string, upTo: string): void;
+
+  /**
+   * Removes the directory entry at `path`, never following a link there.
+   *
+   * @throws Any failure, `ENOENT` included, with its errno `code` intact.
+   */
+  removeFile(path: string): void;
 }
 
 /** What {@link AuthService.ensureEditorCredential} reports. */
@@ -476,6 +651,16 @@ export interface ServerAgentCredentialRequest {
   readonly projectRoot: string;
   /** An explicit expiry in epoch milliseconds, in the future; absent to live until revoked. */
   readonly expiresAt?: number | undefined;
+  /**
+   * Marks the credential as a **lease** this service process holds: minted by
+   * the dev-server launcher for a child it supervises, renewed only while that
+   * child runs, and revoked when it exits. Requires `expiresAt`. The holder's
+   * process id is stored with the row, so a lease left behind by a service that
+   * crashed is revoked the next time a service starts
+   * ({@link AuthService.revokeOrphanedServerAgentLeases}) instead of lingering
+   * until it lapses.
+   */
+  readonly lease?: boolean | undefined;
 }
 
 /**
@@ -526,19 +711,77 @@ export interface RotationOutcome {
 }
 
 /**
- * A live workspace announcement. Released when the connection that made it
- * closes; releasing twice is harmless.
+ * The longest lease {@link WorkspaceAnnouncement.releaseAfter} grants: five
+ * minutes. A lease covers a routine disconnect — an editor reconnecting, or
+ * VS Code's `deactivate()` ending its sessions over HTTP after its socket has
+ * closed — and nothing longer; a caller asking for more is clamped to this.
+ */
+export const MAX_WORKSPACE_ANNOUNCEMENT_LEASE_MS = 5 * 60_000;
+
+/**
+ * A live workspace announcement: the folders one editor connection announced,
+ * in the scope of its credential until the announcement is settled.
+ *
+ * The first call of either method settles it; every later call of either is a
+ * no-op. Settling an announcement that a rotation or shutdown already cleared
+ * does nothing, so a socket closed by the revocation itself cannot bring its
+ * folders back.
+ *
+ * @example
+ * ```ts
+ * const announced = auth.announceWorkspace(principal);
+ * // …the connection closes on its own:
+ * announced.value.releaseAfter(offlineGraceMs);
+ * // …or the server is closing, or the connection never registered:
+ * announced.value.release();
+ * ```
  */
 export interface WorkspaceAnnouncement {
+  /** Withdraws the folders at once — unless another connection, or its lease, still holds them. */
   readonly release: () => void;
+  /**
+   * Withdraws this connection's claim but keeps its folders in scope for
+   * `leaseMs` more milliseconds of the service's clock, clamped to
+   * `[0, MAX_WORKSPACE_ANNOUNCEMENT_LEASE_MS]` (a non-finite or negative value
+   * is `0`, which is {@link WorkspaceAnnouncement.release}). The lease is judged lazily on the next
+   * scope read; no timer is started.
+   */
+  readonly releaseAfter: (leaseMs: number) => void;
+}
+
+/**
+ * One announced folder's standing for one editor credential: how many live
+ * announcements name it, and until when a settled one's lease keeps it.
+ */
+interface FolderStanding {
+  /** Announcements naming the folder that are not yet settled. */
+  live: number;
+  /** Epoch milliseconds before which the folder stays in scope with no live announcement; `0` for none. */
+  leaseUntil: number;
+}
+
+/**
+ * The lease `requested` milliseconds amounts to: whole milliseconds within
+ * `[0, MAX_WORKSPACE_ANNOUNCEMENT_LEASE_MS]`, and `0` for anything non-finite
+ * or negative.
+ */
+function workspaceLeaseMs(requested: number): number {
+  if (!Number.isFinite(requested) || requested <= 0) {
+    return 0;
+  }
+  return Math.min(Math.floor(requested), MAX_WORKSPACE_ANNOUNCEMENT_LEASE_MS);
 }
 
 /* -------------------------------------------------------------------------------------------------
  * Failure vocabulary
  * ---------------------------------------------------------------------------------------------- */
 
-/** The HTTP statuses an access-boundary failure is answered with. */
-export type AuthHttpStatus = 401 | 403 | 429;
+/**
+ * The HTTP statuses an access-boundary failure is answered with. `400` is
+ * reserved for an {@link ACTING_TAB_HEADER} value that is not one tab id — a
+ * malformed request rather than a refused credential.
+ */
+export type AuthHttpStatus = 400 | 401 | 403 | 429;
 
 /** One entry of {@link AUTH_FAILURE_REASONS}. */
 interface AuthFailureDescriptor {
@@ -556,10 +799,11 @@ interface AuthFailureDescriptor {
  * Every way the access boundary refuses, with the error code and HTTP status
  * each one carries.
  *
- * The table is the single place a refusal's status is decided: 401 when the
- * caller is not (or no longer) authenticated, 403 when it is authenticated but
- * the origin, role or scope does not permit the act, 429 during a pairing
- * lockout. `details.reason` on every refusal names its entry, so
+ * The table is the single place a refusal's status is decided: 400 when the
+ * acting-tab header is not a tab id, 401 when the caller is not (or no longer)
+ * authenticated, 403 when it is authenticated but the origin, role, scope or
+ * acting tab does not permit the act, 429 during a pairing lockout.
+ * `details.reason` on every refusal names its entry, so
  * {@link authFailureStatus} can map an error back to its status without parsing
  * a message.
  */
@@ -645,6 +889,24 @@ export const AUTH_FAILURE_REASONS = Object.freeze({
     message: 'This DevTools client may act only on the session its inspected tab is bound to.',
     hint: 'Open the Debug Generator panel on the tab running the session.',
   },
+  'acting-tab-required': {
+    code: 'TAB_NOT_BOUND',
+    status: 403,
+    message: 'A DevTools request must name the inspected tab it acts for.',
+    hint: 'Update the Debug Generator Chrome extension; this service needs every DevTools request to name its inspected tab.',
+  },
+  'acting-tab-invalid': {
+    code: 'PROTOCOL_INVALID_MESSAGE',
+    status: 400,
+    message: `The ${ACTING_TAB_HEADER} header must be exactly one Chrome tab id.`,
+    hint: 'Send the inspected tab id as a non-negative decimal integer, once.',
+  },
+  'acting-tab-not-permitted': {
+    code: 'UNAUTHORIZED',
+    status: 403,
+    message: `Only a DevTools credential names an inspected tab; this request may not carry the ${ACTING_TAB_HEADER} header.`,
+    hint: 'Omit the acting-tab header outside the Debug Generator Chrome extension.',
+  },
   'pairing-origin-required': {
     code: 'FORBIDDEN_ORIGIN',
     status: 403,
@@ -719,7 +981,7 @@ export function authFailureReasonOf(error: DebuggenError): AuthFailureReason | u
  * not an access-boundary refusal and should be treated as a server failure.
  *
  * @param error Any error returned by this module.
- * @returns 401, 403 or 429 per {@link AUTH_FAILURE_REASONS}.
+ * @returns 400, 401, 403 or 429 per {@link AUTH_FAILURE_REASONS}.
  */
 export function authFailureStatus(error: DebuggenError): AuthHttpStatus | undefined {
   const reason = authFailureReasonOf(error);
@@ -769,6 +1031,14 @@ export type AuthenticatedOperation = Exclude<HttpOperationId, AuthExemptOperatio
  * {@link requireSessionAccess}.
  *
  * - The editor controls sessions, dev servers and pairing.
+ * - The three administrative operations are the editor's alone:
+ *   `session.purge` (the on-demand retention sweep behind
+ *   `debuggen.purgeSessions`), `devServer.credential` (a project-scoped
+ *   server-agent credential for a dev server the caller starts itself, as
+ *   `scripts/dev-instrumented.mjs` requests one) and `credentials.rotate`
+ *   (the revocation behind `debuggen.rotateServiceToken`). Each acts on state
+ *   no DevTools client or server agent may reach: every session's history,
+ *   the minting of a credential, and every credential at once.
  * - A DevTools client reads and captures only through the session its tab is
  *   bound to, and can never create, question or end a session.
  * - A server agent may only post telemetry for its project.
@@ -779,8 +1049,10 @@ export const OPERATION_ROLES = Object.freeze({
   'session.get': ['vscode', 'devtools'],
   'session.question': ['vscode'],
   'session.end': ['vscode'],
+  'session.purge': ['vscode'],
   'capture.start': ['vscode', 'devtools'],
   'capture.stop': ['vscode', 'devtools'],
+  'target.request': ['vscode'],
   'panel.data': ['vscode', 'devtools'],
   'panel.get': ['vscode', 'devtools'],
   'panel.getById': ['vscode', 'devtools'],
@@ -788,7 +1060,9 @@ export const OPERATION_ROLES = Object.freeze({
   'telemetry.event': ['server-agent'],
   'devServer.launch': ['vscode'],
   'devServer.stop': ['vscode'],
+  'devServer.credential': ['vscode'],
   'pair.start': ['vscode'],
+  'credentials.rotate': ['vscode'],
 } as const satisfies Readonly<Record<AuthenticatedOperation, readonly PrincipalRole[]>>);
 
 /** {@link isAuthExemptOperation} as a type guard over the operation vocabulary. */
@@ -891,19 +1165,36 @@ export function isAllowedOrigin(origin: string | undefined): boolean {
 }
 
 /**
+ * How a credential is presented, which decides whether a DevTools credential
+ * may arrive without an `Origin` (see the module's origin policy): `read` for
+ * an HTTP `GET`, `write` for every other HTTP request and for `client.hello`.
+ */
+type CredentialPresentation = 'read' | 'write';
+
+/** The presentation of an HTTP request for `operation`, by its route's method. */
+function presentationOf(operation: HttpOperationId): CredentialPresentation {
+  return HTTP_ROUTES[operation].method === 'GET' ? 'read' : 'write';
+}
+
+/**
  * Whether a credential of this principal's role may be presented from this
  * origin: editor credentials from Node or a VS Code webview, DevTools
- * credentials only from the extension they were issued to, server-agent
- * credentials only from Node.
+ * credentials from the extension they were issued to — or from no origin on a
+ * `read`, because Chrome omits the header on the extension's `GET`s —
+ * server-agent credentials only from Node.
  */
-function originPermitsPrincipal(origin: OriginClass, principal: Principal): boolean {
+function originPermitsPrincipal(
+  origin: OriginClass,
+  principal: Principal,
+  presentation: CredentialPresentation,
+): boolean {
   switch (principal.role) {
     case 'vscode':
       return origin.kind === 'absent' || origin.kind === 'vscode-webview';
     case 'devtools':
-      return (
-        origin.kind === 'chrome-extension' && origin.extensionId === principal.scope.extensionId
-      );
+      return origin.kind === 'absent'
+        ? presentation === 'read'
+        : origin.kind === 'chrome-extension' && origin.extensionId === principal.scope.extensionId;
     case 'server-agent':
       return origin.kind === 'absent';
   }
@@ -993,6 +1284,39 @@ function readHeader(headers: HeaderSource, name: string): HeaderRead {
 }
 
 /**
+ * The acting-tab rule over one read of the {@link ACTING_TAB_HEADER}, in the
+ * order that reveals least: a request that names no tab is not refused here
+ * (the per-session guard, {@link requireBoundSession}, refuses a DevTools
+ * action that needs one); a header on a request whose principal is not a
+ * DevTools one — an editor, a server agent, or an auth-exempt operation, which
+ * has no principal — is refused whatever its value, because no such caller
+ * acts for a tab; and only then is a DevTools request's value parsed, with
+ * protocol's own `parseActingTabHeader`. A header sent more than once is
+ * refused rather than guessed at, like an ambiguous credential. No refusal
+ * carries the presented value.
+ *
+ * @param principal The resolved principal, or `null` for an auth-exempt operation.
+ * @param header The header as {@link readHeader} read it.
+ * @returns The acting tab, `undefined` when none was named, or the refusal.
+ */
+function decideActingTab(
+  principal: Principal | null,
+  header: HeaderRead,
+): Result<number | undefined, DebuggenError> {
+  if (header.kind === 'absent') {
+    return ok(undefined);
+  }
+  if (principal?.role !== 'devtools') {
+    return refuse('acting-tab-not-permitted');
+  }
+  if (header.kind === 'ambiguous') {
+    return refuse('acting-tab-invalid');
+  }
+  const parsed = parseActingTabHeader(header.value);
+  return isErr(parsed) ? refuse('acting-tab-invalid') : parsed;
+}
+
+/**
  * The bounds a presented credential must satisfy before it is hashed: protocol's
  * own token field schema, so the service and every client agree on them
  * without either restating a number.
@@ -1075,7 +1399,17 @@ const storedScopeSchema = z.discriminatedUnion('kind', [
     kind: z.literal('extension'),
     extensionId: z.string().regex(EXTENSION_ID_PATTERN),
   }),
-  z.strictObject({ kind: z.literal('project'), projectRoot: projectRootFieldSchema }),
+  z.strictObject({
+    kind: z.literal('project'),
+    projectRoot: projectRootFieldSchema,
+    /**
+     * For a lease — a credential the dev-server launcher minted for a child it
+     * supervises and renews while that child runs — the process id of the
+     * service that holds it. A lease whose holder is gone is revoked when the
+     * service starts ({@link AuthService.revokeOrphanedServerAgentLeases}).
+     */
+    leaseHolder: z.number().int().positive().optional(),
+  }),
 ]);
 
 /** A stored scope. */
@@ -1095,6 +1429,9 @@ const credentialRowSchema = z.object({
 
 /** A validated `credentials` row. */
 type CredentialRow = z.infer<typeof credentialRowSchema>;
+
+/** The two columns {@link AuthService.revokeOrphanedServerAgentLeases} reads per row. */
+const credentialScopeRowSchema = z.object({ token_hash: z.string(), scope: z.string() });
 
 /** One `pairing_codes` row as `node:sqlite` returns it. */
 const pairingRowSchema = z.object({
@@ -1127,9 +1464,14 @@ const SQL = Object.freeze({
     'SELECT token_hash, role, scope, issued_at, expires_at FROM credentials WHERE token_hash = ?',
   selectCredentialsByRole:
     'SELECT token_hash, role, scope, issued_at, expires_at FROM credentials WHERE role = ?',
+  selectAnyCredentialOfRole: 'SELECT 1 AS present FROM credentials WHERE role = ? LIMIT 1',
   insertCredential:
     'INSERT INTO credentials (token_hash, role, scope, issued_at, expires_at) VALUES (?, ?, ?, ?, ?)',
   deleteCredential: 'DELETE FROM credentials WHERE token_hash = ?',
+  deleteCredentialOfRole: 'DELETE FROM credentials WHERE token_hash = ? AND role = ?',
+  selectCredentialScopesOfRole: 'SELECT token_hash, scope FROM credentials WHERE role = ?',
+  renewLeasedCredential:
+    'UPDATE credentials SET expires_at = max(expires_at, ?) WHERE token_hash = ? AND role = ? AND expires_at IS NOT NULL AND expires_at > ?',
   deleteCredentialsByRole: 'DELETE FROM credentials WHERE role = ?',
   deleteOtherCredentialsOfRole: 'DELETE FROM credentials WHERE role = ? AND token_hash <> ?',
   deleteExpiredCredentials:
@@ -1166,20 +1508,103 @@ function errnoCodeOf(cause: unknown): string | undefined {
 }
 
 /**
- * A filesystem failure on the editor credential file, keeping a policy refusal
- * from `@debuggen/shared/node` (`FS_UNSAFE_PATH`) as it is and wrapping a raw
- * errno failure. The file's contents never enter the error.
+ * Whether `pid` names a live process: a signal-0 probe, which checks for the
+ * process without signalling it. `EPERM` means it exists under another user,
+ * so only `ESRCH` (and an unusable id) counts as gone.
+ *
+ * @param pid The process id a lease recorded as its holder.
+ * @returns `false` only when no such process exists.
  */
-function credentialFileFailure(cause: unknown, operation: string): DebuggenError {
+function isProcessAlive(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 0) {
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (cause) {
+    return errnoCodeOf(cause) !== 'ESRCH';
+  }
+}
+
+/**
+ * A filesystem failure on the editor credential file or its journal, keeping a
+ * policy refusal from `@debuggen/shared/node` (`FS_UNSAFE_PATH`) as it is and
+ * wrapping a raw errno failure. The file's contents never enter the error.
+ *
+ * @param subject Which file failed: {@link AUTH_FILE_SUBJECT} or {@link AUTH_STAGE_SUBJECT}.
+ */
+function credentialFileFailure(
+  cause: unknown,
+  operation: string,
+  subject: string = AUTH_FILE_SUBJECT,
+): DebuggenError {
   if (DebuggenError.is(cause)) {
     return cause;
   }
   const errno = errnoCodeOf(cause);
-  return new DebuggenError('INTERNAL', `The editor credential file could not be ${operation}.`, {
+  return new DebuggenError('INTERNAL', `The ${subject} could not be ${operation}.`, {
     hint: 'Check that $DEBUGGEN_HOME is a private directory owned by this account.',
     details: { operation, ...(errno === undefined ? {} : { errno }) },
     cause,
   });
+}
+
+/**
+ * The failure a rotation reports when it stopped before its store transaction
+ * committed: nothing was rotated, so every existing credential is still valid.
+ * Keeps the underlying code, hint and diagnostic details, and says so.
+ */
+function rotationNotApplied(cause: DebuggenError): DebuggenError {
+  return new DebuggenError(
+    cause.code,
+    'Credentials were not rotated; every existing credential is still valid.',
+    {
+      hint:
+        cause.hint ??
+        'Check that $DEBUGGEN_HOME is a private directory owned by this account and that the session store is writable, then rotate again.',
+      details: { operation: 'rotate-credentials', ...cause.details, rotated: false },
+      cause,
+    },
+  );
+}
+
+/**
+ * What reading one editor credential record from disk — `auth.json` or its
+ * journal — established. Only `record` carries the plaintext.
+ */
+type CredentialFileRead =
+  | { readonly kind: 'absent' }
+  /** Readable by another account, so its credential may have been read: never trusted. */
+  | { readonly kind: 'exposed'; readonly mode: number }
+  | { readonly kind: 'not-json' }
+  | { readonly kind: 'not-a-record' }
+  | { readonly kind: 'record'; readonly record: AuthFileRecord };
+
+/**
+ * What recovering the editor credential's journal did.
+ *
+ * - `none` — there was no journal.
+ * - `completed` — the journal's store change had committed; its record is now
+ *   in `auth.json`.
+ * - `discarded` — the journal's store change never committed, or the journal
+ *   was not a record this module wrote; it was removed and `auth.json` is
+ *   judged as it stands.
+ * - `exposed` — the journal was readable by another account; it was removed,
+ *   and neither it nor `auth.json` is trusted, so a new credential is issued.
+ */
+type StageRecovery = 'none' | 'completed' | 'discarded' | 'exposed';
+
+/** A replacement of the editor credential whose store transaction committed. */
+interface CommittedReplacement<T> {
+  /** What the store change returned. */
+  readonly value: T;
+  /**
+   * Whether `auth.json` now holds the new record. An `Err` means the store
+   * change is durable but the file is behind it: the journal is left in place,
+   * and the next recovery publishes it.
+   */
+  readonly published: Result<void, DebuggenError>;
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -1194,10 +1619,18 @@ export interface AuthService {
   /**
    * The start-up path: adopt the editor credential in `auth.json`, or mint one.
    *
-   * Safe to call once per start and idempotent across restarts. A file whose
-   * token has no live row (a store purged under it) is re-registered; a file
-   * that is unreadable as a record, or readable by another account, is
-   * replaced by a freshly minted credential. Expired credentials are swept.
+   * Safe to call once per start and idempotent across restarts. Expired
+   * credentials are swept first. Then a journal an interrupted replacement left
+   * is recovered: published to `auth.json` when its store change committed,
+   * discarded when it did not. Only then is `auth.json` judged. A file whose
+   * token has no row while the store holds no editor credential at all (a store
+   * purged or replaced under it) is re-registered; a file whose token has no row
+   * while another editor credential is registered — a file behind the store —
+   * is never re-registered, because that would revive a credential a committed
+   * rotation retired, so a new credential is minted instead. A file that is
+   * unreadable as a record, or readable by another account, and every file
+   * after a journal readable by another account, is replaced by a freshly
+   * minted credential.
    */
   ensureEditorCredential(): Result<EditorCredentialState, DebuggenError>;
 
@@ -1213,8 +1646,60 @@ export interface AuthService {
   ): Result<IssuedCredential, DebuggenError>;
 
   /**
-   * Revokes every server-agent credential scoped to `projectRoot` — what the
-   * launcher calls when the process it started exits.
+   * Extends the lease of one server-agent credential: the dev-server launcher
+   * renews the credential of a child it started while that child runs, so a
+   * crashed service or a lost revocation leaves the credential valid for at
+   * most one lease (AAP §0.5.6).
+   *
+   * Only a **live, expiring** server-agent credential is renewed. A credential
+   * that has lapsed, was revoked or rotated away is never resurrected, and one
+   * issued without an expiry is never given one — a renewal cannot turn a
+   * dead credential live or a bounded one unbounded.
+   *
+   * @param token The plaintext credential, which the launcher holds for its child.
+   * @param expiresAt The new expiry, in epoch milliseconds; must lie in the future.
+   * @returns `true` when the lease was extended, `false` when no live, expiring
+   *   server-agent credential has that token.
+   */
+  renewServerAgentCredential(token: string, expiresAt: number): Result<boolean, DebuggenError>;
+
+  /**
+   * Revokes exactly one server-agent credential, identified by its token —
+   * what the launcher calls when the process it started exits or is stopped.
+   *
+   * Scoped to the departing child's own credential: another credential of the
+   * same project — a second launched child's, or one minted for a dev server
+   * the developer started themselves — keeps working. Only a `server-agent`
+   * row is ever deleted by this method.
+   *
+   * @param token The plaintext credential being revoked.
+   * @returns `true` when a credential was deleted, `false` when none had that
+   *   token (already revoked, rotated away or swept): either way it no longer
+   *   authenticates.
+   */
+  revokeServerAgentCredential(token: string): Result<boolean, DebuggenError>;
+
+  /**
+   * Revokes every server-agent **lease** whose holder process is gone — what
+   * the service runs on start, before it serves (AAP §0.5.6: a launched
+   * child's credential stops working when its process exits or is stopped).
+   *
+   * A lease is held by the service process that launched its child. When that
+   * process crashed, nothing supervises the child any more and nothing retries
+   * a revocation it could not finish, so its lease is revoked here instead of
+   * authenticating until it lapses. A lease whose holder still runs — another
+   * service on the same state root — is left to that holder. Credentials that
+   * are not leases (a `POST /dev-server/credential` token for a dev server the
+   * developer started) are never touched.
+   *
+   * @returns How many leases were revoked.
+   */
+  revokeOrphanedServerAgentLeases(): Result<number, DebuggenError>;
+
+  /**
+   * Revokes every server-agent credential scoped to `projectRoot` — reserved
+   * for tearing a whole project down. A launched child's exit revokes only its
+   * own credential, through {@link revokeServerAgentCredential}.
    *
    * @returns How many credentials were revoked.
    */
@@ -1225,7 +1710,9 @@ export interface AuthService {
 
   /**
    * The HTTP middleware core: origin policy first, then the exemption, then the
-   * bearer credential and the operation's role table.
+   * bearer credential and the operation's role table, and last the
+   * {@link ACTING_TAB_HEADER} rule — only a DevTools principal may name an
+   * acting tab, and only as one well-formed tab id.
    *
    * @returns The principal, or `null` for an auth-exempt operation.
    */
@@ -1241,7 +1728,9 @@ export interface AuthService {
 
   /**
    * Records an editor connection's announced workspace folders so HTTP requests
-   * presenting the same credential may act under them, until `release()`.
+   * presenting the same credential may act under them, until the announcement
+   * is released — at once by `release()`, or once its bounded lease has passed
+   * by `releaseAfter(leaseMs)`.
    */
   announceWorkspace(principal: Principal): Result<WorkspaceAnnouncement, DebuggenError>;
 
@@ -1259,8 +1748,69 @@ export interface AuthService {
    * closes every open socket with `WS_CLOSE_UNAUTHORIZED` through the injected
    * revoker. Paired Chrome extensions must pair again and launched dev servers
    * must be relaunched (AAP §0.5.6).
+   *
+   * The new editor credential is staged in the journal, the store change
+   * commits, the journal's record is published to `auth.json`, the journal is
+   * removed, and only then are sockets closed — so the editor client, which
+   * re-reads `auth.json` when it is closed with 4401, finds the new token.
+   *
+   * @returns The outcome, or an `Err` whose message says which side of the
+   * commit it stopped on. Before the commit (a journal that cannot be written,
+   * a store that cannot commit, an earlier journal that cannot be finished):
+   * nothing was rotated and every credential is still valid. After it: every
+   * old credential is refused and every socket was closed, but `auth.json`
+   * could not be updated — the journal stays, and restarting the service
+   * finishes the rotation — or the revoker failed and some connections may
+   * still be open. A journal that cannot be removed after `auth.json` was
+   * updated is not a failure: the rotation is complete, and the leftover is
+   * logged and cleared by the next recovery.
    */
   rotateAll(): Result<RotationOutcome, DebuggenError>;
+
+  /**
+   * The revocation fence: whether the credential a principal was resolved
+   * from is still live **now** — its row still stored, still of the
+   * principal's role, not expired.
+   *
+   * A principal is a snapshot. {@link createAuthMiddleware} resolves it once,
+   * before the handler runs, and a handler that reads a request body then
+   * awaits the client for as long as the client takes to send it. A rotation
+   * ({@link rotateAll}), a revocation ({@link revokeServerAgentCredentials})
+   * or an expiry can retire the credential inside that gap, and acting on the
+   * snapshot afterwards would let a credential that no longer exists mint a
+   * credential, run a sweep or rotate again — exactly what AAP §0.5.6's
+   * revocation boundary forbids.
+   *
+   * Every route therefore calls this **between reading its body and its side
+   * effect**, with no `await` between the check and the call that acts. The
+   * check is synchronous, and so is every retirement (each one store
+   * statement or transaction on the one `node:sqlite` connection), so no
+   * retirement can interleave between a check that passed and the synchronous
+   * work that follows it.
+   *
+   * Nothing presented or stored leaves this method: the lookup binds the
+   * principal's digest as a parameter, a refusal carries only its reason, and
+   * the log record names the reason and the role — never the digest.
+   *
+   * @param principal The principal the middleware (or `client.hello`) resolved.
+   * @returns `ok` while the credential is live; otherwise `unknown-credential`
+   * (401) when its row is gone or now holds another role, `corrupt-credential`
+   * (401) when the row no longer validates, `expired-credential` (401) once its
+   * expiry has passed, or the store's own failure (`STORE_ERROR`, answered
+   * `500`) when the row cannot be read.
+   *
+   * @example
+   * ```ts
+   * const body = await readBody(c, operation);
+   * const live = auth.requireLiveCredential(principal);
+   * if (isErr(live)) {
+   *   const { status, body: refusal } = authErrorResponse(live.error);
+   *   return c.json(refusal, status);
+   * }
+   * sideEffect(body); // called with no await after the check
+   * ```
+   */
+  requireLiveCredential(principal: Principal): Result<void, DebuggenError>;
 
   /** Drops the in-memory lockout ledger and announcements. Owns no timer or socket. */
   close(): void;
@@ -1280,7 +1830,38 @@ export interface AuthServiceDeps {
   readonly now?: (() => number) | undefined;
   /** The randomness source. Defaults to `node:crypto`'s CSPRNG. */
   readonly randomBytes?: ((size: number) => Uint8Array) | undefined;
+  /**
+   * This service's process id, recorded as the holder of every lease it
+   * issues. Defaults to `process.pid`.
+   */
+  readonly processId?: number | undefined;
+  /**
+   * Whether a process id names a live process — how a lease's holder is judged
+   * gone. Defaults to a signal-0 probe (`process.kill(pid, 0)`).
+   */
+  readonly isProcessAlive?: ((pid: number) => boolean) | undefined;
+  /**
+   * The credential file writes, a test seam ({@link CredentialFileSystem}).
+   * Defaults to {@link SECURE_CREDENTIAL_FILE_SYSTEM}; production never sets it.
+   */
+  readonly fileSystem?: CredentialFileSystem | undefined;
 }
+
+/**
+ * The real {@link CredentialFileSystem}: `writeSecureFileAtomic`, which
+ * verifies the parent chain, writes an unpredictably named `0600` sibling and
+ * renames it over the target; and `unlinkSync`, which removes the directory
+ * entry itself and never follows a link at it. The directory both act in is
+ * the one {@link CredentialAuthority} verified private before either runs.
+ */
+const SECURE_CREDENTIAL_FILE_SYSTEM: CredentialFileSystem = Object.freeze({
+  writeSecureFile(path: string, data: string, upTo: string): void {
+    writeSecureFileAtomic(path, data, { upTo });
+  },
+  removeFile(path: string): void {
+    unlinkSync(path);
+  },
+});
 
 /** One origin's (or the global) pairing-failure record. */
 interface PairingLedgerEntry {
@@ -1319,6 +1900,9 @@ interface CredentialAuthorityInit {
   readonly revoker: ConnectionRevoker | undefined;
   readonly clock: () => number;
   readonly random: (size: number) => Uint8Array;
+  readonly processId: number;
+  readonly isProcessAlive: (pid: number) => boolean;
+  readonly files: CredentialFileSystem;
 }
 
 /**
@@ -1330,6 +1914,9 @@ class CredentialAuthority implements AuthService {
 
   readonly #authFilePath: string;
 
+  /** `auth.json`'s journal: {@link #authFilePath} + {@link AUTH_FILE_STAGE_SUFFIX}. */
+  readonly #stagePath: string;
+
   readonly #debuggenHome: string;
 
   readonly #logger: Logger;
@@ -1340,23 +1927,38 @@ class CredentialAuthority implements AuthService {
 
   readonly #random: (size: number) => Uint8Array;
 
+  /** The process id this service records as the holder of the leases it issues. */
+  readonly #processId: number;
+
+  readonly #isProcessAlive: (pid: number) => boolean;
+
+  readonly #files: CredentialFileSystem;
+
   /** Pairing failures per presenting origin, in insertion (oldest-first) order. */
   readonly #ledger = new Map<string, PairingLedgerEntry>();
 
   /** Pairing failures across every origin. */
   #globalLedger: PairingLedgerEntry = newLedgerEntry();
 
-  /** Announced workspace folders per editor credential digest, reference-counted. */
-  readonly #announcements = new Map<string, Map<string, number>>();
+  /**
+   * Announced workspace folders per editor credential digest: each folder's
+   * live-announcement count and lease. An inner map is replaced, never reused,
+   * once cleared, so an announcement can tell that its own map is gone.
+   */
+  readonly #announcements = new Map<string, Map<string, FolderStanding>>();
 
   constructor(init: CredentialAuthorityInit) {
     this.#store = init.store;
     this.#authFilePath = init.authFilePath;
+    this.#stagePath = `${init.authFilePath}${AUTH_FILE_STAGE_SUFFIX}`;
     this.#debuggenHome = init.debuggenHome;
     this.#logger = init.logger;
     this.#revoker = init.revoker;
     this.#clock = init.clock;
     this.#random = init.random;
+    this.#processId = init.processId;
+    this.#isProcessAlive = init.isProcessAlive;
+    this.#files = init.files;
   }
 
   /* ----------------------------------------------------------------------------------------------
@@ -1473,10 +2075,31 @@ class CredentialAuthority implements AuthService {
       .run(tokenHash, role, JSON.stringify(scope), issuedAt, expiresAt);
   }
 
-  /** The workspace folders the credential's live connections announce, sorted and frozen. */
+  /**
+   * The workspace folders in the credential's scope, sorted and frozen: those a
+   * live connection announces, and those a settled announcement's lease still
+   * covers. A folder whose lease has passed with no live announcement is pruned
+   * here — the lazy expiry that spares this module a timer.
+   */
   #announcedFolders(tokenHash: string): readonly string[] {
-    const counts = this.#announcements.get(tokenHash);
-    return Object.freeze(counts === undefined ? [] : [...counts.keys()].sort());
+    const standings = this.#announcements.get(tokenHash);
+    if (standings === undefined) {
+      return Object.freeze([]);
+    }
+    const now = this.#now();
+    const folders: string[] = [];
+    for (const [folder, standing] of standings) {
+      if (standing.live > 0 || standing.leaseUntil > now) {
+        folders.push(folder);
+      } else {
+        // Deleting the entry being visited is safe for a Map iterator.
+        standings.delete(folder);
+      }
+    }
+    if (standings.size === 0) {
+      this.#announcements.delete(tokenHash);
+    }
+    return Object.freeze(folders.sort());
   }
 
   /**
@@ -1533,9 +2156,13 @@ class CredentialAuthority implements AuthService {
    * Resolves a presented credential to the principal its stored row describes:
    * bounds, digest lookup, constant-time digest comparison, row validation,
    * expiry, and finally whether the credential's role may be presented from
-   * this origin.
+   * this origin in this way ({@link originPermitsPrincipal}).
    */
-  #authenticate(token: string, origin: OriginClass): Result<Principal, DebuggenError> {
+  #authenticate(
+    token: string,
+    origin: OriginClass,
+    presentation: CredentialPresentation,
+  ): Result<Principal, DebuggenError> {
     if (!presentedCredentialSchema.safeParse(token).success) {
       return refuse('malformed-credential');
     }
@@ -1564,7 +2191,7 @@ class CredentialAuthority implements AuthService {
     if (isErr(principal)) {
       return principal;
     }
-    if (!originPermitsPrincipal(origin, principal.value)) {
+    if (!originPermitsPrincipal(origin, principal.value, presentation)) {
       return refuse('origin-not-permitted-for-role');
     }
     return principal;
@@ -1598,6 +2225,53 @@ class CredentialAuthority implements AuthService {
   }
 
   /**
+   * Reads one editor credential record — `auth.json` or its journal — without
+   * following a link at its final component, and without logging: each caller
+   * reports what the read established in its own terms.
+   *
+   * @param path The file to read.
+   * @param subject How failures name it ({@link AUTH_FILE_SUBJECT} or {@link AUTH_STAGE_SUBJECT}).
+   * @returns What is there. The group and other permission bits are judged
+   * before a byte is read, so an exposed file's content is never parsed. Only an
+   * unsafe path — a link, a foreign owner, a second hard link — or an unreadable
+   * file is an `Err`, because those need the developer rather than a new
+   * credential.
+   */
+  #readCredentialRecord(path: string, subject: string): Result<CredentialFileRead, DebuggenError> {
+    let state;
+    try {
+      state = inspectPrivateFileNoFollow(path);
+    } catch (cause) {
+      return err(credentialFileFailure(cause, 'inspected', subject));
+    }
+    if (state === undefined) {
+      return ok({ kind: 'absent' });
+    }
+    if (isPosixHost() && (state.mode & GROUP_OR_OTHER_PERMISSION_BITS) !== 0) {
+      return ok({ kind: 'exposed', mode: state.mode });
+    }
+
+    let bytes: Buffer;
+    try {
+      bytes = readFileNoFollow(path);
+    } catch (cause) {
+      if (errnoCodeOf(cause) === 'ENOENT') {
+        return ok({ kind: 'absent' });
+      }
+      return err(credentialFileFailure(cause, 'read', subject));
+    }
+
+    let json: unknown;
+    try {
+      json = JSON.parse(bytes.toString('utf8'));
+    } catch {
+      return ok({ kind: 'not-json' });
+    }
+    const record = authFileSchema.safeParse(json);
+    return ok(record.success ? { kind: 'record', record: record.data } : { kind: 'not-a-record' });
+  }
+
+  /**
    * Reads `auth.json` without following a link at its final component.
    *
    * @returns The record, or `undefined` when there is none to adopt: the file is
@@ -1607,80 +2281,286 @@ class CredentialAuthority implements AuthService {
    * `Err`, because those need the developer rather than a new credential.
    */
   #readAuthFile(): Result<AuthFileRecord | undefined, DebuggenError> {
-    let state;
-    try {
-      state = inspectPrivateFileNoFollow(this.#authFilePath);
-    } catch (cause) {
-      return err(credentialFileFailure(cause, 'inspected'));
+    const read = this.#readCredentialRecord(this.#authFilePath, AUTH_FILE_SUBJECT);
+    if (isErr(read)) {
+      return read;
     }
-    if (state === undefined) {
-      return ok(undefined);
-    }
-    if (isPosixHost() && (state.mode & GROUP_OR_OTHER_PERMISSION_BITS) !== 0) {
-      this.#logger.warn(
-        'the editor credential file was readable by other accounts; its credential is discarded and a new one issued',
-        { mode: state.mode },
-      );
-      return ok(undefined);
-    }
-
-    let bytes: Buffer;
-    try {
-      bytes = readFileNoFollow(this.#authFilePath);
-    } catch (cause) {
-      if (errnoCodeOf(cause) === 'ENOENT') {
+    const found = read.value;
+    switch (found.kind) {
+      case 'absent':
         return ok(undefined);
-      }
-      return err(credentialFileFailure(cause, 'read'));
+      case 'exposed':
+        this.#logger.warn(
+          'the editor credential file was readable by other accounts; its credential is discarded and a new one issued',
+          { mode: found.mode },
+        );
+        return ok(undefined);
+      case 'not-json':
+        this.#logger.warn(
+          'the editor credential file is not valid JSON; a new credential is issued',
+        );
+        return ok(undefined);
+      case 'not-a-record':
+        this.#logger.warn(
+          'the editor credential file is not a record this service wrote; a new credential is issued',
+        );
+        return ok(undefined);
+      case 'record':
+        return ok(found.record);
     }
-
-    let json: unknown;
-    try {
-      json = JSON.parse(bytes.toString('utf8'));
-    } catch {
-      this.#logger.warn('the editor credential file is not valid JSON; a new credential is issued');
-      return ok(undefined);
-    }
-    const record = authFileSchema.safeParse(json);
-    if (!record.success) {
-      this.#logger.warn(
-        'the editor credential file is not a record this service wrote; a new credential is issued',
-      );
-      return ok(undefined);
-    }
-    return ok(record.data);
   }
 
   /**
-   * Writes `auth.json` atomically at `0600` and confirms the result is private.
-   * Throws; called inside a store transaction so a failed write rolls the row
-   * back with it.
+   * Writes one editor credential record to `path` — the journal or `auth.json`
+   * — atomically at `0600`, and confirms the result is a private, regular,
+   * single-link file.
+   *
+   * Never called inside a store transaction: a file cannot be rolled back with
+   * the rows, which is the whole reason replacements are journaled (see
+   * {@link #replaceEditorCredential}).
+   *
+   * @param subject How failures name the file.
+   * @param verifyOperation The `details.operation` of a verification failure.
+   * @throws {DebuggenError} `FS_UNSAFE_PATH` or `INTERNAL`; the record never
+   * enters the error.
    */
-  #writeAuthFile(record: AuthFileRecord): void {
+  #writeCredentialFile(
+    path: string,
+    record: AuthFileRecord,
+    subject: string,
+    verifyOperation: string,
+  ): void {
     try {
-      writeSecureFileAtomic(this.#authFilePath, `${JSON.stringify(record, null, 2)}\n`, {
-        upTo: this.#debuggenHome,
-      });
+      this.#files.writeSecureFile(path, `${JSON.stringify(record, null, 2)}\n`, this.#debuggenHome);
     } catch (cause) {
-      throw credentialFileFailure(cause, 'written');
+      throw credentialFileFailure(cause, 'written', subject);
     }
 
     let state;
     try {
-      state = inspectPrivateFileNoFollow(this.#authFilePath);
+      state = inspectPrivateFileNoFollow(path);
     } catch (cause) {
-      throw credentialFileFailure(cause, 'verified after writing');
+      throw credentialFileFailure(cause, 'verified after writing', subject);
     }
     if (state === undefined || (isPosixHost() && state.mode !== SECURE_FILE_MODE)) {
       throw new DebuggenError(
         'FS_UNSAFE_PATH',
-        'The editor credential file was not left private after it was written.',
+        `The ${subject} was not left private after it was written.`,
         {
           hint: 'Check that $DEBUGGEN_HOME is a private directory owned by this account.',
-          details: { operation: 'verify-auth-file' },
+          details: { operation: verifyOperation },
         },
       );
     }
+  }
+
+  /**
+   * Step 1 of a replacement: writes the new record to the journal. Runs before
+   * the store transaction and outside it.
+   *
+   * @returns `ok` when the journal holds the record. On failure the journal is
+   * removed and nothing else has changed. Removing it is always safe: a failed
+   * atomic write leaves the previous journal or none, and every caller
+   * recovered the previous one first, so it is either already in `auth.json`
+   * or uncommitted; a failed verification leaves this record, whose credential
+   * no row holds.
+   */
+  #stageRecord(record: AuthFileRecord): Result<void, DebuggenError> {
+    try {
+      this.#writeCredentialFile(this.#stagePath, record, AUTH_STAGE_SUBJECT, 'verify-auth-stage');
+      return ok(undefined);
+    } catch (cause) {
+      const error = credentialFileFailure(cause, 'written', AUTH_STAGE_SUBJECT);
+      this.#logger.error('the editor credential journal could not be written', {
+        errorCode: error.code,
+      });
+      this.#removeStage();
+      return err(error);
+    }
+  }
+
+  /**
+   * Step 3 of a replacement, and the completion of an interrupted one: writes
+   * a record whose store change has committed to `auth.json`, trying
+   * {@link PUBLISH_ATTEMPTS} times.
+   *
+   * @returns `ok` when `auth.json` holds the record; otherwise the last
+   * failure, with the journal left untouched for the next recovery.
+   */
+  #publishAuthFile(record: AuthFileRecord): Result<void, DebuggenError> {
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        this.#writeCredentialFile(
+          this.#authFilePath,
+          record,
+          AUTH_FILE_SUBJECT,
+          'verify-auth-file',
+        );
+        return ok(undefined);
+      } catch (cause) {
+        const error = credentialFileFailure(cause, 'written');
+        if (attempt >= PUBLISH_ATTEMPTS) {
+          this.#logger.error(
+            'the editor credential file is behind the credential store; the journal is kept for the next start',
+            { attempts: attempt, errorCode: error.code },
+          );
+          return err(error);
+        }
+        this.#logger.warn('the editor credential file could not be updated; retrying', {
+          attempt,
+          errorCode: error.code,
+        });
+      }
+    }
+  }
+
+  /**
+   * Step 4 of a replacement: removes the journal. An absent journal counts as
+   * removed.
+   *
+   * A failure is logged by its errno and never returned: every journal this
+   * leaves behind is safe for the next recovery to judge — one whose store
+   * change committed is published again (to the same content), one whose
+   * change never committed is discarded.
+   */
+  #removeStage(): void {
+    try {
+      this.#files.removeFile(this.#stagePath);
+    } catch (cause) {
+      const errno = errnoCodeOf(cause);
+      if (errno === 'ENOENT') {
+        return;
+      }
+      this.#logger.warn(
+        'the editor credential journal could not be removed; the next recovery judges it again',
+        { errno: errno ?? 'unknown' },
+      );
+    }
+  }
+
+  /**
+   * Whether a validated `credentials` row is a live editor credential: the
+   * editor role, the machine-user scope and no expiry reached.
+   */
+  #isLiveEditorRow(row: CredentialRow): boolean {
+    const expired = row.expires_at !== null && row.expires_at <= this.#now();
+    return (
+      row.role === 'vscode' && parseStoredScope(row.scope)?.kind === 'machine-user' && !expired
+    );
+  }
+
+  /**
+   * Finishes or abandons a replacement of the editor credential that an
+   * earlier call — in this process, or in one that died — left journaled.
+   * Runs at every start before `auth.json` is judged, and before every
+   * rotation, so no replacement ever writes its journal over a committed
+   * record `auth.json` does not hold yet.
+   *
+   * Whether the journal's store change committed is read from the store: the
+   * transaction inserted the journal's editor row together with every deletion
+   * it made, so a live editor row for the journal's credential means the whole
+   * change committed, and its absence means none of it did.
+   *
+   * Logs what it did, never the token, its digest or the file's content.
+   *
+   * @returns The {@link StageRecovery}; an `Err` for an unsafe or unreadable
+   * journal, a store failure, or a committed record that could not be
+   * published — in every one of those cases `auth.json` is not yet safe to
+   * judge, so the journal stays.
+   */
+  #recoverStagedCredential(): Result<StageRecovery, DebuggenError> {
+    const read = this.#readCredentialRecord(this.#stagePath, AUTH_STAGE_SUBJECT);
+    if (isErr(read)) {
+      this.#logger.error('the editor credential journal is not safe to read', {
+        errorCode: read.error.code,
+      });
+      return read;
+    }
+    const found = read.value;
+    switch (found.kind) {
+      case 'absent':
+        return ok('none');
+      case 'exposed':
+        this.#logger.warn(
+          'the editor credential journal was readable by other accounts; it is discarded and a new editor credential issued',
+          { mode: found.mode },
+        );
+        this.#removeStage();
+        return ok('exposed');
+      case 'not-json':
+      case 'not-a-record':
+        this.#logger.warn(
+          'the editor credential journal is not a record this service wrote; it is discarded',
+        );
+        this.#removeStage();
+        return ok('discarded');
+      case 'record':
+        break;
+    }
+
+    const tokenHash = sha256Hex(found.record.token);
+    const raw = this.#guard('read-journaled-credential', () =>
+      this.#store.statement(SQL.selectCredential).get(tokenHash),
+    );
+    if (isErr(raw)) {
+      return raw;
+    }
+    const row = raw.value === undefined ? undefined : credentialRowSchema.safeParse(raw.value);
+    if (row?.success !== true || !this.#isLiveEditorRow(row.data)) {
+      this.#logger.info('discarded an uncommitted editor credential replacement');
+      this.#removeStage();
+      return ok('discarded');
+    }
+
+    const published = this.#publishAuthFile(found.record);
+    if (isErr(published)) {
+      return published;
+    }
+    this.#removeStage();
+    this.#logger.info('completed an interrupted editor credential replacement');
+    return ok('completed');
+  }
+
+  /**
+   * Replaces the editor credential across its two resources, in the order the
+   * module documentation sets out: stage the record in the journal, commit
+   * `change` in one store transaction, publish the record to `auth.json`,
+   * remove the journal. No file is touched inside the transaction.
+   *
+   * @param record The new `auth.json` record.
+   * @param operation The store operation's name, for {@link #guard}.
+   * @param change The store change: it must insert `record`'s editor row, which
+   * is the commit marker {@link #recoverStagedCredential} reads.
+   * @returns An `Err` when the change did not commit — the journal could not be
+   * written or the transaction failed — in which case nothing changed. Once it
+   * committed, the {@link CommittedReplacement}, whose `published` says whether
+   * `auth.json` caught up.
+   */
+  #replaceEditorCredential<T>(
+    record: AuthFileRecord,
+    operation: string,
+    change: () => T,
+  ): Result<CommittedReplacement<T>, DebuggenError> {
+    const staged = this.#stageRecord(record);
+    if (isErr(staged)) {
+      return staged;
+    }
+
+    const committed = this.#guard(operation, () => this.#store.transaction(change));
+    if (isErr(committed)) {
+      // The transaction rolled back and auth.json was never touched, so the
+      // journal is the only trace of the attempt; removing it restores the state
+      // exactly. A journal that cannot be removed names a credential no row
+      // holds, which the next recovery discards.
+      this.#removeStage();
+      return committed;
+    }
+
+    const published = this.#publishAuthFile(record);
+    if (!isErr(published)) {
+      this.#removeStage();
+    }
+    return ok(Object.freeze({ value: committed.value, published }));
   }
 
   /**
@@ -1688,7 +2568,8 @@ class CredentialAuthority implements AuthService {
    *
    * @returns The editor principal, or `undefined` when the file's credential
    * cannot be adopted (its row belongs to another role, is corrupt or has
-   * expired) and a new one must be minted.
+   * expired, or it has no row while another editor credential is registered)
+   * and a new one must be minted.
    */
   #adoptEditorToken(record: AuthFileRecord): Result<EditorPrincipal | undefined, DebuggenError> {
     const tokenHash = sha256Hex(record.token);
@@ -1700,13 +2581,22 @@ class CredentialAuthority implements AuthService {
     }
 
     if (raw.value === undefined) {
-      // A stale file: the store was purged or replaced under it. The file is the
-      // only holder of this credential, so it is registered again rather than
-      // replaced, and every other editor row — orphans whose token nobody holds —
-      // goes with the transaction.
-      const registered = this.#guard('reregister-editor-credential', () => {
+      // The file names a credential the store does not hold. Two very different
+      // states look like that, and the store tells them apart — inside the one
+      // transaction that acts on the answer, so it cannot change in between.
+      //
+      // - No editor credential at all: the store was purged or replaced under
+      //   the file. The file is the only holder of this credential, so it is
+      //   registered again rather than replaced.
+      // - Another editor credential is registered: the file is *behind* the
+      //   store — a committed replacement whose journal was lost before
+      //   auth.json caught up. That commit retired the file's credential, and
+      //   registering it again would revive it, so a new one is minted instead.
+      const registered = this.#guard('reregister-editor-credential', () =>
         this.#store.transaction(() => {
-          this.#store.statement(SQL.deleteCredentialsByRole).run('vscode');
+          if (this.#store.statement(SQL.selectAnyCredentialOfRole).get('vscode') !== undefined) {
+            return false;
+          }
           this.#insertCredential(
             tokenHash,
             'vscode',
@@ -1714,10 +2604,17 @@ class CredentialAuthority implements AuthService {
             record.issuedAt,
             null,
           );
-        });
-      });
+          return true;
+        }),
+      );
       if (isErr(registered)) {
         return registered;
+      }
+      if (!registered.value) {
+        this.#logger.warn(
+          'auth.json holds a credential the store retired in favour of another; a new editor credential is issued',
+        );
+        return ok(undefined);
       }
       this.#logger.info('re-registered the editor credential held in auth.json');
       return ok(this.#editorPrincipal(tokenHash, record.issuedAt));
@@ -1727,9 +2624,7 @@ class CredentialAuthority implements AuthService {
     if (!row.success) {
       return ok(undefined);
     }
-    const expired = row.data.expires_at !== null && row.data.expires_at <= this.#now();
-    const scope = parseStoredScope(row.data.scope);
-    if (row.data.role !== 'vscode' || scope?.kind !== 'machine-user' || expired) {
+    if (!this.#isLiveEditorRow(row.data)) {
       this.#logger.warn(
         'the credential in auth.json is not a live editor credential; a new one is issued',
       );
@@ -1745,7 +2640,16 @@ class CredentialAuthority implements AuthService {
     return ok(this.#editorPrincipal(tokenHash, row.data.issued_at));
   }
 
-  /** Mints a new editor credential, replacing every editor row and `auth.json` in one transaction. */
+  /**
+   * Mints a new editor credential that replaces every editor row and
+   * `auth.json`, through the journaled {@link #replaceEditorCredential}: the
+   * row commits first and `auth.json` is published after it, so neither a file
+   * without a row nor a row without a file survives a failure.
+   *
+   * @returns The new principal; an `Err` when nothing changed, or when the row
+   * committed but `auth.json` could not be written — the journal then stays and
+   * the next start publishes it.
+   */
   #mintEditorCredential(): Result<EditorPrincipal, DebuggenError> {
     const token = this.#mintToken();
     if (isErr(token)) {
@@ -1755,15 +2659,15 @@ class CredentialAuthority implements AuthService {
     const issuedAt = this.#now();
     const record: AuthFileRecord = { version: AUTH_FILE_VERSION, token: token.value, issuedAt };
 
-    const minted = this.#guard('mint-editor-credential', () => {
-      this.#store.transaction(() => {
-        this.#store.statement(SQL.deleteCredentialsByRole).run('vscode');
-        this.#insertCredential(tokenHash, 'vscode', MACHINE_USER_STORED_SCOPE, issuedAt, null);
-        this.#writeAuthFile(record);
-      });
+    const replaced = this.#replaceEditorCredential(record, 'mint-editor-credential', () => {
+      this.#store.statement(SQL.deleteCredentialsByRole).run('vscode');
+      this.#insertCredential(tokenHash, 'vscode', MACHINE_USER_STORED_SCOPE, issuedAt, null);
     });
-    if (isErr(minted)) {
-      return minted;
+    if (isErr(replaced)) {
+      return replaced;
+    }
+    if (isErr(replaced.value.published)) {
+      return replaced.value.published;
     }
     this.#logger.info('issued a new editor credential and wrote auth.json');
     return ok(this.#editorPrincipal(tokenHash, issuedAt));
@@ -1795,17 +2699,29 @@ class CredentialAuthority implements AuthService {
       return swept;
     }
 
-    const existing = this.#readAuthFile();
-    if (isErr(existing)) {
-      return existing;
+    // A replacement the previous run did not finish is settled before auth.json
+    // is trusted: otherwise a file behind a committed rotation would be judged
+    // as if the rotation had never happened.
+    const recovered = this.#recoverStagedCredential();
+    if (isErr(recovered)) {
+      return recovered;
     }
-    if (existing.value !== undefined) {
-      const adopted = this.#adoptEditorToken(existing.value);
-      if (isErr(adopted)) {
-        return adopted;
+
+    // An exposed journal may have handed its credential — which may also be the
+    // one auth.json holds — to another account, so nothing on disk is adopted.
+    if (recovered.value !== 'exposed') {
+      const existing = this.#readAuthFile();
+      if (isErr(existing)) {
+        return existing;
       }
-      if (adopted.value !== undefined) {
-        return ok(Object.freeze({ principal: adopted.value, created: false }));
+      if (existing.value !== undefined) {
+        const adopted = this.#adoptEditorToken(existing.value);
+        if (isErr(adopted)) {
+          return adopted;
+        }
+        if (adopted.value !== undefined) {
+          return ok(Object.freeze({ principal: adopted.value, created: false }));
+        }
       }
     }
 
@@ -1878,20 +2794,26 @@ class CredentialAuthority implements AuthService {
       }
       expiresAt = requested;
     }
+    const lease = request.lease === true;
+    if (lease && expiresAt === null) {
+      // A lease is bounded by definition: renewal extends it, nothing makes it unbounded.
+      return err(
+        new DebuggenError('INTERNAL', 'A server-agent credential lease must carry an expiry.', {
+          details: { problem: 'lease-without-expiry' },
+        }),
+      );
+    }
 
     const token = this.#mintToken();
     if (isErr(token)) {
       return token;
     }
     const tokenHash = sha256Hex(token.value);
+    const scope: StoredScope = lease
+      ? { kind: 'project', projectRoot, leaseHolder: this.#processId }
+      : { kind: 'project', projectRoot };
     const stored = this.#guard('issue-server-agent-credential', () => {
-      this.#insertCredential(
-        tokenHash,
-        'server-agent',
-        { kind: 'project', projectRoot },
-        issuedAt,
-        expiresAt,
-      );
+      this.#insertCredential(tokenHash, 'server-agent', scope, issuedAt, expiresAt);
     });
     if (isErr(stored)) {
       return stored;
@@ -1899,12 +2821,154 @@ class CredentialAuthority implements AuthService {
     this.#logger.info('issued a server-agent credential', {
       projectRoot,
       expires: expiresAt !== null,
+      lease,
     });
     return ok(
       Object.freeze(
         expiresAt === null ? { token: token.value } : { token: token.value, expiresAt },
       ),
     );
+  }
+
+  renewServerAgentCredential(token: string, expiresAt: number): Result<boolean, DebuggenError> {
+    if (!presentedCredentialSchema.safeParse(token).success) {
+      // A value of the wrong shape was never issued, so there is nothing live to renew.
+      return ok(false);
+    }
+    const now = this.#now();
+    const requested = Math.floor(expiresAt);
+    if (!Number.isSafeInteger(requested) || requested <= now) {
+      return err(
+        new DebuggenError('INTERNAL', 'A server-agent credential lease must end in the future.', {
+          details: { problem: 'expiry-not-in-future' },
+        }),
+      );
+    }
+
+    const tokenHash = sha256Hex(token);
+    // One statement: the row must still be a live, expiring server-agent
+    // credential at the moment it is extended, so a revocation or a lapse that
+    // won the race is never undone.
+    const renewed = this.#guard(
+      'renew-server-agent-credential',
+      () =>
+        Number(
+          this.#store
+            .statement(SQL.renewLeasedCredential)
+            .run(requested, tokenHash, 'server-agent', now).changes,
+        ) > 0,
+    );
+    if (isErr(renewed)) {
+      return renewed;
+    }
+    if (renewed.value) {
+      this.#logger.debug('renewed a server-agent credential lease', { expiresAt: requested });
+    } else {
+      this.#logger.info('a server-agent credential lease was not renewed: it is no longer live');
+    }
+    return renewed;
+  }
+
+  revokeServerAgentCredential(token: string): Result<boolean, DebuggenError> {
+    if (!presentedCredentialSchema.safeParse(token).success) {
+      // A value of the wrong shape was never issued, so nothing authenticates with it.
+      return ok(false);
+    }
+
+    const tokenHash = sha256Hex(token);
+    const revoked = this.#guard('revoke-server-agent-credential', () =>
+      this.#store.transaction((): { readonly deleted: boolean; readonly projectRoot?: string } => {
+        const raw: unknown = this.#store.statement(SQL.selectCredential).get(tokenHash);
+        const row = credentialRowSchema.safeParse(raw);
+        if (!row.success || row.data.role !== 'server-agent') {
+          // Absent, unreadable or another role's row: this method only ever
+          // deletes the one server-agent credential it was handed.
+          return { deleted: false };
+        }
+        this.#store.statement(SQL.deleteCredentialOfRole).run(tokenHash, 'server-agent');
+        const scope = parseStoredScope(row.data.scope);
+        const projectRoot =
+          scope?.kind === 'project' ? normalizeRoot(scope.projectRoot) : undefined;
+        return projectRoot === undefined ? { deleted: true } : { deleted: true, projectRoot };
+      }),
+    );
+    if (isErr(revoked)) {
+      return revoked;
+    }
+    // Whether or not a row was deleted just now, nothing may stay connected on
+    // this credential: close its sockets, and only its sockets.
+    const socketsClosed = this.#closeConnectionsOf(tokenHash);
+    this.#logger.info('revoked a server-agent credential', {
+      revoked: revoked.value.deleted,
+      socketsClosed,
+      ...(revoked.value.projectRoot === undefined
+        ? {}
+        : { projectRoot: revoked.value.projectRoot }),
+    });
+    return ok(revoked.value.deleted);
+  }
+
+  revokeOrphanedServerAgentLeases(): Result<number, DebuggenError> {
+    const revoked = this.#guard('revoke-orphaned-server-agent-leases', () =>
+      this.#store.transaction((): number => {
+        const rows: unknown[] = this.#store
+          .statement(SQL.selectCredentialScopesOfRole)
+          .all('server-agent');
+        let count = 0;
+        for (const raw of rows) {
+          const row = credentialScopeRowSchema.safeParse(raw);
+          const scope = row.success ? parseStoredScope(row.data.scope) : undefined;
+          if (!row.success || scope?.kind !== 'project') {
+            continue;
+          }
+          const tokenHash = row.data.token_hash;
+          const holder = scope.leaseHolder;
+          // This process issued nothing yet, so a lease naming its pid belongs
+          // to a predecessor that reused it.
+          if (
+            holder === undefined ||
+            (holder !== this.#processId && this.#isProcessAlive(holder))
+          ) {
+            continue;
+          }
+          this.#store.statement(SQL.deleteCredentialOfRole).run(tokenHash, 'server-agent');
+          count += 1;
+        }
+        return count;
+      }),
+    );
+    if (isErr(revoked)) {
+      return revoked;
+    }
+    if (revoked.value > 0) {
+      this.#logger.info(
+        'revoked the server-agent leases of dev servers no running service supervises',
+        { revoked: revoked.value },
+      );
+    }
+    return revoked;
+  }
+
+  /**
+   * Closes the connections authenticated with one credential through the
+   * injected revoker, when it can. Never throws: a revoker failure is logged
+   * and the expiry sweep closes the socket instead (see {@link authorizeHello}).
+   *
+   * @returns How many sockets were closed.
+   */
+  #closeConnectionsOf(tokenHash: string): number {
+    const close = this.#revoker?.closeCredential?.bind(this.#revoker);
+    if (close === undefined) {
+      return 0;
+    }
+    try {
+      return close(tokenHash, WS_CLOSE_UNAUTHORIZED, REVOCATION_CLOSE_REASON);
+    } catch (cause) {
+      this.#logger.warn('the connections of a revoked credential could not be closed', {
+        errorCode: DebuggenError.from(cause).code,
+      });
+      return 0;
+    }
   }
 
   revokeServerAgentCredentials(projectRoot: string): Result<number, DebuggenError> {
@@ -1976,10 +3040,13 @@ class CredentialAuthority implements AuthService {
       return refuse('forbidden-origin');
     }
 
-    // 2. The exemption: no bearer credential for `health` and `pair.complete`.
+    // 2. The exemption: no bearer credential for `health` and `pair.complete` —
+    //    and, with no principal, no acting tab either.
     const { operation } = request;
+    const actingTab = readHeader(request.headers, ACTING_TAB_HEADER);
     if (isExemptOperation(operation)) {
-      return ok(null);
+      const exemptTab = decideActingTab(null, actingTab);
+      return isErr(exemptTab) ? exemptTab : ok(null);
     }
 
     // 3. Exactly one well-formed bearer credential.
@@ -1997,7 +3064,7 @@ class CredentialAuthority implements AuthService {
 
     // 4. The stored row decides the principal, and its role must be one the
     //    operation admits.
-    const principal = this.#authenticate(token, origin);
+    const principal = this.#authenticate(token, origin, presentationOf(operation));
     if (isErr(principal)) {
       return principal;
     }
@@ -2005,7 +3072,12 @@ class CredentialAuthority implements AuthService {
     if (!permitted.includes(principal.value.role)) {
       return refuse('role-not-permitted');
     }
-    return principal;
+
+    // 5. An acting tab only from a DevTools principal, and only one tab id.
+    //    Whether the tab is bound to the session the route acts on is the
+    //    route's check (`requireBoundSession`), which needs the session id.
+    const tab = decideActingTab(principal.value, actingTab);
+    return isErr(tab) ? tab : principal;
   }
 
   authorizeHello(request: HelloAuthorizationRequest): Result<Principal, DebuggenError> {
@@ -2049,7 +3121,7 @@ class CredentialAuthority implements AuthService {
       );
     }
 
-    const resolved = this.#authenticate(hello.token, origin);
+    const resolved = this.#authenticate(hello.token, origin, 'write');
     if (isErr(resolved)) {
       return resolved;
     }
@@ -2107,8 +3179,67 @@ class CredentialAuthority implements AuthService {
             );
           }
         }
-        return ok(principal);
+        return ok(this.#liveServerAgentPrincipal(principal));
       }
+    }
+  }
+
+  /**
+   * A dev-server connection's principal whose `expiresAt` follows the stored
+   * credential for the life of the socket.
+   *
+   * A socket's principal outlives the hello that resolved it, and the client
+   * registry closes a connection once `now >= principal.expiresAt`. For a
+   * launched child's lease — renewed while the child runs — an expiry frozen at
+   * hello would close a healthy child's socket at its first lease's end, and
+   * the preload does not reconnect after an unauthorized close. So the expiry
+   * is read from the credential's row whenever it is asked for: a renewal
+   * extends the live socket, a revocation (the row is gone) makes it expired as
+   * of that moment, and a lapse is seen as it happens. A credential without an
+   * expiry is returned as it is. When the row cannot be read (the store is
+   * closing), the last value read stands.
+   */
+  #liveServerAgentPrincipal(principal: ServerAgentPrincipal): ServerAgentPrincipal {
+    const initial = principal.expiresAt;
+    if (initial === undefined) {
+      return principal;
+    }
+    const { tokenHash } = principal;
+    let known = initial;
+    const readExpiry = (): number => {
+      known = this.#currentExpiry(tokenHash, known);
+      return known;
+    };
+    const live: ServerAgentPrincipal = {
+      role: principal.role,
+      scope: principal.scope,
+      tokenHash,
+      issuedAt: principal.issuedAt,
+      get expiresAt(): number {
+        return readExpiry();
+      },
+    };
+    return Object.freeze(live);
+  }
+
+  /**
+   * The stored expiry of the credential with `tokenHash`: its row's, the
+   * moment of the call when the row no longer exists, or `fallback` when the
+   * row cannot be read or carries none.
+   */
+  #currentExpiry(tokenHash: string, fallback: number): number {
+    if (this.#store.isClosed) {
+      return fallback;
+    }
+    try {
+      const raw: unknown = this.#store.statement(SQL.selectCredential).get(tokenHash);
+      if (raw === undefined) {
+        return Math.min(fallback, this.#now());
+      }
+      const row = credentialRowSchema.safeParse(raw);
+      return row.success && row.data.expires_at !== null ? row.data.expires_at : fallback;
+    } catch {
+      return fallback;
     }
   }
 
@@ -2118,37 +3249,62 @@ class CredentialAuthority implements AuthService {
     }
     const { tokenHash } = principal;
     const folders = principal.scope.workspaceFolders;
-    const counts = this.#announcements.get(tokenHash) ?? new Map<string, number>();
+    const standings = this.#announcements.get(tokenHash) ?? new Map<string, FolderStanding>();
     for (const folder of folders) {
-      counts.set(folder, (counts.get(folder) ?? 0) + 1);
+      const standing = standings.get(folder);
+      if (standing === undefined) {
+        standings.set(folder, { live: 1, leaseUntil: 0 });
+      } else {
+        // A folder still under a lease is simply live again; the lease stays
+        // as the floor it already was.
+        standing.live += 1;
+      }
     }
-    if (counts.size > 0) {
-      this.#announcements.set(tokenHash, counts);
+    if (standings.size > 0) {
+      this.#announcements.set(tokenHash, standings);
     }
 
-    let released = false;
-    const release = (): void => {
-      if (released) {
+    let settled = false;
+    /**
+     * Withdraws this announcement's claim, keeping each folder in scope until
+     * `leaseUntil` (`0`: no lease of its own). A no-op after the first call,
+     * and when rotation or shutdown has cleared the map it wrote to.
+     */
+    const settle = (leaseMs: number): void => {
+      if (settled) {
         return;
       }
-      released = true;
-      const current = this.#announcements.get(tokenHash);
-      if (current === undefined) {
+      settled = true;
+      if (this.#announcements.get(tokenHash) !== standings) {
         return;
       }
+      const now = this.#now();
+      const leaseUntil = leaseMs > 0 ? now + leaseMs : 0;
       for (const folder of folders) {
-        const remaining = (current.get(folder) ?? 0) - 1;
-        if (remaining > 0) {
-          current.set(folder, remaining);
-        } else {
-          current.delete(folder);
+        const standing = standings.get(folder);
+        if (standing === undefined) {
+          continue;
+        }
+        standing.live = Math.max(0, standing.live - 1);
+        standing.leaseUntil = Math.max(standing.leaseUntil, leaseUntil);
+        if (standing.live === 0 && standing.leaseUntil <= now) {
+          standings.delete(folder);
         }
       }
-      if (current.size === 0) {
+      if (standings.size === 0) {
         this.#announcements.delete(tokenHash);
       }
     };
-    return ok(Object.freeze({ release }));
+    return ok(
+      Object.freeze({
+        release: (): void => {
+          settle(0);
+        },
+        releaseAfter: (leaseMs: number): void => {
+          settle(workspaceLeaseMs(leaseMs));
+        },
+      }),
+    );
   }
 
   /* ----------------------------------------------------------------------------------------------
@@ -2354,58 +3510,155 @@ class CredentialAuthority implements AuthService {
   rotateAll(): Result<RotationOutcome, DebuggenError> {
     const prepared = this.#prepareAuthDirectory();
     if (isErr(prepared)) {
-      return prepared;
+      return err(rotationNotApplied(prepared.error));
     }
+
+    // A replacement an earlier call could not finish is settled first, so this
+    // rotation's journal never overwrites a committed record auth.json does not
+    // hold yet. One that still cannot be published means auth.json cannot be
+    // written at all, which this rotation would fail on too — so it stops here,
+    // having changed nothing.
+    const recovered = this.#recoverStagedCredential();
+    if (isErr(recovered)) {
+      return err(rotationNotApplied(recovered.error));
+    }
+
     const token = this.#mintToken();
     if (isErr(token)) {
-      return token;
+      return err(rotationNotApplied(token.error));
     }
     const tokenHash = sha256Hex(token.value);
     const issuedAt = this.#now();
     const record: AuthFileRecord = { version: AUTH_FILE_VERSION, token: token.value, issuedAt };
 
-    // One transaction: every credential and every outstanding pairing code goes,
-    // the new editor credential arrives, and auth.json is rewritten. A failed
-    // write rolls the deletions back, so a rotation either happens whole or not
-    // at all.
-    const deleted = this.#guard('rotate-credentials', () =>
-      this.#store.transaction(() => {
-        const removed = Number(this.#store.statement(SQL.deleteAllCredentials).run().changes);
-        this.#store.statement(SQL.deleteAllPairingCodes).run();
-        this.#insertCredential(tokenHash, 'vscode', MACHINE_USER_STORED_SCOPE, issuedAt, null);
-        this.#writeAuthFile(record);
-        return removed;
-      }),
-    );
-    if (isErr(deleted)) {
-      return deleted;
+    // Stage, then one transaction — every credential and every outstanding
+    // pairing code goes and the new editor credential arrives — then publish
+    // auth.json and remove the journal. A failure before the commit changes
+    // nothing; after it, the rotation is durable whatever happens to the file.
+    const replaced = this.#replaceEditorCredential(record, 'rotate-credentials', () => {
+      const removed = Number(this.#store.statement(SQL.deleteAllCredentials).run().changes);
+      this.#store.statement(SQL.deleteAllPairingCodes).run();
+      this.#insertCredential(tokenHash, 'vscode', MACHINE_USER_STORED_SCOPE, issuedAt, null);
+      return removed;
+    });
+    if (isErr(replaced)) {
+      return err(rotationNotApplied(replaced.error));
     }
+    const { value: credentialsDeleted, published } = replaced.value;
     this.#announcements.clear();
 
-    // Every open socket authenticated with a credential that no longer exists.
-    // Paired Chrome extensions must pair again, and launched dev servers must be
-    // relaunched to receive a new server-agent credential (AAP §0.5.6).
+    // Every open socket authenticated with a credential the store no longer
+    // holds, so every one is closed — also when auth.json could not be updated,
+    // because the old credentials are refused either way. When the file was
+    // updated this runs after it, so the editor client, which re-reads auth.json
+    // on 4401, reconnects with the new credential. Paired Chrome extensions must
+    // pair again, and launched dev servers must be relaunched to receive a new
+    // server-agent credential (AAP §0.5.6).
     let socketsClosed = 0;
+    let revokeFailure: { readonly cause: unknown } | undefined;
     if (this.#revoker !== undefined) {
       try {
         socketsClosed = this.#revoker.revokeAll(WS_CLOSE_UNAUTHORIZED, ROTATION_CLOSE_REASON);
       } catch (cause) {
+        revokeFailure = { cause };
         this.#logger.error('credentials were rotated but open connections could not be closed');
-        return err(
-          new DebuggenError(
-            'INTERNAL',
-            'Credentials were rotated, but the open connections could not all be closed.',
-            { hint: 'Restart the Debug Generator service to drop every open connection.', cause },
-          ),
-        );
       }
     }
 
+    if (isErr(published)) {
+      this.#logger.error('credentials were rotated but auth.json could not be updated', {
+        rowsDeleted: credentialsDeleted,
+        socketsClosed,
+        connectionsClosed: revokeFailure === undefined,
+      });
+      return err(
+        new DebuggenError(
+          'INTERNAL',
+          revokeFailure === undefined
+            ? 'Credentials were rotated, but auth.json could not be updated with the new editor credential.'
+            : 'Credentials were rotated, but auth.json could not be updated with the new editor credential and the open connections could not all be closed.',
+          {
+            hint: 'Restart the Debug Generator service: it finishes the rotation as it starts, and the editor then reconnects with the new credential.',
+            details: {
+              operation: 'publish-auth-file',
+              rotated: true,
+              credentialsDeleted,
+              socketsClosed,
+              publishErrorCode: published.error.code,
+            },
+            cause: published.error,
+          },
+        ),
+      );
+    }
+
+    if (revokeFailure !== undefined) {
+      return err(
+        new DebuggenError(
+          'INTERNAL',
+          'Credentials were rotated, but the open connections could not all be closed.',
+          {
+            hint: 'Restart the Debug Generator service to drop every open connection.',
+            details: { operation: 'revoke-connections', rotated: true, credentialsDeleted },
+            cause: revokeFailure.cause,
+          },
+        ),
+      );
+    }
+
     this.#logger.info('rotated every service credential', {
-      rowsDeleted: deleted.value,
+      rowsDeleted: credentialsDeleted,
       socketsClosed,
     });
-    return ok(Object.freeze({ credentialsDeleted: deleted.value, socketsClosed }));
+    return ok(Object.freeze({ credentialsDeleted, socketsClosed }));
+  }
+
+  requireLiveCredential(principal: Principal): Result<void, DebuggenError> {
+    const decision = this.#decideLiveCredential(principal);
+    if (isErr(decision) && authFailureReasonOf(decision.error) !== undefined) {
+      // A store failure was already logged by #guard; a refusal is logged here,
+      // by its reason and the principal's role only.
+      this.#logRefusal(
+        'refused a request whose credential was retired after it was authenticated',
+        decision.error,
+        { role: principal.role },
+      );
+    }
+    return decision;
+  }
+
+  /**
+   * {@link requireLiveCredential} without the logging: the principal's row by
+   * digest, then the same row checks {@link #authenticate} applies, then the
+   * role the principal was resolved with.
+   */
+  #decideLiveCredential(principal: Principal): Result<void, DebuggenError> {
+    const raw = this.#guard('read-live-credential', () =>
+      this.#store.statement(SQL.selectCredential).get(principal.tokenHash),
+    );
+    if (isErr(raw)) {
+      return raw;
+    }
+    if (raw.value === undefined) {
+      return refuse('unknown-credential');
+    }
+    const row = credentialRowSchema.safeParse(raw.value);
+    if (!row.success) {
+      this.#logger.error('a stored credential record is not valid; it is refused');
+      return refuse('corrupt-credential');
+    }
+    if (!digestsEqual(row.data.token_hash, principal.tokenHash)) {
+      return refuse('unknown-credential');
+    }
+    if (row.data.expires_at !== null && row.data.expires_at <= this.#now()) {
+      return refuse('expired-credential');
+    }
+    // A digest now stored under another role is not the credential the
+    // principal was resolved from, whatever the digest says.
+    if (row.data.role !== principal.role) {
+      return refuse('unknown-credential');
+    }
+    return ok(undefined);
   }
 
   close(): void {
@@ -2423,7 +3676,7 @@ class CredentialAuthority implements AuthService {
  * `main.ts`'s start-up step once `$DEBUGGEN_HOME` exists.
  *
  * @param deps The store, the two configured paths, the logger, and the
- * optional revoker, clock and randomness seams.
+ * optional revoker, clock, randomness and credential-file seams.
  * @returns The service, or `CONFIG_INVALID` when `auth.json` would not sit
  * inside the state root, or `STORE_ERROR` when the store is already closed.
  *
@@ -2469,6 +3722,9 @@ export function createAuthService(deps: AuthServiceDeps): Result<AuthService, De
       revoker: deps.revoker,
       clock: deps.now ?? nowEpochMs,
       random: random ?? ((size: number): Uint8Array => cryptoRandomBytes(size)),
+      processId: deps.processId ?? process.pid,
+      isProcessAlive: deps.isProcessAlive ?? isProcessAlive,
+      files: deps.fileSystem ?? SECURE_CREDENTIAL_FILE_SYSTEM,
     }),
   );
 }
@@ -2531,26 +3787,58 @@ export function requireProjectScope(
 /**
  * The DevTools rule of AAP §0.5.6: a DevTools principal may bind its tab,
  * select targets, start and stop capture, query panel data and send
- * `source.open` only for the session bound to its tab, by a binding its own
- * credential made.
+ * `source.open` only for the session bound to **its** tab, by a binding its
+ * own credential made.
+ *
+ * "Its tab" is the request's acting tab, because the credential cannot say:
+ * every tab one paired extension inspects presents the same credential (see
+ * {@link TabBinding}). The action is admitted only when all of these hold:
+ *
+ * 1. the request names an acting tab — a DevTools action that names none is
+ *    refused (`acting-tab-required`) rather than attributed to a guessed tab;
+ * 2. the session has a live binding, and it is the binding of that session;
+ * 3. the binding's tab **is** the acting tab — tab B cannot act on the session
+ *    tab A is bound to, and a tab displaced by a later bind loses the session;
+ * 4. the binding was made by this principal's credential (constant-time digest
+ *    comparison).
+ *
+ * The acting tab is required as an explicit argument, never defaulted, so
+ * every call site states where its tab comes from: the verified
+ * `c.get('actingTabId')` of an HTTP request, the envelope or single-tab hello
+ * `tabId` of a WebSocket frame, or the payload's own `tabId` for a frame about
+ * one tab.
  *
  * @param principal The requesting principal; must be a DevTools one.
  * @param sessionId The session the request acts on.
- * @param binding The tab binding recorded for that session, if any.
- * @returns `ok`, or `TAB_NOT_BOUND` (`session-not-bound`, 403); a non-DevTools
- * principal is `UNAUTHORIZED` (`role-not-permitted`).
+ * @param binding The live tab binding recorded for that session, if any.
+ * @param actingTabId The inspected tab the request acts for, or `undefined` when it named none.
+ * @returns `ok`, or `TAB_NOT_BOUND` (`acting-tab-required` or `session-not-bound`,
+ * 403); a non-DevTools principal is `UNAUTHORIZED` (`role-not-permitted`).
+ *
+ * @example
+ * ```ts
+ * // tab 7 is bound to session S by credential C
+ * requireBoundSession(principalOfC, S, bindingOfS, 7); // ok
+ * requireBoundSession(principalOfC, S, bindingOfS, 8); // TAB_NOT_BOUND — another tab of C
+ * requireBoundSession(principalOfC, S, bindingOfS, undefined); // TAB_NOT_BOUND — no tab named
+ * ```
  */
 export function requireBoundSession(
   principal: Principal,
   sessionId: string,
   binding: TabBinding | undefined,
+  actingTabId: number | undefined,
 ): Result<void, DebuggenError> {
   if (principal.role !== 'devtools') {
     return refuse('role-not-permitted', 'Only a DevTools credential acts through a tab binding.');
   }
+  if (actingTabId === undefined) {
+    return refuse('acting-tab-required');
+  }
   if (
     binding === undefined ||
     binding.sessionId !== sessionId ||
+    binding.tabId !== actingTabId ||
     !digestsEqual(binding.boundBy, principal.tokenHash)
   ) {
     return refuse('session-not-bound');
@@ -2560,27 +3848,71 @@ export function requireBoundSession(
 
 /**
  * The whole per-session access matrix in one call: an editor principal by
- * project scope, a DevTools principal by its tab binding, and a server agent
- * never (it only ingests).
+ * project scope, a DevTools principal by its acting tab's binding
+ * ({@link requireBoundSession}), and a server agent never (it only ingests).
  *
  * @param principal The requesting principal.
  * @param session The session's id and project root.
- * @param binding The tab binding recorded for the session, if any.
+ * @param binding The live tab binding recorded for the session, if any.
+ * @param actingTabId The inspected tab a DevTools request acts for; ignored for
+ * the other roles, which never name one.
  * @returns `ok`, or the refusal of the rule that applies to the principal's role.
  */
 export function requireSessionAccess(
   principal: Principal,
   session: SessionAccessTarget,
   binding?: TabBinding,
+  actingTabId?: number,
 ): Result<void, DebuggenError> {
   switch (principal.role) {
     case 'vscode':
       return requireProjectScope(principal, session.projectRoot);
     case 'devtools':
-      return requireBoundSession(principal, session.id, binding);
+      return requireBoundSession(principal, session.id, binding, actingTabId);
     case 'server-agent':
       return refuse('role-not-permitted', 'A dev-server credential may only post telemetry.');
   }
+}
+
+/**
+ * The acting tab of an HTTP request: the {@link ACTING_TAB_HEADER} value,
+ * judged against the request's principal. Pure — it reads nothing but its
+ * arguments — and it is the rule {@link AuthService.authorizeHttpRequest}
+ * enforces, exported so {@link createAuthMiddleware} can hand routes the same
+ * verified value as `c.get('actingTabId')`.
+ *
+ * - No header: `ok(undefined)`. A DevTools action that needs a tab is refused
+ *   later, by {@link requireBoundSession} (`acting-tab-required`).
+ * - A header on a request whose principal is not a DevTools one, or on an
+ *   auth-exempt operation (`principal` `null`): `acting-tab-not-permitted`
+ *   (`UNAUTHORIZED`, 403) — no editor, dev server or unauthenticated caller
+ *   acts for a tab.
+ * - A DevTools request's header that is not exactly one tab id (protocol's
+ *   `parseActingTabHeader`): `acting-tab-invalid` (`PROTOCOL_INVALID_MESSAGE`,
+ *   400).
+ *
+ * The header value is never interpolated into a refusal or logged.
+ *
+ * @param principal The resolved principal, or `null` for an auth-exempt operation.
+ * @param raw The header's raw value, or `undefined` when the request carried none.
+ * @returns The acting tab, `undefined` when none was named, or the refusal.
+ *
+ * @example
+ * ```ts
+ * resolveActingTab(devtoolsPrincipal, '42'); // ok(42)
+ * resolveActingTab(devtoolsPrincipal, undefined); // ok(undefined)
+ * resolveActingTab(editorPrincipal, '42'); // err: acting-tab-not-permitted
+ * resolveActingTab(devtoolsPrincipal, '-1'); // err: acting-tab-invalid
+ * ```
+ */
+export function resolveActingTab(
+  principal: Principal | null,
+  raw: string | undefined,
+): Result<number | undefined, DebuggenError> {
+  return decideActingTab(
+    principal,
+    raw === undefined ? { kind: 'absent' } : { kind: 'single', value: raw },
+  );
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -2595,9 +3927,11 @@ export type AuthMiddlewareFactory = (operation: HttpOperationId) => MiddlewareHa
  *
  * The registration loop passes each route's operation id, so this code never
  * matches a path: it asks {@link AuthService.authorizeHttpRequest} about the
- * operation it was built for, sets `operation` and — for every non-exempt
+ * operation it was built for, sets `operation`, `actingTabId` (the verified
+ * {@link ACTING_TAB_HEADER} of a DevTools request, from
+ * {@link resolveActingTab}; `undefined` otherwise) and — for every non-exempt
  * operation — `principal` on the context, and otherwise answers with the
- * protocol's error body at the refusal's status (401, 403 or 429).
+ * protocol's error body at the refusal's status (400, 401, 403 or 429).
  *
  * ⚠️ It sets **no `Access-Control-Allow-Origin` header, deliberately**, and
  * nothing else may add one. Its absence is why a browser page cannot read any
@@ -2630,7 +3964,16 @@ export function createAuthMiddleware(
       const { status, body } = authErrorResponse(decision.error);
       return c.json(body, status);
     }
+    // The same pure rule the decision above enforced, over the same headers,
+    // so this only extracts the value the access boundary already accepted;
+    // should the two ever disagree the request is refused, never admitted.
+    const actingTab = resolveActingTab(decision.value, c.req.header(ACTING_TAB_HEADER));
+    if (isErr(actingTab)) {
+      const { status, body } = authErrorResponse(actingTab.error);
+      return c.json(body, status);
+    }
     c.set('operation', operation);
+    c.set('actingTabId', actingTab.value);
     if (decision.value !== null) {
       c.set('principal', decision.value);
     }

@@ -401,7 +401,7 @@ const ALL_ZERO_HEX_PATTERN = /^0+$/;
  * Whether `value` is a well-formed trace id.
  *
  * A type guard for boundaries that receive unvalidated input — a `traceparent`
- * header read back from a request, a value relayed through `postMessage`, an
+ * header read back from a request, a value relayed over the page channel, an
  * id stored in the page by a previous document — where the compiler knows only
  * `unknown`. The string check comes first, so a number, `null` or an object is
  * rejected rather than coerced to text and matched.

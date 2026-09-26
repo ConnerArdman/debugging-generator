@@ -53,11 +53,15 @@
  *   status      the capability table decides; an unavailable action shows the table's reason.
  *
  * A capture that yields nothing returns the session to `ready` (AAP 0.5.5), so "Start capture"
- * becomes usable again with no special case. A failed request is never presented as success: a
- * rejected callback clears the pending state and `aria-busy` at once, leaves the control operable
- * for a retry, and re-raises the rejection instead of swallowing it — the composition root owns
- * error presentation (for example a capture already held by another session), so no competing
- * error block is rendered here.
+ * becomes usable again with no special case. A failed request is never presented as success and
+ * never swallowed: a callback that throws or rejects clears the pending state and `aria-busy` at
+ * once, leaves the control operable for a retry, and hands the failure to the required
+ * `onActionError` reporter with the action that failed. Nothing is re-raised — a rethrow from the
+ * click handler or from the detached promise's rejection handler would reach no caller and
+ * surface only as an uncaught error or an unhandled rejection. The composition root owns error
+ * presentation (for example a capture already held by another session), so no competing error
+ * block is rendered here. Should the reporter itself throw, that failure goes to the platform's
+ * root reporter, `globalThis.reportError`, and the promise chain still ends handled.
  *
  * ## The live event counter
  *
@@ -65,10 +69,31 @@
  * event count is shown beside the control through `Text` with tabular figures, so the row does
  * not jitter as the number climbs, and always with a visible unit word ("1 event", "1,204 events",
  * "0 events captured" after an empty capture). The counter is a labelled `group` stating what it
- * counts. It is deliberately NOT a live region: it can change many times per second and would
- * flood a screen reader; the running state is announced through the control's own name instead.
- * The count arrives as a prop from the store's capture slice, which the connection layer updates
- * from the `telemetry.tail` and `capture.*` pushes — nothing is polled or counted here.
+ * counts, and it is current on every render. The count arrives as a prop from the store's capture
+ * slice, which the connection layer updates from the `telemetry.tail` and `capture.*` pushes —
+ * nothing is polled or counted here.
+ *
+ * ## The progress announcement
+ *
+ * The visible counter is deliberately NOT a live region: it can change many times per second and
+ * would flood a screen reader. Progress reaches assistive technology through a second, visually
+ * hidden element instead — a polite, atomic `role="status"` region that is always mounted (so it
+ * exists before its first sentence arrives) and whose sentence changes on a schedule rather than
+ * on every count:
+ *
+ *   capture starts       at once       "Capture running. 0 events received."
+ *   count changes        throttled     "1,204 events received during the running capture."
+ *   capture stops        at once       "Capture stopped. 1,204 events captured."
+ *   count corrected      throttled     "1,206 events captured." (after a stop it announced)
+ *   capture id cleared   at once       the sentence is cleared, so nothing stale remains
+ *
+ * The throttle is trailing: the first unannounced count change starts a
+ * {@link COUNT_ANNOUNCE_INTERVAL_MS} timer and the sentence is composed when it fires, from the
+ * latest count, so a burst collapses into one announcement per interval and never speaks a
+ * superseded number. A start or stop supersedes a pending count sentence. A capture this component
+ * only ever saw stopped — a panel opened on a finished session — is never announced, and a
+ * switch to such a capture clears the previous capture's sentence. The schedule lives in
+ * {@link CaptureAnnouncer}; the region's text is React state set only from its timer callbacks.
  *
  * ## Accessibility
  *
@@ -82,12 +107,19 @@
  * - The bubble is placed below the control, because the header sits at the top edge of the panel.
  * - Every state is carried by text — the button's label and the counter's words — never by colour.
  * - The focus ring is the renderer's token ring on `:focus-visible`.
+ * - Capture progress is announced politely, never assertively, and never moves focus: the
+ *   `role="status"` region carries `aria-live="polite"` and `aria-atomic="true"` explicitly, so
+ *   its one sentence is read whole and waits for the screen reader to finish speaking. The region
+ *   is out of the visual flow and adds nothing a sighted reader sees; the visible counter keeps
+ *   its `group` label and is not announced a second time.
  *
  * ## Design-system compliance (AAP 0.6.2, 0.6.4)
  *
  * Every visual value resolves through a renderer component — `Stack`, `Tooltip`, `Button` and
  * `Text` — and therefore through the `--dg-*` tokens behind them. This file writes no inline
- * style, no length, no colour and no class name of its own.
+ * style, no length, no colour and no class name of its own. The announcement region composes the
+ * renderer's global `dg-visually-hidden` utility (`base.css`), exactly as `Header` and
+ * `TargetPicker` do; it is absolutely positioned, so it takes no gap in the row.
  *
  * BLITZY [DESIGN_SYSTEM_GAP]: the renderer's single disabled treatment is keyed on the native
  * `disabled` attribute and the class `Button` adds for it; it has no treatment for
@@ -149,9 +181,45 @@ const LIVE_COUNTER_LABEL = 'Events received during the running capture';
 /** The counter's accessible label once the capture it counts has stopped. */
 const LAST_COUNTER_LABEL = 'Events received by the last capture';
 
+/** The lead of the sentence announced when a capture starts running. */
+const CAPTURE_RUNNING_LEAD = 'Capture running.';
+
+/** The lead of the sentence announced when the running capture stops. */
+const CAPTURE_STOPPED_LEAD = 'Capture stopped.';
+
+/** The tail of the throttled sentence announced while the running capture's count climbs. */
+const RUNNING_PROGRESS_TAIL = 'received during the running capture.';
+
+/**
+ * The developer-facing message of the aggregate raised when the platform's own error reporter
+ * throws while reporting a failure of the capture controls' error reporter.
+ */
+const PLATFORM_REPORTER_FAILED =
+  'The platform error reporter failed while reporting a capture control error.';
+
+/**
+ * The renderer's global utility in `base.css` that keeps text in the accessibility tree while
+ * painting nothing. Out of flow, so the announcement region takes no gap in the row.
+ */
+const VISUALLY_HIDDEN_CLASS = 'dg-visually-hidden';
+
 // ---------------------------------------------------------------------------
 // Behaviour constants
 // ---------------------------------------------------------------------------
+
+/**
+ * The shortest spacing, in milliseconds, between two count announcements. A count that changes
+ * many times per second is spoken at most once per interval, always with the latest number; a
+ * start or a stop is announced at once regardless.
+ */
+const COUNT_ANNOUNCE_INTERVAL_MS = 5_000;
+
+/**
+ * The delay of a prompt announcement (start, stop, clear). Zero, but still a timer: the region's
+ * text is state, and state is set only from timer callbacks — never synchronously in an effect —
+ * which also guarantees the always-mounted region exists before its first sentence arrives.
+ */
+const PROMPT_ANNOUNCE_DELAY_MS = 0;
 
 /**
  * How long, in milliseconds, a request that resolved keeps the control waiting for the status or
@@ -278,8 +346,11 @@ function isPermitted(action: CaptureAction, status: SessionStatus | undefined): 
 // Request tracking and slot resolution
 // ---------------------------------------------------------------------------
 
-/** The two requests this component can raise. */
-type CaptureAction = 'start' | 'stop';
+/**
+ * The two requests this component can raise. Exported because {@link CaptureControlsProps}'
+ * `onActionError` names the action whose request failed.
+ */
+export type CaptureAction = 'start' | 'stop';
 
 /**
  * A request this component raised, from activation until the session visibly moves on.
@@ -389,6 +460,68 @@ function isThenable(value: unknown): value is PromiseLike<unknown> {
 }
 
 // ---------------------------------------------------------------------------
+// Failure reporting
+// ---------------------------------------------------------------------------
+
+/**
+ * Hands a failure no reporter of the caller's could take to the platform's root error reporter.
+ *
+ * `globalThis.reportError` reports an error to the global `error` event and the console exactly
+ * as an uncaught exception would, without unwinding any caller. Every Chrome this extension
+ * supports has it (the manifest's minimum version is far past its introduction). A host without
+ * it gets the failure rethrown on a fresh task instead ({@link throwOnFreshTask}), and a
+ * non-conforming `reportError` that throws gets both errors delivered that way together, so
+ * neither is dropped.
+ *
+ * @param failure What the caller's reporter threw.
+ */
+function reportToPlatform(failure: unknown): void {
+  const platformReporter: unknown = Reflect.get(globalThis, 'reportError');
+  if (typeof platformReporter !== 'function') {
+    throwOnFreshTask(failure);
+    return;
+  }
+  try {
+    Reflect.apply(platformReporter, globalThis, [failure]);
+  } catch (platformFailure: unknown) {
+    throwOnFreshTask(new AggregateError([failure, platformFailure], PLATFORM_REPORTER_FAILED));
+  }
+}
+
+/**
+ * Rethrows `failure` from a timer callback: the idiom that predates `reportError` and reaches the
+ * same global error handler. Being outside every promise chain and every caller's stack, it can
+ * neither unwind the click that caused it nor surface as an unhandled rejection.
+ */
+function throwOnFreshTask(failure: unknown): void {
+  setTimeout(() => {
+    throw failure;
+  }, 0);
+}
+
+/**
+ * Delivers a failed capture request to the caller's reporter, and ends there: nothing is
+ * re-raised. A reporter that throws is itself handed to {@link reportToPlatform}, so calling this
+ * from a promise's rejection handler always settles that handler normally — the chain ends
+ * handled whatever the reporter does.
+ *
+ * @param report The caller's {@link CaptureControlsProps.onActionError}.
+ * @param error What the capture callback threw or rejected with, unchanged.
+ * @param action The request that failed.
+ */
+function reportActionError(
+  report: CaptureControlsProps['onActionError'],
+  error: unknown,
+  action: CaptureAction,
+): void {
+  try {
+    report(error, action);
+  } catch (reporterFailure: unknown) {
+    reportToPlatform(reporterFailure);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // The counter
 // ---------------------------------------------------------------------------
 
@@ -406,6 +539,208 @@ function counterText(eventCount: number, live: boolean): string {
   const unit = count === 1 ? 'event' : 'events';
   const formatted = `${EVENT_COUNT_FORMAT.format(count)} ${unit}`;
   return live ? formatted : `${formatted} captured`;
+}
+
+// ---------------------------------------------------------------------------
+// The progress announcement
+// ---------------------------------------------------------------------------
+
+/** The sentence announced when a capture starts: "Capture running. 0 events received." */
+function startSentence(count: number): string {
+  return `${CAPTURE_RUNNING_LEAD} ${counterText(count, true)} received.`;
+}
+
+/** The throttled sentence while it runs: "1,204 events received during the running capture." */
+function progressSentence(count: number): string {
+  return `${counterText(count, true)} ${RUNNING_PROGRESS_TAIL}`;
+}
+
+/** The sentence announced when the capture stops: "Capture stopped. 1,204 events captured." */
+function stopSentence(count: number): string {
+  return `${CAPTURE_STOPPED_LEAD} ${counterText(count, false)}.`;
+}
+
+/** The throttled sentence for a count corrected after the stop: "1,206 events captured." */
+function totalSentence(count: number): string {
+  return `${counterText(count, false)}.`;
+}
+
+/** The capture the announcer follows, as it was last observed. */
+interface FollowedCapture {
+  readonly captureId: string;
+  /** Whether the capture was running at the last observation. */
+  readonly live: boolean;
+  /** Whether it was ever observed running; a capture seen only stopped is never announced. */
+  readonly seenLive: boolean;
+}
+
+/** An announcement delivered at once: the capture started or stopped, or the sentence is cleared. */
+type PromptAnnouncement = 'start' | 'stop' | 'clear';
+
+/**
+ * The schedule behind the progress announcement: it observes the capture on every change and
+ * decides what the live region says, and when (the table in the module header).
+ *
+ * A plain object rather than more hooks, so the whole schedule and both of its timers are owned
+ * in one place: the component creates it in a mount effect, feeds it from an effect keyed on the
+ * capture, and disposes of it on unmount, which cancels every pending timer. `announce` is invoked
+ * only from a timer callback, never synchronously from {@link CaptureAnnouncer.observe}, so the
+ * component's state is never set in an effect body.
+ *
+ * Invariants:
+ * - at most one prompt timer and one count timer are pending, and scheduling a prompt cancels
+ *   both — a start or stop supersedes whatever was about to be said;
+ * - no count timer is scheduled while a prompt is pending, because the prompt states the count;
+ * - every sentence is composed when its timer fires, from the latest observed count, so a
+ *   superseded number is never spoken.
+ */
+class CaptureAnnouncer {
+  readonly #announce: (sentence: string) => void;
+
+  #followed: FollowedCapture | undefined = undefined;
+
+  /** The latest observed count of the followed capture. */
+  #count = 0;
+
+  /** The count the last sentence about the followed capture stated; `undefined` before one. */
+  #spokenCount: number | undefined = undefined;
+
+  #promptTimer: ReturnType<typeof setTimeout> | undefined = undefined;
+
+  #countTimer: ReturnType<typeof setTimeout> | undefined = undefined;
+
+  /** @param announce Replaces the live region's sentence; `''` empties it. */
+  constructor(announce: (sentence: string) => void) {
+    this.#announce = announce;
+  }
+
+  /**
+   * Records the capture as the component now renders it and schedules what the change warrants.
+   *
+   * @param captureId The running or last capture's id; `undefined` before the first capture.
+   * @param live Whether the session is capturing.
+   * @param count The capture's displayable event count.
+   */
+  observe(captureId: string | undefined, live: boolean, count: number): void {
+    this.#count = count;
+    const previous = this.#followed;
+
+    if (captureId === undefined) {
+      this.#followed = undefined;
+      if (previous !== undefined) {
+        this.#prompt('clear');
+      }
+      return;
+    }
+
+    if (previous?.captureId !== captureId) {
+      // A capture seen for the first time is announced only when it is seen running. A switch to
+      // one seen stopped clears what the region said about the previous capture.
+      this.#followed = { captureId, live, seenLive: live };
+      this.#spokenCount = undefined;
+      if (live) {
+        this.#prompt('start');
+      } else if (previous !== undefined) {
+        this.#prompt('clear');
+      }
+      return;
+    }
+
+    if (live !== previous.live) {
+      // The same capture started or stopped; either way it has now been seen running.
+      this.#followed = { captureId, live, seenLive: true };
+      this.#prompt(live ? 'start' : 'stop');
+      return;
+    }
+
+    if (previous.seenLive && count !== this.#spokenCount) {
+      this.#scheduleCount();
+    }
+  }
+
+  /** Cancels every pending announcement; the component calls it on unmount. */
+  dispose(): void {
+    this.#cancelTimers();
+  }
+
+  /** Replaces anything pending with a prompt announcement of `kind`. */
+  #prompt(kind: PromptAnnouncement): void {
+    this.#cancelTimers();
+    this.#promptTimer = setTimeout(() => {
+      this.#promptTimer = undefined;
+      if (kind === 'clear') {
+        this.#spokenCount = undefined;
+        this.#announce('');
+        return;
+      }
+      const count = this.#count;
+      this.#spokenCount = count;
+      this.#announce(kind === 'start' ? startSentence(count) : stopSentence(count));
+    }, PROMPT_ANNOUNCE_DELAY_MS);
+  }
+
+  /**
+   * The trailing throttle: the first unannounced count change starts the interval, later changes
+   * within it only update `#count`, and the sentence states whatever the count is when it fires.
+   */
+  #scheduleCount(): void {
+    if (this.#promptTimer !== undefined || this.#countTimer !== undefined) {
+      return;
+    }
+    this.#countTimer = setTimeout(() => {
+      this.#countTimer = undefined;
+      const followed = this.#followed;
+      const count = this.#count;
+      if (followed === undefined || !followed.seenLive || count === this.#spokenCount) {
+        return;
+      }
+      this.#spokenCount = count;
+      this.#announce(followed.live ? progressSentence(count) : totalSentence(count));
+    }, COUNT_ANNOUNCE_INTERVAL_MS);
+  }
+
+  #cancelTimers(): void {
+    clearTimeout(this.#promptTimer);
+    clearTimeout(this.#countTimer);
+    this.#promptTimer = undefined;
+    this.#countTimer = undefined;
+  }
+}
+
+/**
+ * The progress announcement's current sentence, driven by a {@link CaptureAnnouncer} for the life
+ * of the component.
+ *
+ * @param captureId The running or last capture's id.
+ * @param live Whether the session is capturing.
+ * @param count The capture's displayable event count.
+ * @returns The sentence the live region holds; `''` when there is nothing to say.
+ */
+function useCaptureAnnouncement(
+  captureId: string | undefined,
+  live: boolean,
+  count: number,
+): string {
+  const [announcement, setAnnouncement] = useState('');
+  const announcerRef = useRef<CaptureAnnouncer | undefined>(undefined);
+
+  // Declared before the observing effect, so the announcer exists when that effect first runs;
+  // its cleanup cancels every pending timer on unmount. A remount (React's development
+  // double-invocation included) starts a fresh announcer that the observing effect feeds again.
+  useEffect(() => {
+    const announcer = new CaptureAnnouncer(setAnnouncement);
+    announcerRef.current = announcer;
+    return () => {
+      announcer.dispose();
+      announcerRef.current = undefined;
+    };
+  }, []);
+
+  useEffect(() => {
+    announcerRef.current?.observe(captureId, live, count);
+  }, [captureId, live, count]);
+
+  return announcement;
 }
 
 // ---------------------------------------------------------------------------
@@ -433,16 +768,40 @@ export interface CaptureControlsProps {
 
   /**
    * Asks the service to open a capture window. Called only when the session is `ready`. A
-   * returned promise holds the control busy until it settles; a rejection is re-raised, never
-   * swallowed, so the composition root presents it.
+   * returned promise holds the control busy until it settles. A synchronous throw or a rejection
+   * releases the control at once and is handed to {@link CaptureControlsProps.onActionError}
+   * with the action `'start'` — never re-raised and never swallowed.
    */
   onStartCapture: () => Promise<void> | void;
 
   /**
    * Asks the service to close the running capture window. Called only when the session is
-   * `capturing`, with the same promise handling as {@link CaptureControlsProps.onStartCapture}.
+   * `capturing`, with the same promise and failure handling as
+   * {@link CaptureControlsProps.onStartCapture}; a failure is reported with the action `'stop'`.
    */
   onStopCapture: () => Promise<void> | void;
+
+  /**
+   * The root reporter of a failed capture request: receives, unchanged, whatever
+   * `onStartCapture` or `onStopCapture` threw or rejected with, and the action that failed. It is
+   * the only exit for that failure — this component re-raises nothing, because a rethrow from a
+   * click handler or a detached promise reaches no caller — so it is required rather than
+   * optional. The composition root routes it into the panel's non-blocking error notice.
+   *
+   * Called at most once per activation, after the control has been released for a retry. The
+   * reporter current at activation receives that activation's failure, even if the component has
+   * since re-rendered or unmounted. A reporter that itself throws is not re-raised either: its
+   * error goes to the platform's root reporter, `globalThis.reportError`.
+   *
+   * @example
+   * <CaptureControls
+   *   // …
+   *   onActionError={(error, action) => {
+   *     presentFailure(action === 'start' ? 'Could not start the capture' : 'Could not stop it', error);
+   *   }}
+   * />
+   */
+  onActionError: (error: unknown, action: CaptureAction) => void;
 
   /**
    * True while the caller knows of a capture request this component did not raise. The control
@@ -466,10 +825,12 @@ export interface CaptureControlsProps {
 
 /**
  * Renders the capture action slot — "Start capture" or "Stop capture", with its unavailable
- * reason in a `Tooltip` — followed by the live event counter while a capture id is present.
+ * reason in a `Tooltip` — followed by the live event counter while a capture id is present, and
+ * the always-mounted, visually hidden progress announcement.
  *
  * @param props The props documented on {@link CaptureControlsProps}.
- * @returns The horizontal row holding the control and, when applicable, the counter.
+ * @returns The horizontal row holding the control, the counter when applicable, and the
+ *   announcement region.
  *
  * @example
  * // The composition root, with the store's capture slice and the port requests:
@@ -479,6 +840,7 @@ export interface CaptureControlsProps {
  *   eventCount={capture.eventCount}
  *   onStartCapture={startCapture}
  *   onStopCapture={stopCapture}
+ *   onActionError={reportCaptureFailure}
  * />
  */
 export function CaptureControls(props: CaptureControlsProps): ReactElement {
@@ -488,6 +850,7 @@ export function CaptureControls(props: CaptureControlsProps): ReactElement {
     eventCount,
     onStartCapture,
     onStopCapture,
+    onActionError,
     busy = false,
     disabledReason,
     className,
@@ -512,6 +875,10 @@ export function CaptureControls(props: CaptureControlsProps): ReactElement {
     };
   }, [request]);
 
+  const live = sessionStatus === 'capturing';
+  // The throttled sentence of the always-mounted live region (see "The progress announcement").
+  const announcement = useCaptureAnnouncement(captureId, live, displayableCount(eventCount));
+
   const holding = holdingRequest(request, sessionStatus, captureId);
   const slot = resolveSlot(sessionStatus, holding, busy, disabledReason);
 
@@ -531,17 +898,19 @@ export function CaptureControls(props: CaptureControlsProps): ReactElement {
       fromStatus: sessionStatus,
       fromCaptureId: captureId,
     };
-    const callback = slot.action === 'start' ? onStartCapture : onStopCapture;
+    const action = slot.action;
+    const callback = action === 'start' ? onStartCapture : onStopCapture;
 
     inFlightRef.current = true;
     let outcome: unknown;
     try {
       outcome = callback();
-    } catch (error) {
-      // A synchronous throw is the caller's failure to present: nothing was requested, so nothing
-      // is held, and the error continues to the caller's error handling unchanged.
+    } catch (error: unknown) {
+      // A synchronous throw: nothing was requested, so nothing is held. The failure goes to the
+      // explicit reporter and ends there — rethrown from a click handler it would reach no caller.
       inFlightRef.current = false;
-      throw error;
+      reportActionError(onActionError, error, action);
+      return;
     }
 
     if (!isThenable(outcome)) {
@@ -561,15 +930,14 @@ export function CaptureControls(props: CaptureControlsProps): ReactElement {
       },
       (reason: unknown) => {
         // Never presented as success and never swallowed: release the control for a retry, clear
-        // `aria-busy`, and re-raise the rejection for the composition root's error handling.
+        // `aria-busy` (only while this request is still the tracked one), and hand the rejection
+        // to the explicit reporter. Nothing is rethrown, so this chain always ends handled.
         inFlightRef.current = false;
         setRequest((current) => (current === pending ? undefined : current));
-        throw reason;
+        reportActionError(onActionError, reason, action);
       },
     );
   };
-
-  const live = sessionStatus === 'capturing';
 
   return (
     <Stack direction="horizontal" gap={2} align="center" wrap className={className}>
@@ -605,6 +973,11 @@ export function CaptureControls(props: CaptureControlsProps): ReactElement {
           {counterText(eventCount, live)}
         </Text>
       ) : null}
+      {/* Always mounted, even before the first capture, so the region exists before its text
+          changes; visually hidden and out of flow, so the row looks exactly as without it. */}
+      <Text role="status" aria-live="polite" aria-atomic="true" className={VISUALLY_HIDDEN_CLASS}>
+        {announcement}
+      </Text>
     </Stack>
   );
 }

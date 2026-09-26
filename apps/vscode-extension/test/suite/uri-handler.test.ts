@@ -37,6 +37,15 @@
  * declined, reaches it zero times after exactly one question naming that file
  * and line; and the production dialog asks exactly "Open ‹file›:‹line›?".
  *
+ * THE PRODUCER'S SIDE OF THE CONTRACT. The link a DevTools panel opens when no
+ * editor is connected is built by `buildEditorOpenUri` of `@debuggen/protocol`
+ * from its `EDITOR_OPEN_URI` table, encoding every value twice. The suite
+ * proves the handler reads that table's path and parameter names, and that a
+ * built link parsed by the real `vscode.Uri.parse` — the one decode this
+ * editor applies before the handler's own query parser — gives back the exact
+ * file, line and column for names carrying `+`, `&`, `=`, `%`, `#`, `?`, a
+ * space and non-ASCII text, and opens such a file once when confirmed.
+ *
  * WORKSPACE CONTAINMENT is driven through `resolveWithinWorkspace(request,
  * folders)` and the handler's injectable `workspaceFolders`, with a scratch
  * directory under `os.tmpdir()` standing in as the open folder and symlinks
@@ -68,8 +77,9 @@ import assert from 'node:assert/strict';
 import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
 
+import { EDITOR_OPEN_URI, buildEditorOpenUri } from '@debuggen/protocol';
 import { DEBUGGEN_ERROR_CODES, DebuggenError, createConsoleLogger } from '@debuggen/shared';
-import type { DebuggenErrorCode, LogRecord, Result } from '@debuggen/shared';
+import type { DebuggenErrorCode, LogRecord, Result, SourceLocation } from '@debuggen/shared';
 import * as vscode from 'vscode';
 
 import {
@@ -413,6 +423,77 @@ function positionTail(): string {
 }
 
 // ---------------------------------------------------------------------------
+// The editor-open URI a DevTools panel builds
+// ---------------------------------------------------------------------------
+
+/**
+ * Project-relative names in which every special character means something to a
+ * URI or to a form-encoded query. Each is written into a link by
+ * `buildEditorOpenUri`, exactly as a DevTools panel does when no editor is
+ * connected, and must come back out of the handler's parse byte for byte.
+ */
+const ROUND_TRIP_FILES: readonly string[] = Object.freeze([
+  // `+` is a space in a form-encoded query.
+  'src/a+b.ts',
+  // `&` and `=` would split the pair and smuggle in a second `line`.
+  'src/a&line=9.ts',
+  // A bare percent sign, and escapes that must not be decoded a third time.
+  'src/100%.ts',
+  'src/%41%2e%2e%2f.ts',
+  // `#` would start a fragment and `?` a second query.
+  'src/hash#fragment?query.ts',
+  // Spaces, including a run of them.
+  'src/with space/and  two.ts',
+  // Non-ASCII text: precomposed Latin letters, CJK, and an astral character.
+  'src/ünïcødé/模块.ts',
+  'src/emoji-😀.ts',
+]);
+
+/** The positions each round-trip name is carried at: an ordinary one, and both inclusive bounds. */
+const ROUND_TRIP_POSITIONS: readonly AnchorPosition[] = Object.freeze([
+  Object.freeze({ line: 12, column: 7 }),
+  Object.freeze({ line: MAX_URI_LINE, column: MAX_URI_COLUMN }),
+]);
+
+/**
+ * A real file inside the stand-in workspace whose name needs both encodings:
+ * `+`, `&`, `=`, a `%` escape, spaces and non-ASCII text in one name.
+ */
+const FALLBACK_FILE = 'src/fallback a+b&c=d%41 ü.ts';
+
+/** The token the position inside {@link FALLBACK_FILE} is found by. */
+const FALLBACK_ANCHOR = 'fallbackAnchorTarget';
+
+const FALLBACK_MODULE_TEXT = [
+  '/** A module whose name needs both encodings of the editor-open URI. */',
+  `export const ${FALLBACK_ANCHOR} = 'reached through buildEditorOpenUri';`,
+  '',
+].join('\n');
+
+/** The shared source location a DevTools panel holds for `file` at `position`. */
+function panelLocation(file: string, position: AnchorPosition): SourceLocation {
+  return { file, ...position, resolvedBy: 'code-graph', confidence: 1 };
+}
+
+/** One link as `buildEditorOpenUri` wrote it, and as this editor parses it. */
+interface BuiltLink {
+  /** The URI text exactly as the DevTools panel would open it. */
+  readonly text: string;
+  /** That text through the real `vscode.Uri.parse`, which decodes the query once. */
+  readonly uri: vscode.Uri;
+}
+
+/**
+ * The link `buildEditorOpenUri` builds for `location`, parsed by the real
+ * `vscode.Uri.parse` — the decode this editor applies to a `vscode://` URI
+ * before any handler sees it.
+ */
+function builtLink(location: SourceLocation): BuiltLink {
+  const text = expectAccepted(buildEditorOpenUri(location), `buildEditorOpenUri(${location.file})`);
+  return { text, uri: vscode.Uri.parse(text, true) };
+}
+
+// ---------------------------------------------------------------------------
 // The handler probe: every collaborator substituted and recorded
 // ---------------------------------------------------------------------------
 
@@ -723,6 +804,87 @@ describe('vscode:// source-open handler (src/uri-handler.ts)', () => {
         );
         assert.deepEqual(request, { file: IN_WORKSPACE.module, ...position });
       }
+    });
+  });
+
+  describe('the editor-open URI of @debuggen/protocol reaches the handler unchanged', () => {
+    afterEach(async () => {
+      disposeSourceRevealResources();
+      await closeAllEditors();
+    });
+
+    it("is built from the path and parameter names the handler reads, under this extension's identity", () => {
+      assert.equal(OPEN_SOURCE_URI_PATH, EDITOR_OPEN_URI.path);
+      assert.deepEqual(
+        [
+          EDITOR_OPEN_URI.fileParameter,
+          EDITOR_OPEN_URI.lineParameter,
+          EDITOR_OPEN_URI.columnParameter,
+        ],
+        LINK_PARAMETERS,
+      );
+      const manifest = readExtensionManifest();
+      assert.equal(EDITOR_OPEN_URI.authority, `${manifest.publisher}.${manifest.name}`);
+      assert.equal(EDITOR_OPEN_URI.authority, EXTENSION_ID);
+
+      const { uri } = builtLink(panelLocation(IN_WORKSPACE.module, FIRST_POSITION));
+      assert.equal(uri.scheme, EDITOR_OPEN_URI.scheme);
+      assert.equal(uri.authority, EDITOR_OPEN_URI.authority);
+      assert.equal(uri.path, OPEN_SOURCE_URI_PATH);
+    });
+
+    it('gives back the exact file, line and column through vscode.Uri.parse, whatever the name holds', () => {
+      for (const file of ROUND_TRIP_FILES) {
+        for (const position of ROUND_TRIP_POSITIONS) {
+          const { text, uri } = builtLink(panelLocation(file, position));
+          const subject = `parseOpenSourceUri(Uri.parse(${text}))`;
+          // Written as exactly three pairs: no `&` or `=` of the name survives
+          // into the text as a separator.
+          const query = text.slice(text.indexOf('?') + 1);
+          assert.equal(query.split('&').length, LINK_PARAMETERS.length, `${subject}: pair count`);
+
+          const request = expectAccepted(parseOpenSourceUri(uri), subject);
+          assert.deepEqual(request, { file, ...position }, `${subject}: recovered request`);
+        }
+      }
+    });
+
+    it('opens a real file whose name needs both encodings, once, at its line and column', async () => {
+      const layout = requireScratch();
+      const written = writeFixtureFile(layout.workspaceRoot, FALLBACK_FILE, FALLBACK_MODULE_TEXT);
+      const canonicalPath = await fsp.realpath(written);
+      const position = await locateAnchor(written, FALLBACK_ANCHOR);
+      const probe = createProbe({ confirmAnswer: true, workspaceFolders: () => layout.folders });
+
+      await probe.handler.handleUri(builtLink(panelLocation(FALLBACK_FILE, position)).uri);
+
+      // The developer is asked about the name exactly as the panel held it.
+      assert.deepEqual(probe.confirmRequests, [{ file: FALLBACK_FILE, ...position }]);
+      assert.equal(probe.revealCalls.length, 1, 'the editor must be asked exactly once');
+      const [call] = probe.revealCalls;
+      assert.ok(call !== undefined, 'no reveal call was recorded');
+      assert.equal(call.uri.fsPath, canonicalPath, 'revealed file (canonical path)');
+      assert.equal(call.line, position.line, 'revealed line');
+      assert.equal(call.column, position.column, 'revealed column');
+      const [outcome] = probe.revealResults;
+      assert.ok(outcome !== undefined, 'the reveal did not settle');
+      assert.equal(expectAccepted(outcome, 'revealLocationInEditor').clamped, false);
+      assert.equal(probe.notifications.length, 0, 'a successful open raises nothing');
+      assert.equal(
+        probe.logRecords.filter((record) => record.level === 'warn').length,
+        0,
+        'a successful open logs no refusal',
+      );
+
+      const editor = await waitFor(
+        () =>
+          vscode.window.visibleTextEditors.find(
+            (candidate) => candidate.document.uri.fsPath === canonicalPath,
+          ),
+        { message: `an editor showing ${FALLBACK_FILE}` },
+      );
+      assert.equal(editor.selection.active.line, position.line - 1, 'cursor line');
+      assert.equal(editor.selection.active.character, position.column - 1, 'cursor column');
     });
   });
 

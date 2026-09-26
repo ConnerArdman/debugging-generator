@@ -24,8 +24,9 @@
  *                                          { sessionId, analysis: AnalysisResult }
  *
  * session.create       HTTP  VS Code → service
- *                       { projectRoot, question, target? } → SessionRecord
- * session.question     HTTP  VS Code → service     { question } → SessionRecord
+ *         { projectRoot, question, target?, devServerUrl? } → SessionRecord
+ * session.question     HTTP  VS Code → service
+ *                                  { question, attemptId? } → SessionRecord
  * session.end          HTTP  VS Code → service     {} → { cleanup: … }
  * ```
  *
@@ -174,7 +175,7 @@ import type { DebuggenError, Result, SessionId } from '@debuggen/shared';
 
 import { analysisResultSchema } from '../analysis.js';
 import type { AnalysisResult } from '../analysis.js';
-import { sessionRecordSchema } from '../session-record.js';
+import { followUpAttemptIdSchema, sessionRecordSchema } from '../session-record.js';
 import type { SessionRecord } from '../session-record.js';
 import { protocolParseError } from '../version.js';
 
@@ -415,6 +416,22 @@ export type SessionCreatedPayload = z.infer<typeof sessionCreatedPayloadSchema>;
  * The *shape* is written once all the same: this schema is built from
  * {@link sessionCreatedPayloadSchema}'s `shape`, so the two cannot drift while
  * they are meant to agree.
+ *
+ * ## Whole records, not deltas
+ *
+ * Every frame carries the complete record, as AAP §0.4.2 specifies, and that is
+ * what makes each frame self-sufficient: a client that missed frames — an MV3
+ * service worker the browser suspended, an editor that reconnected after a
+ * service restart — is fully current again on the next one, with no base
+ * version to reconcile and no gap to detect. The cost of repeating the record is
+ * bounded where it is paid instead of by splitting the frame: the service
+ * encodes each frame once and sends it only to the session's own editors and
+ * its bound tab (`apps/local-service/src/server/clients.ts`); receivers drop a
+ * record older than the one they hold and keep only list rows, never whole
+ * records, for sessions they merely list (`SessionListItem`, `../http.ts`); and
+ * the record's heavy collections have their own paged reads —
+ * `GET /sessions/:id/modifications` under a diff budget, `panel-data` for
+ * telemetry.
  */
 export const sessionUpdatedPayloadSchema = z.strictObject({
   ...sessionCreatedPayloadSchema.shape,
@@ -586,6 +603,55 @@ export const SESSION_MESSAGE_PAYLOADS = Object.freeze({
 // ---------------------------------------------------------------------------
 
 /**
+ * The longest dev-server URL a `session.create` body may carry: **2048**, the
+ * bound `../session-record.ts` applies to the `devServerUrl` it stores, so any
+ * URL this body accepts can be recorded on the session it creates.
+ *
+ * Module-local for the same reason {@link MAX_ID_LENGTH} is.
+ */
+const MAX_DEV_SERVER_URL_LENGTH = 2048;
+
+/**
+ * Whether an absolute URL is free of user information (`user@host`,
+ * `user:password@host`).
+ *
+ * A dev-server URL is stored on the session record and shown in both user
+ * interfaces, so one that carried a credential would copy it into the store and
+ * onto the screen (AAP §0.5.2). A value the URL parser refuses is reported as
+ * free of user information here, because the preceding `z.url` check already
+ * refuses it with its own, more precise issue.
+ *
+ * @param value A string that has passed the absolute-URL check.
+ * @returns `false` only when the parsed URL carries a user name or password.
+ */
+function hasNoUserInfo(value: string): boolean {
+  try {
+    const parsed = new URL(value);
+    return parsed.username === '' && parsed.password === '';
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * A dev-server URL a client sends for the service to verify: an absolute
+ * `http:`/`https:` URL within {@link MAX_DEV_SERVER_URL_LENGTH} characters that
+ * embeds no user name or password.
+ *
+ * What a transport can check, and nothing more: whether the URL names this
+ * machine, answers, and belongs to a dev server carrying the telemetry preload
+ * are the service's questions, answered by its own loopback probe before the
+ * value is used. Shared by `session.create` (below) and `devServer.launch`
+ * (`../http.ts`), so both bodies accept exactly the same URLs.
+ */
+export const devServerUrlSchema = z
+  .url({ protocol: /^https?$/, error: 'expected an absolute http: or https: URL' })
+  .max(MAX_DEV_SERVER_URL_LENGTH, {
+    error: `expected a dev-server URL of at most ${String(MAX_DEV_SERVER_URL_LENGTH)} characters`,
+  })
+  .refine(hasNoUserInfo, { error: 'expected a dev-server URL without embedded credentials' });
+
+/**
  * The `session.create` request body: which project, which question, and
  * optionally what the developer had already pointed at.
  *
@@ -599,11 +665,10 @@ export const SESSION_MESSAGE_PAYLOADS = Object.freeze({
  * data and is never compared, matched or branched on in this package or any
  * other (AAP §0.5.4).
  *
- * `strictObject`: a body carrying a fourth key is a client working from a
- * contract this one replaced — a `sessionId` it hoped to choose, a `devServerUrl`
- * the service probes for itself, a `provider` that is configuration rather than
- * a request — and a silent acceptance would leave it believing the field had an
- * effect.
+ * `strictObject`: a body carrying a fifth key is a client working from a
+ * contract this one replaced — a `sessionId` it hoped to choose, a `provider`
+ * that is configuration rather than a request — and a silent acceptance would
+ * leave it believing the field had an effect.
  */
 export const sessionCreateRequestSchema = z.strictObject({
   /**
@@ -657,6 +722,26 @@ export const sessionCreateRequestSchema = z.strictObject({
    * §0.2.3), and an absent key is how this body says so.
    */
   target: selectedTargetSchema.optional(),
+
+  /**
+   * The dev-server URL the editor found answering, when it found one.
+   *
+   * A session is created "with a `projectRoot` and the project's dev-server
+   * URL (probed or launched)" (AAP §0.2.3). A dev server the service launched is
+   * known to the service already; one the developer started themselves is not,
+   * and the editor is what knows where it serves — its `debuggen.devServerUrl`
+   * setting, probed immediately before this request. So the editor forwards
+   * that URL here **only after its own probe got an answer**, and omits the key
+   * otherwise.
+   *
+   * Checked here for what a transport can check: an absolute `http:`/`https:`
+   * URL within {@link MAX_DEV_SERVER_URL_LENGTH} characters that embeds no user
+   * name or password. Whether it names this machine, whether it answers, and
+   * whether the process behind it carries the telemetry preload are the
+   * service's questions, answered by its own loopback probe before the value
+   * is recorded — a client's word is never stored unverified.
+   */
+  devServerUrl: devServerUrlSchema.optional(),
 });
 
 /** The validated `session.create` request body. */
@@ -668,9 +753,10 @@ export type SessionCreateRequest = z.infer<typeof sessionCreateRequestSchema>;
  *
  * The session is named in the route, and everything else the follow-up needs is
  * already stored — the prior understanding, the plan, the latest capture summary,
- * the latest analysis and panel. So the body is the one thing only the developer
- * can supply, bounded exactly as {@link sessionCreateRequestSchema}'s `question`
- * is, by the same constant, because it is the same kind of value.
+ * the latest analysis and panel. So the body is what only the asking client can
+ * supply: the question, bounded exactly as {@link sessionCreateRequestSchema}'s
+ * `question` is, by the same constant, because it is the same kind of value —
+ * and the identity of the attempt.
  *
  * What happens next is the service's decision and not this shape's: the
  * follow-up stage either re-derives an answer from the stored capture
@@ -679,6 +765,22 @@ export type SessionCreateRequest = z.infer<typeof sessionCreateRequestSchema>;
  * analysis and panel versions rather than overwriting the old (AAP §0.4.2). A
  * client learns which path was taken from the frames that follow, never from
  * this request.
+ *
+ * ## Idempotency: `attemptId`
+ *
+ * The request is keyed by `attemptId` (see `../session-record.ts`'s
+ * `followUpAttemptIdSchema`), never by its text (AAP §0.5.4):
+ *
+ * | `attemptId` names … | The service … |
+ * | --- | --- |
+ * | nothing it recorded (or is absent) | records a new follow-up with `attempt: 1` |
+ * | the session's latest follow-up, still unanswered | retries it **in place**: same entry, `attempt + 1`, this request's question and time |
+ * | an answered follow-up, or one a later follow-up followed | refuses with `409 SESSION_INVALID_STATE` and runs nothing |
+ *
+ * A client mints a fresh id (`newId(FOLLOW_UP_ATTEMPT_ID_PREFIX)`) for every
+ * new question and resends the same id to retry a failed one. When the key is
+ * absent the service mints one, so such a request can never be retried in
+ * place — it is always a new follow-up.
  */
 export const sessionQuestionRequestSchema = z.strictObject({
   /** The follow-up question, in the developer's own words. */
@@ -688,6 +790,16 @@ export const sessionQuestionRequestSchema = z.strictObject({
     .max(MAX_TEXT_LENGTH, {
       error: `expected a question of at most ${String(MAX_TEXT_LENGTH)} characters`,
     }),
+
+  /**
+   * The identity of this ask: fresh for a new question, the failed attempt's
+   * own for a Retry. The imported `followUpAttemptIdSchema` itself, so the id a
+   * request carries and the id the stored follow-up records are validated by
+   * one definition.
+   *
+   * **Optional, not nullable**: an absent key asks the service to mint one.
+   */
+  attemptId: followUpAttemptIdSchema.optional(),
 });
 
 /** The validated `session.question` request body. */
@@ -934,7 +1046,7 @@ export function parseSessionCreateRequest(
     value,
     sessionCreateRequestSchema,
     'Invalid session.create request',
-    'A session.create request body carries projectRoot, question and an optional target descriptor, and nothing else.',
+    'A session.create request body carries projectRoot, question, an optional target descriptor and an optional http(s) devServerUrl, and nothing else.',
   );
 }
 

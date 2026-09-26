@@ -1,29 +1,33 @@
 /**
- * Lumen Supply - the catalog segment's loading UI.
+ * Lumen Supply - the root segment's loading UI.
  *
- * Next.js renders this file in place of `{children}` while the route beside it resolves, and swaps
- * it for the page the moment that route's markup is ready. It sits in the `(catalog)` route group
- * next to `page.tsx`, so the Suspense boundary it declares covers the catalog at `/` and nothing
- * else - the group contributes no path segment, so the address is unchanged.
+ * Next.js wraps the root layout's `{children}` in a Suspense boundary whose fallback is this file,
+ * renders it while the requested route resolves, and swaps it for that route's markup the moment
+ * the markup is ready. Declared at the root, the boundary covers the catalog at `/` and every
+ * route beneath the root layout that declares no loading boundary of its own: the product detail,
+ * cart, checkout, orders and dashboard routes. None of them has a `loading.tsx`, so this is the
+ * state every one of them opens with while its page resolves; the dashboard additionally holds a
+ * `<Suspense>` of its own inside its page, around the part of it that waits.
  *
- * WHY THE BOUNDARY IS SCOPED TO THIS GROUP AND NOT DECLARED AT THE ROOT
- * A `loading.tsx` at the root would wrap every route beneath the root layout, and a route that has
- * to answer with a status code cannot be wrapped: Next.js marks a response 404 only when a
- * `notFound()` signal escapes the shell of the render, and any Suspense boundary between the shell
- * and the segment absorbs that signal first - so `/products/<unknown-slug>` answered the not-found
- * document with a 200 status line for as long as this file was the root's. Moving it into the group
- * that holds the catalog keeps the wait it exists to cover and leaves the product route - whose own
- * contract is a 404 for a slug no product owns - outside every boundary. The cart and checkout
- * routes render synchronously and never suspend, so they lose nothing by it; the dashboard
- * declares its own `<Suspense>` around the work that waits.
+ * THE PRODUCT ROUTE'S 404 IS DECIDED BEFORE THIS BOUNDARY IS REACHED
+ * Because this boundary also covers `/products/[slug]`, a `notFound()` that route raises while
+ * rendering arrives inside a stream whose status line has already been sent, so it can replace
+ * the markup but no longer the status. The 404 for a slug no product owns is therefore decided
+ * before rendering begins, by `proxy.ts` beside the `app/` directory, which looks the slug up and
+ * rewrites an address no product owns to the not-found route (a dotted address that names no
+ * public file is rewritten there by `next.config.ts` instead). This file stays as it is for every
+ * route: nothing here knows or needs to know which route is waiting.
  *
  * WHAT IT RESERVES, AND WHY THAT SHAPE
- * The catalog opens with a heading block and continues with a grid of product cards, so the
- * reservation is those two pieces: the head's two lines of type, then a grid of card-shaped
- * placeholders. Reserving the box the content will occupy - rather than centring a spinner in an
- * empty region - is what keeps the header, navigation and footer still while the swap happens, and
- * it is what makes the wait read as "this page is arriving" instead of "something is happening
- * somewhere".
+ * Every page of the storefront opens with the same heading block, and the address a visitor lands
+ * on - the catalog - continues with a grid of product cards, so the reservation is those two
+ * pieces: the head's two lines of type, then a grid of card-shaped placeholders. Reserving the box
+ * the content will occupy - rather than centring a spinner in an empty region - is what keeps the
+ * header, navigation and footer still while the swap happens, and it is what makes the wait read
+ * as "this page is arriving" instead of "something is happening somewhere". The grid is shaped
+ * after the catalog rather than after an average of every route because the catalog is where a
+ * visit begins; a route with less below its heading replaces the placeholders with less, which
+ * moves nothing above them.
  *
  * Twelve cards, not the catalog's full page of forty-eight: a dozen fills a desktop fold and a
  * little past it, which is as much as a reader can see while the wait lasts. Reserving the whole
@@ -96,10 +100,11 @@ const RESERVED_CARD_COUNT = 12;
 const BUSY_MESSAGE = 'Loading products';
 
 /**
- * Render the catalog's loading state.
+ * Render the root segment's loading state.
  *
- * Next.js passes no props to a `loading` file, so this takes none; it is a plain synchronous
- * function component whose output depends on nothing outside this module.
+ * Named for the catalog listing whose shape it reserves; it is the fallback for every route the
+ * root boundary covers. Next.js passes no props to a `loading` file, so this takes none; it is a
+ * plain synchronous function component whose output depends on nothing outside this module.
  *
  * The tree is three elements deep and each one is here for a stated reason:
  *

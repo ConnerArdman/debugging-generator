@@ -25,7 +25,7 @@
 # extension host bundle, main in package.json
 !dist/extension.js
 !dist/extension.js.map
-# embedded coordination service: bundle, ESM marker, prompts, store DDL
+# embedded coordination service: bundle (with the store DDL inlined), ESM marker, prompts
 !dist/service/**
 # Node preload plus its vendored dependency closure (dist/telemetry/node_modules)
 !dist/telemetry/**

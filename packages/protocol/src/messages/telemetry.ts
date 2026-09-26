@@ -46,8 +46,9 @@
  * runtime port to the MV3 service worker, which is what wraps them in a
  * protocol envelope and sends the `telemetry.event` frame. The agent bundle
  * never imports `@debuggen/protocol` (AAP §0.2.3) — which is exactly why this
- * payload is a bare `{ events }` and why the envelope, not the payload, carries
- * routing.
+ * payload is the batch plus two pieces of delivery context the worker copies
+ * from the bridge frame (`armedCaptureId`, `droppedCount`), and why the
+ * envelope, not the payload, carries routing.
  *
  * ## What this module does not own
  *
@@ -199,6 +200,28 @@ const EVENTS_MAX_EXPECTATION = `expected at most ${String(
 )} telemetry events in one batch`;
 
 /**
+ * The failure message of a malformed `droppedCount`.
+ *
+ * A count, so a whole number from zero; bounded to the safe-integer range so
+ * the service can sum reports without losing precision. One sentence for every
+ * way of missing it, for the same reason {@link IDENTIFIER_EXPECTATION} is one.
+ */
+const DROPPED_COUNT_EXPECTATION =
+  'expected droppedCount to be a whole number of events from 0 within the safe-integer range';
+
+/**
+ * How many events a producer discarded before delivery, as a count field.
+ *
+ * @returns An integer schema from `0` to `Number.MAX_SAFE_INTEGER`.
+ */
+function droppedCountSchema(): z.ZodInt {
+  return z
+    .int({ error: DROPPED_COUNT_EXPECTATION })
+    .min(0, { error: DROPPED_COUNT_EXPECTATION })
+    .max(Number.MAX_SAFE_INTEGER, { error: DROPPED_COUNT_EXPECTATION });
+}
+
+/**
  * The array schema shared by both payloads, over whichever event schema the
  * direction calls for.
  *
@@ -257,6 +280,25 @@ function eventBatchSchema<S extends z.ZodType>(element: S): z.ZodArray<S> {
  *    are attributed by the same code from the same evidence. A `sessionId` here
  *    would be a second, weaker path to the same field — present on one transport,
  *    absent on the other, authoritative on neither.
+ *
+ * **Two optional fields of delivery context — neither can attribute anything.**
+ * The service worker copies them from the page agent's bridge frame:
+ *
+ * - `armedCaptureId` — the capture the agent was armed for when it recorded the
+ *   batch. It is **refusal-only**: the service still resolves the session and
+ *   the open capture window from the tab's binding, and uses this value solely
+ *   to refuse a batch that names a *different* capture — a batch the agent
+ *   recorded for an earlier window that reached the service late (a queued
+ *   frame delivered after a reconnect, say). Naming the open capture adds no
+ *   authority over omitting the field; naming another one can only discard the
+ *   page's own batch. That asymmetry is what lets a page-originated value exist
+ *   here without reopening self-attribution, and it is what keeps capture A's
+ *   evidence out of capture B (`apps/local-service/src/telemetry/attribute.ts`).
+ * - `droppedCount` — how many events the producer discarded since the batch
+ *   that last reported a loss (the agent's in-memory buffer is bounded at
+ *   5 000 events while the bridge is away, AAP §0.5.5). Absent means none were
+ *   reported. The service accumulates it per capture so a capture summary can
+ *   say its evidence is incomplete instead of looking whole.
  */
 export const telemetryEventPayloadSchema = z.strictObject({
   /**
@@ -265,6 +307,15 @@ export const telemetryEventPayloadSchema = z.strictObject({
    * the transport boundary rather than reaching the store.
    */
   events: eventBatchSchema(telemetryEventIngressSchema),
+
+  /**
+   * The capture the producer was armed for when it recorded these events.
+   * Refusal-only context: never used to choose a session or a capture.
+   */
+  armedCaptureId: identifierSchema().optional(),
+
+  /** Events the producer discarded before delivery since its previous loss report. */
+  droppedCount: droppedCountSchema().optional(),
 });
 
 /**
@@ -327,12 +378,14 @@ export type TelemetryTailPayload = z.infer<typeof telemetryTailPayloadSchema>;
 
 /** The hint offered when an inbound producer batch fails validation. */
 const EVENT_HINT =
-  'A telemetry.event payload is exactly { events }: between 1 and ' +
+  'A telemetry.event payload is { events, armedCaptureId?, droppedCount? }: between 1 and ' +
   `${String(MAX_EVENTS_PER_BATCH)} producer events, each carrying an id and producerId, a 32-hex ` +
   'traceId, a 16-hex spanId, a kind and tier that agree, a name, a Unix epoch millisecond ' +
-  'startTime, a non-negative duration, a status, an attributes object and a zero-based seq. It ' +
-  'carries no sessionId: the envelope carries routing, and sessionId, captureId and ingestSeq are ' +
-  'assigned by the service at ingest and must not be sent by a producer.';
+  'startTime, a non-negative duration, a status, an attributes object and a zero-based seq; ' +
+  'optionally the identifier of the capture the producer was armed for, and a whole-number count ' +
+  'of events it discarded. It carries no sessionId: the envelope carries routing, and sessionId, ' +
+  'captureId and ingestSeq on an event are assigned by the service at ingest and must not be sent ' +
+  'by a producer.';
 
 /** The hint offered when an outbound live-tail frame fails validation. */
 const TAIL_HINT =

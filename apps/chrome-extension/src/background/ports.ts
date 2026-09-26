@@ -27,6 +27,44 @@
  * traffic in both directions (panel → worker RPCs, worker → bridge round
  * trips), fans pushes out per tab, and cleans up on disconnect.
  *
+ * ## One bridge per tab, one document per bridge
+ *
+ * Page-originated frames decide readiness and feed the capture, so the hub
+ * attributes each one to exactly one document before it is dispatched:
+ *
+ * - **Supersession retires.** When a bridge connects for a tab that already
+ *   has one (the tab navigated, or a document came back from the back/forward
+ *   cache), the previous bridge is retired *before* the new one is
+ *   registered: its pending round trips are rejected with a typed
+ *   `TRANSPORT_DISCONNECTED`, it leaves the registry and every index, its
+ *   listeners are detached and its port is disconnected, and it is reported
+ *   through `onBridgeDisconnected` with reason `superseded`. Nothing it posts
+ *   afterwards is routed, and its late `onDisconnect` cannot touch the
+ *   successor's index entry (index removal is keyed by connection id).
+ * - **Every frame is verified.** A frame is dispatched only while its
+ *   connection is the tab's current bridge. The first `agent.ready` on a
+ *   connection pins that connection's `documentId` and `producerId`; a later
+ *   `agent.ready` naming either differently is refused, while an identical
+ *   pair is a legitimate re-announce (after `bridge.ready`, or once React
+ *   appears) and passes with its refreshed URL and flags. Every other frame —
+ *   `telemetry.batch`, `target.described` (whether it answers a
+ *   {@link PortHub.requestFromBridge} round trip or not) and `agent.error` —
+ *   is dispatched only after the pin, and a batch only when it and every
+ *   event in it carry the pinned producer (and the batch the pinned
+ *   document). The bridge re-announces the document's last `agent.ready` as
+ *   the first frame of every new port, before the agent can drain its buffer,
+ *   and the agent answers `target.request` and reports arming, release and
+ *   event-delivery failures only once it is running, so none of these
+ *   routinely precedes the pin (see `../content/bridge.ts`). What can — a
+ *   transport diagnostic raised before the agent announced itself (a realm
+ *   with no CSPRNG, or an `agent.ready` too large to post) — names no
+ *   document, so it is withheld as unattributable; the page agent's
+ *   transport still counts it in its own statistics.
+ * - **Checked again after every wait.** A handler that awaits (the worker's
+ *   cold start, a registry read) can resume after its bridge was superseded,
+ *   so it re-asks {@link PortHub.isCurrentBridge} with its context before any
+ *   side effect; a frame whose document is no longer the tab's is dropped.
+ *
  * ## What it deliberately does not do
  *
  * - **No I/O of its own.** No `fetch`, no `WebSocket`, no `chrome.alarms`, no
@@ -42,7 +80,8 @@
  *   came (the envelope wrap and the `MAX_EVENTS_PER_BATCH` chunking are
  *   `ws-bridge.ts`'s), readiness is `agent-control.ts`'s decision, and whether
  *   a panel disconnect warrants `session.unbind` is `tab-registry.ts`'s. This
- *   module attaches attribution (tab, connection, document) and routes.
+ *   module attaches attribution (tab, connection, document), withholds a
+ *   frame whose attribution does not hold (see above), and routes.
  * - **No import-time side effect.** The factory registers nothing:
  *   `service-worker.ts` calls `chrome.runtime.onConnect.addListener(
  *   hub.handleConnect)`. All state lives inside the factory closure, so two
@@ -105,7 +144,9 @@ import type {
   DevtoolsUpstreamPayloads,
   DevtoolsUpstreamType,
   ExtensionPortName,
+  PageAgentReadyPayload,
   PageTargetDescribedPayload,
+  PageTelemetryBatchPayload,
   PanelConnectionState,
   PortConnectionPush,
   PortFailureResponse,
@@ -262,11 +303,12 @@ export type ChromeRuntimeSatisfiesPortHubRuntime = AssertTrue<
  * - `connectionId` — the panel connection that asked. A panel port does not
  *   know its inspected tab at connect time (its `sender` never names the
  *   inspected tab — a DevTools panel has no tab at all, and a panel page
- *   opened directly in a tab names only its own — and no panel request
- *   payload carries one), so a handler that learns the tab —
- *   for example the `session.snapshot` handler, from the tab bound to the
- *   named session — calls {@link PortHub.bindPanelTab} with this id.
- * - `tabId` — the tab this panel is bound to, when it is.
+ *   opened directly in a tab names only its own), so a handler that learns
+ *   the tab from a trusted source — the `session.snapshot` handler, from the
+ *   `inspectedTabId` the panel document names or the DevTools page that
+ *   announced it — calls {@link PortHub.bindPanelTab} with this id.
+ * - `tabId` — the tab this panel is bound to, when it is. Once set it never
+ *   changes for the life of the connection.
  * - `signal` — aborted when the request times out or the panel disconnects,
  *   with the typed `DebuggenError` as its `reason`; pass it to any
  *   cancellable work (an `HttpClient` call) so abandoned work stops.
@@ -308,13 +350,19 @@ export type PortRequestHandlers = {
 /**
  * What a bridge frame handler is told besides the payload. Attribution comes
  * from the bridge port's `sender`, never from the page-originated payload.
+ *
+ * A handler is only ever called for the tab's current bridge, and only after
+ * that connection's `agent.ready` pinned its document (for `agent.ready`
+ * itself, by that very frame) — so `documentId` is always set. That holds when
+ * the handler is called, not after it awaits: a handler that awaits passes this
+ * context to {@link PortHub.isCurrentBridge} before acting.
  */
 export interface BridgeMessageContext {
   /** The bridge connection the frame arrived on. */
   readonly connectionId: WorkerConnectionId;
   /** The tab the bridge runs in, from the port's `sender.tab.id`. */
   readonly tabId: TabId;
-  /** The page agent's per-document id, once its `agent.ready` has arrived. */
+  /** The page agent's per-document id, pinned by the connection's first `agent.ready`. */
   readonly documentId: BridgeConnection['documentId'];
 }
 
@@ -382,8 +430,17 @@ export type DevtoolsMessageHandlers = {
  * - `disposed` — the worker itself tore the connection down through
  *   {@link PortHub.disposeAll} (tests, credential rotation). Never a signal
  *   that DevTools closed.
+ * - `superseded` — a content-script bridge was retired because a newer bridge
+ *   connected for the same tab (the tab navigated, or its document was
+ *   restored from the back/forward cache). Only bridge connections close for
+ *   this reason; the worker disconnects the retired port itself.
  */
-export const PORT_CLOSE_REASONS = ['remote-disconnect', 'send-failed', 'disposed'] as const;
+export const PORT_CLOSE_REASONS = [
+  'remote-disconnect',
+  'send-failed',
+  'disposed',
+  'superseded',
+] as const;
 
 /** One of {@link PORT_CLOSE_REASONS}. */
 export type PortCloseReason = (typeof PORT_CLOSE_REASONS)[number];
@@ -414,7 +471,11 @@ export interface PortHubEvents {
   readonly onPanelDisconnected?: HubCallback<PortClosedEvent<PanelConnection>> | undefined;
   /** A devtools-page connection left the registry. */
   readonly onDevtoolsDisconnected?: HubCallback<PortClosedEvent<DevtoolsConnection>> | undefined;
-  /** A content-script bridge connection left the registry. */
+  /**
+   * A content-script bridge connection left the registry — including a bridge
+   * retired with reason `superseded`, which is reported before its successor's
+   * `onConnected`.
+   */
   readonly onBridgeDisconnected?: HubCallback<PortClosedEvent<BridgeConnection>> | undefined;
 }
 
@@ -491,10 +552,18 @@ export interface PortHub {
 
   /**
    * Late-bind a panel connection to its inspected tab, so it starts receiving
-   * that tab's pushes. Rebinding to another tab moves it.
+   * that tab's pushes and its requests are scoped to that tab.
    *
-   * @returns `false` when no panel connection has that id (it is gone, or is
-   * not a panel) or the tab id is not a tab.
+   * The inspected tab is the connection's identity and is **immutable once
+   * set**: binding an unbound panel associates it, binding it to the same tab
+   * again is a no-op, and binding it to a different tab changes nothing. A
+   * panel port lives inside one DevTools window, which inspects one tab; a
+   * caller that believes otherwise is holding stale evidence (a session that
+   * has since been bound elsewhere), not a reason to move the panel.
+   *
+   * @returns `true` when the panel is (now, or already) bound to `tabId`;
+   * `false` when no panel connection has that id (it is gone, or is not a
+   * panel), the tab id is not a tab, or the panel is bound to another tab.
    */
   readonly bindPanelTab: (connectionId: WorkerConnectionId, tabId: TabId) => boolean;
 
@@ -534,6 +603,8 @@ export interface PortHub {
 
   /**
    * Send one frame to the content-script bridge of one tab — a `BridgeSend`.
+   * Only the tab's current bridge is addressed; a superseded one has already
+   * been retired.
    *
    * @returns `false` when no bridge is attached for that tab (page not loaded,
    * mid-navigation, or not a local app origin) or its port turned out dead —
@@ -548,7 +619,10 @@ export interface PortHub {
    *
    * Rejects with a typed `DebuggenError` — `AGENT_NOT_READY` when no bridge is
    * attached or the agent does not answer in time, `TRANSPORT_DISCONNECTED`
-   * when the bridge disconnects first — so no promise outlives its port.
+   * when the bridge disconnects first or is superseded by a newer bridge for
+   * the tab — so no promise outlives its port, and no answer from a retired
+   * document, nor one sent before the connection's `agent.ready` pinned its
+   * document, can settle it.
    */
   readonly requestFromBridge: (
     tabId: TabId,
@@ -565,6 +639,22 @@ export interface PortHub {
 
   /** Whether a content-script bridge is attached for a tab. */
   readonly hasBridge: (tabId: TabId) => boolean;
+
+  /**
+   * Whether a bridge frame's attribution still holds: its connection is still
+   * registered, is still its tab's current bridge, and its pinned document is
+   * still the one the context names.
+   *
+   * The hub checks this before it dispatches a frame; a handler that awaits
+   * anything (the worker's cold start, a registry read) calls it again with
+   * the context it was handed, after the wait and before each side effect, so
+   * a frame received before its bridge was superseded — or before its
+   * connection was closed — cannot act for the document that replaced it.
+   *
+   * @returns `false` for a closed, superseded or unpinned connection, or one
+   * whose pinned document differs from `context.documentId`.
+   */
+  readonly isCurrentBridge: (context: BridgeMessageContext) => boolean;
 
   /** The current descriptor of one connection, when it is still registered. */
   readonly getConnection: (connectionId: WorkerConnectionId) => WorkerConnection | undefined;
@@ -651,8 +741,10 @@ function parseUrl(value: string): URL | undefined {
 /**
  * Whether a serialized origin is a local app origin the manifest's host
  * permissions cover: `http:` on `localhost` or `127.0.0.1`, any port.
+ * Exported so `service-worker.ts` offers a page reload only where the
+ * statically declared content scripts — and so the page agent — can run.
  */
-function isLocalAppOrigin(origin: string): boolean {
+export function isLocalAppOrigin(origin: string): boolean {
   const parsed = parseUrl(origin);
   return (
     parsed !== undefined &&
@@ -799,6 +891,31 @@ interface PendingPanelRequest {
   readonly cancel: (reason: DebuggenError) => void;
 }
 
+/**
+ * The page document a bridge connection serves, pinned by the first
+ * `agent.ready` that travelled up it. Hub-private: `BridgeConnection` carries
+ * the `documentId` (and URL) handlers read, while the `producerId` that every
+ * telemetry event must carry is only needed here, to verify frames.
+ */
+interface BridgeIdentity {
+  /** The agent's per-document id. */
+  readonly documentId: PageAgentReadyPayload['documentId'];
+  /** The agent's per-document producer id, stamped on every event. */
+  readonly producerId: PageAgentReadyPayload['producerId'];
+}
+
+/** Why a validated bridge frame was withheld from its handler, for the debug log. */
+type BridgeFrameRefusal =
+  | 'not-current-bridge'
+  | 'document-changed'
+  | 'producer-changed'
+  | 'batch-before-ready'
+  | 'batch-foreign-document'
+  | 'batch-foreign-producer'
+  | 'event-foreign-producer'
+  | 'described-before-ready'
+  | 'error-before-ready';
+
 /** A worker → bridge round trip awaiting its correlated answer. */
 interface PendingBridgeRequest {
   /** The bridge connection the request was sent on; only it may answer. */
@@ -858,6 +975,8 @@ export function createPortHub(deps: PortHubDeps): PortHub {
   const panelRequests = new Map<WorkerConnectionId, Map<PortRequestId, PendingPanelRequest>>();
   /** Worker → bridge round trips awaiting an answer, by request id. */
   const bridgeRequests = new Map<PortRequestId, PendingBridgeRequest>();
+  /** Bridge connection → the document its first `agent.ready` pinned. */
+  const bridgeIdentities = new Map<WorkerConnectionId, BridgeIdentity>();
 
   /** The last connection sequence number minted by this hub. */
   let connectionSequence = 0;
@@ -1009,9 +1128,12 @@ export function createPortHub(deps: PortHubDeps): PortHub {
   }
 
   /**
-   * Remove a connection from the registry and every index, settle everything
-   * pending on it with a typed error, detach its listeners, and report it.
-   * Idempotent: a second call for the same id does nothing.
+   * Remove a connection from the registry and every index, forget a bridge's
+   * pinned document, settle everything pending on it with a typed error,
+   * detach its listeners, disconnect its port (unless the other end already
+   * went away), and report it. Idempotent: a second call for the same id does
+   * nothing — which is what makes a retired bridge's late `onDisconnect`
+   * harmless.
    */
   function closeConnection(
     connectionId: WorkerConnectionId,
@@ -1024,6 +1146,7 @@ export function createPortHub(deps: PortHubDeps): PortHub {
     }
     connections.delete(connectionId);
     unindexConnection(connection);
+    bridgeIdentities.delete(connectionId);
     detachers.get(connectionId)?.();
     detachers.delete(connectionId);
 
@@ -1043,10 +1166,19 @@ export function createPortHub(deps: PortHubDeps): PortHub {
       if (pending.connectionId === connectionId) {
         bridgeRequests.delete(requestId);
         pending.reject(
-          workerError(
-            'TRANSPORT_DISCONNECTED',
-            'The page bridge disconnected before the page agent answered.',
-          ),
+          reason === 'superseded'
+            ? workerError(
+                'TRANSPORT_DISCONNECTED',
+                'A newer page bridge replaced this one before the page agent answered.',
+                {
+                  hint: 'The page navigated or reloaded; try again on the current page.',
+                  details: { reason },
+                },
+              )
+            : workerError(
+                'TRANSPORT_DISCONNECTED',
+                'The page bridge disconnected before the page agent answered.',
+              ),
         );
       }
     }
@@ -1245,10 +1377,13 @@ export function createPortHub(deps: PortHubDeps): PortHub {
         }
         const previous = bridgeByTab.get(verdict.tabId);
         if (previous !== undefined) {
+          // Retire the old document's bridge before the new one is indexed,
+          // so no frame, answer or send can reach the wrong document.
           log.debug('a new bridge supersedes the previous one for its tab', {
             tabId: verdict.tabId,
             previous,
           });
+          closeConnection(previous, 'superseded', false);
         }
         register({
           role: PORT_CONTENT_BRIDGE,
@@ -1374,6 +1509,12 @@ export function createPortHub(deps: PortHubDeps): PortHub {
     }
     if (isPortRequestOfMethod(request, 'session.snapshot')) {
       serve(connection, request, handlers['session.snapshot']);
+      return;
+    }
+    if (isPortRequestOfMethod(request, 'page.reload')) {
+      // The developer's consent to reload the inspected tab; the handler, not
+      // the hub, decides which tab that is and whether a reload is offered.
+      serve(connection, request, handlers['page.reload']);
       return;
     }
     assertNever(request, 'An unhandled panel request kind reached the port hub.');
@@ -1548,11 +1689,81 @@ export function createPortHub(deps: PortHubDeps): PortHub {
   }
 
   /**
+   * Log a validated bridge frame that is withheld from its handler: ids, the
+   * frame type, the reason and counts only — never the payload, which is page
+   * data.
+   */
+  function withholdBridgeFrame(
+    connection: BridgeConnection,
+    type: AgentOutboundType,
+    reason: BridgeFrameRefusal,
+    counts: Readonly<Record<string, number>> = {},
+  ): void {
+    log.debug('withheld a bridge frame', {
+      connectionId: connection.connectionId,
+      tabId: connection.tabId,
+      type,
+      reason,
+      ...counts,
+    });
+  }
+
+  /**
+   * Why an `agent.ready` may not stand for its connection, or `undefined` when
+   * it is the connection's first (it will pin the document) or restates the
+   * pinned `documentId` and `producerId` exactly. A document's two ids are
+   * memoized for its lifetime by the agent, so a change on one connection is
+   * never the same document speaking again.
+   */
+  function readyRefusal(
+    connection: BridgeConnection,
+    payload: PageAgentReadyPayload,
+  ): BridgeFrameRefusal | undefined {
+    const pinned = bridgeIdentities.get(connection.connectionId);
+    if (pinned === undefined) {
+      return undefined;
+    }
+    if (payload.documentId !== pinned.documentId) {
+      return 'document-changed';
+    }
+    return payload.producerId === pinned.producerId ? undefined : 'producer-changed';
+  }
+
+  /**
+   * Why a `telemetry.batch` may not be forwarded, or `undefined` when its
+   * connection's document is pinned and the batch — and every event in it —
+   * carries that document's producer (and the batch that document's id).
+   *
+   * The shared guard checks only that each event is a record; the producer
+   * check here also refuses an event without a `producerId`, which the
+   * service would refuse anyway.
+   */
+  function batchRefusal(
+    connection: BridgeConnection,
+    payload: PageTelemetryBatchPayload,
+  ): BridgeFrameRefusal | undefined {
+    const pinned = bridgeIdentities.get(connection.connectionId);
+    if (pinned === undefined) {
+      return 'batch-before-ready';
+    }
+    if (payload.documentId !== pinned.documentId) {
+      return 'batch-foreign-document';
+    }
+    if (payload.producerId !== pinned.producerId) {
+      return 'batch-foreign-producer';
+    }
+    return payload.events.every((event) => event.producerId === pinned.producerId)
+      ? undefined
+      : 'event-foreign-producer';
+  }
+
+  /**
    * Handle one frame from a content-script bridge: validate it with the shared
-   * guard (the data is page-originated), narrow it per type, and delegate. The
-   * payload is forwarded exactly as it came — no batching, no concatenation,
-   * no re-capping — so `ws-bridge.ts` applies the protocol's bounds to what
-   * the agent actually sent, promptly.
+   * guard (the data is page-originated), confirm it came from its tab's
+   * current bridge, narrow it per type, and delegate. The payload is forwarded
+   * exactly as it came — no batching, no concatenation, no re-capping — so
+   * `ws-bridge.ts` applies the protocol's bounds to what the agent actually
+   * sent, promptly.
    */
   function receiveBridgeFrame(connection: BridgeConnection, message: unknown): void {
     if (!isBridgeUpstreamMessage(message)) {
@@ -1562,30 +1773,60 @@ export function createPortHub(deps: PortHubDeps): PortHub {
       });
       return;
     }
+    if (bridgeByTab.get(connection.tabId) !== connection.connectionId) {
+      // A superseded bridge leaves the registry, so `receive` already drops
+      // its frames; this holds the rule for any connection that is registered
+      // without being its tab's current bridge.
+      withholdBridgeFrame(connection, message.type, 'not-current-bridge');
+      return;
+    }
     dispatchBridgeFrame(connection, message);
   }
 
-  /** Delegate a validated bridge frame to the handler for its type. */
+  /**
+   * Delegate a validated frame of the tab's current bridge to the handler for
+   * its type, after the per-document checks: `agent.ready` pins (or must
+   * restate) the connection's document, `telemetry.batch` must belong to that
+   * pinned document and producer, and `target.described` and `agent.error`
+   * need the pin — a frame that no document of this connection has announced
+   * cannot be attributed to one, so it neither settles a round trip nor
+   * reaches a handler.
+   */
   function dispatchBridgeFrame(connection: BridgeConnection, message: BridgeUpstreamMessage): void {
     if (isBridgeMessageOfKind(message, 'agent.ready')) {
-      // Record the document the bridge now serves, so later frames and the
-      // readiness decision are attributed to the current document. The URL
-      // is held in memory only (query-redacted by the agent) and never logged.
+      const { payload } = message;
+      const refusal = readyRefusal(connection, payload);
+      if (refusal !== undefined) {
+        withholdBridgeFrame(connection, message.type, refusal);
+        return;
+      }
+      if (!bridgeIdentities.has(connection.connectionId)) {
+        bridgeIdentities.set(connection.connectionId, {
+          documentId: payload.documentId,
+          producerId: payload.producerId,
+        });
+      }
+      // Record the document the bridge serves, so later frames and the
+      // readiness decision are attributed to it. The URL is refreshed on a
+      // re-announce (a same-document navigation changes it), held in memory
+      // only (query-redacted by the agent) and never logged.
       const updated: BridgeConnection = {
         ...connection,
-        documentId: message.payload.documentId,
-        url: message.payload.url,
+        documentId: payload.documentId,
+        url: payload.url,
       };
       replaceConnection(connection, updated);
-      invokeSafely(
-        'agent.ready',
-        bridgeHandlers['agent.ready'],
-        message.payload,
-        bridgeContext(updated),
-      );
+      invokeSafely('agent.ready', bridgeHandlers['agent.ready'], payload, bridgeContext(updated));
       return;
     }
     if (isBridgeMessageOfKind(message, 'telemetry.batch')) {
+      const refusal = batchRefusal(connection, message.payload);
+      if (refusal !== undefined) {
+        withholdBridgeFrame(connection, message.type, refusal, {
+          events: message.payload.events.length,
+        });
+        return;
+      }
       invokeSafely(
         'telemetry.batch',
         bridgeHandlers['telemetry.batch'],
@@ -1595,6 +1836,12 @@ export function createPortHub(deps: PortHubDeps): PortHub {
       return;
     }
     if (isBridgeMessageOfKind(message, 'target.described')) {
+      if (!bridgeIdentities.has(connection.connectionId)) {
+        // An answer before the pin settles nothing either: the round trip
+        // waits for an attributable answer, or times out as "agent not ready".
+        withholdBridgeFrame(connection, message.type, 'described-before-ready');
+        return;
+      }
       if (settleBridgeRequest(connection, message.payload)) {
         return;
       }
@@ -1607,6 +1854,10 @@ export function createPortHub(deps: PortHubDeps): PortHub {
       return;
     }
     if (isBridgeMessageOfKind(message, 'agent.error')) {
+      if (!bridgeIdentities.has(connection.connectionId)) {
+        withholdBridgeFrame(connection, message.type, 'error-before-ready');
+        return;
+      }
       invokeSafely(
         'agent.error',
         bridgeHandlers['agent.error'],
@@ -1721,6 +1972,20 @@ export function createPortHub(deps: PortHubDeps): PortHub {
 
   const hasBridge = (tabId: TabId): boolean => bridgeByTab.has(tabId);
 
+  const isCurrentBridge = (context: BridgeMessageContext): boolean => {
+    const connection = connections.get(context.connectionId);
+    if (
+      connection === undefined ||
+      connection.role !== PORT_CONTENT_BRIDGE ||
+      connection.tabId !== context.tabId ||
+      bridgeByTab.get(connection.tabId) !== connection.connectionId
+    ) {
+      return false;
+    }
+    const pinned = bridgeIdentities.get(connection.connectionId);
+    return pinned !== undefined && pinned.documentId === context.documentId;
+  };
+
   // -------------------------------------------------------------------------
   // Devtools-page traffic
   // -------------------------------------------------------------------------
@@ -1806,11 +2071,23 @@ export function createPortHub(deps: PortHubDeps): PortHub {
     if (connection === undefined || connection.role !== PORT_PANEL) {
       return false;
     }
-    if (connection.tabId !== tabId) {
-      const updated: PanelConnection = { ...connection, tabId };
-      replaceConnection(connection, updated);
-      log.debug('panel bound to its inspected tab', { connectionId, tabId });
+    if (connection.tabId === tabId) {
+      return true;
     }
+    if (connection.tabId !== undefined) {
+      // A panel document inspects one tab for its whole life, so its first
+      // association is its identity: moving it would hand it another tab's
+      // pushes and scope its requests to another tab's session.
+      log.warn('refused to move a panel to another tab', {
+        connectionId,
+        tabId: connection.tabId,
+        refusedTabId: tabId,
+      });
+      return false;
+    }
+    const updated: PanelConnection = { ...connection, tabId };
+    replaceConnection(connection, updated);
+    log.debug('panel bound to its inspected tab', { connectionId, tabId });
     return true;
   };
 
@@ -1957,6 +2234,7 @@ export function createPortHub(deps: PortHubDeps): PortHub {
     panelRequests.clear();
     panelsByTab.clear();
     bridgeByTab.clear();
+    bridgeIdentities.clear();
     devtoolsByTab.clear();
     detachers.clear();
     connections.clear();
@@ -1972,6 +2250,7 @@ export function createPortHub(deps: PortHubDeps): PortHub {
     requestFromBridge,
     sendToDevtools,
     hasBridge,
+    isCurrentBridge,
     getConnection,
     listConnections,
     disposeAll,

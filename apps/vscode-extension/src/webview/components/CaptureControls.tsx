@@ -32,8 +32,9 @@
  *                action is possible and no capture is running). An enabled-looking control that
  *                could not do anything is never rendered.
  *   controls     the "Start capture" and "Stop capture" buttons, the capture state region and,
- *                while the session is armed but not yet capturing, the "Reproduce the issue now."
- *                prompt.
+ *                while the session is armed but not yet capturing, the arming prompt: "Reproduce
+ *                the issue now." for the first capture, and "Reproduce the issue again." when a
+ *                follow-up question asked for new evidence (`followUpCapture`, AAP 0.4.2).
  *
  * ## Accessibility
  *
@@ -105,6 +106,13 @@ export interface CaptureControlsProps {
    */
   armed?: boolean | undefined;
 
+  /**
+   * Whether the armed capture was requested by a follow-up question that needs new evidence
+   * (AAP 0.4.2's new-capture path). The arming prompt then reads "Reproduce the issue again."
+   * rather than "Reproduce the issue now."; it has no effect while the prompt is not shown.
+   */
+  followUpCapture?: boolean | undefined;
+
   /** A start or stop request is in flight. Replaces the controls with a busy placeholder. */
   pending?: boolean | undefined;
 
@@ -155,10 +163,16 @@ const ARMED_LABEL = 'Ready to capture';
 const IDLE_LABEL = 'Not capturing';
 
 /**
- * The arming prompt (AAP 0.7.3). Product copy about the pipeline state; `ProgressSteps` shows the
- * same sentence as the progress list's call to action.
+ * The arming prompt for the first capture (AAP 0.7.3). Product copy about the pipeline state;
+ * `ProgressSteps` shows the same sentence as the progress list's call to action.
  */
 const ARMED_PROMPT = 'Reproduce the issue now.';
+
+/**
+ * The arming prompt for the capture a follow-up question asked for (AAP 0.4.2's new-capture
+ * path). `ProgressSteps` shows the same sentence in that case.
+ */
+const FOLLOW_UP_ARMED_PROMPT = 'Reproduce the issue again.';
 
 /** The copy of the unavailable state - generic product vocabulary only (AAP 0.5.4). */
 const UNAVAILABLE_MESSAGE = 'Capture becomes available once instrumentation is ready.';
@@ -255,6 +269,7 @@ export function CaptureControls(props: CaptureControlsProps): ReactElement {
     onStart,
     onStop,
     armed = false,
+    followUpCapture = false,
     error,
     onRetry,
     className,
@@ -388,7 +403,7 @@ export function CaptureControls(props: CaptureControlsProps): ReactElement {
       </Text>
       {showPrompt ? (
         <Text as="p" size="sm" weight="medium">
-          {ARMED_PROMPT}
+          {followUpCapture ? FOLLOW_UP_ARMED_PROMPT : ARMED_PROMPT}
         </Text>
       ) : null}
     </div>

@@ -240,30 +240,33 @@
  * the only thing any `style` attribute here contains:
  *
  *   --dgc-columns         the grid track template, consumed by each row as
- *                         `grid-template-columns: var(--dgc-columns, minmax(0, 1fr))`. The header
- *                         row and each data row are SEPARATE grid containers - a positioned row
- *                         cannot share a parent's tracks - so a track only lines a header up with
- *                         its column if it resolves to the same width in every row; see
+ *                         `grid-template-columns: var(--dgc-columns, …)`. Every track is one of
+ *                         {@link DATA_TABLE_COLUMN_TRACKS}, built from `--dg-column-min-*` and
+ *                         `--dg-column-share-*` tokens only. The header row and each data row are
+ *                         SEPARATE grid containers - a positioned row cannot share a parent's
+ *                         tracks - so a track only lines a header up with its column because every
+ *                         role track resolves to the same width in every row; see
  *                         {@link DataTableColumn.width}.
- *   --dgc-min-inline      the sum of the tracks' MINIMUMS (`calc(22ch + 9ch + …)`), and
+ *   --dgc-min-inline      the sum of the tracks' MINIMUMS
+ *                         (`calc(var(--dg-column-min-name) + var(--dg-column-min-quantity) + …)`),
+ *                         and
  *   --dgc-column-count    the number of tracks, which together give the grid its floor:
  *                         `min-inline-size: max(100%, <minimums> + <gaps> + <row edge>)`. A table
  *                         narrower than that floor keeps every column at its readable minimum and
  *                         SCROLLS HORIZONTALLY inside its viewport, instead of squeezing tracks to
- *                         nothing and painting one cell's content over the next. See
- *                         {@link resolveTrackMinimum} for which tracks contribute a minimum.
+ *                         nothing and painting one cell's content over the next.
  *   --dgc-virtual-total   the canvas height as a UNITLESS number, consumed as
- *                         `block-size: calc(var(--dgc-virtual-total, 0) * 1px)`
+ *                         `min-block-size: calc(var(--dgc-virtual-total, 0) * var(--dg-pixel-unit))`
  *   --dgc-virtual-start   a row's offset as a UNITLESS number, consumed as
- *                         `inset-block-start: calc(var(--dgc-virtual-start, 0) * 1px)`. An inset,
- *                         not a transform: a transformed ancestor is the containing block of every
- *                         fixed-position descendant, and it would trap the `./Tooltip` bubbles of
- *                         a positioned row inside the scroll container they must escape.
+ *                         `inset-block-start: calc(var(--dgc-virtual-start, 0) * var(--dg-pixel-unit))`.
+ *                         An inset, not a transform: a transformed ancestor is the containing block
+ *                         of every fixed-position descendant, and it would trap the `./Tooltip`
+ *                         bubbles of a positioned row inside the scroll container they must escape.
  *   --dgc-align           a cell's alignment keyword, consumed as `text-align: var(--dgc-align, start)`
  *
- * The two virtualization properties are unitless on purpose: a bare number is the same kind of
- * value as the unitless SVG geometry base.css permits, and it keeps every length unit in the
- * stylesheet where the token system can see it.
+ * The two virtualization properties are unitless on purpose: they are numbers the virtualizer
+ * measured in CSS pixels, not design values, and the stylesheet gives them their unit through the
+ * `--dg-pixel-unit` token, so no length unit is written anywhere outside the token table.
  *
  * A newly expanded row is scrolled into view once its detail row has rendered: the detail opens
  * BELOW the row inside a viewport capped at a fixed height, so without it a toggle on one of the
@@ -284,7 +287,7 @@
  *
  * ## Building on this
  *
- * A table component supplies `columns` (key, header, alignment, optional grid track, cell
+ * A table component supplies `columns` (key, header, alignment, optional width role, cell
  * renderer), `rows` exactly as the data source ordered them (or as the caller itself arranged
  * them, under the disclosure rule above), `rowKey`, a `caption`, the controlled
  * `sort` plus `onSortChange`, and - when rows have detail - `expandedRowKeys`, `onRowToggle` and
@@ -308,9 +311,91 @@ import type {
   ReactNode,
 } from 'react';
 
+import { cssVar } from '../tokens/tokens';
+import type { TokenKey } from '../tokens/tokens';
 import { Button } from './Button';
 import { EmptyState } from './EmptyState';
 import { Text } from './Text';
+
+/**
+ * The semantic width ROLE a column is sized by - what kind of content it holds, never how wide it
+ * is in some unit a caller picked.
+ *
+ *   ordinal    a short position number: an event sequence number, a plan version. A FIXED track:
+ *              the column takes its floor and no spare width, so the figures it holds never drift
+ *   count      an integer tally, with room for a compact badge beside it
+ *   quantity   a formatted measurement with its unit: a duration, a time, an offset, a byte size
+ *   status     a short status word or badge, a tier, or one compact action control
+ *   label      a short categorical label: a kind chip, an attribute key, a system or hook name
+ *   name       an identifier: a component, operation or file name, a source-location chip
+ *   text       long free text that truncates: a statement, a URL, a value preview, a caller list
+ *   standard   the role of a column declared with none: room for a short label or a figure
+ *
+ * Each role resolves, through {@link DATA_TABLE_COLUMN_TRACKS}, to a grid track built from the
+ * `--dg-column-min-*` floor and the `--dg-column-share-*` spare-width share the token table
+ * declares for it (`../tokens/tokens.ts`). That is what makes column geometry a design-system
+ * decision rather than a per-component one: both extension surfaces and every visualization table
+ * agree on how wide a duration or a path column is, and one token edit re-densifies all of them.
+ */
+export type DataTableColumnWidth =
+  'ordinal' | 'count' | 'quantity' | 'status' | 'label' | 'name' | 'text' | 'standard';
+
+/**
+ * The grid geometry one {@link DataTableColumnWidth} role resolves to.
+ */
+export interface DataTableColumnTrack {
+  /**
+   * The CSS grid track the column takes in every row: `minmax(<floor>, <share>)`, or the bare
+   * floor for a fixed role. Token references only - it carries no number of its own.
+   */
+  readonly track: string;
+
+  /**
+   * The track's guaranteed MINIMUM, a `var(--dg-column-min-*)` reference. The table sums every
+   * column's minimum into its own floor (`--dgc-min-inline`), which is what makes a surface
+   * narrower than the columns need scroll horizontally instead of squeezing a column to nothing.
+   */
+  readonly minimum: string;
+}
+
+/**
+ * One role's track, built from its floor token and, for a role that shares spare width, its share
+ * token.
+ *
+ * @param minimum The `columnMin*` token that is the role's readable floor.
+ * @param share The `columnShare*` token that is its share of spare width, or `undefined` for a
+ *   fixed role that takes its floor and nothing more.
+ * @returns The role's track and minimum, as token references.
+ */
+function roleTrack(minimum: TokenKey, share: TokenKey | undefined): DataTableColumnTrack {
+  const floor = cssVar(minimum);
+
+  return {
+    track: share === undefined ? floor : `minmax(${floor}, ${cssVar(share)})`,
+    minimum: floor,
+  };
+}
+
+/**
+ * Every column width role and the token-built grid track it resolves to - the single table of
+ * column geometry in the product.
+ *
+ * Figures (counts, quantities, statuses) take the compact share of spare width, labels and unsized
+ * columns an equal part, names twice that and free text the most, so a wide panel spends its room
+ * where content is longest while a narrow dock keeps every column at its readable floor and scrolls.
+ */
+export const DATA_TABLE_COLUMN_TRACKS: Readonly<
+  Record<DataTableColumnWidth, DataTableColumnTrack>
+> = {
+  ordinal: roleTrack('columnMinOrdinal', undefined),
+  count: roleTrack('columnMinCount', 'columnShareCompact'),
+  quantity: roleTrack('columnMinQuantity', 'columnShareCompact'),
+  status: roleTrack('columnMinStatus', 'columnShareCompact'),
+  label: roleTrack('columnMinLabel', 'columnShareDefault'),
+  name: roleTrack('columnMinName', 'columnShareWide'),
+  text: roleTrack('columnMinText', 'columnShareWidest'),
+  standard: roleTrack('columnMinStandard', 'columnShareDefault'),
+};
 
 /**
  * The two directions a column can be ordered in.
@@ -428,33 +513,24 @@ export interface DataTableColumn<Row> {
   align?: 'start' | 'center' | 'end' | undefined;
 
   /**
-   * The column's CSS **grid track**, joined with its siblings into `--dgc-columns`.
+   * The column's semantic width ROLE (see {@link DataTableColumnWidth}), which the table resolves
+   * through {@link DATA_TABLE_COLUMN_TRACKS} to a token-built grid track and joins with its
+   * siblings into `--dgc-columns`. Omitted, the column takes the `standard` role: an equal share
+   * of the free space that never drops below the `--dg-column-min-standard` floor.
    *
-   * Relational and intrinsic forms only - `minmax(12ch, 2fr)`, `9ch`, `2fr`, `max-content`,
-   * `fit-content(30ch)`, `auto`, a `var(--dg-space-*)`-based length, a `ch` measure tied to the
-   * content. A literal `px` or `rem` track is a hardcoded value and AAP 0.6.4 forbids it; review
-   * rejects one. Omitted, the column takes {@link DEFAULT_COLUMN_TRACK}, `minmax(10ch, 1fr)`: an
-   * equal share of the free space that never drops below a readable minimum.
+   * A role, never a CSS value: a column cannot state `minmax(12ch, 2fr)` or `9ch`, because a
+   * number chosen here would be a visual value outside the token table (AAP 0.6.4). Choose the role
+   * by the column's CONTENT - the smallest role whose floor keeps that content readable - and the
+   * design system decides how wide that is, identically on every surface.
    *
-   * GIVE EVERY COLUMN A NON-ZERO MINIMUM - `minmax(<n>ch, <m>fr)` for a column that should share
-   * spare width, a bare `<n>ch` for a numeric column whose values have a known widest form. The
-   * minimum is what the grid scrolls against: the table sums every track's minimum into its own
-   * floor (`--dgc-min-inline`, see this module's header), so a surface narrower than the sum
-   * scrolls horizontally with every column still readable. A `minmax(0, …)` track has no floor at
-   * all - it collapses to its padding in a narrow panel and its content paints over the next cell
-   * - so it is reserved for a column whose content is designed to disappear, which no column in
-   * this package is. Size the minimum for the column's CONTENT plus the cell's inline padding, in
-   * `ch` of the table's own type, which is also what every row resolves `ch` against.
-   *
-   * PREFER A TRACK THAT RESOLVES IDENTICALLY IN EVERY ROW - a ratio, a `ch` measure, or a
-   * token-based length. The header row and each data row are separate grid containers (see this
-   * module's header), so an INTRINSIC track sizes itself from one row's own content: a
-   * `max-content` column whose values vary in width lands at a different offset in every row and
-   * stops sitting under its own header. Reserve the intrinsic forms for columns whose content is
-   * uniformly wide - a two-letter kind chip, a fixed-width badge, an icon - and remember that an
-   * intrinsic track contributes nothing to the grid's floor.
+   * Every role has a non-zero floor, and the table sums the floors into its own minimum width
+   * (`--dgc-min-inline`, see this module's header), so a surface narrower than the sum scrolls
+   * horizontally with every column still readable instead of painting one cell over the next. And
+   * every role track is a floor and a ratio, which resolves identically in every row - the header
+   * row and each data row are separate grid containers, so an intrinsic track sized from one row's
+   * own content would stop sitting under its header.
    */
-  width?: string | undefined;
+  width?: DataTableColumnWidth | undefined;
 
   /**
    * Whether this column offers sorting. Defaults to `false`.
@@ -774,107 +850,30 @@ const HEADER_ARIA_ROW_INDEX = 1;
 const FIRST_DATA_ARIA_ROW_INDEX = 2;
 
 /**
- * The grid track a column without {@link DataTableColumn.width} takes: an equal share of the free
- * space with a floor of ten characters - room for a short label, a formatted duration or a status
- * chip plus the cell's padding. The floor is what makes a narrow table scroll rather than squeeze:
- * a `minmax(0, 1fr)` default let every unsized column collapse to its padding in a narrow panel,
- * where one cell's content then painted over its neighbour's. A long value still cannot widen the
- * row, because the maximum stays a share of the free space rather than the content's width.
+ * The role a column without {@link DataTableColumn.width} takes: `standard`, an equal share of the
+ * free space above the `--dg-column-min-standard` floor - room for a short label, a formatted
+ * figure or a status chip plus the cell's padding. The floor is what makes a narrow table scroll
+ * rather than squeeze: a floorless default would let every unsized column collapse to its padding
+ * in a narrow dock, where one cell's content then painted over its neighbour's. A long value still
+ * cannot widen the row, because the maximum stays a share of the free space rather than the
+ * content's width.
  */
-const DEFAULT_COLUMN_TRACK = 'minmax(10ch, 1fr)';
+const DEFAULT_COLUMN_WIDTH: DataTableColumnWidth = 'standard';
 
 /**
- * A font-relative length a column minimum may be written in, with a strictly positive magnitude.
- * `px` is deliberately absent: a literal pixel track is a hardcoded value AAP 0.6.4 forbids, so it
- * is not given a floor that would make it look sanctioned. `%` is absent too - a percentage track
- * resolves against the grid's own width, and summing it into that width is circular.
- */
-const TRACK_MINIMUM_LENGTH_PATTERN = /^(?:\d+\.?\d*|\.\d+)(?:ch|em|rem|ex|lh|cap|ic)$/u;
-
-/**
- * A CSS function whose result is a length a column minimum may be written as: a token reference
- * (`var(--dg-space-5)`) or a computed length (`calc(…)`, `min(…)`, `max(…)`, `clamp(…)`).
- */
-const TRACK_MINIMUM_FUNCTION_PATTERN = /^(?:var|calc|min|max|clamp)\(/u;
-
-/**
- * Splits the argument list of a CSS function at its top-level commas, so a nested function's own
- * commas (`minmax(max(9ch, var(--dg-space-7)), 1fr)`) stay inside the argument they belong to.
+ * The token-built track a column's width role resolves to.
  *
- * @param argumentList The text between a function's outer parentheses.
- * @returns The trimmed arguments, in order.
+ * The role is type-checked at every typed call site; the own-property check additionally keeps an
+ * untyped caller's unknown string (or an inherited name such as `constructor`) from resolving to
+ * something that is not a track, by falling back to the default role instead.
+ *
+ * @param width The column's declared role, if any.
+ * @returns The role's track and minimum.
  */
-function splitTopLevelArguments(argumentList: string): string[] {
-  const parts: string[] = [];
-  let depth = 0;
-  let current = '';
-
-  for (const character of argumentList) {
-    if (character === ',' && depth === 0) {
-      parts.push(current.trim());
-      current = '';
-      continue;
-    }
-    if (character === '(') {
-      depth += 1;
-    } else if (character === ')') {
-      depth = Math.max(0, depth - 1);
-    }
-    current += character;
-  }
-  parts.push(current.trim());
-
-  return parts;
-}
-
-/**
- * The part of one grid track that is a guaranteed MINIMUM width, or `undefined` when it has none
- * the grid can count on.
- *
- *   minmax(<min>, <max>)   the `<min>` argument, when it is itself a length (below)
- *   <length>               a positive font-relative length (`9ch`) or a length-valued function
- *                          (`var(--dg-space-5)`, `calc(…)`) is its own minimum
- *   anything else          no minimum: `0`, a flexible `fr` track, `auto`, `min-content`,
- *                          `max-content` and `fit-content(…)` all size from content or free space,
- *                          which only the browser can resolve and which is not known here
- *
- * Only the minimums that are known without layout are summed into `--dgc-min-inline`. The grid's
- * floor is therefore a LOWER bound - a track the sum leaves out still sizes itself as CSS says - so
- * it can never force a table wider than its columns need.
- *
- * @param track One column's grid track, as {@link DataTableColumn.width} documents it.
- * @returns The track's minimum as a CSS length, or `undefined`.
- */
-function resolveTrackMinimum(track: string): string | undefined {
-  const trimmed = track.trim();
-  const minmax = /^minmax\((.*)\)$/su.exec(trimmed);
-
-  if (minmax !== null) {
-    const [minimum] = splitTopLevelArguments(minmax[1] ?? '');
-
-    return minimum === undefined ? undefined : resolveLengthMinimum(minimum);
-  }
-
-  return resolveLengthMinimum(trimmed);
-}
-
-/**
- * A track component that is a length the grid can count on, or `undefined`.
- *
- * @param value One track, or the first argument of one `minmax()`.
- * @returns The value unchanged when it is a positive font-relative length or a length-valued
- *   function, else `undefined`.
- */
-function resolveLengthMinimum(value: string): string | undefined {
-  const trimmed = value.trim();
-
-  if (TRACK_MINIMUM_FUNCTION_PATTERN.test(trimmed)) {
-    return trimmed;
-  }
-
-  return TRACK_MINIMUM_LENGTH_PATTERN.test(trimmed) && Number.parseFloat(trimmed) > 0
-    ? trimmed
-    : undefined;
+function resolveColumnTrack(width: DataTableColumnWidth | undefined): DataTableColumnTrack {
+  return width !== undefined && Object.hasOwn(DATA_TABLE_COLUMN_TRACKS, width)
+    ? DATA_TABLE_COLUMN_TRACKS[width]
+    : DATA_TABLE_COLUMN_TRACKS[DEFAULT_COLUMN_WIDTH];
 }
 
 /** The alignment a column without {@link DataTableColumn.align} takes. */
@@ -1810,19 +1809,17 @@ export function DataTable<Row>(props: DataTableProps<Row>): ReactElement {
   }, [rows, rowKey, expandedRowKeys, canExpand]);
 
   // The grid track template, inherited by every row through `--dgc-columns`, and the floor the grid
-  // may not shrink below, `--dgc-min-inline`: the sum of every track's known minimum. Relational
-  // tracks only: a column's `width` is a grid track, never a literal length (AAP 0.6.4).
+  // may not shrink below, `--dgc-min-inline`: the sum of every column's floor. Both are token
+  // references only: a column's `width` is a semantic role, never a CSS value (AAP 0.6.4).
   const { columnTemplate, minimumInlineSize } = useMemo(() => {
-    const tracks = columns.map((column) => column.width ?? DEFAULT_COLUMN_TRACK);
-    const minimums = tracks.flatMap((track) => {
-      const minimum = resolveTrackMinimum(track);
-
-      return minimum === undefined ? [] : [minimum];
-    });
+    const tracks = columns.map((column) => resolveColumnTrack(column.width));
 
     return {
-      columnTemplate: tracks.join(' '),
-      minimumInlineSize: minimums.length === 0 ? undefined : `calc(${minimums.join(' + ')})`,
+      columnTemplate: tracks.map((entry) => entry.track).join(' '),
+      minimumInlineSize:
+        tracks.length === 0
+          ? undefined
+          : `calc(${tracks.map((entry) => entry.minimum).join(' + ')})`,
     };
   }, [columns]);
 

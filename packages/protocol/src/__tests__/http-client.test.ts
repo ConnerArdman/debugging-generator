@@ -16,21 +16,28 @@
  *   canonical output, and every rule it enforces is checked for its refusal. A
  *   client built on a refused base URL — a public name, a private or unspecified
  *   address, a look-alike host, embedded credentials, a path, a query, a
- *   fragment — must still construct, and every one of the seventeen operations
+ *   fragment — must still construct, and every one of the twenty-one operations
  *   must then fail locally: the transport is never called, the credential
  *   provider is never asked, no `authorization` header exists, and the raw value
  *   (seeded with a unique marker) appears nowhere, because it may carry a pasted
  *   credential (CWE-200, CWE-918, AAP §0.5.2).
- * - **The credential itself.** Fifteen operations carry
+ * - **The credential itself.** Sixteen operations carry
  *   `authorization: Bearer <token>`; `health` and `pair.complete` never do, even
  *   when a credential is configured (AAP §0.5.6). A credential may be a string,
  *   a synchronous or asynchronous provider, may throw, reject or be absent, and
  *   may be rotated between calls — each of those has a case.
  * - **What goes on the wire.** Method and URL come from `HTTP_ROUTES` and
- *   `buildPath`; headers are exactly `accept`, `content-type` with a body, and
- *   the credential; `credentials: 'omit'` always; no `origin`, `cookie` or
- *   `access-control-*` header ever. A missing path parameter or a body the
- *   route's schema refuses fails before anything is sent.
+ *   `buildPath`; headers are exactly `accept`, `content-type` with a body, the
+ *   credential, and `x-debuggen-tab` only when the call acts for a tab;
+ *   `credentials: 'omit'` always; no `origin`, `cookie` or `access-control-*`
+ *   header ever. A missing path parameter or a body the route's schema refuses
+ *   fails before anything is sent.
+ * - **The acting tab.** One paired DevTools credential serves every inspected
+ *   tab, so a call's `tabId` becomes the acting-tab header the service holds a
+ *   DevTools request to (AAP §0.5.6) — through `request` and through a named
+ *   method's options alike. No `tabId`, no header; a `tabId` that is not a tab
+ *   id, or one given for an auth-exempt operation, fails locally with neither
+ *   the credential provider nor the transport reached.
  * - **What comes back.** A valid reply parses; invalid JSON, a schema-violating
  *   reply and an empty body are protocol failures; a non-2xx keeps the service's
  *   code, except that `401`/`403` stay in the unauthorized family (a `403`
@@ -73,6 +80,7 @@ import type {
   TokenProvider,
 } from '../client/http-client.js';
 import {
+  ACTING_TAB_HEADER,
   AUTHORIZATION_HEADER,
   CAPTURE_CONFLICT_ERROR_CODE,
   HTTP_OPERATIONS,
@@ -158,8 +166,10 @@ const VALID_REQUESTS: { readonly [O in HttpOperation]: HttpRequestBody<O> } = {
   'session.get': undefined,
   'session.question': { question: 'Why did that step run twice?' },
   'session.end': {},
+  'session.purge': {},
   'capture.start': {},
   'capture.stop': {},
+  'target.request': {},
   'panel.data': { source: 'spans', sort: 'duration_desc', limit: 25, offset: 0 },
   'panel.get': undefined,
   'panel.getById': undefined,
@@ -167,9 +177,11 @@ const VALID_REQUESTS: { readonly [O in HttpOperation]: HttpRequestBody<O> } = {
   'telemetry.event': { projectRoot: PROJECT_ROOT, events: [INGRESS_EVENT] },
   'devServer.launch': { projectRoot: PROJECT_ROOT },
   'devServer.stop': { projectRoot: PROJECT_ROOT },
+  'devServer.credential': { projectRoot: PROJECT_ROOT },
   health: undefined,
   'pair.start': {},
   'pair.complete': { code: PAIRING_CODE },
+  'credentials.rotate': {},
 };
 
 /** The path parameters every operation declares, keyed by operation. */
@@ -179,8 +191,10 @@ const VALID_PARAMS: { readonly [O in HttpOperation]: HttpPathParams<O> } = {
   'session.get': { id: SESSION_ID },
   'session.question': { id: SESSION_ID },
   'session.end': { id: SESSION_ID },
+  'session.purge': {},
   'capture.start': { id: SESSION_ID },
   'capture.stop': { id: SESSION_ID },
+  'target.request': { id: SESSION_ID },
   'panel.data': { id: SESSION_ID },
   'panel.get': { id: SESSION_ID },
   'panel.getById': { id: SESSION_ID, panelId: PANEL_ID },
@@ -188,24 +202,40 @@ const VALID_PARAMS: { readonly [O in HttpOperation]: HttpPathParams<O> } = {
   'telemetry.event': {},
   'devServer.launch': {},
   'devServer.stop': {},
+  'devServer.credential': {},
   health: {},
   'pair.start': {},
   'pair.complete': {},
+  'credentials.rotate': {},
 };
 
 /** A valid `GET /health` reply. */
 const HEALTH_REPLY = { version: '0.1.0', protocolVersion: '1.0.0', pairingAvailable: true };
 
+/**
+ * A valid `GET /sessions` reply: an empty first page, with the paging echo the
+ * listing always carries.
+ */
+const EMPTY_SESSION_PAGE = { sessions: [], total: 0, limit: 100, offset: 0, nextOffset: null };
+
 /** The two operations that are called without a credential. */
 const EXEMPT_OPERATIONS = HTTP_OPERATIONS.filter((operation) => isAuthExemptOperation(operation));
 
-/** The fifteen operations that must carry one. */
+/** The nineteen operations that must carry one. */
 const PROTECTED_OPERATIONS = HTTP_OPERATIONS.filter(
   (operation) => !isAuthExemptOperation(operation),
 );
 
 /** The only header names this client may ever write. */
-const ALLOWED_HEADER_NAMES: readonly string[] = ['accept', 'content-type', AUTHORIZATION_HEADER];
+const ALLOWED_HEADER_NAMES: readonly string[] = [
+  'accept',
+  'content-type',
+  AUTHORIZATION_HEADER,
+  ACTING_TAB_HEADER,
+];
+
+/** The inspected tab the acting-tab cases act for: distinctive on purpose. */
+const ACTING_TAB = 8_675_309;
 
 /** The only fields a log record may carry. */
 const ALLOWED_LOG_FIELDS: readonly string[] = ['operation', 'status', 'elapsedMs', 'cancelled'];
@@ -794,6 +824,66 @@ describe('HttpClient — method, URL, body and headers from the route table', ()
     expect(onlyCall(fetch).url).toBe(`${ORIGIN}/sessions/a%2Fb%3Fc%23d`);
   });
 
+  it('sends a page window as the query string the listing parses', async () => {
+    const fetch = vi.fn<FetchLike>((url) =>
+      Promise.resolve(
+        reply(
+          200,
+          url.includes('/modifications')
+            ? { modifications: [], total: 0, limit: 0, offset: 0, nextOffset: null }
+            : { ...EMPTY_SESSION_PAGE, limit: 50, offset: 100 },
+        ),
+      ),
+    );
+    const client = new HttpClient({ baseUrl: ORIGIN, token: EDITOR_TOKEN, fetch });
+
+    expect((await client.request('session.list', { query: { limit: 50, offset: 100 } })).ok).toBe(
+      true,
+    );
+    expect(
+      (
+        await client.request('modifications.list', {
+          params: { id: SESSION_ID },
+          query: { limit: 0 },
+        })
+      ).ok,
+    ).toBe(true);
+    await client.request('session.list', { query: { limit: undefined, offset: undefined } });
+
+    expect(fetch.mock.calls.map(([url]) => url)).toEqual([
+      `${ORIGIN}/sessions?limit=50&offset=100`,
+      `${ORIGIN}${buildPath('modifications.list', { id: SESSION_ID })}?limit=0`,
+      `${ORIGIN}/sessions`,
+    ]);
+  });
+
+  it('refuses a page window locally, before any credential or transport is reached', async () => {
+    const fetch = fetchReplying(reply(200, EMPTY_SESSION_PAGE));
+    const token = vi.fn<TokenProvider>(() => EDITOR_TOKEN);
+    const client = new HttpClient({ baseUrl: ORIGIN, token, fetch });
+
+    const tooLarge = failureOf(await client.request('session.list', { query: { limit: 501 } }));
+    const negative = failureOf(
+      await client.request('modifications.list', {
+        params: { id: SESSION_ID },
+        query: { offset: -1 },
+      }),
+    );
+    // An untyped caller naming a window for a route that reads none.
+    const untyped = failureOf(
+      await client.request('session.get', {
+        params: { id: SESSION_ID },
+        query: { limit: 1 },
+      } as unknown as HttpRequestArgs<'session.get'>),
+    );
+
+    for (const error of [tooLarge, negative, untyped]) {
+      expect(error.code).toBe('PROTOCOL_INVALID_MESSAGE');
+    }
+    expect(token).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it('fails a missing path parameter locally, before any credential is resolved', async () => {
     const fetch = fetchReplying(reply(200, {}));
     const token = vi.fn<TokenProvider>(() => EDITOR_TOKEN);
@@ -920,7 +1010,7 @@ describe('HttpClient — the bearer credential', () => {
 
   it('names exactly health and pair.complete as exempt', () => {
     expect([...EXEMPT_OPERATIONS].sort()).toEqual(['health', 'pair.complete']);
-    expect(PROTECTED_OPERATIONS).toHaveLength(15);
+    expect(PROTECTED_OPERATIONS).toHaveLength(19);
   });
 
   it.each(PROTECTED_OPERATIONS)('%s carries authorization: Bearer <token>', async (operation) => {
@@ -939,10 +1029,10 @@ describe('HttpClient — the bearer credential', () => {
     ['a synchronous provider', (): string => EDITOR_TOKEN],
     ['an asynchronous provider', (): Promise<string> => Promise.resolve(EDITOR_TOKEN)],
   ] as const)('accepts the credential as %s', async (_label, source) => {
-    const fetch = fetchReplying(reply(200, { sessions: [] }));
+    const fetch = fetchReplying(reply(200, EMPTY_SESSION_PAGE));
     const client = new HttpClient({ baseUrl: ORIGIN, token: source, fetch });
 
-    expect(valueOf(await client.request('session.list'))).toEqual({ sessions: [] });
+    expect(valueOf(await client.request('session.list'))).toEqual(EMPTY_SESSION_PAGE);
     expect(onlyCall(fetch).init.headers?.[AUTHORIZATION_HEADER]).toBe(formatBearer(EDITOR_TOKEN));
   });
 
@@ -975,7 +1065,7 @@ describe('HttpClient — the bearer credential', () => {
   ] as const)(
     'fails a protected call locally when the credential is %s',
     async (_label, source, reason) => {
-      const fetch = fetchReplying(reply(200, { sessions: [] }));
+      const fetch = fetchReplying(reply(200, EMPTY_SESSION_PAGE));
       const client = new HttpClient({ baseUrl: ORIGIN, token: source, fetch });
 
       const error = failureOf(await client.request('session.list'));
@@ -1000,7 +1090,7 @@ describe('HttpClient — the bearer credential', () => {
   });
 
   it('presents the rotated credential from the next call onward, and none once cleared', async () => {
-    const fetch = fetchReplying(reply(200, { sessions: [] }));
+    const fetch = fetchReplying(reply(200, EMPTY_SESSION_PAGE));
     const client = new HttpClient({ baseUrl: ORIGIN, token: EDITOR_TOKEN, fetch });
 
     await client.request('session.list');
@@ -1017,7 +1107,7 @@ describe('HttpClient — the bearer credential', () => {
   });
 
   it('resolves a provider per call, so a rotated value takes effect without a new client', async () => {
-    const fetch = fetchReplying(reply(200, { sessions: [] }));
+    const fetch = fetchReplying(reply(200, EMPTY_SESSION_PAGE));
     const issued = [EDITOR_TOKEN, ROTATED_TOKEN];
     const token = vi.fn<TokenProvider>(() => issued.shift());
     const client = new HttpClient({ baseUrl: ORIGIN, token, fetch });
@@ -1033,7 +1123,7 @@ describe('HttpClient — the bearer credential', () => {
   });
 
   it('switches from a string to a provider with setToken', async () => {
-    const fetch = fetchReplying(reply(200, { sessions: [] }));
+    const fetch = fetchReplying(reply(200, EMPTY_SESSION_PAGE));
     const client = new HttpClient({ baseUrl: ORIGIN, token: EDITOR_TOKEN, fetch });
     const provider = vi.fn<TokenProvider>(() => Promise.resolve(ROTATED_TOKEN));
 
@@ -1042,6 +1132,155 @@ describe('HttpClient — the bearer credential', () => {
 
     expect(provider).toHaveBeenCalledTimes(1);
     expect(onlyCall(fetch).init.headers?.[AUTHORIZATION_HEADER]).toBe(formatBearer(ROTATED_TOKEN));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The acting tab
+// ---------------------------------------------------------------------------
+
+describe('HttpClient — the acting tab a DevTools request is for', () => {
+  it.each(PROTECTED_OPERATIONS)(
+    '%s sends tabId as x-debuggen-tab beside the credential',
+    async (operation) => {
+      const fetch = fetchReplying(reply(200, {}));
+      const client = new HttpClient({ baseUrl: ORIGIN, token: EDITOR_TOKEN, fetch });
+
+      await client.request(operation, { ...argsFor(operation), tabId: ACTING_TAB });
+
+      const headers = onlyCall(fetch).init.headers ?? {};
+
+      expect(headers[ACTING_TAB_HEADER]).toBe(String(ACTING_TAB));
+      expect(headers[AUTHORIZATION_HEADER]).toBe(formatBearer(EDITOR_TOKEN));
+      expect(Object.keys(headers).every((name) => ALLOWED_HEADER_NAMES.includes(name))).toBe(true);
+    },
+  );
+
+  it('sends the tab through a named method’s options', async () => {
+    const fetch = fetchReplying(reply(200, { captureId: CAPTURE_ID }));
+    const client = new HttpClient({ baseUrl: ORIGIN, token: EDITOR_TOKEN, fetch });
+
+    const started = await client.startCapture(SESSION_ID, { tabId: ACTING_TAB });
+
+    expect(valueOf(started)).toEqual({ captureId: CAPTURE_ID });
+    expect(onlyCall(fetch).init.headers?.[ACTING_TAB_HEADER]).toBe(String(ACTING_TAB));
+  });
+
+  it('sends tab 0, which is a real tab rather than an absent one', async () => {
+    const fetch = fetchReplying(reply(200, { sessions: [] }));
+    const client = new HttpClient({ baseUrl: ORIGIN, token: EDITOR_TOKEN, fetch });
+
+    await client.request('session.list', { tabId: 0 });
+
+    expect(onlyCall(fetch).init.headers?.[ACTING_TAB_HEADER]).toBe('0');
+  });
+
+  it.each([
+    ['omitted', {}],
+    ['explicitly undefined', { tabId: undefined }],
+  ] as const)('sends no acting-tab header when tabId is %s', async (_label, extra) => {
+    const fetch = fetchReplying(reply(200, { captureId: CAPTURE_ID }));
+    const client = new HttpClient({ baseUrl: ORIGIN, token: EDITOR_TOKEN, fetch });
+
+    await client.request('capture.start', { ...argsFor('capture.start'), ...extra });
+    await client.startCapture(SESSION_ID, extra);
+
+    for (const [, init] of fetch.mock.calls) {
+      expect(init?.headers).not.toHaveProperty(ACTING_TAB_HEADER);
+    }
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ['chrome.tabs.TAB_ID_NONE', -1],
+    ['a fraction', 1.5],
+    ['NaN', Number.NaN],
+    ['an infinite value', Number.POSITIVE_INFINITY],
+    ['the first integer beyond the safe range', Number.MAX_SAFE_INTEGER + 1],
+    ['a string from untyped code', '7' as unknown as number],
+  ])(
+    'refuses %s as tabId locally, before the credential or the transport',
+    async (_label, tabId) => {
+      const fetch = fetchReplying(reply(200, {}));
+      const token = vi.fn<TokenProvider>(() => EDITOR_TOKEN);
+      const client = new HttpClient({ baseUrl: ORIGIN, token, fetch });
+
+      const viaRequest = failureOf(
+        await client.request('panel.data', { ...argsFor('panel.data'), tabId }),
+      );
+      const viaMethod = failureOf(await client.startCapture(SESSION_ID, { tabId }));
+
+      expect(viaRequest.code).toBe('PROTOCOL_INVALID_MESSAGE');
+      expect(viaRequest.message).toBe(
+        'Cannot call panel.data: tabId is not a non-negative safe-integer Chrome tab id',
+      );
+      expect(viaRequest.details).toEqual({ operation: 'panel.data', header: ACTING_TAB_HEADER });
+      expect(viaMethod.code).toBe('PROTOCOL_INVALID_MESSAGE');
+      expect(viaMethod.details).toEqual({ operation: 'capture.start', header: ACTING_TAB_HEADER });
+      expect(fetch).not.toHaveBeenCalled();
+      expect(token).not.toHaveBeenCalled();
+    },
+  );
+
+  it('never quotes a refused tab id in the failure', async () => {
+    const fetch = fetchReplying(reply(200, {}));
+    const client = new HttpClient({ baseUrl: ORIGIN, token: EDITOR_TOKEN, fetch });
+    // Negative and distinctive, so the search cannot be satisfied by a digit
+    // that an unrelated part of the error happens to contain.
+    const refused = -ACTING_TAB;
+
+    const error = failureOf(await client.request('session.list', { tabId: refused }));
+
+    expect(error.code).toBe('PROTOCOL_INVALID_MESSAGE');
+    expect(reachableText(error)).not.toContain(String(ACTING_TAB));
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it.each(EXEMPT_OPERATIONS)(
+    'refuses a tabId on the exempt %s operation, which has no principal to act as',
+    async (operation) => {
+      const fetch = fetchReplying(reply(200, HEALTH_REPLY));
+      const token = vi.fn<TokenProvider>(() => EDITOR_TOKEN);
+      const client = new HttpClient({ baseUrl: ORIGIN, token, fetch });
+
+      const error = failureOf(
+        await client.request(operation, { ...argsFor(operation), tabId: ACTING_TAB }),
+      );
+
+      expect(error.code).toBe('PROTOCOL_INVALID_MESSAGE');
+      expect(error.message).toBe(
+        `Cannot call ${operation}: an acting tab was given for an operation that carries no credential`,
+      );
+      expect(error.details).toEqual({ operation, header: ACTING_TAB_HEADER });
+      expect(reachableText(error)).not.toContain(String(ACTING_TAB));
+      expect(fetch).not.toHaveBeenCalled();
+      expect(token).not.toHaveBeenCalled();
+    },
+  );
+
+  it('refuses a tabId passed to the named health and pairComplete methods', async () => {
+    const fetch = fetchReplying(reply(200, HEALTH_REPLY));
+    const client = new HttpClient({ baseUrl: ORIGIN, token: EDITOR_TOKEN, fetch });
+
+    const health = failureOf(await client.health({ tabId: ACTING_TAB }));
+    const paired = failureOf(await client.pairComplete(PAIRING_CODE, { tabId: ACTING_TAB }));
+
+    expect(health.code).toBe('PROTOCOL_INVALID_MESSAGE');
+    expect(health.details).toEqual({ operation: 'health', header: ACTING_TAB_HEADER });
+    expect(paired.code).toBe('PROTOCOL_INVALID_MESSAGE');
+    expect(paired.details).toEqual({ operation: 'pair.complete', header: ACTING_TAB_HEADER });
+    expect(reachableText(paired)).not.toContain(PAIRING_CODE);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('still answers a refused base URL first, whatever the tab', async () => {
+    const fetch = fetchReplying(reply(200, {}));
+    const client = new HttpClient({ baseUrl: 'http://example.com:43117', fetch });
+
+    const error = failureOf(await client.request('session.list', { tabId: -1 }));
+
+    expect(error.code).toBe('CONFIG_INVALID');
+    expect(fetch).not.toHaveBeenCalled();
   });
 });
 
@@ -1396,6 +1635,94 @@ describe('HttpClient — replies', () => {
 });
 
 // ---------------------------------------------------------------------------
+// The editor's target request
+// ---------------------------------------------------------------------------
+
+describe('HttpClient — the target.request operation', () => {
+  /** The Chrome tab the session is bound to. */
+  const TAB_ID = 7;
+
+  /** The arguments of a valid call for the fixture session. */
+  const TARGET_REQUEST_ARGS: HttpRequestArgs<'target.request'> = {
+    params: { id: SESSION_ID },
+    body: {},
+  };
+
+  it('posts an empty body with the editor credential and parses the session and tab it reached', async () => {
+    const fetch = fetchReplying(reply(200, { sessionId: SESSION_ID, tabId: TAB_ID }));
+    const client = new HttpClient({ baseUrl: ORIGIN, token: EDITOR_TOKEN, fetch });
+
+    const answer = valueOf(await client.request('target.request', TARGET_REQUEST_ARGS));
+
+    expect(answer).toEqual({ sessionId: SESSION_ID, tabId: TAB_ID });
+
+    const { url, init } = onlyCall(fetch);
+
+    expect(url).toBe(`${ORIGIN}/sessions/${SESSION_ID}/target/request`);
+    expect(init.method).toBe('POST');
+    expect(init.body).toBe('{}');
+    expect(init.headers?.[AUTHORIZATION_HEADER]).toBe(formatBearer(EDITOR_TOKEN));
+  });
+
+  it('refuses a body carrying any key locally, before a credential is resolved', async () => {
+    const fetch = fetchReplying(reply(200, { sessionId: SESSION_ID, tabId: TAB_ID }));
+    const token = vi.fn<TokenProvider>(() => EDITOR_TOKEN);
+    const client = new HttpClient({ baseUrl: ORIGIN, token, fetch });
+    const invalid: unknown = { tabId: TAB_ID, note: MARKER };
+
+    const error = failureOf(
+      await client.request('target.request', {
+        params: { id: SESSION_ID },
+        body: invalid as HttpRequestBody<'target.request'>,
+      }),
+    );
+
+    expect(error.code).toBe('PROTOCOL_INVALID_MESSAGE');
+    expect(fetch).not.toHaveBeenCalled();
+    expect(token).not.toHaveBeenCalled();
+    expect(reachableText(error)).not.toContain(MARKER);
+  });
+
+  it('reports a 2xx reply without the tab as a protocol failure, with the status attached', async () => {
+    const client = new HttpClient({
+      baseUrl: ORIGIN,
+      token: EDITOR_TOKEN,
+      fetch: fetchReplying(reply(200, { sessionId: SESSION_ID })),
+    });
+
+    const error = failureOf(await client.request('target.request', TARGET_REQUEST_ARGS));
+
+    expect(error.code).toBe('PROTOCOL_INVALID_MESSAGE');
+    expect(error.details).toEqual(
+      expect.objectContaining({ operation: 'target.request', status: 200 }),
+    );
+  });
+
+  it.each([
+    [404, 'SESSION_NOT_FOUND', 'No such session'],
+    [409, 'SESSION_INVALID_STATE', 'The session has ended'],
+    [409, 'TAB_NOT_BOUND', 'No DevTools tab is bound to this session'],
+    [503, 'TRANSPORT_DISCONNECTED', 'The bound tab is offline'],
+  ] as const)(
+    'keeps the route’s documented %i %s refusal as the service sent it',
+    async (status, code, message) => {
+      const client = new HttpClient({
+        baseUrl: ORIGIN,
+        token: EDITOR_TOKEN,
+        fetch: fetchReplying(reply(status, { code, message })),
+      });
+
+      const error = failureOf(await client.request('target.request', TARGET_REQUEST_ARGS));
+
+      expect(error.code).toBe(code);
+      expect(error.details).toEqual(
+        expect.objectContaining({ operation: 'target.request', status }),
+      );
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
 // The transport failing
 // ---------------------------------------------------------------------------
 
@@ -1515,7 +1842,7 @@ describe('HttpClient — cancellation is established before the credential is re
   });
 
   it('ends a call whose credential provider never settles at the timeout', async () => {
-    const fetch = fetchReplying(reply(200, { sessions: [] }));
+    const fetch = fetchReplying(reply(200, EMPTY_SESSION_PAGE));
     const late = deferred<string | undefined>();
     const token = vi.fn<TokenProvider>(() => late.promise);
     const { logger, records } = capturingLogger();
@@ -1554,7 +1881,7 @@ describe('HttpClient — cancellation is established before the credential is re
   });
 
   it('applies the client default timeout to credential resolution too', async () => {
-    const fetch = fetchReplying(reply(200, { sessions: [] }));
+    const fetch = fetchReplying(reply(200, EMPTY_SESSION_PAGE));
     const late = deferred<string | undefined>();
     const client = new HttpClient({
       baseUrl: ORIGIN,
@@ -1614,7 +1941,7 @@ describe('HttpClient — cancellation is established before the credential is re
   });
 
   it('ends the call when the caller aborts during credential resolution, and ignores the late credential', async () => {
-    const fetch = fetchReplying(reply(200, { sessions: [] }));
+    const fetch = fetchReplying(reply(200, EMPTY_SESSION_PAGE));
     const late = deferred<string | undefined>();
     const client = new HttpClient({ baseUrl: ORIGIN, token: () => late.promise, fetch });
     const caller = new AbortController();
@@ -1747,7 +2074,7 @@ describe('HttpClient — cancellation is established before the credential is re
     const client = new HttpClient({
       baseUrl: ORIGIN,
       token: EDITOR_TOKEN,
-      fetch: fetchReplying(reply(200, { sessions: [] })),
+      fetch: fetchReplying(reply(200, EMPTY_SESSION_PAGE)),
     });
     let result: Result<unknown, DebuggenError> | undefined;
 
@@ -1765,7 +2092,7 @@ describe('HttpClient — cancellation is established before the credential is re
     await vi.advanceTimersByTimeAsync(100);
 
     expect(vi.getTimerCount()).toBe(0);
-    expect(valueOf(result)).toEqual({ sessions: [] });
+    expect(valueOf(result)).toEqual(EMPTY_SESSION_PAGE);
   });
 
   it('ends a call whose body read stalls at the timeout', async () => {
@@ -1798,7 +2125,7 @@ describe('HttpClient — cancellation is established before the credential is re
   });
 
   it('clears its timer and listener once a call succeeds', async () => {
-    const fetch = fetchReplying(reply(200, { sessions: [] }));
+    const fetch = fetchReplying(reply(200, EMPTY_SESSION_PAGE));
     const client = new HttpClient({ baseUrl: ORIGIN, token: EDITOR_TOKEN, fetch });
     const caller = new AbortController();
     const removed = vi.spyOn(caller.signal, 'removeEventListener');
@@ -1852,9 +2179,9 @@ describe('HttpClient — cancellation is established before the credential is re
       expect(vi.getTimerCount()).toBe(0);
       expect(onlyCall(fetch).init).not.toHaveProperty('signal');
 
-      stalled.resolve(reply(200, { sessions: [] }));
+      stalled.resolve(reply(200, EMPTY_SESSION_PAGE));
 
-      expect(valueOf(await pending)).toEqual({ sessions: [] });
+      expect(valueOf(await pending)).toEqual(EMPTY_SESSION_PAGE);
     },
   );
 
@@ -1875,9 +2202,9 @@ describe('HttpClient — cancellation is established before the credential is re
 
     expect(settled).toBe(false);
 
-    stalled.resolve(reply(200, { sessions: [] }));
+    stalled.resolve(reply(200, EMPTY_SESSION_PAGE));
 
-    expect(valueOf(await pending)).toEqual({ sessions: [] });
+    expect(valueOf(await pending)).toEqual(EMPTY_SESSION_PAGE);
     expect(vi.getTimerCount()).toBe(0);
   });
 
@@ -1918,9 +2245,9 @@ describe('HttpClient — cancellation is established before the credential is re
 
     expect(onlyCall(fetch).init.signal?.aborted).toBe(false);
 
-    stalled.resolve(reply(200, { sessions: [] }));
+    stalled.resolve(reply(200, EMPTY_SESSION_PAGE));
 
-    expect(valueOf(await pending)).toEqual({ sessions: [] });
+    expect(valueOf(await pending)).toEqual(EMPTY_SESSION_PAGE);
   });
 });
 

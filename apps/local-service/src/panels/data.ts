@@ -24,7 +24,7 @@
  *
  * | source             | result                  | built from                                              |
  * |--------------------|-------------------------|---------------------------------------------------------|
- * | `trace`            | `TraceTree \| null`      | the service's `TraceCorrelator` (`../telemetry/correlate.ts`) |
+ * | `trace`            | `TraceTree \| null`      | the service's `TraceCorrelator` (`../telemetry/correlate.ts`), narrowed by the filter and held to {@link TRACE_NODE_BUDGET} |
  * | `spans`, `events`  | `TelemetryEvent[]`      | `TelemetryRepo.query`, with filter, sort and page pushed down |
  * | `renders`          | `RenderStat[]`          | `aggregateRenders`                                      |
  * | `componentTree`    | snapshot `\| null`       | `buildComponentTreeSnapshot`                            |
@@ -32,7 +32,7 @@
  * | `queries`          | `QueryGroup[]`          | `aggregateQueries`                                      |
  * | `stateTransitions` | `StateTransition[]`     | `aggregateStateTransitions`                             |
  * | `graph`            | `DependencyGraphData`   | `buildDependencyGraph`                                  |
- * | `metrics`          | `MetricValue[]`         | the capture summary, else `computeMetrics`              |
+ * | `metrics`          | `MetricValue[]`         | the capture summary when it covers every event, else `computeMetrics` |
  *
  * ## Paging (AAP 0.4.2)
  *
@@ -68,29 +68,114 @@
  *
  * ## Capture scoping
  *
- * Evidence is always read from **one** capture: the one the context names, or
- * else the session's open capture, or else its most recent one. A read never
- * spans captures, because two reproductions of an issue mixed into one table
- * would be evidence of neither. A session with no capture yet answers every
- * source with its empty value — an empty array, `null` or an empty graph — which
- * is a success the components render as their empty state.
+ * Evidence is always read from **one** capture, chosen in this order:
+ *
+ * 1. **The rendered panel's capture.** A query sent for a node of a rendered
+ *    panel names that panel (`panelId` on the request body, carried here as
+ *    {@link PanelDataContext.panelId}), and the read is bound to the capture the
+ *    panel was generated from — the `capture_id` its row was stored with — so a
+ *    panel still on screen after a newer capture started keeps drawing the
+ *    evidence its own findings cite. A panel the session does not hold is
+ *    refused; a panel whose capture has been purged answers every source with
+ *    its empty value, never with some other capture's evidence.
+ * 2. **A named capture** ({@link PanelDataContext.captureId}), checked to belong
+ *    to the session.
+ * 3. **Live evidence**, when neither is named: the session's open capture, else
+ *    its most recent one — each one indexed lookup, never a walk of the
+ *    session's capture history.
+ *
+ * A read never spans captures, because two reproductions of an issue mixed into
+ * one table would be evidence of neither. A session with no capture yet answers
+ * every source with its empty value — an empty array, `null` or an empty graph —
+ * which is a success the components render as their empty state.
  *
  * ## Filters
  *
  * `traceId`, `kinds`, `tier`, `minDuration` and `component` are pushed into the
  * store read for the flat sources, where the repository applies them with its
- * own indexes. The aggregate sources read the capture's events in bounded pages
- * and hand them to the aggregate, and two of them need records the filter would
- * otherwise remove: a query's caller is found by walking up its parent spans, a
- * state transition's trigger is another record entirely, and a request joins to
- * its resource-timing entry. For those, the filter narrows the aggregate's
- * **subjects** — the records of the kind group it summarises — while every other
- * record of the capture (narrowed by `traceId` only) stays in the slice as the
- * context it resolves against. Both halves are store reads; no filter is
- * re-implemented here.
+ * own indexes. The aggregate sources read the capture's events as whole slices
+ * and hand them to the aggregate, and several of them need records the filter
+ * would otherwise remove: a query's caller is found by walking up its parent
+ * spans, a state transition's trigger is another record entirely, and a request
+ * joins to its resource-timing entry. For those, the filter narrows the
+ * aggregate's **subjects** — the records of the kind group it summarises —
+ * while every other record of the capture (narrowed by `traceId` only) stays in
+ * the slice as the context it resolves against. Both halves come from store
+ * reads that apply the filter; the only thing done here is partitioning a read
+ * by event kind — the column a store `kinds` narrowing filters on — and no
+ * other filter field is re-implemented.
  *
- * The `trace` source is the one exception: a correlated tree's structure is its
- * meaning, and the correlator never drops a node, so only `traceId` narrows it.
+ * The `trace` source applies the filter too, to the one tree it answers with:
+ * `traceId` chooses the tree, and the other fields keep the nodes the store
+ * matches for them **plus every ancestor of a match**, because a correlated
+ * tree's structure is its meaning and a matched span shown without the path
+ * that caused it would be a row with no context. The matching is again the
+ * store's read, never a second implementation here.
+ *
+ * ## Completeness, and the one bound
+ *
+ * An aggregate is always computed from **every** event of its slice, so
+ * `total`, `nextOffset` and every count an aggregate reports describe the
+ * whole capture — the result carries no coverage field, so it may only ever be
+ * complete. Each slice is **one scan** (`TelemetryRepo.scanEvents`): one count
+ * over the filter and, when the selection fits, one ordered statement in
+ * capture order (`start_time`, then `id`) — never a walk of pages, each with
+ * its own count and offset. A subject-narrowed slice is two such scans, and
+ * the shared traversal (below) two at most.
+ *
+ * The one bound is on memory: a slice larger than
+ * {@link MAX_AGGREGATE_INPUT_EVENTS} — the two scans of one answer counted
+ * together — is **refused** with `PANEL_INVALID` (reason
+ * `aggregate-input-too-large`) and a hint to narrow the view, from the count
+ * alone and without a row being read, rather than answered from a prefix that
+ * would present partial totals as the capture's. A scan that contradicts its
+ * own count or budget is refused with `STORE_ERROR` (reason
+ * `scan-inconsistent`) rather than trusted. The unfiltered `metrics` source is
+ * held to the same rule: a capture summary is served only when it was computed
+ * from every event the capture now holds (its `eventCount` equals the
+ * capture's stored count, read with `captureStamp`), and the values are
+ * computed from the whole capture otherwise.
+ *
+ * A correlated tree is bounded separately, by {@link TRACE_NODE_BUDGET} nodes
+ * in canonical pre-order, and a tree cut by it says so through its own
+ * `truncated` flag — the one completeness marker the wire shape carries.
+ *
+ * ## The aggregate cache
+ *
+ * Computing an aggregate means reading and parsing its whole slice, and one
+ * generated panel asks for several — each node separately, a paged table once
+ * per page — over the same capture and, usually, the same filter.
+ *
+ * - **One traversal serves every aggregate source.** A cold read of a source
+ *   whose slice is every kind (`queries`, `stateTransitions`, `graph`,
+ *   `metrics`) reads the capture once under its filter — the trace's whole
+ *   slice, plus the whole filter's selection when the filter narrows by more
+ *   than the trace — and derives **all seven** aggregate sources' inputs from
+ *   it by kind, each row for row and in the order its own read would return
+ *   ({@link sharedAggregateInput}). A traversal that does not fit the ceiling
+ *   is abandoned without an error and the source reads its own, narrower
+ *   slice, so a view is refused only when its own slice is too large. A source
+ *   whose slice is a subset of the kinds (`renders`, `componentTree`,
+ *   `requests`) never widens its read: on a miss it reads its own slice.
+ * - **One entry per capture and filter.** The resulting values are kept as one
+ *   bundle, keyed by session, capture and filter (not by source), in a
+ *   least-recently-used cache bounded by entry count
+ *   ({@link AGGREGATE_CACHE_MAX_ENTRIES}) and by the events its entries' values
+ *   were computed from ({@link AGGREGATE_CACHE_MAX_INPUT_EVENTS}). An entry
+ *   weighs the events read by the writes it still holds — a traversal weighs
+ *   what it read, however many sources it serves — so a 100 000-event capture
+ *   is one entry of that weight rather than one per source.
+ * - **Validated by the capture's generation.** Every read of an entry checks
+ *   it against `captureGeneration` — a pragma and a lookup in the store's
+ *   write ledger, which every insert into the capture and every purge moves,
+ *   as does any other connection's commit — so a hit reads no telemetry row
+ *   and counts nothing. The generation is read before, and in the same
+ *   synchronous turn as, the reads a value is computed from, so a cached value
+ *   always describes exactly the rows its generation names: a panel reloaded
+ *   during a capture sees the evidence that has arrived since, and a stopped
+ *   capture is traversed once.
+ *
+ * Only aggregates are cached — never events, never a failure.
  *
  * ## Privacy and failure (AAP 0.5.2, 0.5.5)
  *
@@ -105,7 +190,11 @@
  * @example
  * ```ts
  * const resolver = createPanelDataResolver({ telemetry, correlator, sessions, captures, logger });
- * const result = await resolver.resolve({ sessionId }, { source: 'renders', sort: 'count_desc' });
+ * // A node of the rendered panel `panelId`: answered from that panel's capture.
+ * const result = await resolver.resolve(
+ *   { sessionId, panelId },
+ *   { source: 'renders', sort: 'count_desc' },
+ * );
  * if (result.ok && result.value.source === 'renders') {
  *   // result.value.renders, result.value.total, result.value.nextOffset
  * }
@@ -116,6 +205,7 @@ import {
   DATA_QUERY_DEFAULT_LIMIT,
   DATA_QUERY_DEFAULT_OFFSET,
   DATA_QUERY_MAX_LIMIT,
+  DATA_QUERY_SOURCES,
 } from '@debuggen/panel-schema';
 import type {
   DataQuery,
@@ -125,7 +215,7 @@ import type {
 } from '@debuggen/panel-schema';
 import type { DataPage, DataResult, DataResultFor } from '@debuggen/protocol';
 import { DebuggenError, assertNever, err, noopLogger, ok } from '@debuggen/shared';
-import type { CaptureId, Logger, Result, SessionId, TraceId } from '@debuggen/shared';
+import type { CaptureId, Logger, PanelId, Result, SessionId } from '@debuggen/shared';
 import {
   COMPONENT_TREE_ATTRIBUTE_KEYS,
   ERROR_KINDS,
@@ -143,24 +233,30 @@ import {
   attributeKeysFor,
   buildComponentTreeSnapshot,
   buildDependencyGraph,
+  buildTraceTree,
   computeMetrics,
+  walkNode,
 } from '@debuggen/telemetry';
 import type {
   CaptureSummary,
   MetricValue,
   TelemetryEvent,
   TelemetryKind,
+  TraceNode,
   TraceTree,
 } from '@debuggen/telemetry';
 
 import type { AnalysisSummarizer } from '../analysis/summarize.js';
 import { sessionLogger, subsystemLogger } from '../logging.js';
 import type { SessionsRepo, StoredCapture } from '../store/sessions-repo.js';
-import {
-  TELEMETRY_QUERY_DEFAULT_OFFSET,
-  TELEMETRY_QUERY_MAX_LIMIT,
+import type {
+  CaptureEventStamp,
+  CaptureGeneration,
+  TelemetryPage,
+  TelemetryRepo,
+  TelemetryScan,
+  TelemetryScanFilter,
 } from '../store/telemetry-repo.js';
-import type { TelemetryPage, TelemetryQuery, TelemetryRepo } from '../store/telemetry-repo.js';
 import type { TraceCorrelator } from '../telemetry/correlate.js';
 
 /* -------------------------------------------------------------------------------------------------
@@ -668,6 +764,11 @@ type AggregateDataSource = Exclude<DataQuerySource, 'trace' | 'spans' | 'events'
  *   narrows the participants directly.
  * - `metrics` — every kind; a filtered metrics read computes the values over
  *   the records the filter selects.
+ *
+ * The four every-kind plans are the sources that take the shared traversal on
+ * a cache miss ("The aggregate cache" above); the other three read their own
+ * slice. Either way, these plans define each source's input: the shared
+ * traversal derives exactly the rows these reads return.
  */
 const AGGREGATE_READ_PLANS: Readonly<Record<AggregateDataSource, AggregateReadPlan>> =
   Object.freeze({
@@ -707,53 +808,105 @@ function intersectKinds(
  * ---------------------------------------------------------------------------------------------- */
 
 /**
- * How many store pages one aggregate read walks at most: `10`.
+ * The most events one panel read aggregates: `250 000`.
  *
- * Each page is the store's own ceiling, `TELEMETRY_QUERY_MAX_LIMIT`, so an
- * aggregate is computed from at most {@link MAX_AGGREGATE_INPUT_EVENTS} events
- * and the resolver never holds an unbounded result set in memory. A capture
- * larger than that is aggregated over its first events in start order — the
- * same window on every read — and the read is reported at `warn` with its
- * counts.
+ * A memory ceiling, not a window. An aggregate is computed from **every**
+ * event of its slice or not at all: the store's scan counts a slice before it
+ * reads a row (`TelemetryRepo.scanEvents`), and a slice counted above this —
+ * both halves of a subject-narrowed slice together — is refused with
+ * `PANEL_INVALID` (reason `aggregate-input-too-large`) without its events being
+ * read, with a hint to narrow the view, because an answer computed from a
+ * prefix would carry totals the protocol presents as the capture's. The shared
+ * traversal is held to it too, its two reads together; one that does not fit
+ * is abandoned for the source's own slice rather than refused.
+ *
+ * Sized from a measurement: a parsed event of the shapes the agent and the
+ * preload emit holds about 0.66 KB on a Node 24 heap, so a slice at the ceiling
+ * is about 165 MB for the duration of one read. A capture of a reproduced
+ * interaction is two to three orders of magnitude smaller; the ceiling exists
+ * for the capture left running for hours, which must fail loudly rather than
+ * take the service's memory with it.
  */
-export const MAX_AGGREGATE_INPUT_PAGES = 10;
-
-/** The most events one aggregate is computed from. */
-export const MAX_AGGREGATE_INPUT_EVENTS = MAX_AGGREGATE_INPUT_PAGES * TELEMETRY_QUERY_MAX_LIMIT;
+export const MAX_AGGREGATE_INPUT_EVENTS = 250_000;
 
 /**
- * The order an aggregate's input slice is read in: capture order.
+ * The most nodes a `trace` answer holds: `5 000`, the protocol's page ceiling.
  *
- * Every aggregate is order-independent, but the **window** a bounded read
- * keeps is not, and reading in start order makes it the earliest events of the
- * capture, identically on every read.
+ * A correlated tree is one value rather than a page, so it cannot be paged
+ * through; a tree larger than this is cut to its first nodes in canonical
+ * pre-order — which keeps every kept node's ancestors, so the answer is still
+ * one connected tree per root — and says so through `truncated: true`, the
+ * flag `TraceTree` carries for exactly this ("a caller's node budget").
  */
-const SLICE_READ_SORT: DataQuerySort = 'start_asc';
+export const TRACE_NODE_BUDGET = DATA_QUERY_MAX_LIMIT;
+
+/**
+ * How many cache entries the resolver keeps: `64`.
+ *
+ * One entry holds every aggregate source of one capture under one filter, so
+ * this is enough for the distinct filters of a few generated panels at once,
+ * across their captures. Past it the least recently used entry is evicted.
+ */
+export const AGGREGATE_CACHE_MAX_ENTRIES = 64;
+
+/**
+ * The most events the cached entries' values may have been computed from,
+ * together: {@link MAX_AGGREGATE_INPUT_EVENTS}.
+ *
+ * An aggregate is a reduction or a projection of its input, so its size is at
+ * most proportional to the events it was computed from. An entry weighs the
+ * events read by the writes it still holds — one traversal weighs what it
+ * read, whichever sources it serves, and a write whose every slot a later one
+ * replaced weighs nothing — and least recently used entries are evicted while
+ * the sum is above this, which bounds the cache at about the size of one slice
+ * at the ceiling however many sessions and captures its entries describe. A
+ * merge into an entry that would weigh more than this keeps the newest write
+ * alone, and a write weighing more on its own is answered but not kept.
+ */
+export const AGGREGATE_CACHE_MAX_INPUT_EVENTS = MAX_AGGREGATE_INPUT_EVENTS;
 
 /* -------------------------------------------------------------------------------------------------
  * Ports and dependencies
  * ---------------------------------------------------------------------------------------------- */
 
 /**
- * The telemetry read this module performs: `TelemetryRepo.query`, the
- * panel-data surface of the store.
+ * The telemetry reads this module performs, picked from `TelemetryRepo`:
+ *
+ * - `query` — the panel-data surface of the store: one filtered, ordered page,
+ *   which is how the flat `spans` and `events` sources are served.
+ * - `scanEvents` — the whole of a filtered selection in capture order, or the
+ *   statement that it exceeds a row budget: one count and at most one ordered
+ *   statement, never a page walk. Every aggregate slice, and the node matching
+ *   of a filtered `trace`, is one such call.
+ * - `firstTraceId` — a capture's earliest trace (earliest start, then the
+ *   first-arrived event), one indexed read, for a `trace` query that names
+ *   none and has no primary trace to fall back on.
+ * - `captureStamp` — a capture's event count and highest arrival number, one
+ *   covering index read: what tells a stored capture summary that still
+ *   covers every event from one that no longer does.
+ * - `captureGeneration` — where a capture's rows stand, read without touching
+ *   a telemetry row: what every cached aggregate is validated against.
  *
  * A consumer-side port picked from the production interface, so the real
  * repository satisfies it by construction and a suite supplies a plain object
- * with one function instead of an open database.
+ * with five functions instead of an open database.
  */
-export type PanelTelemetryPort = Pick<TelemetryRepo, 'query'>;
+export type PanelTelemetryPort = Pick<
+  TelemetryRepo,
+  'query' | 'scanEvents' | 'firstTraceId' | 'captureStamp' | 'captureGeneration'
+>;
 
-/** The trace reads this module performs, picked from the service's `TraceCorrelator`. */
-export type PanelTracePort = Pick<TraceCorrelator, 'getTrace' | 'listTraceIds'>;
+/** The trace read this module performs, picked from the service's `TraceCorrelator`. */
+export type PanelTracePort = Pick<TraceCorrelator, 'getTrace'>;
 
 /**
- * The capture lookups this module performs, picked from `SessionsRepo`: a named
- * capture's owner, and a session's open and most recent captures.
+ * The capture lookups this module performs, picked from `SessionsRepo`, each
+ * one indexed read: a named capture's owner, a rendered panel's capture, and a
+ * session's open and most recent captures.
  */
 export type SessionCapturePort = Pick<
   SessionsRepo,
-  'getCapture' | 'getActiveCapture' | 'listCaptures'
+  'getCapture' | 'getActiveCapture' | 'getLatestCapture' | 'getPanelCapture'
 >;
 
 /**
@@ -787,13 +940,23 @@ export interface PanelDataResolverDeps {
   readonly now?: (() => number) | undefined;
 }
 
-/** Which session, and optionally which capture, a query reads. */
+/**
+ * Which session a query reads, and which of its captures: the rendered
+ * panel's, a named one, or the live one (see "Capture scoping" above).
+ */
 export interface PanelDataContext {
   /** The session whose evidence is read; already authorised by the route. */
   readonly sessionId: SessionId;
   /**
-   * The capture to read. Absent means the session's open capture, else its most
-   * recent one.
+   * The rendered panel the query was sent for. Present, the read is bound to
+   * the capture that panel was generated from, whatever capture is open or
+   * newest; absent, the query reads live evidence.
+   */
+  readonly panelId?: PanelId | undefined;
+  /**
+   * The capture to read. Absent means the rendered panel's capture when a
+   * panel is named, and otherwise the session's open capture, else its most
+   * recent one. Named together with a panel, it must be that panel's capture.
    */
   readonly captureId?: CaptureId | undefined;
 }
@@ -803,14 +966,25 @@ export interface PanelDataResolver {
   /**
    * Answers one data query.
    *
-   * @param context The session and optional capture to read.
+   * @param context The session, and the panel or capture, to read.
    * @param query A parsed `DataQuery`.
-   * @returns The `DataResult` member for `query.source` — an empty one when the
-   * scope holds no matching evidence — or a typed error: `PANEL_INVALID` for a
-   * paging value outside its domain, `SESSION_INVALID_STATE` for a capture that
-   * is not the session's (or when no capture can be determined), `STORE_ERROR`
-   * for a failed or throwing read, and `INTERNAL` for anything unforeseen. Never
-   * rejects.
+   * @returns The `DataResult` member for `query.source`, computed from every
+   * event of the scope it reads — an empty one when the scope holds no matching
+   * evidence, or when the rendered panel's capture has since been purged — or a
+   * typed error:
+   * - `PANEL_INVALID` for a paging value outside its domain, and for an
+   *   aggregate whose slice exceeds {@link MAX_AGGREGATE_INPUT_EVENTS} (reason
+   *   `aggregate-input-too-large`);
+   * - `SESSION_INVALID_STATE` for a panel the session does not hold (reason
+   *   `panel-not-in-session`), a capture that is not the session's
+   *   (`capture-not-in-session`) or not the named panel's
+   *   (`panel-capture-mismatch`), and when no capture can be looked up at all
+   *   (`no-capture-lookup`);
+   * - `STORE_ERROR` for a failed or throwing read, or a scan that contradicts
+   *   its own count or row budget (`scan-inconsistent`);
+   * - `INTERNAL` for anything unforeseen.
+   *
+   * Never rejects.
    */
   resolve(context: PanelDataContext, query: DataQuery): Promise<Result<DataResult, DebuggenError>>;
 }
@@ -830,41 +1004,205 @@ const STORE_FAILURE_HINT =
 const INTERNAL_FAILURE_HINT =
   'Reload the panel; if the view still fails, report it with the service log.';
 
-/** The one capture a query reads, or none when the session has not captured yet. */
+/**
+ * How a query's capture was chosen, for its timing record: bound to a rendered
+ * panel, named by the caller, or the session's live capture.
+ */
+type ScopeBinding = 'panel' | 'capture' | 'live';
+
+/**
+ * The one capture a query reads, or none when the session has not captured
+ * yet (or the rendered panel's capture has been purged).
+ */
 interface ResolvedScope {
   /** The session. */
   readonly sessionId: SessionId;
-  /** The capture, or `undefined` when the session holds none. */
+  /** The capture, or `undefined` when there is none to read. */
   readonly captureId: CaptureId | undefined;
   /** The summary stored with that capture, when it has one and it describes it. */
   readonly storedSummary: CaptureSummary | undefined;
+  /** How the capture was chosen. */
+  readonly binding: ScopeBinding;
 }
 
-/** The narrowing of one store read: the filter fields `TelemetryQuery` accepts. */
+/**
+ * The narrowing of one store read: the filter fields a scan and a page both
+ * accept (`TelemetryScanFilter` is `TelemetryQuery` without its ordering and
+ * paging fields).
+ */
 type SliceNarrowing = Pick<
-  TelemetryQuery,
+  TelemetryScanFilter,
   'traceId' | 'kinds' | 'tier' | 'minDuration' | 'component'
 >;
 
-/** A bounded read of a capture's events. */
+/** A complete read of the events a narrowing selects in one capture. */
 interface EventSlice {
-  /** The events read, in start order. */
+  /** Every event the narrowing selects, in capture order (`startTime`, then `id`). */
   readonly events: readonly TelemetryEvent[];
-  /** How many events the store holds for the narrowing. */
-  readonly total: number;
-  /** Whether events remain that the bound left unread. */
-  readonly truncated: boolean;
+  /**
+   * What the read was held to the ceiling as: the scan's `total`, which for a
+   * complete scan is `events.length` plus `skipped`.
+   */
+  readonly counted: number;
   /** Stored rows the store could not reconstruct and left out. */
   readonly skipped: number;
 }
 
+/**
+ * One scan's outcome within its row budget: the whole slice, or the
+ * statement that the slice is larger than the budget and was not read.
+ */
+type ScannedSlice =
+  | { readonly fits: true; readonly slice: EventSlice }
+  | { readonly fits: false; readonly total: number };
+
 /** The empty slice: what a scope without a capture, or a narrowing to no kind, reads. */
 const EMPTY_SLICE: EventSlice = Object.freeze({
   events: Object.freeze([]),
-  total: 0,
-  truncated: false,
+  counted: 0,
   skipped: 0,
 });
+
+/**
+ * The value each aggregate source computes from its slice, before ordering and
+ * paging: what a cache entry holds per source. Typed off the protocol's result
+ * members, so a cached value is exactly what a response is built from.
+ */
+interface AggregateValues {
+  readonly renders: readonly DataRowOf<'renders'>[];
+  readonly componentTree: PayloadOf<'componentTree'>;
+  readonly requests: readonly DataRowOf<'requests'>[];
+  readonly queries: readonly DataRowOf<'queries'>[];
+  readonly stateTransitions: readonly DataRowOf<'stateTransitions'>[];
+  readonly graph: PayloadOf<'graph'>;
+  readonly metrics: readonly MetricValue[];
+}
+
+/** How each aggregate source is computed from its input events. */
+type AggregateComputations = {
+  readonly [S in AggregateDataSource]: (events: readonly TelemetryEvent[]) => AggregateValues[S];
+};
+
+/**
+ * The one computation of each aggregate source, used by the shared traversal
+ * and by a source's own slice read alike, so the two can only differ in their
+ * input — which the shared traversal derives to be the same.
+ *
+ * `stateTransitions` lifts the aggregate's own cap to the slice ceiling, so
+ * `total` is every transition of the slice rather than the aggregate's
+ * default; `componentTree` turns "no rendering evidence" (`undefined`, which
+ * does not survive JSON) into the wire's `null`.
+ */
+const AGGREGATE_COMPUTE: AggregateComputations = Object.freeze({
+  renders: (events) => aggregateRenders(events),
+  componentTree: (events) => buildComponentTreeSnapshot(events) ?? null,
+  requests: (events) => aggregateRequests(events),
+  queries: (events) => aggregateQueries(events),
+  stateTransitions: (events) =>
+    aggregateStateTransitions(events, { maxTransitions: MAX_AGGREGATE_INPUT_EVENTS }),
+  graph: (events) => buildDependencyGraph(events),
+  metrics: (events) => computeMetrics(events),
+});
+
+/**
+ * Everything one cache entry can hold for a capture and a filter: the value
+ * of each aggregate source, and the answer of an unfiltered `metrics` read.
+ */
+interface BundleValues extends AggregateValues {
+  /**
+   * What an unfiltered `metrics` read answers with at the entry's generation:
+   * the capture summary's values when a summary covers every stored event, and
+   * otherwise the values computed from the events. Held apart from `metrics` —
+   * always computed from the events — because a covering summary takes
+   * precedence over the computation.
+   */
+  readonly unfilteredMetrics: readonly MetricValue[];
+}
+
+/** One value a cache entry can hold. */
+type BundleSlot = keyof BundleValues;
+
+/** The values a cache entry holds, or a write supplies: any subset of the slots. */
+type AggregateBundle = Partial<BundleValues>;
+
+/** The aggregate sources, in vocabulary order, read off the query vocabulary itself. */
+const AGGREGATE_DATA_SOURCES: readonly AggregateDataSource[] = Object.freeze(
+  DATA_QUERY_SOURCES.filter(
+    (source): source is AggregateDataSource =>
+      source !== 'trace' && source !== 'spans' && source !== 'events',
+  ),
+);
+
+/** Every slot of a cache entry. */
+const BUNDLE_SLOTS: readonly BundleSlot[] = Object.freeze([
+  ...AGGREGATE_DATA_SOURCES,
+  'unfilteredMetrics',
+]);
+
+/** A write of one source's value alone. */
+type SingleSlotWriters = {
+  readonly [S in AggregateDataSource]: (value: AggregateValues[S]) => AggregateBundle;
+};
+
+/**
+ * The bundle holding one source's value and nothing else: what a source that
+ * read its own slice caches.
+ */
+const SINGLE_SLOT: SingleSlotWriters = Object.freeze({
+  renders: (renders) => ({ renders }),
+  componentTree: (componentTree) => ({ componentTree }),
+  requests: (requests) => ({ requests }),
+  queries: (queries) => ({ queries }),
+  stateTransitions: (stateTransitions) => ({ stateTransitions }),
+  graph: (graph) => ({ graph }),
+  metrics: (metrics) => ({ metrics }),
+});
+
+/** The refusal of a slice larger than {@link MAX_AGGREGATE_INPUT_EVENTS}. Counts only. */
+function sliceTooLarge(source: DataQuerySource, total: number): DebuggenError {
+  return new DebuggenError(
+    'PANEL_INVALID',
+    'The view covers more captured events than one panel read aggregates.',
+    {
+      hint: 'Narrow the view — filter it to one trace or to fewer kinds — so it reads fewer events.',
+      details: {
+        source,
+        total,
+        bound: MAX_AGGREGATE_INPUT_EVENTS,
+        reason: 'aggregate-input-too-large',
+      },
+    },
+  );
+}
+
+/** The refusal of a scan that contradicts its own count or row budget. Counts only. */
+function scanInconsistent(): DebuggenError {
+  return new DebuggenError(
+    'STORE_ERROR',
+    'The store scanned capture events inconsistently with its own count.',
+    {
+      hint: STORE_FAILURE_HINT,
+      details: { operation: 'reading capture events', reason: 'scan-inconsistent' },
+    },
+  );
+}
+
+/**
+ * Whether a scan contradicts itself under the row budget it was given.
+ *
+ * `TelemetryRepo.scanEvents` is complete exactly when its selection fits the
+ * budget, and a complete scan's `total` is its rows plus the rows it skipped.
+ * A scan claiming completeness over more than the budget, or over more rows
+ * than it counted, would let a slice past the memory ceiling; one declaring
+ * itself incomplete within the budget would refuse a view that fits. Either is
+ * a store fault rather than an answer.
+ */
+function scanContradictsItself(scan: TelemetryScan, budget: number): boolean {
+  if (!scan.complete) {
+    return scan.total <= budget;
+  }
+  return scan.total > budget || scan.rows.length + (scan.skipped ?? 0) > scan.total;
+}
 
 /**
  * The store failure a throwing port is converted to.
@@ -972,28 +1310,468 @@ function orderMetrics(values: readonly MetricValue[]): MetricValue[] {
 }
 
 /**
- * The trace a `trace` query without a `traceId` resolves to.
+ * The roots of a tree reduced to the nodes `keep` selects **and every ancestor
+ * of one**, each surviving node otherwise unchanged.
  *
- * The capture summary's `primaryTraceId` — the longest interaction, which is
- * the trace a timeline filters on by default — when the stored summary names
- * one the capture still holds; otherwise the capture's first trace in the
- * store's order (earliest event first). Both are total orders, so every read
- * of one capture picks the same trace.
+ * Because a node survives whenever a descendant does, the path from every kept
+ * node to its root is kept whole, so every `depth`, orphan flag and lineage
+ * stays true of the reduced tree. A node whose children all survive untouched
+ * is returned as the same object; any other survivor is copied with only its
+ * surviving children, in their canonical order. Iterative, like the package's
+ * own traversals, so a deep tree cannot exhaust the stack.
  */
-function defaultTraceId(
-  traceIds: readonly TraceId[],
-  summary: CaptureSummary | undefined,
-): TraceId | undefined {
-  const primary = summary?.primaryTraceId;
-  if (primary !== undefined && traceIds.includes(primary)) {
-    return primary;
+function pruneTraceRoots(
+  roots: readonly TraceNode[],
+  keep: (node: TraceNode) => boolean,
+): TraceNode[] {
+  interface Frame {
+    readonly node: TraceNode;
+    next: number;
+    readonly kept: TraceNode[];
   }
-  return traceIds[0];
+  const survivors: TraceNode[] = [];
+  for (const root of roots) {
+    const stack: Frame[] = [{ node: root, next: 0, kept: [] }];
+    for (let frame = stack.at(-1); frame !== undefined; frame = stack.at(-1)) {
+      const child = frame.node.children[frame.next];
+      if (child !== undefined) {
+        frame.next += 1;
+        stack.push({ node: child, next: 0, kept: [] });
+        continue;
+      }
+      stack.pop();
+      if (frame.kept.length === 0 && !keep(frame.node)) {
+        continue;
+      }
+      const { node, kept } = frame;
+      const untouched =
+        kept.length === node.children.length &&
+        kept.every((survivor, index) => survivor === node.children[index]);
+      const survived: TraceNode = untouched ? node : { ...node, children: kept };
+      (stack.at(-1)?.kept ?? survivors).push(survived);
+    }
+  }
+  return survivors;
+}
+
+/**
+ * A tree rebuilt from a subset of its own nodes, every aggregate re-derived.
+ *
+ * The builder's own observations are carried over only as far as they still
+ * hold: the primary root while it is still a root, and the duplicated span ids
+ * that still have a node in the tree.
+ */
+function rebuiltTree(tree: TraceTree, roots: readonly TraceNode[], truncated: boolean): TraceTree {
+  const present = new Set<string>();
+  for (const root of roots) {
+    walkNode(root, (node) => {
+      present.add(node.event.spanId);
+    });
+  }
+  const primary = tree.primaryRootSpanId;
+  return buildTraceTree(tree.traceId, roots, {
+    primaryRootSpanId:
+      primary !== undefined && roots.some((root) => root.event.spanId === primary)
+        ? primary
+        : undefined,
+    duplicateSpanIds: tree.duplicateSpanIds.filter((spanId) => present.has(spanId)),
+    truncated,
+  });
+}
+
+/**
+ * A tree cut to its first `budget` nodes in canonical pre-order, flagged
+ * `truncated`; the tree itself when it is within the budget.
+ *
+ * Pre-order visits a parent before any of its children, so the first `budget`
+ * nodes always include every ancestor of each of them and the cut tree stays
+ * connected. Counts the nodes it walks rather than trusting `nodeCount`, and
+ * stops one past the budget.
+ */
+function withinNodeBudget(tree: TraceTree, budget: number): TraceTree {
+  const inBudget = new Set<TraceNode>();
+  const stack: TraceNode[] = [...tree.roots].reverse();
+  let exceeded = false;
+  for (let node = stack.pop(); node !== undefined; node = stack.pop()) {
+    if (inBudget.size === budget) {
+      exceeded = true;
+      break;
+    }
+    inBudget.add(node);
+    for (let index = node.children.length - 1; index >= 0; index -= 1) {
+      const child = node.children[index];
+      if (child !== undefined) {
+        stack.push(child);
+      }
+    }
+  }
+  if (!exceeded) {
+    return tree;
+  }
+  return rebuiltTree(
+    tree,
+    pruneTraceRoots(tree.roots, (node) => inBudget.has(node)),
+    true,
+  );
+}
+
+/**
+ * Capture order, the order every scan returns its rows in (`start_time ASC,
+ * id ASC`): `startTime`, then `id`.
+ */
+function compareStartOrder(left: TelemetryEvent, right: TelemetryEvent): number {
+  if (left.startTime !== right.startTime) {
+    return left.startTime < right.startTime ? -1 : 1;
+  }
+  if (left.id === right.id) {
+    return 0;
+  }
+  return left.id < right.id ? -1 : 1;
+}
+
+/**
+ * Two slices, each in capture order and disjoint by kind, merged into one in
+ * capture order.
+ *
+ * Every row is appended one at a time, remainders included. A spread
+ * (`push(...rest)`) passes each remaining row as a call argument, and a
+ * remainder of the size a slice may reach — up to
+ * {@link MAX_AGGREGATE_INPUT_EVENTS} rows — exceeds the engine's argument
+ * limit (Node 24 throws `RangeError` from about 150 000), which would turn a
+ * readable view into an `INTERNAL` failure.
+ */
+function mergeInStartOrder(
+  left: readonly TelemetryEvent[],
+  right: readonly TelemetryEvent[],
+): TelemetryEvent[] {
+  const merged: TelemetryEvent[] = [];
+  let leftIndex = 0;
+  let rightIndex = 0;
+  while (leftIndex < left.length && rightIndex < right.length) {
+    const fromLeft = left[leftIndex];
+    const fromRight = right[rightIndex];
+    // Unreachable for the dense arrays a scan returns; a hole is skipped
+    // rather than allowed to end the merge early.
+    if (fromLeft === undefined) {
+      leftIndex += 1;
+      continue;
+    }
+    if (fromRight === undefined) {
+      rightIndex += 1;
+      continue;
+    }
+    if (compareStartOrder(fromLeft, fromRight) <= 0) {
+      merged.push(fromLeft);
+      leftIndex += 1;
+    } else {
+      merged.push(fromRight);
+      rightIndex += 1;
+    }
+  }
+  for (; leftIndex < left.length; leftIndex += 1) {
+    const rest = left[leftIndex];
+    if (rest !== undefined) {
+      merged.push(rest);
+    }
+  }
+  for (; rightIndex < right.length; rightIndex += 1) {
+    const rest = right[rightIndex];
+    if (rest !== undefined) {
+      merged.push(rest);
+    }
+  }
+  return merged;
+}
+
+/**
+ * The cache key of one capture and filter: every aggregate source read under
+ * that filter shares the entry, which is what lets one traversal serve them
+ * all.
+ *
+ * The filter's fields are listed by name in a fixed order and `kinds` as a
+ * sorted copy, because the store reads a kind list as a set: two filters that
+ * select the same events share one entry. Held in memory only, never logged —
+ * a filter may carry a captured component name.
+ */
+function aggregateCacheKey(
+  sessionId: SessionId,
+  captureId: CaptureId,
+  filter: DataQueryFilter | undefined,
+): string {
+  const canonical: Readonly<Record<string, unknown>> = {
+    ...filter,
+    ...(filter?.kinds === undefined ? {} : { kinds: [...filter.kinds].sort(compareText) }),
+  };
+  const fields = Object.entries(canonical)
+    .filter(([, value]) => value !== undefined)
+    .sort(([left], [right]) => compareText(left, right));
+  return JSON.stringify([sessionId, captureId, fields]);
+}
+
+/** Code-unit order of two strings, for the canonical forms above. */
+function compareText(left: string, right: string): number {
+  if (left === right) {
+    return 0;
+  }
+  return left < right ? -1 : 1;
+}
+
+/**
+ * Whether two capture generations are the same, field for field — the only
+ * comparison `CaptureGeneration` supports: equal means the capture holds the
+ * rows it held, and nothing is implied by an order.
+ */
+function sameGeneration(left: CaptureGeneration, right: CaptureGeneration): boolean {
+  return (
+    left.dataVersion === right.dataVersion &&
+    left.purges === right.purges &&
+    left.writes === right.writes
+  );
+}
+
+/** The slots a bundle actually carries, in {@link BUNDLE_SLOTS} order. */
+function slotsOf(values: AggregateBundle): BundleSlot[] {
+  return BUNDLE_SLOTS.filter((slot) => values[slot] !== undefined);
+}
+
+/** One write still represented in a cache entry. */
+interface CacheContribution {
+  /** The slots the write supplied that no later write has replaced. */
+  readonly slots: readonly BundleSlot[];
+  /** How many events the write read: its share of the entry's weight. */
+  readonly weight: number;
+}
+
+/** One cached bundle and the capture generation its values describe. */
+interface CacheEntry {
+  /** The capture's generation, read before any event the values were computed from. */
+  readonly generation: CaptureGeneration;
+  /** The values. */
+  readonly values: AggregateBundle;
+  /** The writes the values came from, so a replaced slot stops weighing. */
+  readonly contributions: readonly CacheContribution[];
+  /** The sum of the contributions' weights: the entry's weight against the bound. */
+  readonly weight: number;
+}
+
+/** The resolver's aggregate cache (see "The aggregate cache" above). */
+interface AggregateCache {
+  /**
+   * One slot of the entry under `key`, when the entry was computed at exactly
+   * `generation`; an entry of any other generation is dropped. A read that
+   * finds the entry marks it most recently used, whether or not it holds the
+   * slot.
+   */
+  read<K extends BundleSlot>(
+    key: string,
+    generation: CaptureGeneration,
+    slot: K,
+  ): BundleValues[K] | undefined;
+  /**
+   * Caches `values`, computed at `generation` from `weight` events: merged into
+   * the entry under `key` when that entry is of the same generation, and
+   * replacing it otherwise. Least recently used entries are evicted past
+   * either bound.
+   */
+  write(key: string, generation: CaptureGeneration, values: AggregateBundle, weight: number): void;
+}
+
+/**
+ * A least-recently-used cache of aggregate bundles, bounded by entry count and
+ * by the events its entries were computed from.
+ *
+ * One `Map` — whose insertion order is the recency order — holds every entry,
+ * so eviction is global across sessions, captures and filters. An entry's
+ * weight is the events read by the writes it still holds: a write that
+ * replaces every slot an earlier write supplied (the shared traversal after a
+ * source's own read) retires that write's weight, so one capture's bundle
+ * weighs what one traversal of it read, however many sources it serves. A
+ * merge that would weigh more than the bound keeps the newest write alone; a
+ * write heavier than the bound by itself is not kept, and its values are still
+ * the caller's answer.
+ */
+function createAggregateCache(maxEntries: number, maxWeight: number): AggregateCache {
+  const entries = new Map<string, CacheEntry>();
+  let weight = 0;
+
+  const forget = (key: string): void => {
+    const entry = entries.get(key);
+    if (entry === undefined) {
+      return;
+    }
+    entries.delete(key);
+    weight -= entry.weight;
+  };
+
+  const keep = (key: string, entry: CacheEntry): void => {
+    entries.set(key, entry);
+    weight += entry.weight;
+    while (entries.size > maxEntries || weight > maxWeight) {
+      const oldest = entries.keys().next();
+      if (oldest.done === true) {
+        break;
+      }
+      forget(oldest.value);
+    }
+  };
+
+  return {
+    read(key, generation, slot) {
+      const entry = entries.get(key);
+      if (entry === undefined) {
+        return undefined;
+      }
+      if (!sameGeneration(entry.generation, generation)) {
+        forget(key);
+        return undefined;
+      }
+      entries.delete(key);
+      entries.set(key, entry);
+      return entry.values[slot];
+    },
+    write(key, generation, values, written) {
+      const slots = slotsOf(values);
+      if (slots.length === 0) {
+        return;
+      }
+      const incoming: CacheContribution = { slots, weight: Math.max(1, written) };
+      const existing = entries.get(key);
+      forget(key);
+
+      let entry: CacheEntry = {
+        generation,
+        values,
+        contributions: [incoming],
+        weight: incoming.weight,
+      };
+      if (existing !== undefined && sameGeneration(existing.generation, generation)) {
+        const contributions = [
+          ...existing.contributions
+            .map((contribution) => ({
+              slots: contribution.slots.filter((slot) => !slots.includes(slot)),
+              weight: contribution.weight,
+            }))
+            .filter((contribution) => contribution.slots.length > 0),
+          incoming,
+        ];
+        const merged = contributions.reduce((sum, contribution) => sum + contribution.weight, 0);
+        if (merged <= maxWeight) {
+          entry = {
+            generation,
+            values: { ...existing.values, ...values },
+            contributions,
+            weight: merged,
+          };
+        }
+      }
+      if (entry.weight > maxWeight) {
+        return;
+      }
+      keep(key, entry);
+    },
+  };
 }
 
 /** Whether a kind narrowing selects no kind at all, and so matches nothing. */
 function selectsNoKind(kinds: readonly TelemetryKind[] | undefined): boolean {
   return kinds !== undefined && kinds.length === 0;
+}
+
+/**
+ * The context kinds of a subject-narrowed read plan: the kinds of its slice
+ * except the subjects'. Disjoint from the subject kinds by construction, so
+ * the two halves of the slice never hold one record twice.
+ */
+function contextKindsOf(
+  plan: AggregateReadPlan,
+  subjectKinds: readonly TelemetryKind[],
+): readonly TelemetryKind[] {
+  return (plan.sliceKinds ?? TELEMETRY_KINDS).filter((kind) => !subjectKinds.includes(kind));
+}
+
+/**
+ * The events of `events` whose kind is one of `kinds`, in their order; all of
+ * them, as the same array, when `kinds` is `undefined`.
+ *
+ * This is the partition a store read's `kinds` narrowing applies — the store
+ * filters on the same `kind` value — so partitioning a capture-ordered read
+ * yields exactly the rows, in exactly the order, the narrowed read returns.
+ */
+function ofKinds(
+  events: readonly TelemetryEvent[],
+  kinds: readonly TelemetryKind[] | undefined,
+): readonly TelemetryEvent[] {
+  if (kinds === undefined) {
+    return events;
+  }
+  const selected = new Set<TelemetryKind>(kinds);
+  return events.filter((event) => selected.has(event.kind));
+}
+
+/** The reads of one shared traversal of a capture under one filter, both in capture order. */
+interface SharedSlices {
+  /** Every event of the capture the filter's `traceId` selects, of every kind. */
+  readonly whole: readonly TelemetryEvent[];
+  /**
+   * Every event the whole filter selects: a read of its own when the filter
+   * narrows by more than the trace, and `whole` itself otherwise.
+   */
+  readonly narrowed: readonly TelemetryEvent[];
+  /** Whether the filter narrows by more than the trace ({@link narrowsSubjects}). */
+  readonly narrowing: boolean;
+  /** How many events the traversal read, both reads together: the bundle's cache weight. */
+  readonly read: number;
+}
+
+/**
+ * The input of one aggregate source derived from a shared traversal — row for
+ * row, and in the same order, what the source's own read under its
+ * {@link AGGREGATE_READ_PLANS} entry returns:
+ *
+ * - a source whose every record is a subject reads the whole filter narrowed
+ *   to its slice kinds: `narrowed`, partitioned by kind;
+ * - a subject-narrowed source under a filter that narrows by the trace only
+ *   reads its slice kinds of the trace: `whole`, partitioned by kind;
+ * - under a filter that narrows further, its context half (its slice kinds
+ *   except the subjects', narrowed by the trace only) is `whole` partitioned
+ *   by kind, its subject half (the subjects the whole filter selects) is
+ *   `narrowed` partitioned by kind, and the two are merged into capture order
+ *   by the same merge the two reads are.
+ */
+function sharedAggregateInput(
+  source: AggregateDataSource,
+  shared: SharedSlices,
+): readonly TelemetryEvent[] {
+  const plan = AGGREGATE_READ_PLANS[source];
+  const subjectKinds = plan.subjectKinds;
+  if (subjectKinds === undefined) {
+    return ofKinds(shared.narrowed, plan.sliceKinds);
+  }
+  if (!shared.narrowing) {
+    return ofKinds(shared.whole, plan.sliceKinds);
+  }
+  return mergeInStartOrder(
+    ofKinds(shared.whole, contextKindsOf(plan, subjectKinds)),
+    ofKinds(shared.narrowed, subjectKinds),
+  );
+}
+
+/**
+ * Every aggregate source computed from one shared traversal: the bundle a
+ * cold read of an every-kind source caches, one explicit property per source.
+ */
+function computeBundle(shared: SharedSlices): AggregateValues {
+  return {
+    renders: AGGREGATE_COMPUTE.renders(sharedAggregateInput('renders', shared)),
+    componentTree: AGGREGATE_COMPUTE.componentTree(sharedAggregateInput('componentTree', shared)),
+    requests: AGGREGATE_COMPUTE.requests(sharedAggregateInput('requests', shared)),
+    queries: AGGREGATE_COMPUTE.queries(sharedAggregateInput('queries', shared)),
+    stateTransitions: AGGREGATE_COMPUTE.stateTransitions(
+      sharedAggregateInput('stateTransitions', shared),
+    ),
+    graph: AGGREGATE_COMPUTE.graph(sharedAggregateInput('graph', shared)),
+    metrics: AGGREGATE_COMPUTE.metrics(sharedAggregateInput('metrics', shared)),
+  };
 }
 
 /** The paging counts of a result, for a timing record. */
@@ -1021,8 +1799,11 @@ type EventRowDataSource = {
 /**
  * Builds the panel-data resolver.
  *
- * Holds no state of its own between calls: every query reads the store afresh,
- * so a panel reloaded during a capture sees the evidence that has arrived since.
+ * Every query reads its scope from the store, so a panel reloaded during a
+ * capture sees the evidence that has arrived since. The one state kept between
+ * calls is the aggregate cache ("The aggregate cache" above), and it cannot
+ * change an answer: an entry is served only while the capture's generation is
+ * the one read before the rows its values were computed from.
  *
  * @param deps The store, correlator and lookups the resolver reads.
  * @returns The resolver.
@@ -1031,16 +1812,101 @@ export function createPanelDataResolver(deps: PanelDataResolverDeps): PanelDataR
   const logger = subsystemLogger(deps.logger ?? noopLogger, SUBSYSTEM);
   const now = deps.now ?? Date.now;
   const { telemetry, correlator } = deps;
+  const cache = createAggregateCache(AGGREGATE_CACHE_MAX_ENTRIES, AGGREGATE_CACHE_MAX_INPUT_EVENTS);
 
-  /** The one capture a query reads. */
+  /** The refusal of a read no capture lookup can scope. */
+  const noCaptureLookup = (sessionId: SessionId, message: string): DebuggenError =>
+    new DebuggenError('SESSION_INVALID_STATE', message, {
+      hint: 'Name the capture to read, or construct the resolver with the session store.',
+      details: { sessionId, reason: 'no-capture-lookup' },
+    });
+
+  /** The refusal of a capture that is not the session's. */
+  const captureNotInSession = (sessionId: SessionId, captureId: CaptureId): DebuggenError =>
+    new DebuggenError('SESSION_INVALID_STATE', 'The session has no such capture.', {
+      hint: 'Choose a capture of this session, or omit the capture to read its latest one.',
+      details: { sessionId, captureId, reason: 'capture-not-in-session' },
+    });
+
+  /**
+   * The capture a rendered panel was generated from.
+   *
+   * One indexed read of the panel's row and its linked capture. A panel the
+   * session does not hold is refused; a panel whose capture was purged scopes
+   * the read to no capture, so every source answers with its empty value and
+   * never with another capture's evidence. The panel id reaches no error and no
+   * record: the caller knows which panel it asked about.
+   */
+  const panelScope = (
+    sessions: SessionCapturePort,
+    sessionId: SessionId,
+    panelId: PanelId,
+    named: CaptureId | undefined,
+  ): Result<ResolvedScope, DebuggenError> => {
+    const lookup = guarded("reading a panel's capture", () =>
+      sessions.getPanelCapture(sessionId, panelId),
+    );
+    if (!lookup.ok) {
+      return err(lookup.error);
+    }
+    if (lookup.value.panel === 'unknown') {
+      return err(
+        new DebuggenError('SESSION_INVALID_STATE', 'The session has no such panel.', {
+          hint: 'Reload the panel from the session that generated it.',
+          details: { sessionId, reason: 'panel-not-in-session' },
+        }),
+      );
+    }
+    const stored = lookup.value.capture;
+    if (stored !== undefined && stored.sessionId !== sessionId) {
+      return err(captureNotInSession(sessionId, stored.capture.id));
+    }
+    const captureId = stored?.capture.id;
+    if (named !== undefined && named !== captureId) {
+      return err(
+        new DebuggenError(
+          'SESSION_INVALID_STATE',
+          'The named capture is not the one the panel was generated from.',
+          {
+            hint: 'Name only the panel; its data is read from its own capture.',
+            details: { sessionId, captureId: named, reason: 'panel-capture-mismatch' },
+          },
+        ),
+      );
+    }
+    if (captureId === undefined) {
+      return ok({ sessionId, captureId: undefined, storedSummary: undefined, binding: 'panel' });
+    }
+    return ok({
+      sessionId,
+      captureId,
+      storedSummary: summaryFor(stored, captureId),
+      binding: 'panel',
+    });
+  };
+
+  /**
+   * The one capture a query reads: the rendered panel's, else the named one,
+   * else the session's open capture, else its most recent — each an indexed
+   * lookup, never a walk of the session's capture history.
+   */
   const resolveScope = (context: PanelDataContext): Result<ResolvedScope, DebuggenError> => {
     const { sessionId } = context;
     const sessions = deps.sessions;
 
+    if (context.panelId !== undefined) {
+      if (sessions === undefined) {
+        return err(
+          noCaptureLookup(sessionId, "A panel was named, and its capture can't be looked up."),
+        );
+      }
+      return panelScope(sessions, sessionId, context.panelId, context.captureId);
+    }
+
     if (context.captureId !== undefined) {
       const captureId = context.captureId;
       if (sessions === undefined) {
-        return ok({ sessionId, captureId, storedSummary: undefined });
+        return ok({ sessionId, captureId, storedSummary: undefined, binding: 'capture' });
       }
       const stored = guarded('reading a capture', () => sessions.getCapture(captureId));
       if (!stored.ok) {
@@ -1048,27 +1914,18 @@ export function createPanelDataResolver(deps: PanelDataResolverDeps): PanelDataR
       }
       const found = stored.value;
       if (found === undefined || found.sessionId !== sessionId || found.capture.id !== captureId) {
-        return err(
-          new DebuggenError('SESSION_INVALID_STATE', 'The session has no such capture.', {
-            hint: 'Choose a capture of this session, or omit the capture to read its latest one.',
-            details: { sessionId, captureId, reason: 'capture-not-in-session' },
-          }),
-        );
+        return err(captureNotInSession(sessionId, captureId));
       }
-      return ok({ sessionId, captureId, storedSummary: summaryFor(found, captureId) });
+      return ok({
+        sessionId,
+        captureId,
+        storedSummary: summaryFor(found, captureId),
+        binding: 'capture',
+      });
     }
 
     if (sessions === undefined) {
-      return err(
-        new DebuggenError(
-          'SESSION_INVALID_STATE',
-          'No capture was named and none can be looked up.',
-          {
-            hint: 'Name the capture to read, or construct the resolver with the session store.',
-            details: { sessionId, reason: 'no-capture-lookup' },
-          },
-        ),
-      );
+      return err(noCaptureLookup(sessionId, 'No capture was named and none can be looked up.'));
     }
 
     const active = guarded('reading the open capture', () => sessions.getActiveCapture(sessionId));
@@ -1077,98 +1934,130 @@ export function createPanelDataResolver(deps: PanelDataResolverDeps): PanelDataR
     }
     let chosen = active.value?.sessionId === sessionId ? active.value : undefined;
     if (chosen === undefined) {
-      const listed = guarded('listing captures', () => sessions.listCaptures(sessionId));
-      if (!listed.ok) {
-        return err(listed.error);
+      const latest = guarded('reading the latest capture', () =>
+        sessions.getLatestCapture(sessionId),
+      );
+      if (!latest.ok) {
+        return err(latest.error);
       }
-      chosen = listed.value.filter((capture) => capture.sessionId === sessionId).at(-1);
+      chosen = latest.value?.sessionId === sessionId ? latest.value : undefined;
     }
     if (chosen === undefined) {
-      return ok({ sessionId, captureId: undefined, storedSummary: undefined });
+      return ok({ sessionId, captureId: undefined, storedSummary: undefined, binding: 'live' });
     }
     const captureId = chosen.capture.id;
-    return ok({ sessionId, captureId, storedSummary: summaryFor(chosen, captureId) });
+    return ok({
+      sessionId,
+      captureId,
+      storedSummary: summaryFor(chosen, captureId),
+      binding: 'live',
+    });
   };
 
   /**
-   * Reads a capture's events for an aggregate, page by page in start order, up
-   * to {@link MAX_AGGREGATE_INPUT_EVENTS}.
+   * Reads **every** event a narrowing selects in the scope's capture — one
+   * `scanEvents` call, which is one count and, when the selection fits
+   * `budget`, one ordered statement in capture order — or reports that it does
+   * not fit, having read no row.
+   *
+   * A store failure is an `Err`; so is a scan that contradicts its own count
+   * or budget ({@link scanContradictsItself}), refused as `scan-inconsistent`
+   * rather than trusted. Synchronous, so no ingest interleaves with the read.
    */
-  const readSlice = (
+  const scanSlice = (
     log: Logger,
-    source: AggregateDataSource,
+    source: DataQuerySource,
     scope: ResolvedScope,
     narrowing: SliceNarrowing,
-  ): Result<EventSlice, DebuggenError> => {
+    budget: number,
+  ): Result<ScannedSlice, DebuggenError> => {
     const captureId = scope.captureId;
     if (captureId === undefined || selectsNoKind(narrowing.kinds)) {
-      return ok(EMPTY_SLICE);
+      return ok({ fits: true, slice: EMPTY_SLICE });
     }
 
-    const events: TelemetryEvent[] = [];
-    let offset = TELEMETRY_QUERY_DEFAULT_OFFSET;
-    let total = 0;
-    let skipped = 0;
-    let pages = 0;
-    let truncated = false;
-
-    for (;;) {
-      if (pages >= MAX_AGGREGATE_INPUT_PAGES) {
-        truncated = true;
-        break;
-      }
-      const pageOffset = offset;
-      const page = guarded('reading capture events', () =>
-        telemetry.query({
-          sessionId: scope.sessionId,
-          captureId,
-          ...narrowing,
-          sort: SLICE_READ_SORT,
-          limit: TELEMETRY_QUERY_MAX_LIMIT,
-          offset: pageOffset,
-        }),
+    const scanned = guarded('reading capture events', () =>
+      telemetry.scanEvents({ sessionId: scope.sessionId, captureId, ...narrowing }, budget),
+    );
+    if (!scanned.ok) {
+      return err(scanned.error);
+    }
+    const scan = scanned.value;
+    const skipped = scan.skipped ?? 0;
+    if (scanContradictsItself(scan, budget)) {
+      log.warn(
+        'The store scanned a slice inconsistently with its own count; the view was refused.',
+        {
+          source,
+          complete: scan.complete,
+          read: scan.rows.length,
+          skipped,
+          total: scan.total,
+          budget,
+        },
       );
-      if (!page.ok) {
-        return err(page.error);
-      }
-      pages += 1;
-      total = page.value.total;
-      skipped += page.value.skipped ?? 0;
-      for (const row of page.value.rows) {
-        events.push(row);
-      }
-      const next = page.value.nextOffset;
-      if (next === undefined) {
-        break;
-      }
-      if (next <= pageOffset) {
-        // A pager that does not advance cannot be followed; what was read is
-        // kept and reported as incomplete rather than requested again forever.
-        truncated = true;
-        break;
-      }
-      offset = next;
+      return err(scanInconsistent());
+    }
+    if (!scan.complete) {
+      return ok({ fits: false, total: scan.total });
     }
 
-    if (truncated) {
-      log.warn('An aggregate read reached its bound; the view covers the earliest events.', {
-        source,
-        read: events.length,
-        total,
-        bound: MAX_AGGREGATE_INPUT_EVENTS,
-      });
-    }
     if (skipped > 0) {
       log.warn('Stored events that no longer validate were left out of a panel view.', {
         source,
         skipped,
       });
     }
-
-    return ok({ events, total, truncated, skipped });
+    return ok({ fits: true, slice: { events: scan.rows, counted: scan.total, skipped } });
   };
 
-  /** The input slice of one aggregate source, per its {@link AGGREGATE_READ_PLANS} entry. */
+  /**
+   * Reads **every** event a narrowing selects in the scope's capture, or
+   * refuses: one {@link scanSlice} whose row budget is what the ceiling leaves.
+   *
+   * `alreadyCounted` is what an earlier read for the same answer was held to
+   * the ceiling as, so the two halves of a subject-narrowed slice are held to
+   * one ceiling together. A slice that does not fit is refused with
+   * {@link sliceTooLarge}, never answered from part of it.
+   */
+  const readSlice = (
+    log: Logger,
+    source: DataQuerySource,
+    scope: ResolvedScope,
+    narrowing: SliceNarrowing,
+    alreadyCounted: number,
+  ): Result<EventSlice, DebuggenError> => {
+    const scanned = scanSlice(
+      log,
+      source,
+      scope,
+      narrowing,
+      Math.max(0, MAX_AGGREGATE_INPUT_EVENTS - alreadyCounted),
+    );
+    if (!scanned.ok) {
+      return err(scanned.error);
+    }
+    if (!scanned.value.fits) {
+      const covered = alreadyCounted + scanned.value.total;
+      log.warn('A panel view covers more events than one read aggregates; it was refused.', {
+        source,
+        total: covered,
+        bound: MAX_AGGREGATE_INPUT_EVENTS,
+      });
+      return err(sliceTooLarge(source, covered));
+    }
+    return ok(scanned.value.slice);
+  };
+
+  /**
+   * The input slice of one aggregate source, per its {@link AGGREGATE_READ_PLANS}
+   * entry — every event of it — read for that source alone.
+   *
+   * A subject-narrowed slice is read in two disjoint halves, each read once: the
+   * context records (every kind of the slice but the subjects', narrowed by
+   * `traceId` only) and the subjects the whole filter selects, merged back into
+   * capture order and held to the ceiling together.
+   */
   const readAggregateSlice = (
     log: Logger,
     source: AggregateDataSource,
@@ -1179,38 +2068,204 @@ export function createPanelDataResolver(deps: PanelDataResolverDeps): PanelDataR
     const subjectKinds = plan.subjectKinds;
 
     if (subjectKinds === undefined) {
-      return readSlice(log, source, scope, {
-        ...fullNarrowing(filter),
-        kinds: intersectKinds(plan.sliceKinds, filter?.kinds),
-      });
+      return readSlice(
+        log,
+        source,
+        scope,
+        { ...fullNarrowing(filter), kinds: intersectKinds(plan.sliceKinds, filter?.kinds) },
+        0,
+      );
+    }
+    if (!narrowsSubjects(filter)) {
+      return readSlice(log, source, scope, { traceId: filter?.traceId, kinds: plan.sliceKinds }, 0);
     }
 
-    const context = readSlice(log, source, scope, {
-      traceId: filter?.traceId,
-      kinds: plan.sliceKinds,
-    });
-    if (!context.ok || !narrowsSubjects(filter)) {
+    const context = readSlice(
+      log,
+      source,
+      scope,
+      { traceId: filter?.traceId, kinds: contextKindsOf(plan, subjectKinds) },
+      0,
+    );
+    if (!context.ok) {
       return context;
     }
-
-    const subjects = readSlice(log, source, scope, {
-      ...fullNarrowing(filter),
-      kinds: intersectKinds(subjectKinds, filter?.kinds),
-    });
+    const subjects = readSlice(
+      log,
+      source,
+      scope,
+      { ...fullNarrowing(filter), kinds: intersectKinds(subjectKinds, filter?.kinds) },
+      context.value.counted,
+    );
     if (!subjects.ok) {
       return subjects;
     }
-
-    const selected = new Set(subjects.value.events.map((event) => event.id));
-    const events = context.value.events.filter(
-      (event) => !subjectKinds.includes(event.kind) || selected.has(event.id),
-    );
     return ok({
-      events,
-      total: context.value.total,
-      truncated: context.value.truncated || subjects.value.truncated,
+      events: mergeInStartOrder(context.value.events, subjects.value.events),
+      counted: context.value.counted + subjects.value.counted,
       skipped: context.value.skipped + subjects.value.skipped,
     });
+  };
+
+  /**
+   * One shared traversal of the scope's capture under `filter`: the reads
+   * every aggregate source's input is derived from ({@link sharedAggregateInput}).
+   *
+   * When the filter narrows by more than the trace, the whole filter's
+   * selection is read first, then the trace's whole slice with what the
+   * ceiling leaves; otherwise the trace's whole slice alone, which is then the
+   * filter's selection as well. `undefined` when either read does not fit the
+   * ceiling — no error: the requesting source then reads its own, narrower
+   * slice, and is refused only if that does not fit either. A store failure is
+   * an `Err`.
+   */
+  const readShared = (
+    log: Logger,
+    source: AggregateDataSource,
+    scope: ResolvedScope,
+    filter: DataQueryFilter | undefined,
+  ): Result<SharedSlices | undefined, DebuggenError> => {
+    const narrowing = narrowsSubjects(filter);
+    let narrowed: EventSlice = EMPTY_SLICE;
+    if (narrowing) {
+      const selection = scanSlice(
+        log,
+        source,
+        scope,
+        fullNarrowing(filter),
+        MAX_AGGREGATE_INPUT_EVENTS,
+      );
+      if (!selection.ok) {
+        return err(selection.error);
+      }
+      if (!selection.value.fits) {
+        return ok(undefined);
+      }
+      narrowed = selection.value.slice;
+    }
+    const trace = scanSlice(
+      log,
+      source,
+      scope,
+      { traceId: filter?.traceId },
+      Math.max(0, MAX_AGGREGATE_INPUT_EVENTS - narrowed.counted),
+    );
+    if (!trace.ok) {
+      return err(trace.error);
+    }
+    if (!trace.value.fits) {
+      return ok(undefined);
+    }
+    const whole = trace.value.slice.events;
+    return ok({
+      whole,
+      narrowed: narrowing ? narrowed.events : whole,
+      narrowing,
+      read: whole.length + (narrowing ? narrowed.events.length : 0),
+    });
+  };
+
+  /** The capture's generation: what every cached aggregate is validated against. */
+  const readGeneration = (
+    sessionId: SessionId,
+    captureId: CaptureId,
+  ): Result<CaptureGeneration, DebuggenError> =>
+    guarded('reading the capture generation', () =>
+      telemetry.captureGeneration(sessionId, captureId),
+    );
+
+  /** The capture's stamp: how many events it holds, for the summary coverage check. */
+  const readStamp = (
+    sessionId: SessionId,
+    captureId: CaptureId,
+  ): Result<CaptureEventStamp, DebuggenError> =>
+    guarded('reading the capture stamp', () => telemetry.captureStamp(sessionId, captureId));
+
+  /**
+   * One aggregate of a capture whose generation `generation` was read in the
+   * caller's synchronous turn, before any event: from the cache while the
+   * entry of this capture and filter was computed at that generation, and
+   * otherwise computed and cached under it.
+   *
+   * On a miss, a source that reads every kind (`sliceKinds` undefined:
+   * `queries`, `stateTransitions`, `graph`, `metrics`) takes one shared
+   * traversal and computes **every** aggregate source from it, caching them as
+   * one bundle, so the other nodes of the panel are answered from memory; when
+   * that traversal does not fit the ceiling it reads its own slice instead. A
+   * source that reads a subset of the kinds (`renders`, `componentTree`,
+   * `requests`) reads only its own slice and caches only its own value. Both
+   * compute through {@link AGGREGATE_COMPUTE}. Failures are never cached.
+   */
+  const aggregateAt = <S extends AggregateDataSource>(
+    log: Logger,
+    source: S,
+    scope: ResolvedScope,
+    captureId: CaptureId,
+    filter: DataQueryFilter | undefined,
+    generation: CaptureGeneration,
+  ): Result<AggregateValues[S], DebuggenError> => {
+    const key = aggregateCacheKey(scope.sessionId, captureId, filter);
+    const cached = cache.read(key, generation, source);
+    if (cached !== undefined) {
+      log.debug('A panel view was answered from the aggregate cache.', { source });
+      return ok(cached);
+    }
+
+    if (AGGREGATE_READ_PLANS[source].sliceKinds === undefined) {
+      const shared = readShared(log, source, scope, filter);
+      if (!shared.ok) {
+        return err(shared.error);
+      }
+      if (shared.value !== undefined) {
+        const bundle = computeBundle(shared.value);
+        cache.write(key, generation, bundle, shared.value.read);
+        log.debug('Every aggregate of a panel view was computed from one traversal.', {
+          source,
+          read: shared.value.read,
+        });
+        return ok(bundle[source]);
+      }
+      log.debug('The shared traversal exceeds the ceiling; the view reads its own slice.', {
+        source,
+        bound: MAX_AGGREGATE_INPUT_EVENTS,
+      });
+    }
+
+    const slice = readAggregateSlice(log, source, scope, filter);
+    if (!slice.ok) {
+      return err(slice.error);
+    }
+    const compute: (events: readonly TelemetryEvent[]) => AggregateValues[S] =
+      AGGREGATE_COMPUTE[source];
+    const value = compute(slice.value.events);
+    const single: (computed: AggregateValues[S]) => AggregateBundle = SINGLE_SLOT[source];
+    cache.write(key, generation, single(value), slice.value.events.length);
+    return ok(value);
+  };
+
+  /**
+   * One aggregate of the scope's capture ({@link aggregateAt}), its capture's
+   * generation read first, in the same synchronous turn as any read of its
+   * events — so a value is cached under a generation that describes exactly
+   * the rows it was computed from, and a hit costs that one read.
+   */
+  const aggregateOf = <S extends AggregateDataSource>(
+    log: Logger,
+    source: S,
+    scope: ResolvedScope,
+    filter: DataQueryFilter | undefined,
+  ): Result<AggregateValues[S], DebuggenError> => {
+    const captureId = scope.captureId;
+    if (captureId === undefined) {
+      const compute: (events: readonly TelemetryEvent[]) => AggregateValues[S] =
+        AGGREGATE_COMPUTE[source];
+      return ok(compute(EMPTY_SLICE.events));
+    }
+    const generation = readGeneration(scope.sessionId, captureId);
+    if (!generation.ok) {
+      return err(generation.error);
+    }
+    return aggregateAt(log, source, scope, captureId, filter, generation.value);
   };
 
   /** One page of a flat event source, filtered, ordered and paged by the store. */
@@ -1287,7 +2342,61 @@ export function createPanelDataResolver(deps: PanelDataResolverDeps): PanelDataR
     return ok(orderRows(rows, chain));
   };
 
-  /** The `trace` source: one correlated interaction, or `null`. */
+  /**
+   * The correlated tree a `trace` query names, or its capture's default one.
+   *
+   * With no `traceId`, the default is the stored summary's `primaryTraceId` —
+   * the longest interaction, the trace a timeline anchors on — read directly
+   * when the capture still holds it, and otherwise the trace of the capture's
+   * earliest event, one indexed read (`firstTraceId`: `start_time` first, and
+   * two traces tied at the earliest instant go to the event that arrived
+   * first, by `ingest_seq` — not to the smaller trace id). Arrival numbers are
+   * never reused, so both rules are total orders: every read of one capture
+   * picks the same trace, and neither lists the capture's traces. After a
+   * purge removes the earliest rows, the default moves to the trace of the
+   * earliest event that remains.
+   */
+  const findTrace = async (
+    scope: ResolvedScope,
+    captureId: CaptureId,
+    named: string | undefined,
+  ): Promise<Result<TraceTree | undefined, DebuggenError>> => {
+    const read = (traceId: string): Promise<Result<TraceTree | undefined, DebuggenError>> =>
+      guardedAsync('reading a trace', () =>
+        correlator.getTrace(scope.sessionId, traceId, captureId),
+      );
+
+    if (named !== undefined) {
+      return read(named);
+    }
+    const primary = scope.storedSummary?.primaryTraceId;
+    if (primary !== undefined) {
+      const tree = await read(primary);
+      if (!tree.ok || tree.value !== undefined) {
+        return tree;
+      }
+    }
+    const first = guarded('finding the first trace', () =>
+      telemetry.firstTraceId(scope.sessionId, captureId),
+    );
+    if (!first.ok) {
+      return err(first.error);
+    }
+    const earliest = first.value;
+    if (earliest === undefined || earliest === primary) {
+      return ok(undefined);
+    }
+    return read(earliest);
+  };
+
+  /**
+   * The `trace` source: one correlated interaction, or `null`.
+   *
+   * The filter's other fields keep the nodes the store matches for them in
+   * that trace plus every ancestor of a match; a filter no node matches
+   * answers `null`, the empty value. Whatever it keeps, the answer holds at
+   * most {@link TRACE_NODE_BUDGET} nodes and says so when cut.
+   */
   const resolveTrace = async (
     log: Logger,
     scope: ResolvedScope,
@@ -1298,41 +2407,130 @@ export function createPanelDataResolver(deps: PanelDataResolverDeps): PanelDataR
       return ok(null);
     }
 
-    if (narrowsSubjects(filter)) {
-      log.debug('A trace is narrowed by its trace id only; the other filter fields do not apply.', {
-        ignored: filterFieldsOf(filter).filter((field) => field !== 'traceId'),
-      });
+    const found = await findTrace(scope, captureId, filter?.traceId);
+    if (!found.ok) {
+      return err(found.error);
     }
-
-    let traceId = filter?.traceId;
-    if (traceId === undefined) {
-      const listed = await guardedAsync('listing traces', () =>
-        correlator.listTraceIds(scope.sessionId, captureId),
-      );
-      if (!listed.ok) {
-        return err(listed.error);
-      }
-      traceId = defaultTraceId(listed.value, scope.storedSummary);
-    }
-    if (traceId === undefined) {
+    const tree = found.value;
+    if (tree === undefined) {
       return ok(null);
     }
 
-    const wanted = traceId;
-    const tree = await guardedAsync('reading a trace', () =>
-      correlator.getTrace(scope.sessionId, wanted, captureId),
-    );
-    if (!tree.ok) {
-      return err(tree.error);
+    let shaped = tree;
+    if (narrowsSubjects(filter)) {
+      const matched = readSlice(
+        log,
+        'trace',
+        scope,
+        { ...fullNarrowing(filter), traceId: tree.traceId },
+        0,
+      );
+      if (!matched.ok) {
+        return err(matched.error);
+      }
+      const matchedIds = new Set(matched.value.events.map((event) => event.id));
+      const roots = pruneTraceRoots(tree.roots, (node) => matchedIds.has(node.event.id));
+      if (roots.length === 0) {
+        log.debug('No node of the trace matches the filter.', {
+          fields: filterFieldsOf(filter),
+          nodes: tree.nodeCount,
+        });
+        return ok(null);
+      }
+      shaped = rebuiltTree(tree, roots, tree.truncated);
     }
-    return ok(tree.value ?? null);
+
+    const bounded = withinNodeBudget(shaped, TRACE_NODE_BUDGET);
+    if (bounded !== shaped) {
+      log.debug('A trace was cut to the node budget.', {
+        nodes: shaped.nodeCount,
+        budget: TRACE_NODE_BUDGET,
+      });
+    }
+    return ok(bounded);
   };
 
   /**
-   * The metric values of the capture, before ordering: the stored or loaded
-   * capture summary's when the query is unfiltered, and values computed over
-   * the filtered events when it narrows anything, because a summary describes
-   * the whole capture and would silently ignore the filter.
+   * The capture summary a `metrics` read may be answered from: the one loaded
+   * through the captures port, else the one stored with the capture, else
+   * none. A load that fails or describes another capture is logged and falls
+   * back; it never fails the read.
+   */
+  const loadSummary = async (
+    log: Logger,
+    source: AggregateDataSource,
+    scope: ResolvedScope,
+    captureId: CaptureId,
+  ): Promise<CaptureSummary | undefined> => {
+    const captures = deps.captures;
+    if (captures !== undefined) {
+      const loaded = await guardedAsync('loading the capture summary', () =>
+        captures.loadCaptureSummary(scope.sessionId, captureId),
+      );
+      if (loaded.ok && loaded.value.captureId === captureId) {
+        return loaded.value;
+      }
+      log.warn('The capture summary could not be used; computing the metrics from events.', {
+        source,
+        ...(loaded.ok
+          ? { reason: 'summary-describes-another-capture' }
+          : { reason: 'summary-load-failed', code: loaded.error.code }),
+      });
+    }
+    return scope.storedSummary;
+  };
+
+  /**
+   * The summary's metrics when it accounts for **every** event the capture now
+   * holds — its `eventCount` equals the capture's stored count, read here —
+   * and `undefined` otherwise.
+   *
+   * A summary computed from part of the capture (the summarizer reads a
+   * bounded prefix) or before later events arrived does not account for all of
+   * them and is not used, so the metric cards never show totals of a prefix as
+   * the capture's.
+   */
+  const coveringMetrics = (
+    log: Logger,
+    source: AggregateDataSource,
+    scope: ResolvedScope,
+    captureId: CaptureId,
+    summary: CaptureSummary | undefined,
+  ): Result<readonly MetricValue[] | undefined, DebuggenError> => {
+    if (summary === undefined) {
+      return ok(undefined);
+    }
+    const stamp = readStamp(scope.sessionId, captureId);
+    if (!stamp.ok) {
+      return err(stamp.error);
+    }
+    if (summary.eventCount !== stamp.value.count) {
+      log.debug('The capture summary does not cover every stored event; computing the metrics.', {
+        source,
+        summarized: summary.eventCount,
+        stored: stamp.value.count,
+      });
+      return ok(undefined);
+    }
+    return ok(summary.metrics);
+  };
+
+  /**
+   * The metric values of the capture, before ordering, always describing every
+   * event of it.
+   *
+   * Filtered, the values computed over the events the filter selects — the
+   * `metrics` value of the filter's bundle — because a summary describes the
+   * whole capture and would silently ignore the filter.
+   *
+   * Unfiltered, a capture summary's values when one accounts for every stored
+   * event, and the values computed from the whole capture otherwise: the
+   * summary takes precedence. Whichever answers is cached as the entry's
+   * `unfilteredMetrics` under the capture's generation, so a repeated read is
+   * one generation read — it neither reloads the summary nor recounts the
+   * capture. After the summary settles, the generation, the coverage count
+   * and any computation are read in one synchronous turn, so the answer
+   * cached describes exactly the rows that generation names.
    */
   const metricValues = async (
     log: Logger,
@@ -1341,32 +2539,43 @@ export function createPanelDataResolver(deps: PanelDataResolverDeps): PanelDataR
     captureId: CaptureId,
     filter: DataQueryFilter | undefined,
   ): Promise<Result<readonly MetricValue[], DebuggenError>> => {
-    if (filterFieldsOf(filter).length === 0) {
-      const captures = deps.captures;
-      if (captures !== undefined) {
-        const loaded = await guardedAsync('loading the capture summary', () =>
-          captures.loadCaptureSummary(scope.sessionId, captureId),
-        );
-        if (loaded.ok && loaded.value.captureId === captureId) {
-          return ok(loaded.value.metrics);
-        }
-        log.warn('The capture summary could not be used; computing the metrics from events.', {
-          source,
-          ...(loaded.ok
-            ? { reason: 'summary-describes-another-capture' }
-            : { reason: 'summary-load-failed', code: loaded.error.code }),
-        });
-      }
-      if (scope.storedSummary !== undefined) {
-        return ok(scope.storedSummary.metrics);
-      }
+    if (filterFieldsOf(filter).length > 0) {
+      return aggregateOf(log, 'metrics', scope, filter);
     }
 
-    const slice = readAggregateSlice(log, source, scope, filter);
-    if (!slice.ok) {
-      return err(slice.error);
+    const key = aggregateCacheKey(scope.sessionId, captureId, undefined);
+    const before = readGeneration(scope.sessionId, captureId);
+    if (!before.ok) {
+      return err(before.error);
     }
-    return ok(computeMetrics(slice.value.events));
+    const cached = cache.read(key, before.value, 'unfilteredMetrics');
+    if (cached !== undefined) {
+      log.debug('A panel view was answered from the aggregate cache.', { source });
+      return ok(cached);
+    }
+
+    const summary = await loadSummary(log, source, scope, captureId);
+
+    // One synchronous turn from here: the generation is read before the count
+    // and before any event, and nothing interleaves until the answer is cached.
+    const generation = readGeneration(scope.sessionId, captureId);
+    if (!generation.ok) {
+      return err(generation.error);
+    }
+    const covering = coveringMetrics(log, source, scope, captureId, summary);
+    if (!covering.ok) {
+      return err(covering.error);
+    }
+    if (covering.value !== undefined) {
+      cache.write(key, generation.value, { unfilteredMetrics: covering.value }, 1);
+      return ok(covering.value);
+    }
+    const computed = aggregateAt(log, 'metrics', scope, captureId, undefined, generation.value);
+    if (!computed.ok) {
+      return err(computed.error);
+    }
+    cache.write(key, generation.value, { unfilteredMetrics: computed.value }, 1);
+    return ok(computed.value);
   };
 
   /** Dispatches one query to its source. */
@@ -1413,16 +2622,11 @@ export function createPanelDataResolver(deps: PanelDataResolverDeps): PanelDataR
       }
 
       case 'renders': {
-        const slice = readAggregateSlice(log, query.source, scope, filter);
-        if (!slice.ok) {
-          return err(slice.error);
+        const renders = aggregateOf(log, query.source, scope, filter);
+        if (!renders.ok) {
+          return err(renders.error);
         }
-        const ordered = orderFor(
-          log,
-          query.source,
-          aggregateRenders(slice.value.events),
-          query.sort,
-        );
+        const ordered = orderFor(log, query.source, renders.value, query.sort);
         if (!ordered.ok) {
           return err(ordered.error);
         }
@@ -1431,27 +2635,19 @@ export function createPanelDataResolver(deps: PanelDataResolverDeps): PanelDataR
       }
 
       case 'componentTree': {
-        const slice = readAggregateSlice(log, query.source, scope, filter);
-        if (!slice.ok) {
-          return err(slice.error);
-        }
-        // `undefined` means "no rendering evidence", and does not survive JSON;
-        // the wire value for it is `null`.
-        const snapshot = buildComponentTreeSnapshot(slice.value.events) ?? null;
-        return ok({ source: query.source, componentTree: snapshot });
+        // `null` when the capture holds no rendering evidence (see AGGREGATE_COMPUTE).
+        const snapshot = aggregateOf(log, query.source, scope, filter);
+        return snapshot.ok
+          ? ok({ source: query.source, componentTree: snapshot.value })
+          : err(snapshot.error);
       }
 
       case 'requests': {
-        const slice = readAggregateSlice(log, query.source, scope, filter);
-        if (!slice.ok) {
-          return err(slice.error);
+        const requests = aggregateOf(log, query.source, scope, filter);
+        if (!requests.ok) {
+          return err(requests.error);
         }
-        const ordered = orderFor(
-          log,
-          query.source,
-          aggregateRequests(slice.value.events),
-          query.sort,
-        );
+        const ordered = orderFor(log, query.source, requests.value, query.sort);
         if (!ordered.ok) {
           return err(ordered.error);
         }
@@ -1460,16 +2656,11 @@ export function createPanelDataResolver(deps: PanelDataResolverDeps): PanelDataR
       }
 
       case 'queries': {
-        const slice = readAggregateSlice(log, query.source, scope, filter);
-        if (!slice.ok) {
-          return err(slice.error);
+        const queries = aggregateOf(log, query.source, scope, filter);
+        if (!queries.ok) {
+          return err(queries.error);
         }
-        const ordered = orderFor(
-          log,
-          query.source,
-          aggregateQueries(slice.value.events),
-          query.sort,
-        );
+        const ordered = orderFor(log, query.source, queries.value, query.sort);
         if (!ordered.ok) {
           return err(ordered.error);
         }
@@ -1478,16 +2669,13 @@ export function createPanelDataResolver(deps: PanelDataResolverDeps): PanelDataR
       }
 
       case 'stateTransitions': {
-        const slice = readAggregateSlice(log, query.source, scope, filter);
-        if (!slice.ok) {
-          return err(slice.error);
+        // Every transition of the slice: the aggregate's own cap is lifted to the
+        // slice ceiling (see AGGREGATE_COMPUTE).
+        const transitions = aggregateOf(log, query.source, scope, filter);
+        if (!transitions.ok) {
+          return err(transitions.error);
         }
-        // The aggregate's own cap is lifted to the slice bound, so `total` is
-        // every transition in the slice rather than the aggregate's default.
-        const transitions = aggregateStateTransitions(slice.value.events, {
-          maxTransitions: MAX_AGGREGATE_INPUT_EVENTS,
-        });
-        const ordered = orderFor(log, query.source, transitions, query.sort);
+        const ordered = orderFor(log, query.source, transitions.value, query.sort);
         if (!ordered.ok) {
           return err(ordered.error);
         }
@@ -1496,11 +2684,8 @@ export function createPanelDataResolver(deps: PanelDataResolverDeps): PanelDataR
       }
 
       case 'graph': {
-        const slice = readAggregateSlice(log, query.source, scope, filter);
-        if (!slice.ok) {
-          return err(slice.error);
-        }
-        return ok({ source: query.source, graph: buildDependencyGraph(slice.value.events) });
+        const graph = aggregateOf(log, query.source, scope, filter);
+        return graph.ok ? ok({ source: query.source, graph: graph.value }) : err(graph.error);
       }
 
       case 'metrics': {
@@ -1559,6 +2744,7 @@ export function createPanelDataResolver(deps: PanelDataResolverDeps): PanelDataR
 
       scopedLog.debug('Panel data resolved.', {
         source,
+        binding: scope.value.binding,
         hasCapture: scope.value.captureId !== undefined,
         ...pageCounts(result.value),
         durationMs: now() - started,

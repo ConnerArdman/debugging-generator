@@ -100,13 +100,21 @@ import { TELEMETRY_KINDS, TELEMETRY_TIERS, allowedTiersFor } from '../schema/kin
 import type { TelemetryKind, TelemetryTier } from '../schema/kinds.js';
 
 import {
+  EXTENSION_REFUSAL_REASONS,
   compareEventsCanonical,
   correlateEvents,
   correlateTrace,
+  extendCorrelatedTrace,
+  indexTraceForExtension,
   rootAffinityForKind,
   sortEventsCanonical,
 } from './correlator.js';
-import type { CorrelationResult } from './correlator.js';
+import type {
+  CorrelationResult,
+  ExtensionRefusalReason,
+  TraceExtensionIndex,
+  TraceExtensionResult,
+} from './correlator.js';
 import {
   DEFAULT_MAX_DEPTH,
   ORPHAN_REASONS,
@@ -3084,5 +3092,1891 @@ describe('the mixed-producer facts of the committed corpus', () => {
       expect(event.startTime).toBeGreaterThanOrEqual(tree.startTime);
       expect(event.startTime + event.duration).toBeLessThanOrEqual(tree.endTime);
     }
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Incremental extension (`indexTraceForExtension`, `extendCorrelatedTrace`)
+ *
+ * The service grows cached trees batch by batch instead of re-correlating the
+ * whole trace per batch (the `O(n²/b)` the code review rejected). The contract
+ * under test is exactness: every `extended` answer must be identical — deeply
+ * and in `JSON.stringify` key order — to `correlateTrace` over every row so
+ * far, and every `refused` answer must leave the index untouched and be one of
+ * the documented reasons. The randomized differential case is the main
+ * evidence — its batches routinely carry orphans ahead of their parents, late
+ * parents (real children, repairs and genuine roots among them, several per
+ * batch), rings the late parents close, anchoring and non-anchoring roots and
+ * moved subtrees on and past the depth guard. The explicit cases pin each of
+ * the fast path's cases (new roots, new repairs, late parents), each form of
+ * `primary-change` and every other refusal, the replay no-op, the anchor's
+ * prefix/suffix layout, the per-step cost bound and the bounded fallback on a
+ * demo-shaped stream one at a time.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * A seeded uniform source in `[0, 1)`: the same linear congruential generator
+ * as {@link shuffle}, read through its full 32-bit state. Never `Math.random`.
+ */
+function randomSource(seed: number): () => number {
+  let state = seed >>> 0 || 1;
+  return () => {
+    state = (state * 1_664_525 + 1_013_904_223) >>> 0;
+    return state / 0x1_0000_0000;
+  };
+}
+
+/** One element of a non-empty list, chosen by `random`. */
+function pick<T>(items: readonly T[], random: () => number): T {
+  const chosen = items[Math.floor(random() * items.length)];
+  if (chosen === undefined) {
+    throw new Error('pick() needs a non-empty list');
+  }
+  return chosen;
+}
+
+/** The kinds a generated non-root span reports. */
+const GENERATED_CHILD_KINDS: readonly TelemetryKind[] = [
+  'fetch',
+  'http.server',
+  'route.handler',
+  'function',
+  'db.query',
+  'http.client',
+  'render',
+  'commit',
+  'state',
+  'log',
+];
+
+/**
+ * The kinds a generated extra genuine root reports: three that rank below an
+ * `interaction`, so one arriving in a trace anchored on the click leaves the
+ * anchor in place, and `interaction` itself, which outranks every other root
+ * and ties the anchor — so both the non-anchoring and the anchoring root are
+ * generated.
+ */
+const GENERATED_ROOT_KINDS: readonly TelemetryKind[] = [
+  'http.server',
+  'navigation',
+  'fetch',
+  'interaction',
+];
+
+/**
+ * How often a generated trace carries each irregularity, per event.
+ *
+ * Two profiles: a *regular* trace has only what real captures routinely have
+ * (a stray parentless span, a parent that never arrives, a deep branch), and a
+ * *malformed* one adds what only a misbehaving producer emits (self-parents,
+ * reused span ids, two-span cycles and longer rings) — each of which, once
+ * stored, keeps the trace on the full-correlation path for good, so a trace
+ * carries them rarely or not at all.
+ */
+interface IrregularityRates {
+  readonly extraRoot: number;
+  readonly missingParent: number;
+  readonly selfParent: number;
+  readonly reusedSpan: number;
+  readonly cycle: number;
+  /** A ring of three or four spans, each naming the next. */
+  readonly ring: number;
+  /** A chain of three to six spans under one parent: a deep subtree to move. */
+  readonly branch: number;
+}
+
+const REGULAR_RATES: IrregularityRates = {
+  extraRoot: 0.02,
+  missingParent: 0.02,
+  selfParent: 0,
+  reusedSpan: 0,
+  cycle: 0,
+  ring: 0,
+  branch: 0.03,
+};
+
+const MALFORMED_RATES: IrregularityRates = {
+  extraRoot: 0.02,
+  missingParent: 0.025,
+  selfParent: 0.012,
+  reusedSpan: 0.004,
+  cycle: 0.006,
+  ring: 0.01,
+  branch: 0.03,
+};
+
+/**
+ * A random trace, as the store would hold it once every row has arrived:
+ * usually one genuine `interaction` root, fan-out and depth underneath it, two
+ * producers landing on a small set of shared timestamps, and — at the given
+ * rates — extra parentless roots, missing parents, self-parents, deep
+ * branches, reused span ids, two-span cycles and longer rings. Every span,
+ * including a repaired or parentless one, can gain children, so a late parent
+ * can be a real child, an orphan itself or a genuine root. Late parents are
+ * not generated here: they come from the arrival order, when a subtree is
+ * delivered before its parent.
+ *
+ * @param random The seeded source.
+ * @param traceId The trace every event carries.
+ * @param size At least how many events to generate.
+ * @param rates How often each irregularity occurs.
+ * @returns The events, in generation order; `ingestSeq` is assigned later, by
+ * arrival.
+ */
+function generatedTrace(
+  random: () => number,
+  traceId: TraceId,
+  size: number,
+  rates: IrregularityRates,
+): TelemetryEvent[] {
+  const events: TelemetryEvent[] = [];
+  const spans: SpanId[] = [];
+  let missingOrdinal = 0;
+
+  // The tier's own producer, as in a real capture, with one span in ten from
+  // the other one — so cross-producer edges exist beyond the fetch → server
+  // seam without being every edge.
+  const producerFor = (kind: TelemetryKind): ProducerId => {
+    const own = firstAllowedTier(kind) === 'browser' ? BROWSER_PRODUCER : SERVER_PRODUCER;
+    if (random() < 0.1) {
+      return own === BROWSER_PRODUCER ? SERVER_PRODUCER : BROWSER_PRODUCER;
+    }
+    return own;
+  };
+
+  const span = (
+    spanId: SpanId,
+    parentSpanId: SpanId | undefined,
+    kind: TelemetryKind,
+  ): TelemetryEvent => {
+    const event = makeEvent({
+      spanId,
+      traceId,
+      ...(parentSpanId !== undefined ? { parentSpanId } : {}),
+      kind,
+      // Twenty-four shared instants: cross-producer ties are routine.
+      startTime: at(Math.floor(random() * 24) * 0.5),
+      duration: Math.floor(random() * 200) * 0.25,
+      producerId: producerFor(kind),
+    });
+    events.push(event);
+    spans.push(spanId);
+    return event;
+  };
+  const missingSpanId = (): SpanId => {
+    missingOrdinal += 1;
+    // Far above the fixture counter, so no generated span ever carries it.
+    return hexSpan(0xdead_0000 + missingOrdinal);
+  };
+
+  if (random() < 0.85) {
+    span(nextSpanId(), undefined, 'interaction');
+  }
+
+  // Cumulative thresholds over one roll per event, in a fixed order.
+  const extraRoot = rates.extraRoot;
+  const missingParent = extraRoot + rates.missingParent;
+  const selfParent = missingParent + rates.selfParent;
+  const reusedSpan = selfParent + rates.reusedSpan;
+  const cycle = reusedSpan + rates.cycle;
+  const ring = cycle + rates.ring;
+  const branch = ring + rates.branch;
+
+  while (events.length < size) {
+    const roll = random();
+    const kind = pick(GENERATED_CHILD_KINDS, random);
+
+    if (roll < extraRoot) {
+      span(nextSpanId(), undefined, pick(GENERATED_ROOT_KINDS, random));
+    } else if (roll < missingParent || spans.length === 0) {
+      span(nextSpanId(), missingSpanId(), kind);
+    } else if (roll < selfParent) {
+      const spanId = nextSpanId();
+      span(spanId, spanId, kind);
+    } else if (roll < reusedSpan) {
+      span(pick(spans, random), pick(spans, random), kind);
+    } else if (roll < cycle) {
+      const first = nextSpanId();
+      const second = nextSpanId();
+      span(first, second, kind);
+      span(second, first, kind);
+    } else if (roll < ring) {
+      // Each member names the next and the last names the first: delivered
+      // across batches, the span that closes the ring is a late parent.
+      const members = [nextSpanId(), nextSpanId(), nextSpanId()];
+      if (random() < 0.5) {
+        members.push(nextSpanId());
+      }
+      const [first] = members;
+      if (first === undefined) {
+        throw new Error('a ring needs members');
+      }
+      members.forEach((spanId, position) => {
+        span(spanId, members[position + 1] ?? first, kind);
+      });
+    } else if (roll < branch) {
+      // A deep subtree under one span: moved whole when its top arrives late.
+      let parentSpanId = pick(spans, random);
+      const length = 3 + Math.floor(random() * 4);
+      for (let level = 0; level < length; level += 1) {
+        parentSpanId = span(nextSpanId(), parentSpanId, pick(GENERATED_CHILD_KINDS, random)).spanId;
+      }
+    } else {
+      const recent = spans.slice(-6);
+      span(nextSpanId(), pick(random() < 0.6 ? recent : spans, random), kind);
+    }
+  }
+
+  return events;
+}
+
+/**
+ * The order two independent producers deliver a trace in: roughly emission
+ * order, because both flush as they go, with each event's position jittered —
+ * slightly for most, by several places for one in six, and by several whole
+ * batches for one in eight: the span whose producer's flush lagged the other's.
+ * That is what delivers a server span ahead of the browser span that caused
+ * it, a subtree ahead of its root, and several late parents in one batch.
+ * `scrambled` replaces it with a full permutation, the worst case.
+ */
+function deliveryOrder(
+  random: () => number,
+  events: readonly TelemetryEvent[],
+  scrambled: boolean,
+): TelemetryEvent[] {
+  if (scrambled) {
+    return shuffle(events, Math.floor(random() * 0xffff_ffff));
+  }
+
+  return events
+    .map((event, position) => {
+      const roll = random();
+      const lag =
+        roll < 1 / 8 ? 6 + random() * 24 : roll < 1 / 8 + 1 / 6 ? random() * 8 : random() * 1.5;
+      return { event, due: position + lag };
+    })
+    .sort((left, right) => left.due - right.due)
+    .map((entry) => entry.event);
+}
+
+/**
+ * The generated trace's arrival, with `ingestSeq` assigned in arrival order as
+ * the store assigns it, split into batches of one to six rows. About one batch
+ * in five also replays an earlier row, one in twenty repeats one of its own,
+ * and one in twelve is followed by a batch of replays alone — each exactly as
+ * the store returns it, the stored row itself.
+ */
+function arrivalBatches(
+  random: () => number,
+  events: readonly TelemetryEvent[],
+  scrambled: boolean,
+): TelemetryEvent[][] {
+  const arrival = deliveryOrder(random, events, scrambled).map((event, position) => ({
+    ...event,
+    ingestSeq: position + 1,
+  }));
+  const batches: TelemetryEvent[][] = [];
+  const delivered: TelemetryEvent[] = [];
+  let cursor = 0;
+
+  while (cursor < arrival.length) {
+    const rows = arrival.slice(cursor, cursor + 1 + Math.floor(random() * 6));
+    cursor += rows.length;
+
+    const batch = [...rows];
+    if (delivered.length > 0 && random() < 0.2) {
+      batch.push(pick(delivered, random));
+    }
+    if (random() < 0.05) {
+      batch.push(pick(rows, random));
+    }
+
+    delivered.push(...rows);
+    batches.push(shuffle(batch, Math.floor(random() * 0xffff_ffff)));
+
+    // Now and then a batch of nothing but replays: a reloaded page flushing a
+    // buffer the store already holds.
+    if (random() < 0.08) {
+      batches.push([pick(delivered, random), pick(delivered, random)]);
+    }
+  }
+
+  return batches;
+}
+
+/**
+ * The refusals the generator can provoke; the other reasons need crafted rows
+ * (`ambiguous-order`, `stale-replay`, `non-finite-time`, `options-mismatch`,
+ * `inconsistent-index`) and have explicit cases below.
+ */
+const GENERATED_REFUSALS: readonly ExtensionRefusalReason[] = [
+  'primary-change',
+  'duplicate-span',
+  'cycle',
+  'max-depth',
+];
+
+/** The batch's new events: replays of tree rows, and repeats within it, removed. */
+function freshEventsOf(before: TraceTree, batch: readonly TelemetryEvent[]): TelemetryEvent[] {
+  const inTree = new Map(flattenTrace(before).map((node) => [node.event.spanId, node] as const));
+  const fresh: TelemetryEvent[] = [];
+  const seen = new Set<string>();
+  for (const event of batch) {
+    if (inTree.get(event.spanId)?.event.id === event.id || seen.has(event.id)) {
+      continue;
+    }
+    seen.add(event.id);
+    fresh.push(event);
+  }
+  return fresh;
+}
+
+/**
+ * Whether the pre-batch tree and the batch really exhibit the condition a
+ * refusal names — an independent restatement of each rule, so a refusal for
+ * the wrong reason (or for none) fails the differential case.
+ *
+ * @param reason The refusal.
+ * @param before The indexed tree the batch was offered to.
+ * @param batch The batch, replays included.
+ * @param after The full correlation of every row including the batch.
+ */
+function refusalIsJustified(
+  reason: ExtensionRefusalReason,
+  before: TraceTree,
+  batch: readonly TelemetryEvent[],
+  after: TraceTree | undefined,
+): boolean {
+  const treeEvents = flattenTrace(before).map((node) => node.event);
+  const fresh = freshEventsOf(before, batch);
+
+  switch (reason) {
+    case 'primary-change':
+      // The full correlation anchors the trace somewhere else.
+      return after !== undefined && after.primaryRootSpanId !== before.primaryRootSpanId;
+    case 'duplicate-span': {
+      const spans = new Set(treeEvents.map((event) => event.spanId));
+      return fresh.some((event) => {
+        const repeated = spans.has(event.spanId);
+        spans.add(event.spanId);
+        return repeated;
+      });
+    }
+    case 'cycle': {
+      // Some event of the combined rows lies on a `parentSpanId` loop.
+      const bySpanId = new Map<SpanId, TelemetryEvent>();
+      for (const event of [...treeEvents, ...fresh]) {
+        bySpanId.set(event.spanId, event);
+      }
+      return [...bySpanId.values()].some((start) => {
+        const seen = new Set<SpanId>();
+        let cursor: TelemetryEvent | undefined = start;
+        while (cursor !== undefined) {
+          if (seen.has(cursor.spanId)) {
+            return true;
+          }
+          seen.add(cursor.spanId);
+          const parentSpanId: SpanId | undefined = cursor.parentSpanId;
+          cursor = parentSpanId === undefined ? undefined : bySpanId.get(parentSpanId);
+        }
+        return false;
+      });
+    }
+    case 'max-depth':
+      return after?.truncated === true;
+    default:
+      return false;
+  }
+}
+
+/** What one extended step exercised, read off the trees rather than the code. */
+interface StepShape {
+  /** A new event was repaired onto the anchor (case B). */
+  readonly repairAdded: boolean;
+  /** A new genuine root joined the roots without moving the anchor (case A). */
+  readonly rootAdded: boolean;
+  /** How many distinct late parents adopted an orphan of the tree (case C). */
+  readonly lateParents: number;
+  /** A late parent that is itself a repair of the anchor adopted an orphan. */
+  readonly repairedLateParent: boolean;
+  /** A late parent that is a genuine root adopted an orphan. */
+  readonly rootLateParent: boolean;
+  /** The deepest node of a moved subtree, after the move; `-1` when none moved. */
+  readonly deepestMoved: number;
+}
+
+/**
+ * Reads what a step did from the tree before and after it: which orphans lost
+ * their flags, who adopted them, and what joined the roots and the repairs.
+ */
+function shapeOfStep(before: TraceTree, after: TraceTree): StepShape {
+  const earlier = new Map(flattenTrace(before).map((node) => [node.event.spanId, node] as const));
+  const parentOf = new Map<SpanId, TraceNode | undefined>();
+  walkTrace(after, (node, parent) => {
+    parentOf.set(node.event.spanId, parent);
+  });
+
+  let repairAdded = false;
+  let repairedLateParent = false;
+  let rootLateParent = false;
+  let deepestMoved = -1;
+  const adopters = new Set<SpanId>();
+
+  for (const node of flattenTrace(after)) {
+    const old = earlier.get(node.event.spanId);
+    if (old === undefined) {
+      repairAdded ||= node.orphaned;
+      continue;
+    }
+    if (!old.orphaned || node.orphaned) {
+      continue;
+    }
+
+    const adopter = parentOf.get(node.event.spanId);
+    if (adopter !== undefined) {
+      adopters.add(adopter.event.spanId);
+      repairedLateParent ||= adopter.orphaned;
+      rootLateParent ||= adopter.depth === 0;
+    }
+    for (const moved of flattenNode(node)) {
+      deepestMoved = Math.max(deepestMoved, moved.depth);
+    }
+  }
+
+  return {
+    repairAdded,
+    rootAdded: after.roots.length > before.roots.length,
+    lateParents: adopters.size,
+    repairedLateParent,
+    rootLateParent,
+    deepestMoved,
+  };
+}
+
+/**
+ * How many nodes of `after` are new objects — absent from `before`, or not the
+ * very node `before` held for that span. With every unchanged node shared,
+ * this is exactly the count an extension reports as `nodesBuilt`.
+ */
+function freshNodeObjects(before: TraceTree, after: TraceTree): number {
+  const earlier = new Map(flattenTrace(before).map((node) => [node.event.spanId, node] as const));
+  return flattenTrace(after).filter((node) => earlier.get(node.event.spanId) !== node).length;
+}
+
+/**
+ * Whether a node that was rebuilt had to be: a rebuilt node of the tree must
+ * differ from the node it replaces in depth, in its flags, or in its children
+ * (a child added, removed or itself rebuilt). A rebuild that changes none of
+ * them is work the extension should not have done.
+ */
+function everyRebuildIsNeeded(before: TraceTree, after: TraceTree): boolean {
+  const earlier = new Map(flattenTrace(before).map((node) => [node.event.spanId, node] as const));
+  return flattenTrace(after).every((node) => {
+    const old = earlier.get(node.event.spanId);
+    if (old === undefined || old === node) {
+      return true;
+    }
+    return (
+      old.depth !== node.depth ||
+      old.orphanReason !== node.orphanReason ||
+      old.children.length !== node.children.length ||
+      old.children.some((child, position) => node.children[position] !== child)
+    );
+  });
+}
+
+/**
+ * Whether an index still describes its tree exactly as a fresh index of that
+ * tree would: every node the same object, the same missing parents with the
+ * same counts, and the same running aggregates.
+ */
+function indexMatchesFreshIndex(index: TraceExtensionIndex, maxDepth: number | undefined): boolean {
+  const fresh = indexTraceForExtension(index.tree, { maxDepth });
+  if (fresh === undefined || fresh.nodeBySpanId.size !== index.nodeBySpanId.size) {
+    return false;
+  }
+  for (const [spanId, node] of fresh.nodeBySpanId) {
+    if (index.nodeBySpanId.get(spanId) !== node) {
+      return false;
+    }
+  }
+  const counts = (map: ReadonlyMap<SpanId, number>): string =>
+    JSON.stringify([...map.entries()].sort(([left], [right]) => (left < right ? -1 : 1)));
+  return (
+    counts(fresh.missingParents) === counts(index.missingParents) &&
+    snapshotIndex(fresh).aggregates === snapshotIndex(index).aggregates
+  );
+}
+
+/** What a refusal must leave exactly as it found it. */
+interface IndexSnapshot {
+  readonly tree: TraceTree;
+  readonly spans: number;
+  readonly missingParents: number;
+  readonly aggregates: string;
+}
+
+/** A snapshot of the parts of an index an extension would write. */
+function snapshotIndex(index: TraceExtensionIndex): IndexSnapshot {
+  const { tiers, kinds, producerIds, ...scalars } = index.aggregates;
+  return {
+    tree: index.tree,
+    spans: index.nodeBySpanId.size,
+    missingParents: index.missingParents.size,
+    aggregates: JSON.stringify({
+      ...scalars,
+      tiers: [...tiers].sort(),
+      kinds: [...kinds].sort(),
+      producerIds: [...producerIds].sort(),
+    }),
+  };
+}
+
+/** The tree of an `extended` result, or a failure naming the refusal. */
+function extendedTree(result: TraceExtensionResult): TraceTree {
+  if (result.kind !== 'extended') {
+    throw new Error(`expected an extension, got a refusal: ${result.reason}`);
+  }
+  return result.tree;
+}
+
+/** The index of a tree that must be extendable, or a failure saying it is not. */
+function indexOf(tree: TraceTree | undefined, maxDepth?: number): TraceExtensionIndex {
+  if (tree === undefined) {
+    throw new Error('expected a correlated tree to index');
+  }
+  const index = indexTraceForExtension(tree, { maxDepth });
+  if (index === undefined) {
+    throw new Error(`expected trace ${tree.traceId} to be extendable`);
+  }
+  return index;
+}
+
+/** `value` and everything reachable from it, frozen, so a write would throw. */
+function deepFreeze<T>(value: T): T {
+  if (typeof value === 'object' && value !== null && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const member of Object.values(value)) {
+      deepFreeze(member);
+    }
+  }
+  return value;
+}
+
+/**
+ * Asserts that `batch` is refused with `reason` and that the index, its tree
+ * and the batch are exactly as they were.
+ */
+function expectRefusedUntouched(
+  index: TraceExtensionIndex,
+  batch: readonly TelemetryEvent[],
+  reason: ExtensionRefusalReason,
+  maxDepth?: number,
+): void {
+  const before = snapshotIndex(index);
+  const treeText = JSON.stringify(index.tree);
+  const frozen = deepFreeze([...batch]);
+
+  const result = extendCorrelatedTrace(index, frozen, { maxDepth });
+
+  expect(result).toEqual({ kind: 'refused', reason });
+  expect(snapshotIndex(index)).toEqual(before);
+  expect(index.tree).toBe(before.tree);
+  expect(JSON.stringify(index.tree)).toBe(treeText);
+}
+
+/** The default trace `events` correlate into, or a failure saying they do not. */
+function correlateTraceOrFail(
+  events: readonly TelemetryEvent[],
+  options?: { readonly maxDepth?: number },
+): TraceTree {
+  const tree = correlateTrace(events, DEFAULT_TRACE_ID, options);
+  if (tree === undefined) {
+    throw new Error('expected the events to correlate into a trace');
+  }
+  return tree;
+}
+
+/**
+ * Asserts that `batch` really moves the anchor of the trace `rows` correlate
+ * into — checked against a full correlation, not assumed — and that the
+ * extension refuses it as `primary-change`, leaving the index untouched.
+ */
+function expectPrimaryChange(
+  rows: readonly TelemetryEvent[],
+  batch: readonly TelemetryEvent[],
+): void {
+  const before = correlateTraceOrFail(rows);
+  const after = correlateTraceOrFail([...rows, ...batch]);
+  expect(after.primaryRootSpanId).not.toBe(before.primaryRootSpanId);
+  expectRefusedUntouched(indexOf(before), batch, 'primary-change');
+}
+
+/** A small, fully placed trace: an interaction, a fetch under it, a query under that. */
+function smallTrace(): TelemetryEvent[] {
+  return chainEvents([
+    { kind: 'interaction', offsetMs: 0, durationMs: 100 },
+    { kind: 'fetch', offsetMs: 5, durationMs: 80 },
+    { kind: 'db.query', offsetMs: 10, durationMs: 40, producerId: SERVER_PRODUCER },
+  ]);
+}
+
+/** The event at `position`, or a failure naming the gap. */
+function eventAt(events: readonly TelemetryEvent[], position: number): TelemetryEvent {
+  const event = events[position];
+  if (event === undefined) {
+    throw new Error(`expected a fixture event at ${position}`);
+  }
+  return event;
+}
+
+describe('incremental extension: the randomized differential', () => {
+  it('matches a full correlation after every batch, and refuses only for documented reasons', () => {
+    const tally = {
+      steps: 0,
+      extended: 0,
+      grown: 0,
+      repairsAdded: 0,
+      rootsAdded: 0,
+      lateParentSteps: 0,
+      severalLateParents: 0,
+      repairedLateParents: 0,
+      rootLateParents: 0,
+      movedToTheGuard: 0,
+      lateParentRings: 0,
+    };
+    const refusals = new Map<ExtensionRefusalReason, number>();
+
+    for (let seed = 1; seed <= 96; seed += 1) {
+      const random = randomSource(seed * 7_919);
+      const traceId = hexTrace(0x5_0000 + seed);
+      // A shallow guard on every fourth trace and a moderate one on the next,
+      // so moved subtrees land on and past the guard; a malformed producer on
+      // every third and a fully scrambled arrival on every fifth.
+      const maxDepth = seed % 4 === 0 ? 3 : seed % 4 === 1 ? 5 : undefined;
+      const limit = maxDepth ?? DEFAULT_MAX_DEPTH;
+      const options = { maxDepth };
+      const rates = seed % 3 === 0 ? MALFORMED_RATES : REGULAR_RATES;
+      const batches = arrivalBatches(
+        random,
+        generatedTrace(random, traceId, 40 + Math.floor(random() * 120), rates),
+        seed % 5 === 0,
+      );
+
+      const stored: TelemetryEvent[] = [];
+      const storedIds = new Set<string>();
+      let index: TraceExtensionIndex | undefined;
+
+      for (const batch of batches) {
+        for (const event of batch) {
+          if (!storedIds.has(event.id)) {
+            storedIds.add(event.id);
+            stored.push(event);
+          }
+        }
+        const expected = correlateTrace(stored, traceId, options);
+
+        if (index === undefined) {
+          // Seeding, or re-seeding after a refusal or an unextendable tree.
+          index = expected === undefined ? undefined : indexTraceForExtension(expected, options);
+          continue;
+        }
+
+        tally.steps += 1;
+        const before = snapshotIndex(index);
+        const result = extendCorrelatedTrace(index, deepFreeze([...batch]), options);
+
+        if (result.kind === 'extended') {
+          tally.extended += 1;
+          if (result.added > 0) {
+            tally.grown += 1;
+          }
+          expect(result.tree).toStrictEqual(expected);
+          expect(JSON.stringify(result.tree)).toBe(JSON.stringify(expected));
+          expect(index.tree).toBe(result.tree);
+          // Exactly one new object per changed node, none for anything else,
+          // and no rebuild of a node that did not change.
+          expect(result.nodesBuilt).toBe(freshNodeObjects(before.tree, result.tree));
+          expect(everyRebuildIsNeeded(before.tree, result.tree)).toBe(true);
+          // The index the next batch reads is the one this tree would get.
+          expect(indexMatchesFreshIndex(index, maxDepth)).toBe(true);
+
+          const shape = shapeOfStep(before.tree, result.tree);
+          tally.repairsAdded += shape.repairAdded ? 1 : 0;
+          tally.rootsAdded += shape.rootAdded ? 1 : 0;
+          tally.lateParentSteps += shape.lateParents > 0 ? 1 : 0;
+          tally.severalLateParents += shape.lateParents > 1 ? 1 : 0;
+          tally.repairedLateParents += shape.repairedLateParent ? 1 : 0;
+          tally.rootLateParents += shape.rootLateParent ? 1 : 0;
+          tally.movedToTheGuard += shape.deepestMoved === limit ? 1 : 0;
+          continue;
+        }
+
+        expect(GENERATED_REFUSALS).toContain(result.reason);
+        expect(refusalIsJustified(result.reason, before.tree, batch, expected)).toBe(true);
+        expect(snapshotIndex(index)).toEqual(before);
+        refusals.set(result.reason, (refusals.get(result.reason) ?? 0) + 1);
+
+        // A loop closed by the parent an orphan of the tree was waiting for.
+        const waiting = new Set(index.missingParents.keys());
+        if (
+          result.reason === 'cycle' &&
+          freshEventsOf(before.tree, batch).some((event) => waiting.has(event.spanId))
+        ) {
+          tally.lateParentRings += 1;
+        }
+
+        index = expected === undefined ? undefined : indexTraceForExtension(expected, options);
+      }
+    }
+
+    // The case must exercise both halves: most steps extend, every case of the
+    // fast path is taken many times, and every refusal the generator can
+    // provoke is actually provoked. The run is seeded, so these are floors at
+    // about half of what it produces — a generator change that stops
+    // exercising a case fails here instead of silently testing less.
+    expect(tally.steps).toBeGreaterThan(1_000);
+    expect(tally.grown).toBeGreaterThan(tally.steps * 0.75);
+    expect(tally.extended).toBeGreaterThan(tally.grown);
+    expect(tally.repairsAdded).toBeGreaterThan(250);
+    expect(tally.rootsAdded).toBeGreaterThan(20);
+    expect(tally.lateParentSteps).toBeGreaterThan(180);
+    expect(tally.severalLateParents).toBeGreaterThan(50);
+    expect(tally.repairedLateParents).toBeGreaterThan(45);
+    expect(tally.rootLateParents).toBeGreaterThan(3);
+    expect(tally.movedToTheGuard).toBeGreaterThan(4);
+    expect(tally.lateParentRings).toBeGreaterThan(4);
+    expect([...refusals.keys()].sort()).toEqual([...GENERATED_REFUSALS].sort());
+    // Refusals are the exception on this stream, not the rule.
+    const refused = [...refusals.values()].reduce((sum, count) => sum + count, 0);
+    expect(refused).toBeLessThan(tally.steps * 0.15);
+  });
+});
+
+describe('incremental extension: indexing', () => {
+  it('indexes a correlated tree with one entry per node and the spans its orphans miss', () => {
+    const events = smallTrace();
+    const neverArrives = nextSpanId();
+    const orphan = makeEvent({
+      spanId: nextSpanId(),
+      parentSpanId: neverArrives,
+      startTime: at(3),
+    });
+    const tree = correlateTrace([...events, orphan], DEFAULT_TRACE_ID);
+    const index = indexOf(tree);
+
+    expect(index.traceId).toBe(DEFAULT_TRACE_ID);
+    expect(index.depthLimit).toBe(DEFAULT_MAX_DEPTH);
+    expect(index.primaryRootSpanId).toBe(eventAt(events, 0).spanId);
+    expect(index.tree).toBe(tree);
+    expect(index.nodeBySpanId.size).toBe(4);
+    expect([...index.missingParents.entries()]).toEqual([[neverArrives, 1]]);
+    expect(index.aggregates).toMatchObject({ nodeCount: 4, maxDepth: 2, orphanCount: 1 });
+  });
+
+  it('declines a tree a later batch could change in a way only a full correlation reproduces', () => {
+    const duplicated = nextSpanId();
+    const withDuplicate = correlateTrace(
+      [
+        makeEvent({ spanId: duplicated, kind: 'interaction' }),
+        makeEvent({ spanId: duplicated, startTime: at(1) }),
+      ],
+      DEFAULT_TRACE_ID,
+    );
+
+    const first = nextSpanId();
+    const second = nextSpanId();
+    const withCycle = correlateTrace(
+      [
+        makeEvent({ spanId: nextSpanId(), kind: 'interaction' }),
+        makeEvent({ spanId: first, parentSpanId: second, startTime: at(1) }),
+        makeEvent({ spanId: second, parentSpanId: first, startTime: at(2) }),
+      ],
+      DEFAULT_TRACE_ID,
+    );
+
+    const truncated = correlateTrace(linearChain(5), DEFAULT_TRACE_ID, { maxDepth: 2 });
+
+    const nonFinite = correlateTrace(
+      [
+        makeEvent({
+          spanId: nextSpanId(),
+          kind: 'interaction',
+          duration: Number.POSITIVE_INFINITY,
+        }),
+      ],
+      DEFAULT_TRACE_ID,
+    );
+
+    expect(withDuplicate?.duplicateSpanIds).toEqual([duplicated]);
+    expect(withCycle?.orphanCount).toBe(1);
+    expect(truncated?.truncated).toBe(true);
+    for (const tree of [withDuplicate, withCycle, truncated, nonFinite]) {
+      if (tree === undefined) {
+        throw new Error('expected a correlated tree');
+      }
+      expect(indexTraceForExtension(tree)).toBeUndefined();
+    }
+
+    // Correlated under a deeper guard than the one it would be extended under.
+    const deep = correlateTrace(linearChain(5), DEFAULT_TRACE_ID);
+    if (deep === undefined) {
+      throw new Error('expected a correlated tree');
+    }
+    expect(indexTraceForExtension(deep, { maxDepth: 2 })).toBeUndefined();
+    expect(indexTraceForExtension(deep, { maxDepth: 4 })).toBeDefined();
+  });
+
+  it('declines a tree whose numbers or placements are not the ones its nodes add up to', () => {
+    const tree = correlateTrace(smallTrace(), DEFAULT_TRACE_ID);
+    if (tree === undefined) {
+      throw new Error('expected a correlated tree');
+    }
+
+    expect(indexTraceForExtension({ ...tree, nodeCount: tree.nodeCount + 1 })).toBeUndefined();
+    expect(indexTraceForExtension({ ...tree, primaryRootSpanId: nextSpanId() })).toBeUndefined();
+    expect(indexTraceForExtension({ ...tree, roots: [] })).toBeUndefined();
+  });
+});
+
+describe('incremental extension: exact application', () => {
+  it('hangs new spans under the tree and under each other, exactly as a full correlation does', () => {
+    const events = smallTrace();
+    const index = indexOf(correlateTrace(events, DEFAULT_TRACE_ID));
+    const handler = makeEvent({
+      spanId: nextSpanId(),
+      parentSpanId: eventAt(events, 1).spanId,
+      kind: 'http.server',
+      startTime: at(7),
+      producerId: SERVER_PRODUCER,
+    });
+    const query = makeEvent({
+      spanId: nextSpanId(),
+      parentSpanId: handler.spanId,
+      kind: 'db.query',
+      startTime: at(8),
+      producerId: SERVER_PRODUCER,
+    });
+    const sibling = makeEvent({
+      spanId: nextSpanId(),
+      parentSpanId: eventAt(events, 0).spanId,
+      kind: 'render',
+      startTime: at(1),
+    });
+    const batch = [query, sibling, handler];
+
+    const result = extendCorrelatedTrace(index, deepFreeze([...batch]));
+    const expected = correlateTrace([...events, ...batch], DEFAULT_TRACE_ID);
+
+    expect(extendedTree(result)).toStrictEqual(expected);
+    expect(JSON.stringify(extendedTree(result))).toBe(JSON.stringify(expected));
+    // Three new nodes; the fetch and the root copied once each, the root only
+    // once although two of its paths changed.
+    expect(result).toMatchObject({ kind: 'extended', added: 3, nodesBuilt: 5 });
+    expect(index.nodeBySpanId.size).toBe(6);
+    expect(index.nodeBySpanId.get(query.spanId)?.depth).toBe(3);
+
+    // And it keeps going from the extended tree.
+    const late = makeEvent({ spanId: nextSpanId(), parentSpanId: query.spanId, startTime: at(9) });
+    expect(extendedTree(extendCorrelatedTrace(index, [late]))).toStrictEqual(
+      correlateTrace([...events, ...batch, late], DEFAULT_TRACE_ID),
+    );
+  });
+
+  it('never mutates the tree it grew: a reader holding it keeps the tree it was served', () => {
+    const events = smallTrace();
+    const tree = correlateTrace(events, DEFAULT_TRACE_ID);
+    const served = JSON.stringify(tree);
+    const index = indexOf(tree);
+
+    extendedTree(
+      extendCorrelatedTrace(index, [
+        makeEvent({
+          spanId: nextSpanId(),
+          parentSpanId: eventAt(events, 2).spanId,
+          startTime: at(11),
+        }),
+      ]),
+    );
+
+    expect(JSON.stringify(tree)).toBe(served);
+    expect(index.tree).not.toBe(tree);
+  });
+
+  it('treats a replayed row, or a row repeated in its batch, as a no-op that keeps the tree', () => {
+    const events = smallTrace();
+    const index = indexOf(correlateTrace(events, DEFAULT_TRACE_ID));
+    const tree = index.tree;
+    const before = snapshotIndex(index);
+
+    const replay = extendCorrelatedTrace(index, [eventAt(events, 2), eventAt(events, 0)]);
+    expect(replay).toEqual({ kind: 'extended', tree, added: 0, nodesBuilt: 0 });
+    expect(extendedTree(replay)).toBe(tree);
+    expect(snapshotIndex(index)).toEqual(before);
+
+    const fresh = makeEvent({ spanId: nextSpanId(), parentSpanId: eventAt(events, 0).spanId });
+    const repeated = extendCorrelatedTrace(index, [fresh, eventAt(events, 1), fresh]);
+    expect(repeated).toMatchObject({ kind: 'extended', added: 1 });
+    expect(extendedTree(repeated)).toStrictEqual(
+      correlateTrace([...events, fresh], DEFAULT_TRACE_ID),
+    );
+  });
+
+  it('ignores events of another trace, as correlateTrace does', () => {
+    const events = smallTrace();
+    const index = indexOf(correlateTrace(events, DEFAULT_TRACE_ID));
+    const elsewhere = makeEvent({
+      spanId: nextSpanId(),
+      traceId: hexTrace(0xabc),
+      kind: 'interaction',
+    });
+
+    expect(extendCorrelatedTrace(index, [elsewhere])).toMatchObject({ kind: 'extended', added: 0 });
+  });
+
+  it('merges new children of the primary root into its real prefix, ahead of the repaired suffix', () => {
+    const root = makeEvent({
+      spanId: nextSpanId(),
+      kind: 'interaction',
+      startTime: at(0),
+      duration: 90,
+    });
+    const real = makeEvent({ spanId: nextSpanId(), parentSpanId: root.spanId, startTime: at(10) });
+    // Repaired nodes: parents that never arrived, one sorting before the real
+    // child and one after it — both still belong to the appended suffix.
+    const earlyOrphan = makeEvent({
+      spanId: nextSpanId(),
+      parentSpanId: nextSpanId(),
+      startTime: at(2),
+    });
+    const lateOrphan = makeEvent({
+      spanId: nextSpanId(),
+      parentSpanId: nextSpanId(),
+      startTime: at(60),
+    });
+    const events = [root, real, earlyOrphan, lateOrphan];
+    const index = indexOf(correlateTrace(events, DEFAULT_TRACE_ID));
+
+    const first = makeEvent({ spanId: nextSpanId(), parentSpanId: root.spanId, startTime: at(1) });
+    const last = makeEvent({ spanId: nextSpanId(), parentSpanId: root.spanId, startTime: at(80) });
+    const underOrphan = makeEvent({
+      spanId: nextSpanId(),
+      parentSpanId: lateOrphan.spanId,
+      startTime: at(61),
+    });
+    const batch = [last, underOrphan, first];
+
+    const tree = extendedTree(extendCorrelatedTrace(index, batch));
+    const expected = correlateTrace([...events, ...batch], DEFAULT_TRACE_ID);
+
+    expect(tree).toStrictEqual(expected);
+    expect(JSON.stringify(tree)).toBe(JSON.stringify(expected));
+    const [anchor] = tree.roots;
+    expect(spanIdsOfNodes(anchor?.children ?? [])).toEqual([
+      first.spanId,
+      real.spanId,
+      last.spanId,
+      earlyOrphan.spanId,
+      lateOrphan.spanId,
+    ]);
+    expect(nodeFor(tree, underOrphan.spanId).depth).toBe(2);
+    expect(tree.orphanCount).toBe(2);
+  });
+
+  it('extends a trace anchored on a repaired root, and a non-primary root of several', () => {
+    // No genuine root: the canonically first parentless span anchors the trace.
+    const fallback = makeEvent({
+      spanId: nextSpanId(),
+      parentSpanId: nextSpanId(),
+      kind: 'http.server',
+    });
+    const other = makeEvent({ spanId: nextSpanId(), parentSpanId: nextSpanId(), startTime: at(5) });
+    const anchored = [fallback, other];
+    const anchoredIndex = indexOf(correlateTrace(anchored, DEFAULT_TRACE_ID));
+    const underAnchor = makeEvent({
+      spanId: nextSpanId(),
+      parentSpanId: fallback.spanId,
+      startTime: at(3),
+    });
+    expect(extendedTree(extendCorrelatedTrace(anchoredIndex, [underAnchor]))).toStrictEqual(
+      correlateTrace([...anchored, underAnchor], DEFAULT_TRACE_ID),
+    );
+
+    // Two genuine roots; the server span is not the anchor.
+    const click = makeEvent({ spanId: nextSpanId(), kind: 'interaction', startTime: at(4) });
+    const server = makeEvent({ spanId: nextSpanId(), kind: 'http.server', startTime: at(1) });
+    const rooted = [click, server];
+    const rootedIndex = indexOf(correlateTrace(rooted, DEFAULT_TRACE_ID));
+    const underServer = makeEvent({
+      spanId: nextSpanId(),
+      parentSpanId: server.spanId,
+      startTime: at(2),
+    });
+    const tree = extendedTree(extendCorrelatedTrace(rootedIndex, [underServer]));
+    expect(tree).toStrictEqual(correlateTrace([...rooted, underServer], DEFAULT_TRACE_ID));
+    expect(tree.primaryRootSpanId).toBe(click.spanId);
+  });
+});
+
+describe('incremental extension: every refusal leaves the index untouched', () => {
+  it('refuses a span id already in the tree under another event, or repeated in the batch', () => {
+    const events = smallTrace();
+    const index = indexOf(correlateTrace(events, DEFAULT_TRACE_ID));
+    const reused = eventAt(events, 2).spanId;
+
+    expectRefusedUntouched(
+      index,
+      [makeEvent({ spanId: reused, parentSpanId: eventAt(events, 0).spanId })],
+      'duplicate-span',
+    );
+
+    const twice = nextSpanId();
+    expectRefusedUntouched(
+      index,
+      [
+        makeEvent({ spanId: twice, parentSpanId: eventAt(events, 0).spanId }),
+        makeEvent({ spanId: twice, parentSpanId: eventAt(events, 1).spanId }),
+      ],
+      'duplicate-span',
+    );
+  });
+
+  it('refuses every batch that moves the anchor as primary-change, in each of its forms', () => {
+    // A genuine root that outranks the anchor: the click lands after the
+    // server span it caused had anchored the trace.
+    const server = makeEvent({
+      spanId: nextSpanId(),
+      kind: 'http.server',
+      startTime: at(10),
+      producerId: SERVER_PRODUCER,
+    });
+    const serverRows = [server];
+    expectPrimaryChange(serverRows, [
+      makeEvent({ spanId: nextSpanId(), kind: 'interaction', startTime: at(20) }),
+    ]);
+
+    // A genuine root that ties the anchor's affinity and sorts ahead of it.
+    const clickRows = smallTrace();
+    expectPrimaryChange(clickRows, [
+      makeEvent({ spanId: nextSpanId(), kind: 'interaction', startTime: at(-1) }),
+    ]);
+
+    // No genuine root yet: the anchor is a repair, the canonically first
+    // parentless span. Any genuine root, however lowly, takes over from it.
+    const anchorParent = nextSpanId();
+    const fallback = makeEvent({
+      spanId: nextSpanId(),
+      parentSpanId: anchorParent,
+      kind: 'http.server',
+      startTime: at(5),
+      producerId: SERVER_PRODUCER,
+    });
+    const repairedRows = [
+      fallback,
+      makeEvent({ spanId: nextSpanId(), parentSpanId: nextSpanId(), startTime: at(9) }),
+    ];
+    expectPrimaryChange(repairedRows, [
+      makeEvent({ spanId: nextSpanId(), kind: 'log', startTime: at(30) }),
+    ]);
+
+    // A new repair, or a new self-parent, that sorts ahead of that anchor.
+    expectPrimaryChange(repairedRows, [
+      makeEvent({ spanId: nextSpanId(), parentSpanId: nextSpanId(), startTime: at(1) }),
+    ]);
+    const self = nextSpanId();
+    expectPrimaryChange(repairedRows, [
+      makeEvent({ spanId: self, parentSpanId: self, startTime: at(2) }),
+    ]);
+
+    // The anchor's own missing parent arrives, itself waiting for a parent.
+    expectPrimaryChange(repairedRows, [
+      makeEvent({
+        spanId: anchorParent,
+        parentSpanId: nextSpanId(),
+        kind: 'fetch',
+        startTime: at(8),
+      }),
+    ]);
+  });
+
+  it('refuses a loop closed by late parents: a ring of two, and one inside the subtree it adopts', () => {
+    const root = makeEvent({ spanId: nextSpanId(), kind: 'interaction', duration: 100 });
+    const firstAwaited = nextSpanId();
+    const secondAwaited = nextSpanId();
+    const firstOrphan = makeEvent({
+      spanId: nextSpanId(),
+      parentSpanId: firstAwaited,
+      startTime: at(10),
+    });
+    const underFirst = makeEvent({
+      spanId: nextSpanId(),
+      parentSpanId: firstOrphan.spanId,
+      startTime: at(11),
+    });
+    const secondOrphan = makeEvent({
+      spanId: nextSpanId(),
+      parentSpanId: secondAwaited,
+      startTime: at(20),
+    });
+    const underSecond = makeEvent({
+      spanId: nextSpanId(),
+      parentSpanId: secondOrphan.spanId,
+      startTime: at(21),
+    });
+    const rows = [root, firstOrphan, underFirst, secondOrphan, underSecond];
+    const index = indexOf(correlateTrace(rows, DEFAULT_TRACE_ID));
+
+    // Each awaited span arrives under the other orphan's subtree.
+    const ring = [
+      makeEvent({ spanId: firstAwaited, parentSpanId: underSecond.spanId, startTime: at(9) }),
+      makeEvent({ spanId: secondAwaited, parentSpanId: underFirst.spanId, startTime: at(19) }),
+    ];
+    // An awaited span that arrives under the orphan it would adopt.
+    const inside = [
+      makeEvent({ spanId: firstAwaited, parentSpanId: underFirst.spanId, startTime: at(12) }),
+    ];
+
+    for (const batch of [ring, inside]) {
+      expect(orphanReasonsIn(correlateTraceOrFail([...rows, ...batch]))).toContain('cycle');
+      expectRefusedUntouched(index, batch, 'cycle');
+    }
+  });
+
+  it('refuses a late parent that carries a moved subtree past the depth guard', () => {
+    const root = makeEvent({ spanId: nextSpanId(), kind: 'interaction', duration: 100 });
+    const awaited = nextSpanId();
+    const orphan = makeEvent({ spanId: nextSpanId(), parentSpanId: awaited, startTime: at(10) });
+    const child = makeEvent({
+      spanId: nextSpanId(),
+      parentSpanId: orphan.spanId,
+      startTime: at(11),
+    });
+    const grandchild = makeEvent({
+      spanId: nextSpanId(),
+      parentSpanId: child.spanId,
+      startTime: at(12),
+    });
+    const rows = [root, orphan, child, grandchild];
+    // Depth 3 holds the orphan's chain as a repair: 1, 2, 3.
+    const index = indexOf(correlateTrace(rows, DEFAULT_TRACE_ID, { maxDepth: 3 }), 3);
+    // Under the root the chain moves to 2, 3, 4.
+    const batch = [makeEvent({ spanId: awaited, parentSpanId: root.spanId, startTime: at(9) })];
+
+    expect(correlateTrace([...rows, ...batch], DEFAULT_TRACE_ID, { maxDepth: 3 })?.truncated).toBe(
+      true,
+    );
+    expectRefusedUntouched(index, batch, 'max-depth', 3);
+  });
+
+  it('refuses a cycle inside the batch, and a child hanging under one', () => {
+    const events = smallTrace();
+    const index = indexOf(correlateTrace(events, DEFAULT_TRACE_ID));
+    const first = nextSpanId();
+    const second = nextSpanId();
+    const ring = [
+      makeEvent({ spanId: first, parentSpanId: second }),
+      makeEvent({ spanId: second, parentSpanId: first }),
+    ];
+
+    expectRefusedUntouched(index, ring, 'cycle');
+    expectRefusedUntouched(
+      index,
+      [makeEvent({ spanId: nextSpanId(), parentSpanId: first }), ...ring],
+      'cycle',
+    );
+  });
+
+  it('refuses a new node past the depth guard, and a guard other than the index’s', () => {
+    const chain = linearChain(3);
+    const index = indexOf(correlateTrace(chain, DEFAULT_TRACE_ID, { maxDepth: 2 }), 2);
+
+    expectRefusedUntouched(
+      index,
+      [makeEvent({ spanId: nextSpanId(), parentSpanId: eventAt(chain, 2).spanId })],
+      'max-depth',
+      2,
+    );
+    expectRefusedUntouched(
+      index,
+      [makeEvent({ spanId: nextSpanId(), parentSpanId: eventAt(chain, 0).spanId })],
+      'options-mismatch',
+      5,
+    );
+  });
+
+  it('refuses siblings that tie on every canonical key', () => {
+    const events = smallTrace();
+    const index = indexOf(correlateTrace(events, DEFAULT_TRACE_ID));
+    const parentSpanId = eventAt(events, 0).spanId;
+    const twin = makeEvent({ spanId: nextSpanId(), parentSpanId, startTime: at(50) });
+
+    // Two new siblings tying on every key, and a new sibling tying an existing one.
+    expectRefusedUntouched(index, [twin, { ...twin, spanId: nextSpanId() }], 'ambiguous-order');
+    expectRefusedUntouched(
+      index,
+      [{ ...eventAt(events, 1), spanId: nextSpanId() }],
+      'ambiguous-order',
+    );
+
+    // A new root tying the anchor (which names no parent), and two new roots
+    // tying each other.
+    expectRefusedUntouched(
+      index,
+      [{ ...eventAt(events, 0), spanId: nextSpanId() }],
+      'ambiguous-order',
+    );
+    const server = makeEvent({ spanId: nextSpanId(), kind: 'http.server', startTime: at(70) });
+    expectRefusedUntouched(index, [server, { ...server, spanId: nextSpanId() }], 'ambiguous-order');
+
+    // A new repair tying a repair the anchor already holds.
+    const repair = makeEvent({
+      spanId: nextSpanId(),
+      parentSpanId: nextSpanId(),
+      startTime: at(80),
+    });
+    const repaired = indexOf(correlateTrace([...events, repair], DEFAULT_TRACE_ID));
+    expectRefusedUntouched(
+      repaired,
+      [{ ...repair, spanId: nextSpanId(), parentSpanId: nextSpanId() }],
+      'ambiguous-order',
+    );
+  });
+
+  it('refuses a stored row delivered with another arrival number, and a non-finite time', () => {
+    const events = smallTrace();
+    const index = indexOf(correlateTrace(events, DEFAULT_TRACE_ID));
+    const row = eventAt(events, 1);
+
+    expectRefusedUntouched(index, [{ ...row, ingestSeq: row.ingestSeq + 10_000 }], 'stale-replay');
+    expectRefusedUntouched(
+      index,
+      [makeEvent({ spanId: nextSpanId(), parentSpanId: row.spanId, startTime: Number.NaN })],
+      'non-finite-time',
+    );
+  });
+
+  it('refuses an index that no longer describes its tree', () => {
+    const events = smallTrace();
+    const index = indexOf(correlateTrace(events, DEFAULT_TRACE_ID));
+    // A caller editing the index: the attachment point's ancestor is gone.
+    index.nodeBySpanId.delete(eventAt(events, 1).spanId);
+
+    expectRefusedUntouched(
+      index,
+      [makeEvent({ spanId: nextSpanId(), parentSpanId: eventAt(events, 2).spanId })],
+      'inconsistent-index',
+    );
+
+    // A caller editing the missing-parent counts: the orphans on the anchor
+    // are no longer the ones the index says a late parent adopts.
+    const awaited = nextSpanId();
+    const orphan = makeEvent({ spanId: nextSpanId(), parentSpanId: awaited, startTime: at(20) });
+    const edited = indexOf(correlateTrace([...events, orphan], DEFAULT_TRACE_ID));
+    edited.missingParents.set(awaited, 2);
+
+    expectRefusedUntouched(
+      edited,
+      [makeEvent({ spanId: awaited, parentSpanId: eventAt(events, 0).spanId, startTime: at(15) })],
+      'inconsistent-index',
+    );
+  });
+
+  it('names every refusal from the closed vocabulary, and no longer refuses what now extends', () => {
+    expect([...EXTENSION_REFUSAL_REASONS]).toEqual([
+      'primary-change',
+      'duplicate-span',
+      'cycle',
+      'max-depth',
+      'ambiguous-order',
+      'stale-replay',
+      'non-finite-time',
+      'options-mismatch',
+      'inconsistent-index',
+    ]);
+    for (const reason of GENERATED_REFUSALS) {
+      expect(EXTENSION_REFUSAL_REASONS).toContain(reason);
+    }
+    for (const extended of ['late-parent', 'new-root', 'self-parent', 'missing-parent']) {
+      expect(EXTENSION_REFUSAL_REASONS).not.toContain(extended);
+    }
+  });
+});
+
+/**
+ * A trace of `size` spans laid out as a `fanOut`-ary heap — span `i` hangs
+ * from span `⌊(i − 1) / fanOut⌋` — so fan-out is bounded and depth is the
+ * heap's.
+ */
+function heapTrace(size: number, fanOut: number): TelemetryEvent[] {
+  const spans: SpanId[] = [];
+  const events: TelemetryEvent[] = [];
+
+  for (let position = 0; position < size; position += 1) {
+    const spanId = nextSpanId();
+    const parentSpanId = position === 0 ? undefined : spans[Math.floor((position - 1) / fanOut)];
+    spans.push(spanId);
+    events.push(
+      makeEvent({
+        spanId,
+        ...(parentSpanId !== undefined ? { parentSpanId } : {}),
+        kind: position === 0 ? 'interaction' : DEFAULT_KIND,
+        startTime: at(position * 0.125),
+        producerId: position % 2 === 0 ? BROWSER_PRODUCER : SERVER_PRODUCER,
+      }),
+    );
+  }
+
+  return events;
+}
+
+describe('incremental extension: the per-step bound', () => {
+  it('builds at most batch × (depth + 1) nodes per step, the same at 2 000 and 20 000 nodes', () => {
+    const fanOut = 12;
+    // Depth-3 spans of a 12-ary heap: positions 157 to 1884. Both sizes hold
+    // them, and both reach depth 4, so the bound is the same for both.
+    const firstDepthThree = 1 + fanOut + fanOut * fanOut;
+    const batchSize = 10;
+    const steps = 4;
+    const builtPerSize: number[][] = [];
+
+    // The positions a step changes: its ten targets and every heap ancestor of
+    // them, each counted once — what "every changed ancestor copied exactly
+    // once" predicts, derived from the heap arithmetic rather than the code.
+    const changedPositions = (step: number): number => {
+      const changed = new Set<number>();
+      for (let offset = 0; offset < batchSize; offset += 1) {
+        let position = firstDepthThree + step * batchSize + offset;
+        while (!changed.has(position)) {
+          changed.add(position);
+          if (position === 0) {
+            break;
+          }
+          position = Math.floor((position - 1) / fanOut);
+        }
+      }
+      return changed.size;
+    };
+
+    for (const size of [2_000, 20_000]) {
+      const events = heapTrace(size, fanOut);
+      const index = indexOf(correlateTrace(events, DEFAULT_TRACE_ID));
+      const stored = [...events];
+      const built: number[] = [];
+
+      for (let step = 0; step < steps; step += 1) {
+        const batch: TelemetryEvent[] = [];
+        for (let offset = 0; offset < batchSize; offset += 1) {
+          const target = eventAt(events, firstDepthThree + step * batchSize + offset);
+          batch.push(
+            makeEvent({
+              spanId: nextSpanId(),
+              parentSpanId: target.spanId,
+              startTime: target.startTime + 0.0625,
+            }),
+          );
+        }
+        stored.push(...batch);
+
+        const result = extendCorrelatedTrace(index, batch);
+        const tree = extendedTree(result);
+        if (result.kind !== 'extended') {
+          throw new Error('unreachable: extendedTree already failed on a refusal');
+        }
+
+        expect(result.added).toBe(batchSize);
+        expect(tree.maxDepth).toBe(4);
+        expect(result.nodesBuilt).toBeLessThanOrEqual(batchSize * (tree.maxDepth + 1));
+        expect(result.nodesBuilt).toBe(batchSize + changedPositions(step));
+        built.push(result.nodesBuilt);
+        expect(tree.nodeCount).toBe(stored.length);
+      }
+
+      // The last step's tree against a full correlation of every row.
+      expect(index.tree).toStrictEqual(correlateTrace(stored, DEFAULT_TRACE_ID));
+      builtPerSize.push(built);
+    }
+
+    // Ten times the tree, the same work per step.
+    const [small, large] = builtPerSize;
+    expect(small).toHaveLength(steps);
+    expect(large).toEqual(small);
+  });
+});
+
+describe('incremental extension: new genuine roots (case A)', () => {
+  it('admits a root that ranks below the anchor at its canonical place, with its subtree', () => {
+    const events = smallTrace();
+    const index = indexOf(correlateTrace(events, DEFAULT_TRACE_ID));
+    const before = index.tree;
+    // A server span whose browser half was never captured: parentless, and
+    // timestamped ahead of the click by the other process's clock.
+    const server = makeEvent({
+      spanId: nextSpanId(),
+      kind: 'http.server',
+      startTime: at(-5),
+      producerId: SERVER_PRODUCER,
+    });
+    const handler = makeEvent({
+      spanId: nextSpanId(),
+      parentSpanId: server.spanId,
+      kind: 'route.handler',
+      startTime: at(-4),
+      producerId: SERVER_PRODUCER,
+    });
+    const batch = [handler, server];
+
+    const result = extendCorrelatedTrace(index, deepFreeze([...batch]));
+    const tree = extendedTree(result);
+    const expected = correlateTrace([...events, ...batch], DEFAULT_TRACE_ID);
+
+    expect(tree).toStrictEqual(expected);
+    expect(JSON.stringify(tree)).toBe(JSON.stringify(expected));
+    expect(spanIdsOfNodes(tree.roots)).toEqual([server.spanId, eventAt(events, 0).spanId]);
+    expect(tree.primaryRootSpanId).toBe(eventAt(events, 0).spanId);
+    expect(nodeFor(tree, handler.spanId).depth).toBe(1);
+    // The two new nodes and nothing else: the anchor's subtree is shared.
+    expect(result).toMatchObject({ kind: 'extended', added: 2, nodesBuilt: 2 });
+    expect(tree.roots[1]).toBe(before.roots[0]);
+  });
+
+  it('admits a root that ties the anchor’s affinity and sorts after it', () => {
+    const events = smallTrace();
+    const index = indexOf(correlateTrace(events, DEFAULT_TRACE_ID));
+    const secondClick = makeEvent({ spanId: nextSpanId(), kind: 'interaction', startTime: at(50) });
+
+    const tree = extendedTree(extendCorrelatedTrace(index, [secondClick]));
+
+    expect(tree).toStrictEqual(correlateTrace([...events, secondClick], DEFAULT_TRACE_ID));
+    expect(spanIdsOfNodes(tree.roots)).toEqual([eventAt(events, 0).spanId, secondClick.spanId]);
+    expect(tree.primaryRootSpanId).toBe(eventAt(events, 0).spanId);
+  });
+});
+
+describe('incremental extension: new repairs (case B)', () => {
+  it('repairs a missing-parent and a self-parent span onto the anchor at their canonical place in the suffix', () => {
+    const root = makeEvent({ spanId: nextSpanId(), kind: 'interaction', duration: 90 });
+    const real = makeEvent({ spanId: nextSpanId(), parentSpanId: root.spanId, startTime: at(10) });
+    const earlyRepair = makeEvent({
+      spanId: nextSpanId(),
+      parentSpanId: nextSpanId(),
+      startTime: at(2),
+    });
+    const lateRepair = makeEvent({
+      spanId: nextSpanId(),
+      parentSpanId: nextSpanId(),
+      startTime: at(60),
+    });
+    const rows = [root, real, earlyRepair, lateRepair];
+    const index = indexOf(correlateTrace(rows, DEFAULT_TRACE_ID));
+
+    const absent = nextSpanId();
+    const missing = makeEvent({ spanId: nextSpanId(), parentSpanId: absent, startTime: at(30) });
+    const underMissing = makeEvent({
+      spanId: nextSpanId(),
+      parentSpanId: missing.spanId,
+      startTime: at(31),
+    });
+    const selfSpan = nextSpanId();
+    const self = makeEvent({ spanId: selfSpan, parentSpanId: selfSpan, startTime: at(1) });
+    const batch = [underMissing, self, missing];
+
+    const result = extendCorrelatedTrace(index, deepFreeze([...batch]));
+    const tree = extendedTree(result);
+    const expected = correlateTrace([...rows, ...batch], DEFAULT_TRACE_ID);
+
+    expect(tree).toStrictEqual(expected);
+    expect(JSON.stringify(tree)).toBe(JSON.stringify(expected));
+    expect(spanIdsOfNodes(primaryRootOf(tree).children)).toEqual([
+      real.spanId,
+      self.spanId,
+      earlyRepair.spanId,
+      missing.spanId,
+      lateRepair.spanId,
+    ]);
+    expect(nodeFor(tree, missing.spanId)).toMatchObject({
+      depth: 1,
+      orphaned: true,
+      orphanReason: 'missing-parent',
+      missingParentSpanId: absent,
+    });
+    expect(nodeFor(tree, self.spanId)).toMatchObject({
+      orphaned: true,
+      orphanReason: 'self-parent',
+    });
+    expect('missingParentSpanId' in nodeFor(tree, self.spanId)).toBe(false);
+    expect(nodeFor(tree, underMissing.spanId)).toMatchObject({ depth: 2, orphaned: false });
+    // Three new nodes and the anchor that holds two of them.
+    expect(result).toMatchObject({ added: 3, nodesBuilt: 4 });
+    expect(index.aggregates.orphanCount).toBe(4);
+    expect(index.missingParents.get(absent)).toBe(1);
+    expect(index.missingParents.size).toBe(3);
+  });
+
+  it('repairs onto a repaired anchor a span that sorts after it', () => {
+    const fallback = makeEvent({
+      spanId: nextSpanId(),
+      parentSpanId: nextSpanId(),
+      kind: 'http.server',
+      startTime: at(5),
+      producerId: SERVER_PRODUCER,
+    });
+    const other = makeEvent({ spanId: nextSpanId(), parentSpanId: nextSpanId(), startTime: at(9) });
+    const rows = [fallback, other];
+    const index = indexOf(correlateTrace(rows, DEFAULT_TRACE_ID));
+    const between = makeEvent({
+      spanId: nextSpanId(),
+      parentSpanId: nextSpanId(),
+      startTime: at(7),
+    });
+
+    const tree = extendedTree(extendCorrelatedTrace(index, [between]));
+
+    expect(tree).toStrictEqual(correlateTrace([...rows, between], DEFAULT_TRACE_ID));
+    expect(tree.primaryRootSpanId).toBe(fallback.spanId);
+    expect(spanIdsOfNodes(primaryRootOf(tree).children)).toEqual([between.spanId, other.spanId]);
+  });
+
+  it('places a repair at depth 1 unchecked under a zero guard, and refuses a child under it', () => {
+    const root = makeEvent({ spanId: nextSpanId(), kind: 'interaction' });
+    const index = indexOf(correlateTrace([root], DEFAULT_TRACE_ID, { maxDepth: 0 }), 0);
+    const repair = makeEvent({
+      spanId: nextSpanId(),
+      parentSpanId: nextSpanId(),
+      startTime: at(1),
+    });
+
+    const tree = extendedTree(extendCorrelatedTrace(index, [repair], { maxDepth: 0 }));
+    expect(tree).toStrictEqual(correlateTrace([root, repair], DEFAULT_TRACE_ID, { maxDepth: 0 }));
+    expect(tree.truncated).toBe(false);
+    expect(nodeFor(tree, repair.spanId).depth).toBe(1);
+
+    const child = makeEvent({
+      spanId: nextSpanId(),
+      parentSpanId: repair.spanId,
+      startTime: at(2),
+    });
+    expect(
+      correlateTrace([root, repair, child], DEFAULT_TRACE_ID, { maxDepth: 0 })?.truncated,
+    ).toBe(true);
+    expectRefusedUntouched(index, [child], 'max-depth', 0);
+  });
+});
+
+describe('incremental extension: late parents (case C)', () => {
+  it('moves the orphans a late parent names under it, with their subtrees, clearing their flags', () => {
+    const root = makeEvent({ spanId: nextSpanId(), kind: 'interaction', duration: 100 });
+    const real = makeEvent({ spanId: nextSpanId(), parentSpanId: root.spanId, startTime: at(10) });
+    const fetchSpan = nextSpanId();
+    const request = makeEvent({
+      spanId: nextSpanId(),
+      parentSpanId: fetchSpan,
+      kind: 'http.server',
+      startTime: at(20),
+      producerId: SERVER_PRODUCER,
+    });
+    const handler = makeEvent({
+      spanId: nextSpanId(),
+      parentSpanId: request.spanId,
+      kind: 'route.handler',
+      startTime: at(21),
+      producerId: SERVER_PRODUCER,
+    });
+    const query = makeEvent({
+      spanId: nextSpanId(),
+      parentSpanId: handler.spanId,
+      kind: 'db.query',
+      startTime: at(22),
+      producerId: SERVER_PRODUCER,
+    });
+    // A second orphan naming the same fetch, and one waiting for another span.
+    const log = makeEvent({ spanId: nextSpanId(), parentSpanId: fetchSpan, startTime: at(25) });
+    const otherAwaited = nextSpanId();
+    const unrelated = makeEvent({
+      spanId: nextSpanId(),
+      parentSpanId: otherAwaited,
+      startTime: at(30),
+    });
+    const rows = [root, real, request, handler, query, log, unrelated];
+    const index = indexOf(correlateTrace(rows, DEFAULT_TRACE_ID));
+    expect(index.missingParents.get(fetchSpan)).toBe(2);
+
+    const fetch = makeEvent({
+      spanId: fetchSpan,
+      parentSpanId: root.spanId,
+      kind: 'fetch',
+      startTime: at(19),
+    });
+    const result = extendCorrelatedTrace(index, deepFreeze([fetch]));
+    const tree = extendedTree(result);
+    const expected = correlateTrace([...rows, fetch], DEFAULT_TRACE_ID);
+
+    expect(tree).toStrictEqual(expected);
+    expect(JSON.stringify(tree)).toBe(JSON.stringify(expected));
+    expect(spanIdsOfNodes(ancestorsOfSpanId(tree, query.spanId))).toEqual([
+      root.spanId,
+      fetchSpan,
+      request.spanId,
+      handler.spanId,
+    ]);
+    expect(spanIdsOfNodes(nodeFor(tree, fetchSpan).children)).toEqual([request.spanId, log.spanId]);
+    for (const moved of [request, log]) {
+      const node = nodeFor(tree, moved.spanId);
+      expect(node).toMatchObject({ depth: 2, orphaned: false });
+      expect('orphanReason' in node || 'missingParentSpanId' in node).toBe(false);
+    }
+    expect(nodeFor(tree, query.spanId).depth).toBe(4);
+    expect(spanIdsOfNodes(primaryRootOf(tree).children)).toEqual([
+      real.spanId,
+      fetchSpan,
+      unrelated.spanId,
+    ]);
+    // The fetch; the request's subtree and the log, one level deeper; the root.
+    expect(result).toMatchObject({ added: 1, nodesBuilt: 6 });
+    expect([...index.missingParents.entries()]).toEqual([[otherAwaited, 1]]);
+    expect(index.aggregates).toMatchObject({ orphanCount: 1, maxDepth: 4, nodeCount: 8 });
+
+    // The moved orphan is an ordinary node now: the next batch hangs under it.
+    const late = makeEvent({ spanId: nextSpanId(), parentSpanId: query.spanId, startTime: at(23) });
+    expect(extendedTree(extendCorrelatedTrace(index, [late]))).toStrictEqual(
+      correlateTrace([...rows, fetch, late], DEFAULT_TRACE_ID),
+    );
+  });
+
+  it('shares a moved subtree whose depth does not change: a late parent that is a genuine root', () => {
+    const click = makeEvent({ spanId: nextSpanId(), kind: 'interaction', duration: 100 });
+    const awaited = nextSpanId();
+    const orphan = makeEvent({ spanId: nextSpanId(), parentSpanId: awaited, startTime: at(20) });
+    const child = makeEvent({
+      spanId: nextSpanId(),
+      parentSpanId: orphan.spanId,
+      startTime: at(21),
+    });
+    const rows = [click, orphan, child];
+    const index = indexOf(correlateTrace(rows, DEFAULT_TRACE_ID));
+    const childBefore = nodeFor(index.tree, child.spanId);
+
+    // A parentless server span, below the click in affinity, is the parent.
+    const server = makeEvent({
+      spanId: awaited,
+      kind: 'http.server',
+      startTime: at(19),
+      producerId: SERVER_PRODUCER,
+    });
+    const result = extendCorrelatedTrace(index, [server]);
+    const tree = extendedTree(result);
+
+    expect(tree).toStrictEqual(correlateTrace([...rows, server], DEFAULT_TRACE_ID));
+    expect(spanIdsOfNodes(tree.roots)).toEqual([click.spanId, awaited]);
+    expect(nodeFor(tree, orphan.spanId)).toMatchObject({ depth: 1, orphaned: false });
+    // Only the server span, the orphan (its flags) and the click (its suffix).
+    expect(result).toMatchObject({ added: 1, nodesBuilt: 3 });
+    expect(nodeFor(tree, child.spanId)).toBe(childBefore);
+  });
+
+  it('lets a late parent that is itself a repair adopt an orphan', () => {
+    const click = makeEvent({ spanId: nextSpanId(), kind: 'interaction', duration: 100 });
+    const firstAwaited = nextSpanId();
+    const secondAwaited = nextSpanId();
+    const first = makeEvent({
+      spanId: nextSpanId(),
+      parentSpanId: firstAwaited,
+      startTime: at(20),
+    });
+    const second = makeEvent({
+      spanId: nextSpanId(),
+      parentSpanId: secondAwaited,
+      startTime: at(40),
+    });
+    const rows = [click, first, second];
+    const index = indexOf(correlateTrace(rows, DEFAULT_TRACE_ID));
+
+    // One late parent waits for a parent of its own; the other names itself.
+    const stillAwaited = nextSpanId();
+    const batch = [
+      makeEvent({ spanId: firstAwaited, parentSpanId: stillAwaited, startTime: at(18) }),
+      makeEvent({ spanId: secondAwaited, parentSpanId: secondAwaited, startTime: at(38) }),
+    ];
+    const tree = extendedTree(extendCorrelatedTrace(index, deepFreeze([...batch])));
+    const expected = correlateTrace([...rows, ...batch], DEFAULT_TRACE_ID);
+
+    expect(tree).toStrictEqual(expected);
+    expect(JSON.stringify(tree)).toBe(JSON.stringify(expected));
+    expect(nodeFor(tree, firstAwaited)).toMatchObject({
+      depth: 1,
+      orphanReason: 'missing-parent',
+      missingParentSpanId: stillAwaited,
+    });
+    expect(nodeFor(tree, secondAwaited)).toMatchObject({ depth: 1, orphanReason: 'self-parent' });
+    expect(nodeFor(tree, first.spanId)).toMatchObject({ depth: 2, orphaned: false });
+    expect(nodeFor(tree, second.spanId)).toMatchObject({ depth: 2, orphaned: false });
+    expect([...index.missingParents.entries()]).toEqual([[stillAwaited, 1]]);
+    expect(index.aggregates.orphanCount).toBe(2);
+  });
+
+  it('applies several late parents in one batch, one of them under a subtree another one moves', () => {
+    const click = makeEvent({ spanId: nextSpanId(), kind: 'interaction', duration: 100 });
+    const outerAwaited = nextSpanId();
+    const innerAwaited = nextSpanId();
+    const outer = makeEvent({
+      spanId: nextSpanId(),
+      parentSpanId: outerAwaited,
+      startTime: at(20),
+    });
+    const outerChild = makeEvent({
+      spanId: nextSpanId(),
+      parentSpanId: outer.spanId,
+      startTime: at(21),
+    });
+    const inner = makeEvent({
+      spanId: nextSpanId(),
+      parentSpanId: innerAwaited,
+      startTime: at(30),
+    });
+    const rows = [click, outer, outerChild, inner];
+    const index = indexOf(correlateTrace(rows, DEFAULT_TRACE_ID));
+
+    const batch = [
+      makeEvent({ spanId: innerAwaited, parentSpanId: outerChild.spanId, startTime: at(29) }),
+      makeEvent({ spanId: outerAwaited, parentSpanId: click.spanId, startTime: at(19) }),
+    ];
+    const result = extendCorrelatedTrace(index, deepFreeze([...batch]));
+    const tree = extendedTree(result);
+    const expected = correlateTrace([...rows, ...batch], DEFAULT_TRACE_ID);
+
+    expect(tree).toStrictEqual(expected);
+    expect(JSON.stringify(tree)).toBe(JSON.stringify(expected));
+    expect(spanIdsOfNodes(ancestorsOfSpanId(tree, inner.spanId))).toEqual([
+      click.spanId,
+      outerAwaited,
+      outer.spanId,
+      outerChild.spanId,
+      innerAwaited,
+    ]);
+    expect(nodeFor(tree, inner.spanId).depth).toBe(5);
+    expect(tree.orphanCount).toBe(0);
+    expect(index.missingParents.size).toBe(0);
+    expect(result).toMatchObject({ added: 2, nodesBuilt: 6 });
+  });
+
+  it('extends a late parent that lands a moved subtree exactly on the depth guard', () => {
+    const root = makeEvent({ spanId: nextSpanId(), kind: 'interaction', duration: 100 });
+    const awaited = nextSpanId();
+    const orphan = makeEvent({ spanId: nextSpanId(), parentSpanId: awaited, startTime: at(10) });
+    const child = makeEvent({
+      spanId: nextSpanId(),
+      parentSpanId: orphan.spanId,
+      startTime: at(11),
+    });
+    const rows = [root, orphan, child];
+    const index = indexOf(correlateTrace(rows, DEFAULT_TRACE_ID, { maxDepth: 3 }), 3);
+    const batch = [makeEvent({ spanId: awaited, parentSpanId: root.spanId, startTime: at(9) })];
+
+    const tree = extendedTree(extendCorrelatedTrace(index, batch, { maxDepth: 3 }));
+
+    expect(tree).toStrictEqual(
+      correlateTrace([...rows, ...batch], DEFAULT_TRACE_ID, { maxDepth: 3 }),
+    );
+    expect(tree.maxDepth).toBe(3);
+    expect(tree.truncated).toBe(false);
+  });
+});
+
+/**
+ * One request of the demo-shaped stream: the dev-server preload's four spans,
+ * which name the browser `fetch` that has not landed yet, and that `fetch`.
+ */
+function demoRequest(
+  interaction: TelemetryEvent,
+  offsetMs: number,
+): { readonly server: TelemetryEvent[]; readonly fetch: TelemetryEvent } {
+  const fetchSpan = nextSpanId();
+  const server: TelemetryEvent[] = [];
+  let parentSpanId = fetchSpan;
+  const kinds: readonly TelemetryKind[] = ['http.server', 'route.handler', 'function', 'db.query'];
+  kinds.forEach((kind, level) => {
+    const event = makeEvent({
+      spanId: nextSpanId(),
+      parentSpanId,
+      kind,
+      startTime: at(offsetMs + 0.5 + level * 0.25),
+      duration: 4 - level,
+      producerId: SERVER_PRODUCER,
+    });
+    server.push(event);
+    parentSpanId = event.spanId;
+  });
+
+  const fetch = makeEvent({
+    spanId: fetchSpan,
+    parentSpanId: interaction.spanId,
+    kind: 'fetch',
+    startTime: at(offsetMs),
+    duration: 6,
+  });
+  return { server, fetch };
+}
+
+describe('incremental extension: the bounded fallback on a demo-shaped stream', () => {
+  it('extends every server-span batch and every late fetch under one interaction, at a cost independent of the stream length', () => {
+    const builtPerLength: number[][] = [];
+
+    for (const requests of [40, 400]) {
+      const interaction = makeEvent({
+        spanId: nextSpanId(),
+        kind: 'interaction',
+        duration: requests * 10 + 10,
+      });
+      const stored: TelemetryEvent[] = [interaction];
+      const index = indexOf(correlateTrace(stored, DEFAULT_TRACE_ID));
+      const built: number[] = [];
+
+      for (let request = 0; request < requests; request += 1) {
+        const { server, fetch } = demoRequest(interaction, 1 + request * 10);
+
+        // The server spans land first: an orphan subtree on the anchor. The
+        // step builds the batch and copies the one node on its path.
+        stored.push(...server);
+        const serverStep = extendCorrelatedTrace(index, server);
+        expect(serverStep).toMatchObject({ kind: 'extended', added: 4 });
+        if (serverStep.kind !== 'extended') {
+          throw new Error(`the server batch was refused: ${serverStep.reason}`);
+        }
+        expect(serverStep.nodesBuilt).toBe(server.length + 1);
+        built.push(serverStep.nodesBuilt);
+
+        // Then the fetch: the late parent adopts the orphan, whose four-node
+        // subtree moves one level down; the anchor on the path is copied.
+        stored.push(fetch);
+        const fetchStep = extendCorrelatedTrace(index, [fetch]);
+        expect(fetchStep).toMatchObject({ kind: 'extended', added: 1 });
+        if (fetchStep.kind !== 'extended') {
+          throw new Error(`the fetch batch was refused: ${fetchStep.reason}`);
+        }
+        expect(fetchStep.nodesBuilt).toBe(1 + server.length + 1);
+        built.push(fetchStep.nodesBuilt);
+
+        if (requests === 40 || request % 50 === 0) {
+          const expected = correlateTrace(stored, DEFAULT_TRACE_ID);
+          expect(fetchStep.tree).toStrictEqual(expected);
+          expect(JSON.stringify(fetchStep.tree)).toBe(JSON.stringify(expected));
+        }
+      }
+
+      const expected = correlateTrace(stored, DEFAULT_TRACE_ID);
+      expect(index.tree).toStrictEqual(expected);
+      expect(index.tree).toMatchObject({ nodeCount: stored.length, orphanCount: 0, maxDepth: 5 });
+      expect(index.missingParents.size).toBe(0);
+      builtPerLength.push(built);
+    }
+
+    // Ten times the stream, the same work per step: every step is bounded by
+    // its batch, the subtree it moves and the path above it, never by N.
+    const [short, long] = builtPerLength;
+    expect(short).toHaveLength(80);
+    expect(long).toHaveLength(800);
+    expect(Math.max(...(long ?? []))).toBe(Math.max(...(short ?? [])));
+    expect(long?.slice(0, short?.length)).toEqual(short);
   });
 });

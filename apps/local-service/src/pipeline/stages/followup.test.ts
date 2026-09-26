@@ -8,7 +8,9 @@
  *    in both addition forms and rejects every malformed variant, each variant
  *    differing from a valid base in exactly one checked condition, so every
  *    rejection is attributable to that condition. `followUpDecisionSchema` is
- *    the same guard behind protocol's `opaqueSchema`.
+ *    that guard in front of a representable structural schema
+ *    (`./reply-schemas.ts`): the two agree on every value, and the schema
+ *    never throws on a hostile one.
  * 2. **The additive-only rule, enforced in code.** `diffAdditionalActions`
  *    refuses a re-emission, a removal, a replacement, a re-scope and a
  *    duplicate, each with its own reason code, computes identity with the
@@ -65,7 +67,9 @@ import {
   deriveServerAgentSignals,
   instrumentationPlanSchema,
   normalizePlan,
+  orderRestorationChain,
   problemUnderstandingSchema,
+  restoreModification,
   type AdapterClaimTable,
   type AdapterRegistry,
   type ClaimingAdapter,
@@ -76,6 +80,8 @@ import {
   type InstrumentationPlan,
   type ModificationRecord,
   type ProblemUnderstanding,
+  type RestoreOutcome,
+  type RestoreOutcomeKind,
 } from '@debuggen/instrumentation';
 import type * as InstrumentationModule from '@debuggen/instrumentation';
 import {
@@ -89,6 +95,7 @@ import {
 } from '@debuggen/model-provider';
 import type { PanelSpec } from '@debuggen/panel-schema';
 import {
+  FOLLOW_UP_ATTEMPT_ID_PREFIX,
   PROGRESS_STAGES,
   PROGRESS_STATUSES,
   type AnalysisResult,
@@ -111,12 +118,18 @@ import type { AnalysisFollowUpContext } from '../../analysis/summarize.js';
 import type { FactVerificationReport } from '../../analysis/facts.js';
 import type { ReadinessVerdict } from '../../instrumentation/readiness.js';
 import type {
+  ArmingSnapshot,
   BuildContextInput,
   InstallRequest,
   InstrumentationOutcome,
 } from '../../instrumentation/service.js';
 import type { PanelGenerationResult, PanelRegenerationRequest } from '../../panels/generate.js';
 import type { FollowUpOutcome, RecordPlanInput, RecordedPlan } from '../../sessions/manager.js';
+import {
+  FAILURE_COPY_BY_CODE,
+  authorProductText,
+  isProductAuthoredText,
+} from '../../sessions/progress.js';
 import type { SessionProgress } from '../../sessions/progress.js';
 import type { SessionFailure } from '../../sessions/state-machine.js';
 import {
@@ -149,10 +162,13 @@ import {
   type FollowUpStageInput,
   type FollowUpStageResult,
 } from './followup.js';
+import { authoredPlanShape } from './plan.js';
 
 // The real normaliser, feasibility gate and identity helper run unchanged;
 // wrapping them in spies is what makes their calls observable (the precedent
-// of `./plan.test.ts`).
+// of `./plan.test.ts`). The restoration pair is wrapped the same way so a
+// compensation's calls are observable; the harness scripts `restoreModification`
+// for every run, so no suite run ever reaches the filesystem through it.
 vi.mock('@debuggen/instrumentation', async (importOriginal) => {
   const actual = await importOriginal<typeof InstrumentationModule>();
   return {
@@ -160,11 +176,17 @@ vi.mock('@debuggen/instrumentation', async (importOriginal) => {
     normalizePlan: vi.fn(actual.normalizePlan),
     checkPlanFeasibility: vi.fn(actual.checkPlanFeasibility),
     actionIdentityKey: vi.fn(actual.actionIdentityKey),
+    orderRestorationChain: vi.fn(actual.orderRestorationChain),
+    restoreModification: vi.fn(actual.restoreModification),
   };
 });
 
 afterEach(() => {
   vi.clearAllMocks();
+  // `clearAllMocks` keeps implementations; the harness's scripted restores and a test's scripted
+  // chain order must not outlive the test that set them.
+  vi.mocked(restoreModification).mockReset();
+  vi.mocked(orderRestorationChain).mockReset();
 });
 
 // ---------------------------------------------------------------------------
@@ -266,6 +288,9 @@ const OTHER_SYMBOL = 'exportRows';
 
 /** The follow-up question, with {@link SENTINEL} planted in it. */
 const FOLLOW_UP_QUESTION = `Why did the totals query run twice ${SENTINEL}?`;
+
+/** The attempt id the follow-up is asked under, as the route or the editor view mints one. */
+const ATTEMPT_ID = `${FOLLOW_UP_ATTEMPT_ID_PREFIX}_0f0llowupst4ge01`;
 
 /** The session's recorded prompt versions: superseded ones, deliberately not the manifest's current. */
 const RECORDED_PROMPT_VERSIONS = Object.freeze({
@@ -502,11 +527,40 @@ function tripwire<T>(name: string, reads: string[]): T {
   ) as unknown as T;
 }
 
-/** A usable {@link InstrumentationContext} over the handles a `buildContext` call was given. */
+/**
+ * A journal whose only answering member is `listBySession`, which resolves to
+ * what `answer` returns at the time of the call — so a listing taken after a
+ * scripted restore sees the state that restore left; every member read — the
+ * listing included — is recorded in `reads`, so a run that reached for
+ * anything else is visible.
+ */
+function listingJournal(
+  answer: () => Result<ModificationRecord[], DebuggenError>,
+  reads: string[],
+): InstrumentationContext['journal'] {
+  return new Proxy(
+    {},
+    {
+      get: (_target, key) => {
+        reads.push(`journal.${String(key)}`);
+        return key === 'listBySession'
+          ? (): Promise<Result<ModificationRecord[], DebuggenError>> => Promise.resolve(answer())
+          : undefined;
+      },
+    },
+  ) as unknown as InstrumentationContext['journal'];
+}
+
+/**
+ * A usable {@link InstrumentationContext} over the handles a `buildContext` call
+ * was given. Its journal is a tripwire unless a listing answer is given, and its
+ * backup store is always one: the stage never reaches either on its own.
+ */
 function instrumentationContext(
   input: BuildContextInput,
   logger: Logger,
   writeReads: string[],
+  journalAnswer?: () => Result<ModificationRecord[], DebuggenError>,
 ): InstrumentationContext {
   return {
     sessionId: input.sessionId,
@@ -518,7 +572,10 @@ function instrumentationContext(
     queries: input.code.queries,
     routeMap: input.code.routeMap,
     projectSummary: input.code.summary,
-    journal: tripwire<InstrumentationContext['journal']>('journal', writeReads),
+    journal:
+      journalAnswer === undefined
+        ? tripwire<InstrumentationContext['journal']>('journal', writeReads)
+        : listingJournal(journalAnswer, writeReads),
     backups: tripwire<InstrumentationContext['backups']>('backups', writeReads),
     readiness: input.readiness ?? {},
     now: () => FIXED_EPOCH_MS,
@@ -897,6 +954,40 @@ function outcomeFor(
   };
 }
 
+/**
+ * What `restoreModification` reports for `record` settled as `kind`: the record
+ * as the journal would then hold it, and the backup disposition that kind
+ * leaves. The stage reads only the kind and the record's status.
+ */
+function restoreOutcomeFor(record: ModificationRecord, kind: RestoreOutcomeKind): RestoreOutcome {
+  const undone = kind === 'restored' || kind === 'already-original';
+  return {
+    kind,
+    record: {
+      ...record,
+      status: undone ? 'reverted' : kind === 'conflict' ? 'conflict' : record.status,
+    },
+    file: record.file,
+    path: kind === 'skipped' ? undefined : `${PROJECT_ROOT}/${record.file}`,
+    wrote: kind === 'restored',
+    recreated: false,
+    backup: undone ? 'deleted' : kind === 'conflict' ? 'retained' : 'untouched',
+    conflict: undefined,
+    completedAt: FIXED_EPOCH_MS,
+  };
+}
+
+/** The arming snapshot the service reports after recomputing it from `plan`. */
+function armingSnapshotOf(plan: InstrumentationPlan): ArmingSnapshot {
+  return {
+    sessionId: plan.sessionId,
+    projectRoot: PROJECT_ROOT,
+    activePlanVersion: plan.planVersion,
+    agentHooks: deriveAgentHookConfig(plan.instrumentationTargets),
+    serverSignals: deriveServerAgentSignals(plan.instrumentationTargets),
+  };
+}
+
 /** What a test may vary about the stage's collaborators. */
 interface HarnessOptions {
   readonly outcomes?: readonly ScriptedOutcome[];
@@ -918,6 +1009,25 @@ interface HarnessOptions {
   ) => Result<InstrumentationOutcome, DebuggenError>;
   readonly analysisAnswer?: (input: AnalyzeStageInput) => Result<AnalyzeStageResult, DebuggenError>;
   readonly recordOutcomeFails?: boolean;
+  /**
+   * What the journal of every built context answers to `listBySession`. An `Ok`
+   * listing is the journal's starting state: each scripted restore that
+   * settles replaces its record there, as the real journal would, so a later
+   * listing sees it. Absent, the journal is a tripwire: reaching it is
+   * recorded and its listing answers nothing usable.
+   */
+  readonly journal?: Result<ModificationRecord[], DebuggenError>;
+  /** How `restoreModification` settles a record, by record id; `restored` for any other record. */
+  readonly restores?: ReadonlyMap<string, RestoreOutcomeKind | DebuggenError>;
+  /** An error `restoreArming` answers with instead of the snapshot of the plan it was given. */
+  readonly restoreArmingFailure?: DebuggenError;
+  /**
+   * What `SessionsRepo.get` answers. Absent, the harness's session record — as
+   * the last successful `patch` left it — is answered.
+   */
+  readonly storedSession?: Result<SessionRecord | undefined, DebuggenError>;
+  /** An error `SessionManager.patch` answers with instead of the patched record. */
+  readonly patchFailure?: DebuggenError;
 }
 
 /** The stage over fakes, and every spy a test asserts on. */
@@ -932,23 +1042,40 @@ interface Harness {
   readonly writeReads: string[];
   readonly buildContext: Mock<FollowUpStageDeps['instrumentation']['buildContext']>;
   readonly install: Mock<FollowUpStageDeps['instrumentation']['install']>;
+  readonly restoreArming: Mock<FollowUpStageDeps['instrumentation']['restoreArming']>;
   readonly analysisRun: Mock<FollowUpStageDeps['analysisRegeneration']['run']>;
   readonly regenerate: Mock<FollowUpStageDeps['panelRegeneration']['regenerate']>;
   readonly latestPlanVersion: Mock<FollowUpStageDeps['sessions']['latestPlanVersion']>;
   readonly getPlan: Mock<FollowUpStageDeps['sessions']['getPlan']>;
   readonly nextPlanVersion: Mock<FollowUpStageDeps['sessions']['nextPlanVersion']>;
+  /** The session-record read: a roll-forward's confirmation and a mirror's base. */
+  readonly getSession: Mock<FollowUpStageDeps['sessions']['get']>;
   readonly latestRecordForFile: Mock<FollowUpStageDeps['modifications']['latestRecordForFile']>;
   readonly appendFollowUp: Mock<FollowUpStageDeps['sessionManager']['appendFollowUp']>;
   readonly recordFollowUpOutcome: Mock<
     FollowUpStageDeps['sessionManager']['recordFollowUpOutcome']
   >;
   readonly recordPlan: Mock<FollowUpStageDeps['sessionManager']['recordPlan']>;
-  readonly history: Mock<FollowUpStageDeps['facts']['history']>;
+  /** A compensation's mirror of its settled records onto the session record. */
+  readonly patch: Mock<FollowUpStageDeps['sessionManager']['patch']>;
+  /** The superseded-analysis read of the ladder check, answered from {@link Harness.ladder}. */
+  readonly getAnalysis: Mock<FollowUpStageDeps['panels']['getAnalysis']>;
+  /**
+   * The newest-analysis read: the configured latest analysis while the ladder
+   * holds only it, and the ladder's newest entry once a regeneration appended.
+   */
+  readonly getLatestAnalysis: Mock<FollowUpStageDeps['panels']['getLatestAnalysis']>;
+  /** Every member name read on the panels repository; single-row reads only, never a whole ladder. */
+  readonly panelReads: string[];
   /** Every member name read on the modifications repository; only the chain-head lookup may appear. */
   readonly modificationReads: string[];
   /** Every member name read on the session manager; no status-writing member may appear. */
   readonly sessionManagerReads: string[];
-  /** Every member name read on the instrumentation service; only the context build and the install may appear. */
+  /**
+   * Every member name read on the instrumentation service: the context build
+   * and the install on every run, and `restoreArming` only when an installed
+   * delta is compensated.
+   */
   readonly instrumentationReads: string[];
 }
 
@@ -982,6 +1109,7 @@ function harness(options: HarnessOptions = {}): Harness {
   const modificationReads: string[] = [];
   const sessionManagerReads: string[] = [];
   const instrumentationReads: string[] = [];
+  const panelReads: string[] = [];
   const ladder: AnalysisResult[] = [options.latestAnalysis ?? ANALYSIS_V1];
   const latestAnalysis = 'latestAnalysis' in options ? options.latestAnalysis : ANALYSIS_V1;
   const latestPanel = 'latestPanel' in options ? options.latestPanel : PANEL_V1;
@@ -989,8 +1117,16 @@ function harness(options: HarnessOptions = {}): Harness {
   const latestVersion =
     'latestPlanVersion' in options ? options.latestPlanVersion : installedPlan.planVersion;
 
+  // The journal's state: the scripted starting listing, each settled restore written over it.
+  const { journal } = options;
+  const journalRecords = journal?.ok === true ? [...journal.value] : undefined;
+  const journalAnswer =
+    journal === undefined
+      ? undefined
+      : (): Result<ModificationRecord[], DebuggenError> =>
+          journalRecords === undefined ? journal : ok([...journalRecords]);
   const buildContext = vi.fn<FollowUpStageDeps['instrumentation']['buildContext']>((input) =>
-    ok(instrumentationContext(input, log.logger, writeReads)),
+    ok(instrumentationContext(input, log.logger, writeReads, journalAnswer)),
   );
   const install = vi.fn<FollowUpStageDeps['instrumentation']['install']>((request) =>
     Promise.resolve(
@@ -999,6 +1135,24 @@ function harness(options: HarnessOptions = {}): Harness {
         : options.installAnswer(request),
     ),
   );
+  const restoreArming = vi.fn<FollowUpStageDeps['instrumentation']['restoreArming']>((input) =>
+    options.restoreArmingFailure === undefined
+      ? ok(armingSnapshotOf(input.plan))
+      : err(options.restoreArmingFailure),
+  );
+  // Every restore is scripted, so no run of this suite reaches a real file or backup through it.
+  vi.mocked(restoreModification).mockImplementation((record) => {
+    const scripted = options.restores?.get(record.id) ?? 'restored';
+    if (scripted instanceof DebuggenError) {
+      return Promise.resolve(err(scripted));
+    }
+    const outcome = restoreOutcomeFor(record, scripted);
+    const index = journalRecords?.findIndex((entry) => entry.id === record.id) ?? -1;
+    if (journalRecords !== undefined && index >= 0) {
+      journalRecords[index] = outcome.record;
+    }
+    return Promise.resolve(ok(outcome));
+  });
   const analysisRun = vi.fn<FollowUpStageDeps['analysisRegeneration']['run']>((_ctx, input) => {
     if (options.analysisAnswer !== undefined) {
       return Promise.resolve(options.analysisAnswer(input));
@@ -1039,6 +1193,21 @@ function harness(options: HarnessOptions = {}): Harness {
   const nextPlanVersion = vi.fn<FollowUpStageDeps['sessions']['nextPlanVersion']>(() =>
     ok(options.nextPlanVersion ?? installedPlan.planVersion + 1),
   );
+  // The session record as the store holds it: what `get` answers, and what `patch` rewrites.
+  let storedRecord: SessionRecord = session;
+  const getSession = vi.fn<FollowUpStageDeps['sessions']['get']>(
+    () => options.storedSession ?? ok(storedRecord),
+  );
+  const patch = vi.fn<FollowUpStageDeps['sessionManager']['patch']>((_sid, changes) => {
+    if (options.patchFailure !== undefined) {
+      return Promise.resolve(err(options.patchFailure));
+    }
+    storedRecord = {
+      ...storedRecord,
+      ...(changes.modifications === undefined ? {} : { modifications: [...changes.modifications] }),
+    };
+    return Promise.resolve(ok(storedRecord));
+  });
   const latestRecordForFile = vi.fn<FollowUpStageDeps['modifications']['latestRecordForFile']>(
     (_sid, file) => Promise.resolve(ok(options.chainHeads?.get(file))),
   );
@@ -1065,7 +1234,12 @@ function harness(options: HarnessOptions = {}): Harness {
       );
     },
   );
-  const history = vi.fn<FollowUpStageDeps['facts']['history']>(() => ok([...ladder]));
+  const getAnalysis = vi.fn<FollowUpStageDeps['panels']['getAnalysis']>((analysisId) =>
+    ok(ladder.find((entry) => entry.id === analysisId)),
+  );
+  const getLatestAnalysis = vi.fn<FollowUpStageDeps['panels']['getLatestAnalysis']>(() =>
+    ok(ladder.length > 1 ? ladder.at(-1) : latestAnalysis),
+  );
 
   const deps: FollowUpStageDeps = {
     contextBuilder: builder,
@@ -1084,19 +1258,18 @@ function harness(options: HarnessOptions = {}): Harness {
         ),
       loadCaptureSummary: () => Promise.resolve(ok(CAPTURE_SUMMARY)),
     },
-    facts: { history },
     analysisRegeneration: { run: analysisRun },
     panelRegeneration: { regenerate },
-    instrumentation: accessRecorded({ buildContext, install }, instrumentationReads),
+    instrumentation: accessRecorded({ buildContext, install, restoreArming }, instrumentationReads),
     registry: options.registry ?? fakeRegistry(),
-    sessions: { latestPlanVersion, getPlan, nextPlanVersion },
-    panels: {
-      getLatestAnalysis: () => ok(latestAnalysis),
-      getLatestPanel: () => ok(latestPanel),
-    },
+    sessions: { latestPlanVersion, getPlan, nextPlanVersion, get: getSession },
+    panels: accessRecorded(
+      { getAnalysis, getLatestAnalysis, getLatestPanel: () => ok(latestPanel) },
+      panelReads,
+    ),
     modifications: accessRecorded({ latestRecordForFile }, modificationReads),
     sessionManager: accessRecorded(
-      { appendFollowUp, recordFollowUpOutcome, recordPlan },
+      { appendFollowUp, recordFollowUpOutcome, recordPlan, patch },
       sessionManagerReads,
     ),
     progress,
@@ -1116,16 +1289,21 @@ function harness(options: HarnessOptions = {}): Harness {
     writeReads,
     buildContext,
     install,
+    restoreArming,
     analysisRun,
     regenerate,
     latestPlanVersion,
     getPlan,
     nextPlanVersion,
+    getSession,
     latestRecordForFile,
     appendFollowUp,
     recordFollowUpOutcome,
     recordPlan,
-    history,
+    patch,
+    getAnalysis,
+    getLatestAnalysis,
+    panelReads,
     modificationReads,
     sessionManagerReads,
     instrumentationReads,
@@ -1134,7 +1312,7 @@ function harness(options: HarnessOptions = {}): Harness {
 
 /** The follow-up input most tests run with. */
 function followUpInput(overrides: Partial<FollowUpStageInput> = {}): FollowUpStageInput {
-  return { followUpQuestion: FOLLOW_UP_QUESTION, ...overrides };
+  return { followUpQuestion: FOLLOW_UP_QUESTION, attemptId: ATTEMPT_ID, ...overrides };
 }
 
 /** The single install request a run sent, or a test failure. */
@@ -1573,7 +1751,7 @@ describe('isFollowUpDecision and followUpDecisionSchema', () => {
     }
   });
 
-  it('wires the schema to the guard: the two agree on every value, and a parse returns the value itself', () => {
+  it('wires the schema to the guard: the two agree on every value, and a parse returns a structurally equal copy', () => {
     const corpus: readonly unknown[] = [
       EXISTING_EVIDENCE_DECISION,
       FETCH_DECISION,
@@ -1590,7 +1768,13 @@ describe('isFollowUpDecision and followUpDecisionSchema', () => {
       expect(parsed.success).toBe(guarded);
       if (parsed.success) {
         accepted += 1;
-        expect(parsed.data).toBe(value);
+        // The structural half re-builds the decision it admitted: equal, key for key.
+        expect(parsed.data).toStrictEqual(value);
+      } else {
+        // A guard refusal is the one root line, quoting nothing of the value.
+        expect(parsed.error.issues).toHaveLength(1);
+        expect(parsed.error.issues[0]?.path).toStrictEqual([]);
+        expect(parsed.error.issues[0]?.message).toBe('expected FollowUpDecision');
       }
     }
     // Both verdicts occur, so the agreement is not vacuous.
@@ -1987,7 +2171,9 @@ describe('createFollowUpStage — the existing-evidence path', () => {
     expect(vi.mocked(checkPlanFeasibility)).not.toHaveBeenCalled();
 
     // The follow-up is recorded when asked, and its outcome links afterwards.
-    expect(h.appendFollowUp).toHaveBeenCalledWith(SESSION_ID, FOLLOW_UP_QUESTION);
+    // Under the input's attempt id, handed over untouched: the manager decides
+    // between a new follow-up and a retry of the failed one in place.
+    expect(h.appendFollowUp).toHaveBeenCalledWith(SESSION_ID, FOLLOW_UP_QUESTION, ATTEMPT_ID);
     expect(firstOrder(h.appendFollowUp)).toBeLessThan(firstOrder(h.provider.structured));
     const outcomeLinks: FollowUpOutcome = {
       needsNewCapture: false,
@@ -2149,11 +2335,15 @@ describe('createFollowUpStage — the existing-evidence path', () => {
     expect(error.code).toBe('STORE_ERROR');
     expect(reasonOf(error)).toBe('analysis-ladder-inconsistent');
     expect(stageOf(error)).toBe(ANALYZE);
+    // Refused from the returned links alone, before either ladder read.
+    expect(h.getAnalysis).not.toHaveBeenCalled();
+    expect(h.getLatestAnalysis).toHaveBeenCalledTimes(1);
     expect(h.regenerate).not.toHaveBeenCalled();
     expect(h.recordFollowUpOutcome).not.toHaveBeenCalled();
   });
 
   it('refuses a regenerated analysis the ladder does not hold as its newest version', async () => {
+    // The port answers with a new analysis it never stored: the newest row is still version 1.
     const h = harness({
       outcomes: [answer(EXISTING_EVIDENCE_DECISION)],
       analysisAnswer: (input) =>
@@ -2171,9 +2361,71 @@ describe('createFollowUpStage — the existing-evidence path', () => {
         }),
     });
     const error = expectErr(await h.stage.run(h.context, followUpInput()));
+    expect(error.code).toBe('STORE_ERROR');
     expect(reasonOf(error)).toBe('analysis-ladder-inconsistent');
-    expect(h.history).toHaveBeenCalledWith(SESSION_ID);
+    expect(stageOf(error)).toBe(ANALYZE);
+    expect(h.getAnalysis).toHaveBeenCalledWith(ANALYSIS_V1.id);
+    expect(h.getLatestAnalysis).toHaveBeenLastCalledWith(SESSION_ID);
     expect(h.regenerate).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['is gone', undefined],
+    ['was rewritten under another version', { ...ANALYSIS_V1, analysisVersion: 3 }],
+    ['belongs to another session', { ...ANALYSIS_V1, sessionId: 'session-elsewhere' }],
+  ] as const)('refuses a regeneration when the superseded analysis %s', async (_label, stored) => {
+    const h = harness({ outcomes: [answer(EXISTING_EVIDENCE_DECISION)] });
+    h.getAnalysis.mockReturnValueOnce(ok(stored));
+    const error = expectErr(await h.stage.run(h.context, followUpInput()));
+    expect(error.code).toBe('STORE_ERROR');
+    expect(reasonOf(error)).toBe('analysis-ladder-inconsistent');
+    expect(stageOf(error)).toBe(ANALYZE);
+    expect(h.getAnalysis).toHaveBeenCalledWith(ANALYSIS_V1.id);
+    expect(h.regenerate).not.toHaveBeenCalled();
+    expect(h.recordFollowUpOutcome).not.toHaveBeenCalled();
+  });
+
+  it.each(['getAnalysis', 'getLatestAnalysis'] as const)(
+    'fails with the store’s own error when the ladder read %s fails',
+    async (member) => {
+      const h = harness({ outcomes: [answer(EXISTING_EVIDENCE_DECISION)] });
+      const failure = new DebuggenError('STORE_ERROR', 'An analysis row is unreadable.', {
+        details: { reason: 'corrupt-row' },
+      });
+      if (member === 'getAnalysis') {
+        h.getAnalysis.mockReturnValueOnce(err(failure));
+      } else {
+        // The first read is the one the follow-up is decided against; the second is the check.
+        h.getLatestAnalysis.mockReturnValueOnce(ok(ANALYSIS_V1)).mockReturnValueOnce(err(failure));
+      }
+      const error = expectErr(await h.stage.run(h.context, followUpInput()));
+      expect(error.code).toBe('STORE_ERROR');
+      expect(error.message).toBe(failure.message);
+      expect(reasonOf(error)).toBe('corrupt-row');
+      expect(stageOf(error)).toBe(ANALYZE);
+      expect(h.regenerate).not.toHaveBeenCalled();
+    },
+  );
+
+  it('proves the ladder appended with two single-row reads, never a listing of the whole ladder', async () => {
+    const h = harness({ outcomes: [answer(EXISTING_EVIDENCE_DECISION)] });
+    const value = expectPath(
+      expectOk(await h.stage.run(h.context, followUpInput())),
+      'existing-evidence',
+    );
+
+    // The superseded analysis by its primary key, and the newest by the session's version index.
+    expect(h.getAnalysis).toHaveBeenCalledTimes(1);
+    expect(h.getAnalysis).toHaveBeenCalledWith(ANALYSIS_V1.id);
+    expect(h.getLatestAnalysis).toHaveBeenCalledTimes(2);
+    expect(h.getLatestAnalysis).toHaveBeenLastCalledWith(SESSION_ID);
+    expect(firstOrder(h.analysisRun)).toBeLessThan(firstOrder(h.getAnalysis));
+    expect(value.analysis.id).toBe(h.ladder.at(-1)?.id);
+
+    // Nothing but single-row reads reached the panels repository: no ladder was listed.
+    expect(new Set(h.panelReads)).toStrictEqual(
+      new Set(['getLatestAnalysis', 'getLatestPanel', 'getAnalysis']),
+    );
   });
 
   it('passes an analysis failure through, filed under the analyze stage and without a row of its own', async () => {
@@ -2565,18 +2817,37 @@ describe('createFollowUpStage — the new-capture path', () => {
     expect(h.install).toHaveBeenCalledTimes(1);
   });
 
-  it('leaves the session at its previous plan version when the delta install fails', async () => {
-    const failure = new DebuggenError('INSTRUMENTATION_INSTALL_FAILED', 'Could not install.');
-    const h = harness({ outcomes: [answer(FETCH_DECISION)], installAnswer: () => err(failure) });
+  it('leaves the session at its previous plan version when the delta install fails and its own unwind left nothing open', async () => {
+    // The shape the service returns for a delta its installer already unwound: the previous
+    // version named as the one left active. The journal confirms it: plan version 2 holds nothing.
+    const failure = new DebuggenError('INSTRUMENTATION_INSTALL_FAILED', 'Could not install.', {
+      details: { planVersion: 2, activePlanVersion: PLAN_V1.planVersion },
+    });
+    const h = harness({
+      outcomes: [answer(FETCH_DECISION)],
+      installAnswer: () => err(failure),
+      journal: ok([RECORD_V1]),
+    });
     const error = expectErr(await h.stage.run(h.context, followUpInput()));
     expect(error.code).toBe('INSTRUMENTATION_INSTALL_FAILED');
+    expect(error.message).toBe(failure.message);
+    expect(error.hint).toBe(failure.hint);
     expect(stageOf(error)).toBe(INSTRUMENT);
+    expect(error.details).toMatchObject({ planVersion: 2, activePlanVersion: 1 });
+    expect(error.details?.['deltaRollback']).toBeUndefined();
     expect(h.recordPlan).not.toHaveBeenCalled();
     expect(h.recordFollowUpOutcome).not.toHaveBeenCalled();
-    // No rollback of its own: the installer reverse-restores what it applied. One install call,
-    // no journal or backup access, and no other instrumentation member reached for.
+    // No rollback of its own: the installer reverse-restored what it applied, and one read-only
+    // listing — over a context for plan version 2 built without the run's signal — proved it.
     expect(h.install).toHaveBeenCalledTimes(1);
-    expect(h.writeReads).toStrictEqual([]);
+    expect(h.buildContext).toHaveBeenCalledTimes(2);
+    const checkBuild = h.buildContext.mock.calls[1]?.[0];
+    expect(checkBuild?.plan).toStrictEqual({ planVersion: 2 });
+    expect(checkBuild === undefined ? true : 'signal' in checkBuild).toBe(false);
+    expect(h.writeReads).toStrictEqual(['journal.listBySession']);
+    expect(vi.mocked(restoreModification)).not.toHaveBeenCalled();
+    expect(h.restoreArming).not.toHaveBeenCalled();
+    expect(h.patch).not.toHaveBeenCalled();
     expect(h.modificationReads).toStrictEqual([]);
     expect(new Set(h.instrumentationReads)).toStrictEqual(new Set(['buildContext', 'install']));
     expect(h.sessionManagerReads).not.toContain('recordPlan');
@@ -2590,15 +2861,26 @@ describe('createFollowUpStage — the new-capture path', () => {
     ]);
   });
 
-  it('does not record a plan version the install did not leave active', async () => {
+  it('does not record a plan version the install did not leave active, and undoes its delta', async () => {
     const h = harness({
       outcomes: [answer(FETCH_DECISION)],
       installAnswer: (request) => ok({ ...outcomeFor(request), activePlanVersion: 1 }),
+      journal: ok([RECORD_V1]),
     });
     const error = expectErr(await h.stage.run(h.context, followUpInput()));
     expect(error.code).toBe('INSTRUMENTATION_INSTALL_FAILED');
     expect(reasonOf(error)).toBe('active-version-mismatch');
+    expect(stageOf(error)).toBe(INSTRUMENT);
     expect(h.recordPlan).not.toHaveBeenCalled();
+    // A runtime-only delta journals nothing, so only the arming state has to go back.
+    expect(vi.mocked(restoreModification)).not.toHaveBeenCalled();
+    expect(h.restoreArming).toHaveBeenCalledTimes(1);
+    expect(error.details?.['deltaRollback']).toMatchObject({
+      trigger: 'active-version-mismatch',
+      attempted: 0,
+      journal: 'listed',
+      arming: 'restored',
+    });
   });
 
   it('refuses to plan when the plan ladder moved under it', async () => {
@@ -2624,6 +2906,11 @@ describe('createFollowUpStage — the new-capture path', () => {
       (record) => record.level === 'error' && record.fields?.['step'] === 'normalize',
     );
     expect(defects).toHaveLength(1);
+    // The record describes plan n + 1 by its closed shape: never the authored input itself.
+    expect(Object.keys(defects[0]?.fields ?? {})).not.toContain('input');
+    expect(defects[0]?.fields).toMatchObject(
+      authoredPlanShape(buildFollowUpPlanInput(PLAN_V1, [ADD_FETCH])),
+    );
   });
 
   it('rejects a next version that would move an installed action to another adapter', async () => {
@@ -2635,15 +2922,31 @@ describe('createFollowUpStage — the new-capture path', () => {
     expect(h.provider.structured).toHaveBeenCalledTimes(1);
     expect(h.install).not.toHaveBeenCalled();
     expect(h.recordPlan).not.toHaveBeenCalled();
+    const defects = h.log.records.filter(
+      (record) => record.level === 'error' && record.fields?.['step'] === 'installed-actions',
+    );
+    expect(defects).toHaveLength(1);
+    expect(defects[0]?.fields).toMatchObject({ index: 1, targetCount: 3 });
+    expect(Object.keys(defects[0]?.fields ?? {})).not.toContain('input');
   });
 
-  it('fails the plan group when recording the installed version fails', async () => {
-    const h = harness({ outcomes: [answer(FETCH_DECISION)] });
+  it('fails the plan group when recording the installed version fails, undoing the delta first', async () => {
+    const h = harness({ outcomes: [answer(FETCH_DECISION)], journal: ok([RECORD_V1]) });
     h.recordPlan.mockResolvedValueOnce(err(new DebuggenError('STORE_ERROR', 'Not stored.')));
     const error = expectErr(await h.stage.run(h.context, followUpInput()));
     expect(error.code).toBe('STORE_ERROR');
     expect(stageOf(error)).toBe(PLAN);
+    expect(error.details?.['planStored']).toBe(false);
+    expect(error.details?.['deltaRollback']).toMatchObject({ trigger: 'plan-unrecorded' });
+    expect(h.restoreArming).toHaveBeenCalledTimes(1);
     expect(h.recordFollowUpOutcome).not.toHaveBeenCalled();
+    // The failure row is the orchestrator's to emit: the plan group closed before the install.
+    expect(h.progress.trail).toStrictEqual([
+      `stageStarted:${FOLLOWUP}`,
+      `stageCompleted:${FOLLOWUP}`,
+      `stageStarted:${PLAN}`,
+      `stageCompleted:${PLAN}`,
+    ]);
   });
 
   it('stops before the install when an orchestrator seam fails', async () => {
@@ -2659,6 +2962,940 @@ describe('createFollowUpStage — the new-capture path', () => {
     );
     expect(error.code).toBe('SESSION_INVALID_STATE');
     expect(h.install).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 4b'. Undoing an installed delta that cannot be kept (AAP §0.4.2, Follow-up row)
+// ---------------------------------------------------------------------------
+
+describe('createFollowUpStage — undoing an installed delta that cannot be kept', () => {
+  /** A backup path in the session's content-addressed store, under a digest of `digit`s. */
+  function backupFor(digit: string): string {
+    return `${DEBUGGEN_HOME}/backups/${SESSION_ID}/${digit.repeat(64)}`;
+  }
+
+  /** A plan version 2 record on a file plan version 1 never touched. */
+  const DELTA_OTHER: ModificationRecord = {
+    id: 'mod_00000000000000d1',
+    sessionId: SESSION_ID,
+    planVersion: 2,
+    file: OTHER_FILE,
+    originalHash: 'd'.repeat(64),
+    backupPath: backupFor('d'),
+    instrumentedHash: 'e'.repeat(64),
+    appliedAt: FIXED_EPOCH_MS + 10,
+    status: 'applied',
+    diff: '--- export\n+++ export\n',
+  };
+
+  /** Plan version 2's first link on the file plan version 1 instruments, layered on {@link RECORD_V1}. */
+  const DELTA_CHAINED: ModificationRecord = {
+    ...RECORD_V1,
+    id: 'mod_00000000000000d2',
+    planVersion: 2,
+    originalHash: RECORD_V1.instrumentedHash,
+    instrumentedHash: 'c'.repeat(64),
+    backupPath: backupFor('b'),
+    previousRecordId: RECORD_V1.id,
+    appliedAt: FIXED_EPOCH_MS + 20,
+  };
+
+  /** Plan version 2's second link on the same file, layered on {@link DELTA_CHAINED}. */
+  const DELTA_TOP: ModificationRecord = {
+    ...DELTA_CHAINED,
+    id: 'mod_00000000000000d3',
+    originalHash: DELTA_CHAINED.instrumentedHash,
+    instrumentedHash: 'f'.repeat(64),
+    backupPath: backupFor('c'),
+    previousRecordId: DELTA_CHAINED.id,
+    appliedAt: FIXED_EPOCH_MS + 30,
+  };
+
+  /**
+   * A plan version 2 record already in conflict: the developer's to resolve.
+   * Never handed to a restore, but reported — its presence means the delta is
+   * not undone.
+   */
+  const DELTA_CONFLICT: ModificationRecord = {
+    ...DELTA_OTHER,
+    id: 'mod_00000000000000d4',
+    file: 'src/ledger/format.ts',
+    originalHash: '1'.repeat(64),
+    backupPath: backupFor('1'),
+    instrumentedHash: '2'.repeat(64),
+    appliedAt: FIXED_EPOCH_MS + 40,
+    status: 'conflict',
+  };
+
+  /** A plan version 2 record already reverted: nothing left to undo. */
+  const DELTA_REVERTED: ModificationRecord = {
+    ...DELTA_OTHER,
+    id: 'mod_00000000000000d5',
+    file: 'src/ledger/rounding.ts',
+    originalHash: '3'.repeat(64),
+    backupPath: backupFor('3'),
+    instrumentedHash: '4'.repeat(64),
+    appliedAt: FIXED_EPOCH_MS + 50,
+    status: 'reverted',
+  };
+
+  /** The session's journal in append order: version 1's record, then plan version 2's. */
+  const JOURNAL: readonly ModificationRecord[] = [
+    RECORD_V1,
+    DELTA_OTHER,
+    DELTA_CHAINED,
+    DELTA_TOP,
+    DELTA_CONFLICT,
+    DELTA_REVERTED,
+  ];
+
+  /** The same journal without the conflict: every open record of plan version 2 can be undone. */
+  const RESTORABLE_JOURNAL: readonly ModificationRecord[] = JOURNAL.filter(
+    (record) => record.id !== DELTA_CONFLICT.id,
+  );
+
+  /** The message of the record a plan version kept although recording it reported a failure. */
+  const RECORDED_DESPITE_REPORT_LOG =
+    'The follow-up plan version was recorded on the plan ladder and the session record although recording it reported a failure; the run continues with it.';
+
+  /** The message of the record of a plan version that could not be recorded. */
+  const UNRECORDED_LOG = 'A follow-up delta was installed but recording its plan version failed.';
+
+  /** The message of the record of a compensation whose settled records could not be mirrored. */
+  const MIRROR_FAILED_LOG =
+    'The records a follow-up compensation settled could not be mirrored onto the session record; clients keep the states they were last sent.';
+
+  /**
+   * Scripts a `recordPlan` that fails after storing — the stage's plan as the
+   * ladder's version 2 — and returns a reader of the plan it was handed.
+   */
+  function storedDespiteFailure(h: Harness, failure: DebuggenError): () => InstrumentationPlan {
+    let stored: InstrumentationPlan | undefined;
+    h.recordPlan.mockImplementationOnce((_sid, plan) => {
+      stored = plan as InstrumentationPlan;
+      return Promise.resolve(err(failure));
+    });
+    // Loading reads version 1; the re-read after the failure finds version 2 stored.
+    h.latestPlanVersion.mockReturnValueOnce(ok(1)).mockReturnValueOnce(ok(2));
+    h.getPlan.mockImplementation((_sid, version) =>
+      ok(version === PLAN_V1.planVersion ? PLAN_V1 : version === 2 ? stored : undefined),
+    );
+    return () => {
+      if (stored === undefined) {
+        throw new Error('Expected recordPlan to have been handed plan version 2.');
+      }
+      return stored;
+    };
+  }
+
+  /** The `modifications` of every patch the stage sent, in call order. */
+  function patchedModifications(h: Harness): (readonly ModificationRecord[] | undefined)[] {
+    return h.patch.mock.calls.map(([, changes]) => changes.modifications);
+  }
+
+  /** `id: status` of each record, in order — the shape of a mirror a client renders. */
+  function statusesOf(records: readonly ModificationRecord[] | undefined): string[] {
+    return (records ?? []).map((record) => `${record.id}:${record.status}`);
+  }
+
+  /** The message of the record a compensation that left nothing behind writes. */
+  const ROLLED_BACK_LOG =
+    'An installed follow-up delta could not be kept and was reverse-restored; the session stays at its previous plan version.';
+
+  /** The message of the record a compensation that left something behind writes. */
+  const ROLLBACK_INCOMPLETE_LOG =
+    'An installed follow-up delta could not be kept and was only partly reverse-restored; the remaining modifications stay for cleanup.';
+
+  /** A store failure of `recordPlan`. */
+  function unrecorded(): DebuggenError {
+    return new DebuggenError('STORE_ERROR', 'The plan version could not be stored.');
+  }
+
+  /** The ids of the records handed to `restoreModification`, in call order. */
+  function restoredIds(): string[] {
+    return vi.mocked(restoreModification).mock.calls.map(([record]) => record.id);
+  }
+
+  /** The `details.deltaRollback` of a compensated failure. */
+  function rollbackOf(error: DebuggenError): Record<string, unknown> {
+    const rollback = error.details?.['deltaRollback'];
+    if (typeof rollback !== 'object' || rollback === null) {
+      throw new Error('Expected the failure to carry a delta rollback report.');
+    }
+    return rollback as Record<string, unknown>;
+  }
+
+  it('reverse-restores only plan version n + 1, newest first, when recording it fails with the ladder still at n — and reports a conflict it left', async () => {
+    const failure = unrecorded();
+    const h = harness({ outcomes: [answer(FETCH_DECISION)], journal: ok([...JOURNAL]) });
+    h.recordPlan.mockResolvedValueOnce(err(failure));
+    const error = expectErr(await h.stage.run(h.context, followUpInput()));
+
+    // The ladder was read again and still names version 1: the plan row was not stored.
+    expect(h.latestPlanVersion).toHaveBeenCalledTimes(2);
+
+    // Newest first: the file touched last, its chain top-down, then the earlier file. Version 1's
+    // record and the already reverted record are never handed to a restore, and neither is the
+    // conflict — its file, the latest touched, is walked first and stops at it untouched.
+    expect(restoredIds()).toStrictEqual([DELTA_TOP.id, DELTA_CHAINED.id, DELTA_OTHER.id]);
+    expect(vi.mocked(orderRestorationChain)).toHaveBeenCalledTimes(3);
+    expect(
+      vi.mocked(restoreModification).mock.calls.map(([, , options]) => options?.retainBackup),
+    ).toStrictEqual([false, false, false]);
+
+    // The restores run over a context for plan version 2 built without the run's signal, and the
+    // stage itself read nothing of it but the journal: listed before the walk and after it.
+    expect(h.buildContext).toHaveBeenCalledTimes(2);
+    const rollbackBuild = h.buildContext.mock.calls[1]?.[0];
+    expect(rollbackBuild?.plan).toStrictEqual({ planVersion: 2 });
+    expect(rollbackBuild === undefined ? true : 'signal' in rollbackBuild).toBe(false);
+    expect(h.writeReads).toStrictEqual(['journal.listBySession', 'journal.listBySession']);
+
+    // Then the arming state goes back to plan version 1, whatever the files did.
+    expect(h.restoreArming).toHaveBeenCalledTimes(1);
+    expect(h.restoreArming).toHaveBeenCalledWith({
+      sessionId: SESSION_ID,
+      projectRoot: PROJECT_ROOT,
+      plan: PLAN_V1,
+    });
+    expect(firstOrder(vi.mocked(restoreModification))).toBeLessThan(firstOrder(h.restoreArming));
+
+    // recordPlan's own error, filed under the plan stage, with one sentence stating the state: the
+    // conflict stands, so the rollback is partial and no active version is claimed.
+    expect(error.code).toBe(failure.code);
+    expect(stageOf(error)).toBe(PLAN);
+    expect(error.message).toBe(
+      `${failure.message} 3 of 4 file modification(s) of plan version 2 were restored; 1 were left exactly as they stand and 0 could not be restored.`,
+    );
+    expect(error.hint).toMatch(/reported as a conflict/u);
+    expect(error.hint).toMatch(/backup directory/u);
+    expect(error.details).toMatchObject({
+      planStored: false,
+      deltaRollback: {
+        trigger: 'plan-unrecorded',
+        attempted: 4,
+        restored: 3,
+        conflicts: [DELTA_CONFLICT.id],
+        conflictCount: 1,
+        skipped: [],
+        failures: [],
+        journal: 'listed',
+        arming: 'restored',
+        mirrored: true,
+      },
+    });
+    expect(error.details?.['activePlanVersion']).toBeUndefined();
+    expect(h.recordFollowUpOutcome).not.toHaveBeenCalled();
+
+    // One error record with counts and ids; no path, digest or diff anywhere the run surfaced.
+    const [logged, ...more] = recordsWith(h.log.records, ROLLBACK_INCOMPLETE_LOG);
+    expect(more).toStrictEqual([]);
+    expect(logged?.level).toBe('error');
+    expect(logged?.fields).toMatchObject({
+      planVersion: 2,
+      previousPlanVersion: 1,
+      restored: 3,
+      conflictCount: 1,
+    });
+    expect(recordsWith(h.log.records, ROLLED_BACK_LOG)).toStrictEqual([]);
+    const surfaced = everythingSurfaced(h, error);
+    for (const fragment of [
+      OTHER_FILE,
+      INDEXED_FILE,
+      DELTA_OTHER.backupPath,
+      DELTA_TOP.backupPath,
+      DELTA_OTHER.originalHash,
+      DELTA_TOP.instrumentedHash,
+      DELTA_OTHER.diff,
+      PROJECT_ROOT,
+    ]) {
+      expect(surfaced).not.toContain(JSON.stringify(fragment).slice(1, -1));
+    }
+  });
+
+  it('rolls forward when the plan row and the session record both hold this run’s plan version although recording it reported a failure', async () => {
+    // What reaches here: recordPlan committed both rows and then failed (a broadcast that threw).
+    const failure = new DebuggenError('INTERNAL', 'The recorded plan could not be announced.');
+    const h = harness({ outcomes: [answer(FETCH_DECISION)], journal: ok([...JOURNAL]) });
+    const storedPlan = storedDespiteFailure(h, failure);
+    h.getSession.mockImplementation(() =>
+      ok(sessionRecord({ plans: [PLAN_V1, storedPlan()], status: 'instrumenting' })),
+    );
+    const value = expectPath(
+      expectOk(await h.stage.run(h.context, followUpInput())),
+      'new-capture',
+    );
+
+    // The run completes with the stored plan: its success tail runs, nothing is undone.
+    expect(value.planVersion).toBe(2);
+    expect(value.plan).toBe(storedPlan());
+    expect(value.previousPlanVersion).toBe(1);
+    expect(h.getPlan).toHaveBeenLastCalledWith(SESSION_ID, 2);
+    expect(h.getSession).toHaveBeenCalledTimes(1);
+    expect(h.recordFollowUpOutcome).toHaveBeenCalledWith(SESSION_ID, {
+      needsNewCapture: true,
+      planVersion: 2,
+    });
+    expect(vi.mocked(restoreModification)).not.toHaveBeenCalled();
+    expect(h.restoreArming).not.toHaveBeenCalled();
+    expect(h.patch).not.toHaveBeenCalled();
+    expect(h.buildContext).toHaveBeenCalledTimes(1);
+    expect(h.writeReads).toStrictEqual([]);
+
+    // Said once at warn, with the code; the run's completion is recorded as usual.
+    const [kept, ...moreKept] = recordsWith(h.log.records, RECORDED_DESPITE_REPORT_LOG);
+    expect(moreKept).toStrictEqual([]);
+    expect(kept?.level).toBe('warn');
+    expect(kept?.fields).toMatchObject({ planVersion: 2, code: failure.code });
+    expect(recordsWith(h.log.records, UNRECORDED_LOG)).toStrictEqual([]);
+    expect(recordsWith(h.log.records, 'Follow-up stage completed.')).toHaveLength(1);
+  });
+
+  it('undoes a plan row the session record does not account for, and names that row', async () => {
+    const failure = new DebuggenError('STORE_ERROR', 'The session record could not be stored.');
+    const h = harness({
+      outcomes: [answer(FETCH_DECISION)],
+      journal: ok([RECORD_V1, DELTA_OTHER]),
+    });
+    storedDespiteFailure(h, failure);
+    // The record the capture stage arms from still stands at plan version 1.
+    h.getSession.mockImplementation(() => ok(sessionRecord({ plans: [PLAN_V1] })));
+    const error = expectErr(await h.stage.run(h.context, followUpInput()));
+
+    // Files and arming go back to version 1 — what the record holds — and the clients are told.
+    expect(restoredIds()).toStrictEqual([DELTA_OTHER.id]);
+    expect(h.restoreArming).toHaveBeenCalledWith({
+      sessionId: SESSION_ID,
+      projectRoot: PROJECT_ROOT,
+      plan: PLAN_V1,
+    });
+    expect(statusesOf(patchedModifications(h)[0])).toStrictEqual([`${DELTA_OTHER.id}:reverted`]);
+    expect(h.recordFollowUpOutcome).not.toHaveBeenCalled();
+
+    expect(error.code).toBe(failure.code);
+    expect(stageOf(error)).toBe(PLAN);
+    expect(error.message).toBe(
+      `${failure.message} Plan version 2 was stored, but the session record does not account for it. All 1 file modification(s) of plan version 2 were restored, so the project holds exactly what plan version 1 installed.`,
+    );
+    expect(error.hint).toMatch(
+      /holds plan version 2 although the session record stands at plan version 1/u,
+    );
+    expect(error.hint).toMatch(/end this session/u);
+    expect(error.details).toMatchObject({
+      planVersion: 2,
+      planStored: true,
+      recordMirrored: false,
+      planCheck: 'record-lacks-plan',
+      activePlanVersion: 1,
+      deltaRollback: { trigger: 'plan-unrecorded', attempted: 1, restored: 1, mirrored: true },
+    });
+    expect(error.details?.['instrumentationKept']).toBeUndefined();
+    const [logged] = recordsWith(h.log.records, UNRECORDED_LOG);
+    expect(logged?.fields).toMatchObject({ planStored: true, planCheck: 'record-lacks-plan' });
+    expect(recordsWith(h.log.records, RECORDED_DESPITE_REPORT_LOG)).toStrictEqual([]);
+  });
+
+  it.each([
+    { check: 'plan-unreadable', what: 'the stored plan cannot be read back' },
+    { check: 'plan-differs', what: 'the stored plan is not this run’s' },
+    { check: 'record-unreadable', what: 'the session record cannot be read' },
+  ] as const)('never keeps a plan row it cannot confirm: $check ($what)', async ({ check }) => {
+    const failure = unrecorded();
+    const h = harness({
+      outcomes: [answer(FETCH_DECISION)],
+      journal: ok([RECORD_V1, DELTA_OTHER]),
+    });
+    const storedPlan = storedDespiteFailure(h, failure);
+    const unreadable = new DebuggenError('STORE_ERROR', 'The row is unreadable.');
+    if (check === 'plan-unreadable') {
+      h.getPlan.mockImplementation((_sid, version) =>
+        version === PLAN_V1.planVersion ? ok(PLAN_V1) : err(unreadable),
+      );
+    } else if (check === 'plan-differs') {
+      h.getPlan.mockImplementation((_sid, version) =>
+        ok(
+          version === PLAN_V1.planVersion
+            ? PLAN_V1
+            : { ...storedPlan(), instrumentationTargets: [...PLAN_V1.instrumentationTargets] },
+        ),
+      );
+    }
+    h.getSession.mockImplementation(() =>
+      check === 'record-unreadable'
+        ? err(unreadable)
+        : ok(sessionRecord({ plans: [PLAN_V1, storedPlan()] })),
+    );
+    const error = expectErr(await h.stage.run(h.context, followUpInput()));
+
+    expect(restoredIds()).toStrictEqual([DELTA_OTHER.id]);
+    expect(h.restoreArming).toHaveBeenCalledTimes(1);
+    expect(h.recordFollowUpOutcome).not.toHaveBeenCalled();
+    expect(error.details).toMatchObject({
+      planStored: true,
+      recordMirrored: false,
+      planCheck: check,
+      deltaRollback: { trigger: 'plan-unrecorded', restored: 1 },
+    });
+  });
+
+  it('restores the files when the ladder cannot be read again: the side that leaves nothing unaccounted for', async () => {
+    const failure = unrecorded();
+    const h = harness({ outcomes: [answer(FETCH_DECISION)], journal: ok([...RESTORABLE_JOURNAL]) });
+    h.latestPlanVersion
+      .mockReturnValueOnce(ok(1))
+      .mockReturnValueOnce(err(new DebuggenError('STORE_ERROR', 'The ladder is unreadable.')));
+    h.recordPlan.mockResolvedValueOnce(err(failure));
+    const error = expectErr(await h.stage.run(h.context, followUpInput()));
+
+    expect(restoredIds()).toStrictEqual([DELTA_TOP.id, DELTA_CHAINED.id, DELTA_OTHER.id]);
+    expect(h.restoreArming).toHaveBeenCalledTimes(1);
+    // With no conflict every open record is undone, so the session provably stands at version 1.
+    expect(error.message).toBe(
+      `${failure.message} All 3 file modification(s) of plan version 2 were restored, so the project holds exactly what plan version 1 installed.`,
+    );
+    expect(error.hint).toMatch(/ask the follow-up again/u);
+    expect(error.details).toMatchObject({ planStored: 'unknown', activePlanVersion: 1 });
+    expect(rollbackOf(error)).toMatchObject({
+      trigger: 'plan-unrecorded',
+      attempted: 3,
+      restored: 3,
+      conflicts: [],
+      skipped: [],
+      failures: [],
+      mirrored: true,
+    });
+    const [logged] = recordsWith(h.log.records, ROLLED_BACK_LOG);
+    expect(logged?.level).toBe('info');
+  });
+
+  it('undoes a delta the install applied before it reported a failure, even for a cancelled run', async () => {
+    const controller = new AbortController();
+    // The service's shape for an install that applied and then could not report: n + 1 active,
+    // with a hint the instrumentation service registers as product text as it builds it.
+    const failure = new DebuggenError(
+      'INTERNAL',
+      'Instrumentation was installed, but reporting it to the user interfaces failed.',
+      {
+        hint: authorProductText('Check the service log for the failing collaborator.'),
+        details: { planVersion: 2, activePlanVersion: 2, applied: 1 },
+      },
+    );
+    const h = harness({
+      outcomes: [answer(FETCH_DECISION)],
+      installAnswer: () => {
+        controller.abort();
+        return err(failure);
+      },
+      journal: ok([RECORD_V1, DELTA_OTHER]),
+    });
+    const error = expectErr(
+      await h.stage.run(stageContext(sessionRecord(), controller.signal), followUpInput()),
+    );
+
+    expect(restoredIds()).toStrictEqual([DELTA_OTHER.id]);
+    expect(h.buildContext.mock.calls[0]?.[0].signal).toBe(controller.signal);
+    expect(h.buildContext.mock.calls[1]?.[0].signal).toBeUndefined();
+    expect(h.restoreArming).toHaveBeenCalledWith({
+      sessionId: SESSION_ID,
+      projectRoot: PROJECT_ROOT,
+      plan: PLAN_V1,
+    });
+    expect(h.recordPlan).not.toHaveBeenCalled();
+
+    expect(error.code).toBe(failure.code);
+    expect(stageOf(error)).toBe(INSTRUMENT);
+    expect(error.message).toBe(
+      `${failure.message} All 1 file modification(s) of plan version 2 were restored, so the project holds exactly what plan version 1 installed.`,
+    );
+    // Intact: the failure's own hint names the recovery for its cause, after what the project
+    // holds — the one text a failed row shows of it, so it is registered as product text.
+    expect(error.hint).toBe(
+      `All 1 file modification(s) of plan version 2 were restored, so the project holds exactly what plan version 1 installed. ${String(failure.hint)}`,
+    );
+    expect(isProductAuthoredText(error.hint)).toBe(true);
+    expect(error.details).toMatchObject({
+      applied: 1,
+      activePlanVersion: 1,
+      deltaRollback: { trigger: 'install-failed', attempted: 1, restored: 1 },
+    });
+  });
+
+  it('checks an install error that names the previous version active, and undoes what its unwind left open', async () => {
+    // The service stamps version 1 on every failed install; this rollback left a record applied.
+    const failure = new DebuggenError(
+      'INSTRUMENTATION_INSTALL_FAILED',
+      'The install stopped part-way and its rollback could not finish.',
+      {
+        hint: 'Review the reported conflicts before installing again.',
+        details: { planVersion: 2, activePlanVersion: PLAN_V1.planVersion, failureCount: 1 },
+      },
+    );
+    const h = harness({
+      outcomes: [answer(FETCH_DECISION)],
+      installAnswer: () => err(failure),
+      journal: ok([RECORD_V1, DELTA_OTHER, DELTA_REVERTED]),
+    });
+    const error = expectErr(await h.stage.run(h.context, followUpInput()));
+
+    // One context for the check, reused by the compensation: listed once to check, once after.
+    expect(h.buildContext).toHaveBeenCalledTimes(2);
+    expect(h.buildContext.mock.calls[1]?.[0].signal).toBeUndefined();
+    expect(h.writeReads).toStrictEqual(['journal.listBySession', 'journal.listBySession']);
+    expect(restoredIds()).toStrictEqual([DELTA_OTHER.id]);
+    expect(h.restoreArming).toHaveBeenCalledWith({
+      sessionId: SESSION_ID,
+      projectRoot: PROJECT_ROOT,
+      plan: PLAN_V1,
+    });
+    expect(h.recordPlan).not.toHaveBeenCalled();
+
+    // The installer's error, annotated: its code, its message plus what the project holds now,
+    // and — since nothing is left — the re-ask instead of the unwind's own now-stale hint.
+    expect(error.code).toBe(failure.code);
+    expect(stageOf(error)).toBe(INSTRUMENT);
+    expect(error.message).toBe(
+      `${failure.message} All 1 file modification(s) of plan version 2 were restored, so the project holds exactly what plan version 1 installed.`,
+    );
+    expect(error.hint).toMatch(
+      /^All 1 file modification\(s\) of plan version 2 were restored, so the project holds exactly what plan version 1 installed\. Nothing from this follow-up remains in the project/u,
+    );
+    expect(isProductAuthoredText(error.hint)).toBe(true);
+    expect(error.details).toMatchObject({
+      failureCount: 1,
+      activePlanVersion: 1,
+      deltaRollback: {
+        trigger: 'install-unwind-incomplete',
+        attempted: 1,
+        restored: 1,
+        journal: 'listed',
+        arming: 'restored',
+        mirrored: true,
+      },
+    });
+    // Every record of plan version 2 is mirrored as the journal now holds it.
+    expect(statusesOf(patchedModifications(h)[0])).toStrictEqual([
+      `${DELTA_OTHER.id}:reverted`,
+      `${DELTA_REVERTED.id}:reverted`,
+    ]);
+  });
+
+  it('does not take the installer’s word for an unwind the journal cannot confirm', async () => {
+    const failure = new DebuggenError('INSTRUMENTATION_INSTALL_FAILED', 'Could not install.', {
+      details: { planVersion: 2, activePlanVersion: PLAN_V1.planVersion },
+    });
+    const h = harness({
+      outcomes: [answer(FETCH_DECISION)],
+      installAnswer: () => err(failure),
+      journal: err(new DebuggenError('STORE_ERROR', 'The journal is locked.')),
+    });
+    const error = expectErr(await h.stage.run(h.context, followUpInput()));
+
+    // The one failed listing serves both the check and the compensation; nothing is restored.
+    expect(h.buildContext).toHaveBeenCalledTimes(2);
+    expect(h.writeReads).toStrictEqual(['journal.listBySession']);
+    expect(vi.mocked(restoreModification)).not.toHaveBeenCalled();
+    expect(h.restoreArming).toHaveBeenCalledTimes(1);
+    expect(h.patch).not.toHaveBeenCalled();
+    expect(error.message).toBe(
+      `${failure.message} The modification journal could not be read, so no file modification of plan version 2 could be looked up or restored.`,
+    );
+    expect(error.hint).toMatch(/journal did not answer/u);
+    expect(rollbackOf(error)).toMatchObject({
+      trigger: 'install-unwind-incomplete',
+      attempted: 0,
+      journal: 'unreadable',
+      journalCode: 'STORE_ERROR',
+    });
+    // The installer's claim of version 1 is not carried over: nothing proved it.
+    expect(error.details?.['activePlanVersion']).toBeUndefined();
+    expect(rollbackOf(error)['mirrored']).toBeUndefined();
+  });
+
+  it('reports a record of plan version n + 1 already in conflict as partial, without touching its file', async () => {
+    const edited: ModificationRecord = { ...DELTA_TOP, status: 'conflict' };
+    const h = harness({
+      outcomes: [answer(FETCH_DECISION)],
+      journal: ok([RECORD_V1, DELTA_CHAINED, edited]),
+    });
+    h.recordPlan.mockResolvedValueOnce(err(unrecorded()));
+    const error = expectErr(await h.stage.run(h.context, followUpInput()));
+
+    // The conflict stops its file before anything is written: the link under it is skipped.
+    expect(vi.mocked(restoreModification)).not.toHaveBeenCalled();
+    expect(vi.mocked(orderRestorationChain)).toHaveBeenCalledTimes(1);
+    expect(rollbackOf(error)).toMatchObject({
+      attempted: 2,
+      restored: 0,
+      conflicts: [edited.id],
+      conflictCount: 1,
+      skipped: [DELTA_CHAINED.id],
+      skippedCount: 1,
+      failures: [],
+      journal: 'listed',
+      arming: 'restored',
+      mirrored: true,
+    });
+    expect(error.message).toMatch(
+      /0 of 2 file modification\(s\) of plan version 2 were restored; 2 were left exactly as they stand and 0 could not be restored\.$/u,
+    );
+    expect(error.hint).toMatch(/reported as a conflict/u);
+    expect(error.details?.['activePlanVersion']).toBeUndefined();
+    expect(h.restoreArming).toHaveBeenCalledTimes(1);
+    expect(recordsWith(h.log.records, ROLLBACK_INCOMPLETE_LOG)).toHaveLength(1);
+    expect(recordsWith(h.log.records, ROLLED_BACK_LOG)).toStrictEqual([]);
+    // Nothing was restored, so the first listing still stands and is what the clients are sent.
+    expect(h.writeReads).toStrictEqual(['journal.listBySession']);
+    expect(statusesOf(patchedModifications(h)[0])).toStrictEqual([
+      `${DELTA_CHAINED.id}:applied`,
+      `${edited.id}:conflict`,
+    ]);
+  });
+
+  it('mirrors the settled records onto the session record, replacing announced ones in place', async () => {
+    // The session record already lists the record the install announced, as applied.
+    const h = harness({
+      outcomes: [answer(FETCH_DECISION)],
+      session: sessionRecord({ modifications: [RECORD_V1, DELTA_OTHER] }),
+      journal: ok([...JOURNAL]),
+      restores: new Map([[DELTA_TOP.id, 'conflict' as const]]),
+    });
+    h.recordPlan.mockResolvedValueOnce(err(unrecorded()));
+    const error = expectErr(await h.stage.run(h.context, followUpInput()));
+
+    // One patch, of modifications only — no status — carrying every plan version 2 record's final
+    // state: replaced in place, then appended in journal order.
+    expect(h.patch).toHaveBeenCalledTimes(1);
+    const [[sessionId, changes] = []] = h.patch.mock.calls;
+    expect(sessionId).toBe(SESSION_ID);
+    expect(Object.keys(changes ?? {})).toStrictEqual(['modifications']);
+    expect(statusesOf(changes?.modifications)).toStrictEqual([
+      `${RECORD_V1.id}:applied`,
+      `${DELTA_OTHER.id}:reverted`,
+      `${DELTA_CHAINED.id}:applied`,
+      `${DELTA_TOP.id}:conflict`,
+      `${DELTA_CONFLICT.id}:conflict`,
+      `${DELTA_REVERTED.id}:reverted`,
+    ]);
+    expect(firstOrder(h.restoreArming)).toBeLessThan(firstOrder(h.patch));
+    expect(rollbackOf(error)).toMatchObject({
+      restored: 1,
+      conflicts: [DELTA_CONFLICT.id, DELTA_TOP.id],
+      skipped: [DELTA_CHAINED.id],
+      mirrored: true,
+    });
+  });
+
+  it.each([
+    ['the patch is refused', 'patch'],
+    ['the session record cannot be read', 'read'],
+  ] as const)(
+    'reports a mirror that failed because %s, and keeps the failure’s code',
+    async (_label, step) => {
+      const refusal = new DebuggenError('STORE_ERROR', 'The session store is read-only.');
+      const failure = unrecorded();
+      const h = harness({
+        outcomes: [answer(FETCH_DECISION)],
+        journal: ok([RECORD_V1, DELTA_OTHER]),
+        ...(step === 'patch' ? { patchFailure: refusal } : { storedSession: err(refusal) }),
+      });
+      h.recordPlan.mockResolvedValueOnce(err(failure));
+      const error = expectErr(await h.stage.run(h.context, followUpInput()));
+
+      expect(restoredIds()).toStrictEqual([DELTA_OTHER.id]);
+      expect(h.patch).toHaveBeenCalledTimes(step === 'patch' ? 1 : 0);
+      expect(error.code).toBe(failure.code);
+      // The files and the arming are back at version 1, so the rollback itself is intact.
+      expect(error.details?.['activePlanVersion']).toBe(1);
+      expect(rollbackOf(error)).toMatchObject({ restored: 1, mirrored: false });
+      const [logged, ...more] = recordsWith(h.log.records, MIRROR_FAILED_LOG);
+      expect(more).toStrictEqual([]);
+      expect(logged?.level).toBe('warn');
+      expect(logged?.fields).toMatchObject({ step, code: refusal.code });
+      expect(JSON.stringify(logged?.fields ?? {})).not.toContain(refusal.message);
+    },
+  );
+
+  it('undoes a delta whose install failed without naming the version it left active', async () => {
+    const h = harness({
+      outcomes: [answer(FETCH_DECISION)],
+      installAnswer: () => {
+        throw new Error(`installer exploded ${SENTINEL}`);
+      },
+      journal: ok([RECORD_V1, DELTA_OTHER]),
+    });
+    const error = expectErr(await h.stage.run(h.context, followUpInput()));
+
+    expect(restoredIds()).toStrictEqual([DELTA_OTHER.id]);
+    expect(h.restoreArming).toHaveBeenCalledTimes(1);
+    expect(error.code).toBe('INTERNAL');
+    expect(stageOf(error)).toBe(INSTRUMENT);
+    expect(rollbackOf(error)).toMatchObject({
+      trigger: 'install-failed',
+      attempted: 1,
+      restored: 1,
+      journal: 'listed',
+    });
+    expect(h.log.records.map(serializeRecord).join('\n')).not.toContain(SENTINEL);
+  });
+
+  it('undoes a delta whose install left another plan version active', async () => {
+    const h = harness({
+      outcomes: [answer(FETCH_DECISION)],
+      installAnswer: (request) =>
+        ok({ ...outcomeFor(request, [DELTA_OTHER]), activePlanVersion: 3 }),
+      journal: ok([RECORD_V1, DELTA_OTHER]),
+    });
+    const error = expectErr(await h.stage.run(h.context, followUpInput()));
+
+    expect(restoredIds()).toStrictEqual([DELTA_OTHER.id]);
+    expect(h.restoreArming).toHaveBeenCalledTimes(1);
+    expect(h.recordPlan).not.toHaveBeenCalled();
+    expect(error.code).toBe('INSTRUMENTATION_INSTALL_FAILED');
+    expect(reasonOf(error)).toBe('active-version-mismatch');
+    expect(error.message).toMatch(/All 1 file modification\(s\) of plan version 2 were restored/u);
+    expect(error.hint).toMatch(
+      /^All 1 file modification\(s\) of plan version 2 were restored, so the project holds exactly what plan version 1 installed\. Ask the follow-up again/u,
+    );
+    expect(isProductAuthoredText(error.hint)).toBe(true);
+    // The version the session is left at is the previous one, not the one the install reported.
+    expect(error.details).toMatchObject({
+      planVersion: 2,
+      activePlanVersion: 1,
+      deltaRollback: { trigger: 'active-version-mismatch', restored: 1 },
+    });
+  });
+
+  it('falls back to the records the install reported when the journal cannot be listed, keeping every backup', async () => {
+    const h = harness({
+      outcomes: [answer(FETCH_DECISION)],
+      installAnswer: (request) => ok(outcomeFor(request, [DELTA_OTHER])),
+      journal: err(new DebuggenError('STORE_ERROR', 'The journal is locked.')),
+    });
+    h.recordPlan.mockResolvedValueOnce(err(unrecorded()));
+    const error = expectErr(await h.stage.run(h.context, followUpInput()));
+
+    expect(restoredIds()).toStrictEqual([DELTA_OTHER.id]);
+    expect(vi.mocked(restoreModification).mock.calls[0]?.[2]?.retainBackup).toBe(true);
+    expect(h.restoreArming).toHaveBeenCalledTimes(1);
+    expect(rollbackOf(error)).toMatchObject({
+      attempted: 1,
+      restored: 1,
+      journal: 'unreadable',
+      journalCode: 'STORE_ERROR',
+      arming: 'restored',
+    });
+    expect(error.message).toMatch(
+      /The modification journal could not be read; of the 1 file modification\(s\) of plan version 2 the install reported, 1 were restored, 0 were left exactly as they stand and 0 could not be restored\.$/u,
+    );
+    expect(error.hint).toMatch(/journal did not answer/u);
+    // Not confirmed intact, so no active version is claimed for the session.
+    expect(error.details?.['activePlanVersion']).toBeUndefined();
+    const [logged] = recordsWith(h.log.records, ROLLBACK_INCOMPLETE_LOG);
+    expect(logged?.level).toBe('error');
+  });
+
+  it.each([
+    ['a conflict', 'conflict' as const],
+    ['a restore failure', new DebuggenError('CLEANUP_PARTIAL', 'The backup could not be read.')],
+  ])(
+    'stops a file’s chain at %s, still restores the other files, and says what is left',
+    async (_label, settled) => {
+      const h = harness({
+        outcomes: [answer(FETCH_DECISION)],
+        journal: ok([...RESTORABLE_JOURNAL]),
+        restores: new Map([[DELTA_TOP.id, settled]]),
+      });
+      h.recordPlan.mockResolvedValueOnce(err(unrecorded()));
+      const error = expectErr(await h.stage.run(h.context, followUpInput()));
+      const conflicted = settled === 'conflict';
+
+      // The link under the one that stopped is never attempted; the other file still is.
+      expect(restoredIds()).toStrictEqual([DELTA_TOP.id, DELTA_OTHER.id]);
+      expect(rollbackOf(error)).toMatchObject({
+        attempted: 3,
+        restored: 1,
+        conflicts: conflicted ? [DELTA_TOP.id] : [],
+        skipped: [DELTA_CHAINED.id],
+        skippedCount: 1,
+        failures: conflicted ? [] : [{ recordId: DELTA_TOP.id, code: 'CLEANUP_PARTIAL' }],
+        journal: 'listed',
+        arming: 'restored',
+      });
+      expect(error.message).toMatch(
+        conflicted
+          ? /1 of 3 file modification\(s\) of plan version 2 were restored; 2 were left exactly as they stand and 0 could not be restored\.$/u
+          : /1 of 3 file modification\(s\) of plan version 2 were restored; 1 were left exactly as they stand and 1 could not be restored\.$/u,
+      );
+      expect(error.hint).toMatch(/backup directory/u);
+      expect(error.details?.['activePlanVersion']).toBeUndefined();
+      expect(h.restoreArming).toHaveBeenCalledTimes(1);
+      const [logged] = recordsWith(h.log.records, ROLLBACK_INCOMPLETE_LOG);
+      expect(logged?.level).toBe('error');
+      expect(recordsWith(h.log.records, ROLLED_BACK_LOG)).toStrictEqual([]);
+    },
+  );
+
+  it('touches no record of a file whose records have no reverse order', async () => {
+    vi.mocked(orderRestorationChain).mockReturnValueOnce(
+      err(new DebuggenError('INTERNAL', 'The records form a cycle.')),
+    );
+    const h = harness({
+      outcomes: [answer(FETCH_DECISION)],
+      journal: ok([...RESTORABLE_JOURNAL]),
+    });
+    h.recordPlan.mockResolvedValueOnce(err(unrecorded()));
+    const error = expectErr(await h.stage.run(h.context, followUpInput()));
+
+    expect(restoredIds()).toStrictEqual([DELTA_OTHER.id]);
+    expect(rollbackOf(error)).toMatchObject({
+      attempted: 3,
+      restored: 1,
+      failures: [
+        { recordId: DELTA_CHAINED.id, code: 'INTERNAL' },
+        { recordId: DELTA_TOP.id, code: 'INTERNAL' },
+      ],
+      failureCount: 2,
+    });
+  });
+
+  it('keeps a backup another open record of the session still needs, and deletes it with its last holder', async () => {
+    const twin = backupFor('9');
+    const lone = backupFor('8');
+    const sharesVersionOne: ModificationRecord = {
+      ...DELTA_OTHER,
+      id: 'mod_00000000000000e1',
+      originalHash: RECORD_V1.originalHash,
+      backupPath: RECORD_V1.backupPath,
+      appliedAt: FIXED_EPOCH_MS + 10,
+    };
+    const firstTwin: ModificationRecord = {
+      ...DELTA_OTHER,
+      id: 'mod_00000000000000e2',
+      file: 'src/ledger/format.ts',
+      backupPath: twin,
+      appliedAt: FIXED_EPOCH_MS + 30,
+    };
+    const secondTwin: ModificationRecord = {
+      ...DELTA_OTHER,
+      id: 'mod_00000000000000e3',
+      file: 'src/ledger/rounding.ts',
+      backupPath: twin,
+      appliedAt: FIXED_EPOCH_MS + 20,
+    };
+    const beside: ModificationRecord = {
+      ...DELTA_OTHER,
+      id: 'mod_00000000000000e4',
+      file: 'src/ledger/audit.ts',
+      backupPath: lone,
+      appliedAt: FIXED_EPOCH_MS + 5,
+    };
+    const conflictHolder: ModificationRecord = {
+      ...beside,
+      id: 'mod_00000000000000e5',
+      file: 'src/ledger/audit-copy.ts',
+      status: 'conflict',
+    };
+    const h = harness({
+      outcomes: [answer(FETCH_DECISION)],
+      journal: ok([RECORD_V1, sharesVersionOne, secondTwin, firstTwin, beside, conflictHolder]),
+    });
+    h.recordPlan.mockResolvedValueOnce(err(unrecorded()));
+    const error = expectErr(await h.stage.run(h.context, followUpInput()));
+
+    expect(
+      vi
+        .mocked(restoreModification)
+        .mock.calls.map(([record, , options]) => [record.id, options?.retainBackup]),
+    ).toStrictEqual([
+      // The first twin keeps the backup the second still needs; the second, its last holder, drops it.
+      [firstTwin.id, true],
+      [secondTwin.id, false],
+      // Version 1's applied record and a conflict record hold their backups past this compensation.
+      [sharesVersionOne.id, true],
+      [beside.id, true],
+    ]);
+    // The conflict itself is never handed to a restore, and it is reported: the rollback is partial.
+    expect(rollbackOf(error)).toMatchObject({
+      attempted: 5,
+      restored: 4,
+      conflicts: [conflictHolder.id],
+    });
+    expect(error.details?.['activePlanVersion']).toBeUndefined();
+  });
+
+  it('returns the arming state to plan version n for a runtime-only delta, which journaled nothing', async () => {
+    const h = harness({ outcomes: [answer(FETCH_DECISION)], journal: ok([RECORD_V1]) });
+    h.recordPlan.mockResolvedValueOnce(err(unrecorded()));
+    const error = expectErr(await h.stage.run(h.context, followUpInput()));
+
+    expect(vi.mocked(restoreModification)).not.toHaveBeenCalled();
+    expect(h.restoreArming).toHaveBeenCalledWith({
+      sessionId: SESSION_ID,
+      projectRoot: PROJECT_ROOT,
+      plan: PLAN_V1,
+    });
+    expect(error.message).toMatch(
+      /No file modification of plan version 2 remained in the project, so it holds exactly what plan version 1 installed\.$/u,
+    );
+    expect(rollbackOf(error)).toMatchObject({ attempted: 0, restored: 0, arming: 'restored' });
+    expect(error.details?.['activePlanVersion']).toBe(1);
+  });
+
+  it('says so when the arming state could not be returned to plan version n', async () => {
+    const h = harness({
+      outcomes: [answer(FETCH_DECISION)],
+      journal: ok([RECORD_V1, DELTA_OTHER]),
+      restoreArmingFailure: new DebuggenError(
+        'INTERNAL',
+        'The arming state could not be recomputed.',
+      ),
+    });
+    h.recordPlan.mockResolvedValueOnce(err(unrecorded()));
+    const error = expectErr(await h.stage.run(h.context, followUpInput()));
+
+    expect(restoredIds()).toStrictEqual([DELTA_OTHER.id]);
+    expect(rollbackOf(error)).toMatchObject({
+      restored: 1,
+      arming: 'failed',
+      armingCode: 'INTERNAL',
+    });
+    expect(error.message).toMatch(
+      /so the project holds exactly what plan version 1 installed\. The capture configuration could not be returned to plan version 1\.$/u,
+    );
+    expect(error.hint).toMatch(
+      /installed\. The capture configuration could not be returned to plan version 1\. Restart the Debug Generator service before capturing again/u,
+    );
+    expect(error.details?.['activePlanVersion']).toBeUndefined();
+  });
+
+  it('never vouches for a carried-over hint no product builder wrote: the code’s fixed hint follows what the project holds', async () => {
+    const carried = `Check ${SENTINEL} before installing again.`;
+    const failure = new DebuggenError('INTERNAL', 'The install could not report.', {
+      hint: carried,
+      details: { planVersion: 2, activePlanVersion: 2, applied: 1 },
+    });
+    const h = harness({
+      outcomes: [answer(FETCH_DECISION)],
+      installAnswer: () => err(failure),
+      journal: ok([RECORD_V1, DELTA_OTHER]),
+    });
+    const error = expectErr(await h.stage.run(h.context, followUpInput()));
+
+    expect(restoredIds()).toStrictEqual([DELTA_OTHER.id]);
+    expect(rollbackOf(error)).toMatchObject({ trigger: 'install-failed', restored: 1 });
+    // What a failed row shows of the failure: the statement, then the fixed hint of its code.
+    expect(error.hint).toBe(
+      `All 1 file modification(s) of plan version 2 were restored, so the project holds exactly what plan version 1 installed. ${FAILURE_COPY_BY_CODE.INTERNAL.hint}`,
+    );
+    expect(isProductAuthoredText(error.hint)).toBe(true);
+    expect(error.hint).not.toContain(SENTINEL);
+    // The failure's own words stay in the error's cause chain, for the local log alone.
+    const causes: unknown[] = [];
+    for (let cause: unknown = error.cause; cause instanceof Error; cause = cause.cause) {
+      causes.push(cause);
+    }
+    expect(causes.some((cause) => DebuggenError.is(cause) && cause.hint === carried)).toBe(true);
   });
 });
 
@@ -2935,10 +4172,13 @@ describe('createFollowUpStage — the gate and its failures', () => {
 // ---------------------------------------------------------------------------
 
 describe('createFollowUpStage — session status', () => {
-  /** The session manager's members that write or move a session's status. */
+  /**
+   * The session manager's members that write or move a session's status.
+   * `patch` is not one: `SessionPatch` has no status member and the manager
+   * refuses one at run time, so a compensation may use it for `modifications`.
+   */
   const STATUS_WRITERS: readonly string[] = [
     'transitionTo',
-    'patch',
     'fail',
     'retry',
     'startCapture',
@@ -2972,6 +4212,30 @@ describe('createFollowUpStage — session status', () => {
     });
     expectErr(await h.stage.run(h.context, followUpInput()));
     expect(h.sessionManagerReads).toStrictEqual(['appendFollowUp']);
+  });
+
+  it('writes no status when a compensation mirrors its records: it patches modifications only', async () => {
+    const applied: ModificationRecord = {
+      ...RECORD_V1,
+      id: 'mod_00000000000000f1',
+      planVersion: 2,
+      file: OTHER_FILE,
+      backupPath: `${DEBUGGEN_HOME}/backups/${SESSION_ID}/${'f'.repeat(64)}`,
+      appliedAt: FIXED_EPOCH_MS + 10,
+    };
+    const h = harness({ outcomes: [answer(FETCH_DECISION)], journal: ok([RECORD_V1, applied]) });
+    h.recordPlan.mockResolvedValueOnce(err(new DebuggenError('STORE_ERROR', 'Not stored.')));
+    expectErr(await h.stage.run(h.context, followUpInput()));
+
+    expect(new Set(h.sessionManagerReads)).toStrictEqual(
+      new Set(['appendFollowUp', 'recordPlan', 'patch']),
+    );
+    for (const writer of STATUS_WRITERS) {
+      expect(h.sessionManagerReads).not.toContain(writer);
+    }
+    expect(h.patch.mock.calls.map(([, changes]) => Object.keys(changes))).toStrictEqual([
+      ['modifications'],
+    ]);
   });
 });
 
@@ -3109,6 +4373,116 @@ describe('createFollowUpStage — privacy', () => {
     const surfaced = h.log.records.map(serializeRecord).join('\n');
     expect(surfaced).not.toContain(SENTINEL);
     expect(error.details?.['stage']).toBe(ANALYZE);
+  });
+
+  describe('a product-defect record describes plan n + 1 by its shape, never by its prose', () => {
+    /** Plan version 1 with the sentinel in its objective, capture, hypotheses and every rationale. */
+    const PROSE_PLAN_V1: InstrumentationPlan = instrumentationPlanSchema.parse({
+      ...PLAN_V1,
+      objective: `${PLAN_V1.objective} ${SENTINEL}`,
+      capture: PLAN_V1.capture.map((phrase) => `${phrase} ${SENTINEL}`),
+      hypotheses: [`The totals refresh runs twice ${SENTINEL}.`],
+      instrumentationTargets: PLAN_V1.instrumentationTargets.map((action) => ({
+        ...action,
+        rationale: `${action.rationale} ${SENTINEL}`,
+      })),
+    });
+    /** The addition the decision proposes, with the sentinel in its rationale. */
+    const PROSE_ADDITION = { ...ADD_FETCH, rationale: `${ADD_FETCH.rationale} ${SENTINEL}` };
+    const PROSE_DECISION: FollowUpDecision = {
+      needsNewCapture: true,
+      additionalActions: [PROSE_ADDITION],
+    };
+
+    /** The one error-level defect record of a run's step, or a test failure. */
+    function defectOf(h: Harness, step: string): LogRecord {
+      const defects = h.log.records.filter(
+        (record) => record.level === 'error' && record.fields?.['step'] === step,
+      );
+      expect(defects).toHaveLength(1);
+      const [defect] = defects;
+      if (defect === undefined) {
+        throw new Error(`Expected one product-defect record for ${step}.`);
+      }
+      return defect;
+    }
+
+    /** Asserts a defect record carries the closed shape and no authored prose anywhere. */
+    function expectShapeOnly(h: Harness, defect: LogRecord, error: DebuggenError): void {
+      expect(Object.keys(defect.fields ?? {})).not.toContain('input');
+      expect(defect.fields).toMatchObject({
+        captureCount: 2,
+        targetCount: 3,
+        hypothesisCount: 1,
+        targetTypes: { 'fetch-tracking': 1, 'function-timing': 1, 'interaction-tracking': 1 },
+      });
+      // The capturing logger records every level down to trace; no record carries the prose.
+      expect(h.log.records.length).toBeGreaterThan(0);
+      expect(everythingSurfaced(h, error)).not.toContain(SENTINEL);
+    }
+
+    it('plants the sentinel in every prose field of the authored input', () => {
+      const authored = buildFollowUpPlanInput(PROSE_PLAN_V1, [PROSE_ADDITION]);
+      expect(authored.objective).toContain(SENTINEL);
+      expect(authored.capture.every((phrase) => phrase.includes(SENTINEL))).toBe(true);
+      expect(authored.hypotheses?.every((line) => line.includes(SENTINEL))).toBe(true);
+      expect(
+        authored.instrumentationTargets.every((target) => target.rationale?.includes(SENTINEL)),
+      ).toBe(true);
+    });
+
+    it('on a normalisation defect, naming only the structural field', async () => {
+      vi.mocked(normalizePlan).mockReturnValueOnce(
+        err(
+          new DebuggenError('INSTRUMENTATION_UNAVAILABLE', 'No adapter claims the action type.', {
+            details: { field: 'instrumentationTargets.2.type', targetIndex: 2 },
+          }),
+        ),
+      );
+      const h = harness({ outcomes: [answer(PROSE_DECISION)], installedPlan: PROSE_PLAN_V1 });
+      const error = expectErr(await h.stage.run(h.context, followUpInput()));
+      const defect = defectOf(h, 'normalize');
+      expect(defect.fields?.['field']).toBe('instrumentationTargets.2.type');
+      expectShapeOnly(h, defect, error);
+      expect(h.install).not.toHaveBeenCalled();
+    });
+
+    it('on an internal-validation defect, naming only issue paths and codes', async () => {
+      vi.mocked(normalizePlan).mockReturnValueOnce(
+        ok({
+          ...PROSE_PLAN_V1,
+          planVersion: 2,
+          instrumentationTargets: [
+            ...PROSE_PLAN_V1.instrumentationTargets,
+            { ...INSTALLED_FETCH, id: 'not-an-opaque-id', rationale: PROSE_ADDITION.rationale },
+          ],
+        }),
+      );
+      const h = harness({ outcomes: [answer(PROSE_DECISION)], installedPlan: PROSE_PLAN_V1 });
+      const error = expectErr(await h.stage.run(h.context, followUpInput()));
+      expect(error.code).toBe('PLAN_INVALID');
+      expect(reasonOf(error)).toBe('internal-validation');
+      const defect = defectOf(h, 'internal-validation');
+      expect(defect.fields).toMatchObject({ code: 'PLAN_INVALID', issueCount: 1 });
+      expect(JSON.stringify(defect.fields?.['issues'])).toContain('instrumentationTargets.2.id');
+      expectShapeOnly(h, defect, error);
+      expect(everythingSurfaced(h, error)).not.toContain('not-an-opaque-id');
+      expect(h.install).not.toHaveBeenCalled();
+    });
+
+    it('on an installed-action defect, naming only the altered index', async () => {
+      const h = harness({
+        outcomes: [answer(PROSE_DECISION)],
+        installedPlan: PROSE_PLAN_V1,
+        registry: driftedRegistry(),
+      });
+      const error = expectErr(await h.stage.run(h.context, followUpInput()));
+      expect(reasonOf(error)).toBe('installed-action-altered');
+      const defect = defectOf(h, 'installed-actions');
+      expect(defect.fields?.['index']).toBe(1);
+      expectShapeOnly(h, defect, error);
+      expect(h.install).not.toHaveBeenCalled();
+    });
   });
 });
 

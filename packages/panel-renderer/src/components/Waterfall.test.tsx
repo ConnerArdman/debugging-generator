@@ -26,6 +26,17 @@
  * claims about coverage, and that "load more" advances the offset the *service*
  * reported on the query the provider actually receives.
  *
+ * Paging far must stay bounded, so three blocks hold the bounds the component
+ * documents. "Pages folded as they arrive" proves a page folded into what is
+ * held nests exactly as a rebuild would — a call moves under the parent a
+ * later page supplies, directly or through an undrawn span. "The held-record
+ * budget" proves the oldest pages are released past the budget, the footer
+ * states which positions are held and how many were released, and a released
+ * call is never reported as not captured. "The mounted row window" proves the
+ * tree never mounts more than its row budget however many rows are expanded,
+ * that Previous/Next rows and the keyboard move the window, and that expansion
+ * and the single tab stop survive every move.
+ *
  * ## The privacy cases, and why they are byte-comparisons (AAP 0.5.2)
  *
  * A redacted URL and a parameterized statement arrive in their final display
@@ -63,15 +74,23 @@
  *     permits instead of a table retyped here; the node catalog's entry is read
  *     the same way, through `catalogEntryFor`. Nothing but the component
  *     stylesheet is read from disk.
- *   - **Layout is stubbed for the axis-density cases only.** The time scale's
- *     range is a percentage interval, so bars, rows and tick positions must be
- *     correct from data alone under happy-dom, where every measurement answers
- *     zero — and every case but one block runs exactly there, which is also
- *     what pins the axis's unmeasured fallback. The exception is how many tick
- *     labels the axis draws, the one decision it takes from its measured
- *     width: "The time axis on a narrow strip" stubs the axis graphic's
- *     `getBoundingClientRect` and `ResizeObserver`, and undoes both after
- *     every case.
+ *   - **Layout is never stubbed.** The time scale's range is a percentage
+ *     interval and the axis fits its tick labels to a fixed logical strip, so
+ *     bars, rows, tick positions and the tick set itself must be correct from
+ *     data alone under happy-dom, where every measurement answers zero — and
+ *     every case runs exactly there. No case spies on, replaces or stubs a
+ *     layout API: "The time axis, from the data alone" asserts the exact tick
+ *     set a window draws, and reads its fit back independently. That the real
+ *     strip is never narrower than the design strip is the stylesheet's
+ *     guarantee, which happy-dom does not apply, so "The axis floor and the
+ *     scroll viewport" asserts it as a contract: the track floor the
+ *     stylesheet declares, resolved through the token table, and the elements
+ *     the one scroll viewport holds.
+ *   - **Budgets are exercised at their documented size.** The held-record
+ *     budget is restated from the node catalog's `DATA_QUERY_MAX_LIMIT` and
+ *     filled mostly with records of a kind this view does not draw, and the
+ *     row budget with the rows of one expanded call, so each bound is crossed
+ *     for real without mounting more than the bound itself.
  *   - **Generic fixture vocabulary only** (AAP 0.5.4): a loopback URL, an
  *     `/example/…` path, an `example_…` table and a `src/example/…` file, none
  *     of which belongs to any inspected application.
@@ -89,7 +108,11 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { DATA_QUERY_DEFAULT_OFFSET, catalogEntryFor } from '@debuggen/panel-schema';
+import {
+  DATA_QUERY_DEFAULT_OFFSET,
+  DATA_QUERY_MAX_LIMIT,
+  catalogEntryFor,
+} from '@debuggen/panel-schema';
 import type { DataQuery, WaterfallNode } from '@debuggen/panel-schema';
 import { DebuggenError } from '@debuggen/shared';
 import type { SourceLocation } from '@debuggen/shared';
@@ -106,6 +129,8 @@ import { DataProviderContext, PanelSessionContext, createDataProvider } from '..
 import type { DataProvider, DataQueryResolver, DataQueryResponse } from '../host/DataProvider';
 import { PanelActionsContext, PanelSelectionContext } from '../host/PanelActions';
 import type { PanelActions, PanelEventRef, PanelSelection } from '../host/PanelActions';
+import { DESIGN_TOKENS, cssVarName } from '../tokens/tokens';
+import type { DesignTokens, TokenKey } from '../tokens/tokens';
 import {
   NOT_AVAILABLE_LABEL,
   formatBytes,
@@ -3859,112 +3884,615 @@ describe('Waterfall counted copy', () => {
 
 /*
  * ---------------------------------------------------------------------------
- * The time axis on a narrow strip
+ * Pages folded as they arrive
  *
- * Tick POSITIONS are percentages and need no layout, but how many tick labels
- * fit does: six labels that read well across a wide panel run together across
- * a phone-width strip. The axis measures its own `<svg>` and thins its ticks
- * until the labels clear each other. These are the only cases in the suite
- * that stub layout — the axis graphic's width, and `ResizeObserver` — and both
- * stubs are undone after every case, so every other case still runs against
- * happy-dom's zero-answering layout.
+ * "Load more" folds each page into what is already held instead of rebuilding
+ * the tree from every page loaded so far, so the cases below prove the fold
+ * stays exact where a rebuild trivially would be: a call drawn at the top level
+ * because its parent was not loaded moves under that parent when a LATER page
+ * supplies it — directly, or through an undrawn span between them — and a
+ * persisted re-attachment flag a later page proves stale stops being drawn.
  * ---------------------------------------------------------------------------
  */
 
-/**
- * The per-character advance the axis estimates a label at, in ems, and the
- * clear space it keeps between labels — the figures the component's fit is
- * held to, restated so the overlap check below is an independent reading of
- * what was drawn.
+/** A function span between the server request and the statement, arriving late. */
+const LATE_BRIDGE = makeEvent({
+  id: eventIdFor(131),
+  spanId: spanIdFor(131),
+  parentSpanId: spanIdFor(2),
+  kind: 'function',
+  tier: 'server',
+  name: 'example.late-step',
+  startTime: BASE_START_MS + 12,
+  duration: 700,
+});
+
+/** A statement whose parent is the late bridging span. */
+const BRIDGED_QUERY = makeEvent({
+  id: eventIdFor(132),
+  spanId: spanIdFor(132),
+  parentSpanId: spanIdFor(131),
+  kind: 'db.query',
+  tier: 'db',
+  name: 'example.bridged-statement',
+  startTime: BASE_START_MS + 20,
+  duration: 300,
+});
+
+describe('Waterfall pages folded as they arrive', () => {
+  it('nests calls under the parents a later page supplies, directly and through an undrawn span', async () => {
+    // Page one holds the statement (its server request is not loaded yet), a
+    // second statement whose bridging span is not loaded yet, and an
+    // unrelated call. Page two supplies the browser request and the server
+    // request; page three supplies the bridging span.
+    const stub = pagingProvider([
+      { data: [QUERY_EVENT, BRIDGED_QUERY, LONE_CALL], total: 6, nextOffset: 3 },
+      { data: [REQUEST_EVENT, SERVER_EVENT], total: 6, nextOffset: 5 },
+      { data: [LATE_BRIDGE], total: 6 },
+    ]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    // Neither statement's parent is loaded: both are top-level rows, and
+    // neither is flagged, because a parent off the page is not a re-attachment.
+    await screen.findByText(
+      `${formatCount(3)} calls · loaded ${formatCount(3)} of ${formatCount(6)} spans`,
+    );
+    expect(drawnRows()).toHaveLength(3);
+    expect(rowLabelled(SQL_STATEMENT).getAttribute('aria-level')).toBe('1');
+    expect(rowLabelled(BRIDGED_QUERY.name).getAttribute('aria-level')).toBe('1');
+    expect(isFlaggedReattached(rowLabelled(SQL_STATEMENT))).toBe(false);
+
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+    await screen.findByText(
+      `${formatCount(5)} calls · loaded ${formatCount(5)} of ${formatCount(6)} spans`,
+    );
+
+    // The statement moved under the server request, under the browser request:
+    // the top level is now the request, the second statement and the lone call.
+    expect(drawnRows().map((row) => row.getAttribute('aria-level'))).toEqual(['1', '1', '1']);
+    expect(screen.queryByText(SQL_STATEMENT)).toBeNull();
+    await user.click(within(rowLabelled(REQUEST_URL)).getByRole('button', { name: EXPAND_NAME }));
+    await user.click(within(rowLabelled(SERVER_ROUTE)).getByRole('button', { name: EXPAND_NAME }));
+    expect(rowLabelled(SERVER_ROUTE).getAttribute('aria-level')).toBe('2');
+    expect(rowLabelled(SQL_STATEMENT).getAttribute('aria-level')).toBe('3');
+    // The second statement still waits for its bridging span.
+    expect(rowLabelled(BRIDGED_QUERY.name).getAttribute('aria-level')).toBe('1');
+
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+    await screen.findByText(
+      `${formatCount(5)} calls · loaded ${formatCount(6)} of ${formatCount(6)} spans`,
+    );
+
+    // The undrawn span arrived and was collapsed through: the second statement
+    // now sits directly under the server request, beside the first one, in
+    // start order — and the rows expanded before the page arrived still are.
+    expect(screen.queryByText(LATE_BRIDGE.name)).toBeNull();
+    expect(rowLabelled(REQUEST_URL).getAttribute('aria-expanded')).toBe('true');
+    expect(rowLabelled(SERVER_ROUTE).getAttribute('aria-expanded')).toBe('true');
+    expect(rowLabelled(BRIDGED_QUERY.name).getAttribute('aria-level')).toBe('3');
+    const levels = drawnRows().map((row) => row.getAttribute('aria-level'));
+    expect(levels).toEqual(['1', '2', '3', '3', '1']);
+    expect(rowLabelled(SQL_STATEMENT).getAttribute('aria-posinset')).toBe('1');
+    expect(rowLabelled(BRIDGED_QUERY.name).getAttribute('aria-posinset')).toBe('2');
+    expect(rowLabelled(BRIDGED_QUERY.name).getAttribute('aria-setsize')).toBe('2');
+    expect(descriptionAt(0)).toContain(`starts ${formatDuration(0)} into the window`);
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+  });
+
+  it('stops drawing a persisted re-attachment flag once a later page supplies the parent', async () => {
+    const flagged = makeEvent({
+      id: eventIdFor(141),
+      spanId: spanIdFor(141),
+      parentSpanId: spanIdFor(140),
+      kind: 'db.query',
+      tier: 'db',
+      name: 'example.late-flag',
+      startTime: BASE_START_MS + 5,
+      duration: 40,
+      attributes: { orphaned: true, orphanedParentSpanId: spanIdFor(140) },
+    });
+    // The parent it names, undrawn, on the next page.
+    const parent = makeEvent({
+      id: eventIdFor(140),
+      spanId: spanIdFor(140),
+      kind: 'function',
+      tier: 'server',
+      name: 'example.late-flag-parent',
+      startTime: BASE_START_MS,
+      duration: 90,
+    });
+    const stub = pagingProvider([
+      { data: [flagged], total: 2, nextOffset: 1 },
+      { data: [parent], total: 2 },
+    ]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+    expect(isFlaggedReattached(rowLabelled(flagged.name))).toBe(true);
+    expect(rowLabelled(flagged.name).getAttribute('aria-label') ?? '').toContain(
+      `${REATTACHED_PHRASE}: the parent ${spanIdFor(140)} of this call never arrived`,
+    );
+
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+    await screen.findByText(
+      `${formatCount(1)} call · loaded ${formatCount(2)} of ${formatCount(2)} spans`,
+    );
+
+    // The parent arrived: the flag is proven stale, and the call is drawn as
+    // an ordinary top-level row (its parent is a kind this view does not draw).
+    expect(isFlaggedReattached(rowLabelled(flagged.name))).toBe(false);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The held-record budget
+ *
+ * The view holds at most twice the largest page a query may ask for, and
+ * releases the oldest pages past that. The cases page through pages of that
+ * largest size — mostly records of a kind this view does not draw, so the
+ * budget is exercised without mounting thousands of rows — and hold the view
+ * to three things: what it holds never exceeds the budget, the footer states
+ * which positions are held and how many were released before them, and a
+ * released call is stated as released, never as not captured.
+ * ---------------------------------------------------------------------------
  */
-const AXIS_GLYPH_EM = 0.6;
 
-/** The two calls whose 180 ms window the axis cases draw. */
-const AXIS_CALLS: readonly TelemetryEvent[] = [
-  makeEvent({
-    id: eventIdFor(161),
-    spanId: spanIdFor(161),
-    name: 'example.axis-first-call',
-    startTime: BASE_START_MS,
-    duration: 40,
-  }),
-  makeEvent({
-    id: eventIdFor(162),
-    spanId: spanIdFor(162),
-    name: 'example.axis-second-call',
-    startTime: BASE_START_MS + 120,
-    duration: 60,
-    seq: 1,
-    ingestSeq: 2,
-  }),
-];
+/** The page size of the budget cases: the largest a query may ask for. */
+const LARGEST_PAGE = DATA_QUERY_MAX_LIMIT;
 
-/** The labels the unmeasured 180 ms axis carries: a 50 ms step from zero. */
-const FULL_AXIS_LABELS: readonly string[] = [0, 50, 100, 150].map((ms) =>
-  formatDurationCompact(ms),
-);
+/** The held-record budget the component documents: two of the largest pages. */
+const HELD_BUDGET = 2 * DATA_QUERY_MAX_LIMIT;
 
-/**
- * A `ResizeObserver` the cases drive by hand: it records what it observes and
- * reports a resize only when {@link FakeResizeObserver.resizeAll} is called.
- */
-class FakeResizeObserver {
-  /** Every observer constructed while the stub is installed. */
-  static readonly instances: FakeResizeObserver[] = [];
+/** The first ordinal of the bulk span ids, clear of every `spanIdFor` ordinal. */
+const BULK_ORDINAL_BASE = 0x10000;
 
-  /** The elements this observer is watching. */
-  readonly observed = new Set<Element>();
-
-  /** Whether `disconnect` was called. */
-  disconnected = false;
-
-  private readonly callback: ResizeObserverCallback;
-
-  constructor(callback: ResizeObserverCallback) {
-    this.callback = callback;
-    FakeResizeObserver.instances.push(this);
-  }
-
-  observe(target: Element): void {
-    this.observed.add(target);
-  }
-
-  unobserve(target: Element): void {
-    this.observed.delete(target);
-  }
-
-  disconnect(): void {
-    this.disconnected = true;
-    this.observed.clear();
-  }
-
-  /** Reports a resize to every live observer, as the browser would after layout. */
-  static resizeAll(): void {
-    for (const observer of FakeResizeObserver.instances) {
-      if (!observer.disconnected && observer.observed.size > 0) {
-        observer.callback([], observer);
-      }
-    }
-  }
+/** A 16-hex span id for bulk fixtures. */
+function bulkSpanId(ordinal: number): string {
+  return (BULK_ORDINAL_BASE + ordinal).toString(16).padStart(16, '0');
 }
 
-/** The inline size the stubbed layout reports for the axis graphic, in pixels. */
-let stubbedAxisWidth = 0;
-
 /**
- * Makes the axis graphic — and only it — report {@link stubbedAxisWidth} as its
- * width; every other element keeps the empty box happy-dom itself reports.
- * Restored by the suite's `vi.restoreAllMocks()`.
+ * `count` records of a kind this view does not draw, numbered from `first` so
+ * every page's records are distinct.
+ *
+ * @param first The first ordinal.
+ * @param count How many records.
+ * @returns The records, in start order.
  */
-function stubAxisLayout(): void {
-  vi.spyOn(Element.prototype, 'getBoundingClientRect').mockImplementation(function (
-    this: Element,
-  ): DOMRect {
-    const isAxisGraphic =
-      this.tagName.toLowerCase() === 'svg' && this.closest('.dg-waterfall__axis-strip') !== null;
-    return new DOMRect(0, 0, isAxisGraphic ? stubbedAxisWidth : 0, 0);
+function undrawnRecords(first: number, count: number): TelemetryEvent[] {
+  return Array.from({ length: count }, (_, at) =>
+    makeEvent({
+      id: `event-bulk-${String(first + at)}`,
+      spanId: bulkSpanId(first + at),
+      kind: 'render',
+      tier: 'browser',
+      name: 'example.bulk-render',
+      startTime: BASE_START_MS + 1000 + at,
+      duration: 1,
+    }),
+  );
+}
+
+/** A browser call of its own, for a budget case to find again by name. */
+function budgetCall(ordinal: number, startOffsetMs: number): TelemetryEvent {
+  return makeEvent({
+    id: eventIdFor(ordinal),
+    spanId: spanIdFor(ordinal),
+    kind: 'fetch',
+    tier: 'browser',
+    name: `example.budget-call-${String(ordinal)}`,
+    startTime: BASE_START_MS + startOffsetMs,
+    duration: 25,
   });
 }
+
+/**
+ * The footer's statement about released pages, spelled as the component's
+ * contract states it, from the figures a case expects.
+ */
+function retentionSentence(first: number, last: number, total: number, released: number): string {
+  return `Holding ${formatCount(last - first + 1)} spans (positions ${formatCount(first)}–${formatCount(last)} of ${formatCount(total)}); the ${formatCount(released)} spans loaded before them were released to keep this view within ${formatCount(HELD_BUDGET)} spans. A call whose parent was released is drawn at the top level.`;
+}
+
+describe('Waterfall held-record budget', () => {
+  it('releases the oldest pages past the budget, says what it holds, and re-places what the release lifted', async () => {
+    const first = budgetCall(151, 0);
+    // A statement on page two whose parent is the call on page one, carrying a
+    // flag an earlier correlation pass wrote: stale while that parent is held.
+    const child = makeEvent({
+      id: eventIdFor(152),
+      spanId: spanIdFor(152),
+      parentSpanId: first.spanId,
+      kind: 'db.query',
+      tier: 'db',
+      name: 'example.budget-child',
+      startTime: BASE_START_MS + 10,
+      duration: 12,
+      attributes: { orphaned: true, orphanedParentSpanId: first.spanId },
+    });
+    const second = budgetCall(153, 20);
+    const third = budgetCall(154, 30);
+    const fourth = budgetCall(155, 40);
+    const total = 4 * LARGEST_PAGE;
+    const stub = pagingProvider([
+      {
+        data: [first, ...undrawnRecords(0, LARGEST_PAGE - 1)],
+        total,
+        nextOffset: LARGEST_PAGE,
+      },
+      {
+        data: [child, second, ...undrawnRecords(LARGEST_PAGE, LARGEST_PAGE - 2)],
+        total,
+        nextOffset: 2 * LARGEST_PAGE,
+      },
+      {
+        data: [third, ...undrawnRecords(2 * LARGEST_PAGE, LARGEST_PAGE - 1)],
+        total,
+        nextOffset: 3 * LARGEST_PAGE,
+      },
+      { data: [fourth, ...undrawnRecords(3 * LARGEST_PAGE, LARGEST_PAGE - 1)], total },
+    ]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+    await screen.findByRole('tree', { name: TREE_NAME });
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+
+    // Two pages: exactly the budget, so nothing is released and nothing is
+    // said about releasing. The statement nests under the call on page one,
+    // and its stale flag is not drawn.
+    await screen.findByText(
+      `${formatCount(3)} calls · loaded ${formatCount(HELD_BUDGET)} of ${formatCount(total)} spans`,
+    );
+    expect(screen.queryByText(/released to keep this view within/)).toBeNull();
+    await user.click(within(rowLabelled(first.name)).getByRole('button', { name: EXPAND_NAME }));
+    expect(rowLabelled(child.name).getAttribute('aria-level')).toBe('2');
+    expect(isFlaggedReattached(rowLabelled(child.name))).toBe(false);
+
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+
+    // Three pages exceed the budget: the oldest is released. The footer still
+    // counts every record loaded, and says which positions are held and how
+    // many were loaded before them.
+    await screen.findByText(
+      retentionSentence(LARGEST_PAGE + 1, 3 * LARGEST_PAGE, total, LARGEST_PAGE),
+    );
+    expect(
+      screen.getByText(
+        `${formatCount(3)} calls · loaded ${formatCount(3 * LARGEST_PAGE)} of ${formatCount(total)} spans`,
+      ),
+    ).toBeTruthy();
+    // The released call is gone; the statement it held moved to the top level,
+    // and its flag — honoured again, since its parent is no longer held — is
+    // stated without claiming the parent never arrived.
+    expect(screen.queryByText(first.name)).toBeNull();
+    const lifted = rowLabelled(child.name);
+    expect(lifted.getAttribute('aria-level')).toBe('1');
+    expect(isFlaggedReattached(lifted)).toBe(true);
+    const liftedDescription = lifted.getAttribute('aria-label') ?? '';
+    expect(liftedDescription).toContain(
+      `${REATTACHED_PHRASE}: the parent ${first.spanId} of this call is not among the records held here, and may have been released`,
+    );
+    expect(liftedDescription).not.toContain('never arrived');
+    // Offsets are measured from the first call still held.
+    expect(liftedDescription).toContain(`starts ${formatDuration(0)} into the window`);
+    expect(screen.queryByText(EMPTY_MESSAGE)).toBeNull();
+
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+
+    // A fourth page releases the second: still no more than the budget held.
+    await screen.findByText(retentionSentence(2 * LARGEST_PAGE + 1, total, total, HELD_BUDGET));
+    expect(
+      screen.getByText(
+        `${formatCount(2)} calls · loaded ${formatCount(total)} of ${formatCount(total)} spans`,
+      ),
+    ).toBeTruthy();
+    expect(drawnRows().map((row) => row.getAttribute('aria-label') ?? '')).toEqual([
+      expect.stringContaining(third.name),
+      expect.stringContaining(fourth.name),
+    ]);
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+  });
+
+  it('states released calls as released, not as missing, when the pages it holds draw none', async () => {
+    const call = budgetCall(161, 0);
+    const total = 3 * LARGEST_PAGE;
+    const stub = pagingProvider([
+      { data: [call, ...undrawnRecords(0, LARGEST_PAGE - 1)], total, nextOffset: LARGEST_PAGE },
+      { data: undrawnRecords(LARGEST_PAGE, LARGEST_PAGE), total, nextOffset: 2 * LARGEST_PAGE },
+      { data: undrawnRecords(2 * LARGEST_PAGE, LARGEST_PAGE), total },
+    ]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+    await screen.findByRole('tree', { name: TREE_NAME });
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+    await screen.findByText(
+      `${formatCount(1)} call · loaded ${formatCount(HELD_BUDGET)} of ${formatCount(total)} spans`,
+    );
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+
+    // The only call was on the released page. The held pages draw nothing,
+    // and that is said as what it is: calls were loaded and released.
+    await screen.findByText('No calls held');
+    expect(
+      screen.getByText(
+        `The ${formatCount(HELD_BUDGET)} spans held (positions ${formatCount(LARGEST_PAGE + 1)}–${formatCount(total)} of ${formatCount(total)}) include no network or database call. The ${formatCount(LARGEST_PAGE)} spans loaded before them included calls, and were released to keep this view within ${formatCount(HELD_BUDGET)} spans.`,
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText(EMPTY_MESSAGE)).toBeNull();
+    expect(screen.queryByText(/none of them is a network or database call/)).toBeNull();
+    expect(screen.queryByRole('tree')).toBeNull();
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The mounted row window
+ *
+ * However many rows are expanded, the tree mounts at most the component's row
+ * budget at once and moves a window over the rest: Previous and Next rows,
+ * and the keyboard stepping past either edge. The footer states which rows are
+ * shown of how many, expansion survives every move, and the tree keeps exactly
+ * one row in the Tab order.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The row budget the component documents. */
+const ROW_BUDGET = 200;
+
+/** The accessible names of the window controls. */
+const PREVIOUS_ROWS_NAME = 'Previous rows';
+const NEXT_ROWS_NAME = 'Next rows';
+
+/** A server request with `count` statements nested under it, in start order. */
+function serverWithStatements(
+  ordinal: number,
+  count: number,
+  startOffsetMs: number,
+): { readonly parent: TelemetryEvent; readonly statements: readonly TelemetryEvent[] } {
+  const parent = makeEvent({
+    id: eventIdFor(ordinal),
+    spanId: spanIdFor(ordinal),
+    kind: 'http.server',
+    tier: 'server',
+    name: `example.window-server-${String(ordinal)}`,
+    startTime: BASE_START_MS + startOffsetMs,
+    duration: 5000,
+  });
+  const statements = Array.from({ length: count }, (_, at) =>
+    makeEvent({
+      id: `event-window-${String(ordinal)}-${String(at)}`,
+      spanId: bulkSpanId(ordinal * 1000 + at),
+      parentSpanId: parent.spanId,
+      kind: 'db.query',
+      tier: 'db',
+      name: `example.window-statement-${String(ordinal)}-${String(at)}`,
+      startTime: BASE_START_MS + startOffsetMs + 1 + at,
+      duration: 2,
+    }),
+  );
+  return { parent, statements };
+}
+
+/** The footer's statement of the mounted rows. */
+function rowWindowText(first: number, last: number, total: number): string {
+  return `Rows ${formatCount(first)}–${formatCount(last)} of ${formatCount(total)}`;
+}
+
+describe('Waterfall row window', () => {
+  it('mounts at most the row budget however many rows are expanded, and moves the window with Previous and Next', async () => {
+    const { parent, statements } = serverWithStatements(171, 450, 0);
+    const stub = resolvingProvider([parent, ...statements]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+    await screen.findByRole('tree', { name: TREE_NAME });
+
+    // One row: nothing to page, so no window controls.
+    expect(drawnRows()).toHaveLength(1);
+    expect(screen.queryByRole('button', { name: NEXT_ROWS_NAME })).toBeNull();
+
+    await user.click(within(rowLabelled(parent.name)).getByRole('button', { name: EXPAND_NAME }));
+
+    // 451 visible rows; the window mounts the budget and says so.
+    const visibleCount = statements.length + 1;
+    expect(drawnRows()).toHaveLength(ROW_BUDGET);
+    expect(screen.getByText(rowWindowText(1, ROW_BUDGET, visibleCount))).toBeTruthy();
+    const previous = screen.getByRole('button', { name: PREVIOUS_ROWS_NAME });
+    expect(previous.hasAttribute('disabled')).toBe(true);
+    // Every nested row states its place among all its siblings, mounted or not.
+    const lastMounted = drawnRows()[ROW_BUDGET - 1];
+    expect(lastMounted?.getAttribute('aria-posinset')).toBe(String(ROW_BUDGET - 1));
+    expect(lastMounted?.getAttribute('aria-setsize')).toBe(String(statements.length));
+    // The mounted children sit in the group their parent owns.
+    const group = lastMounted?.parentElement;
+    expect(group?.getAttribute('role')).toBe('group');
+    expect(rowLabelled(parent.name).getAttribute('aria-owns')).toBe(group?.getAttribute('id'));
+
+    await user.click(screen.getByRole('button', { name: NEXT_ROWS_NAME }));
+
+    // The next window: its parent is not mounted, and its rows keep their
+    // level and their place, in the same indented group.
+    expect(drawnRows()).toHaveLength(ROW_BUDGET);
+    expect(
+      screen.getByText(rowWindowText(ROW_BUDGET + 1, 2 * ROW_BUDGET, visibleCount)),
+    ).toBeTruthy();
+    expect(screen.queryByText(parent.name)).toBeNull();
+    const firstOfSecond = drawnRows()[0];
+    expect(firstOfSecond).toBe(rowLabelled(statements[ROW_BUDGET - 1]?.name ?? ''));
+    expect(firstOfSecond?.getAttribute('aria-level')).toBe('2');
+    expect(firstOfSecond?.getAttribute('aria-posinset')).toBe(String(ROW_BUDGET));
+    expect(firstOfSecond?.parentElement?.classList.contains('dg-waterfall__children')).toBe(true);
+    // Exactly one row is in the Tab order, and it is a mounted one.
+    expect(soleTabStop()).toBe(firstOfSecond);
+
+    await user.click(screen.getByRole('button', { name: NEXT_ROWS_NAME }));
+
+    // The last window holds the remainder, and there is no window after it.
+    expect(drawnRows()).toHaveLength(visibleCount - 2 * ROW_BUDGET);
+    expect(
+      screen.getByText(rowWindowText(2 * ROW_BUDGET + 1, visibleCount, visibleCount)),
+    ).toBeTruthy();
+    expect(screen.getByRole('button', { name: NEXT_ROWS_NAME }).hasAttribute('disabled')).toBe(
+      true,
+    );
+
+    await user.click(screen.getByRole('button', { name: PREVIOUS_ROWS_NAME }));
+    await user.click(screen.getByRole('button', { name: PREVIOUS_ROWS_NAME }));
+
+    // Back at the start, the parent is mounted and still expanded.
+    expect(screen.getByText(rowWindowText(1, ROW_BUDGET, visibleCount))).toBeTruthy();
+    expect(rowLabelled(parent.name).getAttribute('aria-expanded')).toBe('true');
+    expect(soleTabStop()).toBe(rowLabelled(parent.name));
+  });
+
+  it('keeps every expanded row expanded, by record id, as the window moves', async () => {
+    const one = serverWithStatements(181, 250, 0);
+    const two = serverWithStatements(182, 150, 1000);
+    const three = serverWithStatements(183, 150, 2000);
+    const stub = resolvingProvider([
+      one.parent,
+      ...one.statements,
+      two.parent,
+      ...two.statements,
+      three.parent,
+      ...three.statements,
+    ]);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+    await screen.findByRole('tree', { name: TREE_NAME });
+
+    await user.click(
+      within(rowLabelled(three.parent.name)).getByRole('button', { name: EXPAND_NAME }),
+    );
+    await user.click(
+      within(rowLabelled(one.parent.name)).getByRole('button', { name: EXPAND_NAME }),
+    );
+
+    // 3 parents and 400 statements are visible. The first window holds the
+    // first parent and 199 of its statements; the other two parents follow
+    // its remaining 51 statements, in the second window.
+    const visibleCount = 3 + 250 + 150;
+    expect(screen.getByText(rowWindowText(1, ROW_BUDGET, visibleCount))).toBeTruthy();
+    expect(screen.queryByText(three.parent.name)).toBeNull();
+
+    await user.click(screen.getByRole('button', { name: NEXT_ROWS_NAME }));
+
+    // The third parent is mounted again, still expanded, its statements
+    // beneath it; the second one is still collapsed.
+    expect(
+      screen.getByText(rowWindowText(ROW_BUDGET + 1, 2 * ROW_BUDGET, visibleCount)),
+    ).toBeTruthy();
+    expect(rowLabelled(three.parent.name).getAttribute('aria-expanded')).toBe('true');
+    expect(rowLabelled(three.statements[0]?.name ?? '').getAttribute('aria-level')).toBe('2');
+    expect(rowLabelled(two.parent.name).getAttribute('aria-expanded')).toBe('false');
+
+    // Collapsing it here shortens the list; the window stays where it is and
+    // now reaches the end, so there is nothing after it.
+    await user.click(
+      within(rowLabelled(three.parent.name)).getByRole('button', { name: COLLAPSE_NAME }),
+    );
+    const collapsedCount = 3 + 250;
+    expect(spies.onExpand).toHaveBeenLastCalledWith(NODE_ID, three.parent.id, false);
+    expect(
+      screen.getByText(rowWindowText(ROW_BUDGET + 1, collapsedCount, collapsedCount)),
+    ).toBeTruthy();
+    expect(drawnRows()).toHaveLength(collapsedCount - ROW_BUDGET);
+    expect(screen.getByRole('button', { name: NEXT_ROWS_NAME }).hasAttribute('disabled')).toBe(
+      true,
+    );
+
+    // Back to the first window: the first parent is still expanded.
+    await user.click(screen.getByRole('button', { name: PREVIOUS_ROWS_NAME }));
+    expect(screen.getByText(rowWindowText(1, ROW_BUDGET, collapsedCount))).toBeTruthy();
+    expect(rowLabelled(one.parent.name).getAttribute('aria-expanded')).toBe('true');
+  });
+
+  it('pages the window when the keyboard steps past either edge, and keeps one tab stop', async () => {
+    const { parent, statements } = serverWithStatements(191, 450, 0);
+    const stub = resolvingProvider([parent, ...statements]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+    await screen.findByRole('tree', { name: TREE_NAME });
+    await user.click(within(rowLabelled(parent.name)).getByRole('button', { name: EXPAND_NAME }));
+    const visibleCount = statements.length + 1;
+
+    // The last mounted row, then one step down: the window pages to the rows
+    // after it and the next row takes focus and the stop.
+    const lastOfFirst = statements[ROW_BUDGET - 2];
+    rowLabelled(lastOfFirst?.name ?? '').focus();
+    await user.keyboard('{ArrowDown}');
+    const firstOfSecond = rowLabelled(statements[ROW_BUDGET - 1]?.name ?? '');
+    expect(document.activeElement).toBe(firstOfSecond);
+    expect(soleTabStop()).toBe(firstOfSecond);
+    expect(
+      screen.getByText(rowWindowText(ROW_BUDGET + 1, 2 * ROW_BUDGET, visibleCount)),
+    ).toBeTruthy();
+
+    // And one step up pages back.
+    await user.keyboard('{ArrowUp}');
+    expect(document.activeElement).toBe(rowLabelled(lastOfFirst?.name ?? ''));
+    expect(screen.getByText(rowWindowText(1, ROW_BUDGET, visibleCount))).toBeTruthy();
+
+    // End reaches the last visible row, in the last window.
+    await user.keyboard('{End}');
+    const lastRow = rowLabelled(statements[statements.length - 1]?.name ?? '');
+    expect(document.activeElement).toBe(lastRow);
+    expect(soleTabStop()).toBe(lastRow);
+    expect(
+      screen.getByText(rowWindowText(2 * ROW_BUDGET + 1, visibleCount, visibleCount)),
+    ).toBeTruthy();
+
+    // ArrowLeft from a nested row whose parent is windows away steps out to
+    // that parent, paging back to it.
+    await user.keyboard('{ArrowLeft}');
+    expect(document.activeElement).toBe(rowLabelled(parent.name));
+    expect(soleTabStop()).toBe(rowLabelled(parent.name));
+
+    // End then Home: the first row, in the first window.
+    await user.keyboard('{End}');
+    await user.keyboard('{Home}');
+    expect(document.activeElement).toBe(rowLabelled(parent.name));
+    expect(screen.getByText(rowWindowText(1, ROW_BUDGET, visibleCount))).toBeTruthy();
+    expect(drawnRows()).toHaveLength(ROW_BUDGET);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The time axis, from the data alone
+ *
+ * Tick positions are percentages of the track, and how many tick labels the
+ * axis carries is fitted once, from the scale, to a fixed logical design strip
+ * — so the drawn tick set is a pure function of the window, and these cases
+ * assert it exactly under happy-dom's layout-free DOM with nothing stubbed. The
+ * fit is also read back independently: the drawn labels, laid out on the
+ * strip the component documents at the estimate `../utils/format` documents,
+ * clear each other, and the denser set the scale offers first does not.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The design strip the component fits its tick labels to, in ems: 14. */
+const AXIS_DESIGN_WIDTH_EM = 14;
+
+/** The clear space the component keeps between two tick labels, in ems: 1. */
+const AXIS_LABEL_GAP_EM = 1;
+
+/**
+ * The advance `estimateTextWidth` documents for one narrow grapheme, in ems —
+ * every character a compact duration label is made of.
+ */
+const NARROW_ADVANCE_EM = 0.6;
 
 /** One drawn tick label: its text, its position and its anchor. */
 interface DrawnTickLabel {
@@ -3992,169 +4520,402 @@ function drawnTickLabels(): DrawnTickLabel[] {
   }));
 }
 
-/**
- * Whether the drawn labels, at the estimated advance and the strip's own font
- * size, stay inside the strip and clear of each other.
- *
- * @param width The strip width, in pixels.
- * @returns `true` when no two estimated label boxes overlap and none crosses
- * an edge.
- */
-function labelsFit(width: number): boolean {
-  const fontPx = Number.parseFloat(getComputedStyle(axisGraphic()).fontSize);
-  expect(fontPx).toBeGreaterThan(0);
-  let previousEnd = Number.NEGATIVE_INFINITY;
-  for (const { label, percent, anchor } of drawnTickLabels()) {
-    const extent = Array.from(label).length * AXIS_GLYPH_EM * fontPx;
-    const x = (percent / 100) * width;
-    const start = anchor === 'start' ? x : anchor === 'end' ? x - extent : x - extent / 2;
-    if (start < 0 || start + extent > width || start < previousEnd) {
-      return false;
-    }
-    previousEnd = start + extent;
-  }
-  return true;
+/** A percentage as the component writes it: rounded to three decimals. */
+function percentOf(ms: number, windowMs: number): number {
+  return Number(((ms / windowMs) * 100).toFixed(3));
 }
 
-describe('Waterfall time axis density', () => {
-  afterEach(() => {
-    vi.unstubAllGlobals();
-    FakeResizeObserver.instances.length = 0;
-    stubbedAxisWidth = 0;
-  });
+/**
+ * Lays labels out on the design strip by the rule the component documents —
+ * centred under the tick unless that crosses an edge, then anchored to the
+ * tick — and says whether they fit inside it, each one gap clear of the last.
+ *
+ * @param labels The labels and their positions, ascending.
+ * @returns The anchors, or `undefined` when the labels do not fit.
+ */
+function layOutOnDesignStrip(
+  labels: readonly { readonly label: string; readonly percent: number }[],
+): readonly string[] | undefined {
+  const anchors: string[] = [];
+  let previousEnd = Number.NEGATIVE_INFINITY;
+  for (const { label, percent } of labels) {
+    const extent = Array.from(label).length * NARROW_ADVANCE_EM;
+    const x = (percent / 100) * AXIS_DESIGN_WIDTH_EM;
+    let anchor = 'middle';
+    let start = x - extent / 2;
+    if (start < 0) {
+      anchor = 'start';
+      start = x;
+    } else if (start + extent > AXIS_DESIGN_WIDTH_EM) {
+      anchor = 'end';
+      start = x - extent;
+    }
+    if (
+      start < 0 ||
+      start + extent > AXIS_DESIGN_WIDTH_EM ||
+      start - previousEnd < AXIS_LABEL_GAP_EM
+    ) {
+      return undefined;
+    }
+    anchors.push(anchor);
+    previousEnd = start + extent;
+  }
+  return anchors;
+}
 
-  it('keeps the full tick set and its end anchoring where nothing can be measured', async () => {
-    // happy-dom's own layout: every width is zero and its observer never fires.
+/**
+ * Two calls spanning exactly `windowMs`: one at the window's start, one ending
+ * at its end, so the axis draws that window and nothing wider.
+ */
+function callsSpanning(windowMs: number): readonly TelemetryEvent[] {
+  return [
+    makeEvent({
+      id: eventIdFor(201),
+      spanId: spanIdFor(201),
+      name: 'example.axis-first-call',
+      startTime: BASE_START_MS,
+      duration: windowMs / 4,
+    }),
+    makeEvent({
+      id: eventIdFor(202),
+      spanId: spanIdFor(202),
+      name: 'example.axis-second-call',
+      startTime: BASE_START_MS + windowMs / 2,
+      duration: windowMs / 2,
+      seq: 1,
+      ingestSeq: 2,
+    }),
+  ];
+}
+
+/** A window, the tick values the axis labels over it, and their anchors. */
+interface AxisExpectation {
+  readonly windowMs: number;
+  readonly tickMs: readonly number[];
+  readonly anchors: readonly string[];
+  /** The tick values of the densest set the scale offers, which do not fit. */
+  readonly densestMs: readonly number[];
+}
+
+const AXIS_EXPECTATIONS: readonly AxisExpectation[] = [
+  // A 50 ms step labels "0 ms" and "50 ms" into each other on the strip.
+  {
+    windowMs: 180,
+    tickMs: [0, 100],
+    anchors: ['start', 'middle'],
+    densestMs: [0, 50, 100, 150],
+  },
+  // Seconds: "1.0 s" labels every fifth of the window, too close together.
+  {
+    windowMs: 5000,
+    tickMs: [0, 2000, 4000],
+    anchors: ['start', 'middle', 'middle'],
+    densestMs: [0, 1000, 2000, 3000, 4000, 5000],
+  },
+  // A step of a millisecond fits, the last label ending at its tick.
+  {
+    windowMs: 3,
+    tickMs: [0, 1, 2, 3],
+    anchors: ['start', 'middle', 'middle', 'end'],
+    densestMs: [0, 0.5, 1, 1.5, 2, 2.5, 3],
+  },
+];
+
+describe('Waterfall time axis', () => {
+  it.each(AXIS_EXPECTATIONS)(
+    'labels a $windowMs ms window with the densest tick set that clears the design strip',
+    async ({ windowMs, tickMs, anchors, densestMs }) => {
+      renderComponent(makeNode(), {
+        provider: resolvingProvider(callsSpanning(windowMs)).provider,
+        actions: makeActions().actions,
+      });
+      await screen.findByRole('tree', { name: TREE_NAME });
+
+      const drawn = drawnTickLabels();
+      // Exactly the ticks the scale alone determines: labels, positions — the
+      // scale's percentages — and anchors.
+      expect(drawn).toEqual(
+        tickMs.map((ms, at) => ({
+          label: formatDurationCompact(ms),
+          percent: percentOf(ms, windowMs),
+          anchor: anchors[at],
+        })),
+      );
+      // The window's start is always labelled, from its own edge.
+      expect(drawn[0]).toEqual({ label: formatDurationCompact(0), percent: 0, anchor: 'start' });
+      // Read back independently: the drawn labels clear each other on the
+      // strip, with the anchors drawn, and no two of them say the same thing.
+      expect(layOutOnDesignStrip(drawn)).toEqual(drawn.map(({ anchor }) => anchor));
+      expect(new Set(drawn.map(({ label }) => label)).size).toBe(drawn.length);
+      // And the densest set the scale offers first would not have.
+      expect(
+        layOutOnDesignStrip(
+          densestMs.map((ms) => ({
+            label: formatDurationCompact(ms),
+            percent: percentOf(ms, windowMs),
+          })),
+        ),
+      ).toBeUndefined();
+    },
+  );
+
+  it('keeps two ticks from sharing a label when the step is finer than the label precision', async () => {
     renderComponent(makeNode(), {
-      provider: resolvingProvider(AXIS_CALLS).provider,
+      provider: resolvingProvider(callsSpanning(3)).provider,
       actions: makeActions().actions,
     });
     await screen.findByRole('tree', { name: TREE_NAME });
 
-    expect(drawnTickLabels().map(({ label }) => label)).toEqual(FULL_AXIS_LABELS);
-    expect(drawnTickLabels().map(({ anchor }) => anchor)).toEqual([
-      'start',
-      'middle',
-      'middle',
-      'end',
-    ]);
+    // The densest half-millisecond step would print "2 ms" at both 1.5 ms and
+    // 2 ms; the drawn set labels every tick distinctly.
+    expect(formatDurationCompact(1.5)).toBe(formatDurationCompact(2));
+    const labels = drawnTickLabels().map(({ label }) => label);
+    expect(labels).toEqual([0, 1, 2, 3].map((ms) => formatDurationCompact(ms)));
   });
 
-  it('thins the tick labels on a phone-width strip until none of them overlap', async () => {
-    vi.stubGlobal('ResizeObserver', FakeResizeObserver);
-    stubAxisLayout();
-    stubbedAxisWidth = 190;
+  it('draws the same ticks from the same data on every mount, sized only by its container', async () => {
+    const first = renderComponent(makeNode(), {
+      provider: resolvingProvider(callsSpanning(180)).provider,
+      actions: makeActions().actions,
+    });
+    await screen.findByRole('tree', { name: TREE_NAME });
+    const before = drawnTickLabels();
+    // The graphic takes its width from the strip it sits in, relationally, and
+    // declares no coordinate system of its own for the ticks to be scaled by.
+    expect(axisGraphic().getAttribute('width')).toBe('100%');
+    expect(axisGraphic().hasAttribute('viewBox')).toBe(false);
+    first.unmount();
 
     renderComponent(makeNode(), {
-      provider: resolvingProvider(AXIS_CALLS).provider,
+      provider: resolvingProvider(callsSpanning(180)).provider,
       actions: makeActions().actions,
     });
     await screen.findByRole('tree', { name: TREE_NAME });
 
-    const labels = drawnTickLabels();
-    expect(labels.length).toBeGreaterThan(0);
-    expect(labels.length).toBeLessThan(FULL_AXIS_LABELS.length);
-    expect(labelsFit(190)).toBe(true);
-    // The window start is always labelled, and every label still names a tick
-    // of the same scale.
-    expect(labels[0]?.label).toBe(formatDurationCompact(0));
-    // The full set would not have fitted: that is why it was thinned.
-    expect(FULL_AXIS_LABELS.length).toBeGreaterThan(labels.length);
-  });
-
-  it('draws the full tick set on a wide strip, each label under its tick unless it would cross an edge', async () => {
-    vi.stubGlobal('ResizeObserver', FakeResizeObserver);
-    stubAxisLayout();
-    stubbedAxisWidth = 800;
-
-    renderComponent(makeNode(), {
-      provider: resolvingProvider(AXIS_CALLS).provider,
-      actions: makeActions().actions,
-    });
-    await screen.findByRole('tree', { name: TREE_NAME });
-
-    expect(drawnTickLabels().map(({ label }) => label)).toEqual(FULL_AXIS_LABELS);
-    expect(labelsFit(800)).toBe(true);
-    // The zero label would cross the left edge if centred, so it starts at its
-    // tick; the last one fits centred under its tick, so it is not pushed off it.
-    expect(drawnTickLabels().map(({ anchor }) => anchor)).toEqual([
-      'start',
-      'middle',
-      'middle',
-      'middle',
-    ]);
-    // Tick positions are the scale's percentages whatever the width.
-    expect(drawnTickLabels().map(({ percent }) => percent)).toEqual(
-      [0, 50, 100, 150].map((ms) => Number(((ms / 180) * 100).toFixed(3))),
+    expect(drawnTickLabels()).toEqual(before);
+    expect(screen.getByRole('img').getAttribute('aria-label')).toBe(
+      `Time axis spanning ${formatDurationCompact(180)} from the first call`,
     );
   });
+});
 
-  it('re-fits the ticks when the strip is resized, narrower and back', async () => {
-    vi.stubGlobal('ResizeObserver', FakeResizeObserver);
-    stubAxisLayout();
-    stubbedAxisWidth = 800;
+/*
+ * ---------------------------------------------------------------------------
+ * The axis floor and the scroll viewport
+ *
+ * The tick set is fitted to a design strip, so it is legible only on a strip
+ * at least that wide. The stylesheet guarantees it: the row grid floors the
+ * time track at a token-derived minimum, and a panel narrower than a row's
+ * resulting minimum scrolls the axis and the rows together in one viewport
+ * instead of squeezing the track. happy-dom applies no stylesheet, so these
+ * cases hold the two halves of that guarantee as contracts rather than as
+ * measurements: the floor as the stylesheet declares it, resolved through the
+ * token table in every theme, and the elements the rendered viewport holds.
+ * ---------------------------------------------------------------------------
+ */
 
-    const view = renderComponent(makeNode(), {
-      provider: resolvingProvider(AXIS_CALLS).provider,
+/** The class of the scroll viewport the axis and the rows share. */
+const VIEWPORT_CLASS = 'dg-waterfall__viewport';
+
+/** The derived form a token-backed track minimum takes: `calc(<token> * n)`. */
+const TOKEN_MULTIPLE_MINIMUM = /^minmax\(calc\(var\((--dg-[a-z0-9-]+)\) \* (\d+)\), \d+fr\)$/u;
+
+/** A token value written as a whole number of pixels, e.g. `24px`. */
+const PIXEL_VALUE = /^(\d+(?:\.\d+)?)px$/u;
+
+/** The size of a `font` shorthand token, e.g. the `11px` of `400 11px/16px …`. */
+const FONT_SHORTHAND_SIZE = /(?:^|\s)(\d+(?:\.\d+)?)px\//u;
+
+/**
+ * The declaration bodies of every rule in {@link COMPONENT_STYLESHEET} whose
+ * selector list names `selector` exactly — the grouped shared rules as well as
+ * the component's own.
+ *
+ * The stylesheet has no at-rule blocks (its header states it), so each rule is
+ * one `selectors { declarations }` pair at the top level.
+ *
+ * @param selector One selector, exactly as written in a selector list.
+ * @returns The bodies, in source order.
+ */
+function rulesSelecting(selector: string): string[] {
+  const uncommented = COMPONENT_STYLESHEET.replace(/\/\*[\s\S]*?\*\//gu, '');
+  return Array.from(uncommented.matchAll(/([^{}]+)\{([^{}]*)\}/gu))
+    .filter(([, selectors = '']) =>
+      selectors.split(',').some((listed) => listed.trim() === selector),
+    )
+    .map(([, , body = '']) => body);
+}
+
+/**
+ * The value of one declaration in a rule body, failing when it is absent.
+ *
+ * @param body The text between a rule's braces.
+ * @param property The property name.
+ * @returns The declared value, trimmed.
+ */
+function declaredValue(body: string, property: string): string {
+  const match = new RegExp(`(?:^|;)\\s*${property}:\\s*([^;]+);`, 'u').exec(body);
+  if (match?.[1] === undefined) {
+    throw new Error(`the rule declares no ${property}`);
+  }
+  return match[1].trim();
+}
+
+/**
+ * The top-level tracks of a `grid-template-columns` value: split on the spaces
+ * outside any function, so `minmax(0, 2fr)` stays one track.
+ *
+ * @param template The declared template.
+ * @returns The tracks, in order.
+ */
+function topLevelTracks(template: string): string[] {
+  const tracks: string[] = [];
+  let depth = 0;
+  let current = '';
+  for (const char of template) {
+    if (char === '(') {
+      depth += 1;
+    } else if (char === ')') {
+      depth -= 1;
+    }
+    if (char === ' ' && depth === 0) {
+      if (current !== '') {
+        tracks.push(current);
+      }
+      current = '';
+    } else {
+      current += char;
+    }
+  }
+  if (current !== '') {
+    tracks.push(current);
+  }
+  return tracks;
+}
+
+/**
+ * The token a custom property name is generated from, failing on a name the
+ * token table does not declare.
+ *
+ * @param name A `--dg-*` custom property name.
+ * @returns The token key.
+ */
+function tokenKeyOf(name: string): TokenKey {
+  const key = (Object.keys(DESIGN_TOKENS.dark) as TokenKey[]).find(
+    (candidate) => cssVarName(candidate) === name,
+  );
+  if (key === undefined) {
+    throw new Error(`${name} is not a token in the token table`);
+  }
+  return key;
+}
+
+/**
+ * The number of pixels a pattern captures from a token value, failing when
+ * the value is not written that way.
+ *
+ * @param value The token value.
+ * @param pattern A pattern whose first group is the pixel figure.
+ * @returns The figure.
+ */
+function pixelsIn(value: string, pattern: RegExp): number {
+  const figure = pattern.exec(value)?.[1];
+  if (figure === undefined) {
+    throw new Error(`"${value}" states no pixel figure`);
+  }
+  return Number(figure);
+}
+
+describe('Waterfall axis floor and scroll viewport', () => {
+  it('scrolls the axis and every row in one viewport, and keeps the footer outside it', async () => {
+    const user = userEvent.setup();
+    renderComponent(makeNode(), {
+      provider: resolvingProvider([...CHAIN, LONE_CALL, LATER_CALL]).provider,
       actions: makeActions().actions,
     });
-    await screen.findByRole('tree', { name: TREE_NAME });
-    expect(drawnTickLabels()).toHaveLength(FULL_AXIS_LABELS.length);
+    const tree = await screen.findByRole('tree', { name: TREE_NAME });
+    // A nested level on screen too, so the child group a row owns is covered.
+    await user.click(within(rowLabelled(REQUEST_URL)).getByRole('button', { name: EXPAND_NAME }));
 
-    // The axis is observed, and a resize to a phone width thins it.
-    const observers = FakeResizeObserver.instances.filter((observer) =>
-      observer.observed.has(axisGraphic()),
-    );
-    expect(observers).toHaveLength(1);
-    stubbedAxisWidth = 190;
-    act(() => {
-      FakeResizeObserver.resizeAll();
-    });
-    expect(drawnTickLabels().length).toBeLessThan(FULL_AXIS_LABELS.length);
-    expect(labelsFit(190)).toBe(true);
+    const viewports = document.querySelectorAll<HTMLElement>(`.${VIEWPORT_CLASS}`);
+    expect(viewports).toHaveLength(1);
+    const [viewport] = viewports;
+    if (viewport === undefined) {
+      throw new Error('the waterfall rendered no scroll viewport');
+    }
 
-    // And widening it again brings the full set back.
-    stubbedAxisWidth = 800;
-    act(() => {
-      FakeResizeObserver.resizeAll();
-    });
-    expect(drawnTickLabels().map(({ label }) => label)).toEqual(FULL_AXIS_LABELS);
+    // Exactly two items, the axis row then the tree: the stylesheet's one grid
+    // column holds both at one inline size, so scrolling cannot move the strip
+    // against the tracks beneath it.
+    const axisRow = axisGraphic().closest<HTMLElement>('.dg-waterfall__axis');
+    expect(axisRow?.classList.contains('dg-waterfall__row')).toBe(true);
+    expect(Array.from(viewport.children)).toEqual([axisRow, tree]);
 
-    // Unmounting releases the observer.
-    view.unmount();
-    expect(observers.every((observer) => observer.disconnected)).toBe(true);
+    // Every drawn row — top-level and nested — scrolls with the axis.
+    const topLevel = drawnRows().filter((row) => row.getAttribute('aria-level') === '1');
+    expect(topLevel).toHaveLength(3);
+    expect(drawnRows()).toHaveLength(4);
+    for (const row of drawnRows()) {
+      expect(row.closest(`.${VIEWPORT_CLASS}`)).toBe(viewport);
+    }
+
+    // The footer — the counts and the paging controls — stays in reach below.
+    const footer = document.querySelector<HTMLElement>('.dg-waterfall__footer');
+    expect(footer).not.toBeNull();
+    expect(footer?.closest(`.${VIEWPORT_CLASS}`)).toBeNull();
+    expect(viewport.nextElementSibling).toBe(footer);
+
+    // The viewport is a plain scroll container: no role of its own and no tab
+    // stop, so the tree stays one composite widget with one stop in the Tab
+    // order.
+    expect(viewport.hasAttribute('role')).toBe(false);
+    expect(viewport.hasAttribute('tabindex')).toBe(false);
+    expect(soleTabStop().closest(`.${VIEWPORT_CLASS}`)).toBe(viewport);
   });
 
-  // 40 px holds one label; 20 px holds none, and the window start is still
-  // labelled rather than leaving an axis with no scale on it.
-  it.each([40, 20])('labels only the window start on a %i px strip', async (width) => {
-    vi.stubGlobal('ResizeObserver', FakeResizeObserver);
-    stubAxisLayout();
-    stubbedAxisWidth = width;
+  it('floors the time track at the design strip in every theme, from a space token', () => {
+    const [rowRule, ...otherRowRules] = rulesSelecting('.dg-waterfall__row');
+    expect(otherRowRules).toHaveLength(0);
+    const tracks = topLevelTracks(declaredValue(rowRule ?? '', 'grid-template-columns'));
 
-    renderComponent(makeNode(), {
-      provider: resolvingProvider(AXIS_CALLS).provider,
-      actions: makeActions().actions,
-    });
-    await screen.findByRole('tree', { name: TREE_NAME });
+    // Label, time and duration: the label track may still give way, the time
+    // track may not.
+    expect(tracks).toHaveLength(3);
+    expect(tracks[0]).toBe('minmax(0, 2fr)');
+    expect(tracks[2]).toBe('max-content');
+    const floor = TOKEN_MULTIPLE_MINIMUM.exec(tracks[1] ?? '');
+    const [, tokenName = '', multiplier = ''] = floor ?? [];
+    expect(floor).not.toBeNull();
+    const spaceKey = tokenKeyOf(tokenName);
+    expect(spaceKey).toMatch(/^space\d+$/u);
 
-    expect(drawnTickLabels()).toEqual([
-      { label: formatDurationCompact(0), percent: 0, anchor: 'start' },
-    ]);
+    const themes = Object.keys(DESIGN_TOKENS) as (keyof DesignTokens)[];
+    expect(themes).toHaveLength(3);
+    for (const theme of themes) {
+      const values = DESIGN_TOKENS[theme];
+      const floorPx = pixelsIn(values[spaceKey], PIXEL_VALUE) * Number(multiplier);
+      const labelFontPx = pixelsIn(values.textXs, FONT_SHORTHAND_SIZE);
+      expect(
+        floorPx,
+        `${theme}: the time track's floor clears the design strip`,
+      ).toBeGreaterThanOrEqual(AXIS_DESIGN_WIDTH_EM * labelFontPx);
+    }
   });
 
-  it('fits the ticks once from the first measurement in a host without ResizeObserver', async () => {
-    vi.stubGlobal('ResizeObserver', undefined);
-    stubAxisLayout();
-    stubbedAxisWidth = 190;
+  it('declares the viewport a scroll container whose one column is never narrower than a row', () => {
+    const bodies = rulesSelecting(`.${VIEWPORT_CLASS}`);
+    // The shared scroll-container rule, and the component's own.
+    expect(bodies).toHaveLength(2);
+    const scrolling = bodies.filter((body) => /(?:^|;)\s*overflow:\s*auto;/u.test(body));
+    expect(scrolling).toHaveLength(1);
+    const own = bodies.find((body) => !scrolling.includes(body)) ?? '';
+    expect(declaredValue(own, 'display')).toBe('grid');
+    expect(declaredValue(own, 'grid-template-columns')).toBe('minmax(min-content, 1fr)');
+    expect(declaredValue(own, 'min-inline-size')).toBe('0');
 
-    renderComponent(makeNode(), {
-      provider: resolvingProvider(AXIS_CALLS).provider,
-      actions: makeActions().actions,
-    });
-    await screen.findByRole('tree', { name: TREE_NAME });
-
-    expect(drawnTickLabels().length).toBeLessThan(FULL_AXIS_LABELS.length);
-    expect(labelsFit(190)).toBe(true);
+    // The axis strip takes the track's floor from the row grid, not a minimum
+    // of its own that could size the column differently from the bars' track.
+    const [strip] = rulesSelecting('.dg-waterfall__axis-strip');
+    expect(declaredValue(strip ?? '', 'min-inline-size')).toBe('0');
   });
 });

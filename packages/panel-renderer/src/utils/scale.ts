@@ -262,96 +262,35 @@ export function alignHairline(value: number): number {
  * ---------------------------------------------------------------------------
  * Canvas width
  *
- * The SVG views lay themselves out in CSS pixels: the component measures the
- * inner width of its scroll viewport (`./measure`, the one module in `./utils`
- * that touches the DOM) and draws a canvas exactly that wide, with a viewBox of
- * the same size, so one user unit is one CSS pixel and an 11 px label renders
- * at 11 px at every panel width. A fixed-width viewBox scaled to the container
- * was the alternative, and it shrank every glyph with the panel — to a third
- * of its size in a docked DevTools panel — while leaving the canvas's declared
- * height standing as a blank band beneath the drawing.
- *
- * Where nothing has been measured — a test environment without layout, or a
- * platform without `ResizeObserver` — a view lays out at
- * {@link DEFAULT_CANVAS_WIDTH} and scales that drawing to its container
- * instead, which is the only coordinate system available without a width.
+ * The time views draw in one fixed logical coordinate space and never read the
+ * size of the element they are drawn into: `Timeline` and `FlameChart` lay out
+ * in a `viewBox` {@link CHART_VIEWBOX_WIDTH} units wide, declare
+ * `width="100%"` and `preserveAspectRatio="xMinYMin meet"`, and leave sizing
+ * to the stylesheet, which scales the drawing uniformly to its container. A
+ * label is set in the stylesheet's type role, which inside the viewBox is that
+ * many user units tall, so a label that fits its bar in logical units fits it
+ * at every panel width. `DependencyGraph` lays out at its own deterministic
+ * logical size, one unit to a CSS pixel, and its viewport scrolls a graph
+ * wider than the panel. Either way the drawing is a pure function of the data,
+ * identical in a browser and in a layout-free test DOM.
  * ---------------------------------------------------------------------------
  */
 
 /**
- * The coordinate width a view lays out at before (or without) a measured
- * container: the unmeasured fallback of {@link resolveCanvasWidth}.
+ * The fixed logical width of a time chart's canvas, in SVG user units: 1 000.
  *
- * A thousand units keeps every placement in that mode a round per-mille of the
- * plotted window, which is what the package's layout-free tests assert against.
+ * `Timeline` and `FlameChart` lay every bar, frame, tick and label out in a
+ * `viewBox` exactly this wide, and the stylesheet sizes the element
+ * relationally (`inline-size: 100%`, its block size following the viewBox's
+ * aspect ratio) with `preserveAspectRatio="xMinYMin meet"`, so the drawing
+ * scales uniformly to its container and a glyph is never stretched sideways.
+ * No view reads its container's size: the drawing is a pure function of the
+ * data, identical in a browser and in a layout-free test DOM.
+ *
+ * A thousand units keeps every placement a round per-mille of the plotted
+ * window, which is what the package's layout-free tests assert against.
  */
-export const DEFAULT_CANVAS_WIDTH = 1000;
-
-/**
- * The narrowest canvas a measured view draws, in CSS pixels.
- *
- * Below this a time axis has no room for more than a tick or two and a lane
- * label column leaves nothing to plot, so a narrower container scrolls the
- * canvas horizontally rather than squeezing it. It sits below the inner width
- * of a phone-sized or docked DevTools panel (a 375 px viewport leaves roughly
- * 350 px), so the common narrow case still fits without a scrollbar.
- */
-export const MIN_CANVAS_WIDTH = 320;
-
-/** Options of {@link resolveCanvasWidth}. */
-export interface CanvasWidthOptions {
-  /**
-   * The narrowest canvas to draw, in CSS pixels. Defaults to
-   * {@link MIN_CANVAS_WIDTH}; a non-finite or negative value falls back to it.
-   */
-  readonly min?: number;
-  /**
-   * The width to lay out at when `measured` is unusable. Defaults to
-   * {@link DEFAULT_CANVAS_WIDTH}; a non-finite or non-positive value falls back
-   * to it.
-   */
-  readonly fallback?: number;
-}
-
-/**
- * The width a view lays its canvas out at, given the measured inner width of
- * its container.
- *
- * - A usable measurement (finite and at least one pixel) is floored to a whole
- *   pixel — a fractional canvas would overflow its container by the fraction
- *   and summon a scrollbar — and raised to `min`, below which the canvas
- *   scrolls instead of shrinking.
- * - Anything else (`undefined` before the first measurement, `0` where there is
- *   no layout, `NaN`) yields `fallback`, the unmeasured coordinate width.
- *
- * Pair it with {@link isMeasuredWidth} to pick between the two drawing modes:
- * a measured canvas is drawn at its size in pixels, an unmeasured one scaled
- * to its container.
- *
- * @param measured The container's inner width in CSS pixels, if known.
- * @param options Minimum and fallback widths.
- * @returns A finite, positive canvas width.
- */
-export function resolveCanvasWidth(
-  measured: number | undefined,
-  options: CanvasWidthOptions = {},
-): number {
-  const fallback = asPositive(options.fallback, DEFAULT_CANVAS_WIDTH);
-  if (!isMeasuredWidth(measured)) {
-    return fallback;
-  }
-  const min = asNonNegative(options.min, MIN_CANVAS_WIDTH);
-  return Math.max(Math.floor(measured), Math.floor(min), 1);
-}
-
-/**
- * Whether `measured` is a usable container width: finite and at least one
- * pixel. `0` is what a layout-free environment reports, so it is "unmeasured",
- * never a zero-width canvas.
- */
-export function isMeasuredWidth(measured: number | undefined): measured is number {
-  return typeof measured === 'number' && Number.isFinite(measured) && measured >= 1;
-}
+export const CHART_VIEWBOX_WIDTH = 1000;
 
 /*
  * ---------------------------------------------------------------------------
@@ -418,8 +357,8 @@ export interface TimeScale {
    *
    * `true` means every instant maps to {@link rangeStart} and every pixel maps
    * to {@link domainStart}. It is a normal state, not an error: an empty
-   * capture, a trace with a single instantaneous event, or a first render
-   * before the container has been measured all produce it, and a view should
+   * capture, a trace with a single instantaneous event, or a caller that
+   * passed an empty pixel range all produce it, and a view should
    * read it to decide whether to draw an axis rather than to decide whether to
    * draw at all.
    */
@@ -478,7 +417,7 @@ export interface TimeScale {
  * - **Inverted window** (`end < start`) — the bounds are swapped, so a caller
  *   that computed them from an unordered pair gets the window it meant.
  * - **Zero-width or inverted viewport** — same treatment: swapped if inverted,
- *   and `degenerate` if it has no width (a container not yet measured).
+ *   and `degenerate` if it has no width (a caller that passed an empty range).
  * - **Non-finite bound** — replaced with `0`, which collapses the affected
  *   interval rather than poisoning every coordinate derived from it.
  *
@@ -687,8 +626,8 @@ function placeAbsolute(
 
   // Keep a widened bar inside the viewport by shifting it left off the right
   // edge — but only when the viewport is wide enough to hold it. A viewport
-  // narrower than the minimum width (or with no width at all, before the
-  // container has been measured) has no interval to fit the bar into, so the
+  // narrower than the minimum width (or with no width at all) has no
+  // interval to fit the bar into, so the
   // bar starts at the left edge and the caller's own clipping applies.
   const overflow = left + width - scale.rangeEnd;
   const x = overflow > 0 && scale.rangeSpan >= width ? scale.rangeEnd - width : left;
@@ -1153,6 +1092,132 @@ export const DEFAULT_MAX_TRACE_ROWS = 2000;
  */
 export const DEFAULT_MAX_TRACE_DEPTH = 1024;
 
+/*
+ * ---------------------------------------------------------------------------
+ * The drawn-row budget
+ *
+ * A capture can hold far more spans than one SVG can carry: a trace of a
+ * hundred thousand nodes is a hundred thousand bars, labels and handlers, and a
+ * DevTools panel that mounts them freezes. So a view never draws more than a
+ * fixed number of rows at once, however often a reader asks for more. Asking
+ * for more MOVES a window of at most that many rows over the full, ordered
+ * walk instead of growing it; what lies before and after the window is counted
+ * and stated, never silently dropped. The helpers below are that window's
+ * arithmetic, shared so the views that page a walk agree on what "the next
+ * rows" are.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * The most rows one SVG view draws at once: 2 000 — an absolute budget, not a
+ * starting bound.
+ *
+ * Equal to {@link DEFAULT_MAX_TRACE_ROWS}, so a trace that fits the default
+ * walk is drawn whole and a larger one is drawn a window at a time. A view
+ * whose rows are heavier than a bar (a row of controls rather than a rect) may
+ * pass a smaller budget of its own to {@link windowRows}; none may pass a
+ * larger one and still claim to be bounded.
+ */
+export const MAX_DRAWN_ROWS = DEFAULT_MAX_TRACE_ROWS;
+
+/**
+ * A contiguous window of at most `budget` rows over an ordered walk of `total`
+ * rows: rows `[start, end)` are drawn, `before` rows precede them and `after`
+ * rows follow them.
+ *
+ * `before + count + after === total` always holds, so a view can state "rows
+ * `start + 1`–`end` of `total`" and how many it did not draw without any
+ * arithmetic of its own.
+ */
+export interface RowWindow {
+  /** The index of the first drawn row; `0` when there are no rows. */
+  readonly start: number;
+  /** One past the index of the last drawn row; `start` when none are drawn. */
+  readonly end: number;
+  /** How many rows are drawn: `end - start`, never more than `budget`. */
+  readonly count: number;
+  /** How many rows the walk holds in all. */
+  readonly total: number;
+  /** How many rows precede the window and are not drawn: `start`. */
+  readonly before: number;
+  /** How many rows follow the window and are not drawn: `total - end`. */
+  readonly after: number;
+  /** The most rows the window may hold. */
+  readonly budget: number;
+}
+
+/**
+ * The window of at most `budget` rows starting at `start` over `total` rows.
+ *
+ * - `total` that is not a non-negative integer is read as `0`: an empty walk
+ *   yields an empty window at `0`.
+ * - `budget` that is not a positive integer is read as {@link MAX_DRAWN_ROWS}.
+ * - `start` that is not a non-negative integer is read as `0`, and a start at
+ *   or past the end is pulled back to the start of the last window
+ *   ({@link windowStartFor} of the last row), so a window over a non-empty walk
+ *   is never empty — a walk that shrank under a window (a changed query, a
+ *   folded subtree) shows its last rows rather than nothing.
+ *
+ * @param total How many rows the walk holds.
+ * @param start The first row to draw.
+ * @param budget The most rows to draw.
+ */
+export function windowRows(total: number, start = 0, budget: number = MAX_DRAWN_ROWS): RowWindow {
+  const rows = asNonNegativeInt(total, 0);
+  const size =
+    typeof budget === 'number' && Number.isInteger(budget) && budget > 0 ? budget : MAX_DRAWN_ROWS;
+  const requested = asNonNegativeInt(start, 0);
+  const first = rows === 0 ? 0 : requested < rows ? requested : windowStartFor(rows - 1, size);
+  const end = Math.min(rows, first + size);
+  return {
+    start: first,
+    end,
+    count: end - first,
+    total: rows,
+    before: first,
+    after: rows - end,
+    budget: size,
+  };
+}
+
+/**
+ * The start of the aligned window that holds row `index`: the largest multiple
+ * of `budget` not greater than `index`.
+ *
+ * What a view pages to when it must reveal a particular row — a selection made
+ * in another view, a search hit — so the window it shows is the same one the
+ * next/previous controls would have reached. A non-integer or negative `index`
+ * reads as `0`; `budget` is sanitised as in {@link windowRows}.
+ */
+export function windowStartFor(index: number, budget: number = MAX_DRAWN_ROWS): number {
+  const row = asNonNegativeInt(index, 0);
+  const size =
+    typeof budget === 'number' && Number.isInteger(budget) && budget > 0 ? budget : MAX_DRAWN_ROWS;
+  return Math.floor(row / size) * size;
+}
+
+/**
+ * The start of the window after `window`: its `end` while rows follow it, and
+ * its own `start` when it is already the last window, so "next" never moves
+ * past the walk.
+ */
+export function nextWindowStart(window: RowWindow): number {
+  return window.after > 0 ? window.end : window.start;
+}
+
+/**
+ * The start of the window before `window`: one budget earlier, and never
+ * before the first row.
+ */
+export function previousWindowStart(window: RowWindow): number {
+  return Math.max(0, window.start - window.budget);
+}
+
+/** Whether row `index` is drawn by `window`. */
+export function windowContains(window: RowWindow, index: number): boolean {
+  return Number.isInteger(index) && index >= window.start && index < window.end;
+}
+
 /** How a correlated trace is flattened for rendering. Every member is optional. */
 export interface TraceLayoutOptions extends RowLayoutOptions {
   /**
@@ -1168,11 +1233,11 @@ export interface TraceLayoutOptions extends RowLayoutOptions {
    */
   readonly maxRows?: number | undefined;
   /**
-   * The first row to materialise, for a virtualized view; defaults to `0`.
+   * The first row to materialise, for a view that draws a window of the walk
+   * (see {@link windowRows}); defaults to `0`.
    *
-   * The walk still counts every row before it, so the layout's height and
-   * total row count describe the whole tree and a scroll container keeps its
-   * size while the window moves.
+   * The walk still counts every row before it, so the layout's total row count
+   * describes the whole tree while the window moves.
    */
   readonly firstRow?: number | undefined;
   /**
@@ -1258,14 +1323,14 @@ export interface FlatTraceRow {
 
 /** A correlated trace, flattened and positioned. */
 export interface TraceLayout {
-  /** The materialised rows: the virtualization window, or all of them. */
+  /** The materialised rows: the drawn window, or all of them. */
   readonly rows: readonly FlatTraceRow[];
   /** How many rows were materialised; always `rows.length`. */
   readonly rowCount: number;
   /**
    * How many rows the walk produced, whether materialised or not.
    *
-   * What a virtualized scroll container measures itself against, and the `M` in
+   * What a drawn-row window pages over ({@link windowRows}), and the `M` in
    * "showing N of M".
    */
   readonly totalRowCount: number;
@@ -1329,7 +1394,7 @@ interface TraceWalkFrame {
  * Consumers: `FlameChart` (via `depthY`), `Timeline` and `Waterfall` (via `y`).
  *
  * @param tree A correlated trace, read and never mutated.
- * @param options Bounds, virtualization window and row rhythm.
+ * @param options Bounds, drawn-row window and row rhythm.
  */
 export function flattenTraceRows(tree: TraceTree, options?: TraceLayoutOptions): TraceLayout {
   const maxRows = asNonNegativeInt(options?.maxRows, DEFAULT_MAX_TRACE_ROWS);
@@ -1972,68 +2037,6 @@ export function graphCanvasSize(
     width: columns <= 0 ? 0 : columns * nodeWidth + (columns - 1) * columnGap,
     height: rows <= 0 ? 0 : rows * nodeHeight + (rows - 1) * rowGap,
   };
-}
-
-/**
- * The narrowest column gap {@link fitGraphColumnGap} will produce, in SVG user
- * units: 32 — still wide enough that an edge's curve reads as a connector.
- */
-export const MIN_GRAPH_COLUMN_GAP = 32;
-
-/**
- * The widest column gap {@link fitGraphColumnGap} will produce, in SVG user
- * units: 160 — past this, spreading a short graph across a wide panel pulls
- * related participants so far apart that their connector reads as noise.
- */
-export const MAX_GRAPH_COLUMN_GAP = 160;
-
-/** Options of {@link fitGraphColumnGap}. */
-export interface GraphColumnGapOptions {
-  /** Participant box width; defaults to {@link DEFAULT_GRAPH_NODE_WIDTH}. */
-  readonly nodeWidth?: number | undefined;
-  /** Narrowest gap; defaults to {@link MIN_GRAPH_COLUMN_GAP}. */
-  readonly minGap?: number | undefined;
-  /** Widest gap; defaults to {@link MAX_GRAPH_COLUMN_GAP}. */
-  readonly maxGap?: number | undefined;
-}
-
-/**
- * The column gap that makes a layered graph of `layerCount` columns fill a
- * container `containerWidth` pixels wide, kept within `[minGap, maxGap]`.
- *
- * The participant boxes keep their width — their labels are sized for it — so
- * the gaps are what give: a graph narrower than its container spreads its
- * columns (up to `maxGap`, after which it simply stops short of the right
- * edge), and one wider tightens them (down to `minGap`, after which the canvas
- * is wider than the container and its viewport scrolls). Either way the canvas
- * is drawn at one user unit per CSS pixel, so its text never scales.
- *
- * Degenerate inputs, all deliberate:
- *
- * - an unusable `containerWidth` (see {@link isMeasuredWidth}) yields
- *   {@link DEFAULT_GRAPH_COLUMN_GAP}, the unmeasured rhythm;
- * - fewer than two columns have no gap to size, and yield the default too;
- * - `minGap > maxGap` is resolved by swapping them.
- *
- * @param containerWidth The measured inner width of the graph's viewport.
- * @param layerCount How many columns the layout uses.
- * @param options Box width and gap bounds.
- * @returns A finite, non-negative column gap.
- */
-export function fitGraphColumnGap(
-  containerWidth: number | undefined,
-  layerCount: number,
-  options: GraphColumnGapOptions = {},
-): number {
-  const columns = asNonNegativeInt(layerCount, 0);
-  if (!isMeasuredWidth(containerWidth) || columns < 2) {
-    return DEFAULT_GRAPH_COLUMN_GAP;
-  }
-  const nodeWidth = asPositive(options.nodeWidth, DEFAULT_GRAPH_NODE_WIDTH);
-  const minGap = asNonNegative(options.minGap, MIN_GRAPH_COLUMN_GAP);
-  const maxGap = asNonNegative(options.maxGap, MAX_GRAPH_COLUMN_GAP);
-  const available = Math.floor(containerWidth) - columns * nodeWidth;
-  return Math.floor(clamp(available / (columns - 1), minGap, maxGap));
 }
 
 /**

@@ -47,9 +47,11 @@
 import { homedir } from 'node:os';
 import { readFile, readdir, rename, writeFile } from 'node:fs/promises';
 import { join, sep } from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
+import { DORMANT_AGENT_HOOK_CONFIG } from '@debuggen/instrumentation';
 import { validatePanelSpec } from '@debuggen/panel-schema';
 import {
   CLEANUP_STATUSES,
@@ -81,17 +83,24 @@ import type {
   TelemetryEventIngress,
   TraceNode,
 } from '@debuggen/protocol';
-import { isErr } from '@debuggen/shared';
+import { DebuggenError, err, isErr, newEventId, newProducerId, newTraceId } from '@debuggen/shared';
 
+import { LOG_ERROR_FIELD_KEY } from '../../src/logging.js';
 import { PIPELINE_STAGE_ORDER } from '../../src/pipeline/orchestrator.js';
+import { createSessionManager } from '../../src/sessions/manager.js';
+import type { SessionBroadcaster } from '../../src/sessions/manager.js';
 import {
   CAPTURE_SIGNAL_LABELS,
+  FAILURE_COPY_BY_CODE,
   INSTRUMENTATION_ROW_ORDER,
   MAX_FINDING_ROWS_PER_STAGE,
   PROGRESS_STAGE_TITLES,
   READY_TO_CAPTURE_MESSAGE,
+  STAGE_FAILURE_DIAGNOSTIC_MESSAGE,
+  STAGE_FAILURE_LOG_MESSAGE,
   buildInstrumentationRows,
   buildInvestigationRows,
+  createSessionProgress,
 } from '../../src/sessions/progress.js';
 import type { ProgressRow } from '../../src/sessions/progress.js';
 import { MAX_REPLAYED_PROGRESS_ROWS, REPLAY_MESSAGE_ORDER } from '../../src/sessions/reopen.js';
@@ -491,7 +500,7 @@ describe('a debugging session, walked end to end through the real routes and pus
   async function readSession(): Promise<SessionRecord> {
     const read = await harness
       .http(devtools.credential.token, { origin: devtools.credential.origin })
-      .request('session.get', { params: { id: session.id } });
+      .request('session.get', { params: { id: session.id }, tabId: TAB_ID });
     if (isErr(read)) {
       throw new Error(`session.get was refused (${read.error.code}): ${read.error.message}`);
     }
@@ -639,6 +648,13 @@ describe('a debugging session, walked end to end through the real routes and pus
     for (const row of investigationRows) {
       expect(row.status).toBe(ROW.done);
       expect(row.message).toMatch(/^(?:Found|Traced) \S/u);
+      if (row.message.startsWith('Traced')) {
+        // The one event-handler row: the Step-8 label verbatim, its evidence in the detail
+        // (`‹symbols› · ‹file›`), whose file part names the first traced handler's origin.
+        expect(row.message).toBe('Traced event handler');
+        expect(corpus).toContain(row.detail?.split(' · ').at(-1));
+        continue;
+      }
       expect(corpus).toContain(row.detail);
       const path = /^Found (\/\S*)$/u.exec(row.message)?.[1];
       if (path !== undefined) {
@@ -686,10 +702,11 @@ describe('a debugging session, walked end to end through the real routes and pus
       const name = /^Found ([^/\s]\S*)$/u.exec(row.message)?.[1];
       return name === undefined ? [] : [name];
     });
-    const eventHandlers = investigationRows.flatMap((row) => {
-      const name = /^Traced (\S+)$/u.exec(row.message)?.[1];
-      return name === undefined ? [] : [name];
-    });
+    const eventHandlers = investigationRows.flatMap((row) =>
+      row.message === 'Traced event handler'
+        ? (row.detail?.split(' · ')[0]?.split(', ') ?? [])
+        : [],
+    );
     const rebuiltFrom = (findings: {
       readonly components: readonly string[];
       readonly eventHandlers: readonly string[];
@@ -924,6 +941,188 @@ describe('a debugging session, walked end to end through the real routes and pus
     expect(isErr(panels) ? undefined : panels.value).toEqual([]);
   });
 
+  it(`a ${route('capture.stop')} whose status write the store refuses changes nothing: the window stays open, the project owned, its producers armed, and no capture.stopped is sent`, async () => {
+    // Its own session on its own copy, so the walk's session, captures and
+    // status trail stay exactly as the tests around this one expect them.
+    const tabId = TAB_ID + 1;
+    const copy = await harness.copyFixtureProject();
+    const before = await snapshotTree(copy.root);
+    const launched = await harness.launchDevServer(copy.root);
+    if (isErr(launched)) {
+      throw new Error(`the dev server did not launch (${launched.error.code})`);
+    }
+    const origin = new URL(launched.value.devServerUrl).origin;
+    const editor = await harness.editor(copy.root);
+    const created = await harness.createSession({ projectRoot: copy.root, question: QUESTION });
+    const tab = await harness.connectDevtools({ tabId });
+    const bound = await harness.bindTab(tab.client, {
+      tabId,
+      url: `${origin}/`,
+      origin,
+      sessionId: created.id,
+    });
+    if (isErr(bound)) {
+      throw new Error(`session.bind was refused (${bound.error.code}): ${bound.error.message}`);
+    }
+    const report = tab.client.send('agent.ready', {
+      tabId,
+      documentId: 'doc_lifecycle000000002',
+      producerId: newProducerId(),
+      url: `${origin}/`,
+      installedBeforeReact: true,
+      reactDetected: true,
+    });
+    expect(await tab.client.flush()).toBe(true);
+    expect(tab.client.errorsFor(report.id)).toEqual([]);
+    await waitForRecord(editor, created.id, (record) => record.status === STATUS.ready);
+
+    const armMark = tab.client.received.length;
+    const started = await harness.startCapture(created.id);
+    if (isErr(started)) {
+      throw new Error(
+        `capture.start was refused (${started.error.code}): ${started.error.message}`,
+      );
+    }
+    const heldCaptureId = started.value.captureId;
+    await waitForFrame(editor, 'capture.started', created.id);
+    const owner = { sessionId: created.id, captureId: heldCaptureId };
+    expect(harness.manager.captureOwnerForProject(copy.root)).toEqual(owner);
+    // What the capture armed the tab's page agent with, to compare the re-arm against.
+    const armedAtStart = await waitForFrame(tab.client, 'agent.config', created.id, armMark);
+    expect(armedAtStart.payload.captureId).toBe(heldCaptureId);
+    expect(armedAtStart.payload.hooks).not.toEqual(DORMANT_AGENT_HOOK_CONFIG);
+    const mark = editor.received.length;
+    const tabMark = tab.client.received.length;
+
+    // The injected failure: a TEMP trigger on the service's own connection that
+    // aborts every write moving this session out of `capturing` — the stop's
+    // next status and the pipeline's own move to `failed` alike.
+    if (!/^[A-Za-z0-9_-]+$/u.test(created.id)) {
+      throw new Error('The session id cannot be quoted into a trigger.');
+    }
+    const trigger = `lifecycle_block_leave_capturing_${created.id.replaceAll('-', '_')}`;
+    harness.store.db.exec(
+      `CREATE TEMP TRIGGER ${trigger} BEFORE UPDATE OF status ON sessions WHEN OLD.id = '${created.id}' AND OLD.status = 'capturing' AND NEW.status <> 'capturing' BEGIN SELECT RAISE(ABORT, 'session-lifecycle suite: injected status write failure'); END;`,
+    );
+    try {
+      const refused = await harness.stopCapture(created.id);
+      if (!isErr(refused)) {
+        throw new Error('capture.stop was expected to be refused, but it succeeded.');
+      }
+      expect(refused.error.code).toBe('STORE_ERROR');
+
+      // The store, the owner index and the transcript all still say "capturing".
+      const stored = harness.repos.sessions.get(created.id);
+      expect(isErr(stored) ? undefined : stored.value?.status).toBe(STATUS.capturing);
+      const active = harness.repos.sessions.getActiveCapture(created.id);
+      if (isErr(active)) {
+        throw new Error(`the open capture could not be read (${active.error.code})`);
+      }
+      expect(active.value?.capture.id).toBe(heldCaptureId);
+      expect(active.value?.capture.stoppedAt).toBeUndefined();
+      expect(active.value?.capture.summary).toBeUndefined();
+      expect(harness.manager.captureOwnerForProject(copy.root)).toEqual(owner);
+      expect(await editor.flush()).toBe(true);
+      expect(framesOf(editor, 'capture.stopped', created.id, mark)).toEqual([]);
+      expect(
+        framesOf(editor, 'session.updated', created.id, mark).filter(
+          (frame) => frame.payload.session.status !== STATUS.capturing,
+        ),
+      ).toEqual([]);
+
+      // The stop returned the page agent to dormant before the store refused it;
+      // the window is still the session's live capture, so the agent is armed
+      // again — for the same capture, with the hooks the capture started with.
+      const configs = await tab.client.until(
+        () => {
+          const received = framesOf(tab.client, 'agent.config', created.id, tabMark);
+          const last = received.at(-1);
+          return last !== undefined &&
+            !isDeepStrictEqual(last.payload.hooks, DORMANT_AGENT_HOOK_CONFIG)
+            ? received
+            : undefined;
+        },
+        HARNESS_TIMEOUTS.capture,
+        () => 'the page agent was not armed again after the refused stop',
+      );
+      expect(configs.map((frame) => frame.payload.captureId)).toEqual([
+        heldCaptureId,
+        heldCaptureId,
+      ]);
+      expect(configs[0]?.payload.hooks).toEqual(DORMANT_AGENT_HOOK_CONFIG);
+      expect(configs[1]?.payload.hooks).toEqual(armedAtStart.payload.hooks);
+
+      // What the re-armed agent sends next is evidence of the same, still-open window.
+      const traceId = newTraceId();
+      const producers = new Map<string, string>();
+      const resumed = readTelemetryBatch(CROSS_TIER_BATCH)
+        .filter((event) => event.tier === TIER.browser)
+        .map((event): TelemetryEventIngress => {
+          const producerId = producers.get(event.producerId) ?? newProducerId();
+          producers.set(event.producerId, producerId);
+          return { ...event, id: newEventId(), traceId, producerId };
+        });
+      expect(resumed.length).toBeGreaterThan(0);
+      const relayed = await harness.ingestFromAgent(tab.client, resumed);
+      expect(relayed.sent.ok).toBe(true);
+      expect(relayed.settled).toBe(true);
+      expect(relayed.errors).toEqual([]);
+      const attributed = harness.repos.telemetry.listByCapture(created.id, heldCaptureId);
+      if (isErr(attributed)) {
+        throw new Error(`listByCapture failed (${attributed.error.code})`);
+      }
+      expect(
+        attributed.value.rows
+          .filter((event) => event.traceId === traceId)
+          .map((event) => event.id)
+          .sort(),
+      ).toEqual(resumed.map((event) => event.id).sort());
+    } finally {
+      harness.store.db.exec(`DROP TRIGGER IF EXISTS temp.${trigger};`);
+    }
+
+    // With the store writable again, the same stop succeeds once, completely,
+    // and summarises what the window collected after the refusal.
+    const stopped = await harness.stopCapture(created.id);
+    if (isErr(stopped)) {
+      throw new Error(`capture.stop was refused (${stopped.error.code}): ${stopped.error.message}`);
+    }
+    expect(stopped.value.summary.captureId).toBe(heldCaptureId);
+    expect(stopped.value.summary.eventCount).toBeGreaterThan(0);
+    await waitForRecord(
+      editor,
+      created.id,
+      (record) =>
+        record.status === STATUS.generated &&
+        record.captures.some(
+          (capture) => capture.id === heldCaptureId && capture.stoppedAt !== undefined,
+        ),
+    );
+    expect(await editor.flush()).toBe(true);
+    const closedFrames = framesOf(editor, 'capture.stopped', created.id, mark);
+    expect(closedFrames.map((frame) => frame.payload.captureId)).toEqual([heldCaptureId]);
+    // `capture.stopped` precedes the `session.updated` that leaves `capturing`.
+    const stoppedAt = editor.received.indexOf(closedFrames[0]!);
+    const movedAt = editor.received.findIndex(
+      (message, index) =>
+        index >= mark &&
+        concerns(message, 'session.updated', created.id) &&
+        message.payload.session.status !== STATUS.capturing,
+    );
+    expect(stoppedAt).toBeGreaterThanOrEqual(mark);
+    expect(movedAt).toBeGreaterThan(stoppedAt);
+    const after = harness.repos.sessions.getActiveCapture(created.id);
+    expect(isErr(after) ? 'unreadable' : after.value).toBeUndefined();
+    expect(harness.manager.captureOwnerForProject(copy.root)).toBeUndefined();
+
+    const ended = await harness.endSession(created.id);
+    if (isErr(ended)) {
+      throw new Error(`session.end was refused (${ended.error.code})`);
+    }
+    expect(ended.value.cleanup).toBe(CLEANUP.clean);
+    await assertTreeUnchanged(copy.root, before);
+  });
+
   it(`captures one cross-tier trace through both producers: the tab’s telemetry.event frame and ${route('telemetry.event')}`, async () => {
     const mark = vscode.received.length;
     const devtoolsMark = devtools.client.received.length;
@@ -1067,7 +1266,7 @@ describe('a debugging session, walked end to end through the real routes and pus
     expect(summary.primaryTraceId).toBe(expected.traceId);
     const data = await harness
       .http(devtools.credential.token, { origin: devtools.credential.origin })
-      .request('panel.data', { params: { id: session.id }, body: expected.query });
+      .request('panel.data', { params: { id: session.id }, body: expected.query, tabId: TAB_ID });
     if (isErr(data)) {
       throw new Error(`panel.data was refused (${data.error.code}): ${data.error.message}`);
     }
@@ -1239,7 +1438,11 @@ describe('a debugging session, walked end to end through the real routes and pus
     const trail = statusTrail(editor, failing.id);
     expect(trail.at(-1)).toBe(STATUS.failed);
     expect(trail).not.toContain(STATUS.generated);
-    expect(STATUS.failed).not.toBe(STATUS.ended);
+    // Failing is not ending: nothing broadcast `ended` before the explicit end
+    // below, and the stored record holds `failed` rather than a later status.
+    expect(trail).not.toContain(STATUS.ended);
+    const stored = harness.repos.sessions.get(failing.id);
+    expect(isErr(stored) ? undefined : stored.value?.status).toBe(STATUS.failed);
 
     // The failing stage reaches the user interface as the one `failed` row.
     const failedRows = progressRows(editor, failing.id).filter((row) => row.status === ROW.failed);
@@ -1391,5 +1594,143 @@ describe('a debugging session, walked end to end through the real routes and pus
     // Nothing reached the developer's real state directory, and the committed corpus is untouched.
     expect(harness.home.startsWith(join(homedir(), '.debuggen'))).toBe(false);
     await assertTreeUnchanged(fixturePath(DEFAULT_FIXTURE_PROJECT), project.snapshot);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * A cleanup that fails: the row shows product text, never the runner's hint
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * The private fragments of a hint a cleanup runner can propagate from a
+ * collaborator — a backup store's path, a statement, a URL query value.
+ */
+const CLEANUP_HINT_FRAGMENTS: readonly string[] = Object.freeze([
+  '/home/dev/zz-cleanup-project/.debuggen/backups/zz-digest',
+  'zz-cleanup-sql-literal',
+  'zz-cleanup-query-value',
+]);
+
+/** That hint: it reads like a recovery step, and no product builder registered it. */
+const CLEANUP_RUNNER_HINT =
+  `Restore ${String(CLEANUP_HINT_FRAGMENTS[0])} by hand, rerun ` +
+  "UPDATE journal SET status = 'zz-cleanup-sql-literal', then open " +
+  'http://127.0.0.1:3999/status?token=zz-cleanup-query-value.';
+
+/** The runner's own message, which only the failure's debug diagnostic may carry. */
+const CLEANUP_RUNNER_MESSAGE = `The backup under ${String(CLEANUP_HINT_FRAGMENTS[0])} is unreadable.`;
+
+describe('a cleanup that fails, filed through the real manager, progress emitter and store', () => {
+  it("shows the product's retry step or a proven hint, never a hint the cleanup runner propagated", async () => {
+    // The service's own store, progress emitter and logger, with only the
+    // cleanup runner replaced: the first ending fails with a private hint,
+    // the second with a hint that is fixed product copy.
+    const frames: { readonly kinds: readonly string[]; readonly message: ProtocolMessage }[] = [];
+    const broadcaster: SessionBroadcaster = {
+      broadcast: (_sessionId, message) => {
+        frames.push({ kinds: ['*'], message });
+      },
+      broadcastToKinds: (_sessionId, kinds, message) => {
+        frames.push({ kinds, message });
+      },
+    };
+    const progress = createSessionProgress({
+      sessions: harness.repos.sessions,
+      broadcaster,
+      logger: harness.logger.root,
+    });
+    const failures = [
+      new DebuggenError('CLEANUP_PARTIAL', CLEANUP_RUNNER_MESSAGE, { hint: CLEANUP_RUNNER_HINT }),
+      new DebuggenError('CLEANUP_PARTIAL', CLEANUP_RUNNER_MESSAGE, {
+        hint: FAILURE_COPY_BY_CODE.MODIFICATION_CONFLICT.hint,
+      }),
+    ];
+    let attempt = 0;
+    const manager = createSessionManager({
+      sessions: harness.repos.sessions,
+      broadcaster,
+      progress,
+      cleanup: {
+        run: () => {
+          const failure = failures[attempt];
+          attempt += 1;
+          return Promise.resolve(
+            err(failure ?? new DebuggenError('CLEANUP_PARTIAL', CLEANUP_RUNNER_MESSAGE)),
+          );
+        },
+      },
+      config: { provider: 'deterministic' },
+      logger: harness.logger.root,
+    });
+    const created = await manager.create({
+      projectRoot: '/work/zz-cleanup-project',
+      question: QUESTION,
+      devServerUrl: 'http://127.0.0.1:3999/',
+    });
+    if (isErr(created)) {
+      throw new Error(`the probe session was refused (${created.error.code})`);
+    }
+    const sessionId = created.value.id;
+
+    const first = await manager.end(sessionId);
+    const second = await manager.end(sessionId);
+    expect(isErr(first) ? first.error.code : 'ended').toBe('CLEANUP_PARTIAL');
+    expect(isErr(second) ? second.error.code : 'ended').toBe('CLEANUP_PARTIAL');
+
+    // The persisted rows: the retry step for the unproven hint, the proven hint as it was written.
+    const stored = harness.repos.sessions.listProgress(sessionId);
+    if (isErr(stored)) {
+      throw new Error(`the probe session's progress could not be read (${stored.error.code})`);
+    }
+    const failedRows = stored.value.filter(
+      (row) => row.stage === STAGE.cleanup && row.status === ROW.failed,
+    );
+    expect(failedRows).toHaveLength(2);
+    const refPattern = /\(error code: CLEANUP_PARTIAL, ref: (msg_[A-Za-z0-9_-]+)\)$/u;
+    expect(String(failedRows[0]?.detail)).toMatch(
+      /^End the session again to retry cleanup\. \(error code: CLEANUP_PARTIAL, ref: msg_[A-Za-z0-9_-]+\)$/u,
+    );
+    expect(
+      String(failedRows[1]?.detail).startsWith(
+        `${FAILURE_COPY_BY_CODE.MODIFICATION_CONFLICT.hint} (error code: CLEANUP_PARTIAL`,
+      ),
+    ).toBe(true);
+    const refs = failedRows.map((row) => refPattern.exec(String(row.detail))?.[1]);
+    expect(refs.every((ref) => ref !== undefined)).toBe(true);
+
+    // Neither the stored rows nor any frame the clients were sent carries the runner's words.
+    const surfaces = JSON.stringify([stored.value, frames.map(({ message }) => message)]);
+    for (const fragment of [
+      CLEANUP_RUNNER_HINT,
+      CLEANUP_RUNNER_MESSAGE,
+      ...CLEANUP_HINT_FRAGMENTS,
+    ]) {
+      expect(surfaces, `a surface carries ${fragment}`).not.toContain(fragment);
+    }
+    const progressFrames = frames.filter(({ message }) => message.type === 'session.progress');
+    expect(progressFrames.length).toBeGreaterThanOrEqual(2);
+    for (const { kinds } of progressFrames) {
+      expect(kinds).toEqual(['vscode', 'devtools']);
+    }
+
+    // Each row's reference leads to its warn record and its debug diagnostic.
+    const warned = harness.logger
+      .withMessage(STAGE_FAILURE_LOG_MESSAGE)
+      .filter((record) => record.fields['sessionId'] === sessionId);
+    const twins = harness.logger
+      .withMessage(STAGE_FAILURE_DIAGNOSTIC_MESSAGE)
+      .filter((record) => record.fields['sessionId'] === sessionId);
+    expect(warned.map((record) => record.fields['ref'])).toEqual(refs);
+    expect(twins.map((record) => record.fields['ref'])).toEqual(refs);
+    expect(twins.map((record) => record.level)).toEqual(['debug', 'debug']);
+    for (const record of warned) {
+      for (const fragment of CLEANUP_HINT_FRAGMENTS) {
+        expect(record.line, `the warn record carries ${fragment}`).not.toContain(fragment);
+      }
+    }
+    for (const record of twins) {
+      const diagnostic = record.fields[LOG_ERROR_FIELD_KEY];
+      expect(diagnostic).toMatchObject({ type: 'DebuggenError', code: 'CLEANUP_PARTIAL' });
+    }
   });
 });

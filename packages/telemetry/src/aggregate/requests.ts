@@ -80,7 +80,11 @@
  *
  * The join is a function of the events alone: occurrences are considered in
  * canonical order and candidates in start order, so the same capture yields
- * the same pairing however the events arrived.
+ * the same pairing however the events arrived. It is also sub-quadratic —
+ * O((r + c) · log c) for r requests and c resource entries, however many of
+ * them share one URL — because each identity is indexed once and searched by
+ * binary search, skip pointers and a range minimum rather than scanned per
+ * request; the join section below states the algorithm.
  *
  * ## Pending requests
  *
@@ -1201,6 +1205,62 @@ function isRequestEvent(event: TelemetryEvent): boolean {
  * The header states the four rules; this section is their implementation and
  * nothing else. It reads only already-redacted attributes, mints no id, and is
  * a pure function of the event list.
+ *
+ * ## The selection rule
+ *
+ * For each settled occurrence, in canonical order, the join claims the
+ * qualifying unclaimed candidate with the lexicographically smallest
+ * `(initiator rank, |candidate start − occurrence start|, event id)`, and among
+ * candidates equal on all three the one met first — earlier identity, then
+ * earlier position in that identity's `(startTime, eventId)` order. That is
+ * the rule a scan of every candidate applies; what follows reaches the same
+ * answer without the scan.
+ *
+ * ## How it is found: O((r + c) · log c)
+ *
+ * A capture with many requests to one URL — the duplicate-request case this
+ * module exists to report — would make a per-occurrence scan of the URL's
+ * candidates cost O(r · c) for r requests and c entries: the service feeds the
+ * `requests` source up to 50 000 events, and 25 000 requests to one URL
+ * against 25 000 entries measured four to ten seconds of synchronous work on
+ * the service's event loop that way. The join therefore indexes each identity
+ * bucket once:
+ *
+ * - **Sets by transport.** A bucket is split into one set per stated
+ *   `initiator.type` (an unstated type is a set of its own), plus the set of
+ *   every candidate, each kept in the bucket's `(startTime, eventId)` order.
+ *   The initiator rank then selects whole sets instead of testing candidates:
+ *   a request whose transport has a type searches that type's set at rank 0
+ *   and the unstated set at rank 1; one whose transport has none searches the
+ *   unstated set at rank 0 and the set of every candidate at rank 1, which is
+ *   only reached when no rank-0 candidate was found, so every candidate it can
+ *   return is genuinely rank 1. A foreign stated type is never searched, which
+ *   is the rejection {@link eligibleCandidateSets} documents.
+ * - **Binary search for the window.** Within a set, the timing window is the
+ *   contiguous run of positions whose start lies in `[earliest, latest]`, and
+ *   the occurrence's own start splits it into a left half (earlier starts) and
+ *   a right half (the same or later starts). On each half the distance is
+ *   monotonic in position, so the nearest unclaimed candidate on either side
+ *   is the first unclaimed position walking outward from the split.
+ * - **Skip pointers for claims.** "The first unclaimed position at or after
+ *   i" and "the last unclaimed position at or before i" are two union-find
+ *   forests with path compression: claiming a position links it to its
+ *   neighbour, so a run of claimed entries costs amortised O(log c) to cross
+ *   however long it grows, rather than a visit per entry.
+ * - **A range minimum for ties.** Distances are computed in floating point,
+ *   so two distinct starts can round to one distance (a start of `1e-20` and
+ *   one of `2e-20` are both exactly `1` from a start of `1`). The candidates
+ *   tied with the nearest one therefore form a contiguous run found by a
+ *   second binary search — not merely the run sharing its start — and the
+ *   smallest event id among that run's unclaimed members comes from a segment
+ *   tree over event-id ranks in which a claimed position holds no rank.
+ *
+ * Each occurrence costs O(log c) per searched set (at most two per identity,
+ * at most two identities) and each claim O(log c) per set holding the
+ * candidate, so the join is O((r + c) · log c) overall, plus the sort that
+ * orders each bucket. Search structures are built only for a set some
+ * occurrence actually searches, which is what keeps the scripts, images and
+ * stylesheets no request names from costing more than their sort.
  * ---------------------------------------------------------------------------
  */
 
@@ -1225,7 +1285,7 @@ const XHR_KIND: TelemetryKind = 'xhr';
  *
  * Hosts agree on these two spellings, so a *stated* type that is neither of
  * them describes a different load of the same URL — a `<link rel="preload">`,
- * a `<script>`, an image — and {@link rankCandidate} rejects it outright
+ * a `<script>`, an image — and {@link eligibleCandidateSets} rejects it outright
  * rather than accepting it as a last resort: attributing a preload's bytes to
  * a fetch is a wrong number, which is worse than the honest absence AAP 0.6.6
  * provides for. An entry that states **no** type is still eligible, because a
@@ -1239,14 +1299,14 @@ const RESOURCE_INITIATOR_TYPE_BY_KIND: ReadonlyMap<TelemetryKind, string> = new 
 ]);
 
 /**
- * One resource-timing entry offered to the join.
+ * One resource-timing entry offered to the join, as read from its event.
  *
  * Only entries that measured something are collected: an entry with no
  * readable URL cannot be matched and an entry with no exposed bytes has
  * nothing to contribute, so admitting either would only let it be claimed —
  * and a claim's purpose is to stop a *measured* response being counted twice.
  */
-interface ResourceTimingCandidate {
+interface ResourceTimingEntry {
   /** The event the entry arrived as. */
   readonly eventId: EventId;
   /** The entry's URL, already redacted: the join's identity. */
@@ -1257,9 +1317,99 @@ interface ResourceTimingCandidate {
   readonly initiatorType: string | undefined;
   /** The measured bytes; always present by construction. */
   readonly bytes: number;
-  /** Set once the entry has been attributed to an occurrence. */
+}
+
+/**
+ * A resource entry placed in its identity bucket, with the two positions the
+ * search structures address it by.
+ */
+interface ResourceTimingCandidate extends ResourceTimingEntry {
+  /**
+   * Position in the bucket's `(startTime, eventId)` order, which is also its
+   * position in {@link ResourceTimingBucket.everyCandidate}. The selection
+   * rule's last tie-break, after identity order.
+   */
+  readonly bucketIndex: number;
+  /** Position in the bucket's set for this candidate's stated initiator type. */
+  readonly initiatorTypeIndex: number;
+  /**
+   * Set once the entry has been attributed to an occurrence; never cleared.
+   * The flag is the truth a lazily built search index starts from, while each
+   * built index mirrors it in its own skip pointers and rank tree.
+   */
   claimed: boolean;
 }
+
+/**
+ * The search structures over one {@link CandidateSet}, built on first use.
+ *
+ * Typed arrays rather than object graphs: every field is a flat column
+ * addressed by position, which is what makes the binary searches, the
+ * union-find walks and the tree updates allocation-free.
+ */
+interface CandidateSearchIndex {
+  /** Each member's start, by position: the key every binary search reads. */
+  readonly startTimes: Float64Array;
+  /**
+   * The "first unclaimed position at or after i" forest: slot `i` is position
+   * `i`, and slot `members.length` is the always-unclaimed sentinel meaning
+   * "none". A claimed position points at its successor.
+   */
+  readonly nextParents: Int32Array;
+  /**
+   * The "last unclaimed position at or before i" forest, shifted by one so the
+   * sentinel can sit at slot 0: slot `i + 1` is position `i`, and a claimed
+   * position points at its predecessor's slot.
+   */
+  readonly previousParents: Int32Array;
+  /**
+   * The member holding each event-id rank. Ranks order positions by event id,
+   * then by position, so the smallest rank in a range is exactly the member
+   * the selection rule prefers among equally distant candidates.
+   */
+  readonly positionsByRank: Int32Array;
+  /**
+   * A bottom-up segment tree of the minimum rank per subtree: leaf
+   * `leafCount + i` holds position `i`'s rank, or
+   * {@link UNAVAILABLE_RANK} once that position is claimed.
+   */
+  readonly minRankTree: Int32Array;
+  /** The number of leaves: the smallest power of two covering every member. */
+  readonly leafCount: number;
+}
+
+/** Some of one bucket's candidates, in bucket order, with their search index. */
+interface CandidateSet {
+  /** Members in ascending `(startTime, eventId)` order. */
+  readonly members: readonly ResourceTimingCandidate[];
+  /** Built by the first search that reaches this set; `undefined` until then. */
+  search: CandidateSearchIndex | undefined;
+}
+
+/**
+ * Every candidate that shares one identity, viewed the two ways the initiator
+ * rank needs: all together, and split by stated `initiator.type`.
+ *
+ * A candidate belongs to {@link everyCandidate} and to exactly one set of
+ * {@link byInitiatorType}; claiming it withdraws it from both.
+ */
+interface ResourceTimingBucket {
+  /** Every candidate of the identity. */
+  readonly everyCandidate: CandidateSet;
+  /**
+   * The candidates of each stated `initiator.type`; the `undefined` key holds
+   * those that stated none.
+   */
+  readonly byInitiatorType: ReadonlyMap<string | undefined, CandidateSet>;
+}
+
+/**
+ * The rank a claimed position holds in {@link CandidateSearchIndex.minRankTree}.
+ *
+ * Larger than any real rank, since a set never holds 2³¹ − 1 members, so a
+ * range minimum equal to it means the range holds nothing unclaimed.
+ */
+const UNAVAILABLE_RANK = 0x7fffffff;
 
 /** Whether an event is a resource load this join can read. */
 function isResourceTimingEvent(event: TelemetryEvent): boolean {
@@ -1277,17 +1427,64 @@ function isResourceTimingEvent(event: TelemetryEvent): boolean {
   return entryType === undefined || entryType === RESOURCE_ENTRY_TYPE;
 }
 
+/** Bucket order: start time, then event id; the sort is stable beyond that. */
+function compareResourceTimingEntries(
+  left: ResourceTimingEntry,
+  right: ResourceTimingEntry,
+): number {
+  if (left.startTime !== right.startTime) {
+    return left.startTime < right.startTime ? -1 : 1;
+  }
+  return compareStrings(left.eventId, right.eventId);
+}
+
+/**
+ * Place one identity's sorted entries into a bucket: the set of every
+ * candidate and one set per stated initiator type, all in bucket order.
+ *
+ * Only the member lists are built here, in one linear pass; the search index
+ * of each set waits for the first occurrence that searches it.
+ */
+function createResourceTimingBucket(sorted: readonly ResourceTimingEntry[]): ResourceTimingBucket {
+  const every: ResourceTimingCandidate[] = [];
+  const membersByType = new Map<string | undefined, ResourceTimingCandidate[]>();
+
+  for (const [bucketIndex, entry] of sorted.entries()) {
+    let typed = membersByType.get(entry.initiatorType);
+    if (typed === undefined) {
+      typed = [];
+      membersByType.set(entry.initiatorType, typed);
+    }
+    const candidate: ResourceTimingCandidate = {
+      ...entry,
+      bucketIndex,
+      initiatorTypeIndex: typed.length,
+      claimed: false,
+    };
+    typed.push(candidate);
+    every.push(candidate);
+  }
+
+  const byInitiatorType = new Map<string | undefined, CandidateSet>();
+  for (const [initiatorType, members] of membersByType) {
+    byInitiatorType.set(initiatorType, { members, search: undefined });
+  }
+  return { everyCandidate: { members: every, search: undefined }, byInitiatorType };
+}
+
 /**
  * Index the capture's resource entries by identity.
  *
- * Each bucket is sorted by start time, then by event id, so the candidate a
- * given occurrence sees first does not depend on the order the events arrived
- * in.
+ * Each bucket is sorted by start time, then by event id — stably, so entries
+ * equal on both keep their arrival order — and every position the join
+ * addresses is taken from that order, so the candidate a given occurrence
+ * sees first does not depend on the order the events arrived in beyond what
+ * the two keys cannot tell apart.
  */
 function collectResourceTimings(
   events: readonly TelemetryEvent[],
-): Map<string, ResourceTimingCandidate[]> {
-  const byUrl = new Map<string, ResourceTimingCandidate[]>();
+): Map<string, ResourceTimingBucket> {
+  const entriesByUrl = new Map<string, ResourceTimingEntry[]>();
 
   for (const event of events) {
     if (!isResourceTimingEvent(event)) {
@@ -1302,33 +1499,28 @@ function collectResourceTimings(
       continue;
     }
 
-    const candidate: ResourceTimingCandidate = {
+    const entry: ResourceTimingEntry = {
       eventId: event.id,
       url,
       startTime: finiteOrZero(event.startTime),
       initiatorType: readNonBlankString(event, INITIATOR_TYPE_ATTRIBUTE),
       bytes,
-      claimed: false,
     };
 
-    const bucket = byUrl.get(url);
-    if (bucket === undefined) {
-      byUrl.set(url, [candidate]);
+    const entries = entriesByUrl.get(url);
+    if (entries === undefined) {
+      entriesByUrl.set(url, [entry]);
       continue;
     }
-    bucket.push(candidate);
+    entries.push(entry);
   }
 
-  for (const bucket of byUrl.values()) {
-    bucket.sort((left, right) => {
-      if (left.startTime !== right.startTime) {
-        return left.startTime < right.startTime ? -1 : 1;
-      }
-      return compareStrings(left.eventId, right.eventId);
-    });
+  const buckets = new Map<string, ResourceTimingBucket>();
+  for (const [url, entries] of entriesByUrl) {
+    entries.sort(compareResourceTimingEntries);
+    buckets.set(url, createResourceTimingBucket(entries));
   }
-
-  return byUrl;
+  return buckets;
 }
 
 /**
@@ -1353,36 +1545,436 @@ function resourceIdentitiesOf(event: TelemetryEvent, url: string | undefined): s
   return identities;
 }
 
+/** A set of one bucket that an occurrence may claim from, at the rank it confers. */
+interface EligibleCandidateSet {
+  /** The initiator rank every member of {@link set} has for the occurrence; lower wins. */
+  readonly initiatorRank: number;
+  /** The candidates concerned. */
+  readonly set: CandidateSet;
+}
+
 /**
- * How good a match a candidate is for an occurrence, or `undefined` when it is
- * not a match at all: lower sorts first.
+ * The sets of one bucket an occurrence may claim from, best rank first.
  *
  * The initiator type decides eligibility before it decides order. A candidate
  * that states a type the request's transport never produces is **rejected** —
  * it is a different load of the same URL, and crediting its bytes to this
  * request would publish a wrong number where AAP 0.6.6 provides for an honest
- * absence. A candidate whose type matches outranks one that states none, which
- * is what keeps a `<link rel="preload">`-free page from having its fetch
- * matched to an unlabelled entry when its own labelled entry is present.
- * Within a rank the closest start wins, which is the only ordering that
- * behaves correctly when a page issues the same request twice in quick
- * succession.
+ * absence — so its set is simply never offered. A candidate whose type
+ * matches outranks one that states none, which is what keeps a
+ * `<link rel="preload">`-free page from having its fetch matched to an
+ * unlabelled entry when its own labelled entry is present. Within a rank the
+ * closest start wins, which is the only ordering that behaves correctly when
+ * a page issues the same request twice in quick succession.
+ *
+ * Stated as sets rather than as a per-candidate test, the rule is:
+ *
+ * - transport type `E` known: the `E` set at rank 0, the unstated set at
+ *   rank 1, every other stated type rejected;
+ * - transport type unknown: the unstated set at rank 0 (its type equals the
+ *   expected one, both being absent) and every stated type at rank 1, offered
+ *   as the set of every candidate. The caller searches that set only while no
+ *   rank-0 candidate has been found, and a rank-0 search of this same bucket
+ *   finding nothing means none of its unclaimed candidates in the window is
+ *   unstated, so whatever the set of every candidate returns is a stated type.
  */
-function rankCandidate(
-  candidate: ResourceTimingCandidate,
+function eligibleCandidateSets(
+  bucket: ResourceTimingBucket,
   expectedInitiatorType: string | undefined,
-  occurrenceStartTime: number,
-): readonly [number, number] | undefined {
-  if (
-    expectedInitiatorType !== undefined &&
-    candidate.initiatorType !== undefined &&
-    candidate.initiatorType !== expectedInitiatorType
-  ) {
-    return undefined;
+): readonly EligibleCandidateSet[] {
+  const eligible: EligibleCandidateSet[] = [];
+  const unstated = bucket.byInitiatorType.get(undefined);
+
+  if (expectedInitiatorType === undefined) {
+    if (unstated !== undefined) {
+      eligible.push({ initiatorRank: 0, set: unstated });
+    }
+    eligible.push({ initiatorRank: 1, set: bucket.everyCandidate });
+    return eligible;
   }
 
-  const initiatorRank = candidate.initiatorType === expectedInitiatorType ? 0 : 1;
-  return [initiatorRank, Math.abs(candidate.startTime - occurrenceStartTime)];
+  const matching = bucket.byInitiatorType.get(expectedInitiatorType);
+  if (matching !== undefined) {
+    eligible.push({ initiatorRank: 0, set: matching });
+  }
+  if (unstated !== undefined) {
+    eligible.push({ initiatorRank: 1, set: unstated });
+  }
+  return eligible;
+}
+
+/**
+ * How far a candidate started from the occurrence, in milliseconds.
+ *
+ * The one distance formula of the join — `|candidate − occurrence|`, in that
+ * operand order — used for ranking, for the binary searches and for ties
+ * alike, so no two readings of "equally close" can disagree by a rounding.
+ */
+function startDistance(candidateStartTime: number, occurrenceStartTime: number): number {
+  return Math.abs(candidateStartTime - occurrenceStartTime);
+}
+
+/**
+ * An element of a typed column at a position the caller derived from that
+ * column's own length.
+ *
+ * `noUncheckedIndexedAccess` types every indexed read as possibly
+ * `undefined`. The join never reads out of range, so `fallback` is never
+ * observed; it keeps each read total without an assertion.
+ */
+function slotAt(column: Int32Array | Float64Array, position: number, fallback: number): number {
+  return column[position] ?? fallback;
+}
+
+/** The first position in `[from, to)` whose start is at or after `value`; `to` when none is. */
+function firstStartAtOrAfter(
+  startTimes: Float64Array,
+  value: number,
+  from: number,
+  to: number,
+): number {
+  let low = from;
+  let high = to;
+  while (low < high) {
+    const middle = low + Math.floor((high - low) / 2);
+    if (slotAt(startTimes, middle, value) < value) {
+      low = middle + 1;
+    } else {
+      high = middle;
+    }
+  }
+  return low;
+}
+
+/** The first position in `[from, to)` whose start is after `value`; `to` when none is. */
+function firstStartAfter(
+  startTimes: Float64Array,
+  value: number,
+  from: number,
+  to: number,
+): number {
+  let low = from;
+  let high = to;
+  while (low < high) {
+    const middle = low + Math.floor((high - low) / 2);
+    if (slotAt(startTimes, middle, value) <= value) {
+      low = middle + 1;
+    } else {
+      high = middle;
+    }
+  }
+  return low;
+}
+
+/**
+ * The first position in `[from, to]` no further than `distance` from `origin`,
+ * where distance does not increase along the range and `to` qualifies.
+ */
+function firstWithinDistance(
+  startTimes: Float64Array,
+  origin: number,
+  distance: number,
+  from: number,
+  to: number,
+): number {
+  let low = from;
+  let high = to;
+  while (low < high) {
+    const middle = low + Math.floor((high - low) / 2);
+    if (startDistance(slotAt(startTimes, middle, origin), origin) <= distance) {
+      high = middle;
+    } else {
+      low = middle + 1;
+    }
+  }
+  return high;
+}
+
+/**
+ * The last position in `[from, to]` no further than `distance` from `origin`,
+ * where distance does not decrease along the range and `from` qualifies.
+ */
+function lastWithinDistance(
+  startTimes: Float64Array,
+  origin: number,
+  distance: number,
+  from: number,
+  to: number,
+): number {
+  let low = from;
+  let high = to;
+  while (low < high) {
+    const middle = low + Math.ceil((high - low) / 2);
+    if (startDistance(slotAt(startTimes, middle, origin), origin) <= distance) {
+      low = middle;
+    } else {
+      high = middle - 1;
+    }
+  }
+  return low;
+}
+
+/**
+ * The root of `slot` in a skip forest, compressing the path walked.
+ *
+ * A root is a slot that is its own parent: an unclaimed position, or the
+ * sentinel. Pointing every visited slot straight at the root is what keeps a
+ * long run of claimed positions from being walked twice.
+ */
+function findRoot(parents: Int32Array, slot: number): number {
+  let root = slot;
+  let parent = slotAt(parents, root, root);
+  while (parent !== root) {
+    root = parent;
+    parent = slotAt(parents, root, root);
+  }
+
+  let node = slot;
+  while (node !== root) {
+    const next = slotAt(parents, node, root);
+    parents[node] = root;
+    node = next;
+  }
+  return root;
+}
+
+/** The first unclaimed position at or after `position`; the member count when there is none. */
+function nextUnclaimed(search: CandidateSearchIndex, position: number): number {
+  return findRoot(search.nextParents, position);
+}
+
+/** The last unclaimed position at or before `position`; `-1` when there is none. */
+function previousUnclaimed(search: CandidateSearchIndex, position: number): number {
+  return findRoot(search.previousParents, position + 1) - 1;
+}
+
+/** Recompute the tree ancestors of `node` after its value changed. */
+function refreshMinRankAncestors(tree: Int32Array, node: number): void {
+  let parent = Math.floor(node / 2);
+  while (parent >= 1) {
+    tree[parent] = Math.min(
+      slotAt(tree, 2 * parent, UNAVAILABLE_RANK),
+      slotAt(tree, 2 * parent + 1, UNAVAILABLE_RANK),
+    );
+    parent = Math.floor(parent / 2);
+  }
+}
+
+/**
+ * Withdraw a claimed position from one search index: link it out of both
+ * skip forests and give its leaf no rank.
+ */
+function withdrawPosition(search: CandidateSearchIndex, position: number): void {
+  search.nextParents[position] = position + 1;
+  search.previousParents[position + 1] = position;
+  const leaf = search.leafCount + position;
+  search.minRankTree[leaf] = UNAVAILABLE_RANK;
+  refreshMinRankAncestors(search.minRankTree, leaf);
+}
+
+/**
+ * Build the search index of a set's members.
+ *
+ * O(m log m) for the event-id ranking and O(m) for everything else. A member
+ * already claimed through the bucket's other set is withdrawn as its leaf is
+ * written, so an index built late agrees with one built at the start.
+ */
+function buildCandidateSearchIndex(
+  members: readonly ResourceTimingCandidate[],
+): CandidateSearchIndex {
+  const count = members.length;
+  let leafCount = 1;
+  while (leafCount < count) {
+    leafCount *= 2;
+  }
+
+  const startTimes = new Float64Array(count);
+  const nextParents = new Int32Array(count + 1);
+  const previousParents = new Int32Array(count + 1);
+  const positionsByRank = new Int32Array(count);
+  const minRankTree = new Int32Array(2 * leafCount).fill(UNAVAILABLE_RANK);
+
+  for (let slot = 0; slot <= count; slot += 1) {
+    nextParents[slot] = slot;
+    previousParents[slot] = slot;
+  }
+
+  const byEventId = members
+    .map((member, position) => ({ eventId: member.eventId, position }))
+    .sort((left, right) => {
+      const order = compareStrings(left.eventId, right.eventId);
+      return order !== 0 ? order : left.position - right.position;
+    });
+
+  for (const [rank, { position }] of byEventId.entries()) {
+    positionsByRank[rank] = position;
+    minRankTree[leafCount + position] = rank;
+  }
+  for (const [position, member] of members.entries()) {
+    startTimes[position] = member.startTime;
+    if (member.claimed) {
+      nextParents[position] = position + 1;
+      previousParents[position + 1] = position;
+      minRankTree[leafCount + position] = UNAVAILABLE_RANK;
+    }
+  }
+  for (let node = leafCount - 1; node >= 1; node -= 1) {
+    minRankTree[node] = Math.min(
+      slotAt(minRankTree, 2 * node, UNAVAILABLE_RANK),
+      slotAt(minRankTree, 2 * node + 1, UNAVAILABLE_RANK),
+    );
+  }
+
+  return { startTimes, nextParents, previousParents, positionsByRank, minRankTree, leafCount };
+}
+
+/** A set's search index, building it on the first search that needs it. */
+function searchIndexOf(set: CandidateSet): CandidateSearchIndex {
+  if (set.search === undefined) {
+    set.search = buildCandidateSearchIndex(set.members);
+  }
+  return set.search;
+}
+
+/**
+ * The unclaimed member of `[from, to]` with the smallest event id — the
+ * smallest position among equal ids — or `undefined` when all are claimed.
+ */
+function lowestRankedBetween(
+  set: CandidateSet,
+  search: CandidateSearchIndex,
+  from: number,
+  to: number,
+): ResourceTimingCandidate | undefined {
+  const tree = search.minRankTree;
+  let rank = UNAVAILABLE_RANK;
+  let left = from + search.leafCount;
+  let right = to + search.leafCount + 1;
+  while (left < right) {
+    if (left % 2 === 1) {
+      rank = Math.min(rank, slotAt(tree, left, UNAVAILABLE_RANK));
+      left += 1;
+    }
+    if (right % 2 === 1) {
+      right -= 1;
+      rank = Math.min(rank, slotAt(tree, right, UNAVAILABLE_RANK));
+    }
+    left = Math.floor(left / 2);
+    right = Math.floor(right / 2);
+  }
+
+  if (rank === UNAVAILABLE_RANK) {
+    return undefined;
+  }
+  return set.members[slotAt(search.positionsByRank, rank, -1)];
+}
+
+/** The best candidate one set holds for an occurrence, with its distance. */
+interface CandidateMatch {
+  readonly candidate: ResourceTimingCandidate;
+  readonly distance: number;
+}
+
+/** Whether `candidate` beats `current` inside one set: distance, event id, then position. */
+function isBetterMatchInSet(candidate: CandidateMatch, current: CandidateMatch): boolean {
+  if (candidate.distance !== current.distance) {
+    return candidate.distance < current.distance;
+  }
+  const byEventId = compareStrings(candidate.candidate.eventId, current.candidate.eventId);
+  if (byEventId !== 0) {
+    return byEventId < 0;
+  }
+  return candidate.candidate.bucketIndex < current.candidate.bucketIndex;
+}
+
+/**
+ * The time window a candidate must have started in, and the start it is
+ * measured from.
+ */
+interface ClaimWindow {
+  /** The occurrence's start minus the tolerance: the earliest admissible start. */
+  readonly earliest: number;
+  /** The occurrence's end plus the tolerance: the latest admissible start. */
+  readonly latest: number;
+  /** The occurrence's start, from which every distance is measured. */
+  readonly origin: number;
+}
+
+/**
+ * The best unclaimed member of one set inside the window — nearest start,
+ * then smallest event id, then earliest position — or `undefined`.
+ *
+ * The window is the position run `[first, last]`, split at `pivot`, the first
+ * position starting at or after the origin. Right of the split the distance
+ * never decreases with position, left of it it never increases, so on each
+ * side the nearest unclaimed member is the first one met walking outward,
+ * and every member tied with it lies in one contiguous run that a binary
+ * search bounds. The tree then names the tied run's smallest event id.
+ * O(log m).
+ */
+function bestMatchInSet(set: CandidateSet, claimWindow: ClaimWindow): CandidateMatch | undefined {
+  const count = set.members.length;
+  if (count === 0) {
+    return undefined;
+  }
+  const search = searchIndexOf(set);
+  const { startTimes } = search;
+  const { origin } = claimWindow;
+
+  const first = firstStartAtOrAfter(startTimes, claimWindow.earliest, 0, count);
+  const last = firstStartAfter(startTimes, claimWindow.latest, first, count) - 1;
+  if (first > last) {
+    return undefined;
+  }
+  // Searching inside [first, last + 1) clamps the split to the window.
+  const pivot = firstStartAtOrAfter(startTimes, origin, first, last + 1);
+
+  let best: CandidateMatch | undefined;
+
+  if (pivot <= last) {
+    const nearest = nextUnclaimed(search, pivot);
+    if (nearest <= last) {
+      const distance = startDistance(slotAt(startTimes, nearest, origin), origin);
+      const tiedTo = lastWithinDistance(startTimes, origin, distance, nearest, last);
+      const candidate = lowestRankedBetween(set, search, nearest, tiedTo);
+      if (candidate !== undefined) {
+        best = { candidate, distance };
+      }
+    }
+  }
+
+  if (pivot > first) {
+    const nearest = previousUnclaimed(search, pivot - 1);
+    if (nearest >= first) {
+      const distance = startDistance(slotAt(startTimes, nearest, origin), origin);
+      const tiedFrom = firstWithinDistance(startTimes, origin, distance, first, nearest);
+      const candidate = lowestRankedBetween(set, search, tiedFrom, nearest);
+      if (candidate !== undefined) {
+        const match: CandidateMatch = { candidate, distance };
+        if (best === undefined || isBetterMatchInSet(match, best)) {
+          best = match;
+        }
+      }
+    }
+  }
+
+  return best;
+}
+
+/**
+ * Mark a candidate claimed and withdraw it from every built index that holds
+ * it: the bucket's set of every candidate and the set of its stated type.
+ */
+function markClaimed(bucket: ResourceTimingBucket, candidate: ResourceTimingCandidate): void {
+  candidate.claimed = true;
+  const everySearch = bucket.everyCandidate.search;
+  if (everySearch !== undefined) {
+    withdrawPosition(everySearch, candidate.bucketIndex);
+  }
+  const typedSearch = bucket.byInitiatorType.get(candidate.initiatorType)?.search;
+  if (typedSearch !== undefined) {
+    withdrawPosition(typedSearch, candidate.initiatorTypeIndex);
+  }
 }
 
 /**
@@ -1392,14 +1984,17 @@ function rankCandidate(
  * one of the occurrence's identity buckets, must have started no earlier than
  * the occurrence's start minus the tolerance and no later than its end plus
  * the tolerance, and must not state an `initiator.type` this transport never
- * produces ({@link rankCandidate} rejects that one outright). Among the
- * qualifying entries the best rank wins, ties broken by event id so the choice
- * is total.
+ * produces ({@link eligibleCandidateSets} never offers that one). Among the
+ * qualifying entries the smallest `(initiator rank, distance, event id)`
+ * wins, and among entries equal on all three the one in the earlier identity,
+ * then at the earlier bucket position, so the choice is total. The section
+ * header states how that is found in O(log c) per searched set.
  *
- * Claiming mutates only this module's own candidate records, never an event.
+ * Claiming mutates only this module's own candidate records and search
+ * indexes, never an event.
  */
 function claimResourceTiming(
-  byUrl: Map<string, ResourceTimingCandidate[]>,
+  buckets: ReadonlyMap<string, ResourceTimingBucket>,
   identities: readonly string[],
   kind: TelemetryKind,
   startTime: number,
@@ -1407,50 +2002,53 @@ function claimResourceTiming(
   toleranceMs: number,
 ): ResourceTimingCandidate | undefined {
   const expectedInitiatorType = RESOURCE_INITIATOR_TYPE_BY_KIND.get(kind);
-  const earliest = startTime - toleranceMs;
-  const latest = endTime + toleranceMs;
+  const claimWindow: ClaimWindow = {
+    earliest: startTime - toleranceMs,
+    latest: endTime + toleranceMs,
+    origin: startTime,
+  };
 
-  let best: ResourceTimingCandidate | undefined;
-  let bestRank: readonly [number, number] | undefined;
+  let best: (CandidateMatch & { readonly initiatorRank: number }) | undefined;
+  let bestBucket: ResourceTimingBucket | undefined;
 
   for (const identity of identities) {
-    const bucket = byUrl.get(identity);
+    const bucket = buckets.get(identity);
     if (bucket === undefined) {
       continue;
     }
 
-    for (const candidate of bucket) {
-      if (candidate.claimed) {
+    for (const { initiatorRank, set } of eligibleCandidateSets(bucket, expectedInitiatorType)) {
+      // A worse rank can never win, so its set is not searched at all; this is
+      // also what keeps the set of every candidate from answering at rank 1
+      // for a candidate the rank-0 search already found.
+      if (best !== undefined && best.initiatorRank < initiatorRank) {
         continue;
       }
-      if (candidate.startTime < earliest || candidate.startTime > latest) {
+      const match = bestMatchInSet(set, claimWindow);
+      if (match === undefined) {
         continue;
       }
-
-      const rank = rankCandidate(candidate, expectedInitiatorType, startTime);
-      if (rank === undefined) {
-        continue;
-      }
+      // Strictly better only: a tie on rank, distance and event id keeps the
+      // match from the earlier identity, which was searched first.
       if (
-        bestRank === undefined ||
-        rank[0] < bestRank[0] ||
-        (rank[0] === bestRank[0] && rank[1] < bestRank[1]) ||
-        (rank[0] === bestRank[0] &&
-          rank[1] === bestRank[1] &&
-          best !== undefined &&
-          compareStrings(candidate.eventId, best.eventId) < 0)
+        best === undefined ||
+        initiatorRank < best.initiatorRank ||
+        (initiatorRank === best.initiatorRank && match.distance < best.distance) ||
+        (initiatorRank === best.initiatorRank &&
+          match.distance === best.distance &&
+          compareStrings(match.candidate.eventId, best.candidate.eventId) < 0)
       ) {
-        best = candidate;
-        bestRank = rank;
+        best = { ...match, initiatorRank };
+        bestBucket = bucket;
       }
     }
   }
 
-  if (best === undefined) {
+  if (best === undefined || bestBucket === undefined) {
     return undefined;
   }
-  best.claimed = true;
-  return best;
+  markClaimed(bestBucket, best.candidate);
+  return best.candidate;
 }
 
 /**
@@ -1591,7 +2189,7 @@ function supersedeInFlightSnapshots(
  */
 function resolveOccurrenceTransfer(
   unjoined: UnjoinedOccurrence,
-  byUrl: Map<string, ResourceTimingCandidate[]>,
+  buckets: ReadonlyMap<string, ResourceTimingBucket>,
   toleranceMs: number,
 ): RequestOccurrence {
   if (unjoined.base.pending === true) {
@@ -1602,7 +2200,7 @@ function resolveOccurrenceTransfer(
     unjoined.identities.length === 0
       ? undefined
       : claimResourceTiming(
-          byUrl,
+          buckets,
           unjoined.identities,
           unjoined.base.kind,
           unjoined.base.startTime,

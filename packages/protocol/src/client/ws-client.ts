@@ -83,8 +83,18 @@
  * `apps/chrome-extension/src/background/ws-bridge.ts`, which is the only
  * consumer that has an alarms API; nothing here starts a repeating timer. The
  * only timers it starts at all are one-shot and owned by the attempt they
- * serve — the reconnect delay, and the deadline on an asynchronous credential
- * read — and every path that ends an attempt clears both.
+ * serve — the reconnect delay, the opening deadline of a socket that has not
+ * reached `open` yet ({@link DEFAULT_WS_OPEN_TIMEOUT_MS}), and the deadline on
+ * an asynchronous credential read — and every path that ends an attempt clears
+ * all three.
+ *
+ * The opening deadline is what keeps "connecting" a bounded state. A service
+ * that accepts the TCP connection but never completes the upgrade — its event
+ * loop blocked, the process stopped under a debugger, a proxy holding the
+ * request — would otherwise leave the socket in `CONNECTING` indefinitely, with
+ * no `close` event to put the attempt on the backoff curve. On expiry the
+ * socket is retired exactly like one that closed before its hello, and the
+ * retry is scheduled on the same jittered curve.
  *
  * ## Consumed through the barrel, and coupled to one thing
  *
@@ -197,11 +207,35 @@ const REFUSED_CREDENTIAL_REASON = 'the service refused this credential';
 /** The reason a socket that could not even be created reports. */
 const SOCKET_OPEN_FAILED_REASON = 'the socket could not be opened';
 
+/**
+ * The reason a socket that did not reach `open` within the opening deadline
+ * reports — as the close reason sent to the socket, and as the reason of the
+ * `reconnecting` transition that follows.
+ *
+ * Constant, like every other reason here: it names what happened, never the
+ * URL the socket was opened against.
+ */
+const OPEN_TIMEOUT_REASON = 'the socket did not open in time';
+
+/** The failure reported through `onProtocolError` when that deadline expires. */
+const OPEN_TIMEOUT_MESSAGE = 'The connection to the local service did not open in time';
+
+/** Its hint: the client is already retrying, so the remedy is the service. */
+const OPEN_TIMEOUT_HINT =
+  'Check that the local service is running and answering on its loopback address; the client keeps retrying on its backoff curve.';
+
 /** The reason a socket that died before its hello frame reports. */
 const HELLO_WRITE_FAILED_REASON = 'the connection closed before the handshake was sent';
 
 /** The reason a client with an unusable identity reports as it closes. */
 const INVALID_HELLO_REASON = 'this client could not assemble a valid handshake';
+
+/**
+ * The close reason sent to the socket {@link ReconnectingWsClient.setUrl}
+ * retires because the configured service URL changed. It reaches the service's
+ * log, and names neither the old URL nor the new one.
+ */
+const ENDPOINT_CHANGED_REASON = 'the configured service URL changed';
 
 /**
  * The reason reported, as the client stays `closed`, when `connect()` was called
@@ -467,6 +501,9 @@ export type GlobalWebSocketIsWebSocketConstructorLike = AssertTrue<
  * There is deliberately no `setInterval`: the MV3 keepalive of AAP §0.5.5 is the
  * Chrome extension's `chrome.alarms` job, and a repeating timer here would
  * duplicate it in a package that cannot see whether it is running in a worker.
+ * Three one-shot timers run on this pair: the reconnect delay, the opening
+ * deadline ({@link ReconnectingWsClientOptions.openTimeoutMs}) and the
+ * credential deadline ({@link CLIENT_HELLO_TIMEOUT_MS}).
  */
 export interface TimerApi {
   /** Schedules `handler` after `ms` milliseconds; answers an opaque handle. */
@@ -679,6 +716,28 @@ export const DEFAULT_WS_BACKOFF: WsBackoff = Object.freeze({
 export const DEFAULT_MAX_QUEUED_MESSAGES = 200;
 
 /**
+ * How long a socket may take to reach its `open` event before the attempt is
+ * abandoned and retried on the curve: five seconds.
+ *
+ * The socket's opening is a TCP connect and an HTTP upgrade to a service on
+ * this machine's loopback interface, which a healthy service completes in
+ * milliseconds. Five seconds leaves room for a service that is busy — indexing
+ * a project, running a model stage on the same event loop — while keeping the
+ * `connecting` state short enough that the pill a developer is looking at moves
+ * on to "Reconnecting…" and the backoff curve takes over, and it is well inside
+ * the roughly thirty-second idle window of an MV3 service worker (AAP §0.5.5).
+ *
+ * The value is deliberately none of the other numbers this client schedules —
+ * the curve's 500 … 10 000 ms delays and the {@link CLIENT_HELLO_TIMEOUT_MS}
+ * of three seconds — so a test that reads a scheduled timer's delay can tell
+ * which of the three timers it is looking at.
+ *
+ * Overridable per client through
+ * {@link ReconnectingWsClientOptions.openTimeoutMs}.
+ */
+export const DEFAULT_WS_OPEN_TIMEOUT_MS = 5_000;
+
+/**
  * What {@link ReconnectingWsClient.send} did with a frame.
  *
  * `'sent'` means it was written to an open socket; `'queued'` means it is held
@@ -753,7 +812,10 @@ export interface ReconnectingWsClientOptions {
    * same `ws(s)://<loopback host[:port]>/ws` in
    * {@link ReconnectingWsClient.url}, and the path and the scheme mapping are
    * decided in one place (AAP §0.3.4 puts the host and port in the environment,
-   * which is what lets a second service instance run on another port).
+   * which is what lets a second service instance run on another port). A
+   * consumer whose configuration changes at run time — the Chrome extension's
+   * stored service address — replaces it with
+   * {@link ReconnectingWsClient.setUrl}, which applies the same validation.
    *
    * ⚠️ Loopback only. The first frame on this socket carries the bearer
    * credential and the project root, so a value naming any host other than this
@@ -800,6 +862,26 @@ export interface ReconnectingWsClientOptions {
    * handed over while the socket is down is dropped and reported.
    */
   readonly maxQueuedMessages?: number | undefined;
+
+  /**
+   * How long each socket may take to reach its `open` event, in milliseconds.
+   * Defaults to {@link DEFAULT_WS_OPEN_TIMEOUT_MS}; a value that is not a
+   * finite number above zero also means the default, because a deadline of
+   * zero or less would abandon every socket before it could open and a
+   * non-finite one would never fire at all.
+   *
+   * The deadline runs on {@link ReconnectingWsClientOptions.timers}, from the
+   * moment the socket is constructed until its `open` event, and is cleared by
+   * every path that ends the attempt first — `close()`, the socket's own close
+   * event, a replacement socket and a refusal. On expiry the socket loses its
+   * listeners and is closed with a normal-closure code and a constant reason,
+   * a `TRANSPORT_DISCONNECTED` failure is reported through
+   * {@link onProtocolError}, and the next attempt is scheduled on the backoff
+   * curve. The window after `open` — resolving the credential and writing the
+   * hello frame — is not part of it: that is bounded separately, by
+   * {@link CLIENT_HELLO_TIMEOUT_MS}.
+   */
+  readonly openTimeoutMs?: number | undefined;
 
   /**
    * Where this client's few `debug` records go. Defaults to `noopLogger`, so a
@@ -852,8 +934,9 @@ export interface ReconnectingWsClientOptions {
    * Always a {@link DebuggenError} with a code from the closed vocabulary of
    * `@debuggen/shared`: `PROTOCOL_INVALID_MESSAGE` for a frame this client
    * refused, `TRANSPORT_DISCONNECTED` for a socket that could not be opened or
-   * written, `UNAUTHORIZED` for a credential provider that threw, `INTERNAL` for
-   * a handler that threw, and `CONFIG_INVALID` — the
+   * written or did not open within {@link openTimeoutMs} (with
+   * `details: { timeoutMs }`), `UNAUTHORIZED` for a credential provider that
+   * threw, `INTERNAL` for a handler that threw, and `CONFIG_INVALID` — the
    * {@link ReconnectingWsClient.configurationError} itself — when `connect()`
    * is called on a client whose configured URL was refused. None of them
    * carries the rejected frame, a payload, the configured URL or a credential.
@@ -1064,6 +1147,25 @@ interface CredentialDeadline {
   readonly settle: (outcome: TokenOutcome) => void;
 }
 
+/**
+ * The opening deadline of the one socket that has not reached `open` yet.
+ *
+ * Held on the instance for the reason {@link CredentialDeadline} is: the paths
+ * that end an attempt — `close()`, the socket's close event, a replacement, a
+ * refusal — live elsewhere, and each must be able to clear the timer. The
+ * socket and the generation it was armed for are kept beside the handle so an
+ * expiry can prove it still concerns the current attempt before it retires
+ * anything.
+ */
+interface OpenDeadline {
+  /** The timer that abandons the attempt when it fires. */
+  readonly handle: number;
+  /** The socket the deadline bounds. */
+  readonly socket: WebSocketLike;
+  /** The attempt generation the socket was created under. */
+  readonly generation: number;
+}
+
 // ---------------------------------------------------------------------------
 // Section G — the client
 // ---------------------------------------------------------------------------
@@ -1108,6 +1210,11 @@ interface CredentialDeadline {
  *
  * ## What is terminal and what is not
  *
+ * A socket that has not reached `open` within
+ * {@link ReconnectingWsClientOptions.openTimeoutMs} is a failed attempt, never
+ * a terminal one: it is closed, reported as `TRANSPORT_DISCONNECTED` and
+ * retried on the curve exactly like a socket the service dropped.
+ *
  * A close is retried with the backoff curve of {@link WsBackoff} unless it is
  * one of three things: a {@link WS_CLOSE_UNAUTHORIZED} refusal, a
  * {@link ReconnectingWsClient.close} from the owner, or a credential or identity
@@ -1118,17 +1225,31 @@ interface CredentialDeadline {
  * effect without rebuilding the client.
  *
  * A configured URL that the loopback-only service-origin policy refused is the
- * one state `connect()` cannot resume from, because the URL is fixed at
- * construction: every `connect()` on such a client reports
- * {@link ReconnectingWsClient.configurationError} through
+ * one state `connect()` alone cannot resume from: every `connect()` on such a
+ * client reports {@link ReconnectingWsClient.configurationError} through
  * {@link ReconnectingWsClientOptions.onProtocolError}, stays `closed`, opens no
  * socket, schedules nothing and never calls the credential provider. It is not
  * reported as unauthorized — nothing was refused by the service, and pairing
- * again would not help — so the remedy is a new client built from a corrected
- * URL.
+ * again would not help — so the remedy is a corrected URL, handed over with
+ * {@link ReconnectingWsClient.setUrl} (after which `connect()` works) or used
+ * to build a new client.
+ *
+ * Two owner-driven transitions complete the picture.
+ * {@link ReconnectingWsClient.setUrl} moves a client to another endpoint: an
+ * accepted URL on a client that is connecting, open or reconnecting retires the
+ * current socket and opens one against the new URL at once, while a refused URL
+ * stops it the way a refused configuration always does.
+ * {@link ReconnectingWsClient.restart} is the owner's verdict that a socket the
+ * transport still calls open or connecting is dead — a liveness probe of its
+ * own went unanswered — and puts the attempt on the backoff curve exactly as a
+ * dropped connection would be.
  *
  * The outbound queue is kept across a {@link WS_CLOSE_UNAUTHORIZED} refusal and
- * cleared by an explicit `close()`. That asymmetry is deliberate: a refused credential is a problem the
+ * across {@link ReconnectingWsClient.restart}, and cleared by an explicit
+ * `close()` and by an endpoint change (those frames were addressed to the
+ * previous service, and each is reported through
+ * {@link ReconnectingWsClientOptions.onQueueDrop}). The asymmetry between a
+ * refusal and `close()` is deliberate: a refused credential is a problem the
  * developer is about to fix — pair, rotate, `connect()` — and the frames their
  * actions already produced are worth delivering afterwards, while `close()` is
  * the teardown path (the editor's `deactivate()`, the panel being disposed) and
@@ -1153,17 +1274,18 @@ interface CredentialDeadline {
  */
 export class ReconnectingWsClient {
   /**
-   * The configured URL, validated once at construction by {@link resolveWsUrl}:
-   * the canonical socket URL, or the refusal of the loopback-only
-   * service-origin policy.
+   * The configured URL, validated by {@link resolveWsUrl} at construction and
+   * again by every {@link ReconnectingWsClient.setUrl}: the canonical socket
+   * URL, or the refusal of the loopback-only service-origin policy.
    *
    * One field rather than a URL and an error side by side, so the two public
    * views of it — {@link ReconnectingWsClient.url} and
    * {@link ReconnectingWsClient.configurationError} — cannot disagree, and so
    * {@link ReconnectingWsClient.openSocket} cannot reach a socket constructor
-   * without the type system having seen the check pass.
+   * without the type system having seen the check pass. Mutable for
+   * `setUrl` alone, which replaces it whole.
    */
-  private readonly endpoint: Result<string, DebuggenError>;
+  private endpoint: Result<string, DebuggenError>;
 
   /** The injected socket implementation. */
   private readonly webSocketConstructor: WebSocketConstructorLike;
@@ -1182,6 +1304,9 @@ export class ReconnectingWsClient {
 
   /** The outbound queue's bound, sanitised to a non-negative integer. */
   private readonly maxQueuedMessages: number;
+
+  /** The opening deadline, sanitised to a finite number above zero. */
+  private readonly openTimeoutMs: number;
 
   /** Where this client's `debug` records go. */
   private readonly logger: Logger;
@@ -1257,6 +1382,17 @@ export class ReconnectingWsClient {
    */
   private credentialDeadline: CredentialDeadline | undefined;
 
+  /**
+   * The opening deadline of the socket in flight, while it has not reached
+   * `open`.
+   *
+   * At most one, because at most one socket exists. Armed by
+   * {@link openSocket}, cleared by {@link handleOpen} and by every path that
+   * abandons the socket first through {@link cancelOpenDeadline}, so it never
+   * outlives the socket it bounds.
+   */
+  private openDeadline: OpenDeadline | undefined;
+
   /** Whether the next close must not be retried. */
   private terminal = false;
 
@@ -1287,6 +1423,7 @@ export class ReconnectingWsClient {
     this.protocols = options.protocols;
     this.backoff = resolveBackoff(options.backoff);
     this.maxQueuedMessages = resolveQueueBound(options.maxQueuedMessages);
+    this.openTimeoutMs = resolveOpenTimeout(options.openTimeoutMs);
     this.logger = options.logger ?? noopLogger;
     // Resolved here rather than at module scope, and each member still reads its
     // global at call time, so importing this module performs no environment
@@ -1369,7 +1506,8 @@ export class ReconnectingWsClient {
    * On a client whose configured URL was refused it does none of that: it
    * reports {@link ReconnectingWsClient.configurationError} through
    * {@link ReconnectingWsClientOptions.onProtocolError} and stays `closed`, with
-   * no socket, no timer and no call to the credential provider.
+   * no socket, no timer and no call to the credential provider — until
+   * {@link ReconnectingWsClient.setUrl} supplies a URL the policy accepts.
    */
   connect(): void {
     if (this.connectionState === 'connecting' || this.connectionState === 'open') {
@@ -1408,10 +1546,12 @@ export class ReconnectingWsClient {
     this.terminal = true;
     this.draining = false;
     this.clearReconnectTimer();
-    // A credential still being read belongs to the attempt this call ends: its
-    // deadline timer is cleared now rather than left to fire into a closed
-    // client, and the read's eventual answer is ignored.
+    // A credential still being read, or a socket still opening, belongs to the
+    // attempt this call ends: both deadline timers are cleared now rather than
+    // left to fire into a closed client, and the read's eventual answer is
+    // ignored.
     this.cancelCredentialDeadline();
+    this.cancelOpenDeadline();
     this.queue.length = 0;
     // Invalidate anything still in flight — a pending asynchronous handshake in
     // particular — before the socket goes away.
@@ -1438,6 +1578,132 @@ export class ReconnectingWsClient {
     }
 
     this.setState('closed', buildCloseDetail(code ?? NORMAL_CLOSURE_CODE, reason));
+  }
+
+  /**
+   * Points this client at another service endpoint.
+   *
+   * The value is validated exactly as the constructor's
+   * {@link ReconnectingWsClientOptions.url} is — by {@link resolveWsUrl}, the
+   * loopback-only service-origin policy — and the answer is returned:
+   * `ok(url)` with the canonical socket URL, or the `CONFIG_INVALID` refusal,
+   * which quotes nothing of the value.
+   *
+   * - **Unchanged.** A value that canonicalises to the current socket URL
+   *   changes nothing at all: the socket, the queue and every timer stay as
+   *   they are.
+   * - **Changed.** The endpoint is replaced — so
+   *   {@link ReconnectingWsClient.url} and
+   *   {@link ReconnectingWsClient.configurationError} report the new one — and
+   *   every frame still queued is dropped and reported through
+   *   {@link ReconnectingWsClientOptions.onQueueDrop}, because it was
+   *   addressed to the previous service. Then:
+   *   - on a client that is `connecting`, `open` or `reconnecting`, an accepted
+   *     URL retires the current socket (closed with a normal-closure code and a
+   *     constant reason), cancels every pending timer and opens a socket
+   *     against the new URL at once, with the backoff counter reset; a refused
+   *     URL retires the same things and leaves the client `closed`, reporting
+   *     the refusal through {@link ReconnectingWsClientOptions.onProtocolError}
+   *     as `connect()` on a refused configuration does;
+   *   - on a client that is `closed`, nothing is opened: the next
+   *     {@link ReconnectingWsClient.connect} uses the new endpoint (or reports
+   *     its refusal).
+   *
+   * @param url The service's base URL or socket URL, as the constructor accepts
+   * it. Surrounding whitespace is ignored.
+   * @returns The canonical socket URL, or the policy's refusal.
+   *
+   * @example
+   * ```ts
+   * const applied = client.setUrl(storedServiceAddress);
+   * if (!applied.ok) {
+   *   pill.showMisconfigured(applied.error.hint); // never the refused value
+   * }
+   * ```
+   */
+  setUrl(url: string): Result<string, DebuggenError> {
+    const next = resolveWsUrl(url);
+    const current = this.endpoint;
+
+    if (!isErr(next) && !isErr(current) && next.value === current.value) {
+      return next;
+    }
+
+    this.endpoint = next;
+    const dropped = this.dropQueuedFrames();
+    const wanted = this.connectionState !== 'closed';
+
+    this.logger.debug('websocket endpoint changed', {
+      accepted: !isErr(next),
+      dropped,
+      reconnecting: wanted,
+    });
+
+    if (!wanted) {
+      return next;
+    }
+
+    // Whatever the previous endpoint's attempt holds is let go of first — the
+    // pending delay, both deadlines and the socket, closed with a constant
+    // reason — and anything still in flight for it is invalidated.
+    this.draining = false;
+    this.clearReconnectTimer();
+    this.cancelCredentialDeadline();
+    this.retireSocket(ENDPOINT_CHANGED_REASON);
+    this.generation += 1;
+
+    if (isErr(next)) {
+      this.refuseConfiguration(next.error);
+      return next;
+    }
+
+    // A new service is a first attempt, not the continuation of a failing one.
+    this.attempt = 0;
+    this.terminal = false;
+    this.openSocket('connecting');
+    return next;
+  }
+
+  /**
+   * Retires the current socket as dead and reconnects on the backoff curve.
+   *
+   * For an owner that has evidence the transport does not: the Chrome service
+   * worker's liveness probe of the local service went unanswered while the
+   * socket still reads `open`, which is what a connection whose peer vanished
+   * without a close frame looks like until the platform notices. The socket is
+   * retired — both deadlines cleared, its listeners removed, closed with a
+   * normal-closure code and `reason` — and the next attempt is scheduled
+   * exactly as for a dropped connection, so the delay follows the jittered
+   * curve and the client reports `reconnecting` with `reason`. The outbound
+   * queue is kept and flushed after the next hello.
+   *
+   * Only a client that is `open` or `connecting` is restarted. On one that is
+   * `reconnecting` the curve already owns the next attempt, and on one that is
+   * `closed` nothing is wanted, so both are left alone.
+   *
+   * @param reason Why, in a constant sentence of at most 123 bytes (the
+   * WebSocket close-reason limit). It reaches the service's log and the state
+   * detail a user interface renders, so it carries no credential, URL or
+   * payload.
+   */
+  restart(reason: string): void {
+    if (
+      this.terminal ||
+      (this.connectionState !== 'open' && this.connectionState !== 'connecting')
+    ) {
+      return;
+    }
+
+    this.logger.debug('websocket restarted by its owner', { state: this.connectionState });
+
+    this.draining = false;
+    // No reconnect can be pending while `open` or `connecting`; clearing one
+    // anyway guarantees `scheduleReconnect` below is never a no-op that would
+    // leave the client reporting a socket it no longer holds.
+    this.clearReconnectTimer();
+    this.cancelCredentialDeadline();
+    this.retireSocket(reason);
+    this.scheduleReconnect(undefined, reason);
   }
 
   /**
@@ -1602,10 +1868,11 @@ export class ReconnectingWsClient {
     const url = endpoint.value;
 
     // Whatever the previous attempt still holds is retired before its
-    // replacement exists: a credential read's deadline timer is cleared, and a
-    // socket still in flight — a reconnect attempt that `connect()` is
-    // overtaking — loses its listeners and is closed, so no two sockets of this
-    // client ever coexist and nothing of the old attempt outlives it.
+    // replacement exists: a credential read's deadline timer and a socket's
+    // opening deadline are cleared, and a socket still in flight — a reconnect
+    // attempt that `connect()` is overtaking — loses its listeners and is
+    // closed, so no two sockets of this client ever coexist and nothing of the
+    // old attempt outlives it.
     this.cancelCredentialDeadline();
     this.retireSocket();
 
@@ -1631,15 +1898,121 @@ export class ReconnectingWsClient {
     const socket = created.value;
     this.socket = socket;
     this.attachListeners(socket, generation);
+    // Armed only once the listeners exist, so the one socket the deadline can
+    // retire is one whose `open` event would have cleared it.
+    this.armOpenDeadline(socket, generation);
+  }
+
+  /**
+   * Bounds how long `socket` may take to reach `open`: arms a one-shot timer
+   * on the injected {@link TimerApi} that abandons the attempt when it fires.
+   *
+   * Any deadline still armed is cleared first, so at most one exists — the
+   * callers have already retired the socket it belonged to.
+   */
+  private armOpenDeadline(socket: WebSocketLike, generation: number): void {
+    this.cancelOpenDeadline();
+
+    const timeoutMs = this.openTimeoutMs;
+    const handle = this.timers.setTimeout(() => {
+      this.handleOpenTimeout(socket, generation, timeoutMs);
+    }, timeoutMs);
+
+    this.openDeadline = { handle, socket, generation };
+  }
+
+  /**
+   * Clears the opening deadline, if one is armed.
+   *
+   * Called by {@link handleOpen} (the socket opened in time) and by every path
+   * that abandons the socket before then — {@link close}, {@link handleClose},
+   * {@link terminate}, {@link retireSocket} (a replacement) and
+   * {@link refuseConfiguration}. Idempotent: with nothing armed it does
+   * nothing.
+   */
+  private cancelOpenDeadline(): void {
+    const deadline = this.openDeadline;
+
+    if (deadline === undefined) {
+      return;
+    }
+
+    this.openDeadline = undefined;
+    this.timers.clearTimeout(deadline.handle);
+  }
+
+  /**
+   * The opening deadline fired: the socket never reached `open`.
+   *
+   * The attempt is retired the way a socket that died before its hello is —
+   * listeners removed, the socket dropped and closed with a normal-closure
+   * code and {@link OPEN_TIMEOUT_REASON} — and then treated as the failed
+   * attempt it is: a `TRANSPORT_DISCONNECTED` failure naming the deadline, never
+   * the URL, is reported, and the next attempt is scheduled on the jittered
+   * curve, so a service that keeps stalling its upgrades is retried at a
+   * bounded, growing interval rather than hammered or abandoned.
+   *
+   * A deadline that no longer matches the armed record, the current generation
+   * or the current socket is stale and does nothing.
+   */
+  private handleOpenTimeout(socket: WebSocketLike, generation: number, timeoutMs: number): void {
+    const deadline = this.openDeadline;
+
+    if (
+      deadline === undefined ||
+      deadline.socket !== socket ||
+      deadline.generation !== generation
+    ) {
+      return;
+    }
+
+    // The timer has fired, so there is nothing left to clear: only the record
+    // is released.
+    this.openDeadline = undefined;
+
+    if (generation !== this.generation || socket !== this.socket) {
+      return;
+    }
+
+    this.logger.debug('websocket open timed out', { timeoutMs });
+
+    // No credential read can be in flight for a socket that never opened; the
+    // cancellation keeps "every path that ends an attempt clears every
+    // deadline" true without relying on that.
+    this.cancelCredentialDeadline();
+    this.detachListeners();
+    this.socket = undefined;
+
+    const closed = tryCatch(() => {
+      socket.close(NORMAL_CLOSURE_CODE, OPEN_TIMEOUT_REASON);
+    }, 'TRANSPORT_DISCONNECTED');
+
+    if (isErr(closed)) {
+      this.logger.debug('websocket close failed');
+    }
+
+    this.reportProtocolError(
+      new DebuggenError('TRANSPORT_DISCONNECTED', OPEN_TIMEOUT_MESSAGE, {
+        hint: OPEN_TIMEOUT_HINT,
+        details: { timeoutMs },
+      }),
+    );
+    this.scheduleReconnect(undefined, OPEN_TIMEOUT_REASON);
   }
 
   /**
    * Attaches the four listeners this client uses, keeping their identities so
    * {@link detachListeners} can remove exactly them.
    *
-   * Each listener captures the generation it was created under and does nothing
-   * once that value is stale, which is what makes a replaced socket's late
-   * events harmless.
+   * Each listener captures the generation it was created under and the socket
+   * it listens to, and does nothing once either is stale — the generation
+   * moved on, or the client let go of that socket. Both checks are needed: a
+   * socket retired by its opening deadline, by {@link restart} or by a failed
+   * hello write keeps the generation until the next attempt opens, so a late
+   * event from it — one whose listeners the runtime refused to remove — is
+   * recognised by identity alone. That is what makes a replaced or retired
+   * socket's late events harmless, a late 4401 above all, which would
+   * otherwise turn the pending retry into a terminal refusal.
    */
   private attachListeners(socket: WebSocketLike, generation: number): void {
     const listeners: SocketListeners = {
@@ -1647,13 +2020,13 @@ export class ReconnectingWsClient {
         this.handleOpen(socket, generation);
       },
       message: (event) => {
-        this.handleMessage(event, generation);
+        this.handleMessage(event, generation, socket);
       },
       close: (event) => {
-        this.handleClose(event, generation);
+        this.handleClose(event, generation, socket);
       },
       error: () => {
-        this.handleTransportError(generation);
+        this.handleTransportError(generation, socket);
       },
     };
 
@@ -1691,16 +2064,24 @@ export class ReconnectingWsClient {
   }
 
   /**
-   * Retires the current socket, if there is one, before a replacement is
-   * opened: its listeners are removed and it is closed with a normal-closure
+   * Retires the current socket, if there is one: its opening deadline is
+   * cleared, its listeners are removed and it is closed with a normal-closure
    * code.
    *
-   * Reached only from {@link openSocket}, and only when `connect()` overtakes a
-   * reconnect attempt whose socket is still opening. Without it the overtaken
-   * socket would keep its listeners and stay open with no hello on it until the
-   * service's own {@link CLIENT_HELLO_TIMEOUT_MS} deadline closed it.
+   * Reached from {@link openSocket} when `connect()` overtakes a reconnect
+   * attempt whose socket is still opening — without it the overtaken socket
+   * would keep its listeners and stay open with no hello on it until the
+   * service's own {@link CLIENT_HELLO_TIMEOUT_MS} deadline closed it — and from
+   * the two owner-driven transitions, {@link setUrl} and {@link restart}, which
+   * pass the constant reason the service's log should show.
+   *
+   * @param reason The close reason, when the caller has one worth stating.
    */
-  private retireSocket(): void {
+  private retireSocket(reason?: string): void {
+    // Cleared whether or not a socket is held: a deadline must never outlive
+    // the attempt that is being replaced.
+    this.cancelOpenDeadline();
+
     const previous = this.socket;
 
     if (previous === undefined) {
@@ -1711,7 +2092,11 @@ export class ReconnectingWsClient {
     this.socket = undefined;
 
     const closed = tryCatch(() => {
-      previous.close(NORMAL_CLOSURE_CODE);
+      if (reason === undefined) {
+        previous.close(NORMAL_CLOSURE_CODE);
+      } else {
+        previous.close(NORMAL_CLOSURE_CODE, reason);
+      }
     }, 'TRANSPORT_DISCONNECTED');
 
     if (isErr(closed)) {
@@ -1732,9 +2117,19 @@ export class ReconnectingWsClient {
    * deadline of {@link CLIENT_HELLO_TIMEOUT_MS}.
    */
   private handleOpen(socket: WebSocketLike, generation: number): void {
-    if (generation !== this.generation) {
+    // Both checks, for the reason `completeHandshake` gives: a socket retired
+    // by its opening deadline, or dropped by its own close event, keeps the
+    // generation until the reconnect delay elapses, and a late `open` from it
+    // — one whose listeners the runtime refused to remove — must not start a
+    // handshake or ask the credential provider for anything.
+    if (generation !== this.generation || socket !== this.socket) {
       return;
     }
+
+    // The socket opened in time: its opening deadline has done its job. What
+    // follows — the credential and the hello — is bounded by the credential
+    // deadline instead.
+    this.cancelOpenDeadline();
 
     const source = this.tokenSource;
 
@@ -2007,8 +2402,12 @@ export class ReconnectingWsClient {
    * typed handler, never throws, and never closes the socket: a producer that
    * sent one malformed frame is not a reason to lose a session (AAP §0.5.5).
    */
-  private handleMessage(event: WsMessageEventLike, generation: number): void {
-    if (generation !== this.generation) {
+  private handleMessage(
+    event: WsMessageEventLike,
+    generation: number,
+    socket: WebSocketLike,
+  ): void {
+    if (generation !== this.generation || socket !== this.socket) {
       return;
     }
 
@@ -2056,16 +2455,18 @@ export class ReconnectingWsClient {
   /**
    * Handles a close event: terminal for a refused credential, retried otherwise.
    */
-  private handleClose(event: WsCloseEventLike, generation: number): void {
-    if (generation !== this.generation) {
+  private handleClose(event: WsCloseEventLike, generation: number, socket: WebSocketLike): void {
+    if (generation !== this.generation || socket !== this.socket) {
       return;
     }
 
     // A credential still being read was being read for this socket, which is
     // now gone: its deadline is cancelled here, so neither a hello nor a
     // refusal can follow onto the dead connection, and no deadline timer runs
-    // alongside the reconnect delay.
+    // alongside the reconnect delay. A socket that closed before it ever
+    // opened takes its opening deadline with it for the same reason.
     this.cancelCredentialDeadline();
+    this.cancelOpenDeadline();
     this.closeCode = event.code;
     this.detachListeners();
     this.socket = undefined;
@@ -2099,8 +2500,8 @@ export class ReconnectingWsClient {
    * client supports follows an `error` with a `close`, and that is where the one
    * reconnect is scheduled. The pending-reconnect handle guards the case anyway.
    */
-  private handleTransportError(generation: number): void {
-    if (generation !== this.generation) {
+  private handleTransportError(generation: number, socket: WebSocketLike): void {
+    if (generation !== this.generation || socket !== this.socket) {
       return;
     }
 
@@ -2138,6 +2539,7 @@ export class ReconnectingWsClient {
     this.terminal = true;
     this.draining = false;
     this.clearReconnectTimer();
+    this.cancelOpenDeadline();
     this.reportProtocolError(error);
     this.setState('closed', { reason: CONFIGURATION_REFUSED_REASON });
   }
@@ -2151,8 +2553,10 @@ export class ReconnectingWsClient {
     this.draining = false;
     this.clearReconnectTimer();
     // Every local refusal ends here, including the one a timed-out credential
-    // read causes, so this is where a read still in flight is cancelled.
+    // read causes, so this is where a read still in flight is cancelled — and
+    // an opening deadline, should one still be armed, with it.
     this.cancelCredentialDeadline();
+    this.cancelOpenDeadline();
     this.detachListeners();
     this.socket = undefined;
 
@@ -2281,6 +2685,27 @@ export class ReconnectingWsClient {
     }
 
     return true;
+  }
+
+  /**
+   * Empties the queue, reporting every frame it held through
+   * {@link ReconnectingWsClientOptions.onQueueDrop}, oldest first.
+   *
+   * The queue is detached before the first report, so a hook that sends while
+   * it runs appends to a fresh queue instead of feeding this loop; each report's
+   * `queued` counts down the frames of the dropped batch still to be reported,
+   * ending at `0`.
+   *
+   * @returns How many frames were dropped.
+   */
+  private dropQueuedFrames(): number {
+    const dropped = this.queue.splice(0);
+
+    dropped.forEach((entry, index) => {
+      this.notifyQueueDrop({ type: entry.type, queued: dropped.length - index - 1 });
+    });
+
+    return dropped.length;
   }
 
   /** Writes one already-encoded frame, turning a throw into a `Result`. */
@@ -2490,6 +2915,22 @@ function resolveQueueBound(configured: number | undefined): number {
   }
 
   return Math.max(0, Math.floor(configured));
+}
+
+/**
+ * Resolves the opening deadline: a finite number of milliseconds above zero,
+ * defaulting to {@link DEFAULT_WS_OPEN_TIMEOUT_MS}.
+ *
+ * Unlike the queue bound, zero is not meaningful here — a deadline of zero
+ * would abandon every socket before its `open` event could arrive — so it is
+ * treated as unusable along with negative and non-finite values.
+ */
+function resolveOpenTimeout(configured: number | undefined): number {
+  if (configured === undefined || !Number.isFinite(configured) || configured <= 0) {
+    return DEFAULT_WS_OPEN_TIMEOUT_MS;
+  }
+
+  return configured;
 }
 
 /**

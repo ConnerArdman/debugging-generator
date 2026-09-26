@@ -23,19 +23,44 @@
  *   under every `DataQuerySort`, the stable `id` tie-breaker over the batch's
  *   identical-`startTime`-and-`duration` block, the clamp at
  *   `DATA_QUERY_MAX_LIMIT`, and filters narrowing `total` itself.
- * - **Structural renderability.** This workspace has no DOM and may not import
- *   `@debuggen/panel-renderer` (AAP §0.2.2), so a catalog entry's
- *   renderability is proved structurally: every entry's permitted source
- *   answers a real, non-empty `DataResult`; every field in the entry's
- *   `requiredReads` is carried by every record the component draws; the
- *   entry's `reads` is exactly `requiredReads` then `optionalReads`, so no read
- *   escapes that per-record check unless the entry itself declares it an
- *   absent-tolerant enrichment (an orphan flag, a lineage mark, a transfer
- *   size the browser withheld); and a minimal `PanelSpec`
- *   holding the node passes `validatePanelSpec` and `validateAgainstCapture`
- *   with the store's authoritative id resolvers. Rendering React stays with
- *   `packages/panel-renderer/src/host/registry.test.ts` and
- *   `tests/browser/panel-render.spec.ts`.
+ * - **Structural renderability.** Every entry's permitted source answers a
+ *   real, non-empty `DataResult`; every field in the entry's `requiredReads` is
+ *   carried by every record the component draws; the entry's `reads` is
+ *   exactly `requiredReads` then `optionalReads`, so no read escapes that
+ *   per-record check unless the entry itself declares it an absent-tolerant
+ *   enrichment (an orphan flag, a lineage mark, a transfer size the browser
+ *   withheld); and a minimal `PanelSpec` holding the node passes
+ *   `validatePanelSpec` and `validateAgainstCapture` with the store's
+ *   authoritative id resolvers.
+ * - **Live-response rendering.** The structural proof is necessary, not
+ *   sufficient: a real answer shaped in a way the components cannot draw would
+ *   still pass it. So one normalized `PanelSpec` holding every catalog node
+ *   type — the three containers wrapping the thirteen views, each view's query
+ *   chosen from its entry's permitted sources and a trace its real answer has
+ *   something for — is mounted through the renderer's `PanelHost`, over the
+ *   renderer's own `createPanelDataProvider` whose every answer is a real
+ *   `POST /sessions/:id/panel-data` response, and every node must settle in its
+ *   populated state (AAP §0.4.2, §0.8.3). A control mounts the same panel over
+ *   an unknown trace and without a credential: each view must settle empty or
+ *   in error exactly where its real answer says so, which is what shows the
+ *   populated verdict is read from the document rather than assumed. The
+ *   capture it reads holds the case table's fixtures — the paging corpus
+ *   aside — once more under fresh event ids, because no single case capture
+ *   holds every kind the views draw and a panel's queries may only be
+ *   addressed to its own session. The service itself still renders nothing
+ *   (AAP §0.2.2): the renderer, React and happy-dom are devDependencies, and
+ *   `./render/live-panel-host.ts` is the one file that imports them — the
+ *   exception `eslint.config.js` and `tsconfig.json` scope to
+ *   `test/integration/render/**`. That helper installs happy-dom's DOM globals
+ *   only for the duration of the mount, so the in-process service keeps Node's
+ *   globals throughout. `packages/panel-renderer/src/host/registry.test.ts`
+ *   and `tests/browser/panel-render.spec.ts` keep the per-component and
+ *   in-browser rendering over recorded answers.
+ * - **Panel-bound reads.** A panel the real pipeline generated from one
+ *   capture keeps reading that capture once a newer capture of its session is
+ *   open: a body naming the panel (`panelId`) is answered, for every source,
+ *   exactly as the panel's own capture is; the same query without it reads the
+ *   newer capture; and a panel the session does not hold is refused `409`.
  * - **Authorization and privacy**, thinly: the full access matrix belongs to
  *   `auth.test.ts` and the full redaction matrix to `telemetry-ingest.test.ts`.
  *
@@ -66,6 +91,8 @@ import {
   DATA_QUERY_SOURCES,
   DEFAULT_SPLIT_DIRECTION,
   LAYOUT_NODE_MIN_CHILDREN,
+  PANEL_CHILDREN_FIELD,
+  PANEL_LAYOUT_FIELD,
   PANEL_NODE_CATALOG,
   PANEL_SPEC_VERSION,
   isLayoutNodeType,
@@ -83,8 +110,13 @@ import type {
   PanelSpec,
   SemanticValidationOutcome,
 } from '@debuggen/panel-schema';
-import { HTTP_ROUTES, dataResultSchema, panelDataRequestSchema } from '@debuggen/protocol';
-import type { DataResult, HttpClient } from '@debuggen/protocol';
+import {
+  ACTING_TAB_HEADER,
+  HTTP_ROUTES,
+  dataResultSchema,
+  panelDataRequestSchema,
+} from '@debuggen/protocol';
+import type { DataResult, HttpClient, PanelDataRequest } from '@debuggen/protocol';
 import { ID_PREFIXES, assertNever, isErr, newEventId, newId, newTraceId } from '@debuggen/shared';
 import type { CaptureId, DebuggenError, Result, SessionId } from '@debuggen/shared';
 import {
@@ -93,6 +125,7 @@ import {
   METRIC_IDS,
   ORPHAN_REASONS,
   flattenTrace,
+  parseTelemetryEventIngress,
 } from '@debuggen/telemetry';
 import type {
   CaptureSummary,
@@ -123,6 +156,8 @@ import {
   waitUntil,
 } from './harness.js';
 import type { DevtoolsConnection, Harness } from './harness.js';
+import { mountLivePanel } from './render/live-panel-host.js';
+import type { LivePanelReport } from './render/live-panel-host.js';
 
 /* -------------------------------------------------------------------------------------------------
  * Constants
@@ -578,12 +613,17 @@ function batchFor(fixtures: readonly string[], probe: string): TelemetryEventIng
  * and only then is the capture opened and the batch ingested. Every ingested
  * event must be stored: attribution drops are answered 202-style, so the store
  * count is the evidence, not the transport's acknowledgement.
+ *
+ * `events` defaults to the fixtures' own batch; a caller that ingests the same
+ * fixtures a second time passes a re-identified copy instead, because the
+ * store refuses an event id already stored under another session.
  */
 async function openCaptureGroup(
   harness: Harness,
   fixtures: readonly string[],
   ordinal: number,
   probe: string,
+  events: readonly TelemetryEventIngress[] = batchFor(fixtures, probe),
 ): Promise<CaptureGroup> {
   const project = ordinal === 0 ? harness.requireProject() : await harness.copyFixtureProject();
   const launched = expectOk(await harness.launchDevServer(project.root), 'devServer.launch');
@@ -604,7 +644,6 @@ async function openCaptureGroup(
     throw new Error(`session.bind was refused (${bound.error.code}): ${bound.error.message}`);
   }
 
-  const events = batchFor(fixtures, probe);
   const browserEvents = events.filter((event) => event.tier === 'browser');
   const serverEvents = events.filter((event) => event.tier !== 'browser');
   const producerId = browserEvents[0]?.producerId;
@@ -738,16 +777,21 @@ function distinctIngestLists(): readonly (readonly string[])[] {
 /**
  * One `panel.data` request through protocol's `HttpClient` — the path built
  * from `HTTP_ROUTES`, the body validated on the way out and the response on
- * the way in — recording every successful body for the privacy sweep.
+ * the way in — recording every successful body for the privacy sweep. The body
+ * is a `DataQuery`, with the rendered panel's id when the read is bound to one.
+ * A DevTools client passes the inspected tab it acts for as `tabId`, which the
+ * client sends as protocol's acting-tab header.
  */
 async function requestPanelData(
   client: HttpClient,
   sessionId: SessionId,
-  query: DataQuery,
+  query: PanelDataRequest,
+  tabId?: number,
 ): Promise<Result<DataResult, DebuggenError>> {
   const answered = await client.request(PANEL_DATA_OPERATION, {
     params: { [SESSION_PARAM]: sessionId },
     body: query,
+    tabId,
   });
   if (!isErr(answered)) {
     observedResponses.push(JSON.stringify(answered.value));
@@ -2025,6 +2069,21 @@ function minimalSpec(
   evidence: TelemetryEvent,
   citedEventId: string = evidence.id,
 ): unknown {
+  return panelDocument(group, title, [node], evidence, citedEventId);
+}
+
+/**
+ * A specification document holding `layout` as given, with the summary
+ * {@link minimalSpec} uses: one observed fact citing `citedEventId` (by default
+ * the evidence record itself), no likely cause.
+ */
+function panelDocument(
+  group: CaptureGroup,
+  title: string,
+  layout: readonly Record<string, unknown>[],
+  evidence: TelemetryEvent,
+  citedEventId: string = evidence.id,
+): unknown {
   const reference: EventRef = {
     eventId: citedEventId,
     traceId: evidence.traceId,
@@ -2046,7 +2105,7 @@ function minimalSpec(
       ],
       likelyCauses: [],
     },
-    layout: [node],
+    layout,
   };
 }
 
@@ -2241,8 +2300,510 @@ describe('structural renderability of every catalog entry', () => {
 });
 
 /* -------------------------------------------------------------------------------------------------
+ * Live-response rendering: every catalog component mounted against real answers
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The title of the one panel the live-response oracle mounts. */
+const ORACLE_PANEL_TITLE = 'Every catalog view over one real capture';
+
+/** Every catalog entry that draws a view — the source-link leaf included — in catalog order. */
+const VIEW_ENTRIES = CATALOG_ENTRIES.filter((entry) => entry.kind !== 'layout');
+
+/**
+ * The bound of each oracle test: up to two mounts, each given one request
+ * budget to settle in, and one teardown budget for unmounting and closing them.
+ */
+const ORACLE_TEST_TIMEOUT_MS = HARNESS_TIMEOUTS.request * 2 + HARNESS_TIMEOUTS.teardown;
+
+/**
+ * The fixtures the oracle capture holds: every fixture the case table ingests
+ * except the paging corpus, whose 219 `perf.entry` rows give no view anything
+ * the other fixtures do not and would only multiply the rows the mount lays out.
+ */
+function oracleFixtures(): readonly string[] {
+  return distinctIngestLists()
+    .flat()
+    .filter((fixture) => fixture !== VOLUME_FIXTURE);
+}
+
+/**
+ * A copy of `events` under fresh event ids, held to the ingress schema again.
+ *
+ * The event id is the one identity the store keeps unique across sessions
+ * (`telemetry_events.id`), so it is the one re-minted: trace, span and producer
+ * ids keep their values, which the store and the correlator only ever read
+ * within one session. Every other string equal to an original id — a state
+ * transition's `triggerEventId`, say — is rewritten to the same fresh id, so the
+ * copy references itself exactly as the original does.
+ */
+function reidentified(events: readonly TelemetryEventIngress[]): TelemetryEventIngress[] {
+  const fresh = new Map<string, string>(events.map((event) => [event.id, newEventId()]));
+  const remap = (value: unknown): unknown => {
+    if (typeof value === 'string') {
+      return fresh.get(value) ?? value;
+    }
+    if (Array.isArray(value)) {
+      return value.map((element: unknown) => remap(element));
+    }
+    if (isRecord(value)) {
+      return Object.fromEntries(
+        Object.entries(value).map(([key, nested]) => [key, remap(nested)] as const),
+      );
+    }
+    return value;
+  };
+  return events.map((event, index) => {
+    const copy = parseTelemetryEventIngress(remap(event));
+    if (isErr(copy)) {
+      throw new Error(
+        `Re-identified event ${String(index)} left the ingress schema (${copy.error.code}).`,
+      );
+    }
+    return copy.value;
+  });
+}
+
+/** The sources a node of this entry may read, its catalogued default first. */
+function sourcesInPreference(entry: PanelNodeCatalogEntry): readonly DataQuerySource[] {
+  return [
+    ...new Set([
+      ...(entry.defaultSource === undefined ? [] : [entry.defaultSource]),
+      ...entry.sources,
+    ]),
+  ];
+}
+
+/** The trace ids of a group's events, in the order they were ingested. */
+function traceIdsOf(group: CaptureGroup): readonly string[] {
+  return [...new Set(group.events.map((event) => event.traceId))];
+}
+
+/**
+ * The query a node of `entry` is mounted with: the first permitted source and
+ * trace, in preference order, whose real answer holds something the entry's
+ * component draws — the rule the structural block proves every pair by.
+ */
+async function drawableQuery(
+  entry: PanelNodeCatalogEntry,
+  group: CaptureGroup,
+): Promise<DataQuery> {
+  for (const source of sourcesInPreference(entry)) {
+    for (const traceId of traceIdsOf(group)) {
+      const query = typedQuery({ source, filter: { traceId } }, `${entry.type} over ${source}`);
+      const result = await panelData(group.sessionId, query);
+      if (hasContent(result) && (await drawnRecords(entry, group, result)).length > 0) {
+        return query;
+      }
+    }
+  }
+  throw new Error(`No real answer of the oracle capture has anything for a ${entry.type} node.`);
+}
+
+/**
+ * The oracle's layout: one node per catalog entry. The containers, in catalog
+ * order, are the top-level nodes and the views are dealt among them in turn,
+ * so every view sits inside a container — as a generated panel's views do —
+ * and every container holds at least its minimum of children. Ids follow the
+ * normaliser's positional scheme (`layout.0`, `layout.0.children.1`), which is
+ * also the path the renderer writes onto each node's frame.
+ */
+async function oracleLayout(
+  group: CaptureGroup,
+  located: TelemetryEvent,
+): Promise<Record<string, unknown>[]> {
+  const shares = LAYOUT_ENTRIES.map((): PanelNodeCatalogEntry[] => []);
+  VIEW_ENTRIES.forEach((entry, index) => {
+    shares[index % shares.length]?.push(entry);
+  });
+  const layout: Record<string, unknown>[] = [];
+  for (const [position, container] of LAYOUT_ENTRIES.entries()) {
+    const { type } = container;
+    if (!isLayoutNodeType(type)) {
+      throw new Error(`${type} is catalogued as a container but is not a layout node type.`);
+    }
+    const share = shares[position] ?? [];
+    if (share.length < LAYOUT_NODE_MIN_CHILDREN[type]) {
+      throw new Error(`The ${type} container is dealt fewer views than its minimum.`);
+    }
+    const id = `${PANEL_LAYOUT_FIELD}.${String(position)}`;
+    const children: Record<string, unknown>[] = [];
+    for (const [index, entry] of share.entries()) {
+      const leaf: Record<string, unknown> = {
+        type: entry.type,
+        id: `${id}.${PANEL_CHILDREN_FIELD}.${String(index)}`,
+        title: entry.label,
+      };
+      if (entry.requiresQuery) {
+        leaf['query'] = await drawableQuery(entry, group);
+      }
+      for (const option of entry.options ?? []) {
+        leaf[option] = optionValue(option, located);
+      }
+      children.push(leaf);
+    }
+    const node: Record<string, unknown> = { type, id, title: container.label, children };
+    for (const option of container.options ?? []) {
+      node[option] = optionValue(option, located);
+    }
+    layout.push(node);
+  }
+  return layout;
+}
+
+/**
+ * Every successful answer a mount recorded for `query` — same source, same
+ * filter — in the order the requests settled.
+ */
+function answersFor(report: LivePanelReport, query: DataQuery): DataResult[] {
+  return report.exchanges.flatMap((exchange) =>
+    exchange.outcome.ok &&
+    exchange.query.source === query.source &&
+    isDeepStrictEqual(exchange.query.filter, query.filter)
+      ? [exchange.outcome.result]
+      : [],
+  );
+}
+
+/** Adds every successful answer a mount recorded to the privacy sweep's haystack. */
+function recordAnswers(report: LivePanelReport): void {
+  for (const exchange of report.exchanges) {
+    if (exchange.outcome.ok) {
+      observedResponses.push(JSON.stringify(exchange.outcome.result));
+    }
+  }
+}
+
+/** A copy of `nodes` whose every query is narrowed to `traceId` instead. */
+function retraced(
+  nodes: readonly Readonly<Record<string, unknown>>[],
+  traceId: string,
+): Record<string, unknown>[] {
+  return nodes.map((node) => {
+    const { query, children } = node;
+    return {
+      ...node,
+      ...(isRecord(query) ? { query: { ...query, filter: { traceId } } } : {}),
+      ...(Array.isArray(children)
+        ? { children: retraced(children.filter(isRecord), traceId) }
+        : {}),
+    };
+  });
+}
+
+describe('live-response rendering of every catalog component', () => {
+  /** The capture the oracle reads: the case fixtures again, under fresh event ids, in one session. */
+  let oracle: CaptureGroup;
+
+  /** A stored event of the oracle capture that resolved to a source location. */
+  let located: TelemetryEvent;
+
+  /** The layout of every catalog node type, each view's query chosen over HTTP. */
+  let layout: Record<string, unknown>[];
+
+  beforeAll(async () => {
+    const fixtures = oracleFixtures();
+    oracle = await openCaptureGroup(
+      harness,
+      fixtures,
+      distinctIngestLists().length,
+      redactionProbe,
+      reidentified(batchFor(fixtures, redactionProbe)),
+    );
+    const found = (await storedEvents(oracle)).find((event) => event.source !== undefined);
+    if (found === undefined) {
+      throw new Error('No event of the oracle capture resolved to a source location.');
+    }
+    located = found;
+    layout = await oracleLayout(oracle, located);
+  }, GROUP_SETUP_TIMEOUT_MS + HARNESS_TIMEOUTS.request);
+
+  it(
+    'mounts one normalized PanelSpec holding every catalog node type through PanelHost, each view settled in its populated state over a real /panel-data answer',
+    async () => {
+      const build = (cited?: string): unknown =>
+        panelDocument(oracle, ORACLE_PANEL_TITLE, layout, located, cited);
+      await assertSpecValidates(oracle, build, 'the live-response oracle panel');
+      const spec = expectOk(validatePanelSpec(build()), 'validatePanelSpec (live-response oracle)');
+      const catalogTypes = new Set(CATALOG_ENTRIES.map((entry) => entry.type));
+
+      const globalsBefore = Reflect.ownKeys(globalThis);
+      const report = await mountLivePanel({
+        spec,
+        client: harness.http(),
+        documentUrl: harness.url,
+        settleTimeoutMs: HARNESS_TIMEOUTS.request,
+      });
+      recordAnswers(report);
+
+      // The DOM existed for the mount only: every global it installed is gone.
+      expect(report.installedGlobals).toBeGreaterThan(0);
+      expect(Reflect.ownKeys(globalThis), 'globals left behind by the mount').toEqual(
+        globalsBefore,
+      );
+
+      // One node per catalog type, every one of them drawn in its populated state:
+      // no loading, empty or error state, no registry miss, no missing frame.
+      expect(report.settled, 'the panel settled within its bound').toBe(true);
+      expect(report.nodes.map((node) => node.id)).toEqual(report.nodes.map((node) => node.path));
+      expect(report.nodes).toHaveLength(catalogTypes.size);
+      expect(new Set(report.nodes.map((node) => node.type))).toEqual(catalogTypes);
+      expect(
+        report.nodes
+          .filter((node) => node.state !== 'populated')
+          .map((node) => `${node.id} (${node.type}): ${node.state}`),
+        'nodes that did not render their populated state',
+      ).toEqual([]);
+      const rendered = new Set(
+        report.nodes.filter((node) => node.state === 'populated').map((node) => node.type),
+      );
+      expect(rendered, 'the node types rendered').toEqual(catalogTypes);
+      for (const node of report.nodes) {
+        expect(node.renderedChildCount, `${node.id}: child frames rendered`).toBe(node.childCount);
+      }
+
+      // Exactly the query-backed entries carried a query, and each one's view was
+      // drawn from a real answer: addressed to the panel's own session, accepted by
+      // protocol's DataResult union with the node's source, and holding content.
+      expect(
+        report.nodes.filter((node) => node.query !== undefined).map((node) => node.type),
+      ).toEqual(
+        report.nodes
+          .filter((node) => PANEL_NODE_CATALOG[node.type].requiresQuery)
+          .map((node) => node.type),
+      );
+      expect(
+        report.exchanges
+          .filter((exchange) => !exchange.outcome.ok || exchange.sessionId !== spec.sessionId)
+          .map((exchange) => exchange.query.source),
+        'requests refused or addressed to another session',
+      ).toEqual([]);
+      for (const node of report.nodes) {
+        const { query } = node;
+        if (query === undefined) {
+          continue;
+        }
+        const answers = answersFor(report, query);
+        expect(answers.length, `${node.id}: real answers to its query`).toBeGreaterThan(0);
+        for (const answer of answers) {
+          expect(
+            dataResultSchema.safeParse(answer).success,
+            `${node.id}: the answer satisfies DataResult`,
+          ).toBe(true);
+          expect(answer.source, `${node.id}: the answer's source`).toBe(query.source);
+          expect(hasContent(answer), `${node.id}: the answer holds content`).toBe(true);
+        }
+      }
+      expect(report.interactions, 'interactions reported while nothing was clicked').toBe(0);
+    },
+    ORACLE_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    'tells the populated state from the empty and error states: over an unknown trace a view settles empty exactly where its real answer holds nothing, and a refused request settles as an error',
+    async () => {
+      const unknownTrace = newTraceId();
+      const emptied = expectOk(
+        validatePanelSpec(
+          panelDocument(oracle, ORACLE_PANEL_TITLE, retraced(layout, unknownTrace), located),
+        ),
+        'validatePanelSpec (live-response control, unknown trace)',
+      );
+      const overNothing = await mountLivePanel({
+        spec: emptied,
+        client: harness.http(),
+        documentUrl: harness.url,
+        settleTimeoutMs: HARNESS_TIMEOUTS.request,
+      });
+      recordAnswers(overNothing);
+      expect(overNothing.settled, 'the control panel settled within its bound').toBe(true);
+      for (const node of overNothing.nodes) {
+        const { query } = node;
+        if (query === undefined) {
+          expect(node.state, `${node.id}: a node without a query is unaffected`).toBe('populated');
+          continue;
+        }
+        const answers = answersFor(overNothing, query);
+        expect(answers.length, `${node.id}: real answers to its query`).toBeGreaterThan(0);
+        expect(node.state, `${node.id} (${node.type}): the state follows its answer`).toBe(
+          answers.some(hasContent) ? 'populated' : 'empty',
+        );
+      }
+      expect(
+        overNothing.nodes.filter((node) => node.state === 'empty').length,
+        'views the unknown trace emptied',
+      ).toBeGreaterThan(0);
+
+      const spec = expectOk(
+        validatePanelSpec(panelDocument(oracle, ORACLE_PANEL_TITLE, layout, located)),
+        'validatePanelSpec (live-response control, refused)',
+      );
+      const refused = await mountLivePanel({
+        spec,
+        client: harness.http(null),
+        documentUrl: harness.url,
+        settleTimeoutMs: HARNESS_TIMEOUTS.request,
+      });
+      expect(refused.settled, 'the refused panel settled within its bound').toBe(true);
+      expect(refused.exchanges.length).toBeGreaterThan(0);
+      expect(
+        refused.exchanges
+          .filter((exchange) => exchange.outcome.ok)
+          .map((exchange) => exchange.query.source),
+        'requests answered without a credential',
+      ).toEqual([]);
+      for (const node of refused.nodes) {
+        expect(node.state, `${node.id} (${node.type}): the state follows the refusal`).toBe(
+          node.query === undefined ? 'populated' : 'error',
+        );
+      }
+    },
+    ORACLE_TEST_TIMEOUT_MS,
+  );
+});
+
+/* -------------------------------------------------------------------------------------------------
  * Authorization — one assertion per role; the full matrix belongs to auth.test.ts
  * ---------------------------------------------------------------------------------------------- */
+
+/* -------------------------------------------------------------------------------------------------
+ * Panel-bound reads — a rendered panel keeps reading the capture it was generated from
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The status a request answers with when its scope contradicts the session's state. */
+const CONFLICT_STATUS = 409;
+
+/** The code of that answer. */
+const INVALID_STATE_CODE = 'SESSION_INVALID_STATE';
+
+describe('panel-bound reads', () => {
+  /** The session whose first capture the real pipeline generated a panel from. */
+  let group: CaptureGroup;
+
+  /** The capture the panel was generated from, and the newer one opened after it. */
+  let panelCapture: CaptureId;
+  let newerCapture: CaptureId;
+
+  /** The generated panel, as the store holds it. */
+  let panelId: string;
+
+  beforeAll(
+    async () => {
+      // Capture one, through the real producers, then the real pipeline:
+      // stopping it analyses the capture and stores a panel linked to it.
+      group = await openCaptureGroup(
+        harness,
+        [CROSS_TIER_FIXTURE],
+        distinctIngestLists().length + 1,
+        redactionProbe,
+        reidentified(batchFor([CROSS_TIER_FIXTURE], redactionProbe)),
+      );
+      panelCapture = group.captureId;
+      expectOk(await harness.stopCapture(group.sessionId), 'capture.stop');
+      const generated = await harness.waitForSession(
+        group.sessionId,
+        (record) => record.status === 'generated' || record.status === 'failed',
+        { timeoutMs: HARNESS_TIMEOUTS.pipeline },
+      );
+      expect(generated.status, 'the first capture generated a panel').toBe('generated');
+      const panel = expectOk(
+        harness.repos.panels.getLatestPanel(group.sessionId),
+        'getLatestPanel',
+      );
+      if (panel === undefined) {
+        throw new Error('The pipeline stored no panel for the first capture.');
+      }
+      panelId = panel.id;
+
+      // Capture two: a newer capture of the same session holding other evidence,
+      // opened and filled at the store — what every resolver lookup reads.
+      const opened = expectOk(
+        harness.repos.sessions.startCapture({
+          sessionId: group.sessionId,
+          planVersion: generated.plans.at(-1)?.planVersion ?? 1,
+        }),
+        'sessions.startCapture',
+      );
+      newerCapture = opened.capture.id;
+      const evidence = reidentified(readTelemetryBatch(RENDERS_FIXTURE)).map((event) => ({
+        ...event,
+        sessionId: group.sessionId,
+        captureId: newerCapture,
+      }));
+      expectOk(harness.repos.telemetry.insertMany(evidence), 'telemetry.insertMany');
+    },
+    GROUP_SETUP_TIMEOUT_MS + HARNESS_TIMEOUTS.pipeline + HARNESS_TIMEOUTS.request,
+  );
+
+  it('stores the panel linked to the capture it was generated from', () => {
+    const lookup = expectOk(
+      harness.repos.sessions.getPanelCapture(group.sessionId, panelId),
+      'getPanelCapture',
+    );
+    expect(lookup.panel).toBe('found');
+    expect(lookup.panel === 'found' ? lookup.capture?.capture.id : undefined).toBe(panelCapture);
+    expect(
+      expectOk(harness.repos.sessions.getActiveCapture(group.sessionId), 'getActiveCapture')
+        ?.capture.id,
+    ).toBe(newerCapture);
+  });
+
+  it('answers every source of a panel-bound read from the panel’s capture while a newer one is open', async () => {
+    for (const source of DATA_QUERY_SOURCES) {
+      const query: DataQuery = { source, limit: DATA_QUERY_MAX_LIMIT };
+      const bound = expectOk(
+        await requestPanelData(harness.http(), group.sessionId, { ...query, panelId }),
+        `panel.data (${source}, panel-bound)`,
+      );
+      assertResultShape(bound, source);
+      const own = expectOk(
+        await resolver.resolve({ sessionId: group.sessionId, captureId: panelCapture }, query),
+        `resolve (${source}, the panel's capture)`,
+      );
+      expect(bound, `${source} is read from the panel's capture`).toStrictEqual(own);
+    }
+  });
+
+  it('keeps live reads separate: without a panel id the newer capture is read', async () => {
+    const query: DataQuery = { source: 'renders', limit: DATA_QUERY_MAX_LIMIT };
+    const live = await panelData(group.sessionId, query);
+    const bound = expectOk(
+      await requestPanelData(harness.http(), group.sessionId, { ...query, panelId }),
+      'panel.data (renders, panel-bound)',
+    );
+    const newer = expectOk(
+      await resolver.resolve({ sessionId: group.sessionId, captureId: newerCapture }, query),
+      'resolve (renders, the newer capture)',
+    );
+    const older = expectOk(
+      await resolver.resolve({ sessionId: group.sessionId, captureId: panelCapture }, query),
+      "resolve (renders, the panel's capture)",
+    );
+    expect(live).toStrictEqual(newer);
+    expect(bound).toStrictEqual(older);
+    expect(newer).not.toStrictEqual(older);
+  });
+
+  it('refuses a panel the session does not hold with 409, reading nothing on its behalf', async () => {
+    const [other] = [...groups.values()];
+    if (other === undefined) {
+      throw new Error('A second session is needed.');
+    }
+    const query: PanelDataRequest = { source: 'renders' };
+    for (const [sessionId, foreignPanel] of [
+      // A panel of this session, asked about under another session.
+      [other.sessionId, panelId],
+      // A panel id no session holds.
+      [group.sessionId, newId('pnl')],
+    ] as const) {
+      const refused = await requestPanelData(harness.http(), sessionId, {
+        ...query,
+        panelId: foreignPanel,
+      });
+      expect(refusalStatus(refused)).toBe(CONFLICT_STATUS);
+      expect(isErr(refused) ? refused.error.code : 'answered').toBe(INVALID_STATE_CODE);
+    }
+  });
+});
 
 /** The service's code for a DevTools principal acting on a session its tab is not bound to. */
 const TAB_NOT_BOUND_CODE = 'TAB_NOT_BOUND';
@@ -2266,17 +2827,20 @@ describe('authorization', () => {
     const query = typedQuery({ source: 'events', limit: 1 }, 'devtools probe');
 
     const bound = pagedOf(
-      expectOk(await requestPanelData(devtools, own.sessionId, query), 'panel.data (bound tab)'),
+      expectOk(
+        await requestPanelData(devtools, own.sessionId, query, own.tabId),
+        'panel.data (bound tab)',
+      ),
       'bound tab',
     );
     expect(bound.total).toBe(own.events.length);
 
-    expect(refusalStatus(await requestPanelData(devtools, other.sessionId, query))).toBe(
+    expect(refusalStatus(await requestPanelData(devtools, other.sessionId, query, own.tabId))).toBe(
       FORBIDDEN_STATUS,
     );
     const refused = await harness.rawFetch(
       { operation: PANEL_DATA_OPERATION, params: { [SESSION_PARAM]: other.sessionId } },
-      { token, origin, body: query },
+      { token, origin, body: query, headers: { [ACTING_TAB_HEADER]: String(own.tabId) } },
     );
     expect(refused.status).toBe(FORBIDDEN_STATUS);
     expect(fieldOf(refused.json, 'code')).toBe(TAB_NOT_BOUND_CODE);

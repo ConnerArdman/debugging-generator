@@ -19,8 +19,9 @@
  * | URL | {@link PreloadConfig.ingestUrl} **verbatim** |
  * | Headers | `Content-Type: application/json`, `Authorization: Bearer <token>` — and no others |
  * | Body | `{ projectRoot, events }`, `events` being {@link TelemetryEventIngress}[] |
- * | Timeout | {@link INGEST_TIMEOUT_MS}, enforced with an abort signal |
+ * | Timeout | {@link INGEST_TIMEOUT_MS}, enforced with an abort signal that also bounds reading the answer |
  * | Redirects | refused (`redirect: 'error'`) |
+ * | Answer | the status decides; only a `2xx` body — `{ accepted, rejected? }` — is read, at most {@link MAX_ACKNOWLEDGEMENT_BYTES} of it |
  *
  * Three of those rows are traps worth naming:
  *
@@ -40,8 +41,38 @@
  *
  * `sessionId`, `captureId` and `ingestSeq` are **service-assigned** and the
  * ingress schema is strict, so a single extra key fails a whole batch. This
- * module therefore posts exactly the objects `./convert.ts` produced and adds
- * nothing to them.
+ * module therefore posts the objects `./convert.ts` produced with exactly one
+ * addition, the schema's optional `clockOffsetMs` (next section), and nothing
+ * else.
+ *
+ * ## The clock offset (AAP 0.2.3)
+ *
+ * AAP 0.2.3 applies no clock alignment to event times "beyond a recorded
+ * per-producer `clockOffsetMs` (server `Date` header versus local clock,
+ * informational)". This process is the producer, and this processor — which
+ * lives as long as the process — holds its one `ClockOffsetEstimator` from
+ * `../schema/clock-offset.ts`:
+ *
+ * - **Measured** against the local service's own `Date` header on the answer
+ *   to every ingest `POST`, whatever its status (a `401` or a `503` is still
+ *   the service's clock), with the two readings taken immediately around the
+ *   `fetch` from {@link DebuggenSpanProcessorOptions.now} — the wall clock
+ *   OpenTelemetry stamps a span's start with. A request that never got an
+ *   answer yields no sample.
+ * - **Stamped once**, in `onEnd`, on the event `./convert.ts` has just built
+ *   and only once an estimate exists. A batch is serialised once and that body
+ *   is what every retry sends, so an event is never restamped — which is what
+ *   keeps a re-delivered event identical to the one the store already holds.
+ *   The first batch of a process therefore carries no offset: nothing has
+ *   answered yet.
+ * - **Never applied.** `startTime` and `duration` are `./convert.ts`'s,
+ *   untouched; the offset is a statement about them.
+ * - **Process-scoped.** A capture change does not reset it; the process's
+ *   clock is the same clock. {@link DebuggenSpanProcessor.clockOffset} reports
+ *   it without widening {@link DebuggenSpanProcessorStats}.
+ *
+ * The request is unchanged by any of this: the same two headers, the same
+ * body shape, and the response body is still never read.
  *
  * ## Three drop rules, in this order
  *
@@ -105,6 +136,61 @@
  * starve the evidence behind it; losing dev-time telemetry is acceptable,
  * degrading the developer's dev server never is.
  *
+ * A `2xx` ends a batch's attempts whatever its body says. It is the service's
+ * decision about those bytes, and sending them again gets the same decision —
+ * so a batch the service received and stored nothing of is counted as refused
+ * rather than retried, and never as delivered (next section).
+ *
+ * ## What is read of an answer
+ *
+ * The service answers an ingest it processed with `202 { accepted, rejected? }`:
+ * `accepted` is how many of the batch's events it now holds, `rejected` every
+ * other element, omitted when zero. `202 { accepted: 0, rejected: N }` is a
+ * batch it received and refused outright — no capture open for it when it
+ * arrived, a gate the capture's plan applies, or no element it could store
+ * safely. The status cannot tell that from a batch that was stored, so the
+ * body of a `2xx` is read, and only that body:
+ *
+ * - **Bounded.** A declared `Content-Length` over
+ *   {@link MAX_ACKNOWLEDGEMENT_BYTES} is refused without a byte being read, and
+ *   the streamed read cancels the stream the moment it passes the same cap, so
+ *   a broken or hostile listener on the loopback port cannot make the preload
+ *   buffer an unbounded answer. The read shares the request's abort signal,
+ *   so {@link INGEST_TIMEOUT_MS} bounds it in time as well.
+ * - **Structural.** UTF-8 JSON, then two fields checked by hand — `accepted` a
+ *   non-negative safe integer, `rejected` absent or one — because this package
+ *   sits below `@debuggen/protocol` and may not import its schema. Other keys
+ *   are ignored, so a service that learns to say more does not make every
+ *   answer unreadable. The counts are clamped to the batch that was posted —
+ *   `accepted` to at most its size, `rejected` always the remainder — so no
+ *   answer can make this process count more events than it sent.
+ * - **Accounted, never retried.** Accepted events land on
+ *   {@link DebuggenSpanProcessorStats.postedEvents}, refused ones on
+ *   {@link DebuggenSpanProcessorStats.droppedRejectedByService}, and a batch of
+ *   which nothing was stored on {@link DebuggenSpanProcessorStats.refusedBatches}
+ *   instead of {@link DebuggenSpanProcessorStats.postedBatches}.
+ * - **Tolerant of silence.** A `2xx` whose body is absent, empty, oversized,
+ *   unreadable or not an acknowledgement is an answer that says nothing about
+ *   counts. The batch is counted as posted in full, as every `2xx` once was,
+ *   and also on {@link DebuggenSpanProcessorStats.unacknowledgedBatches}, so the
+ *   assumption is visible rather than silent.
+ * - **Never repeated.** The body is not logged, echoed or attached to an
+ *   error. Diagnostics carry the clamped counts and a fixed reason word.
+ *
+ * The body of a non-`2xx` answer is still never read. Its status is the whole
+ * decision — retry, give up, or stop the transport — and an error body can
+ * quote a path or a message this module has no business holding, so it is
+ * cancelled unread to free the connection.
+ *
+ * Refusals are a degraded capture the developer can act on, and also a
+ * condition that repeats on every batch for as long as its cause lasts, so
+ * they are summarised rather than narrated: the counts accumulate, and one
+ * warning carrying them is written at most once per drain and no more often
+ * than {@link REFUSAL_WARNING_INTERVAL_MS}. Nothing is lost to the interval —
+ * a suppressed window's counts travel in the next warning — and the final
+ * drain of `shutdown()` writes whatever is still unreported. Each batch's own
+ * answer is recorded at `debug`.
+ *
  * ## A refused credential stops the transport, for good
  *
  * A `401` or a `403` from the ingest endpoint is not a failed batch, it is the
@@ -139,8 +225,9 @@
  * blocking gate, and a token in a dev-server terminal outlives the process it
  * belonged to by as long as the scrollback does. Diagnostics name the endpoint
  * (which `./config.ts` has already guaranteed carries no credentials), the
- * status code and counts — and every message is passed through a scrub that
- * removes the token should a foreign error text ever quote it.
+ * status code and counts — never the body of an answer — and every message is
+ * passed through a scrub that removes the token should a foreign error text
+ * ever quote it.
  *
  * Where the credential may travel is checked as well as how it is written. The
  * constructor re-applies `./config.ts`'s trust boundary
@@ -158,10 +245,13 @@
  * ```
  */
 
+import { nowEpochMs } from '@debuggen/shared';
 import type { Logger } from '@debuggen/shared';
 import type { Context, Span } from '@opentelemetry/api';
 import type { ReadableSpan, SpanProcessor } from '@opentelemetry/sdk-trace-base';
 
+import { ClockOffsetEstimator } from '../schema/clock-offset.js';
+import type { ClockOffsetSnapshot } from '../schema/clock-offset.js';
 import type { TelemetryEventIngress } from '../schema/event.js';
 import { QUERY_KINDS } from '../schema/kinds.js';
 import type { TelemetryKind } from '../schema/kinds.js';
@@ -189,9 +279,11 @@ import type { ConvertContext, DatabaseSpanSource, SeqAllocator } from './convert
  * Derived tunables
  *
  * `./config.ts` owns the vocabulary — batch size, flush interval, buffer cap,
- * ingest timeout, backoff envelope. The three constants below are *derived*
+ * ingest timeout, backoff envelope. The four constants below are *derived*
  * from it rather than invented, so a change to the envelope moves them too and
- * no number in this file stands on its own.
+ * no tunable in this file stands on its own. What follows them — the two
+ * status tables and the acknowledgement's byte bound — describes the ingest
+ * contract rather than the envelope, and says so where it is declared.
  * ---------------------------------------------------------------------------
  */
 
@@ -234,6 +326,23 @@ export const MAX_DRAIN_BATCHES = Math.ceil(MAX_BUFFERED_EVENTS / BATCH_MAX_EVENT
 export const SHUTDOWN_FLUSH_DEADLINE_MS = INGEST_TIMEOUT_MS;
 
 /**
+ * Milliseconds that must pass between two warnings about events the service
+ * received and did not store.
+ *
+ * The backoff ceiling, {@link RECONNECT_MAX_MS}: the longest this transport
+ * ever waits before repeating an attempt is also the shortest interval at
+ * which it repeats a summary. A refusal is a condition that lasts — a service
+ * with no capture open for this process refuses every batch until one opens —
+ * and with a one-second flush window a per-drain warning would still be a line
+ * a second in the developer's terminal.
+ *
+ * The interval suppresses lines, never counts: what a suppressed drain refused
+ * is carried into the next warning, and the final drain of
+ * {@link DebuggenSpanProcessor.shutdown} writes the remainder regardless.
+ */
+export const REFUSAL_WARNING_INTERVAL_MS = RECONNECT_MAX_MS;
+
+/**
  * HTTP statuses that are worth another attempt even though they are `4xx`.
  *
  * `408 Request Timeout` and `429 Too Many Requests` describe a moment, not the
@@ -259,6 +368,20 @@ export const RETRYABLE_CLIENT_STATUSES: ReadonlySet<number> = new Set([408, 429]
  * is what makes a status added here covered by the existing cases.
  */
 export const AUTH_REJECTED_STATUSES: ReadonlySet<number> = new Set([401, 403]);
+
+/**
+ * Bytes of a `2xx` answer's body this module will read as an acknowledgement.
+ *
+ * The acknowledgement is `{ accepted, rejected? }` — two small integers, a few
+ * dozen bytes — so 4 KiB is two orders of magnitude of headroom and still a
+ * bound nothing listening on the loopback port can talk past. A declared
+ * `Content-Length` above it is refused unread, and a streamed body is cancelled
+ * the moment it passes it. Either way the batch falls back to being counted as
+ * posted and unacknowledged, never to an exception or a retry.
+ *
+ * Exported so the suite drives the real bound rather than a copy of it.
+ */
+export const MAX_ACKNOWLEDGEMENT_BYTES = 4 * 1024;
 
 /*
  * ---------------------------------------------------------------------------
@@ -441,6 +564,25 @@ export interface DebuggenSpanProcessorOptions {
    * envelope should be able to pin it to either extreme.
    */
   readonly random?: (() => number) | undefined;
+
+  /**
+   * The process clock the clock-offset samples are read from, in epoch
+   * milliseconds; defaults to `@debuggen/shared`'s `nowEpochMs` (`Date.now()`).
+   *
+   * It must be the clock event times come from, or the offset would describe a
+   * different clock than the one it is recorded next to: OpenTelemetry stamps a
+   * span's start from `Date.now()`, and `./convert.ts` converts that `hrTime`
+   * without adjustment. Injectable so a suite can place the two readings
+   * around a post exactly and assert the resulting estimate to the
+   * millisecond. Optional, and `register.ts` does not pass it.
+   *
+   * @example Pinning the clock in a test
+   * ```ts
+   * let now = 1_700_000_000_000;
+   * new DebuggenSpanProcessor({ gate, config, fetchImpl, now: () => now });
+   * ```
+   */
+  readonly now?: (() => number) | undefined;
 }
 
 /**
@@ -550,11 +692,57 @@ export interface DebuggenSpanProcessorStats {
   /** Events still buffered when the shutdown flush ran out of its deadline. */
   readonly droppedAtShutdown: number;
 
-  /** Batches the service accepted with a `2xx`. */
+  /**
+   * Batches the service answered with a `2xx` and stored at least one event
+   * of.
+   *
+   * A batch whose acknowledgement said `accepted: 0` is not here but on
+   * {@link refusedBatches}. A `2xx` without a readable acknowledgement is here,
+   * taken as stored in full, and also on {@link unacknowledgedBatches}.
+   */
   readonly postedBatches: number;
 
-  /** Events inside those batches. */
+  /**
+   * Events the service acknowledged storing: each acknowledgement's
+   * `accepted`, clamped to its batch, or the whole batch where the answer
+   * carried no readable acknowledgement.
+   */
   readonly postedEvents: number;
+
+  /**
+   * Events the service answered a `2xx` for and did not store: each
+   * acknowledgement's `rejected`, clamped to its batch.
+   *
+   * The service received them and dropped them — no capture was open for this
+   * process when they arrived, a gate of the capture's plan refused them, or
+   * they could not be stored safely. A `2xx` is the service's decision about
+   * those bytes, so none of them is retried. Disjoint from
+   * {@link droppedFailedBatch}, which counts events that never got an answer
+   * the service stood behind.
+   */
+  readonly droppedRejectedByService: number;
+
+  /**
+   * Batches the service answered with a `2xx` and stored nothing of
+   * (`accepted: 0` with `rejected` above zero).
+   *
+   * Disjoint from {@link postedBatches} and from {@link failedBatches}: the
+   * batch was delivered and refused, which is neither a success nor a
+   * transport failure. Its events are on {@link droppedRejectedByService}.
+   */
+  readonly refusedBatches: number;
+
+  /**
+   * Batches answered with a `2xx` whose body was absent, empty, larger than
+   * {@link MAX_ACKNOWLEDGEMENT_BYTES}, unreadable, or not an acknowledgement.
+   *
+   * Each is also on {@link postedBatches} with all of its events on
+   * {@link postedEvents}: an answer that says nothing about counts is read as
+   * "stored", which is what every `2xx` was taken to mean before the
+   * acknowledgement was read. Non-zero means the delivered figures include
+   * that assumption and are an upper bound.
+   */
+  readonly unacknowledgedBatches: number;
 
   /** Batches abandoned after every permitted attempt failed. */
   readonly failedBatches: number;
@@ -750,13 +938,16 @@ function readSpanAttributes(span: ReadableSpan): Readonly<Record<string, unknown
 const EMPTY_ATTRIBUTES: Readonly<Record<string, unknown>> = Object.freeze({});
 
 /**
- * Release a response body so the underlying socket can be reused.
+ * Release a non-`2xx` response's body, unread, so the underlying socket can be
+ * reused.
  *
- * This module never reads a response: the status is the whole answer, and an
- * error body from the service could quote a path or a message this module has
- * no business logging. An unconsumed body, however, keeps its connection
- * checked out until the garbage collector notices, so it is cancelled
- * explicitly.
+ * The only body this module reads is a `2xx` acknowledgement, through
+ * {@link readIngestAcknowledgement}; the `Date` header of every answer is read
+ * only as a clock sample. Any other answer is decided by its status alone, and
+ * its body — an error payload from the service, or whatever a foreign listener
+ * sent — could quote a path or a message this module has no business holding,
+ * let alone logging. An unconsumed body, however, keeps its connection checked
+ * out until the garbage collector notices, so it is cancelled explicitly.
  *
  * @param response The settled response.
  */
@@ -769,6 +960,319 @@ async function releaseResponseBody(response: Response): Promise<void> {
   } catch {
     // Already consumed, already cancelled, or a response double with no stream.
   }
+}
+
+/**
+ * What the service's `2xx` answer said about one batch, clamped to that batch.
+ *
+ * `accepted + rejected` is always the batch size. `accepted` is the service's
+ * count capped at the events posted, and `rejected` is the remainder: the
+ * service's own `rejected` is validated but never preferred over that
+ * arithmetic, because the two disagree only when one of them is wrong, and
+ * `accepted` — "the store now holds these" — is the count the service takes
+ * from what it actually wrote. Every event not stored is, from this process's
+ * side, an event not delivered.
+ */
+interface IngestAcknowledgement {
+  /** Events of the batch the service now holds. */
+  readonly accepted: number;
+  /** Events of the batch the service received and did not store. */
+  readonly rejected: number;
+  /** Whether the declared counts had to be corrected to fit the batch. */
+  readonly clamped: boolean;
+}
+
+/**
+ * Why a `2xx` answer yielded no acknowledgement.
+ *
+ * A closed vocabulary, so a diagnostic can say which case applied without
+ * quoting a byte of what the answer contained.
+ */
+type UnacknowledgedReason =
+  /** No body at all: a `204`, or a service that answers with a status only. */
+  | 'no-body'
+  /** A body of zero bytes. */
+  | 'empty'
+  /** A declared or streamed length above {@link MAX_ACKNOWLEDGEMENT_BYTES}. */
+  | 'oversized'
+  /**
+   * A stream that errored, was already locked, yielded something other than
+   * bytes, or was still arriving when the request's deadline passed.
+   */
+  | 'unreadable'
+  /** Bytes that are not UTF-8 JSON. */
+  | 'malformed'
+  /** JSON that is not `{ accepted, rejected? }` with non-negative safe integers. */
+  | 'unrecognised';
+
+/** A `2xx` answer that carried no usable acknowledgement, and which case applied. */
+interface Unacknowledged {
+  readonly kind: 'unacknowledged';
+  readonly reason: UnacknowledgedReason;
+}
+
+/** What reading a `2xx` answer's body concluded. */
+type AcknowledgementReading =
+  | { readonly kind: 'acknowledged'; readonly acknowledgement: IngestAcknowledgement }
+  | Unacknowledged;
+
+/** The body of a `2xx` answer as text, or why there is none worth parsing. */
+type AcknowledgementText = { readonly kind: 'text'; readonly text: string } | Unacknowledged;
+
+/**
+ * The reading for an answer that carried no usable acknowledgement.
+ *
+ * @param reason Which case applied.
+ */
+function unacknowledged(reason: UnacknowledgedReason): Unacknowledged {
+  return { kind: 'unacknowledged', reason };
+}
+
+/**
+ * Whether a parsed JSON value is a count: a non-negative safe integer.
+ *
+ * `Number.isSafeInteger` refuses `NaN`, the infinities (which is what JSON's
+ * `1e400` parses to), fractions and anything past 2^53, so a count that passes
+ * can be added to a counter without losing precision.
+ *
+ * @param value The value to judge.
+ */
+function isCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+/**
+ * The response's declared `Content-Length`, when it declares a usable one.
+ *
+ * A value that is not a plain run of digits — absent, a list, a sign, a
+ * fraction — is treated as undeclared, which leaves the streamed cap in
+ * {@link readAcknowledgementText} as the bound. A run of digits too long to be a
+ * safe integer is certainly over the cap and is answered as infinity.
+ *
+ * @param headers The response's headers.
+ * @returns The declared length in bytes, or `undefined`.
+ */
+function declaredContentLength(headers: Headers): number | undefined {
+  const declared = headers.get('content-length');
+  if (declared === null) {
+    return undefined;
+  }
+  const digits = declared.trim();
+  if (!/^\d+$/.test(digits)) {
+    return undefined;
+  }
+  const length = Number(digits);
+  return Number.isSafeInteger(length) ? length : Number.POSITIVE_INFINITY;
+}
+
+/**
+ * Cancel a reader's stream without waiting on it and without throwing.
+ *
+ * Not awaited on purpose: cancelling is how this module lets go of an answer
+ * it has stopped reading, and a stream whose cancellation never settled would
+ * otherwise hold the drain chain — and every batch behind it — hostage.
+ *
+ * @param reader The reader, or `undefined` when none was acquired.
+ */
+function cancelReader(reader: ReadableStreamDefaultReader<Uint8Array> | undefined): void {
+  if (reader === undefined) {
+    return;
+  }
+  try {
+    reader.cancel().catch(() => {
+      // Already closed or errored: there is nothing left to release.
+    });
+  } catch {
+    // A reader double whose `cancel` throws synchronously holds nothing either.
+  }
+}
+
+/**
+ * Read a `2xx` answer's body as text, bounded in bytes and in time.
+ *
+ * The byte bound is {@link MAX_ACKNOWLEDGEMENT_BYTES}, enforced twice: a
+ * declared `Content-Length` above it is refused before the stream is touched,
+ * and the streamed total is checked after every chunk, so a body that lies
+ * about its length or declares none still cannot be read past the cap. The
+ * time bound is the request's own abort signal: when it fires the reader is
+ * cancelled, which settles a pending read, and whatever had arrived is
+ * discarded as a prefix rather than parsed as an answer. Every early exit
+ * cancels the stream so the connection is released.
+ *
+ * @param response A settled response whose status is `2xx`.
+ * @param signal The request's abort signal.
+ * @returns The body's text, or why there is none.
+ */
+async function readAcknowledgementText(
+  response: Response,
+  signal: AbortSignal,
+): Promise<AcknowledgementText> {
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  const cancelOnAbort = (): void => {
+    cancelReader(reader);
+  };
+
+  try {
+    const body: ReadableStream<Uint8Array> | null = response.body;
+    if (body === null) {
+      return unacknowledged('no-body');
+    }
+    if (body.locked) {
+      return unacknowledged('unreadable');
+    }
+
+    const declared = declaredContentLength(response.headers);
+    if (declared !== undefined && declared > MAX_ACKNOWLEDGEMENT_BYTES) {
+      body.cancel().catch(() => {
+        // Nothing was read and nothing will be; a failed cancel holds nothing.
+      });
+      return unacknowledged('oversized');
+    }
+
+    reader = body.getReader();
+    signal.addEventListener('abort', cancelOnAbort, { once: true });
+
+    const chunks: Uint8Array[] = [];
+    let received = 0;
+    for (;;) {
+      if (signal.aborted) {
+        cancelReader(reader);
+        return unacknowledged('unreadable');
+      }
+      const chunk = await reader.read();
+      if (chunk.done) {
+        break;
+      }
+      const value: unknown = chunk.value;
+      if (!(value instanceof Uint8Array)) {
+        cancelReader(reader);
+        return unacknowledged('unreadable');
+      }
+      received += value.byteLength;
+      if (received > MAX_ACKNOWLEDGEMENT_BYTES) {
+        cancelReader(reader);
+        return unacknowledged('oversized');
+      }
+      chunks.push(value);
+    }
+
+    // A deadline that fired mid-read cancelled the stream, and a cancelled
+    // stream ends a read exactly as a complete one does. What arrived is then
+    // a prefix of the answer, not the answer.
+    if (signal.aborted) {
+      return unacknowledged('unreadable');
+    }
+    if (received === 0) {
+      return unacknowledged('empty');
+    }
+
+    const bytes = new Uint8Array(received);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+
+    try {
+      return { kind: 'text', text: new TextDecoder('utf-8', { fatal: true }).decode(bytes) };
+    } catch {
+      return unacknowledged('malformed');
+    }
+  } catch {
+    // A stream that errored mid-read, a `getReader` that refused, or a
+    // response double whose getters threw. The answer is unreadable, never an
+    // exception on the drain.
+    cancelReader(reader);
+    return unacknowledged('unreadable');
+  } finally {
+    try {
+      signal.removeEventListener('abort', cancelOnAbort);
+    } catch {
+      // A signal double without listener support registered nothing to remove.
+    }
+  }
+}
+
+/**
+ * Validate a parsed acknowledgement by structure and clamp it to its batch.
+ *
+ * By hand, because this package sits below `@debuggen/protocol` in the
+ * package graph and may not import its schema. Structural and deliberately
+ * tolerant: the two fields this module reads must be well-formed counts, and
+ * any other key is ignored, so a service that learns to say more does not make
+ * every answer unreadable. Own properties only, so nothing inherited can stand
+ * in for a count the answer did not carry.
+ *
+ * @param value The parsed JSON.
+ * @param eventCount Events in the batch the answer is about.
+ * @returns The clamped acknowledgement, or `undefined` for anything else.
+ */
+function toIngestAcknowledgement(
+  value: unknown,
+  eventCount: number,
+): IngestAcknowledgement | undefined {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return undefined;
+  }
+  const record = value as Readonly<Record<string, unknown>>;
+
+  const declaredAccepted: unknown = Object.hasOwn(record, 'accepted') ? record.accepted : undefined;
+  if (!isCount(declaredAccepted)) {
+    return undefined;
+  }
+  const declaredRejected: unknown = Object.hasOwn(record, 'rejected') ? record.rejected : undefined;
+  if (declaredRejected !== undefined && !isCount(declaredRejected)) {
+    return undefined;
+  }
+
+  const size = isCount(eventCount) ? eventCount : 0;
+  // `Math.max` with `0` first also turns a JSON `-0` into `+0`, so no counter
+  // ever holds a negative zero.
+  const accepted = Math.max(0, Math.min(declaredAccepted, size));
+  const rejected = size - accepted;
+
+  return {
+    accepted,
+    rejected,
+    clamped: declaredAccepted !== accepted || (declaredRejected ?? 0) !== rejected,
+  };
+}
+
+/**
+ * Read the acknowledgement of a `2xx` answer, and never throw.
+ *
+ * The one place this module reads a response body (module overview, *What is
+ * read of an answer*). The text goes no further than `JSON.parse` and
+ * {@link toIngestAcknowledgement}; only the clamped counts and a
+ * {@link UnacknowledgedReason} leave this function, so no diagnostic can
+ * quote the body.
+ *
+ * @param response A settled response whose status is `2xx`.
+ * @param eventCount Events in the batch it answers; the counts are clamped to it.
+ * @param signal The request's abort signal; its deadline bounds the read too.
+ * @returns The acknowledgement, or why there was none.
+ */
+async function readIngestAcknowledgement(
+  response: Response,
+  eventCount: number,
+  signal: AbortSignal,
+): Promise<AcknowledgementReading> {
+  const text = await readAcknowledgementText(response, signal);
+  if (text.kind === 'unacknowledged') {
+    return text;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text.text);
+  } catch {
+    return unacknowledged('malformed');
+  }
+
+  const acknowledgement = toIngestAcknowledgement(parsed, eventCount);
+  return acknowledgement === undefined
+    ? unacknowledged('unrecognised')
+    : { kind: 'acknowledged', acknowledgement };
 }
 
 /**
@@ -789,8 +1293,15 @@ type DrainMode = 'normal' | 'final';
  * answer that will not change by being asked again — a refused credential, a
  * batch the service will not accept — and repeating it would only spend the
  * developer's time and fill their terminal.
+ *
+ * `sent` means the service answered `2xx`, and it carries what the answer's
+ * acknowledgement said: a `2xx` is final for the batch, and whether any of it
+ * was stored is the drain's to account for, not a reason to try again.
  */
-type PostOutcome = 'sent' | 'retry' | 'permanent';
+type PostOutcome =
+  | { readonly kind: 'sent'; readonly reading: AcknowledgementReading }
+  | { readonly kind: 'retry' }
+  | { readonly kind: 'permanent' };
 
 /**
  * What became of one batch, as the drain needs to account for it.
@@ -800,9 +1311,14 @@ type PostOutcome = 'sent' | 'retry' | 'permanent';
  * one the service never accepted loses them to
  * {@link DebuggenSpanProcessorStats.droppedFailedBatch}, and a summed total
  * would hide which of the two happened — the first is a defect in this
- * repository, the second is the developer's service being away.
+ * repository, the second is the developer's service being away. A `sent`
+ * batch carries its acknowledgement, which splits it between the posted and
+ * the refused counters.
  */
-type BatchOutcome = 'sent' | 'failed' | 'unserializable';
+type BatchOutcome =
+  | { readonly kind: 'sent'; readonly reading: AcknowledgementReading }
+  | { readonly kind: 'failed' }
+  | { readonly kind: 'unserializable' };
 
 /**
  * What `onStart` records about the capture a span was started in.
@@ -884,6 +1400,20 @@ export class DebuggenSpanProcessor implements SpanProcessor {
   /** The jitter source {@link computeIngestBackoffMs} is called with. */
   readonly #random: () => number;
 
+  /** The process clock clock-offset samples are read from; see the option. */
+  readonly #now: () => number;
+
+  /**
+   * This process's clock-offset estimate against the local service's `Date`
+   * header (module overview, "The clock offset").
+   *
+   * Owned by the processor because the processor lives as long as the process
+   * and is the one component that talks to the service over HTTP. Never reset:
+   * not on a capture change, not by `reopen()` — the clock it describes is the
+   * process's, and the samples behind it stay true across captures.
+   */
+  readonly #clock = new ClockOffsetEstimator();
+
   /**
    * This processor's `(producerId, captureId)`-scoped sequence.
    *
@@ -929,6 +1459,21 @@ export class DebuggenSpanProcessor implements SpanProcessor {
 
   /** Overflow drops not yet mentioned in a warning — one warning per flush window. */
   #overflowSinceWarning = 0;
+
+  /**
+   * Events the service refused that no warning has mentioned yet; written out
+   * by {@link #reportRefusals}.
+   */
+  #refusedEventsSinceWarning = 0;
+
+  /** Batches the service stored nothing of that no warning has mentioned yet. */
+  #refusedBatchesSinceWarning = 0;
+
+  /**
+   * `Date.now()` when the last refusal warning was written, or `undefined`
+   * before the first one; spaces them {@link REFUSAL_WARNING_INTERVAL_MS} apart.
+   */
+  #lastRefusalWarningAt: number | undefined;
 
   /**
    * Set when the ingest endpoint refused the credential: terminal for this
@@ -995,6 +1540,15 @@ export class DebuggenSpanProcessor implements SpanProcessor {
   /** {@link DebuggenSpanProcessorStats.postedEvents} */
   #postedEvents = 0;
 
+  /** {@link DebuggenSpanProcessorStats.droppedRejectedByService} */
+  #droppedRejectedByService = 0;
+
+  /** {@link DebuggenSpanProcessorStats.refusedBatches} */
+  #refusedBatches = 0;
+
+  /** {@link DebuggenSpanProcessorStats.unacknowledgedBatches} */
+  #unacknowledgedBatches = 0;
+
   /** {@link DebuggenSpanProcessorStats.failedBatches} */
   #failedBatches = 0;
 
@@ -1011,6 +1565,7 @@ export class DebuggenSpanProcessor implements SpanProcessor {
     this.#logger = options.logger ?? createPreloadLogger();
     this.#seq = createSeqAllocator();
     this.#random = options.random ?? Math.random;
+    this.#now = options.now ?? nowEpochMs;
 
     const resolvedFetch: typeof fetch = options.fetchImpl ?? globalThis.fetch;
     this.#fetchImpl = resolvedFetch;
@@ -1094,6 +1649,9 @@ export class DebuggenSpanProcessor implements SpanProcessor {
       droppedAtShutdown: this.#droppedAtShutdown,
       postedBatches: this.#postedBatches,
       postedEvents: this.#postedEvents,
+      droppedRejectedByService: this.#droppedRejectedByService,
+      refusedBatches: this.#refusedBatches,
+      unacknowledgedBatches: this.#unacknowledgedBatches,
       failedBatches: this.#failedBatches,
       internalErrors: this.#internalErrors,
       credentialRejected: this.#credentialRejected,
@@ -1112,6 +1670,24 @@ export class DebuggenSpanProcessor implements SpanProcessor {
    */
   get credentialRejected(): boolean {
     return this.#credentialRejected;
+  }
+
+  /**
+   * A snapshot of this process's clock-offset estimate: the value the next
+   * converted span will be stamped with (`offsetMs`), the interval it is the
+   * midpoint of, and how many samples were accepted, restarted the estimate or
+   * were rejected.
+   *
+   * A method of its own rather than members of {@link stats}, whose field names
+   * are a contract with `./control.test.ts` and whose numbers describe the
+   * transport: this one describes the process's clock, is shaped by
+   * `../schema/clock-offset.ts` so both producers report it identically, and
+   * is never reset.
+   *
+   * @returns A fresh, frozen snapshot.
+   */
+  clockOffset(): ClockOffsetSnapshot {
+    return this.#clock.snapshot();
   }
 
   /**
@@ -1231,8 +1807,14 @@ export class DebuggenSpanProcessor implements SpanProcessor {
         return;
       }
 
+      // The one field this module adds (module overview, "The clock offset"):
+      // stamped here, as the event is created, and never again — the batch
+      // body is serialised once and reused by every retry. Absent until the
+      // service has answered a post, never an explicit `undefined`.
+      const clockOffsetMs = this.#clock.estimate();
+
       this.#convertedCount += 1;
-      this.#enqueue(event);
+      this.#enqueue(clockOffsetMs === undefined ? event : { ...event, clockOffsetMs });
     } catch (error) {
       // A gate whose getter threw, or an array that refused a push. Counted,
       // logged at debug, and absolutely not raised into the application.
@@ -1547,6 +2129,10 @@ export class DebuggenSpanProcessor implements SpanProcessor {
    * posted, so an event is never sent twice, and a batch that could not be
    * delivered is dropped rather than re-queued (module overview).
    *
+   * A delivered batch is accounted by what its acknowledgement said
+   * ({@link #recordAcknowledgement}), and whatever the service refused during
+   * the drain is summarised once at its end ({@link #reportRefusals}).
+   *
    * Never throws, whatever a batch does.
    *
    * @param mode `normal` for the full attempt budget, `final` for one attempt.
@@ -1560,6 +2146,7 @@ export class DebuggenSpanProcessor implements SpanProcessor {
     // shutdown flush both resolve without touching the endpoint.
     if (this.#credentialRejected) {
       this.#discardAfterCredentialRejection();
+      this.#reportRefusals(mode);
       return;
     }
 
@@ -1570,14 +2157,13 @@ export class DebuggenSpanProcessor implements SpanProcessor {
         const batch = this.#buffer.splice(0, BATCH_MAX_EVENTS);
         const outcome = await this.#postBatch(batch, attempts);
 
-        if (outcome === 'sent') {
-          this.#postedBatches += 1;
-          this.#postedEvents += batch.length;
+        if (outcome.kind === 'sent') {
+          this.#recordAcknowledgement(batch.length, outcome.reading);
           continue;
         }
 
         this.#failedBatches += 1;
-        if (outcome === 'unserializable') {
+        if (outcome.kind === 'unserializable') {
           this.#droppedUnserializable += batch.length;
         } else {
           this.#droppedFailedBatch += batch.length;
@@ -1590,6 +2176,7 @@ export class DebuggenSpanProcessor implements SpanProcessor {
         // posted to an endpoint that has already answered `401`.
         if (this.#credentialRejected) {
           this.#discardAfterCredentialRejection();
+          this.#reportRefusals(mode);
           return;
         }
       }
@@ -1598,10 +2185,98 @@ export class DebuggenSpanProcessor implements SpanProcessor {
       this.#log('debug', 'drain failed', { error: describeError(error) });
     }
 
+    this.#reportRefusals(mode);
+
     // Events that arrived while this drain was in flight get their own window.
     // Normally the enqueue path has already armed it; this is what covers the
     // case where it could not, because the drain held the only timer slot.
     this.#armFlushTimer();
+  }
+
+  /**
+   * Account for one batch the service answered with a `2xx`.
+   *
+   * The counters stay disjoint and add up to the batch: accepted events are
+   * posted, refused ones are dropped by the service, and a batch is posted when
+   * the service stored at least one of its events or *refused* when it stored
+   * none. An answer without a readable acknowledgement keeps the meaning every
+   * `2xx` had before acknowledgements were read — the whole batch posted — and
+   * is marked as such on {@link DebuggenSpanProcessorStats.unacknowledgedBatches}.
+   *
+   * @param eventCount Events in the batch that was posted.
+   * @param reading What the answer's acknowledgement said, or why it said nothing.
+   */
+  #recordAcknowledgement(eventCount: number, reading: AcknowledgementReading): void {
+    if (reading.kind === 'unacknowledged') {
+      this.#postedBatches += 1;
+      this.#postedEvents += eventCount;
+      this.#unacknowledgedBatches += 1;
+      return;
+    }
+
+    const { accepted, rejected } = reading.acknowledgement;
+    if (accepted > 0) {
+      this.#postedBatches += 1;
+      this.#postedEvents += accepted;
+    }
+    if (rejected > 0) {
+      this.#droppedRejectedByService += rejected;
+      this.#refusedEventsSinceWarning += rejected;
+      if (accepted === 0) {
+        this.#refusedBatches += 1;
+        this.#refusedBatchesSinceWarning += 1;
+      }
+    }
+  }
+
+  /**
+   * Write the coalesced refusal warning, if the service refused anything no
+   * warning has mentioned yet and the interval allows it.
+   *
+   * Called once at the end of every drain, so a drain that posts many refused
+   * batches writes at most one line. A `normal` drain also waits out
+   * {@link REFUSAL_WARNING_INTERVAL_MS} since the last line, and what it holds
+   * back stays in the pending counts for the next one; the `final` drain of
+   * `shutdown()` writes regardless, so a capture's end always accounts for
+   * every refusal. A clock that has moved backwards counts as the interval
+   * having passed, so a wall-clock correction cannot silence the warning.
+   *
+   * The line carries counts only — never an event, a byte of the answer, or a
+   * cause the service did not state.
+   *
+   * @param mode The mode of the drain that just finished.
+   */
+  #reportRefusals(mode: DrainMode): void {
+    const events = this.#refusedEventsSinceWarning;
+    if (events === 0) {
+      return;
+    }
+
+    const now = Date.now();
+    const last = this.#lastRefusalWarningAt;
+    if (
+      mode !== 'final' &&
+      last !== undefined &&
+      now >= last &&
+      now - last < REFUSAL_WARNING_INTERVAL_MS
+    ) {
+      return;
+    }
+
+    const fullyRefusedBatches = this.#refusedBatchesSinceWarning;
+    this.#refusedEventsSinceWarning = 0;
+    this.#refusedBatchesSinceWarning = 0;
+    this.#lastRefusalWarningAt = now;
+
+    this.#log(
+      'warn',
+      'the local service received telemetry and did not store it; the capture may have closed, or the events were not ones it accepts',
+      {
+        events,
+        fullyRefusedBatches,
+        droppedTotal: this.#droppedRejectedByService,
+      },
+    );
   }
 
   /**
@@ -1674,40 +2349,53 @@ export class DebuggenSpanProcessor implements SpanProcessor {
     maxAttempts: number,
   ): Promise<BatchOutcome> {
     if (events.length === 0) {
-      return 'sent';
+      // Nothing to send and nothing to count: an acknowledgement of zero events
+      // lands on no counter.
+      return {
+        kind: 'sent',
+        reading: {
+          kind: 'acknowledged',
+          acknowledgement: { accepted: 0, rejected: 0, clamped: false },
+        },
+      };
     }
     if (!this.#transportAvailable) {
-      return 'failed';
+      return { kind: 'failed' };
     }
     // Defence in depth. `#drain` already stops before it gets here, and this is
     // the single method that builds the credentialed request — so the guarantee
     // "no post after the endpoint refused this credential" is enforced at the
     // one place no future caller can go around.
     if (this.#credentialRejected) {
-      return 'failed';
+      return { kind: 'failed' };
     }
 
     let body: string;
     try {
       // The ingest body of AAP 0.4.2, exactly: the credential's project root
-      // and the events `./convert.ts` produced, with nothing added to either.
+      // and the events `./convert.ts` produced, carrying nothing but the
+      // `clockOffsetMs` `onEnd` stamped when each was created. Serialised once:
+      // every retry below sends these bytes, so no event is ever restamped.
       body = JSON.stringify({ projectRoot: this.#config.projectRoot, events });
     } catch (error) {
       this.#log('debug', 'a telemetry batch could not be serialised', {
         events: events.length,
         error: describeError(error),
       });
-      return 'unserializable';
+      return { kind: 'unserializable' };
     }
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       const outcome = await this.#attemptPost(body, events.length);
 
-      if (outcome === 'sent') {
-        return 'sent';
+      if (outcome.kind === 'sent') {
+        // A `2xx` ends the attempts whatever its acknowledgement says: it is the
+        // service's decision about these bytes, and resending them would get
+        // the same decision.
+        return outcome;
       }
-      if (outcome === 'permanent') {
-        return 'failed';
+      if (outcome.kind === 'permanent') {
+        return { kind: 'failed' };
       }
       if (attempt < maxAttempts) {
         await sleep(computeIngestBackoffMs(attempt, this.#random));
@@ -1718,21 +2406,34 @@ export class DebuggenSpanProcessor implements SpanProcessor {
       events: events.length,
       attempts: maxAttempts,
     });
-    return 'failed';
+    return { kind: 'failed' };
   }
 
   /**
    * One `POST` of a prepared body.
    *
    * The whole ingest contract lives in this method: the endpoint verbatim, two
-   * headers and no third, the abort signal, and no interpretation of the
-   * response beyond its status.
+   * headers and no third, the abort signal, and what is read of the answer —
+   * the status of every response, and the acknowledgement body of a `2xx`
+   * only (module overview, *What is read of an answer*) — plus its `Date`
+   * header, which is offered to the clock-offset estimate and decides nothing
+   * about the batch.
+   *
+   * The clock is read immediately before the request and immediately after its
+   * response arrives, because the service wrote its `Date` somewhere between
+   * the two. Every answer is sampled, whatever its status; a request that
+   * rejected — refused, timed out, redirected — had no answer and gives none.
    *
    * @param body The serialised `{ projectRoot, events }` payload.
-   * @param eventCount How many events it carries, for diagnostics only.
+   * @param eventCount How many events it carries: what the acknowledgement's
+   * counts are clamped to, and a diagnostic field.
    */
   async #attemptPost(body: string, eventCount: number): Promise<PostOutcome> {
     try {
+      // One deadline for the whole exchange: the request, and the read of the
+      // acknowledgement that answers it.
+      const signal = AbortSignal.timeout(INGEST_TIMEOUT_MS);
+      const sentAt = this.#readClock();
       const response = await this.#fetchImpl(this.#config.ingestUrl, {
         method: 'POST',
         headers: {
@@ -1751,21 +2452,26 @@ export class DebuggenSpanProcessor implements SpanProcessor {
         redirect: 'error',
         // Bounded, so a wedged service cannot leave a request pending and stall
         // the drain chain behind it.
-        signal: AbortSignal.timeout(INGEST_TIMEOUT_MS),
+        signal,
       });
-
-      // Nothing here reads a response body, so the stream is released rather
-      // than left to the garbage collector holding a connection.
-      await releaseResponseBody(response);
+      // Before the body is released, so the reading is as close to the
+      // response's arrival as this code can observe it.
+      const receivedAt = this.#readClock();
+      this.#observeServiceClock(response, sentAt, receivedAt);
 
       if (response.ok) {
-        this.#log('debug', 'telemetry batch accepted', {
-          events: eventCount,
-          status: response.status,
-        });
-        return 'sent';
+        // The service took the request and decided about the batch. The
+        // answer's headers are readable here whatever becomes of the body; the
+        // body is read last, because reading it consumes the stream.
+        const reading = await readIngestAcknowledgement(response, eventCount, signal);
+        this.#logAcknowledgement(response.status, eventCount, reading);
+        return { kind: 'sent', reading };
       }
 
+      // A non-`2xx` body is never read: the status is the whole decision, and
+      // the stream is released rather than left to the garbage collector
+      // holding a connection.
+      await releaseResponseBody(response);
       return this.#classifyRejection(response.status, eventCount);
     } catch (error) {
       // A refused connection, a DNS failure, an abort at the timeout, or a
@@ -1776,8 +2482,39 @@ export class DebuggenSpanProcessor implements SpanProcessor {
         events: eventCount,
         error: describeError(error),
       });
-      return 'retry';
+      return { kind: 'retry' };
     }
+  }
+
+  /**
+   * Record one `2xx` answer at `debug`: counts, the status, and a fixed reason
+   * word when there was no acknowledgement — never a byte of the body.
+   *
+   * Per batch and therefore never at `warn`; the developer-facing summary of
+   * refusals is {@link #reportRefusals}, written once per drain at most.
+   *
+   * @param status The `2xx` status.
+   * @param eventCount Events in the batch.
+   * @param reading What its acknowledgement said, or why it said nothing.
+   */
+  #logAcknowledgement(status: number, eventCount: number, reading: AcknowledgementReading): void {
+    if (reading.kind === 'unacknowledged') {
+      this.#log('debug', 'telemetry batch accepted without a readable acknowledgement', {
+        events: eventCount,
+        status,
+        reason: reading.reason,
+      });
+      return;
+    }
+
+    const { accepted, rejected, clamped } = reading.acknowledgement;
+    this.#log('debug', 'telemetry batch acknowledged', {
+      events: eventCount,
+      status,
+      accepted,
+      rejected,
+      clamped,
+    });
   }
 
   /**
@@ -1808,7 +2545,7 @@ export class DebuggenSpanProcessor implements SpanProcessor {
           { status, url: this.#config.ingestUrl },
         );
       }
-      return 'permanent';
+      return { kind: 'permanent' };
     }
 
     if (status >= 400 && status < 500 && !RETRYABLE_CLIENT_STATUSES.has(status)) {
@@ -1819,14 +2556,98 @@ export class DebuggenSpanProcessor implements SpanProcessor {
         status,
         events: eventCount,
       });
-      return 'permanent';
+      return { kind: 'permanent' };
     }
 
     this.#log('debug', 'the local service could not accept a telemetry batch', {
       status,
       events: eventCount,
     });
-    return 'retry';
+    return { kind: 'retry' };
+  }
+
+  /*
+   * -------------------------------------------------------------------------
+   * Clock offset
+   * -------------------------------------------------------------------------
+   */
+
+  /**
+   * Read the process clock for a clock sample, never throwing.
+   *
+   * Runs on the post path, so a clock that throws — only an injected one can —
+   * must cost the sample and never the batch: the reading becomes `NaN`, which
+   * the estimator counts as a rejected sample, and the failure is counted as
+   * an internal error because it is a defect in something this processor was
+   * handed.
+   *
+   * @returns Epoch milliseconds, or `NaN` when the clock gave no number.
+   */
+  #readClock(): number {
+    try {
+      const value: unknown = this.#now();
+      return typeof value === 'number' ? value : Number.NaN;
+    } catch (error) {
+      this.#internalErrors += 1;
+      this.#log('debug', 'the process clock could not be read for a clock sample', {
+        error: describeError(error),
+      });
+      return Number.NaN;
+    }
+  }
+
+  /**
+   * Offer one ingest answer's `Date` header to the clock-offset estimate.
+   *
+   * Every status counts: the service writes a `Date` on a `401` and a `503`
+   * exactly as on a `204`, and it is the service's clock either way. A
+   * response with no `Date` is no sample; one whose value is not a canonical
+   * IMF-fixdate is a rejected one. A response double with no `headers` at all
+   * — `fetchImpl` is injectable — is treated as carrying none.
+   *
+   * The first estimate and every restart are written at `debug`, with the
+   * numbers only: the offset, its interval and the sample count. Nothing here
+   * can reach the credential, and nothing here throws.
+   *
+   * @param response The settled answer, before its body is released.
+   * @param sentAt The process clock immediately before the request.
+   * @param receivedAt The process clock immediately after the answer arrived.
+   */
+  #observeServiceClock(response: Response, sentAt: number, receivedAt: number): void {
+    try {
+      const headers = (response as Partial<Response>).headers;
+      if (typeof headers?.get !== 'function') {
+        return;
+      }
+
+      const hadEstimate = this.#clock.estimate() !== undefined;
+      const outcome = this.#clock.observeHttpDate(headers.get('date'), sentAt, receivedAt);
+      const firstEstimate = outcome === 'accepted' && !hadEstimate;
+      if (outcome !== 'reset' && !firstEstimate) {
+        return;
+      }
+
+      const snapshot = this.#clock.snapshot();
+      this.#log(
+        'debug',
+        outcome === 'reset'
+          ? "the local service's clock moved against this process's; the clock offset estimate restarted"
+          : "this process's clock offset against the local service was estimated",
+        {
+          offsetMs: snapshot.offsetMs,
+          lowerBoundMs: snapshot.lowerBoundMs,
+          upperBoundMs: snapshot.upperBoundMs,
+          samples: snapshot.samples,
+        },
+      );
+    } catch (error) {
+      // A response whose header bag threw. The batch's outcome is decided by
+      // its status on the next line of the caller, not by this.
+      this.#internalErrors += 1;
+      this.#log('debug', 'the local service clock could not be sampled', {
+        error: describeError(error),
+      });
+    }
   }
 
   /*
@@ -1869,8 +2690,9 @@ export class DebuggenSpanProcessor implements SpanProcessor {
    * Two levels only. `debug` is the default for everything routine, because
    * this output lands in the developer's own dev-server terminal next to their
    * application's logs; `warn` is reserved for a degraded capture they can act
-   * on — a full buffer, a refused credential, a refused batch — which is
-   * exactly the threshold `./config.ts` documents.
+   * on — a full buffer, a refused credential, a refused batch, events the
+   * service received and did not store — which is exactly the threshold
+   * `./config.ts` documents.
    *
    * @param level `debug` for routine detail, `warn` for a degraded capture.
    * @param message Human-readable and value-free.

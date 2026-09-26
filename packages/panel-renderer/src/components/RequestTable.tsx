@@ -129,7 +129,7 @@ import type { BadgeTone, BadgeVariant } from '../primitives/Badge';
 import { Button } from '../primitives/Button';
 import { Code } from '../primitives/Code';
 import { DataTable } from '../primitives/DataTable';
-import type { DataTableColumn, DataTableSort } from '../primitives/DataTable';
+import type { DataTableColumn, DataTableColumnWidth, DataTableSort } from '../primitives/DataTable';
 import { DurationCell } from '../primitives/DurationCell';
 import { EmptyState } from '../primitives/EmptyState';
 import { ErrorState, FOCUS_KEY_ATTRIBUTE } from '../primitives/ErrorState';
@@ -419,46 +419,51 @@ const COLUMN_SORTS: Readonly<Record<string, DataQuerySort | undefined>> = {
 };
 
 /**
- * The grid track of every column, handed to `DataTable` as each column's
+ * The width ROLE of every column, handed to `DataTable` as each column's
  * `width`.
  *
- * Every track has a non-zero MINIMUM, because the minimum is what the grid
- * scrolls against: `DataTable` sums the minimums into the grid's floor, so a
+ * A role names what a column holds, never how wide it is: `DataTable` resolves
+ * each one through `DATA_TABLE_COLUMN_TRACKS` to a grid track built from the
+ * `--dg-column-min-*` floor and `--dg-column-share-*` share tokens, so this
+ * table agrees with every other table on both extension surfaces about how wide
+ * a count or a duration is, and no length is chosen here (AAP 0.6.4). Each
+ * column takes the smallest role whose floor keeps its content readable, in the
+ * vocabulary every table shares:
+ *
+ *   - `request` is `text`: the identity column holds the disclosure toggle, the
+ *     method badge, the grouping chip and a readable run of the URL, which
+ *     ellipsizes beyond that with the full value in its tooltip. It takes the
+ *     widest floor and the widest share of all the columns;
+ *   - `status` is `status`: the code badges, the Pending badge and the failure
+ *     count, which wrap onto another line rather than overflow;
+ *   - `count` (Occurrences) and `duplicates` are `count`: integer tallies, the
+ *     second with its compact duplicate badge;
+ *   - the three durations and `transferred` are `quantity`: a formatted
+ *     measurement with its unit (`999.99 ms`, `123.456 s`, a byte size);
+ *   - `initiators` is `name`: the first caller's source chip and the overflow
+ *     badge beside it.
+ *
+ * Every role has a non-zero floor, because the floor is what the grid scrolls
+ * against: `DataTable` sums the floors into the grid's own minimum width, so a
  * panel narrower than their sum scrolls horizontally with every column still
  * readable instead of squeezing the tracks until one cell paints over the next.
  * The unsized fallback used to be nine equal `minmax(0, 1fr)` tracks, in which
  * the grouping chip ran across the Status column and read as "Requ200key".
- *
- * Each minimum is sized, in `ch` of the table's own type, for the column's
- * header — the sortable one with its ordering arrow — and its widest ordinary
- * value, cell padding included:
- *
- *   - `request` holds the disclosure toggle, the method badge, the grouping
- *     chip and a readable run of about twenty characters of the URL, which
- *     ellipsizes beyond that with the full value in its tooltip;
- *   - `status` holds two code badges and a failure count on one line;
- *   - `count` holds its header and the ordering arrow, the widest header;
- *   - the three durations hold the widest form a duration formats to below a
- *     thousand seconds (`999.99 ms`, `123.456 s`), and `transferred` its header;
- *   - `initiators` holds a readable run of the first caller's chip and the
- *     overflow badge beside it.
- *
- * Spare width is shared by ratio, and mostly to the two columns whose values
- * are text of unbounded length — the request and its callers — so a wide panel
- * shows URLs and caller chips in full rather than widening columns of figures.
- * Ratios and `ch` measures only: they resolve identically in the header row
- * and in every data row, which keeps each column under its own heading, and
- * neither is a hardcoded length (AAP 0.6.4).
+ * Spare width goes mostly to the two columns whose values are text of
+ * unbounded length — the request and its callers — so a wide panel shows URLs
+ * and caller chips in full rather than widening columns of figures. A token
+ * floor and a ratio resolve identically in the header row and in every data
+ * row, which keeps each column under its own heading.
  */
-const COLUMN_TRACKS = Object.freeze({
-  request: 'minmax(44ch, 5fr)',
-  status: 'minmax(14ch, 1fr)',
-  count: 'minmax(12ch, 1fr)',
-  duplicates: 'minmax(10ch, 1fr)',
-  duration: 'minmax(11ch, 1fr)',
-  transferred: 'minmax(11ch, 1fr)',
-  initiators: 'minmax(24ch, 3fr)',
-});
+const COLUMN_WIDTHS = Object.freeze({
+  request: 'text',
+  status: 'status',
+  count: 'count',
+  duplicates: 'count',
+  duration: 'quantity',
+  transferred: 'quantity',
+  initiators: 'name',
+} satisfies Record<string, DataTableColumnWidth>);
 
 /*
  * ---------------------------------------------------------------------------
@@ -1904,7 +1909,7 @@ export function RequestTable(props: RequestTableProps): ReactElement {
         // The identity column: a reader hears the row named by its method and
         // path as they move across it.
         rowHeader: true,
-        width: COLUMN_TRACKS.request,
+        width: COLUMN_WIDTHS.request,
         // The expanded state is the grid's to report and the toggle's to carry:
         // `aria-expanded` is not valid on a `grid` row, so the row states
         // nothing and the disclosure button below exposes `meta.expanded`, with
@@ -1978,14 +1983,14 @@ export function RequestTable(props: RequestTableProps): ReactElement {
       {
         key: COLUMN_KEY_STATUS,
         header: 'Status',
-        width: COLUMN_TRACKS.status,
+        width: COLUMN_WIDTHS.status,
         cell: (group) => renderStatusCell(group),
       },
       {
         key: COLUMN_KEY_COUNT,
         header: 'Occurrences',
         align: 'end',
-        width: COLUMN_TRACKS.count,
+        width: COLUMN_WIDTHS.count,
         // The one column whose ordering the contract can express.
         sortable: true,
         defaultSortDirection: 'desc',
@@ -1999,41 +2004,41 @@ export function RequestTable(props: RequestTableProps): ReactElement {
         key: COLUMN_KEY_DUPLICATES,
         header: 'Duplicates',
         align: 'end',
-        width: COLUMN_TRACKS.duplicates,
+        width: COLUMN_WIDTHS.duplicates,
         cell: (group) => renderDuplicatesCell(group),
       },
       {
         key: COLUMN_KEY_AVERAGE,
         header: 'Average',
         align: 'end',
-        width: COLUMN_TRACKS.duration,
+        width: COLUMN_WIDTHS.duration,
         cell: (group) => <DurationCell ms={group.averageDurationMs} severity="auto" size="sm" />,
       },
       {
         key: COLUMN_KEY_SLOWEST,
         header: 'Slowest',
         align: 'end',
-        width: COLUMN_TRACKS.duration,
+        width: COLUMN_WIDTHS.duration,
         cell: (group) => <DurationCell ms={group.maxDurationMs} severity="auto" size="sm" />,
       },
       {
         key: COLUMN_KEY_TOTAL,
         header: 'Total',
         align: 'end',
-        width: COLUMN_TRACKS.duration,
+        width: COLUMN_WIDTHS.duration,
         cell: (group) => <DurationCell ms={group.totalDurationMs} severity="auto" size="sm" />,
       },
       {
         key: COLUMN_KEY_TRANSFERRED,
         header: 'Transferred',
         align: 'end',
-        width: COLUMN_TRACKS.transferred,
+        width: COLUMN_WIDTHS.transferred,
         cell: (group) => renderTransferredCell(group),
       },
       {
         key: COLUMN_KEY_INITIATORS,
         header: 'Initiated by',
-        width: COLUMN_TRACKS.initiators,
+        width: COLUMN_WIDTHS.initiators,
         cell: (group) => renderInitiatorsCell(group),
       },
     ],

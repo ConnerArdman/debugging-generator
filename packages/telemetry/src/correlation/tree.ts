@@ -35,8 +35,10 @@
  * strings, numbers and booleans:
  *
  * - **no `Map`, no `Set`, no class instance, no function** on any exported
- *   shape (the two `Set`s used inside {@link buildTraceTree} and the `Map`
- *   inside {@link ancestorsOfSpanId} are local scratch, never returned);
+ *   shape (the `Set`s used inside {@link buildTraceTree}, the ones
+ *   {@link assembleTraceTree} reads from its {@link TraceTreeAggregates} input
+ *   and the `Map` inside {@link ancestorsOfSpanId} are scratch and input,
+ *   never returned);
  * - **no parent back-reference on a node.** A child pointing back at its
  *   parent is a cycle, and `JSON.stringify` throws on one. {@link walkNode}
  *   hands the parent to its visitor instead, and {@link ancestorsOfSpanId}
@@ -493,6 +495,46 @@ export interface TraceTreeExtra {
   readonly truncated?: boolean | undefined;
 }
 
+/**
+ * The per-node aggregates of a trace, in the raw form {@link assembleTraceTree}
+ * turns into the derived fields of a {@link TraceTree}.
+ *
+ * Two producers fill one of these, and that is the reason it exists:
+ * {@link buildTraceTree} computes it with one walk of the finished roots, and
+ * the correlator's incremental extension (`extendCorrelatedTrace` in
+ * `./correlator.ts`) keeps a running copy up to date as nodes are added, so
+ * that growing a cached tree by a batch costs the batch rather than another
+ * walk of the whole trace. Both hand it to the same assembler, which is what
+ * guarantees that a tree built from scratch and a tree extended in place carry
+ * the same fields, derived the same way, **in the same key order** — the
+ * property the extension's exactness contract is stated in.
+ *
+ * It is an *input*: the sets are read, never stored on the result, so the
+ * tree stays plain JSON (see the module notes). The raw extremes are
+ * `undefined` rather than `0` when no finite value was seen, because "no
+ * reading yet" and "a reading at the epoch" must stay distinguishable while
+ * the aggregate is still being accumulated; the assembler applies the empty
+ * trace's `0` at the very end.
+ */
+export interface TraceTreeAggregates {
+  /** How many nodes the roots hold, at every depth. */
+  readonly nodeCount: number;
+  /** The greatest `depth` of any node; `0` for a single-level or empty tree. */
+  readonly maxDepth: number;
+  /** How many nodes are flagged `orphaned`. */
+  readonly orphanCount: number;
+  /** The smallest finite `event.startTime`, or `undefined` when there is none. */
+  readonly earliestStart: number | undefined;
+  /** The largest finite {@link nodeEndTime}, or `undefined` when there is none. */
+  readonly latestEnd: number | undefined;
+  /** Every tier any node reports, in any order. */
+  readonly tiers: ReadonlySet<TelemetryTier>;
+  /** Every kind any node reports, in any order. */
+  readonly kinds: ReadonlySet<TelemetryKind>;
+  /** Every producer any node came from, in any order. */
+  readonly producerIds: ReadonlySet<ProducerId>;
+}
+
 /*
  * ---------------------------------------------------------------------------
  * Attribute readers
@@ -763,6 +805,9 @@ function compareIdentifiers(left: string, right: string): number {
  * `totalDuration` is clamped at zero and rounded through the product's single
  * rounding policy so that the same trace serialises to the same digits twice.
  *
+ * The walk is this function's own; the object is assembled by
+ * {@link assembleTraceTree}, the one assembly path every tree goes through.
+ *
  * @param traceId The correlation id every event in the tree shares.
  * @param roots The root nodes, already in canonical order.
  * @param extra The facts only the builder knows; see {@link TraceTreeExtra}.
@@ -773,8 +818,6 @@ export function buildTraceTree(
   roots: readonly TraceNode[],
   extra?: TraceTreeExtra,
 ): TraceTree {
-  const rootList = roots.length === 0 ? EMPTY_NODE_LIST : [...roots];
-
   let nodeCount = 0;
   let maxDepth = 0;
   let orphanCount = 0;
@@ -784,7 +827,7 @@ export function buildTraceTree(
   const presentKinds = new Set<TelemetryKind>();
   const presentProducers = new Set<ProducerId>();
 
-  for (const root of rootList) {
+  for (const root of roots) {
     walkNode(root, (node) => {
       nodeCount += 1;
       if (node.depth > maxDepth) {
@@ -810,21 +853,86 @@ export function buildTraceTree(
     });
   }
 
-  const startTime = earliestStart ?? 0;
-  const endTime = latestEnd ?? 0;
+  return assembleTraceTree(
+    traceId,
+    roots,
+    {
+      nodeCount,
+      maxDepth,
+      orphanCount,
+      earliestStart,
+      latestEnd,
+      tiers: presentTiers,
+      kinds: presentKinds,
+      producerIds: presentProducers,
+    },
+    extra,
+  );
+}
+
+/**
+ * Assembles a {@link TraceTree} from its roots and **precomputed** aggregates:
+ * the one place a tree object is created.
+ *
+ * {@link buildTraceTree} calls it after walking the roots itself; the
+ * correlator's incremental extension calls it with aggregates it maintained as
+ * nodes were added. Keeping one assembler is what makes the two paths
+ * indistinguishable, down to the key order `JSON.stringify` emits: the literal
+ * below fixes that order, the declaration-order filters fix `tiers` and
+ * `kinds`, the code-unit sort fixes `producerIds`, and the optional
+ * `primaryRootSpanId` is added last and only when there is one — exactly as
+ * {@link buildTraceTree} has always produced them.
+ *
+ * `roots` and `extra.duplicateSpanIds` are copied, so the tree does not alias
+ * a caller's arrays. The aggregates are trusted: they describe `roots`, and it
+ * is the caller's contract — {@link buildTraceTree}'s walk, or the extension's
+ * running totals — that they do. Nothing is re-derived here, which is the
+ * point: an extension that re-walked the tree to assemble it would cost the
+ * whole trace again.
+ *
+ * @param traceId The correlation id every event in the tree shares.
+ * @param roots The root nodes, already in canonical order.
+ * @param aggregates The node aggregates of `roots`; see
+ * {@link TraceTreeAggregates}.
+ * @param extra The facts only the builder knows; see {@link TraceTreeExtra}.
+ * @returns A fully derived, JSON-serialisable tree.
+ *
+ * @example
+ * ```ts
+ * const tree = assembleTraceTree(traceId, [root], {
+ *   nodeCount: 1,
+ *   maxDepth: 0,
+ *   orphanCount: 0,
+ *   earliestStart: root.event.startTime,
+ *   latestEnd: nodeEndTime(root),
+ *   tiers: new Set([root.event.tier]),
+ *   kinds: new Set([root.event.kind]),
+ *   producerIds: new Set([root.event.producerId]),
+ * });
+ * ```
+ */
+export function assembleTraceTree(
+  traceId: TraceId,
+  roots: readonly TraceNode[],
+  aggregates: TraceTreeAggregates,
+  extra?: TraceTreeExtra,
+): TraceTree {
+  const rootList = roots.length === 0 ? EMPTY_NODE_LIST : [...roots];
+  const startTime = aggregates.earliestStart ?? 0;
+  const endTime = aggregates.latestEnd ?? 0;
 
   const tree: MutableTraceTree = {
     traceId,
     roots: rootList,
-    nodeCount,
-    maxDepth,
+    nodeCount: aggregates.nodeCount,
+    maxDepth: aggregates.maxDepth,
     startTime,
     endTime,
     totalDuration: roundMs(clampNonNegative(endTime - startTime)),
-    orphanCount,
-    tiers: TELEMETRY_TIERS.filter((tier) => presentTiers.has(tier)),
-    kinds: TELEMETRY_KINDS.filter((kind) => presentKinds.has(kind)),
-    producerIds: [...presentProducers].sort(compareIdentifiers),
+    orphanCount: aggregates.orphanCount,
+    tiers: TELEMETRY_TIERS.filter((tier) => aggregates.tiers.has(tier)),
+    kinds: TELEMETRY_KINDS.filter((kind) => aggregates.kinds.has(kind)),
+    producerIds: [...aggregates.producerIds].sort(compareIdentifiers),
     duplicateSpanIds:
       extra?.duplicateSpanIds === undefined ? EMPTY_STRING_LIST : [...extra.duplicateSpanIds],
     truncated: extra?.truncated ?? false,

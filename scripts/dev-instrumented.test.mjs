@@ -6,29 +6,30 @@
  * contracts it does not own:
  *
  *  1. CALLER/DEFINER CONTRACT. {@link PROTOCOL_ROUTES} below is the definer
- *     side, transcribed from the protocol (AAP 0.4.2 `POST /dev-server/launch`
- *     `{ projectRoot, command? }` → `{ devServerUrl, pid }`,
- *     `POST /dev-server/stop`, `GET /health`; AAP 0.5.6 for who must present a
- *     credential). It is written from the specification and NEVER from the
- *     module under test — deriving the accepted routes from the caller's own
- *     exports would make the pair self-consistent and blind to exactly the
- *     drift this suite exists to catch. `SERVICE_ROUTES` is then asserted
- *     against it, so a rename on either side fails.
+ *     side, transcribed from the specification: the protocol's route table
+ *     (AAP 0.4.2 `POST /dev-server/launch` `{ projectRoot, command? }` →
+ *     `{ devServerUrl, pid }`, `POST /dev-server/stop`, `GET /health`), the
+ *     service's own credential route (`POST /dev-server/credential`
+ *     `{ projectRoot }` → `{ token, expiresAt }`, defined by
+ *     `apps/local-service/src/dev-server/launcher.ts`), and AAP 0.5.6 for who
+ *     must present a credential. It is written from those definitions and
+ *     NEVER from the module under test — deriving the accepted routes from the
+ *     caller's own exports would make the pair self-consistent and blind to
+ *     exactly the drift this suite exists to catch. `SERVICE_ROUTES` is then
+ *     asserted against it, so a rename on either side fails.
  *
  *     The definer is enforced the way a service enforces it: unknown path 404,
  *     wrong method 405, missing or wrong bearer credential 401, wrong
  *     content-type 415, and a body that is not exactly `{ projectRoot }` (plus
- *     the optional `command`) 400. Every rejection is recorded, and the
- *     end-to-end cases assert the caller provokes none of them.
+ *     the launch route's optional `command`) 400. Every rejection is recorded,
+ *     and the end-to-end cases assert the caller provokes none of them.
  *
- *     `agrees with the protocol definition once it lands` closes the loop when
- *     the real definer exists: as soon as `packages/protocol/src/http.ts` or a
- *     route module under `apps/local-service/src/server/routes/` is present,
- *     that test reads it and requires the same three paths. At this boundary
- *     neither file is in the tree (the service is a later boundary's
- *     deliverable), which the test asserts explicitly rather than passing
- *     vacuously, and an in-process run against the real hono app with its auth
- *     middleware belongs to that boundary's own integration suite
+ *     `agrees with the definers of those routes` closes the loop against the
+ *     real definers: it reads `packages/protocol/src/http.ts` for the three
+ *     table routes, and the credential route's path and strict request and
+ *     response schemas from whichever of the launcher or the protocol declares
+ *     them. An in-process run against the real hono app with its auth
+ *     middleware belongs to the service's own integration suite
  *     (`apps/local-service/test/integration/**`, AAP 0.8.3).
  *
  *  2. ENVIRONMENT CONTRACT. `.env.example` claims to document every variable
@@ -59,24 +60,29 @@ import {
   SERVICE_ROUTES,
   awaitShutdownSignal,
   buildChildEnv,
+  buildLaunchCommand,
   describeToken,
+  escapeCmdArgument,
+  escapeCmdCommand,
   isLoopbackHostname,
   launchDevServer,
   main,
   parseArgs,
-  probeServiceReachability,
+  requestServerAgentCredential,
+  resolveProject,
   resolveServiceBase,
   stopDevServer,
   usage,
+  wrapForPlatform,
 } from './dev-instrumented.mjs';
 
 /**
- * The definer's contract, transcribed from the protocol rather than imported
- * from the module under test.
+ * The definer's contract, transcribed from the protocol and from the service's
+ * launcher rather than imported from the module under test.
  *
  * `authenticated` follows AAP 0.5.6: `GET /health` is one of the two
  * unauthenticated routes, and everything else requires a bearer credential —
- * for these two routes the editor credential the service wrote to
+ * for these three routes the editor credential the service wrote to
  * `$DEBUGGEN_HOME/auth.json`.
  */
 const PROTOCOL_ROUTES = Object.freeze({
@@ -101,19 +107,34 @@ const PROTOCOL_ROUTES = Object.freeze({
     required: Object.freeze(['projectRoot']),
     optional: Object.freeze([]),
   }),
+  // `DEV_SERVER_CREDENTIAL_PATH` / `devServerCredentialRequestSchema` in
+  // apps/local-service/src/dev-server/launcher.ts: a strict `{ projectRoot }`,
+  // editor role only, answered with a strict `{ token, expiresAt }`.
+  credential: Object.freeze({
+    method: 'POST',
+    path: '/dev-server/credential',
+    authenticated: true,
+    required: Object.freeze(['projectRoot']),
+    optional: Object.freeze([]),
+  }),
 });
 
-/** Every route of the contract, in the order the protocol table lists them. */
+/**
+ * Every route of the contract: the protocol table's three in the order it
+ * lists them, then the service's credential route.
+ */
 const ALL_PROTOCOL_ROUTES = Object.freeze([
   PROTOCOL_ROUTES.health,
   PROTOCOL_ROUTES.launch,
   PROTOCOL_ROUTES.stop,
+  PROTOCOL_ROUTES.credential,
 ]);
 
 /** Shorthands for expectations, spelled from the contract above. */
 const HEALTH = PROTOCOL_ROUTES.health.path;
 const LAUNCH = PROTOCOL_ROUTES.launch.path;
 const STOP = PROTOCOL_ROUTES.stop.path;
+const CREDENTIAL = PROTOCOL_ROUTES.credential.path;
 
 /** Repository root, derived from this file's location. */
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -128,6 +149,19 @@ const SCRIPT_SOURCE = fs.readFileSync(path.join(REPO_ROOT, 'scripts/dev-instrume
  * test has no reason to carry a fixed one.
  */
 const EDITOR_TOKEN = `editor-credential-${randomUUID()}`;
+
+/**
+ * The server-agent credential the stub service mints, generated per run for
+ * the same reason as {@link EDITOR_TOKEN}.
+ */
+const SERVER_AGENT_TOKEN = `server-agent-credential-${randomUUID()}`;
+
+/**
+ * How far in the future the stub's credential expires: the service's default
+ * lifetime for a credential minted through the credential route
+ * (`DEFAULT_CLI_CREDENTIAL_TTL_MS`, twelve hours).
+ */
+const CREDENTIAL_LIFETIME_MS = 12 * 60 * 60 * 1000;
 
 /** What the stub service reports for a successful launch. */
 const LAUNCHED = Object.freeze({ devServerUrl: 'http://localhost:3000', pid: 4242 });
@@ -167,6 +201,7 @@ function captureStream() {
  * @property {Array<{ path: string, status: number, reason: string }>} rejections
  *   every request the contract refused
  * @property {() => string[]} routes `METHOD /path` for each request, in order
+ * @property {number} expiresAt the `expiresAt` a default credential answer carries
  * @property {() => Promise<void>} close shut the server down
  */
 
@@ -180,6 +215,12 @@ function captureStream() {
  * @param {number} [options.launchStatus] status for the launch route
  * @param {number} [options.stopStatus] status for the stop route
  * @param {Record<string, unknown>} [options.launchBody] body the launch route answers with
+ * @param {number} [options.credentialStatus] status for the credential route
+ * @param {unknown} [options.credentialBody] body the credential route answers
+ *   with, whatever its status; by default `{ token, expiresAt }` on 200 and a
+ *   `{ code, message }` error otherwise
+ * @param {string} [options.credentialText] a raw `text/plain` body for the
+ *   credential route instead of JSON
  * @returns {Promise<StubService>}
  */
 async function startStubService(options = {}) {
@@ -187,6 +228,14 @@ async function startStubService(options = {}) {
   const launchStatus = options.launchStatus ?? 200;
   const stopStatus = options.stopStatus ?? 200;
   const launchBody = options.launchBody ?? LAUNCHED;
+  const credentialStatus = options.credentialStatus ?? 200;
+  const expiresAt = Date.now() + CREDENTIAL_LIFETIME_MS;
+  const credentialBody =
+    'credentialBody' in options
+      ? options.credentialBody
+      : credentialStatus === 200
+        ? { token: SERVER_AGENT_TOKEN, expiresAt }
+        : { code: 'UNAUTHORIZED', message: 'credential refused' };
 
   /** @type {RecordedRequest[]} */
   const requests = [];
@@ -286,6 +335,15 @@ async function startStubService(options = {}) {
         answer(launchStatus, launchStatus === 200 ? launchBody : { message: 'launch refused' });
         return;
       }
+      if (requestPath === CREDENTIAL) {
+        if (options.credentialText !== undefined) {
+          res.writeHead(credentialStatus, { 'content-type': 'text/plain' });
+          res.end(options.credentialText);
+          return;
+        }
+        answer(credentialStatus, credentialBody);
+        return;
+      }
       answer(stopStatus, stopStatus === 200 ? { stopped: true } : { message: 'stop refused' });
     });
   });
@@ -299,6 +357,7 @@ async function startStubService(options = {}) {
     requests,
     rejections,
     routes: () => requests.map((request) => `${request.method} ${request.path}`),
+    expiresAt,
     close: () =>
       new Promise((resolve) => {
         server.closeAllConnections();
@@ -326,6 +385,8 @@ const temporaryRoots = [];
  *
  * @param {object} [options]
  * @param {boolean} [options.withCredential] write `auth.json`
+ * @param {string} [options.packageName] the target's `package.json` `name`
+ *   (default `target-app`)
  * @returns {Promise<Fixture>}
  */
 async function createFixture(options = {}) {
@@ -342,7 +403,7 @@ async function createFixture(options = {}) {
   await fs.promises.mkdir(projectDir, { recursive: true });
   await fs.promises.writeFile(
     path.join(projectDir, 'package.json'),
-    `${JSON.stringify({ name: 'target-app', private: true, scripts: { dev: 'next dev' } }, null, 2)}\n`,
+    `${JSON.stringify({ name: options.packageName ?? 'target-app', private: true, scripts: { dev: 'next dev' } }, null, 2)}\n`,
     'utf8',
   );
 
@@ -369,11 +430,11 @@ async function createFixture(options = {}) {
 
 /**
  * Put a fake package manager on a `PATH` of our own, so the local spawn mode
- * can be driven as a whole — probe, banner, spawn, exit code — without running
- * a real development server.
+ * can be driven as a whole — pre-flight, credential, banner, spawn, exit code —
+ * without running a real development server.
  *
  * It stands in for `pnpm`, which is what {@link buildLaunchCommand} looks up,
- * and it records the argv, working directory and the three injected variables
+ * and it records the argv, working directory and the four injected variables
  * to a file rather than to stdout: `runDevServer` spawns with
  * `stdio: 'inherit'`, so anything it printed would land in the test runner's
  * own output.
@@ -432,8 +493,8 @@ async function createFakeDevServer(fixture, options = {}) {
 /**
  * A loopback address with nothing listening on it: a server is bound to an
  * ephemeral port only to learn a port number, then closed again. Used for the
- * "no local service is running" cases, which are the point of the local spawn
- * mode.
+ * "no local service is running" cases, which every mode — `--spawn-local`
+ * included — must refuse before it launches or spawns anything.
  *
  * @returns {Promise<string>} base URL of an address that refuses connections
  */
@@ -514,20 +575,96 @@ afterAll(async () => {
   }
 });
 
+/**
+ * Escape a literal for use inside a regular expression.
+ *
+ * @param {string} value
+ * @returns {string}
+ */
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+}
+
+/**
+ * The top-level keys of a `const <name> = z.strictObject({ ... })` declaration
+ * in TypeScript source, or `undefined` when the source declares no such strict
+ * object. Read from the text rather than imported, so the check needs no build
+ * of the definer: nested calls, arrays and objects are skipped by bracket
+ * depth, and string and template literals are skipped whole so a bracket or a
+ * colon inside a message cannot be mistaken for structure.
+ *
+ * @param {string} source TypeScript source text
+ * @param {string} name the schema constant's name
+ * @returns {string[] | undefined}
+ */
+function strictObjectKeys(source, name) {
+  const declaration = new RegExp(
+    `\\b${escapeRegExp(name)}\\s*=\\s*z\\.strictObject\\(\\s*\\{`,
+    'u',
+  );
+  const match = declaration.exec(source);
+  if (match === null) return undefined;
+
+  let depth = 1;
+  let topLevel = '';
+  let index = match.index + match[0].length;
+  while (index < source.length && depth > 0) {
+    const character = source[index] ?? '';
+    if (character === "'" || character === '"' || character === '`') {
+      // Skip the literal, honouring backslash escapes.
+      index += 1;
+      while (index < source.length && source[index] !== character) {
+        index += source[index] === '\\' ? 2 : 1;
+      }
+      index += 1;
+      topLevel += ' ';
+      continue;
+    }
+    if (character === '/' && source[index + 1] === '*') {
+      const end = source.indexOf('*/', index + 2);
+      index = end === -1 ? source.length : end + 2;
+      continue;
+    }
+    if (character === '/' && source[index + 1] === '/') {
+      const end = source.indexOf('\n', index);
+      index = end === -1 ? source.length : end;
+      continue;
+    }
+    if (character === '{' || character === '(' || character === '[') depth += 1;
+    else if (character === '}' || character === ')' || character === ']') depth -= 1;
+    else if (depth === 1) topLevel += character;
+    index += 1;
+  }
+
+  return [...topLevel.matchAll(/([A-Za-z_$][\w$]*)\s*:/gu)].map((entry) => entry[1] ?? '');
+}
+
 describe('the route contract the caller is held to', () => {
-  it('matches the protocol, route for route', () => {
+  it('matches the service, route for route', () => {
     // Left side: the caller's exported list. Right side: the contract
-    // transcribed from AAP 0.4.2 at the top of this file. A rename on either
-    // side fails here.
-    expect([...SERVICE_ROUTES]).toEqual([HEALTH, LAUNCH, STOP]);
-    expect([HEALTH, LAUNCH, STOP]).toEqual(['/health', '/dev-server/launch', '/dev-server/stop']);
+    // transcribed at the top of this file from the protocol (AAP 0.4.2) and the
+    // service's launcher. A rename on either side fails here.
+    expect([...SERVICE_ROUTES]).toEqual([HEALTH, LAUNCH, STOP, CREDENTIAL]);
+    expect([HEALTH, LAUNCH, STOP, CREDENTIAL]).toEqual([
+      '/health',
+      '/dev-server/launch',
+      '/dev-server/stop',
+      '/dev-server/credential',
+    ]);
+    expect(PROTOCOL_ROUTES.credential).toEqual({
+      method: 'POST',
+      path: '/dev-server/credential',
+      authenticated: true,
+      required: ['projectRoot'],
+      optional: [],
+    });
   });
 
-  it('contains no invented credential route and no route override', () => {
-    // The defect this guards: three guessed credential endpoints plus a
+  it('contains no guessed credential endpoint and no route override', () => {
+    // The defect this guards: guessed credential endpoints plus a
     // DEBUGGEN_CREDENTIAL_PATH override, none of which the service defines.
+    // The one credential route the service does define is in SERVICE_ROUTES.
     for (const invented of [
-      '/dev-server/credential',
       '/credentials/server-agent',
       '/dev-server/token',
       'DEBUGGEN_CREDENTIAL_PATH',
@@ -536,39 +673,53 @@ describe('the route contract the caller is held to', () => {
     }
   });
 
-  it('agrees with the protocol definition once it lands', async () => {
-    // The definer of these routes is `packages/protocol/src/http.ts` and the
-    // service's route module. Neither is in the tree at this boundary, so this
-    // test records that fact today and turns into a cross-file agreement check
-    // the moment either file appears - no edit required.
-    /** @type {string[]} */
-    const definers = [];
-    for (const candidate of [
-      'packages/protocol/src/http.ts',
-      'apps/local-service/src/server/routes/dev-server.ts',
-    ]) {
-      if (fs.existsSync(path.join(REPO_ROOT, candidate))) definers.push(candidate);
+  it('agrees with the definers of those routes', async () => {
+    // Read the definers themselves, not a comment about them: the protocol's
+    // route table for the three table routes, and the credential route's
+    // single definition, which the launcher owns today and the protocol may
+    // take over without changing the path or either body.
+    const protocolFile = 'packages/protocol/src/http.ts';
+    const launcherFile = 'apps/local-service/src/dev-server/launcher.ts';
+    const protocol = await fs.promises.readFile(path.join(REPO_ROOT, protocolFile), 'utf8');
+    const launcher = await fs.promises.readFile(path.join(REPO_ROOT, launcherFile), 'utf8');
+
+    for (const route of [PROTOCOL_ROUTES.health, PROTOCOL_ROUTES.launch, PROTOCOL_ROUTES.stop]) {
+      const row = new RegExp(
+        `method:\\s*'${route.method}',\\s*pattern:\\s*'${escapeRegExp(route.path)}'`,
+        'u',
+      );
+      expect(protocol, `${protocolFile} must declare ${route.method} ${route.path}`).toMatch(row);
     }
 
-    if (definers.length === 0) {
-      const message = [
-        'No protocol/service definer of the dev-server routes exists yet.',
-        'When packages/protocol/src/http.ts or',
-        'apps/local-service/src/server/routes/dev-server.ts lands, this test',
-        'requires it to declare every path in PROTOCOL_ROUTES, and the',
-        "service boundary's own integration suite must drive this CLI across",
-        'HTTP into the real authorised handler.',
-      ].join(' ');
-      expect(definers, message).toEqual([]);
-      return;
-    }
+    const credential = PROTOCOL_ROUTES.credential;
+    const inLauncher =
+      new RegExp(`DEV_SERVER_CREDENTIAL_PATH\\s*=\\s*'${escapeRegExp(credential.path)}'`, 'u').test(
+        launcher,
+      ) &&
+      new RegExp(`DEV_SERVER_CREDENTIAL_METHOD\\s*=\\s*'${credential.method}'`, 'u').test(launcher);
+    const inProtocol = new RegExp(
+      `method:\\s*'${credential.method}',\\s*pattern:\\s*'${escapeRegExp(credential.path)}'`,
+      'u',
+    ).test(protocol);
+    expect(
+      inLauncher || inProtocol,
+      `${launcherFile} or ${protocolFile} must declare ${credential.method} ${credential.path}`,
+    ).toBe(true);
 
-    for (const definer of definers) {
-      const source = await fs.promises.readFile(path.join(REPO_ROOT, definer), 'utf8');
-      for (const route of ALL_PROTOCOL_ROUTES) {
-        expect(source, `${definer} must declare ${route.path}`).toContain(route.path);
-      }
-    }
+    /**
+     * The keys of a strict schema, from whichever definer declares it.
+     *
+     * @param {string} name
+     * @returns {string[] | undefined}
+     */
+    const schemaKeys = (name) =>
+      strictObjectKeys(launcher, name) ?? strictObjectKeys(protocol, name);
+
+    expect(schemaKeys('devServerCredentialRequestSchema')).toEqual([
+      ...credential.required,
+      ...credential.optional,
+    ]);
+    expect(schemaKeys('devServerCredentialResponseSchema')).toEqual(['token', 'expiresAt']);
   });
 });
 
@@ -986,7 +1137,7 @@ describe('the service address trust boundary', () => {
 });
 
 describe('the local spawn mode', () => {
-  it('attaches the preload and the ingest URL and carries no credential', () => {
+  it('drops an inherited credential when the caller supplies none', () => {
     const childEnv = buildChildEnv({
       preloadUrl: 'file:///tmp/register.mjs',
       base: 'http://127.0.0.1:43117',
@@ -1005,16 +1156,13 @@ describe('the local spawn mode', () => {
     expect('DEBUGGEN_TOKEN' in childEnv).toBe(false);
   });
 
-  it('carries a credential through when one is supplied', () => {
-    // The builder stays general - a credential belongs in the child's
-    // environment when the caller has one - even though the CLI's local spawn
-    // never has one, because only the service's launcher mints them.
+  it('carries the supplied credential through, replacing an inherited one', () => {
     const childEnv = buildChildEnv({
       preloadUrl: 'file:///tmp/register.mjs',
       base: 'http://127.0.0.1:43117',
       projectRoot: '/tmp/target',
       token: 'server-agent-credential',
-      env: { PATH: '/usr/bin' },
+      env: { PATH: '/usr/bin', DEBUGGEN_TOKEN: 'stale-credential' },
     });
 
     expect(childEnv.DEBUGGEN_TOKEN).toBe('server-agent-credential');
@@ -1022,11 +1170,65 @@ describe('the local spawn mode', () => {
     expect(describeToken(childEnv.DEBUGGEN_TOKEN)).toBe(
       `<set, ${'server-agent-credential'.length} bytes>`,
     );
-    expect(describeToken(undefined)).toContain('--spawn-local');
-    // What the absence costs, stated as what actually happens: with no
-    // credential the preload reports itself inert and installs nothing, so no
-    // ingest is attempted and there is nothing for the service to reject.
-    expect(describeToken(undefined)).toContain('inert');
+    // Neutral: the description of an absent credential claims nothing about
+    // any mode.
+    expect(describeToken(undefined)).toBe('<not set>');
+  });
+
+  it('asks the credential route for a scoped credential and returns it verbatim', async () => {
+    service = await startStubService();
+    const projectRoot = path.join(os.tmpdir(), 'some-project');
+
+    const credential = await requestServerAgentCredential({
+      base: service.base,
+      editorToken: EDITOR_TOKEN,
+      projectRoot,
+    });
+
+    expect(credential).toEqual({ token: SERVER_AGENT_TOKEN, expiresAt: service.expiresAt });
+    expect(service.routes()).toEqual([`POST ${CREDENTIAL}`]);
+    expect(service.requests[0]?.authorization).toBe(`Bearer ${EDITOR_TOKEN}`);
+    expect(service.requests[0]?.body).toEqual({ projectRoot });
+    expect(service.rejections).toEqual([]);
+  });
+
+  it('refuses a credential answer that is not exactly a usable { token, expiresAt }', async () => {
+    const future = Date.now() + CREDENTIAL_LIFETIME_MS;
+    /** @type {Array<[unknown, string]>} */
+    const cases = [
+      [{ expiresAt: future }, 'no non-empty string token'],
+      [{ token: '', expiresAt: future }, 'no non-empty string token'],
+      [{ token: `${SERVER_AGENT_TOKEN}\nx`, expiresAt: future }, 'whitespace or control'],
+      [{ token: SERVER_AGENT_TOKEN, expiresAt: 'tomorrow' }, 'not an epoch-millisecond number'],
+      [{ token: SERVER_AGENT_TOKEN, expiresAt: Number.MAX_VALUE }, 'epoch-millisecond'],
+      [{ token: SERVER_AGENT_TOKEN, expiresAt: Date.now() - 1_000 }, 'already passed'],
+      [{ token: SERVER_AGENT_TOKEN, expiresAt: future, scope: 'x' }, 'fields other than'],
+      [[SERVER_AGENT_TOKEN], 'not a JSON object'],
+    ];
+
+    for (const [body, problem] of cases) {
+      service = await startStubService({ credentialBody: body });
+
+      const error = await requestServerAgentCredential({
+        base: service.base,
+        editorToken: EDITOR_TOKEN,
+        projectRoot: path.join(os.tmpdir(), 'some-project'),
+      }).then(
+        () => undefined,
+        (/** @type {unknown} */ caught) => caught,
+      );
+
+      expect(error, problem).toBeInstanceOf(Error);
+      const { message, hint } = /** @type {{ message: string, hint?: string }} */ (error);
+      expect(message).toContain('off-contract');
+      expect(message).toContain(problem);
+      // The body carries a credential by definition, so no part of it is shown.
+      expect(`${message}\n${hint ?? ''}`).not.toContain(SERVER_AGENT_TOKEN);
+      expect(`${message}\n${hint ?? ''}`).not.toContain(EDITOR_TOKEN);
+
+      await service.close();
+      service = undefined;
+    }
   });
 
   // The spawn is exercised through a fake `pnpm` on a `PATH` of the test's own,
@@ -1036,108 +1238,838 @@ describe('the local spawn mode', () => {
   const spawns = it.skipIf(process.platform === 'win32');
 
   spawns(
-    'starts the dev server with no local service running, because the mode asks it for nothing',
+    'mints a server-agent credential and hands it to the dev server, and only to it',
     async () => {
-      // No `auth.json` either: this mode reads no credential, so neither the
-      // service nor the session home is a precondition for it. That is the
-      // whole claim the help text makes about it.
-      const fixture = await createFixture({ withCredential: false });
-      const dev = await createFakeDevServer(fixture);
-      const base = await closedServiceAddress();
-      const { context, stdout, stderr } = contextFor(fixture, dev.env);
+      service = await startStubService();
+      const fixture = await createFixture();
+      const dev = await createFakeDevServer(fixture, { exitCode: 7 });
+      const { context, stdout, stderr } = contextFor(fixture, {
+        ...dev.env,
+        // Inherited from some other process: the minted credential replaces it.
+        DEBUGGEN_TOKEN: 'stale-credential-from-another-process',
+      });
 
-      const code = await main(['--spawn-local', '--service', base], context);
+      const code = await main(['--spawn-local', '--service', service.base], context);
 
-      // The dev server's own status, not a pre-flight failure of this command.
-      expect(code).toBe(0);
+      // 7 is the child's own status; 2 would be this command reporting a failure.
+      expect(code).toBe(7);
       expect(stderr.text()).toBe('');
-      expect(dev.ran()).toBe(true);
 
+      // The pre-flight, then the credential route with the editor credential and
+      // the project root, and nothing else: no launch, no stop, no retry.
+      expect(service.routes()).toEqual([`GET ${HEALTH}`, `POST ${CREDENTIAL}`]);
+      expect(service.rejections).toEqual([]);
+      expect(service.requests[0]?.authorization).toBeUndefined();
+      expect(service.requests[1]?.authorization).toBe(`Bearer ${EDITOR_TOKEN}`);
+      expect(service.requests[1]?.body).toEqual({ projectRoot: fixture.projectDir });
+
+      // All four preload variables reached the child, the credential verbatim.
+      expect(dev.ran()).toBe(true);
       const recorded = dev.read();
       expect(recorded.argv).toBe('--filter target-app dev');
       expect(recorded.cwd).toBe(fs.realpathSync(fixture.root));
       expect(recorded.NODE_OPTIONS).toBe(`--import ${fixture.preloadUrl}`);
-      expect(recorded.DEBUGGEN_INGEST_URL).toBe(`${base}${INGEST_PATH}`);
+      expect(recorded.DEBUGGEN_INGEST_URL).toBe(`${service.base}${INGEST_PATH}`);
       expect(recorded.DEBUGGEN_PROJECT_ROOT).toBe(fixture.projectDir);
-      expect(recorded.DEBUGGEN_TOKEN).toBe('<unset>');
+      expect(recorded.DEBUGGEN_TOKEN).toBe(SERVER_AGENT_TOKEN);
 
-      // The unreachable service is reported, and reported as a note: the run
-      // is complete, not degraded.
+      // Neither credential reached this command's own output.
+      for (const secret of [SERVER_AGENT_TOKEN, EDITOR_TOKEN]) {
+        expect(stdout.text()).not.toContain(secret);
+        expect(stderr.text()).not.toContain(secret);
+      }
+
+      // The banner describes the credential by length and expiry only, and says
+      // plainly that nothing revokes it when the child exits.
       const banner = squash(stdout.text());
-      expect(banner).toContain(`${base} (not answering)`);
-      expect(banner).toContain(
-        'That does not stop this mode and nothing was skipped because of it',
-      );
-      expect(banner).toContain('no server or database spans will be recorded');
+      expect(banner).toContain(`DEBUGGEN_TOKEN <set, ${SERVER_AGENT_TOKEN.length} bytes>`);
+      expect(banner).toContain(`expires ${new Date(service.expiresAt).toISOString()}`);
+      expect(banner).toContain('This run is AUTHENTICATED');
+      expect(banner).toContain('The service has no revoke route');
+      expect(banner).toContain('the credential is not revoked when the dev server exits');
     },
   );
 
-  spawns('asks a running service nothing except whether it is answering', async () => {
-    service = await startStubService();
-    const fixture = await createFixture();
-    const dev = await createFakeDevServer(fixture);
-    const { context, stdout } = contextFor(fixture, dev.env);
+  /**
+   * @typedef {object} SpawnRefusal
+   * @property {string} name what goes wrong, for the test title
+   * @property {Parameters<typeof startStubService>[0]} [stub] stub service
+   *   options; omitted with `down`
+   * @property {boolean} [down] run against an address nothing listens on
+   * @property {boolean} [withCredential] write `auth.json` (default true)
+   * @property {string[]} expected fragments the (whitespace-collapsed) stderr
+   *   must contain
+   * @property {string[] | undefined} routes what the stub must have been asked,
+   *   when a stub runs
+   * @property {number[]} [rejected] statuses the stub's own contract checks
+   *   refused with (default none)
+   */
 
-    const code = await main(['--spawn-local', '--service', service.base], context);
+  const future = Date.now() + CREDENTIAL_LIFETIME_MS;
+  const askedForCredential = [`GET ${HEALTH}`, `POST ${CREDENTIAL}`];
 
-    expect(code).toBe(0);
-    // No launch, no stop, no credential: the liveness route and nothing else.
-    expect(service.routes()).toEqual([`GET ${HEALTH}`]);
-    expect(service.rejections).toEqual([]);
-    expect(service.requests.every((request) => request.authorization === undefined)).toBe(true);
-    expect(stdout.text()).not.toContain('not answering');
-    expect(dev.read().DEBUGGEN_TOKEN).toBe('<unset>');
-  });
+  /** @type {SpawnRefusal[]} */
+  const refusals = [
+    {
+      name: 'the service is not answering',
+      down: true,
+      expected: ['not answering'],
+      routes: undefined,
+    },
+    {
+      name: 'auth.json is missing',
+      withCredential: false,
+      stub: {},
+      expected: ['no editor credential'],
+      routes: [],
+    },
+    {
+      name: 'the credential route answers 401',
+      stub: { credentialStatus: 401 },
+      expected: [`rejected the editor credential at ${CREDENTIAL} with 401`, 'credential refused'],
+      routes: askedForCredential,
+    },
+    {
+      name: 'the credential route answers 403',
+      stub: { credentialStatus: 403 },
+      expected: [
+        `rejected the editor credential at ${CREDENTIAL} with 403`,
+        'outside the workspace folders VS Code announced to the service',
+      ],
+      routes: askedForCredential,
+    },
+    {
+      name: 'the service does not implement the credential route',
+      stub: {
+        implemented: [PROTOCOL_ROUTES.health, PROTOCOL_ROUTES.launch, PROTOCOL_ROUTES.stop],
+      },
+      expected: [
+        `the service answered 404 for ${CREDENTIAL}; no server-agent credential was minted`,
+        'older or newer than this checkout',
+      ],
+      // Exactly one attempt at the credential route: no fallback, no probing.
+      routes: askedForCredential,
+      rejected: [404],
+    },
+    {
+      name: 'a 2xx credential answer carries no token',
+      stub: { credentialBody: { expiresAt: future } },
+      expected: ['off-contract: it carries no non-empty string token'],
+      routes: askedForCredential,
+    },
+    {
+      name: 'a 2xx credential answer has a non-numeric expiresAt',
+      stub: { credentialBody: { token: SERVER_AGENT_TOKEN, expiresAt: 'tomorrow' } },
+      expected: ['off-contract: its expiresAt is not an epoch-millisecond number'],
+      routes: askedForCredential,
+    },
+    {
+      name: 'an error body echoes both credentials',
+      stub: {
+        credentialStatus: 500,
+        credentialBody: {
+          code: 'INTERNAL',
+          message: `could not mint for Bearer ${EDITOR_TOKEN}; discarded ${SERVER_AGENT_TOKEN}`,
+          token: SERVER_AGENT_TOKEN,
+        },
+      },
+      expected: ['answered 500', 'could not mint for Bearer [redacted]; discarded [redacted]'],
+      routes: askedForCredential,
+    },
+  ];
 
-  spawns('exits with the dev server’s status rather than one of its own', async () => {
-    const fixture = await createFixture({ withCredential: false });
-    const dev = await createFakeDevServer(fixture, { exitCode: 7 });
-    const base = await closedServiceAddress();
-    const { context, stderr } = contextFor(fixture, dev.env);
+  for (const refusal of refusals) {
+    spawns(`spawns nothing when ${refusal.name}`, async () => {
+      const fixture = await createFixture({ withCredential: refusal.withCredential !== false });
+      const dev = await createFakeDevServer(fixture);
+      const started = refusal.down === true ? undefined : await startStubService(refusal.stub);
+      service = started;
+      const base = started === undefined ? await closedServiceAddress() : started.base;
+      const { context, stdout, stderr } = contextFor(fixture, dev.env);
 
-    const code = await main(['--spawn-local', '--service', base], context);
+      const code = await main(['--spawn-local', '--service', base], context);
 
-    // 7 is the child's; 2 would be this command reporting a failure of its own,
-    // which is what an unreachable service used to produce here.
-    expect(code).toBe(7);
-    expect(code).not.toBe(2);
-    expect(stderr.text()).toBe('');
-  });
+      expect(code).toBe(2);
+      expect(dev.ran()).toBe(false);
+      // No banner: it is printed only once the credential is in hand.
+      expect(stdout.text()).toBe('');
 
-  it('reports the service probe instead of failing on it, and never rejects', async () => {
-    service = await startStubService();
+      const errors = squash(stderr.text());
+      expect(errors).toContain('Nothing was spawned');
+      for (const fragment of refusal.expected) expect(errors).toContain(fragment);
+      for (const secret of [SERVER_AGENT_TOKEN, EDITOR_TOKEN]) {
+        expect(stderr.text()).not.toContain(secret);
+      }
 
-    await expect(probeServiceReachability(service.base)).resolves.toEqual({ reachable: true });
-    expect(service.routes()).toEqual([`GET ${HEALTH}`]);
+      if (started !== undefined) {
+        expect(started.routes()).toEqual(refusal.routes);
+        expect(started.rejections.map((entry) => entry.status)).toEqual(refusal.rejected ?? []);
+      }
+    });
+  }
 
-    const closed = await closedServiceAddress();
-    const unreachable = await probeServiceReachability(closed);
-
-    expect(unreachable.reachable).toBe(false);
-    expect(unreachable.detail).toContain(`${closed}${HEALTH}`);
-  });
-
-  it('documents the mode it implements: credential-free, inert, and independent of the service', () => {
+  it('documents the mode it implements: authenticated, service-dependent, expiring, never revoked', () => {
     const text = usage();
     const options = text.slice(text.indexOf('\nOptions\n'));
     const start = options.indexOf('  --spawn-local');
     const paragraph = squash(options.slice(start, options.indexOf('  --stop ', start)));
 
-    // The claim and the behaviour asserted above have to stay the same claim:
-    // this paragraph once promised an offline mode that a mandatory health
-    // probe then refused to run.
-    expect(paragraph).toContain('WITHOUT a credential');
-    expect(paragraph).toContain('stays inert');
-    expect(paragraph).toContain('it does not require one');
-    expect(paragraph).toContain('the mode runs offline');
+    // The claim and the behaviour asserted above have to stay the same claim.
+    expect(paragraph).toContain(`through POST ${CREDENTIAL}`);
+    expect(paragraph).toContain(
+      `AUTHENTICATED: it needs the running service and ${AUTH_FILE_NAME}`,
+    );
+    expect(paragraph).toContain('when the credential cannot be obtained nothing is spawned');
+    expect(paragraph).toContain('The credential expires at the time the banner shows');
+    expect(paragraph).toContain(
+      'the service has no revoke route, so it is not revoked when the child exits',
+    );
 
-    // And the exit-code table has to agree about which modes a service that is
-    // not answering is fatal for.
+    const walkthrough = squash(
+      text.slice(text.indexOf('What it does (--spawn-local)'), text.indexOf('\nOptions\n')),
+    );
+    expect(walkthrough).toContain(`POST {service}${CREDENTIAL} with { projectRoot }`);
+    expect(walkthrough).toContain(
+      `This is an AUTHENTICATED run: it needs a running service and ${AUTH_FILE_NAME}`,
+    );
+    expect(walkthrough).toContain('the credential is not revoked when the child exits');
+
+    // The exit-code table agrees that every --spawn-local failure precedes the
+    // spawn.
     const exitCodes = squash(text.slice(text.indexOf('Exit codes')));
     expect(exitCodes).toContain(
-      'In --spawn-local a service that is not answering is a note rather than a failure',
+      'in --spawn-local every such failure happens before the spawn, and the message says nothing was spawned',
     );
-    expect(squash(text)).toContain(`it needs neither ${AUTH_FILE_NAME} nor a running service`);
+
+    // The claims of the unauthenticated mode this replaced are gone everywhere.
+    for (const stale of [
+      'WITHOUT a credential',
+      'stays inert',
+      'runs offline',
+      'it does not require one',
+      'nor a running service',
+      'a note rather than a failure',
+    ]) {
+      expect(squash(text)).not.toContain(stale);
+    }
+  });
+});
+
+describe('service reasons in messages', () => {
+  /** The random part of the editor credential: what must never leak, even in part. */
+  const editorSecret = EDITOR_TOKEN.slice('editor-credential-'.length);
+
+  /**
+   * Drive `--spawn-local` into a refused credential request and return the
+   * reason its first stderr line carries after `answered 500 <phrase>: `.
+   *
+   * @param {Parameters<typeof startStubService>[0]} stub
+   * @returns {Promise<{ reason: string, stderr: string }>}
+   */
+  const refusedReason = async (stub) => {
+    service = await startStubService({ credentialStatus: 500, ...stub });
+    const fixture = await createFixture();
+    const dev = await createFakeDevServer(fixture);
+    const { context, stderr } = contextFor(fixture, dev.env);
+
+    const code = await main(['--spawn-local', '--service', service.base], context);
+
+    expect(code).toBe(2);
+    expect(dev.ran()).toBe(false);
+    const [first = ''] = stderr.text().split('\n');
+    const marker = 'answered 500 Internal Server Error: ';
+    expect(first).toContain(marker);
+    return { reason: first.slice(first.indexOf(marker) + marker.length), stderr: stderr.text() };
+  };
+
+  const spawns = it.skipIf(process.platform === 'win32');
+
+  spawns(
+    'reduces a long multi-line JSON message to one line of at most 200 characters',
+    async () => {
+      // The editor credential straddles the 200-character cut: bounding before
+      // redacting would print the first half of its random part.
+      const message = [
+        'line one',
+        '\tline two\r',
+        `${'y'.repeat(150)}${EDITOR_TOKEN} tail ${'z'.repeat(300)}`,
+      ].join('\n');
+
+      const { reason, stderr } = await refusedReason({
+        credentialBody: { code: 'INTERNAL', message },
+      });
+
+      expect(reason.endsWith('…')).toBe(true);
+      expect(reason.length).toBeLessThanOrEqual(201);
+      expect(reason.startsWith('line one line two yyy')).toBe(true);
+      expect(reason).toContain('[redacted]');
+      expect(reason).not.toMatch(/[\t\r\n]/u);
+      expect(stderr).not.toContain(editorSecret.slice(0, 8));
+    },
+  );
+
+  spawns('bounds the nested error.message and a raw text body the same way', async () => {
+    const nested = await refusedReason({
+      credentialBody: { error: { message: `nested\n\n${'n'.repeat(400)}` } },
+    });
+    expect(nested.reason).toBe(`nested ${'n'.repeat(193)}…`);
+
+    const raw = await refusedReason({
+      credentialText: `<html>\n\u001b[31m${'r'.repeat(400)}\u009b2J\u202e</html>`,
+    });
+    expect(raw.reason.endsWith('…')).toBe(true);
+    expect(raw.reason.length).toBeLessThanOrEqual(201);
+    expect(raw.reason.startsWith('<html> [31m')).toBe(true);
+    // No control or bidirectional-format character reaches the terminal.
+    for (const character of ['\u001b', '\u009b', '\u202e']) {
+      expect(raw.stderr).not.toContain(character);
+    }
+  });
+});
+
+describe('response and project text that reaches the terminal', () => {
+  /**
+   * Start a loopback server whose answer to each request is decided by the
+   * test, for the response shapes the contract stub does not produce: a
+   * hostile reason phrase and a body cut off after its headers.
+   *
+   * @param {(req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse, path: string) => void} answer
+   * @returns {Promise<{ base: string, routes: string[], close: () => Promise<void> }>}
+   */
+  async function startScriptedServer(answer) {
+    /** @type {string[]} */
+    const routes = [];
+    const server = http.createServer((req, res) => {
+      const requestPath = new URL(req.url ?? '/', 'http://127.0.0.1').pathname;
+      routes.push(`${req.method ?? 'GET'} ${requestPath}`);
+      req.resume();
+      req.on('end', () => answer(req, res, requestPath));
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve(undefined)));
+    const address = server.address();
+    const port = typeof address === 'object' && address !== null ? address.port : 0;
+    return {
+      base: `http://127.0.0.1:${port}`,
+      routes,
+      close: () =>
+        new Promise((resolve) => {
+          server.closeAllConnections();
+          server.close(() => resolve(undefined));
+        }),
+    };
+  }
+
+  /** A reason phrase that echoes both credentials, as a hostile listener might. */
+  const HOSTILE_PHRASE = `denied Bearer ${EDITOR_TOKEN} after minting ${SERVER_AGENT_TOKEN}`;
+
+  it('redacts both credentials from the status phrase of a refused credential, launch or stop', async () => {
+    const scripted = await startScriptedServer((_req, res) => {
+      res.writeHead(500, HOSTILE_PHRASE, { 'content-type': 'application/json' });
+      // The body names the minted token, which is how this command learns it.
+      res.end(JSON.stringify({ code: 'INTERNAL', message: 'refused', token: SERVER_AGENT_TOKEN }));
+    });
+    const projectRoot = path.join(os.tmpdir(), 'some-project');
+
+    try {
+      /** @type {string[]} */
+      const messages = [];
+      for (const call of [requestServerAgentCredential, launchDevServer, stopDevServer]) {
+        const failure = await call({ base: scripted.base, editorToken: EDITOR_TOKEN, projectRoot })
+          .then(() => undefined)
+          .catch((/** @type {unknown} */ error) => error);
+        expect(failure, call.name).toBeInstanceOf(Error);
+        messages.push(/** @type {Error} */ (failure).message);
+      }
+
+      const [credential = '', launch = '', stop = ''] = messages;
+      for (const message of messages) {
+        expect(message).toContain('answered 500 denied Bearer [redacted]');
+        expect(message).not.toContain(EDITOR_TOKEN);
+      }
+      // The credential route's own answer names the minted token, so that one
+      // is redacted from its message too.
+      expect(credential).toContain('after minting [redacted]');
+      expect(credential).not.toContain(SERVER_AGENT_TOKEN);
+      expect(launch).toContain(': refused');
+      expect(stop).toContain(': refused');
+    } finally {
+      await scripted.close();
+    }
+  });
+
+  const spawns = it.skipIf(process.platform === 'win32');
+
+  spawns(
+    'reports a credential answer cut off mid-body as a pre-spawn failure, not a stack',
+    async () => {
+      const scripted = await startScriptedServer((_req, res, requestPath) => {
+        if (requestPath === HEALTH) {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end('{"status":"ok"}');
+          return;
+        }
+        // Headers promise a body that never finishes arriving.
+        res.writeHead(200, { 'content-type': 'application/json', 'content-length': '200' });
+        res.write('{"token":"');
+        setTimeout(() => res.socket?.destroy(), 20);
+      });
+      const fixture = await createFixture();
+      const dev = await createFakeDevServer(fixture);
+      const { context, stdout, stderr } = contextFor(fixture, dev.env);
+
+      try {
+        const code = await main(['--spawn-local', '--service', scripted.base], context);
+
+        expect(code).toBe(2);
+        expect(dev.ran()).toBe(false);
+        expect(stdout.text()).toBe('');
+        expect(scripted.routes).toEqual([`GET ${HEALTH}`, `POST ${CREDENTIAL}`]);
+
+        const errors = squash(stderr.text());
+        expect(errors).toContain(`request to ${scripted.base}${CREDENTIAL} failed while reading`);
+        expect(errors).toContain('Nothing was spawned');
+        expect(errors).not.toContain('unexpected failure');
+        expect(stderr.text()).not.toContain(EDITOR_TOKEN);
+      } finally {
+        await scripted.close();
+      }
+    },
+  );
+
+  it('shows bidirectional and other invisible characters of a package name as escapes', async () => {
+    const fixture = await createFixture();
+    const dev = await createFakeDevServer(fixture);
+    const spoofing = 'app\u202egnp.exe';
+
+    // An invalid in-repository name: refused before it reaches `pnpm --filter`,
+    // and quoted with the override made visible.
+    let refusal = '';
+    try {
+      buildLaunchCommand({
+        project: { dir: fixture.projectDir, label: 'x', packageName: spoofing, inRepo: true },
+        root: fixture.root,
+        env: { PATH: dev.env.PATH },
+        platform: 'linux',
+      });
+    } catch (error) {
+      refusal = error instanceof Error ? error.message : String(error);
+    }
+    expect(refusal).toContain('app\\u202egnp.exe');
+    expect(refusal).not.toContain('\u202e');
+
+    // A project elsewhere is never put on a command line, but its name still
+    // labels the banner and every message: escaped there too.
+    const elsewhere = path.join(fixture.base, 'elsewhere');
+    await fs.promises.mkdir(elsewhere, { recursive: true });
+    await fs.promises.writeFile(
+      path.join(elsewhere, 'package.json'),
+      JSON.stringify({ name: `shop\u2066\u200b${spoofing}`, scripts: { dev: 'next dev' } }),
+      'utf8',
+    );
+    const resolved = await resolveProject({ root: fixture.root, project: elsewhere });
+    expect(resolved.label).toContain('shop\\u2066\\u200bapp\\u202egnp.exe');
+    expect(resolved.label).not.toMatch(/[\u202e\u2066\u200b]/u);
+    // The raw name is kept for the one place that validates it first.
+    expect(resolved.packageName).toBe(`shop\u2066\u200b${spoofing}`);
+
+    await fs.promises.writeFile(
+      path.join(elsewhere, 'package.json'),
+      JSON.stringify({ name: spoofing, scripts: {} }),
+      'utf8',
+    );
+    const missingDev = await resolveProject({ root: fixture.root, project: elsewhere })
+      .then(() => '')
+      .catch((/** @type {unknown} */ error) => (error instanceof Error ? error.message : ''));
+    expect(missingDev).toContain('app\\u202egnp.exe has no "dev" script');
+    expect(missingDev).not.toContain('\u202e');
+  });
+});
+
+/**
+ * The metacharacters that, reaching cmd.exe's parser unescaped and outside a
+ * quoted run, would chain, pipe, redirect or open a block.
+ */
+const CMD_OPERATORS = '&|<>()';
+
+/**
+ * @typedef {object} CmdPass
+ * @property {string} text the line as cmd.exe hands it on
+ * @property {boolean[]} literal per character of `text`, whether it was
+ *   escaped (and so cannot delimit a token)
+ * @property {string[]} operators every operator that reached the parser live
+ * @property {number} quotes how many unescaped `"` toggled the quoted run
+ */
+
+/**
+ * One parse of a line by cmd.exe's escape-and-quote phase, the part of its
+ * parser that decides what `&`, `|`, `<`, `>`, `(` and `)` mean: outside a
+ * quoted run a `^` is removed and the next character is taken literally, and a
+ * `"` toggles the quoted run; inside one only `"` is special. Test-local by
+ * design — a model of the interpreter this suite cannot run on a POSIX host,
+ * written from cmd.exe's documented behaviour rather than from the escaping
+ * under test.
+ *
+ * @param {string} line
+ * @returns {CmdPass}
+ */
+function cmdEscapePass(line) {
+  let text = '';
+  /** @type {boolean[]} */
+  const literal = [];
+  /** @type {string[]} */
+  const operators = [];
+  let quoted = false;
+  let quotes = 0;
+  for (let index = 0; index < line.length; index += 1) {
+    const character = line[index] ?? '';
+    if (quoted) {
+      if (character === '"') quoted = false;
+      text += character;
+      literal.push(true);
+      continue;
+    }
+    if (character === '^') {
+      index += 1;
+      if (index < line.length) {
+        text += line[index] ?? '';
+        literal.push(true);
+      }
+      continue;
+    }
+    if (character === '"') {
+      quoted = true;
+      quotes += 1;
+    } else if (CMD_OPERATORS.includes(character)) {
+      operators.push(character);
+    }
+    text += character;
+    literal.push(false);
+  }
+  return { text, literal, operators, quotes };
+}
+
+/**
+ * Split a command line into argv the way the MSVCRT startup code
+ * (`CommandLineToArgvW`) does: spaces and tabs separate arguments outside
+ * quotes; `2n` backslashes before `"` are `n` backslashes and a quote toggle,
+ * `2n + 1` are `n` backslashes and a literal `"`; other backslashes are
+ * literal; `""` inside quotes is a literal `"`.
+ *
+ * @param {string} line
+ * @returns {string[]}
+ */
+function parseMsvcrtArgv(line) {
+  /** @type {string[]} */
+  const argv = [];
+  let current = '';
+  let started = false;
+  let quoted = false;
+  let index = 0;
+  while (index < line.length) {
+    const character = line[index] ?? '';
+    if (character === '\\') {
+      let backslashes = 0;
+      while (line[index] === '\\') {
+        backslashes += 1;
+        index += 1;
+      }
+      if (line[index] === '"') {
+        current += '\\'.repeat(Math.floor(backslashes / 2));
+        if (backslashes % 2 === 1) {
+          current += '"';
+          index += 1;
+        }
+      } else {
+        current += '\\'.repeat(backslashes);
+      }
+      started = true;
+      continue;
+    }
+    if (character === '"') {
+      if (quoted && line[index + 1] === '"') {
+        current += '"';
+        index += 2;
+      } else {
+        quoted = !quoted;
+        index += 1;
+      }
+      started = true;
+      continue;
+    }
+    if ((character === ' ' || character === '\t') && !quoted) {
+      if (started) argv.push(current);
+      current = '';
+      started = false;
+      index += 1;
+      continue;
+    }
+    current += character;
+    started = true;
+    index += 1;
+  }
+  if (started) argv.push(current);
+  return argv;
+}
+
+/**
+ * Replay what Windows does with a wrapped `.cmd` launch: cmd.exe strips the
+ * outer quotes (`/s`) and parses the line once, which yields the command token
+ * and the batch file's arguments; the batch file hands those on as `%*`, which
+ * cmd.exe parses a second time; the program then splits them MSVCRT-style.
+ *
+ * @param {string} line the fourth argument `wrapForPlatform` produced
+ * @returns {{ file: string, argv: string[], passes: CmdPass[], percentPairs: string[] }}
+ */
+function replayCmdLaunch(line) {
+  expect(line.startsWith('"') && line.endsWith('"'), 'the /s form wraps the line in quotes').toBe(
+    true,
+  );
+  const inner = line.slice(1, -1);
+  // cmd.exe expands %NAME% before it looks at carets; a caret inside the pair
+  // makes the name one no variable has, so it is left alone.
+  const percentPairs = [...inner.matchAll(/%[^%^]*%/gu)].map((match) => match[0]);
+
+  const first = cmdEscapePass(inner);
+  const separator = first.literal.findIndex(
+    (isLiteral, index) => !isLiteral && first.text[index] === ' ',
+  );
+  const file = separator === -1 ? first.text : first.text.slice(0, separator);
+  const rest = separator === -1 ? '' : first.text.slice(separator + 1);
+
+  const second = cmdEscapePass(rest);
+  return { file, argv: parseMsvcrtArgv(second.text), passes: [first, second], percentPairs };
+}
+
+describe('Windows command lines and package names', () => {
+  /** Arguments carrying every cmd.exe and MSVCRT special case at once. */
+  const adversarialArguments = [
+    '--filter',
+    '@scope/app',
+    'dev',
+    'x&calc',
+    'a|b',
+    'a>b',
+    'a<b',
+    '"a"',
+    'a b',
+    '%PATH%',
+    '%%',
+    '^a',
+    '(a)',
+    '!a!',
+    ';a,b',
+    '`a`',
+    '*?[]',
+    'tab\tseparated',
+    'back\\slash',
+    'trailing\\',
+    'trailing\\\\',
+    'quote\\"inside',
+    '\\\\"',
+    // A quote cmd.exe would read as closing a quoted run, followed by an
+    // operator: with only one caret layer, the batch file's re-parse of `%*`
+    // runs whatever follows the `&`.
+    'x"&calc',
+    'y\\"|more',
+    '',
+  ];
+
+  it('wraps a .cmd launcher so cmd.exe and the program read back exactly the original argv', () => {
+    const file = 'C:\\Program Files (x86)\\A&B\\pnpm.cmd';
+    const comSpec = 'C:\\Windows\\System32\\cmd.exe';
+
+    const wrapped = wrapForPlatform(
+      {
+        file,
+        args: adversarialArguments,
+        cwd: 'C:\\repo',
+        display: 'pnpm --filter @scope/app dev',
+      },
+      { platform: 'win32', comSpec },
+    );
+
+    expect(wrapped.file).toBe(comSpec);
+    expect(wrapped.windowsVerbatimArguments).toBe(true);
+    expect(wrapped.args.slice(0, 3)).toEqual(['/d', '/s', '/c']);
+    expect(wrapped.args).toHaveLength(4);
+    expect(wrapped.cwd).toBe('C:\\repo');
+    expect(wrapped.display).toBe('pnpm --filter @scope/app dev');
+
+    const replay = replayCmdLaunch(wrapped.args[3] ?? '');
+    expect(replay.file).toBe(file);
+    expect(replay.argv).toEqual(adversarialArguments);
+    // No pass ever saw a live operator or toggled a quoted run, and no
+    // %NAME% pair could have expanded.
+    for (const pass of replay.passes) {
+      expect(pass.operators).toEqual([]);
+      expect(pass.quotes).toBe(0);
+    }
+    expect(replay.percentPairs).toEqual([]);
+  });
+
+  it('wraps a .bat launcher and a plain path the same way', () => {
+    for (const file of ['C:\\Users\\dev\\AppData\\Roaming\\npm\\pnpm.CMD', 'D:\\tools\\npm.bat']) {
+      const wrapped = wrapForPlatform(
+        { file, args: ['run', 'dev'], cwd: 'D:\\app', display: 'npm run dev' },
+        { platform: 'win32' },
+      );
+      expect(wrapped.file).toBe('cmd.exe');
+      const replay = replayCmdLaunch(wrapped.args[3] ?? '');
+      expect(replay.file).toBe(file);
+      expect(replay.argv).toEqual(['run', 'dev']);
+    }
+  });
+
+  it('escapes the command token once and each batch argument twice', () => {
+    expect(escapeCmdCommand('C:\\Program Files (x86)\\A&B\\pnpm.cmd')).toBe(
+      'C:\\Program^ Files^ ^(x86^)\\A^&B\\pnpm.cmd',
+    );
+    expect(escapeCmdArgument('a&b')).toBe('^"a^&b^"');
+    expect(escapeCmdArgument('a&b', { doubleEscape: true })).toBe('^^^"a^^^&b^^^"');
+    expect(escapeCmdArgument('trailing\\')).toBe('^"trailing\\\\^"');
+    expect(escapeCmdArgument('say "hi"')).toBe('^"say^ \\^"hi\\^"^"');
+  });
+
+  it('refuses a line break or NUL, which no escaping carries through cmd.exe', () => {
+    for (const argument of ['a\nb', 'a\rb', 'a\0b']) {
+      expect(() =>
+        wrapForPlatform(
+          { file: 'C:\\npm\\pnpm.cmd', args: ['--filter', argument], cwd: 'C:\\', display: 'pnpm' },
+          { platform: 'win32' },
+        ),
+      ).toThrow(/line break or a NUL/u);
+    }
+  });
+
+  it('returns any other executable, and every other platform, unchanged', () => {
+    const exe = { file: 'C:\\nodejs\\node.exe', args: ['a&b'], cwd: 'C:\\', display: 'node' };
+    expect(wrapForPlatform(exe, { platform: 'win32' })).toBe(exe);
+
+    const shim = { file: 'C:\\npm\\pnpm.cmd', args: ['a&b'], cwd: 'C:\\', display: 'pnpm' };
+    for (const platform of /** @type {NodeJS.Platform[]} */ (['linux', 'darwin', 'freebsd'])) {
+      expect(wrapForPlatform(shim, { platform })).toBe(shim);
+    }
+  });
+
+  it('builds a wrapped Windows launch end to end from PATHEXT and ComSpec', async () => {
+    const fixture = await createFixture();
+    const binDir = path.join(fixture.base, `win-bin-${randomUUID()}`);
+    await fs.promises.mkdir(binDir, { recursive: true });
+    const shim = path.join(binDir, 'pnpm.CMD');
+    await fs.promises.writeFile(shim, '@echo off\r\n', 'utf8');
+    await fs.promises.chmod(shim, 0o755);
+
+    const command = buildLaunchCommand({
+      project: {
+        dir: fixture.projectDir,
+        label: 'apps/demo-app (@scope/app)',
+        packageName: '@scope/app',
+        inRepo: true,
+      },
+      root: fixture.root,
+      env: { PATH: binDir, PATHEXT: '.EXE;.CMD', COMSPEC: 'C:\\Windows\\System32\\cmd.exe' },
+      platform: 'win32',
+    });
+
+    expect(command.file).toBe('C:\\Windows\\System32\\cmd.exe');
+    expect(command.windowsVerbatimArguments).toBe(true);
+    expect(command.cwd).toBe(fixture.root);
+    const replay = replayCmdLaunch(command.args[3] ?? '');
+    expect(replay.file).toBe(shim);
+    expect(replay.argv).toEqual(['--filter', '@scope/app', 'dev']);
+  });
+
+  it('accepts valid npm package names for pnpm --filter', async () => {
+    const fixture = await createFixture();
+    const dev = await createFakeDevServer(fixture);
+
+    for (const name of ['target-app', '@debuggen/demo-app', 'socket.io', 'a_b', 'x'.repeat(214)]) {
+      const command = buildLaunchCommand({
+        project: { dir: fixture.projectDir, label: name, packageName: name, inRepo: true },
+        root: fixture.root,
+        env: { PATH: dev.binDir },
+        platform: 'linux',
+      });
+      expect(command.args).toEqual(['--filter', name, 'dev']);
+    }
+  });
+
+  it('rejects every package name that is not a valid npm name, before anything runs', async () => {
+    const fixture = await createFixture();
+    const dev = await createFakeDevServer(fixture);
+
+    for (const name of [
+      'x&calc',
+      'a|b',
+      'a>b',
+      'a<b',
+      '"a"',
+      'a b',
+      '%PATH%',
+      '^a',
+      '(a)',
+      '!a',
+      'a;b',
+      'a,b',
+      '@scope/a&b',
+      '@sc*pe/a',
+      'Upper',
+      '.hidden',
+      '_private',
+      'a...',
+      'x'.repeat(215),
+      '\u001b[31mred',
+    ]) {
+      expect(
+        () =>
+          buildLaunchCommand({
+            project: { dir: fixture.projectDir, label: 'x', packageName: name, inRepo: true },
+            root: fixture.root,
+            env: { PATH: dev.binDir },
+            platform: 'linux',
+          }),
+        name,
+      ).toThrow(/^the package name .+ in apps\/demo-app\/package\.json /u);
+    }
+    expect(dev.ran()).toBe(false);
+
+    // The name is quoted, control characters escaped, so a hostile one cannot
+    // write to the terminal.
+    expect(() =>
+      buildLaunchCommand({
+        project: {
+          dir: fixture.projectDir,
+          label: 'x',
+          packageName: '\u001b[31mred',
+          inRepo: true,
+        },
+        root: fixture.root,
+        env: { PATH: dev.binDir },
+        platform: 'linux',
+      }),
+    ).toThrow('"\\u001b[31mred"');
+  });
+
+  const spawns = it.skipIf(process.platform === 'win32');
+
+  spawns('refuses such a name through the CLI and asks the service for nothing', async () => {
+    service = await startStubService();
+    const fixture = await createFixture({ packageName: 'x&calc' });
+    const dev = await createFakeDevServer(fixture);
+    const { context, stdout, stderr } = contextFor(fixture, dev.env);
+
+    const code = await main(['--spawn-local', '--service', service.base], context);
+
+    expect(code).toBe(2);
+    expect(dev.ran()).toBe(false);
+    expect(stdout.text()).toBe('');
+    const errors = squash(stderr.text());
+    expect(errors).toContain('the package name "x&calc" in apps/demo-app/package.json');
+    expect(errors).toContain('is not a valid npm package name');
+    expect(errors).toContain('Nothing was spawned');
+    // Validated before the credential request, so none was minted for a run
+    // that could not start.
+    expect(service.routes()).toEqual([]);
   });
 });
 
